@@ -4,9 +4,9 @@ from .base import ToolBase
 from pydantic import Field
 
 class FileWriter(ToolBase):
-    tool: Literal['file_writer'] = Field(default = 'file_writer', description="Writes a single file")
-    filename: str
-    content: str
+    """Writes a single file"""
+    filename: str = Field(description="Filename for the file to write")
+    content: str = Field(descriptor = "Content to write to the file")
 
     def execute(self) -> str:
         try:

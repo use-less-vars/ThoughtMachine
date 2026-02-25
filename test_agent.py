@@ -2,33 +2,41 @@
 import json
 from agent_core import run_agent_stream, AgentConfig
 from dotenv import load_dotenv
-import os
+import os       
+
+load_dotenv()  # Load environment variables from .env file  
 
 def main():
-    # Replace with your actual API key or load from file
-    load_dotenv()
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    api_key = api_key   # replace with actual
+
     config = AgentConfig(
         api_key=api_key,
-        max_turns=5,
+        model="deepseek-chat",       # or "deepseek-chat"
+        max_turns=15,
         temperature=0.2,
         extra_system=None,
-        stop_check=lambda: False   # no stop
+        stop_check=lambda: False
     )
 
-    query = "What is 15 * 27? Then write the result to result.txt"
+    query = "Look if there are poems in the folder, if so, write in each file at the beginning: 'reasoner was here'"
 
     print("Starting agent...")
     for event in run_agent_stream(query, config):
         print(f"\n--- Event: {event['type']} ---")
+        if "reasoning" in event and event["reasoning"]:
+            print("Reasoning:", event["reasoning"])
         if event["type"] == "turn":
             print(f"Turn {event['turn']}")
-            print("Tool call:", json.dumps(event["tool_call"], indent=2))
-            print("Result:", event["tool_result"])
-            print("Token usage:", event.get("usage"))
+            # tool_calls is a list
+            for tc in event["tool_calls"]:
+                print(f"Tool: {tc['name']}")
+                print("Arguments:", json.dumps(tc["arguments"], indent=2))
+                print("Result:", tc["result"])
+            print("Token usage:", event["usage"])
         elif event["type"] == "final":
             print("Final answer:", event["content"])
-            print("Total usage:", event.get("usage"))
+            print("Total usage:", event["usage"])
             break
         elif event["type"] == "stopped":
             print("Agent stopped")

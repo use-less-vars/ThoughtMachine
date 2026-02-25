@@ -8,7 +8,7 @@ class ToolBase(BaseModel):
     They must define a 'tool' field with a Literal of their unique name.
     They must implement execute() returning a string.
     """
-    tool: str  # will be overridden by Literal in subclasses
+
 
     def execute(self) -> str:
         raise NotImplementedError

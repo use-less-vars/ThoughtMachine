@@ -1,17 +1,14 @@
+# agent_core.py
 import json
 import logging
-from typing import Optional, Callable, Dict, Any, Union
-from pathlib import Path
-import instructor
+from typing import Optional, Callable, List, Any, Dict
 from openai import OpenAI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ValidationError
 
-# Import the tool registry and union type
-from tools import TOOL_REGISTRY, AgentResponse, ToolBase
-
-# ----------------------------
-# Configuration
-# ----------------------------
+from tools import TOOL_CLASSES
+from tools.base import ToolBase
+from tools.final import Final
+from tools.utils import model_to_openai_tool
 
 class AgentConfig(BaseModel):
     api_key: str
@@ -19,47 +16,21 @@ class AgentConfig(BaseModel):
     temperature: float = 0.2
     max_turns: int = 12
     extra_system: Optional[str] = None
-    # Optional callable to check if we should stop (e.g., from GUI)
     stop_check: Optional[Callable[[], bool]] = None
-    # You can add more parameters like tool_choice, response_model, etc.
-
-# ----------------------------
-# Client factory
-# ----------------------------
-
-def get_client(api_key: str):
-    return instructor.from_openai(
-        OpenAI(api_key=api_key, base_url="https://api.deepseek.com"),
-        mode=instructor.Mode.JSON
-    )
-
-# ----------------------------
-# System prompt (can be moved to a separate file later)
-# ----------------------------
 
 SYSTEM_PROMPT = """
 You are an assistant that can use tools.
 First, think about the problem. Use the tools if needed. When done, use the final tool to output your answer.
 """
 
-# ----------------------------
-# Agent loop with streaming
-# ----------------------------
-
 def run_agent_stream(query: str, config: AgentConfig):
-    """
-    Yields dictionaries with keys:
-      - type: 'turn', 'final', 'stopped', 'max_turns', 'error'
-      - turn: int (if applicable)
-      - tool_call: dict (if turn)
-      - tool_result: str (if turn)
-      - history: list of messages (if turn)
-      - usage: dict with input/output tokens
-    """
-    client = get_client(config.api_key)
+    client = OpenAI(api_key=config.api_key, base_url="https://api.deepseek.com")
 
-    # Conversation history starts with system and user query
-    conversation = [
+    # Prepare tool definitions for OpenAI
+    tool_definitions = [model_to_openai_tool(cls) for cls in TOOL_CLASSES]
+
+    # Build conversation starting with system message(s) and the user query
+    conversation: List[Dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT}
     ]
     if config.extra_system:
@@ -75,74 +46,124 @@ def run_agent_stream(query: str, config: AgentConfig):
             yield {
                 "type": "stopped",
                 "turn": turn,
-                "usage": {
-                    "total_input": total_input_tokens,
-                    "total_output": total_output_tokens,
-                }
+                "usage": {"total_input": total_input_tokens, "total_output": total_output_tokens}
             }
             return
 
-        # Build messages for this turn: fresh system + everything after initial system
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        if config.extra_system:
-            messages.append({"role": "system", "content": config.extra_system})
-        # Append all messages from conversation after the first system message(s)
-        # Conversation[0] is the original system, maybe followed by extra_system.
-        # We want to include everything from index 1 onward (including the user query)
-        start_idx = 2 if config.extra_system else 1
-        messages.extend(conversation[start_idx:])
+        # Use the full conversation as messages (system messages remain)
+        messages = conversation
 
-        # Call the LLM
+        # Call OpenAI with tools
         response = client.chat.completions.create(
             model=config.model,
             messages=messages,
-            response_model=AgentResponse,
+            tools=tool_definitions,
+            tool_choice="auto",
             temperature=config.temperature,
-            max_retries=3,
         )
 
-        # Extract token usage if available (instructor may put it in _raw_response)
-        usage = {}
-        if hasattr(response, '_raw_response') and response._raw_response.usage:
-            raw_usage = response._raw_response.usage
-            input_tokens = raw_usage.prompt_tokens
-            output_tokens = raw_usage.completion_tokens
-            total_input_tokens += input_tokens
-            total_output_tokens += output_tokens
-            usage = {
-                "input": input_tokens,
-                "output": output_tokens,
-                "total_input": total_input_tokens,
-                "total_output": total_output_tokens,
-            }
+        # Token usage
+        usage = response.usage
+        if usage:
+            input_tokens = usage.prompt_tokens or 0
+            output_tokens = usage.completion_tokens or 0
         else:
-            usage = {
-                "total_input": total_input_tokens,
-                "total_output": total_output_tokens,
+            input_tokens = output_tokens = 0
+        total_input_tokens += input_tokens
+        total_output_tokens += output_tokens
+
+        # Extract assistant message (may contain reasoning_content and tool_calls)
+        assistant_message = response.choices[0].message
+        content = assistant_message.content or ""
+        reasoning = getattr(assistant_message, 'reasoning_content', None)
+        tool_calls = assistant_message.tool_calls
+
+        # Build assistant message dict for storage
+        assistant_dict = {"role": "assistant", "content": content}
+        if reasoning:
+            assistant_dict["reasoning_content"] = reasoning
+        if tool_calls:
+            # Convert tool calls to dict for storage (they are Pydantic models)
+            assistant_dict["tool_calls"] = [tc.model_dump() for tc in tool_calls]
+
+        conversation.append(assistant_dict)
+
+        # If there are tool calls, execute them and append tool responses
+        if tool_calls:
+            executed_tools = []
+            final_detected = False
+            final_content = None
+
+            for tool_call in tool_calls:
+                tool_name = tool_call.function.name
+                arguments = json.loads(tool_call.function.arguments)
+
+                # Find matching tool class
+                tool_class = next((cls for cls in TOOL_CLASSES if cls.__name__ == tool_name), None)
+                if not tool_class:
+                    error_msg = f"Unknown tool: {tool_name}"
+                    tool_result = error_msg
+                else:
+                    try:
+                        tool_instance = tool_class(**arguments)
+                        tool_result = tool_instance.execute()
+                        # Check if this is a Final tool
+                        if isinstance(tool_instance, Final):
+                            final_detected = True
+                            final_content = tool_result
+                    except ValidationError as e:
+                        tool_result = f"Invalid arguments: {e}"
+                    except Exception as e:
+                        tool_result = f"Error executing tool: {e}"
+
+                # Append tool result as a message with role "tool"
+                conversation.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": tool_result
+                })
+
+                executed_tools.append({
+                    "name": tool_name,
+                    "arguments": arguments,
+                    "result": tool_result
+                })
+
+            # Yield turn event with all tool calls and results
+            yield {
+                "type": "turn",
+                "turn": turn,
+                "tool_calls": executed_tools,
+                "reasoning": reasoning,
+                "history": conversation.copy(),
+                "usage": {
+                    "input": input_tokens,
+                    "output": output_tokens,
+                    "total_input": total_input_tokens,
+                    "total_output": total_output_tokens,
+                }
             }
 
-        tool_call = response.model_dump_tool()  # uses our helper to exclude execute
-        tool_result = response.execute()
+            # If a Final tool was called, stop the agent
+            if final_detected:
+                yield {
+                    "type": "final",
+                    "content": final_content,
+                    "reasoning": reasoning,
+                    "usage": {
+                        "total_input": total_input_tokens,
+                        "total_output": total_output_tokens,
+                    }
+                }
+                return
 
-        # Append to conversation
-        conversation.append({"role": "assistant", "content": json.dumps(tool_call)})
-        conversation.append({"role": "user", "content": f"Tool responded: {tool_result}"})
-
-        # Yield turn data
-        yield {
-            "type": "turn",
-            "turn": turn,
-            "tool_call": tool_call,
-            "tool_result": tool_result,
-            "history": conversation.copy(),
-            "usage": usage,
-        }
-
-        # Check if this was the final answer
-        if response.tool == "final":
+            # Otherwise continue to next turn
+        else:
+            # No tool calls: this is the final answer
             yield {
                 "type": "final",
-                "content": tool_result,
+                "content": content,
+                "reasoning": reasoning,
                 "usage": {
                     "total_input": total_input_tokens,
                     "total_output": total_output_tokens,
@@ -150,12 +171,9 @@ def run_agent_stream(query: str, config: AgentConfig):
             }
             return
 
-    # Max turns reached
+    # Max turns reached without final answer
     yield {
         "type": "max_turns",
         "turn": config.max_turns,
-        "usage": {
-            "total_input": total_input_tokens,
-            "total_output": total_output_tokens,
-        }
+        "usage": {"total_input": total_input_tokens, "total_output": total_output_tokens}
     }

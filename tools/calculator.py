@@ -1,12 +1,12 @@
 from typing import Literal
-from .base import ToolBase
 from pydantic import Field
+from .base import ToolBase
 
 class Calculator(ToolBase):
-    tool: Literal['calculator'] = Field(default = 'calculator', description="Perform basic arithmetic")
-    a: float
-    b: float
-    operation: Literal["add", "subtract", "multiply", "divide"]
+    """Perform basic arithmetic."""
+    a: float = Field(description="First number")
+    b: float = Field(description="Second number")
+    operation: Literal["add", "subtract", "multiply", "divide"] = Field(description="Operation")
 
     def execute(self) -> str:
         if self.operation == "add":
@@ -21,4 +21,3 @@ class Calculator(ToolBase):
             else:
                 return "invalid division"
         return f"{self.a} {self.operation} {self.b} = {res}"
-

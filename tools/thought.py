@@ -3,8 +3,8 @@ from .base import ToolBase
 from pydantic import Field
 
 class Thought(ToolBase):
-    tool: Literal['thought'] = Field(default = 'thought', description="Write down reasoning")
-    content: str
+    """Write down reasoning"""
+    content: str = Field(description="Thought content") 
 
     def execute(self) -> str:
         return self.content

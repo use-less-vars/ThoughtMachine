@@ -5,8 +5,8 @@ import glob
 from pydantic import Field
 
 class FileLister(ToolBase):
-    tool: Literal['file_lister'] = Field(default = 'file_lister', description="Lists files in a directory")
-    directory: str
+    """"Lists files in a directory"""
+    directory: str = Field(description="Directory to list files from")
 
     def execute(self) -> str:
         try:

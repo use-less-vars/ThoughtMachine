@@ -4,8 +4,8 @@ from .base import ToolBase
 from pydantic import Field
 
 class FileReader(ToolBase):
-    tool: Literal['file_reader'] = Field(default = 'file_reader', description="Reads a single file")
-    filename: str
+    """Reads a single file"""""
+    filename: str = Field(description="Path to the file to read")
 
     def execute(self) -> str:
         try:
