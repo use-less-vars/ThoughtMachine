@@ -3,6 +3,7 @@ import threading
 import queue
 import traceback
 from agent_core import run_agent_stream, AgentConfig
+from typing import Optional, List, Dict, Any
 
 class AgentController:
     """
@@ -22,19 +23,21 @@ class AgentController:
         # Thread handle and running flag
         self.thread = None
         self._running = False
+        self._initial_conversation = None
 
     @property
     def is_running(self):
         """Return True if the agent thread is alive."""
         return self._running
 
-    def start(self, query: str, config: AgentConfig):
+    def start(self, query: str, config: AgentConfig, initial_conversation: Optional[List[Dict[str, Any]]] = None):
         """
         Start the agent with the given query and configuration.
 
         Args:
             query: The user query string.
             config: An AgentConfig instance (api_key, model, etc.).
+            initial_conversation: Optional previous conversation history to continue from.
         """
         if self._running:
             raise RuntimeError("Agent is already running. Stop it first.")
@@ -46,6 +49,7 @@ class AgentController:
         # Store query and config for the background thread
         self._query = query
         self._config = config
+        self._initial_conversation = initial_conversation
 
         # Create and start the daemon thread
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -94,6 +98,8 @@ class AgentController:
             # (optional, but good practice)
             run_config = self._config.model_copy() if hasattr(self._config, 'model_copy') else self._config
             run_config.stop_check = should_stop
+            if self._initial_conversation is not None:
+                run_config.initial_conversation = self._initial_conversation
 
             # Run the agent stream
             for event in run_agent_stream(self._query, run_config):

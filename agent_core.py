@@ -5,7 +5,7 @@ from typing import Optional, Callable, List, Any, Dict
 from openai import OpenAI
 from pydantic import BaseModel, ValidationError
 
-from tools import TOOL_CLASSES
+from tools import TOOL_CLASSES, SIMPLIFIED_TOOL_CLASSES
 from tools.base import ToolBase
 from tools.final import Final
 from tools.utils import model_to_openai_tool
@@ -13,48 +13,41 @@ from fast_json_repair import loads as repair_loads
 
 class AgentConfig(BaseModel):
     api_key: str
-    model: str = "deepseek-chat"
+    model: str = "deepseek-reasoner"
     temperature: float = 0.2
-    max_turns: int = 12
+    max_turns: int = 30
     extra_system: Optional[str] = None
     stop_check: Optional[Callable[[], bool]] = None
     tool_classes: Optional[List[type]] = None   # 
+    initial_conversation: Optional[List[Dict[str, Any]]] = None
 
-SYSTEM_PROMPT = """
-You are an assistant that can use tools.
-First, think about the problem. Use the tools if needed. When done, use the final tool to output your answer.
-
-## Important Guidelines:
-
-1. **Partial File Operations**: When modifying existing files, strongly prefer partial file tools (FileLineReader, FileLineWriter, FileLineInserter, FileLineReplacer, FileLineAppender, FileLineDeleter) over full file read/write tools (FileReader, FileWriter). The reason is that the larger the files become, the more error prone LLM outputs become. Changing a file in place using partial tools is safer than rewriting the whole file. Full file rewrites should only be used for creating new files or when completely replacing small files.
-
-2. **AI Documentation Folder**: Any LLM should consult the AI documentation folder (`./ai_docs/`) to obtain meta-information and further instructions. This folder contains:
-   - `README.md`: Index and overview of available documentation
-   - `tool_creation_guide.md`: Detailed guide on creating new tools
-   Refer to these files for tool creation guidelines, project architecture, and best practices.
-
-3. **Thinking and Planning**: Use the Thought tool to reason through complex problems before taking action. Document your reasoning to help with debugging and understanding your thought process.
-
-## General Approach:
-- Always consider the impact of file operations before executing them.
-- When in doubt about tool usage, check the AI documentation folder.
-- Prefer incremental, safe modifications over large, risky changes.
-"""
+    
 def run_agent_stream(query: str, config: AgentConfig):
     client = OpenAI(api_key=config.api_key, base_url="https://api.deepseek.com")
     # Prepare tool definitions for OpenAI
-    tool_classes = config.tool_classes if config.tool_classes is not None else TOOL_CLASSES
+    tool_classes = config.tool_classes if config.tool_classes is not None else SIMPLIFIED_TOOL_CLASSES
     tool_definitions = [model_to_openai_tool(cls) for cls in tool_classes]
     # Build conversation starting with system message(s) and the user query
-    conversation: List[Dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_PROMPT}
-    ]
-    if config.extra_system:
-        conversation.append({"role": "system", "content": config.extra_system})
-    conversation.append({"role": "user", "content": query})
+    
+    #load system prompt from file
+    with open("system_prompt.txt", "r") as f:
+        system_prompt = f.read()
+    
+    if config.initial_conversation is not None:
+        conversation = config.initial_conversation.copy()
+        conversation.append({"role": "user", "content": query})
+    else:
+        conversation: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_prompt}
+        ]
+        if config.extra_system:
+            conversation.append({"role": "system", "content": config.extra_system})
+        conversation.append({"role": "user", "content": query})
 
     total_input_tokens = 0
     total_output_tokens = 0
+    last_input_tokens = 0
+    last_output_tokens = 0
 
     for turn in range(config.max_turns):
         # Check stop signal
@@ -62,11 +55,16 @@ def run_agent_stream(query: str, config: AgentConfig):
             yield {
                 "type": "stopped",
                 "turn": turn,
-                "usage": {"total_input": total_input_tokens, "total_output": total_output_tokens}
+                 "usage": {"input": last_input_tokens, "output": last_output_tokens, "total_input": total_input_tokens, "total_output": total_output_tokens}
             }
             return
 
         # Use the full conversation as messages (system messages remain)
+        # Ensure any assistant message with tool_calls has reasoning_content field
+        for msg in conversation:
+            if msg.get("role") == "assistant" and "tool_calls" in msg:
+                if msg.get("reasoning_content") is None:
+                    msg["reasoning_content"] = ""
         messages = conversation
 
         # Call OpenAI with tools
@@ -87,6 +85,8 @@ def run_agent_stream(query: str, config: AgentConfig):
             input_tokens = output_tokens = 0
         total_input_tokens += input_tokens
         total_output_tokens += output_tokens
+        last_input_tokens = input_tokens
+        last_output_tokens = output_tokens
 
         # Extract assistant message (may contain reasoning_content and tool_calls)
         assistant_message = response.choices[0].message
@@ -96,8 +96,13 @@ def run_agent_stream(query: str, config: AgentConfig):
 
         # Build assistant message dict for storage
         assistant_dict = {"role": "assistant", "content": content}
-        if reasoning:
+        # Always include reasoning_content when present (could be None or empty string)
+        if reasoning is not None:
             assistant_dict["reasoning_content"] = reasoning
+        elif tool_calls:
+            # DeepSeek API requires reasoning_content when tool_calls are present
+            # Include empty string as default
+            assistant_dict["reasoning_content"] = ""
         if tool_calls:
             assistant_dict["tool_calls"] = [tc.model_dump() for tc in tool_calls]
 
@@ -134,23 +139,9 @@ def run_agent_stream(query: str, config: AgentConfig):
                             "result": tool_result
                         })
                         continue 
-                try:
-    # First attempt: normal JSON parse (fastest for valid JSON)
-                    arguments = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError:
-                    try:
-                        # Second attempt: use repair library
-                        arguments = repair_loads(tool_call.function.arguments)
-                        # Log that repair was needed (optional, for debugging)
-                        print(f"JSON repair applied for tool {tool_name}")
-                    except Exception as repair_error:
-                        # If both fail, return error to LLM for retry
-                        error_msg = f"Invalid JSON in tool arguments. Original error: {e}. Repair failed: {repair_error}"
-                        tool_result = error_msg
-                        continue  # Skip to next tool or handle appropriately
 
                 # Find matching tool class
-                tool_class = next((cls for cls in TOOL_CLASSES if cls.__name__ == tool_name), None)
+                tool_class = next((cls for cls in tool_classes if cls.__name__ == tool_name), None)
                 if not tool_class:
                     error_msg = f"Unknown tool: {tool_name}"
                     tool_result = error_msg
@@ -203,6 +194,8 @@ def run_agent_stream(query: str, config: AgentConfig):
                     "content": final_content,
                     "reasoning": reasoning,
                     "usage": {
+                        "input": input_tokens,
+                        "output": output_tokens,
                         "total_input": total_input_tokens,
                         "total_output": total_output_tokens,
                     }
@@ -217,6 +210,8 @@ def run_agent_stream(query: str, config: AgentConfig):
                 "content": content,
                 "reasoning": reasoning,
                 "usage": {
+                    "input": input_tokens,
+                    "output": output_tokens,
                     "total_input": total_input_tokens,
                     "total_output": total_output_tokens,
                 }
@@ -227,5 +222,5 @@ def run_agent_stream(query: str, config: AgentConfig):
     yield {
         "type": "max_turns",
         "turn": config.max_turns,
-        "usage": {"total_input": total_input_tokens, "total_output": total_output_tokens}
+         "usage": {"input": last_input_tokens, "output": last_output_tokens, "total_input": total_input_tokens, "total_output": total_output_tokens}
     }

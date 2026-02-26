@@ -17,4 +17,30 @@ for file in tools_dir.glob("*.py"):
         if isinstance(cls, type) and issubclass(cls, ToolBase) and cls != ToolBase:
             TOOL_CLASSES.append(cls)
 
-__all__ = ['TOOL_CLASSES']
+# Define a simplified toolset that excludes redundant file operation tools
+# Keep only unified FileEditor and essential file management tools
+FILE_TOOL_BLACKLIST = {
+    'FileLineReader',
+    'FileLineWriter', 
+    'FileLineInserter',
+    'FileLineAppender',
+    'FileLineReplacer',
+    'FileLineDeleter',
+    'FileReader',
+    'FileWriter',
+}
+
+SIMPLIFIED_TOOL_CLASSES = [
+    cls for cls in TOOL_CLASSES 
+    if cls.__name__ not in FILE_TOOL_BLACKLIST
+]
+
+# Ensure FileEditor is included (in case it wasn't discovered yet)
+try:
+    from .file_editor import FileEditor
+    if FileEditor not in SIMPLIFIED_TOOL_CLASSES:
+        SIMPLIFIED_TOOL_CLASSES.append(FileEditor)
+except ImportError:
+    pass
+
+__all__ = ['TOOL_CLASSES', 'SIMPLIFIED_TOOL_CLASSES']

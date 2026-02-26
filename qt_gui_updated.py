@@ -1,6 +1,7 @@
 # qt_gui.py (Step 3) - Updated with 6-line prompt and music player buttons
 import sys
 import os
+import json
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit, QListWidget,
@@ -106,6 +107,8 @@ class StatusPanel(QGroupBox):
         self.status_label = QLabel("Ready")
         self.token_label = QLabel("Tokens: 0 in / 0 out")
         layout.addWidget(self.status_label)
+        self.context_label = QLabel("Context: 0 tokens")
+        layout.addWidget(self.context_label)
         layout.addWidget(self.token_label)
         layout.addStretch()
         self.setLayout(layout)
@@ -115,6 +118,8 @@ class StatusPanel(QGroupBox):
     
     def update_tokens(self, total_input, total_output):
         self.token_label.setText(f"Tokens: {total_input} in / {total_output} out")
+    def update_context_length(self, context_tokens):
+        self.context_label.setText(f"Context: {context_tokens} tokens")
 
 class EventFrame(QFrame):
     """A frame that holds a single event with structured content lines."""
@@ -152,6 +157,8 @@ class AgentGUI(QMainWindow):
         self.controller = AgentController()
         self.total_input = 0
         self.total_output = 0
+        self.context_length = 0
+        self.last_history = None
         
         self.init_ui()
         self.setup_polling()
@@ -291,6 +298,27 @@ class AgentGUI(QMainWindow):
         self.resume_btn.clicked.connect(self.resume_agent)
         self.resume_btn.setEnabled(False)
         btn_layout.addWidget(self.resume_btn)
+        # Continue button (↪)
+        self.continue_btn = QPushButton("↪ Continue")
+        self.continue_btn.setMaximumWidth(80)
+        self.continue_btn.setStyleSheet("""
+            QPushButton {
+                padding: 5px;
+                font-size: 12px;
+                background-color: #9C27B0;
+                color: white;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #7B1FA2;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+            }
+        """)
+        self.continue_btn.clicked.connect(self.continue_agent)
+        self.continue_btn.setEnabled(False)
+        btn_layout.addWidget(self.continue_btn)
         
         btn_layout.addStretch()
         right_layout.addWidget(btn_frame)
@@ -346,6 +374,13 @@ class AgentGUI(QMainWindow):
         open_prompt_action.triggered.connect(self.open_prompt)
         file_menu.addAction(open_prompt_action)
         file_menu.addSeparator()
+        save_session_action = QAction("Save Session...", self)
+        save_session_action.triggered.connect(self.save_session)
+        file_menu.addAction(save_session_action)
+        load_session_action = QAction("Load Session...", self)
+        load_session_action.triggered.connect(self.load_session)
+        file_menu.addAction(load_session_action)
+        file_menu.addSeparator()
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
@@ -370,6 +405,44 @@ class AgentGUI(QMainWindow):
                     self.query_entry.setText(content)
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to read file: {e}")
+    def save_session(self):
+        if self.last_history is None:
+            QMessageBox.warning(self, "No history", "No conversation history to save.")
+            return
+        filename, _ = QFileDialog.getSaveFileName(self, "Save Session", "", "JSON files (*.json)")
+        if not filename:
+            return
+        enabled_names = self.tool_loader.get_enabled_tool_names()
+        data = {
+            "history": self.last_history,
+            "enabled_tools": enabled_names
+        }
+        try:
+            with open(filename, 'w') as f:
+                json.dump(data, f, indent=2)
+            QMessageBox.information(self, "Session Saved", f"Session saved to {filename}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save session: {e}")
+
+    def load_session(self):
+        filename, _ = QFileDialog.getOpenFileName(self, "Load Session", "", "JSON files (*.json)")
+        if not filename:
+            return
+        try:
+            with open(filename, 'r') as f:
+                data = json.load(f)
+            # Validate required keys
+            if "history" not in data or "enabled_tools" not in data:
+                raise ValueError("Invalid session file format.")
+            self.last_history = data["history"]
+            enabled_names = set(data["enabled_tools"])
+            # Update tool checkboxes
+            for tool_name, checkbox in self.tool_loader.tool_checkboxes.items():
+                checkbox.setChecked(tool_name in enabled_names)
+            self.update_buttons(running=False)
+            QMessageBox.information(self, "Session Loaded", f"Session loaded from {filename}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load session: {e}")
     
     # ---- Agent control ----
     def run_agent(self):
@@ -405,7 +478,40 @@ class AgentGUI(QMainWindow):
         self.status_panel.update_status("Running")
         self.total_input = 0
         self.total_output = 0
+        self.context_length = 0
+        self.status_panel.update_context_length(self.context_length)
         self.status_panel.update_tokens(self.total_input, self.total_output)
+    def continue_agent(self):
+        query = self.interactive_entry.text().strip()
+        if not query:
+            QMessageBox.warning(self, "No query", "Please enter a follow-up query in the interactive prompt.")
+            return
+        api_key = os.getenv("DEEPSEEK_API_KEY")
+        if not api_key:
+            QMessageBox.critical(self, "API Key missing", "Set DEEPSEEK_API_KEY in .env file")
+            return
+        
+        enabled_names = self.tool_loader.get_enabled_tool_names()
+        tool_name_to_class = {cls.__name__: cls for cls in TOOL_CLASSES}
+        enabled_classes = [tool_name_to_class[name] for name in enabled_names]
+
+        config = AgentConfig(
+            api_key=api_key,
+            model="deepseek-reasoner",
+            max_turns=100,
+            temperature=0.2,
+            extra_system=None,
+            tool_classes=enabled_classes
+        )
+
+        try:
+            self.controller.start(query, config, initial_conversation=self.last_history.copy() if self.last_history else None)
+        except RuntimeError as e:
+            QMessageBox.critical(self, "Error", str(e))
+            return
+
+        self.update_buttons(running=True)
+        self.status_panel.update_status("Running")
     
     def stop_agent(self):
         self.controller.stop()
@@ -429,11 +535,13 @@ class AgentGUI(QMainWindow):
             self.stop_btn.setEnabled(True)
             self.pause_btn.setEnabled(True)
             self.resume_btn.setEnabled(False)
+            self.continue_btn.setEnabled(False)
         else:
             self.run_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
             self.pause_btn.setEnabled(False)
             self.resume_btn.setEnabled(False)
+            self.continue_btn.setEnabled(self.last_history is not None)
             self.status_panel.update_status("Ready")
     
     def poll(self):
@@ -494,6 +602,10 @@ class AgentGUI(QMainWindow):
     def display_event(self, event):
         etype = event["type"]
         detail_level = self.detail_combo.currentText()
+        # Store conversation history if present
+        if "history" in event:
+            self.last_history = event["history"]
+            self.update_buttons(running=self.controller.is_running)
 
         frame = EventFrame(etype.upper(), etype)
 
@@ -526,6 +638,8 @@ class AgentGUI(QMainWindow):
             usage = event.get("usage", {})
             self.total_input = usage.get("total_input", self.total_input)
             self.total_output = usage.get("total_output", self.total_output)
+            self.context_length = usage.get("input", self.context_length)
+            self.status_panel.update_context_length(self.context_length)
             self.status_panel.update_tokens(self.total_input, self.total_output)
 
         elif etype == "final":
@@ -535,12 +649,26 @@ class AgentGUI(QMainWindow):
             usage = event.get("usage", {})
             self.total_input = usage.get("total_input", self.total_input)
             self.total_output = usage.get("total_output", self.total_output)
+            self.context_length = usage.get("input", self.context_length)
+            self.status_panel.update_context_length(self.context_length)
             self.status_panel.update_tokens(self.total_input, self.total_output)
 
         elif etype == "stopped":
             frame.add_content_line("Agent stopped by user.", style="color: #FF8C00;")
+            usage = event.get("usage", {})
+            self.total_input = usage.get("total_input", self.total_input)
+            self.total_output = usage.get("total_output", self.total_output)
+            self.context_length = usage.get("input", self.context_length)
+            self.status_panel.update_tokens(self.total_input, self.total_output)
+            self.status_panel.update_context_length(self.context_length)
         elif etype == "max_turns":
             frame.add_content_line("Max turns reached without final answer.", style="color: #FF8C00;")
+            usage = event.get("usage", {})
+            self.total_input = usage.get("total_input", self.total_input)
+            self.total_output = usage.get("total_output", self.total_output)
+            self.context_length = usage.get("input", self.context_length)
+            self.status_panel.update_tokens(self.total_input, self.total_output)
+            self.status_panel.update_context_length(self.context_length)
         elif etype == "error":
             frame.add_content_line(f"ERROR: {event.get('message')}", style="color: #FF0000; font-weight: bold;")
             if "traceback" in event and detail_level == "verbose":
@@ -565,6 +693,8 @@ class AgentGUI(QMainWindow):
             item = self.output_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        self.last_history = None
+        self.update_buttons(running=False)
 
 def main():
     app = QApplication(sys.argv)
