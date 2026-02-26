@@ -388,8 +388,8 @@ class AgentGUI(QMainWindow):
         
         config = AgentConfig(
             api_key=api_key,
-            model="deepseek-chat",
-            max_turns=30,
+            model="deepseek-reasoner",
+            max_turns=100,
             temperature=0.2,
             extra_system=None,
             tool_classes=enabled_classes

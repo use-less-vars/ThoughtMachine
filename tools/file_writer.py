@@ -3,7 +3,7 @@ from tools.base import ToolBase
 from pydantic import Field
 
 class FileWriter(ToolBase):
-    """Write content to a file."""
+    """Write content to a file. Note: For modifying existing files, prefer partial file tools like FileLineWriter, FileLineInserter, etc."""
     filename: str = Field(description="Name of the file to write (can include path).")
     content: str = Field(description="Content to write to the file.")
 

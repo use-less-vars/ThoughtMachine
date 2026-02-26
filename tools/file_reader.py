@@ -4,7 +4,7 @@ from .base import ToolBase
 from pydantic import Field
 
 class FileReader(ToolBase):
-    """Reads a single file"""
+    """Reads a single file. Note: For reading specific lines from existing files, consider using FileLineReader."""
     filename: str = Field(description="Path to the file to read")
 
     def execute(self) -> str:

@@ -4,7 +4,7 @@ from .base import ToolBase
 from pydantic import Field
 
 class FileLineReader(ToolBase):
-    """Read specific lines from a file using line numbers."""
+    """Read specific lines from a file using line numbers. Preferred for reading specific parts of existing files."""
     filename: str = Field(description="Path to the file to read")
     line_numbers: Optional[Union[int, List[int], str]] = Field(
         default=None,

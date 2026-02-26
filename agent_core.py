@@ -23,12 +23,25 @@ class AgentConfig(BaseModel):
 SYSTEM_PROMPT = """
 You are an assistant that can use tools.
 First, think about the problem. Use the tools if needed. When done, use the final tool to output your answer.
-As general guidline use partial file write tools instead of writing big files at once. It is safer to only do partial writing and works usually better. 
-"""
 
+## Important Guidelines:
+
+1. **Partial File Operations**: When modifying existing files, strongly prefer partial file tools (FileLineReader, FileLineWriter, FileLineInserter, FileLineReplacer, FileLineAppender, FileLineDeleter) over full file read/write tools (FileReader, FileWriter). The reason is that the larger the files become, the more error prone LLM outputs become. Changing a file in place using partial tools is safer than rewriting the whole file. Full file rewrites should only be used for creating new files or when completely replacing small files.
+
+2. **AI Documentation Folder**: Any LLM should consult the AI documentation folder (`./ai_docs/`) to obtain meta-information and further instructions. This folder contains:
+   - `README.md`: Index and overview of available documentation
+   - `tool_creation_guide.md`: Detailed guide on creating new tools
+   Refer to these files for tool creation guidelines, project architecture, and best practices.
+
+3. **Thinking and Planning**: Use the Thought tool to reason through complex problems before taking action. Document your reasoning to help with debugging and understanding your thought process.
+
+## General Approach:
+- Always consider the impact of file operations before executing them.
+- When in doubt about tool usage, check the AI documentation folder.
+- Prefer incremental, safe modifications over large, risky changes.
+"""
 def run_agent_stream(query: str, config: AgentConfig):
     client = OpenAI(api_key=config.api_key, base_url="https://api.deepseek.com")
-
     # Prepare tool definitions for OpenAI
     tool_classes = config.tool_classes if config.tool_classes is not None else TOOL_CLASSES
     tool_definitions = [model_to_openai_tool(cls) for cls in tool_classes]

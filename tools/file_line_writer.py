@@ -4,7 +4,7 @@ from .base import ToolBase
 from pydantic import Field
 
 class FileLineWriter(ToolBase):
-    """Write content to specific lines in a file."""
+    """Write content to specific lines in a file. Preferred for modifying existing files."""
     filename: str = Field(description="Path to the file to modify")
     line_number: int = Field(description="Line number to write to (1-indexed)")
     content: str = Field(description="Content to write to the specified line")
