@@ -23,8 +23,7 @@ class AgentConfig(BaseModel):
 SYSTEM_PROMPT = """
 You are an assistant that can use tools.
 First, think about the problem. Use the tools if needed. When done, use the final tool to output your answer.
-
-IMPORTANT: When providing long text content (e.g., for file writing), you must base64‑encode it to avoid JSON escaping issues. Use the field `content_base64` for such tools.
+As general guidline use partial file write tools instead of writing big files at once. It is safer to only do partial writing and works usually better. 
 """
 
 def run_agent_stream(query: str, config: AgentConfig):
@@ -87,7 +86,6 @@ def run_agent_stream(query: str, config: AgentConfig):
         if reasoning:
             assistant_dict["reasoning_content"] = reasoning
         if tool_calls:
-            # Convert tool calls to dict for storage (they are Pydantic models)
             assistant_dict["tool_calls"] = [tc.model_dump() for tc in tool_calls]
 
         conversation.append(assistant_dict)
@@ -173,6 +171,7 @@ def run_agent_stream(query: str, config: AgentConfig):
             yield {
                 "type": "turn",
                 "turn": turn,
+                "assistant_content": content, 
                 "tool_calls": executed_tools,
                 "reasoning": reasoning,
                 "history": conversation.copy(),
