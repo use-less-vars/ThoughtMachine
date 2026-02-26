@@ -9,6 +9,7 @@ from tools import TOOL_CLASSES
 from tools.base import ToolBase
 from tools.final import Final
 from tools.utils import model_to_openai_tool
+from fast_json_repair import loads as repair_loads 
 
 class AgentConfig(BaseModel):
     api_key: str
@@ -17,18 +18,21 @@ class AgentConfig(BaseModel):
     max_turns: int = 12
     extra_system: Optional[str] = None
     stop_check: Optional[Callable[[], bool]] = None
+    tool_classes: Optional[List[type]] = None   # 
 
 SYSTEM_PROMPT = """
 You are an assistant that can use tools.
 First, think about the problem. Use the tools if needed. When done, use the final tool to output your answer.
+
+IMPORTANT: When providing long text content (e.g., for file writing), you must base64‑encode it to avoid JSON escaping issues. Use the field `content_base64` for such tools.
 """
 
 def run_agent_stream(query: str, config: AgentConfig):
     client = OpenAI(api_key=config.api_key, base_url="https://api.deepseek.com")
 
     # Prepare tool definitions for OpenAI
-    tool_definitions = [model_to_openai_tool(cls) for cls in TOOL_CLASSES]
-
+    tool_classes = config.tool_classes if config.tool_classes is not None else TOOL_CLASSES
+    tool_definitions = [model_to_openai_tool(cls) for cls in tool_classes]
     # Build conversation starting with system message(s) and the user query
     conversation: List[Dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT}
@@ -96,7 +100,43 @@ def run_agent_stream(query: str, config: AgentConfig):
 
             for tool_call in tool_calls:
                 tool_name = tool_call.function.name
-                arguments = json.loads(tool_call.function.arguments)
+                arguments_str = tool_call.function.arguments
+
+                try:
+                    arguments = json.loads(arguments_str)
+                except json.JSONDecodeError:
+                    try:
+                        arguments = repair_loads(arguments_str)
+                        # Optional: log repair
+                        print(f"Repaired JSON for {tool_name}")
+                    except Exception as e:
+                        tool_result = f"Invalid JSON in arguments: {e}. Raw: {arguments_str}"
+                        # Append error result
+                        conversation.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": tool_result
+                        })
+                        executed_tools.append({
+                            "name": tool_name,
+                            "arguments": {"error": "Invalid JSON", "raw": arguments_str},
+                            "result": tool_result
+                        })
+                        continue 
+                try:
+    # First attempt: normal JSON parse (fastest for valid JSON)
+                    arguments = json.loads(tool_call.function.arguments)
+                except json.JSONDecodeError:
+                    try:
+                        # Second attempt: use repair library
+                        arguments = repair_loads(tool_call.function.arguments)
+                        # Log that repair was needed (optional, for debugging)
+                        print(f"JSON repair applied for tool {tool_name}")
+                    except Exception as repair_error:
+                        # If both fail, return error to LLM for retry
+                        error_msg = f"Invalid JSON in tool arguments. Original error: {e}. Repair failed: {repair_error}"
+                        tool_result = error_msg
+                        continue  # Skip to next tool or handle appropriately
 
                 # Find matching tool class
                 tool_class = next((cls for cls in TOOL_CLASSES if cls.__name__ == tool_name), None)
