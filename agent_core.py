@@ -61,11 +61,13 @@ def prune_conversation_history(conversation: List[Dict[str, Any]], config: Agent
         
         # Determine how many turns to keep
         turns_to_keep = config.max_history_turns
-        if config.keep_initial_query and turns:
+        if turns_to_keep <= 0:
+            kept_turns = []
+        elif config.keep_initial_query and turns:
             # Always keep the first turn (initial query)
-            if turns_to_keep <= 1:
+            if turns_to_keep == 1:
                 # Keep only first turn
-                kept_turns = [turns[0]] if turns else []
+                kept_turns = [turns[0]]
             else:
                 # Keep first turn plus recent turns
                 if len(turns) <= turns_to_keep:
@@ -74,21 +76,6 @@ def prune_conversation_history(conversation: List[Dict[str, Any]], config: Agent
                     # Keep first turn + (turns_to_keep-1) most recent turns
                     recent_turns = turns[-(turns_to_keep-1):]
                     kept_turns = [turns[0]] + recent_turns
-        else:
-            # Just keep most recent turns
-            kept_turns = turns[-turns_to_keep:] if turns_to_keep > 0 else []
-        turns_to_keep = config.max_history_turns
-        if config.keep_initial_query and turns:
-            # Always keep the first turn (initial query)
-            if turns_to_keep > 0:
-                # Keep first turn plus recent turns
-                if len(turns) <= turns_to_keep:
-                    kept_turns = turns
-                else:
-                    # Keep first turn + (turns_to_keep-1) most recent turns
-                    kept_turns = [turns[0]] + turns[-(turns_to_keep-1):]
-            else:
-                kept_turns = [turns[0]] if turns else []
         else:
             # Just keep most recent turns
             kept_turns = turns[-turns_to_keep:] if turns_to_keep > 0 else []
@@ -146,12 +133,6 @@ def run_agent_stream(query: str, config: AgentConfig):
         conversation = prune_conversation_history(conversation, config)
         
         # Use the full conversation as messages (system messages remain)
-        # Ensure any assistant message with tool_calls has reasoning_content field
-        for msg in conversation:
-            if msg.get("role") == "assistant" and "tool_calls" in msg:
-                if msg.get("reasoning_content") is None:
-                    msg["reasoning_content"] = ""
-        messages = conversation
         # Ensure any assistant message with tool_calls has reasoning_content field
         for msg in conversation:
             if msg.get("role") == "assistant" and "tool_calls" in msg:
