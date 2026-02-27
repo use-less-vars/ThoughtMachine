@@ -1,0 +1,7 @@
+1	Start stable agent	–
+2	Instruct: “Create construction workspace”	Copies code → ./construction/
+3	Instruct: “Add X to construction”	Edits files in ./construction/
+4	Test manually in ./construction/	–
+5	If broken, instruct: “Restore construction”	Wipes and recopies from stable
+6	If good, manually copy files to stable	–
+7	Restart stable agent	Now includes new features
