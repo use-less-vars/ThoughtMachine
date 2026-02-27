@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Literal
 from pathlib import Path
 from .base import ToolBase
 import shutil
@@ -22,7 +22,22 @@ class FileMover(ToolBase):
     create_dirs: bool = Field(default=False, description="Create destination directories if they don't exist.")
     recursive: bool = Field(default=False, description="For pattern matching, include subdirectories recursively.")
     preserve_structure: bool = Field(default=False, description="For batch moves, preserve relative directory structure when moving to destination.")
+    workspace: Literal["stable", "construction"] = Field(
+        default="stable",
+        description="Workspace to operate in: 'stable' (current directory) or 'construction' (./construction/ directory)"
+    )
 
+    def _adjust_path(self, path: str) -> str:
+        """Adjust path based on workspace setting."""
+        if self.workspace == "construction":
+            # Ensure construction directory exists
+            Path("./construction").mkdir(parents=True, exist_ok=True)
+            # If path is absolute, keep it as is (no workspace mapping)
+            if os.path.isabs(path):
+                return path
+            # Prefix with construction directory
+            return f"./construction/{path}"
+        return path
     @model_validator(mode='after')
     def validate_sources(self):
         # Determine which source specification to use
@@ -53,6 +68,25 @@ class FileMover(ToolBase):
             sources = [Path(self.source_path)]
         return sources
 
+    def _expand_sources_adjusted(self) -> List[Path]:
+        """Return a list of Path objects based on source specification, adjusted for workspace."""
+        sources = []
+        if self.pattern is not None:
+            # Adjust pattern for workspace
+            adjusted_pattern = self._adjust_path(self.pattern)
+            # Use glob to find matching files
+            matches = glob.glob(adjusted_pattern, recursive=self.recursive)
+            sources = [Path(m) for m in matches]
+            # Sort for deterministic behavior
+            sources.sort()
+        elif self.source_paths is not None:
+            # Adjust each source path
+            adjusted_paths = [self._adjust_path(sp) for sp in self.source_paths]
+            sources = [Path(sp) for sp in adjusted_paths]
+        elif self.source_path is not None:
+            adjusted_path = self._adjust_path(self.source_path)
+            sources = [Path(adjusted_path)]
+        return sources
     def _common_parent(self, paths: List[Path]) -> Path:
         """Return the longest common parent directory for a list of paths."""
         if not paths:
@@ -81,10 +115,10 @@ class FileMover(ToolBase):
 
     def execute(self) -> str:
         try:
-            destination = Path(self.destination_path)
+            destination = Path(self._adjust_path(self.destination_path))
             
             # Expand sources
-            sources = self._expand_sources()
+            sources = self._expand_sources_adjusted()
             if not sources:
                 return "No files or directories matched the source specification."
             

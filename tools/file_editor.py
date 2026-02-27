@@ -1,5 +1,6 @@
 # tools/file_editor.py
 from typing import List, Optional, Union, Dict, Literal
+import os
 from pathlib import Path
 from pydantic import Field, model_validator
 from .base import ToolBase
@@ -39,6 +40,10 @@ class FileEditor(ToolBase):
         default="replace",
         description="Mode for write operation: 'replace' (overwrite line), 'insert' (insert before line), 'append' (append after line). Only used when operation='write' and line_number is specified."
     )
+    workspace: Literal["stable", "construction"] = Field(
+        default="stable",
+        description="Workspace to operate in: 'stable' (current directory) or 'construction' (./construction/ directory)"
+    )
 
     @model_validator(mode='after')
     def validate_operation(self):
@@ -72,6 +77,17 @@ class FileEditor(ToolBase):
             raise ValueError("filenames list cannot be empty")
         return self
 
+    def _get_actual_path(self, filename: str) -> str:
+        """Convert filename based on workspace setting."""
+        if self.workspace == "construction":
+            # Ensure construction directory exists
+            Path("./construction").mkdir(parents=True, exist_ok=True)
+            # If filename is absolute, keep it as is (no workspace mapping)
+            if os.path.isabs(filename):
+                return filename
+            # Prefix with construction directory
+            return f"./construction/{filename}"
+        return filename
     def execute(self) -> str:
         # Determine target files
         if self.filenames is not None:
@@ -84,24 +100,24 @@ class FileEditor(ToolBase):
         results = []
         for filename in target_files:
             try:
+                actual_filename = self._get_actual_path(filename)
                 if self.operation == "read":
-                    result = self._execute_read(filename)
+                    result = self._execute_read(actual_filename)
                 elif self.operation == "write":
-                    result = self._execute_write(filename)
+                    result = self._execute_write(actual_filename)
                 elif self.operation == "insert":
-                    result = self._execute_insert(filename)
+                    result = self._execute_insert(actual_filename)
                 elif self.operation == "append":
-                    result = self._execute_append(filename)
+                    result = self._execute_append(actual_filename)
                 elif self.operation == "replace":
-                    result = self._execute_replace(filename)
+                    result = self._execute_replace(actual_filename)
                 elif self.operation == "delete":
-                    result = self._execute_delete(filename)
+                    result = self._execute_delete(actual_filename)
                 else:
                     result = f"Error: Unknown operation {self.operation}"
                 results.append(f"{filename}: {result}")
             except Exception as e:
                 results.append(f"{filename}: Error: {e}")
-        
         # Format output
         if batch_mode:
             success_count = sum(1 for r in results if "Error:" not in r)

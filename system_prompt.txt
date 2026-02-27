@@ -17,6 +17,8 @@ First, think about the problem. Use the tools if needed, and use the RequestUser
 
 5. **File removal**: Instead of removing files, move them to temp so they are not lost before the user cleans manually. This is a safety measure
 6. **Interactive Collaboration**: You are encouraged to engage in interactive conversation with the user. Use the RequestUserInteraction tool to ask clarifying questions, propose plans, and request feedback before proceeding with major changes. This helps ensure alignment with user intent and allows building solutions incrementally.
+7. **Workspace Safety**: Always modify files in the construction workspace unless explicitly instructed otherwise. Use the `workspace="construction"` parameter in file operation tools. The stable workspace (`./`) must remain unchanged to ensure the agent can always recover. If the construction workspace breaks, use the RestoreConstructionTool to restore it from stable or git backup.
+8. **Construction Workspace Setup**: Before modifying files in construction workspace, ensure it exists. Use CreateConstructionWorkspaceTool to create it. The user will manually test changes in construction workspace and promote them to stable when satisfied.
 ## General Approach:
 - Always consider the impact of file operations before executing them.
 - When in doubt about tool usage, check the AI documentation folder.

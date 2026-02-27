@@ -9,10 +9,25 @@ class DirectoryCreator(ToolBase):
     directory_path: str = Field(description="Directory path to create")
     parents: bool = Field(default=True, description="Create parent directories if they don't exist")
     exist_ok: bool = Field(default=True, description="Don't raise error if directory already exists")
+    workspace: Literal["stable", "construction"] = Field(
+        default="stable",
+        description="Workspace to operate in: 'stable' (current directory) or 'construction' (./construction/ directory)"
+    )
 
+    def _adjust_path(self, path: str) -> str:
+        """Adjust path based on workspace setting."""
+        if self.workspace == "construction":
+            # Ensure construction directory exists (parent of target)
+            Path("./construction").mkdir(parents=True, exist_ok=True)
+            # If path is absolute, keep it as is (no workspace mapping)
+            if os.path.isabs(path):
+                return path
+            # Prefix with construction directory
+            return f"./construction/{path}"
+        return path
     def execute(self) -> str:
         try:
-            directory = Path(self.directory_path)
+            directory = Path(self._adjust_path(self.directory_path))
             
             # Check if directory already exists
             if directory.exists():
