@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit, QListWidget,
     QGroupBox, QCheckBox, QMenuBar, QMenu, QFileDialog,
-    QMessageBox, QScrollArea, QFrame, QComboBox, QSplitter, QDialog
+    QMessageBox, QScrollArea, QFrame, QComboBox, QSpinBox, QSplitter, QDialog
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QAction, QFont
@@ -323,6 +323,33 @@ class AgentGUI(QMainWindow):
         btn_layout.addStretch()
         right_layout.addWidget(btn_frame)
         
+        # Pruning controls
+        pruning_frame = QWidget()
+        pruning_layout = QHBoxLayout()
+        pruning_frame.setLayout(pruning_layout)
+        
+        self.pruning_checkbox = QCheckBox("Enable pruning")
+        self.pruning_checkbox.setChecked(False)
+        pruning_layout.addWidget(self.pruning_checkbox)
+        
+        pruning_layout.addWidget(QLabel("Keep turns:"))
+        self.turns_spinbox = QSpinBox()
+        self.turns_spinbox.setRange(1, 50)
+        self.turns_spinbox.setValue(5)
+        self.turns_spinbox.setEnabled(False)
+        pruning_layout.addWidget(self.turns_spinbox)
+        
+        self.keep_initial_checkbox = QCheckBox("Keep initial query")
+        self.keep_initial_checkbox.setChecked(True)
+        self.keep_initial_checkbox.setEnabled(False)
+        pruning_layout.addWidget(self.keep_initial_checkbox)
+        
+        pruning_layout.addStretch()
+        right_layout.addWidget(pruning_frame)
+        
+        # Connect pruning checkbox to enable/disable other controls
+        self.pruning_checkbox.stateChanged.connect(self.update_pruning_controls)
+        self.update_pruning_controls()  # Set initial state
         # Controls
         controls_frame = QWidget()
         controls_layout = QHBoxLayout()
@@ -444,6 +471,11 @@ class AgentGUI(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load session: {e}")
     
+    def update_pruning_controls(self):
+        """Enable/disable pruning controls based on checkbox."""
+        enabled = self.pruning_checkbox.isChecked()
+        self.turns_spinbox.setEnabled(enabled)
+        self.keep_initial_checkbox.setEnabled(enabled)
     # ---- Agent control ----
     def run_agent(self):
         query = self.query_entry.toPlainText().strip()  # Changed from .text() to .toPlainText()
@@ -465,7 +497,10 @@ class AgentGUI(QMainWindow):
             max_turns=100,
             temperature=0.2,
             extra_system=None,
-            tool_classes=enabled_classes
+            tool_classes=enabled_classes,
+            max_history_turns=self.turns_spinbox.value() if self.pruning_checkbox.isChecked() else None,
+            keep_initial_query=self.keep_initial_checkbox.isChecked() if self.pruning_checkbox.isChecked() else True,
+            keep_system_messages=True
         )
         
         try:
@@ -501,8 +536,12 @@ class AgentGUI(QMainWindow):
             max_turns=100,
             temperature=0.2,
             extra_system=None,
-            tool_classes=enabled_classes
-        )
+            tool_classes=enabled_classes,
+            max_history_turns=self.turns_spinbox.value() if self.pruning_checkbox.isChecked() else None,
+            keep_initial_query=self.keep_initial_checkbox.isChecked() if self.pruning_checkbox.isChecked() else True,
+            keep_system_messages=True
+            )
+            
 
         try:
             self.controller.start(query, config, initial_conversation=self.last_history.copy() if self.last_history else None)
@@ -605,7 +644,11 @@ class AgentGUI(QMainWindow):
         # Store conversation history if present
         if "history" in event:
             self.last_history = event["history"]
-            self.update_buttons(running=self.controller.is_running)
+            # For user interaction requests, treat as not running to enable Continue button
+            if etype == "user_interaction_requested":
+                self.update_buttons(running=False)
+            else:
+                self.update_buttons(running=self.controller.is_running)
 
         frame = EventFrame(etype.upper(), etype)
 
@@ -661,6 +704,17 @@ class AgentGUI(QMainWindow):
             self.context_length = usage.get("input", self.context_length)
             self.status_panel.update_tokens(self.total_input, self.total_output)
             self.status_panel.update_context_length(self.context_length)
+        elif etype == "user_interaction_requested":
+            frame.add_content_line(f"Agent requests interaction: {event.get('message', '')}", style="color: #008080;")
+            # Optionally auto-focus the interactive input
+            self.interactive_entry.setPlaceholderText("Type your response here...")
+            self.interactive_entry.setFocus()
+            usage = event.get("usage", {})
+            self.total_input = usage.get("total_input", self.total_input)
+            self.total_output = usage.get("total_output", self.total_output)
+            self.context_length = usage.get("input", self.context_length)
+            self.status_panel.update_context_length(self.context_length)
+            self.status_panel.update_tokens(self.total_input, self.total_output)
         elif etype == "max_turns":
             frame.add_content_line("Max turns reached without final answer.", style="color: #FF8C00;")
             usage = event.get("usage", {})

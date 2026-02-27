@@ -8,6 +8,7 @@ from pydantic import BaseModel, ValidationError
 from tools import TOOL_CLASSES, SIMPLIFIED_TOOL_CLASSES
 from tools.base import ToolBase
 from tools.final import Final
+from tools.request_user_interaction import RequestUserInteraction
 from tools.utils import model_to_openai_tool
 from fast_json_repair import loads as repair_loads 
 
@@ -20,7 +21,89 @@ class AgentConfig(BaseModel):
     stop_check: Optional[Callable[[], bool]] = None
     tool_classes: Optional[List[type]] = None   # 
     initial_conversation: Optional[List[Dict[str, Any]]] = None
+    max_history_turns: Optional[int] = None
+    max_tokens: Optional[int] = None
+    keep_initial_query: bool = True
+    keep_system_messages: bool = True
 
+def prune_conversation_history(conversation: List[Dict[str, Any]], config: AgentConfig) -> List[Dict[str, Any]]:
+    """Prune conversation history based on config settings."""
+    if config.max_history_turns is None and config.max_tokens is None:
+        return conversation
+    
+    # Separate system messages and other messages
+    system_messages = []
+    other_messages = []
+    for msg in conversation:
+        if msg.get("role") == "system":
+            system_messages.append(msg)
+        else:
+            other_messages.append(msg)
+    
+    # If no pruning needed for other messages, just return
+    if not other_messages:
+        return conversation
+    
+    # Apply turn-based pruning if configured
+    if config.max_history_turns is not None:
+        # Group messages by turns starting from user messages
+        turns = []
+        current_turn = []
+        for msg in other_messages:
+            if msg.get("role") == "user":
+                if current_turn:
+                    turns.append(current_turn)
+                current_turn = [msg]
+            else:
+                current_turn.append(msg)
+        if current_turn:
+            turns.append(current_turn)
+        
+        # Determine how many turns to keep
+        turns_to_keep = config.max_history_turns
+        if config.keep_initial_query and turns:
+            # Always keep the first turn (initial query)
+            if turns_to_keep <= 1:
+                # Keep only first turn
+                kept_turns = [turns[0]] if turns else []
+            else:
+                # Keep first turn plus recent turns
+                if len(turns) <= turns_to_keep:
+                    kept_turns = turns
+                else:
+                    # Keep first turn + (turns_to_keep-1) most recent turns
+                    recent_turns = turns[-(turns_to_keep-1):]
+                    kept_turns = [turns[0]] + recent_turns
+        else:
+            # Just keep most recent turns
+            kept_turns = turns[-turns_to_keep:] if turns_to_keep > 0 else []
+        turns_to_keep = config.max_history_turns
+        if config.keep_initial_query and turns:
+            # Always keep the first turn (initial query)
+            if turns_to_keep > 0:
+                # Keep first turn plus recent turns
+                if len(turns) <= turns_to_keep:
+                    kept_turns = turns
+                else:
+                    # Keep first turn + (turns_to_keep-1) most recent turns
+                    kept_turns = [turns[0]] + turns[-(turns_to_keep-1):]
+            else:
+                kept_turns = [turns[0]] if turns else []
+        else:
+            # Just keep most recent turns
+            kept_turns = turns[-turns_to_keep:] if turns_to_keep > 0 else []
+        
+        # Flatten kept turns
+        pruned_other = []
+        for turn in kept_turns:
+            pruned_other.extend(turn)
+        
+        # Combine with system messages
+        result = system_messages + pruned_other if config.keep_system_messages else pruned_other
+        return result
+    
+    # TODO: Implement token-based pruning
+    return conversation
     
 def run_agent_stream(query: str, config: AgentConfig):
     client = OpenAI(api_key=config.api_key, base_url="https://api.deepseek.com")
@@ -59,7 +142,16 @@ def run_agent_stream(query: str, config: AgentConfig):
             }
             return
 
+        # Prune conversation history if configured
+        conversation = prune_conversation_history(conversation, config)
+        
         # Use the full conversation as messages (system messages remain)
+        # Ensure any assistant message with tool_calls has reasoning_content field
+        for msg in conversation:
+            if msg.get("role") == "assistant" and "tool_calls" in msg:
+                if msg.get("reasoning_content") is None:
+                    msg["reasoning_content"] = ""
+        messages = conversation
         # Ensure any assistant message with tool_calls has reasoning_content field
         for msg in conversation:
             if msg.get("role") == "assistant" and "tool_calls" in msg:
@@ -113,6 +205,8 @@ def run_agent_stream(query: str, config: AgentConfig):
             executed_tools = []
             final_detected = False
             final_content = None
+            user_interaction_requested = False
+            user_interaction_message = None
 
             for tool_call in tool_calls:
                 tool_name = tool_call.function.name
@@ -153,6 +247,10 @@ def run_agent_stream(query: str, config: AgentConfig):
                         if isinstance(tool_instance, Final):
                             final_detected = True
                             final_content = tool_result
+                        # Check if this is a RequestUserInteraction tool
+                        if isinstance(tool_instance, RequestUserInteraction):
+                            user_interaction_requested = True
+                            user_interaction_message = tool_result
                     except ValidationError as e:
                         tool_result = f"Invalid arguments: {e}"
                     except Exception as e:
@@ -186,6 +284,21 @@ def run_agent_stream(query: str, config: AgentConfig):
                     "total_output": total_output_tokens,
                 }
             }
+            # If a RequestUserInteraction tool was called, stop the agent and wait for user response
+            if user_interaction_requested:
+                yield {
+                    "type": "user_interaction_requested",
+                    "turn": turn,
+                    "message": user_interaction_message,
+                    "history": conversation.copy(),
+                    "usage": {
+                        "input": input_tokens,
+                        "output": output_tokens,
+                        "total_input": total_input_tokens,
+                        "total_output": total_output_tokens,
+                    }
+                }
+                return
 
             # If a Final tool was called, stop the agent
             if final_detected:

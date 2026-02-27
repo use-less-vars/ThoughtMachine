@@ -24,12 +24,29 @@ FileEditor is a unified tool that supports all common file operations:
 
 ### Parameters
 - `operation`: One of the above operations (required)
-- `filename`: Path to the file (required)
+- `filename`: Path to a single file (optional, either filename or filenames must be provided)
+- `filenames`: List of file paths to operate on (optional, either filename or filenames must be provided)
 - `content`: String or list of strings for write/insert/append operations
 - `line_number`: Line number for insert/write operations (1-indexed)
 - `line_numbers`: Line number(s) for read/delete operations (single int, list, range string, or 'all')
 - `replacements`: Dictionary mapping line numbers to new content for replace operation
 - `mode`: For write operation with line_number: 'replace', 'insert', or 'append'
+### Batch Operations
+
+FileEditor supports batch operations across multiple files. When `filenames` parameter is provided, the same operation will be applied to each file in the list. This is useful for making identical changes across multiple files.
+
+Example: Replace line 5 in three configuration files
+```json
+{
+  "operation": "replace",
+  "filenames": ["config1.yaml", "config2.yaml", "config3.yaml"],
+  "replacements": {
+    5: "enabled: true"
+  }
+}
+```
+
+Batch operations return a summary of successes and failures for each file.
 
 ### Usage Examples
 

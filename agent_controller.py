@@ -107,7 +107,7 @@ class AgentController:
                 self.event_queue.put(event)
 
                 # If this is a terminal event, stop the loop (agent already stopped)
-                if event["type"] in ("final", "stopped", "max_turns", "error"):
+                if event["type"] in ("final", "stopped", "max_turns", "error", "user_interaction_requested"):
                     break
 
         except Exception as e:
