@@ -16,9 +16,33 @@ First, think about the problem. Use the tools if needed, and use the RequestUser
 4. **Creating helper files**: If you need to write small files for testing or storing some temporary info, use the ./temp folder. Do not pollute the workspace
 
 5. **File removal**: Instead of removing files, move them to temp so they are not lost before the user cleans manually. This is a safety measure
+
 6. **Interactive Collaboration**: You are encouraged to engage in interactive conversation with the user. Use the RequestUserInteraction tool to ask clarifying questions, propose plans, and request feedback before proceeding with major changes. This helps ensure alignment with user intent and allows building solutions incrementally.
+
 7. **Workspace Safety**: Always modify files in the construction workspace unless explicitly instructed otherwise. Use the `workspace="construction"` parameter in file operation tools. The stable workspace (`./`) must remain unchanged to ensure the agent can always recover. If the construction workspace breaks, use the RestoreConstructionTool to restore it from stable or git backup.
+
 8. **Construction Workspace Setup**: Before modifying files in construction workspace, ensure it exists. Use CreateConstructionWorkspaceTool to create it (note: overwrite=False by default for safety). The user will manually test changes in construction workspace and promote them to stable when satisfied.
+
+9. **Directory Structure Diagnosis**: When you start or encounter file access errors, immediately determine the project root location:
+   1. **Initial Check**: Use FileLister on `.` (current directory) and `..` (parent directory).
+   2. **Identify Project Root**: Look for key project files: `agent_core.py`, `tools/`, `ai_docs/`.
+      - If these are in `.`, project root is current directory (normal operation).
+      - If these are in `..`, project root is parent directory (sandbox/isolation).
+      - If neither, use RequestUserInteraction to ask for guidance.
+   3. **Adjust File Paths**:
+      - If project root is `.`: Use normal file paths (e.g., `"agent_core.py"`).
+      - If project root is `..`: Prefix all file paths with `../` (e.g., `"../agent_core.py"`).
+   4. **Construction Workspace Location**:
+      - If project root is `.`: Construction workspace is `./construction/`.
+      - If project root is `..`: Construction workspace is `../construction/`. Use `workspace="construction"` with `../` prefix for filenames, OR use `workspace="stable"` with `../` prefix and avoid construction workspace.
+   5. **Quick Verification**: Use FileEditor to read `../ai_docs/integration_guide.md` lines 1-10 to confirm file access.
+
+10. **Path Resolution Summary**:
+    | Scenario | Project Root | Stable Workspace | Construction Workspace | Example File Path |
+    |----------|--------------|------------------|------------------------|-------------------|
+    | Normal   | `.`          | `./`             | `./construction/`      | `"agent_core.py"` with `workspace="construction"` |
+    | Sandbox  | `..`         | `../`            | `../construction/`     | `"../agent_core.py"` with `workspace="construction"` OR `"../agent_core.py"` with `workspace="stable"` |
+
 ## General Approach:
 - Always consider the impact of file operations before executing them.
 - When in doubt about tool usage, check the AI documentation folder.

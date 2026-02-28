@@ -44,7 +44,11 @@ class SystemViewPanel(QGroupBox):
     """Simple file browser panel."""
     def __init__(self):
         super().__init__("System View")
-        self.current_dir = os.getcwd()
+        try:
+            self.current_dir = os.getcwd()
+        except FileNotFoundError:
+            # fallback to user's home directory
+            self.current_dir = os.path.expanduser("~")
         
         layout = QVBoxLayout()
         
@@ -196,132 +200,6 @@ class AgentGUI(QMainWindow):
         right_layout = QVBoxLayout()
         right_container.setLayout(right_layout)
         
-        # Query input - Updated: Label above, 6-line text edit
-        query_label = QLabel("Query:")
-        query_label.setStyleSheet("font-weight: bold;")
-        right_layout.addWidget(query_label)
-        
-        self.query_entry = QTextEdit()
-        self.query_entry.setMaximumHeight(120)  # Approx 6 lines
-        self.query_entry.setPlaceholderText("Enter your query here...")
-        right_layout.addWidget(self.query_entry)
-        
-        # Music player style buttons - Updated: smaller, with symbols
-        btn_frame = QWidget()
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(5)  # Smaller spacing between buttons
-        btn_frame.setLayout(btn_layout)
-        
-        # Run button (▶)
-        self.run_btn = QPushButton("▶ Run")
-        self.run_btn.setMaximumWidth(80)
-        self.run_btn.setStyleSheet("""
-            QPushButton {
-                padding: 5px;
-                font-size: 12px;
-                background-color: #4CAF50;
-                color: white;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-            }
-        """)
-        self.run_btn.clicked.connect(self.run_agent)
-        btn_layout.addWidget(self.run_btn)
-        
-        # Stop button (■)
-        self.stop_btn = QPushButton("■ Stop")
-        self.stop_btn.setMaximumWidth(80)
-        self.stop_btn.setStyleSheet("""
-            QPushButton {
-                padding: 5px;
-                font-size: 12px;
-                background-color: #f44336;
-                color: white;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #da190b;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-            }
-        """)
-        self.stop_btn.clicked.connect(self.stop_agent)
-        self.stop_btn.setEnabled(False)
-        btn_layout.addWidget(self.stop_btn)
-        
-        # Pause button (⏸)
-        self.pause_btn = QPushButton("⏸ Pause")
-        self.pause_btn.setMaximumWidth(80)
-        self.pause_btn.setStyleSheet("""
-            QPushButton {
-                padding: 5px;
-                font-size: 12px;
-                background-color: #ff9800;
-                color: white;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #e68a00;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-            }
-        """)
-        self.pause_btn.clicked.connect(self.pause_agent)
-        self.pause_btn.setEnabled(False)
-        btn_layout.addWidget(self.pause_btn)
-        
-        # Resume button (⏵)
-        self.resume_btn = QPushButton("⏵ Resume")
-        self.resume_btn.setMaximumWidth(80)
-        self.resume_btn.setStyleSheet("""
-            QPushButton {
-                padding: 5px;
-                font-size: 12px;
-                background-color: #2196F3;
-                color: white;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #0b7dda;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-            }
-        """)
-        self.resume_btn.clicked.connect(self.resume_agent)
-        self.resume_btn.setEnabled(False)
-        btn_layout.addWidget(self.resume_btn)
-        # Continue button (↪)
-        self.continue_btn = QPushButton("↪ Continue")
-        self.continue_btn.setMaximumWidth(80)
-        self.continue_btn.setStyleSheet("""
-            QPushButton {
-                padding: 5px;
-                font-size: 12px;
-                background-color: #9C27B0;
-                color: white;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #7B1FA2;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-            }
-        """)
-        self.continue_btn.clicked.connect(self.continue_agent)
-        self.continue_btn.setEnabled(False)
-        btn_layout.addWidget(self.continue_btn)
-        
-        btn_layout.addStretch()
-        right_layout.addWidget(btn_frame)
         
         # Pruning controls
         pruning_frame = QWidget()
@@ -343,28 +221,17 @@ class AgentGUI(QMainWindow):
         self.keep_initial_checkbox.setChecked(True)
         self.keep_initial_checkbox.setEnabled(False)
         pruning_layout.addWidget(self.keep_initial_checkbox)
-        
+        pruning_layout.addWidget(QLabel("Detail:"))
+        self.detail_combo = QComboBox()
+        self.detail_combo.addItems(["minimal", "normal", "verbose"])
+        self.detail_combo.setCurrentText("normal")
+        pruning_layout.addWidget(self.detail_combo)
         pruning_layout.addStretch()
         right_layout.addWidget(pruning_frame)
         
         # Connect pruning checkbox to enable/disable other controls
         self.pruning_checkbox.stateChanged.connect(self.update_pruning_controls)
         self.update_pruning_controls()  # Set initial state
-        # Controls
-        controls_frame = QWidget()
-        controls_layout = QHBoxLayout()
-        controls_frame.setLayout(controls_layout)
-        controls_layout.addWidget(QLabel("Interactive Prompt (placeholder):"))
-        self.interactive_entry = QLineEdit()
-        self.interactive_entry.setMaximumWidth(300)
-        controls_layout.addWidget(self.interactive_entry)
-        controls_layout.addWidget(QLabel("Detail:"))
-        self.detail_combo = QComboBox()
-        self.detail_combo.addItems(["minimal", "normal", "verbose"])
-        self.detail_combo.setCurrentText("normal")
-        controls_layout.addWidget(self.detail_combo)
-        controls_layout.addStretch()
-        right_layout.addWidget(controls_frame)
         
         # Clear button
         clear_btn = QPushButton("Clear Output")
@@ -384,6 +251,132 @@ class AgentGUI(QMainWindow):
         
         self.output_scroll_area.setWidget(self.output_container)
         right_layout.addWidget(self.output_scroll_area)
+        # Query input - Updated: Label above, 6-line text edit
+        query_label = QLabel("Query:")
+        query_label.setStyleSheet("font-weight: bold;")
+        right_layout.addWidget(query_label)
+
+        self.query_entry = QTextEdit()
+        self.query_entry.setMaximumHeight(120)  # Approx 6 lines
+        self.query_entry.setPlaceholderText("Enter your query here...")
+        right_layout.addWidget(self.query_entry)
+
+        # Music player style buttons - Updated: smaller, with symbols
+        btn_frame = QWidget()
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(5)  # Smaller spacing between buttons
+        btn_frame.setLayout(btn_layout)
+
+        # Run button (▶)
+        self.run_btn = QPushButton("▶ Run")
+        self.run_btn.setMaximumWidth(80)
+        self.run_btn.setStyleSheet("""
+            QPushButton {
+                padding: 5px;
+                font-size: 12px;
+                background-color: #4CAF50;
+                color: white;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+            }
+        """)
+        self.run_btn.clicked.connect(self.run_agent)
+        btn_layout.addWidget(self.run_btn)
+
+        # Stop button (■)
+        self.stop_btn = QPushButton("■ Stop")
+        self.stop_btn.setMaximumWidth(80)
+        self.stop_btn.setStyleSheet("""
+            QPushButton {
+                padding: 5px;
+                font-size: 12px;
+                background-color: #f44336;
+                color: white;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #da190b;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+            }
+        """)
+        self.stop_btn.clicked.connect(self.stop_agent)
+        self.stop_btn.setEnabled(False)
+        btn_layout.addWidget(self.stop_btn)
+
+        # Pause button (⏸)
+        self.pause_btn = QPushButton("⏸ Pause")
+        self.pause_btn.setMaximumWidth(80)
+        self.pause_btn.setStyleSheet("""
+            QPushButton {
+                padding: 5px;
+                font-size: 12px;
+                background-color: #ff9800;
+                color: white;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #e68a00;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+            }
+        """)
+        self.pause_btn.clicked.connect(self.pause_agent)
+        self.pause_btn.setEnabled(False)
+        btn_layout.addWidget(self.pause_btn)
+
+        # Resume button (⏵)
+        self.resume_btn = QPushButton("⏵ Resume")
+        self.resume_btn.setMaximumWidth(80)
+        self.resume_btn.setStyleSheet("""
+            QPushButton {
+                padding: 5px;
+                font-size: 12px;
+                background-color: #2196F3;
+                color: white;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #0b7dda;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+            }
+        """)
+        self.resume_btn.clicked.connect(self.resume_agent)
+        self.resume_btn.setEnabled(False)
+        btn_layout.addWidget(self.resume_btn)
+        # Restart session button (↪)
+        self.restart_btn = QPushButton("↪ Restart Session")
+        self.restart_btn.setMaximumWidth(80)
+        self.restart_btn.setStyleSheet("""
+            QPushButton {
+                padding: 5px;
+                font-size: 12px;
+                background-color: #9C27B0;
+                color: white;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #7B1FA2;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+            }
+        """)
+        self.restart_btn.clicked.connect(self.restart_session)
+        self.restart_btn.setEnabled(False)
+        btn_layout.addWidget(self.restart_btn)
+
+        btn_layout.addStretch()
+        right_layout.addWidget(btn_frame)
         
         splitter.addWidget(right_container)
         splitter.setSizes([300, 200, 900])
@@ -478,7 +471,7 @@ class AgentGUI(QMainWindow):
         self.keep_initial_checkbox.setEnabled(enabled)
     # ---- Agent control ----
     def run_agent(self):
-        query = self.query_entry.toPlainText().strip()  # Changed from .text() to .toPlainText()
+        query = self.query_entry.toPlainText().strip()
         if not query:
             QMessageBox.warning(self, "No query", "Please enter a query.")
             return
@@ -486,11 +479,11 @@ class AgentGUI(QMainWindow):
         if not api_key:
             QMessageBox.critical(self, "API Key missing", "Set DEEPSEEK_API_KEY in .env file")
             return
-        
+
         enabled_names = self.tool_loader.get_enabled_tool_names()
         tool_name_to_class = {cls.__name__: cls for cls in TOOL_CLASSES}
         enabled_classes = [tool_name_to_class[name] for name in enabled_names]
-        
+
         config = AgentConfig(
             api_key=api_key,
             model="deepseek-reasoner",
@@ -502,55 +495,29 @@ class AgentGUI(QMainWindow):
             keep_initial_query=self.keep_initial_checkbox.isChecked() if self.pruning_checkbox.isChecked() else True,
             keep_system_messages=True
         )
-        
-        try:
-            self.controller.start(query, config)
-        except RuntimeError as e:
-            QMessageBox.critical(self, "Error", str(e))
-            return
-        
-        self.update_buttons(running=True)
-        self.status_panel.update_status("Running")
-        self.total_input = 0
-        self.total_output = 0
-        self.context_length = 0
-        self.status_panel.update_context_length(self.context_length)
-        self.status_panel.update_tokens(self.total_input, self.total_output)
-    def continue_agent(self):
-        query = self.interactive_entry.text().strip()
-        if not query:
-            QMessageBox.warning(self, "No query", "Please enter a follow-up query in the interactive prompt.")
-            return
-        api_key = os.getenv("DEEPSEEK_API_KEY")
-        if not api_key:
-            QMessageBox.critical(self, "API Key missing", "Set DEEPSEEK_API_KEY in .env file")
-            return
-        
-        enabled_names = self.tool_loader.get_enabled_tool_names()
-        tool_name_to_class = {cls.__name__: cls for cls in TOOL_CLASSES}
-        enabled_classes = [tool_name_to_class[name] for name in enabled_names]
-
-        config = AgentConfig(
-            api_key=api_key,
-            model="deepseek-reasoner",
-            max_turns=100,
-            temperature=0.2,
-            extra_system=None,
-            tool_classes=enabled_classes,
-            max_history_turns=self.turns_spinbox.value() if self.pruning_checkbox.isChecked() else None,
-            keep_initial_query=self.keep_initial_checkbox.isChecked() if self.pruning_checkbox.isChecked() else True,
-            keep_system_messages=True
-            )
-            
 
         try:
-            self.controller.start(query, config, initial_conversation=self.last_history.copy() if self.last_history else None)
+            if self.last_history is not None:
+                # Continue existing session
+                self.controller.start(query, config, initial_conversation=self.last_history.copy())
+            else:
+                # Start new session
+                self.controller.start(query, config)
+                # Reset token totals only for new session
+                self.total_input = 0
+                self.total_output = 0
+                self.context_length = 0
+                self.status_panel.update_context_length(self.context_length)
+                self.status_panel.update_tokens(self.total_input, self.total_output)
         except RuntimeError as e:
             QMessageBox.critical(self, "Error", str(e))
             return
 
         self.update_buttons(running=True)
         self.status_panel.update_status("Running")
+    def restart_session(self):
+        self.last_history = None
+        self.update_buttons(running=False)
     
     def stop_agent(self):
         self.controller.stop()
@@ -574,13 +541,13 @@ class AgentGUI(QMainWindow):
             self.stop_btn.setEnabled(True)
             self.pause_btn.setEnabled(True)
             self.resume_btn.setEnabled(False)
-            self.continue_btn.setEnabled(False)
+            self.restart_btn.setEnabled(False)
         else:
             self.run_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
             self.pause_btn.setEnabled(False)
             self.resume_btn.setEnabled(False)
-            self.continue_btn.setEnabled(self.last_history is not None)
+            self.restart_btn.setEnabled(self.last_history is not None)
             self.status_panel.update_status("Ready")
     
     def poll(self):
@@ -644,7 +611,7 @@ class AgentGUI(QMainWindow):
         # Store conversation history if present
         if "history" in event:
             self.last_history = event["history"]
-            # For user interaction requests, treat as not running to enable Continue button
+            # For user interaction requests, treat as not running to enable Run button.
             if etype == "user_interaction_requested":
                 self.update_buttons(running=False)
             else:
@@ -706,9 +673,8 @@ class AgentGUI(QMainWindow):
             self.status_panel.update_context_length(self.context_length)
         elif etype == "user_interaction_requested":
             frame.add_content_line(f"Agent requests interaction: {event.get('message', '')}", style="color: #008080;")
-            # Optionally auto-focus the interactive input
-            self.interactive_entry.setPlaceholderText("Type your response here...")
-            self.interactive_entry.setFocus()
+            # Optionally auto-focus the query input
+            self.query_entry.setFocus()
             usage = event.get("usage", {})
             self.total_input = usage.get("total_input", self.total_input)
             self.total_output = usage.get("total_output", self.total_output)

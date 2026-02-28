@@ -1,6 +1,7 @@
 # agent_core.py
 import json
 import logging
+import os
 from typing import Optional, Callable, List, Any, Dict
 from openai import OpenAI
 from pydantic import BaseModel, ValidationError
@@ -99,9 +100,23 @@ def run_agent_stream(query: str, config: AgentConfig):
     tool_definitions = [model_to_openai_tool(cls) for cls in tool_classes]
     # Build conversation starting with system message(s) and the user query
     
-    #load system prompt from file
-    with open("system_prompt.txt", "r") as f:
-        system_prompt = f.read()
+    # Load system prompt from file - try multiple locations
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_paths = [
+        os.path.join(script_dir, "system_prompt.txt"),
+        os.path.join(script_dir, "..", "system_prompt.txt"),
+        "./system_prompt.txt"
+    ]
+    system_prompt = None
+    for path in possible_paths:
+        try:
+            with open(path, "r") as f:
+                system_prompt = f.read()
+                break
+        except FileNotFoundError:
+            continue
+    if system_prompt is None:
+        raise RuntimeError("Could not find system_prompt.txt in any known location")
     
     if config.initial_conversation is not None:
         conversation = config.initial_conversation.copy()

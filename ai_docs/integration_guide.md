@@ -167,6 +167,72 @@ When to use FileEditor vs legacy tools:
 | Appending to files | FileEditor append operation |
 | Bulk replacements | FileEditor write operation (if replacing >50% of file) |
 
+## Workspace Isolation and Directory Structure
+
+When using the agent in isolated environments (such as sandboxes or containers), the current working directory (`.`) may differ from the project root directory. This can cause file access errors. Follow these steps to diagnose and resolve:
+
+### Two Operating Scenarios
+
+1. **Normal Operation**: Project root is current directory (`.`)
+   - Current directory contains: `agent_core.py`, `tools/`, `ai_docs/`, etc.
+   - Stable workspace: `./`
+   - Construction workspace: `./construction/`
+   - File paths: Use normal relative paths (e.g., `"agent_core.py"`)
+
+2. **Sandbox/Isolation**: Project root is parent directory (`..`)
+   - Current directory is empty or `/`
+   - Parent directory contains project files
+   - Stable workspace: `../`
+   - Construction workspace: `../construction/` (if created)
+   - File paths: Prefix with `../` (e.g., `"../agent_core.py"`)
+
+### Diagnostic Procedure
+
+When you start or encounter file access errors:
+
+1. **Initial Check**: Run FileLister on both `.` and `..` to understand directory structure.
+2. **Identify Project Root**: Look for key project files: `agent_core.py`, `tools/`, `ai_docs/`.
+   - If these are in `.`, you're in Normal Operation.
+   - If these are in `..`, you're in Sandbox Operation.
+   - If neither, use RequestUserInteraction to ask for guidance.
+3. **Adjust File Paths**:
+   - Normal: Use standard paths.
+   - Sandbox: Prefix all file paths with `../`.
+4. **Construction Workspace Consideration**:
+   - In Sandbox mode, you can still use `workspace="construction"` but note that the construction directory will be at `../construction/`. The FileEditor tool automatically maps `workspace="construction"` to `./construction/`, so you may need to use `workspace="stable"` with `../` prefix for immediate access, or create construction workspace in parent directory.
+
+### Quick Diagnostic Command
+```json
+{
+  "operation": "read",
+  "filename": "../ai_docs/integration_guide.md",
+  "line_numbers": "1-10"
+}
+```
+
+### Common Patterns
+- Stable workspace = project root directory (either `.` or `..`)
+- Construction workspace = project root + `/construction/`
+- Temp directory = project root + `/temp/` for safe file operations
+
+### Solution Template
+```python
+# Diagnostic first
+FileLister(directory=".", workspace="stable")
+FileLister(directory="..", workspace="stable")
+
+# Based on findings:
+# If project root is '..':
+FileEditor(filename="../agent_core.py", operation="read", workspace="stable")
+FileEditor(filename="../construction/agent_core.py", operation="read", workspace="stable")
+```
+
+### Preventive Measure
+Always check both `.` and `..` during initial environment assessment before attempting file operations.
+
+### Why This Happens
+Workspace isolation for safety may place agent in different directory than project root. The agent must adapt to the actual file location structure.
+
 ## Security Considerations
 - Tools validate all input parameters
 - No arbitrary code execution
