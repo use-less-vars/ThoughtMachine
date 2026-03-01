@@ -36,10 +36,6 @@ class BatchFileEditor(ToolBase):
         default="replace",
         description="Mode for write operation: 'replace' (overwrite line), 'insert' (insert before line), 'append' (append after line). Only used when operation='write' and line_number is specified."
     )
-    workspace: Literal["stable", "construction"] = Field(
-        default="stable",
-        description="Workspace to operate in: 'stable' (current directory) or 'construction' (./construction/ directory)"
-    )
 
     @model_validator(mode='after')
     def validate_operation(self):
@@ -69,22 +65,11 @@ class BatchFileEditor(ToolBase):
             raise ValueError("filenames list cannot be empty")
         return self
 
-    def _get_actual_path(self, filename: str) -> str:
-        """Convert filename based on workspace setting."""
-        if self.workspace == "construction":
-            # Ensure construction directory exists
-            Path("./construction").mkdir(parents=True, exist_ok=True)
-            # If filename is absolute, keep it as is (no workspace mapping)
-            if os.path.isabs(filename):
-                return filename
-            # Prefix with construction directory
-            return f"./construction/{filename}"
-        return filename
     def execute(self) -> str:
         results = []
         for filename in self.filenames:
             try:
-                actual_filename = self._get_actual_path(filename)
+                actual_filename = filename
                 if self.operation == "read":
                     result = self._execute_read(actual_filename)
                 elif self.operation == "write":

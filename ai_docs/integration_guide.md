@@ -176,14 +176,12 @@ When using the agent in isolated environments (such as sandboxes or containers),
 1. **Normal Operation**: Project root is current directory (`.`)
    - Current directory contains: `agent_core.py`, `tools/`, `ai_docs/`, etc.
    - Stable workspace: `./`
-   - Construction workspace: `./construction/`
    - File paths: Use normal relative paths (e.g., `"agent_core.py"`)
 
 2. **Sandbox/Isolation**: Project root is parent directory (`..`)
    - Current directory is empty or `/`
    - Parent directory contains project files
    - Stable workspace: `../`
-   - Construction workspace: `../construction/` (if created)
    - File paths: Prefix with `../` (e.g., `"../agent_core.py"`)
 
 ### Diagnostic Procedure
@@ -198,8 +196,6 @@ When you start or encounter file access errors:
 3. **Adjust File Paths**:
    - Normal: Use standard paths.
    - Sandbox: Prefix all file paths with `../`.
-4. **Construction Workspace Consideration**:
-   - In Sandbox mode, you can still use `workspace="construction"` but note that the construction directory will be at `../construction/`. The FileEditor tool automatically maps `workspace="construction"` to `./construction/`, so you may need to use `workspace="stable"` with `../` prefix for immediate access, or create construction workspace in parent directory.
 
 ### Quick Diagnostic Command
 ```json
@@ -212,19 +208,17 @@ When you start or encounter file access errors:
 
 ### Common Patterns
 - Stable workspace = project root directory (either `.` or `..`)
-- Construction workspace = project root + `/construction/`
 - Temp directory = project root + `/temp/` for safe file operations
 
 ### Solution Template
 ```python
 # Diagnostic first
-FileLister(directory=".", workspace="stable")
-FileLister(directory="..", workspace="stable")
+FileLister(directory=".")
+FileLister(directory="..")
 
 # Based on findings:
 # If project root is '..':
-FileEditor(filename="../agent_core.py", operation="read", workspace="stable")
-FileEditor(filename="../construction/agent_core.py", operation="read", workspace="stable")
+FileEditor(filename="../agent_core.py", operation="read")
 ```
 
 ### Preventive Measure
