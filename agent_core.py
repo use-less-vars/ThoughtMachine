@@ -39,7 +39,7 @@ class AgentConfig(BaseModel):
     keep_system_messages: bool = True
     
     # Logging configuration
-    enable_logging: bool = Field(default=False, description="Enable agent logging")
+    enable_logging: bool = Field(default=True, description="Enable agent logging")
     log_dir: str = Field(default="./logs", description="Directory for log files")
     log_level: str = Field(default="INFO", description="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)")
     enable_file_logging: bool = Field(default=True, description="Write logs to files")
