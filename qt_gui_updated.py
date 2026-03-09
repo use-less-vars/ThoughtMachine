@@ -295,13 +295,13 @@ class AgentGUI(QMainWindow):
         self.stop_btn.setStyleSheet("""
             QPushButton {
                 padding: 5px;
-                font-size: 12px;
-                background-color: #FFD700;
+                font-size: 14px;
+                background-color: #FF9800;
                 color: white;
                 border-radius: 4px;
             }
             QPushButton:hover {
-                background-color: #FFC107;
+                background-color: #F57C00;
             }
             QPushButton:disabled {
                 background-color: #cccccc;
@@ -312,8 +312,8 @@ class AgentGUI(QMainWindow):
         btn_layout.addWidget(self.stop_btn)
 
         btn_layout.addStretch()
-        # New session button (↪)
-        self.restart_btn = QPushButton("↪ New Session")
+        # New session button
+        self.restart_btn = QPushButton("New Session")
         self.restart_btn.setMaximumWidth(80)
         self.restart_btn.setStyleSheet("""
             QPushButton {
