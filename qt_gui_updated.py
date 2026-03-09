@@ -289,19 +289,19 @@ class AgentGUI(QMainWindow):
         self.run_btn.clicked.connect(self.run_agent)
         btn_layout.addWidget(self.run_btn)
 
-        # Stop button (■)
-        self.stop_btn = QPushButton("■ Pause")
+        # Pause button (⏸)
+        self.stop_btn = QPushButton("⏸ Pause")
         self.stop_btn.setMaximumWidth(80)
         self.stop_btn.setStyleSheet("""
             QPushButton {
                 padding: 5px;
                 font-size: 12px;
-                background-color: #f44336;
+                background-color: #FFD700;
                 color: white;
                 border-radius: 4px;
             }
             QPushButton:hover {
-                background-color: #da190b;
+                background-color: #FFC107;
             }
             QPushButton:disabled {
                 background-color: #cccccc;
@@ -312,8 +312,8 @@ class AgentGUI(QMainWindow):
         btn_layout.addWidget(self.stop_btn)
 
         btn_layout.addStretch()
-        # Restart session button (↪)
-        self.restart_btn = QPushButton("↪ Restart Session")
+        # New session button (↪)
+        self.restart_btn = QPushButton("↪ New Session")
         self.restart_btn.setMaximumWidth(80)
         self.restart_btn.setStyleSheet("""
             QPushButton {
