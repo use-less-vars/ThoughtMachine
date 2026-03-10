@@ -3,22 +3,55 @@ import os
 import pathlib
 import stat
 from pydantic import Field
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, ClassVar
 import time
 
 class DirectoryTreeTool(ToolBase):
-    """Show directory structure with tree visualization or flat file listing. Supports recursion limits, hidden file filtering, pattern matching, and output truncation."""
+    """Show directory structure with tree visualization or flat file listing. Supports recursion limits, hidden file filtering, pattern matching, and output truncation.
+    
+    Key improvements to reduce token usage:
+    - Excludes cache directories (__pycache__, .git, node_modules, etc.) by default
+    - Reduced default max_depth from 3 to 2
+    - Skips line counting for binary files and large files (>1MB)
+    - Optional skip_line_count parameter for performance
+    """
+    
+    # Common binary file extensions where line counting should be skipped
+    BINARY_EXTENSIONS: ClassVar[set[str]] = {'.pyc', '.pyo', '.so', '.dll', '.exe', '.bin', '.o', '.a', '.lib', '.dylib',
+                         '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.ico', '.webp',
+                         '.mp3', '.mp4', '.avi', '.mov', '.wav', '.flac', '.ogg', '.mkv',
+                         '.zip', '.tar', '.gz', '.bz2', '.xz', '.7z', '.rar',
+                         '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+                         '.db', '.sqlite', '.sqlite3', '.mdb', '.accdb'}
+    
+    def _debug_log(self, message: str) -> None:
+        """Debug logging - writes to file and stderr."""
+        import sys
+        print(f"DEBUG: {message}", file=sys.stderr)
+        try:
+            with open('debug.log', 'a', encoding='utf-8') as f:
+                import time
+                f.write(f"{time.time():.3f}: {message}\n")
+        except Exception as e:
+            print(f"DEBUG LOG ERROR: {e}", file=sys.stderr)
+    
+
     
     directory: str = Field(description="Root directory to show tree structure")
-    max_depth: int = Field(default=3, description="Maximum depth to recurse (0 for unlimited)")
+    max_depth: int = Field(default=2, description="Maximum depth to recurse (0 for unlimited)")
     show_hidden: bool = Field(default=False, description="Show hidden files and directories (starting with .)")
     include_sizes: bool = Field(default=True, description="Include file sizes and line counts")
+    skip_line_count: bool = Field(default=True, description="Skip line counting for performance (line_count will be 0)")
     pattern: str = Field(default="*", description="Glob pattern to filter files (e.g., '*.py', '*.txt')")
     format: str = Field(default='tree', description="Output format: 'tree' (directory tree) or 'list' (flat file list)")
-    max_results: int = Field(default=100, description="Maximum files to show in list format (0=unlimited)")
+    max_results: int = Field(default=100, description="Maximum files/entries to show (0=unlimited, applies to both list and tree formats)")
     sort_by: str = Field(default='name', description="Sort order for list format: 'name', 'size', or 'modified'")
+    exclude_dirs: List[str] = Field(default_factory=lambda: ["__pycache__", ".git", ".svn", ".hg", "node_modules", ".idea", ".vscode", ".pytest_cache", "build", "dist", "*.egg-info"], description="Directories to exclude from traversal")
     
     def execute(self) -> str:
+        self._debug_log(f"DirectoryTreeTool.execute called with directory={self.directory}, exclude_dirs={self.exclude_dirs}")
+        import sys
+        print(f"EXECUTE: directory={self.directory}, exclude_dirs={self.exclude_dirs}", file=sys.stderr)
         try:
             # Resolve directory path
             dir_path = pathlib.Path(self.directory)
@@ -37,7 +70,17 @@ class DirectoryTreeTool(ToolBase):
     
     def _build_tree(self, dir_path: pathlib.Path, current_depth: int) -> Dict[str, Any]:
         """Recursively build tree structure."""
+        # Debug: write to file
+        try:
+            import os
+            with open('tree_debug.txt', 'a', encoding='utf-8') as f:
+                f.write(f"_build_tree: {dir_path.name}, depth={current_depth}, cwd={os.getcwd()}\n")
+        except Exception as e:
+            with open('debug_error.txt', 'a') as f2:
+                f2.write(f"Error: {e}\n")
+        self._debug_log(f"_build_tree: {dir_path.name}, depth={current_depth}")
         if self.max_depth > 0 and current_depth >= self.max_depth:
+            self._debug_log(f"max_depth reached, returning empty")
             return {'type': 'directory', 'path': dir_path, 'name': dir_path.name, 'children': [], 'file_count': 0, 'total_size': 0, 'line_count': 0}
         
         tree_node = {
@@ -59,7 +102,21 @@ class DirectoryTreeTool(ToolBase):
             
             # Sort: directories first, then files, alphabetically
             entries.sort(key=lambda x: (not x.is_dir(), x.name.lower()))
-            
+
+            # Filter out excluded directories
+            self._debug_log(f"Before filter, entries: {[e.name for e in entries]}")
+            filtered_entries = []
+            for entry in entries:
+                if entry.is_dir():
+                    excluded = self._should_exclude_dir(entry.name)
+                    self._debug_log(f"Checking directory {entry.name}: excluded={excluded}")
+                    if excluded:
+                        self._debug_log(f"Excluding directory {entry.name}")
+                        continue
+                filtered_entries.append(entry)
+            entries = filtered_entries
+            self._debug_log(f"After filter, entries: {[e.name for e in entries]}")
+
             for entry in entries:
                 if entry.is_dir():
                     # Recursively process subdirectory
@@ -72,13 +129,12 @@ class DirectoryTreeTool(ToolBase):
                     # Check pattern filter
                     if not self._matches_pattern(entry.name):
                         continue
-                    
+
                     file_info = self._get_file_info(entry)
                     tree_node['children'].append(file_info)
                     tree_node['file_count'] += 1
                     tree_node['total_size'] += file_info['size']
-                    tree_node['line_count'] += file_info.get('line_count', 0)
-            
+                    tree_node['line_count'] += file_info.get('line_count', 0)            
         except (PermissionError, OSError) as e:
             tree_node['error'] = str(e)
         
@@ -88,6 +144,41 @@ class DirectoryTreeTool(ToolBase):
         """Check if filename matches the glob pattern."""
         import fnmatch
         return fnmatch.fnmatch(filename, self.pattern)
+
+    def _should_exclude_dir(self, dir_name: str) -> bool:
+        """Check if directory should be excluded based on exclude_dirs patterns."""
+        import fnmatch
+        import os
+        os.makedirs('temp', exist_ok=True)
+        # Debug: write to file
+        try:
+            with open('temp/debug_exclude.txt', 'a', encoding='utf-8') as f:
+                f.write(f"Checking '{dir_name}' against {self.exclude_dirs}\n")
+        except:
+            pass
+        # Debug: print patterns and matching
+        self._debug_log(f"exclude_dirs: {self.exclude_dirs}, checking dir '{dir_name}'")
+        import sys
+        print(f"EXCLUDE_CHECK: '{dir_name}' against {self.exclude_dirs}", file=sys.stderr)
+        for pattern in self.exclude_dirs:
+            if fnmatch.fnmatch(dir_name, pattern):
+                self._debug_log(f"directory '{dir_name}' matches pattern '{pattern}'")
+                import sys
+                print(f"EXCLUDE_MATCH: '{dir_name}' matches pattern '{pattern}'", file=sys.stderr)
+                # Also write to file
+                try:
+                    with open('temp/debug_exclude.txt', 'a', encoding='utf-8') as f:
+                        f.write(f"  MATCH: '{dir_name}' matches '{pattern}'\n")
+                except:
+                    pass
+                return True
+        # Write no match
+        try:
+            with open('temp/debug_exclude.txt', 'a', encoding='utf-8') as f:
+                f.write(f"  NO MATCH\n")
+        except:
+            pass
+        return False
     
     def _get_file_info(self, file_path: pathlib.Path) -> Dict[str, Any]:
         """Get detailed information about a file."""
@@ -107,18 +198,26 @@ class DirectoryTreeTool(ToolBase):
             file_info['mtime'] = stat_info.st_mtime
             
             # Line count (for text files)
-            if self.include_sizes:
-                try:
-                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        line_count = 0
-                        for line in f:
-                            line_count += 1
-                            if line_count > 10000:  # Limit for performance
-                                break
-                        file_info['line_count'] = line_count
-                except (UnicodeDecodeError, IOError):
-                    # Binary file or unreadable
+            if self.include_sizes and not self.skip_line_count:
+                # Skip line counting for binary files and large files (>1MB)
+                skip_line_count = False
+                file_ext = file_path.suffix.lower()
+                if file_ext in self.BINARY_EXTENSIONS or file_info['size'] > 1_048_576:
                     file_info['line_count'] = 0
+                    skip_line_count = True
+                
+                if not skip_line_count:
+                    try:
+                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            line_count = 0
+                            for line in f:
+                                line_count += 1
+                                if line_count > 10000:  # Limit for performance
+                                    break
+                            file_info['line_count'] = line_count
+                    except (UnicodeDecodeError, IOError):
+                        # Binary file or unreadable
+                        file_info['line_count'] = 0
                     
         except (OSError, PermissionError):
             pass
@@ -260,6 +359,9 @@ class DirectoryTreeTool(ToolBase):
                     if not self.show_hidden and entry.name.startswith('.'):
                         continue
                     if entry.is_dir():
+                        # Skip excluded directories
+                        if self._should_exclude_dir(entry.name):
+                            continue
                         # Add subdirectory to stack for further traversal
                         stack.append((entry, depth + 1))
                     elif entry.is_file():
