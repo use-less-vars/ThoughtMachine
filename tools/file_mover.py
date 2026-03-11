@@ -83,10 +83,27 @@ class FileMover(ToolBase):
         try:
             destination = Path(self.destination_path)
             
+            # Validate destination is within workspace
+            try:
+                validated_destination = self._validate_path(str(destination))
+                destination = Path(validated_destination)
+            except ValueError as e:
+                return f"Error: {e}"
+            
             # Expand sources
             sources = self._expand_sources()
             if not sources:
                 return "No files or directories matched the source specification."
+            
+            # Validate all sources are within workspace
+            validated_sources = []
+            for source in sources:
+                try:
+                    validated_path = self._validate_path(str(source))
+                    validated_sources.append(Path(validated_path))
+                except ValueError as e:
+                    return f"Error: {e}"
+            sources = validated_sources
             
             # Validate all sources exist before moving anything
             for source in sources:

@@ -509,7 +509,11 @@ class Agent:
                         tool_result = error_msg
                     else:
                         try:
-                            tool_instance = tool_class(**arguments)
+                            # Add workspace_path from config if tool supports it
+                            tool_args = arguments.copy()
+                            if self.config.workspace_path is not None:
+                                tool_args['workspace_path'] = self.config.workspace_path
+                            tool_instance = tool_class(**tool_args)
                             tool_result = tool_instance.execute()
                             # Check if this is a Final tool
                             if isinstance(tool_instance, Final):

@@ -220,17 +220,38 @@ class ApplyEdits(ToolBase):
 
     def _get_file_paths(self) -> List[Path]:
         '''Return list of Path objects for files to edit based on file_path, files, or file_pattern.'''
+        import os
         if self.files:
-            return [Path(f) for f in self.files]
+            validated_paths = []
+            for f in self.files:
+                try:
+                    validated = self._validate_path(f)
+                    validated_paths.append(Path(validated))
+                except ValueError as e:
+                    raise ValueError(f"File '{f}' is outside workspace: {e}")
+            return validated_paths
         elif self.file_pattern:
             # Use glob recursively if pattern contains **
             pattern = self.file_pattern
             if '**' in pattern:
-                return list(Path('.').glob(pattern))
+                raw_paths = list(Path('.').glob(pattern))
             else:
-                return list(Path('.').glob(pattern))
+                raw_paths = list(Path('.').glob(pattern))
+            validated_paths = []
+            for p in raw_paths:
+                try:
+                    validated = self._validate_path(str(p))
+                    validated_paths.append(Path(validated))
+                except ValueError:
+                    # Skip files outside workspace
+                    continue
+            return validated_paths
         elif self.file_path:
-            return [Path(self.file_path)]
+            try:
+                validated = self._validate_path(self.file_path)
+                return [Path(validated)]
+            except ValueError as e:
+                raise ValueError(f"File '{self.file_path}' is outside workspace: {e}")
         else:
             raise ValueError('Must provide one of file_path, files, or file_pattern.')
     

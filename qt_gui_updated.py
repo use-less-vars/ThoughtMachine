@@ -268,15 +268,34 @@ class AgentGUI(QMainWindow):
         token_monitor_layout.addStretch()
         right_layout.addWidget(token_monitor_frame)
         
+        # Workspace safety controls
+        workspace_frame = QWidget()
+        workspace_layout = QHBoxLayout()
+        workspace_frame.setLayout(workspace_layout)
+        
+        workspace_layout.addWidget(QLabel("Workspace:"))
+        
+        self.workspace_display = QLabel("None (unrestricted)")
+        self.workspace_display.setStyleSheet("color: blue;")
+        self.workspace_display.setWordWrap(True)
+        workspace_layout.addWidget(self.workspace_display, 1)
+        
+        self.set_workspace_btn = QPushButton("Set workspace")
+        self.set_workspace_btn.clicked.connect(self.set_workspace)
+        workspace_layout.addWidget(self.set_workspace_btn)
+        
+        self.clear_workspace_btn = QPushButton("Clear")
+        self.clear_workspace_btn.clicked.connect(self.clear_workspace)
+        workspace_layout.addWidget(self.clear_workspace_btn)
+        
+        right_layout.addWidget(workspace_frame)
+        
         # Connect token monitor checkbox to enable/disable threshold controls
         self.token_monitor_checkbox.stateChanged.connect(self.update_token_monitor_controls)
         self.update_token_monitor_controls()  # Set initial state
         self._update_token_threshold_labels()  # Set initial formatted labels
         
-        # Clear button
-        clear_btn = QPushButton("Clear Output")
-        clear_btn.clicked.connect(self.clear_output)
-        right_layout.addWidget(clear_btn)
+
         
         # Output area (scrollable container)
         self.output_scroll_area = QScrollArea()
@@ -429,12 +448,15 @@ class AgentGUI(QMainWindow):
         if not filename:
             return
         enabled_names = self.tool_loader.get_enabled_tool_names()
+        workspace_display = self.workspace_display.text()
+        workspace_path = None if workspace_display == "None (unrestricted)" else workspace_display
         data = {
             "history": self.last_history,
             "enabled_tools": enabled_names,
             "token_monitor_enabled": self.token_monitor_checkbox.isChecked(),
             "warning_threshold": self.warning_threshold_spinbox.value(),
-            "critical_threshold": self.critical_threshold_spinbox.value()
+            "critical_threshold": self.critical_threshold_spinbox.value(),
+            "workspace_path": workspace_path
         }
         try:
             with open(filename, 'w') as f:
@@ -480,6 +502,19 @@ class AgentGUI(QMainWindow):
             
             self.update_token_monitor_controls()  # Update UI state
             self._update_token_threshold_labels()  # Update formatted labels
+            
+            # Load workspace path if available
+            if "workspace_path" in data:
+                workspace_path = data["workspace_path"]
+                if workspace_path is None:
+                    self.workspace_display.setText("None (unrestricted)")
+                else:
+                    # Ensure path is normalized and absolute
+                    workspace_path = os.path.normpath(workspace_path)
+                    if not os.path.isabs(workspace_path):
+                        workspace_path = os.path.abspath(workspace_path)
+                    self.workspace_display.setText(workspace_path)
+            
             self.update_buttons(running=False)
             QMessageBox.information(self, "Session Loaded", f"Session loaded from {filename}")
         except Exception as e:
@@ -550,6 +585,10 @@ class AgentGUI(QMainWindow):
         tool_name_to_class = {cls.__name__: cls for cls in TOOL_CLASSES}
         enabled_classes = [tool_name_to_class[name] for name in enabled_names]
 
+        # Extract workspace path
+        workspace_display = self.workspace_display.text()
+        workspace_path = None if workspace_display == "None (unrestricted)" else workspace_display
+        
         # Use cached config if available (created by restart_session)
         if self._cached_config is not None:
             # Start with cached config but update fields that may have changed
@@ -568,7 +607,8 @@ class AgentGUI(QMainWindow):
                 initial_output_tokens=self.total_output if self.last_history is not None else 0,
                 token_monitor_enabled=self.token_monitor_checkbox.isChecked(),
                 token_monitor_warning_threshold=self.warning_threshold_spinbox.value() * 1000,
-                token_monitor_critical_threshold=self.critical_threshold_spinbox.value() * 1000
+                token_monitor_critical_threshold=self.critical_threshold_spinbox.value() * 1000,
+                workspace_path=workspace_path
             )
             print(f"[GUI] Using cached config with updated token monitoring: enabled={config.token_monitor_enabled}, warning={config.token_monitor_warning_threshold}, critical={config.token_monitor_critical_threshold}")
             self._cached_config = None  # Clear after use
@@ -587,7 +627,8 @@ class AgentGUI(QMainWindow):
                 initial_output_tokens=self.total_output if self.last_history is not None else 0,
                 token_monitor_enabled=self.token_monitor_checkbox.isChecked(),
                 token_monitor_warning_threshold=self.warning_threshold_spinbox.value() * 1000,
-                token_monitor_critical_threshold=self.critical_threshold_spinbox.value() * 1000
+                token_monitor_critical_threshold=self.critical_threshold_spinbox.value() * 1000,
+                workspace_path=workspace_path
             )
 
         try:
@@ -689,6 +730,9 @@ class AgentGUI(QMainWindow):
             tool_name_to_class = {cls.__name__: cls for cls in TOOL_CLASSES}
             enabled_classes = [tool_name_to_class[name] for name in enabled_names]
             
+            # Extract workspace path
+            workspace_display = self.workspace_display.text()
+            workspace_path = None if workspace_display == "None (unrestricted)" else workspace_display
             # Store config for next run (similar to run_agent())
             self._cached_config = AgentConfig(
                 api_key=api_key,
@@ -703,7 +747,8 @@ class AgentGUI(QMainWindow):
                 initial_output_tokens=0,
                 token_monitor_enabled=self.token_monitor_checkbox.isChecked(),
                 token_monitor_warning_threshold=self.warning_threshold_spinbox.value() * 1000,
-                token_monitor_critical_threshold=self.critical_threshold_spinbox.value() * 1000
+                token_monitor_critical_threshold=self.critical_threshold_spinbox.value() * 1000,
+                workspace_path=workspace_path
             )
             print(f"[GUI] Created new config for next session with token monitoring: enabled={self.token_monitor_checkbox.isChecked()}, warning={self.warning_threshold_spinbox.value() * 1000}, critical={self.critical_threshold_spinbox.value() * 1000}")
         else:
@@ -933,19 +978,27 @@ class AgentGUI(QMainWindow):
     def _do_scroll_to_bottom(self):
         scrollbar = self.output_scroll_area.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
-
-    def clear_output(self):
-        while self.output_layout.count():
-            item = self.output_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self.last_history = None
-        self.total_input = 0
-        self.total_output = 0
-        self.context_length = 0
-        self.status_panel.update_context_length(self.context_length)
-        self.status_panel.update_tokens(self.total_input, self.total_output)
-        self.update_buttons(running=False)
+    # ---- Workspace methods ----
+    def set_workspace(self):
+        """Open dialog to select workspace directory."""
+        current_workspace = self.workspace_display.text()
+        if current_workspace == "None (unrestricted)":
+            start_dir = os.getcwd()
+        else:
+            start_dir = current_workspace
+        
+        new_workspace = QFileDialog.getExistingDirectory(self, "Select Workspace Directory", start_dir)
+        if new_workspace:
+            # Ensure path is normalized and absolute
+            new_workspace = os.path.normpath(new_workspace)
+            if not os.path.isabs(new_workspace):
+                new_workspace = os.path.abspath(new_workspace)
+            self.workspace_display.setText(new_workspace)
+            
+    def clear_workspace(self):
+        """Clear workspace restriction."""
+        self.workspace_display.setText("None (unrestricted)")
+    
     def _update_token_threshold_labels(self):
         """Update formatted labels for token thresholds."""
         # Format warning threshold (multiply by 1000 for display)

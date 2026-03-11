@@ -35,22 +35,52 @@ class FileSearchTool(ToolBase):
             files_to_search = []
             if self.filenames:
                 for f in self.filenames:
-                    if os.path.isdir(f):
+                    try:
+                        validated_f = self._validate_path(f)
+                    except ValueError as e:
+                        return f"Error: {e}"
+                    if os.path.isdir(validated_f):
                         # treat as directory, expand recursively
-                        for root, dirs, files in os.walk(f):
+                        for root, dirs, files in os.walk(validated_f):
                             for file in files:
-                                files_to_search.append(os.path.join(root, file))
+                                full_path = os.path.join(root, file)
+                                # Validate each subfile (should be within workspace since root is)
+                                try:
+                                    validated_sub = self._validate_path(full_path)
+                                    files_to_search.append(validated_sub)
+                                except ValueError:
+                                    # Skip files outside workspace
+                                    continue
                     else:
-                        files_to_search.append(f)
+                        files_to_search.append(validated_f)
             elif self.directory:
-                if not os.path.isdir(self.directory):
+                # Validate directory path is within workspace
+                try:
+                    validated_dir = self._validate_path(self.directory)
+                except ValueError as e:
+                    return f"Error: {e}"
+                if not os.path.isdir(validated_dir):
                     return f"Error: '{self.directory}' is not a valid directory."
-                for root, dirs, files in os.walk(self.directory):
+                for root, dirs, files in os.walk(validated_dir):
                     for file in files:
-                        files_to_search.append(os.path.join(root, file))
+                        full_path = os.path.join(root, file)
+                        # Validate each subfile (should be within workspace since root is)
+                        try:
+                            validated_sub = self._validate_path(full_path)
+                            files_to_search.append(validated_sub)
+                        except ValueError:
+                            # Skip files outside workspace
+                            continue
             elif self.file_pattern:
                 # Use glob to find files matching pattern
-                files_to_search = [str(p) for p in Path('.').glob(self.file_pattern)]
+                files_to_search = []
+                for p in Path('.').glob(self.file_pattern):
+                    try:
+                        validated_path = self._validate_path(str(p))
+                        files_to_search.append(validated_path)
+                    except ValueError:
+                        # Skip files outside workspace
+                        continue
             else:
                 return "Error: Provide one of 'filenames', 'directory', or 'file_pattern'."
             

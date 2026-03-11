@@ -23,6 +23,12 @@ class FilePreviewTool(ToolBase):
         try:
             # Resolve file path
             file_path = pathlib.Path(self.filename)
+            # Validate file path is within workspace
+            try:
+                validated_path = self._validate_path(str(file_path))
+                file_path = pathlib.Path(validated_path)
+            except ValueError as e:
+                return f"Error: {e}"
             if not file_path.exists():
                 return f"Error: File '{self.filename}' does not exist."
             if not file_path.is_file():

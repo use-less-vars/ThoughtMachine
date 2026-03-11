@@ -98,6 +98,11 @@ def model_to_openai_tool(model: Type[BaseModel]) -> Dict[str, Any]:
     Uses the model's JSON schema for parameters, then simplifies it.
     """
     schema = model.model_json_schema()
+    # Exclude workspace_path from tool schema (automatically set by agent)
+    if "properties" in schema and "workspace_path" in schema["properties"]:
+        del schema["properties"]["workspace_path"]
+        if "required" in schema and "workspace_path" in schema["required"]:
+            schema["required"].remove("workspace_path")
     # Remove the top-level title and description from parameters
     parameters = {k: v for k, v in schema.items() if k not in ("title", "description")}
     # Simplify the parameters schema

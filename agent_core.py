@@ -57,6 +57,9 @@ class AgentConfig(BaseModel):
     max_backup_files: int = Field(default=5, description="Maximum number of backup log files to keep")
     session_id: Optional[str] = Field(default=None, description="Unique session ID for logging (auto-generated if None)")
     
+    # Workspace configuration for file system access restrictions
+    workspace_path: Optional[str] = Field(default=None, description="Root directory for file operations (None = unrestricted)")
+    
     class Config:
         extra = "ignore"  # Allow backward compatibility with older configs
 def run_agent_stream(query: str, config: AgentConfig):

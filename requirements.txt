@@ -4,3 +4,4 @@ python-dotenv>=1.0.0
 PyQt6>=6.5.0
 fast-json-repair>=0.1.0
 libcst
+tiktoken

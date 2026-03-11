@@ -98,23 +98,25 @@ class FileEditor(ToolBase):
         for filename in target_files:
             try:
                 actual_filename = filename
+                # Validate path is within workspace if workspace_path is set
+                validated_filename = self._validate_path(actual_filename)
                 if self.operation == "read":
-                    result = self._execute_read(actual_filename)
+                    result = self._execute_read(validated_filename)
                 elif self.operation == "write":
-                    result = self._execute_write(actual_filename)
+                    result = self._execute_write(validated_filename)
                 elif self.operation == "insert":
-                    result = self._execute_insert(actual_filename)
+                    result = self._execute_insert(validated_filename)
                 elif self.operation == "append":
-                    result = self._execute_append(actual_filename)
+                    result = self._execute_append(validated_filename)
                 elif self.operation == "replace":
-                    result = self._execute_replace(actual_filename)
+                    result = self._execute_replace(validated_filename)
                 elif self.operation == "delete":
-                    result = self._execute_delete(actual_filename)
+                    result = self._execute_delete(validated_filename)
                 elif self.operation == "grep":
-                    result = self._execute_grep(actual_filename)
+                    result = self._execute_grep(validated_filename)
                 else:
                     result = f"Error: Unknown operation {self.operation}"
-                    result = self._execute_delete(actual_filename)
+                    result = self._execute_delete(validated_filename)
                 results.append(f"{filename}: {result}")
             except Exception as e:
                 results.append(f"{filename}: Error: {e}")

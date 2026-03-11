@@ -76,11 +76,25 @@ class RefactorTool(ToolBase):
     def _get_file_paths(self) -> List[Path]:
         """Return list of Path objects for files to edit based on file_pattern."""
         pattern = self.file_pattern
+        # Determine base directory for globbing
+        if self.workspace_path:
+            base_dir = Path(self.workspace_path)
+        else:
+            base_dir = Path('.')
         # Use glob recursively if pattern contains **
         if '**' in pattern:
-            return list(Path('.').glob(pattern))
+            raw_paths = list(base_dir.glob(pattern))
         else:
-            return list(Path('.').glob(pattern))
+            raw_paths = list(base_dir.glob(pattern))
+        validated_paths = []
+        for p in raw_paths:
+            try:
+                validated = self._validate_path(str(p))
+                validated_paths.append(Path(validated))
+            except ValueError:
+                # Skip files outside workspace
+                continue
+        return validated_paths
     
     def _map_operation_and_params(self) -> tuple[str, dict]:
         """

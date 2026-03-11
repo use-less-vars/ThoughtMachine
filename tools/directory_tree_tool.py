@@ -55,6 +55,12 @@ class DirectoryTreeTool(ToolBase):
         try:
             # Resolve directory path
             dir_path = pathlib.Path(self.directory)
+            # Validate directory is within workspace
+            try:
+                validated_path = self._validate_path(str(dir_path))
+                dir_path = pathlib.Path(validated_path)
+            except ValueError as e:
+                return f"Error: {e}"
             if not dir_path.exists():
                 return f"Error: Directory '{self.directory}' does not exist."
             if not dir_path.is_dir():

@@ -156,7 +156,12 @@ class CodeModifier(ToolBase):
 
 
     def execute(self) -> str:
-        actual_path = self.file_path
+        # Validate file path is within workspace
+        try:
+            validated_path = self._validate_path(self.file_path)
+            actual_path = validated_path
+        except ValueError as e:
+            return f"Error: {e}"
 
         if not os.path.exists(actual_path):
             return f"Error: File {actual_path} does not exist."

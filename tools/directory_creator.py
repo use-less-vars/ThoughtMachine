@@ -13,6 +13,12 @@ class DirectoryCreator(ToolBase):
     def execute(self) -> str:
         try:
             directory = Path(self.directory_path)
+            # Validate directory path is within workspace
+            try:
+                validated_path = self._validate_path(str(directory))
+                directory = Path(validated_path)
+            except ValueError as e:
+                return f"Error: {e}"
             
             # Check if directory already exists
             if directory.exists():
