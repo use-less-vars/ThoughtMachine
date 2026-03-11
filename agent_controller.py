@@ -36,6 +36,10 @@ class AgentController:
     def is_running(self):
         """Return True if the agent thread is alive."""
         return self._running
+    
+    def get_config(self):
+        """Return the current AgentConfig being used."""
+        return self._config
 
     def start(self, query: str, config: AgentConfig, initial_conversation: Optional[List[Dict[str, Any]]] = None):
         """

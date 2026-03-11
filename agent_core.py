@@ -43,9 +43,8 @@ class AgentConfig(BaseModel):
     
     # Token monitoring configuration
     token_monitor_enabled: bool = Field(default=True, description="Enable automatic token usage warnings")
-    token_monitor_low_threshold: int = Field(default=35000, description="Token count below this is low state")
-    token_monitor_medium_threshold: int = Field(default=55000, description="Token count between low and medium thresholds")
-    token_monitor_high_threshold: int = Field(default=75000, description="Token count between medium and high thresholds")
+    token_monitor_warning_threshold: int = Field(default=35000, description="Token count threshold for warning (user)")
+    token_monitor_critical_threshold: int = Field(default=50000, description="Token count threshold for critical warning (user)")
     
     # Logging configuration
     enable_logging: bool = Field(default=True, description="Enable agent logging")

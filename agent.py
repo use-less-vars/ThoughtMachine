@@ -12,6 +12,7 @@ from tools.final import Final
 from tools.request_user_interaction import RequestUserInteraction
 from tools.summarize_tool import SummarizeTool
 from fast_json_repair import loads as repair_loads
+import tiktoken
 
 # Import logging module
 try:
@@ -54,13 +55,37 @@ class Agent:
         self._paused = False
         self._should_reset = False
         # Token monitoring state
-        self.token_state = "low"  # low, medium, high, critical
+        self.token_state = "low"  # low, warning, critical
         self.current_conversation_tokens = 0
         self.last_warning_state = "low"
         # Token warning event storage
         self._last_token_warning = None
         self._last_token_warning_count = 0
         
+    def _estimate_tokens(self, text_or_message):
+        """Estimate token count for a string or message dict using tiktoken."""
+        if self._token_encoder is None:
+            # Default to cl100k_base (used by gpt-4, gpt-3.5-turbo)
+            try:
+                self._token_encoder = tiktoken.get_encoding("cl100k_base")
+            except Exception:
+                # Fallback to approximate estimation
+                self._token_encoder = None
+                # Use len//4 as fallback
+                if isinstance(text_or_message, dict):
+                    return len(str(text_or_message)) // 4
+                else:
+                    return len(str(text_or_message)) // 4
+        
+        if isinstance(text_or_message, dict):
+            # Convert dict to JSON string for tokenization
+            text = str(text_or_message)
+        else:
+            text = str(text_or_message)
+        
+        tokens = self._token_encoder.encode(text)
+        return len(tokens)
+
     def _load_system_prompt(self):
         script_dir = os.path.dirname(os.path.abspath(__file__))
         possible_paths = [
@@ -224,20 +249,21 @@ class Agent:
         # Update current conversation tokens estimate after pruning
         # We need to estimate because we won't get accurate token count until next API call
         old_token_count = self.current_conversation_tokens
-        total_chars = 0
+        estimated_tokens = 0
         for msg in self.conversation:
-            # Estimate tokens based on character count (rough)
-            content = msg.get('content', '')
-            if isinstance(content, str):
-                total_chars += len(content)
-            # Also count JSON structure overhead
-            total_chars += len(str(msg)) - len(content) if isinstance(content, str) else len(str(msg))
-        estimated_tokens = total_chars // 4
+            estimated_tokens += self._estimate_tokens(msg)
         self.current_conversation_tokens = estimated_tokens
         if self.logger and hasattr(self.logger, 'py_logger'):
             self.logger.py_logger.info(
                 f"[PRUNING] Updated token estimate: {estimated_tokens} tokens (was {old_token_count})"
             )
+    
+    def _format_tokens(self, tokens):
+        """Format token count in thousands with 'k' suffix."""
+        if tokens >= 1000:
+            return f"{tokens // 1000}k"
+        return str(tokens)
+    
     def _check_token_state_and_warn(self):
         """Check current token count against thresholds and inject warning if state changed."""
         if not self.config.token_monitor_enabled:
@@ -245,47 +271,55 @@ class Agent:
 
         # Determine new state based on current conversation tokens
         total = self.current_conversation_tokens
-        if total < self.config.token_monitor_low_threshold:
+        if total < self.config.token_monitor_warning_threshold:
             new_state = "low"
-        elif total < self.config.token_monitor_medium_threshold:
-            new_state = "medium"
-        elif total < self.config.token_monitor_high_threshold:
-            new_state = "high"
+        elif total < self.config.token_monitor_critical_threshold:
+            new_state = "warning"
         else:
             new_state = "critical"
 
-        # Check if state changed (only upward transitions trigger warnings)
-        if new_state != self.token_state:
-            old_state = self.token_state
-            self.token_state = new_state
+        # Update current state
+        old_state = self.token_state
+        self.token_state = new_state
 
-            # Only warn when moving to a higher state (not when decreasing)
-            state_order = {"low": 0, "medium": 1, "high": 2, "critical": 3}
-            if state_order[new_state] > state_order[old_state]:
-                # Create warning message
-                sender = "system"
-                if new_state == "medium":
-                    warning = f"[SYSTEM] Token usage warning: Conversation is approaching context limits ({total} tokens). As soon as possible, summarize to cause pruning."
-                elif new_state == "high":
-                    sender = "user"
-                    warning = f"[SYSTEM] Token usage warning: Conversation is nearing context window limits ({total} tokens). Please consider pruning soon when you are at a good point."
-                elif new_state == "critical":
-                    sender = "user"
-                    warning = f"[SYSTEM] Token usage warning: Conversation is at critical context window limits ({total} tokens). Please prune now to avoid losing context."
-                else:
-                    warning = None
-
-                if warning:
-                    # Append as system message
-                    self.conversation.append({"role": sender, "content": warning})
-                    # Estimate tokens for warning message and update current count
-                    warning_tokens = len(warning) // 4
-                    self.current_conversation_tokens += warning_tokens
-                    # Store warning to be yielded as event
-                    self._last_token_warning = warning
-                    self._last_token_warning_count = total
-                    if self.logger:
-                        self.logger.log_token_warning(old_state, new_state, total, warning)
+        # Check if we need to warn (only warn on upward transitions to a NEW warning state)
+        state_order = {"low": 0, "warning": 1, "critical": 2}
+        
+        # Warn if:
+        # 1. We're moving to a higher state
+        # 2. AND we haven't already warned for this state (last_warning_state != new_state)
+        # 3. AND new_state is actually a warning state (warning or critical)
+        if (state_order[new_state] > state_order[old_state] and 
+            self.last_warning_state != new_state and
+            new_state in ("warning", "critical")):
+            
+            # Create warning message
+            sender = "user"  # Always use user role (system warnings are ignored)
+            if new_state == "warning":
+                formatted = self._format_tokens(total)
+                warning = f"[SYSTEM] Token usage warning: Conversation is nearing context window limits. Please consider pruning soon when you are at a good point."
+            else:  # critical
+                formatted = self._format_tokens(total)
+                warning = f"Conversation is at critical context window limits. You MUST prune now to avoid system crash."
+            
+            # Store warning to be yielded as event (BEFORE adding to conversation)
+            self._last_token_warning = warning
+            self._last_token_warning_count = total
+            self.last_warning_state = new_state  # Mark that we've warned for this state
+            
+            if self.logger:
+                self.logger.log_token_warning(old_state, new_state, total, warning)
+            
+            # Append as user message AFTER storing warning
+            warning_msg = {"role": sender, "content": warning}
+            self.conversation.append(warning_msg)
+            # Estimate tokens for warning message (including JSON structure) and update current count
+            warning_tokens = self._estimate_tokens(warning_msg)
+            self.current_conversation_tokens += warning_tokens
+        
+        # Reset last_warning_state if we drop below warning threshold
+        if new_state == "low":
+            self.last_warning_state = "low"
 
     def process_query(self, query):
         """Process a user query, appending it to conversation and running the agent.
@@ -305,9 +339,10 @@ class Agent:
             }
             self.logger.log_agent_start(query, config_data)
         # Append user message
-        self.conversation.append({"role": "user", "content": query})
-        # Estimate tokens for the new user message and update current count
-        estimated_tokens = len(query) // 4  # rough estimate
+        user_msg = {"role": "user", "content": query}
+        self.conversation.append(user_msg)
+        # Estimate tokens for the new user message (including JSON structure) and update current count
+        estimated_tokens = self._estimate_tokens(user_msg)
         self.current_conversation_tokens += estimated_tokens
         
         prev_conversation_len = len(self.conversation)
@@ -418,7 +453,7 @@ class Agent:
             
             self.conversation.append(assistant_dict)
             # Estimate tokens for assistant message
-            assistant_tokens = len(str(assistant_dict)) // 4
+            assistant_tokens = self._estimate_tokens(assistant_dict)
             self.current_conversation_tokens += assistant_tokens
             
             if self.logger:

@@ -2,6 +2,7 @@
 import sys
 import os
 import json
+import html
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit, QListWidget,
@@ -120,10 +121,19 @@ class StatusPanel(QGroupBox):
     def update_status(self, text):
         self.status_label.setText(text)
     
+    def format_tokens(self, tokens):
+        """Format token count in thousands with 'k' suffix."""
+        if tokens >= 1000:
+            return f"{tokens // 1000}k"
+        return str(tokens)
+    
     def update_tokens(self, total_input, total_output):
-        self.token_label.setText(f"Tokens: {total_input} in / {total_output} out")
+        in_text = self.format_tokens(total_input)
+        out_text = self.format_tokens(total_output)
+        self.token_label.setText(f"Tokens: {in_text} in / {out_text} out")
     def update_context_length(self, context_tokens):
-        self.context_label.setText(f"Context: {context_tokens} tokens")
+        text = self.format_tokens(context_tokens)
+        self.context_label.setText(f"Context: {text} tokens")
 
 class EventFrame(QFrame):
     """A frame that holds a single event with structured content lines."""
@@ -148,8 +158,11 @@ class EventFrame(QFrame):
     
     def add_content_line(self, text, style=""):
         """Add a simple text line (label)."""
-        label = QLabel(text)
+        # Escape HTML entities to prevent rendering issues
+        escaped_text = html.escape(text)
+        label = QLabel(escaped_text)
         label.setWordWrap(True)
+        label.setTextFormat(Qt.TextFormat.PlainText)
         label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         if style:
             label.setStyleSheet(style)
@@ -164,6 +177,7 @@ class AgentGUI(QMainWindow):
         self.context_length = 0
         self.last_history = None
         self.agent_idle = False
+        self._cached_config = None  # Config created by restart_session for next run
         
         self.init_ui()
         self.setup_polling()
@@ -202,37 +216,62 @@ class AgentGUI(QMainWindow):
         right_container.setLayout(right_layout)
         
         
-        # Pruning controls
-        pruning_frame = QWidget()
-        pruning_layout = QHBoxLayout()
-        pruning_frame.setLayout(pruning_layout)
+        # Token monitoring controls
+        token_monitor_frame = QWidget()
+        token_monitor_layout = QHBoxLayout()
+        token_monitor_frame.setLayout(token_monitor_layout)
         
-        self.pruning_checkbox = QCheckBox("Enable pruning")
-        self.pruning_checkbox.setChecked(False)
-        pruning_layout.addWidget(self.pruning_checkbox)
+        self.token_monitor_checkbox = QCheckBox("Enable token warnings")
+        self.token_monitor_checkbox.setChecked(True)
+        token_monitor_layout.addWidget(self.token_monitor_checkbox)
         
-        pruning_layout.addWidget(QLabel("Keep turns:"))
-        self.turns_spinbox = QSpinBox()
-        self.turns_spinbox.setRange(1, 50)
-        self.turns_spinbox.setValue(5)
-        self.turns_spinbox.setEnabled(False)
-        pruning_layout.addWidget(self.turns_spinbox)
+        token_monitor_layout.addWidget(QLabel("Warning:"))
+        self.warning_threshold_spinbox = QSpinBox()
+        self.warning_threshold_spinbox.setRange(1, 200)
+        self.warning_threshold_spinbox.setValue(35)
+        self.warning_threshold_spinbox.setEnabled(True)
+        token_monitor_layout.addWidget(self.warning_threshold_spinbox)
+        self.warning_formatted_label = QLabel("(35k)")
+        token_monitor_layout.addWidget(self.warning_formatted_label)
+        token_monitor_layout.addWidget(QLabel("tokens"))
         
-        self.keep_initial_checkbox = QCheckBox("Keep initial query")
-        self.keep_initial_checkbox.setChecked(True)
-        self.keep_initial_checkbox.setEnabled(False)
-        pruning_layout.addWidget(self.keep_initial_checkbox)
-        pruning_layout.addWidget(QLabel("Detail:"))
+        token_monitor_layout.addWidget(QLabel("Critical:"))
+        self.critical_threshold_spinbox = QSpinBox()
+        self.critical_threshold_spinbox.setRange(1, 200)
+        self.critical_threshold_spinbox.setValue(50)
+        self.critical_threshold_spinbox.setEnabled(True)
+        token_monitor_layout.addWidget(self.critical_threshold_spinbox)
+        self.critical_formatted_label = QLabel("(50k)")
+        token_monitor_layout.addWidget(self.critical_formatted_label)
+        # Set step size to 1 (representing 1k tokens)
+        self.warning_threshold_spinbox.setSingleStep(1)
+        self.critical_threshold_spinbox.setSingleStep(1)
+        
+        # Debounce timers for threshold changes
+        self._warning_threshold_timer = QTimer()
+        self._warning_threshold_timer.setSingleShot(True)
+        self._warning_threshold_timer.timeout.connect(self._adjust_warning_threshold)
+        self._critical_threshold_timer = QTimer()
+        self._critical_threshold_timer.setSingleShot(True)
+        self._critical_threshold_timer.timeout.connect(self._adjust_critical_threshold)
+        
+        # Connect threshold adjustments to maintain ordering
+        self.warning_threshold_spinbox.valueChanged.connect(self._on_warning_threshold_changed)
+        self.critical_threshold_spinbox.valueChanged.connect(self._on_critical_threshold_changed)
+        token_monitor_layout.addWidget(QLabel("tokens"))
+        
+        token_monitor_layout.addWidget(QLabel("Detail:"))
         self.detail_combo = QComboBox()
         self.detail_combo.addItems(["minimal", "normal", "verbose"])
         self.detail_combo.setCurrentText("normal")
-        pruning_layout.addWidget(self.detail_combo)
-        pruning_layout.addStretch()
-        right_layout.addWidget(pruning_frame)
+        token_monitor_layout.addWidget(self.detail_combo)
+        token_monitor_layout.addStretch()
+        right_layout.addWidget(token_monitor_frame)
         
-        # Connect pruning checkbox to enable/disable other controls
-        self.pruning_checkbox.stateChanged.connect(self.update_pruning_controls)
-        self.update_pruning_controls()  # Set initial state
+        # Connect token monitor checkbox to enable/disable threshold controls
+        self.token_monitor_checkbox.stateChanged.connect(self.update_token_monitor_controls)
+        self.update_token_monitor_controls()  # Set initial state
+        self._update_token_threshold_labels()  # Set initial formatted labels
         
         # Clear button
         clear_btn = QPushButton("Clear Output")
@@ -392,7 +431,10 @@ class AgentGUI(QMainWindow):
         enabled_names = self.tool_loader.get_enabled_tool_names()
         data = {
             "history": self.last_history,
-            "enabled_tools": enabled_names
+            "enabled_tools": enabled_names,
+            "token_monitor_enabled": self.token_monitor_checkbox.isChecked(),
+            "warning_threshold": self.warning_threshold_spinbox.value(),
+            "critical_threshold": self.critical_threshold_spinbox.value()
         }
         try:
             with open(filename, 'w') as f:
@@ -416,16 +458,82 @@ class AgentGUI(QMainWindow):
             # Update tool checkboxes
             for tool_name, checkbox in self.tool_loader.tool_checkboxes.items():
                 checkbox.setChecked(tool_name in enabled_names)
+            
+            # Load token monitoring settings if available
+            if "token_monitor_enabled" in data:
+                self.token_monitor_checkbox.setChecked(data["token_monitor_enabled"])
+            if "warning_threshold" in data:
+                warning_value = data["warning_threshold"]
+                # Convert old session files (values in actual tokens) to display units
+                if warning_value >= 1000:  # Old format: actual token count (e.g., 55000)
+                    warning_value = max(1, warning_value // 1000)
+                elif warning_value > 200:  # Out of range display value, clamp
+                    warning_value = 200
+                self.warning_threshold_spinbox.setValue(warning_value)
+            if "critical_threshold" in data:
+                critical_value = data["critical_threshold"]
+                if critical_value >= 1000:  # Old format
+                    critical_value = max(1, critical_value // 1000)
+                elif critical_value > 200:  # Out of range display value, clamp
+                    critical_value = 200
+                self.critical_threshold_spinbox.setValue(critical_value)
+            
+            self.update_token_monitor_controls()  # Update UI state
+            self._update_token_threshold_labels()  # Update formatted labels
             self.update_buttons(running=False)
             QMessageBox.information(self, "Session Loaded", f"Session loaded from {filename}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load session: {e}")
     
-    def update_pruning_controls(self):
-        """Enable/disable pruning controls based on checkbox."""
-        enabled = self.pruning_checkbox.isChecked()
-        self.turns_spinbox.setEnabled(enabled)
-        self.keep_initial_checkbox.setEnabled(enabled)
+    def update_token_monitor_controls(self):
+        """Enable/disable token monitor threshold controls based on checkbox."""
+        enabled = self.token_monitor_checkbox.isChecked()
+        self.warning_threshold_spinbox.setEnabled(enabled)
+        self.critical_threshold_spinbox.setEnabled(enabled)
+
+    def _on_warning_threshold_changed(self, value):
+        """Start debounced adjustment of warning threshold."""
+        self._warning_threshold_timer.start(500)
+
+    def _adjust_warning_threshold(self):
+        """Ensure warning threshold is always lower than critical threshold."""
+        value = self.warning_threshold_spinbox.value()
+        critical = self.critical_threshold_spinbox.value()
+        step = self.warning_threshold_spinbox.singleStep()
+        if value >= critical:
+            # Clamp warning to critical - step (instead of adjusting critical)
+            clamped_value = critical - step
+            if clamped_value < 1:
+                clamped_value = 1
+            # Temporarily block signals to prevent infinite recursion
+            self.warning_threshold_spinbox.blockSignals(True)
+            self.warning_threshold_spinbox.setValue(clamped_value)
+            self.warning_threshold_spinbox.blockSignals(False)
+        # Update formatted labels
+        self._update_token_threshold_labels()
+
+    def _on_critical_threshold_changed(self, value):
+        """Start debounced adjustment of critical threshold."""
+        self._critical_threshold_timer.start(500)
+
+    def _adjust_critical_threshold(self):
+        """Ensure critical threshold is always higher than warning threshold."""
+        value = self.critical_threshold_spinbox.value()
+        warning = self.warning_threshold_spinbox.value()
+        step = self.critical_threshold_spinbox.singleStep()
+        if value <= warning:
+            # Clamp critical to warning + step (instead of adjusting warning)
+            clamped_value = warning + step
+            max_val = self.critical_threshold_spinbox.maximum()
+            if clamped_value > max_val:
+                clamped_value = max_val
+            # Temporarily block signals to prevent infinite recursion
+            self.critical_threshold_spinbox.blockSignals(True)
+            self.critical_threshold_spinbox.setValue(clamped_value)
+            self.critical_threshold_spinbox.blockSignals(False)
+        # Update formatted labels
+        self._update_token_threshold_labels()
+
     # ---- Agent control ----
     def run_agent(self):
         print(f"[GUI] run_agent called, controller.is_running={self.controller.is_running}, agent_idle={self.agent_idle}")
@@ -442,24 +550,89 @@ class AgentGUI(QMainWindow):
         tool_name_to_class = {cls.__name__: cls for cls in TOOL_CLASSES}
         enabled_classes = [tool_name_to_class[name] for name in enabled_names]
 
-        config = AgentConfig(
-            api_key=api_key,
-            model="deepseek-reasoner",
-            max_turns=100,
-            temperature=0.2,
-            tool_classes=enabled_classes,
-            max_history_turns=self.turns_spinbox.value() if self.pruning_checkbox.isChecked() else None,
-            keep_initial_query=self.keep_initial_checkbox.isChecked() if self.pruning_checkbox.isChecked() else True,
-            keep_system_messages=True,
-            initial_input_tokens=self.total_input if self.last_history is not None else 0,
-            initial_output_tokens=self.total_output if self.last_history is not None else 0
-        )
+        # Use cached config if available (created by restart_session)
+        if self._cached_config is not None:
+            # Start with cached config but update fields that may have changed
+            base_config = self._cached_config
+            # Create new config with current GUI values
+            config = AgentConfig(
+                api_key=api_key,
+                model=base_config.model,
+                max_turns=base_config.max_turns,
+                temperature=base_config.temperature,
+                tool_classes=enabled_classes,  # Use current tool selection
+                max_history_turns=base_config.max_history_turns,
+                keep_initial_query=base_config.keep_initial_query,
+                keep_system_messages=base_config.keep_system_messages,
+                initial_input_tokens=self.total_input if self.last_history is not None else 0,
+                initial_output_tokens=self.total_output if self.last_history is not None else 0,
+                token_monitor_enabled=self.token_monitor_checkbox.isChecked(),
+                token_monitor_warning_threshold=self.warning_threshold_spinbox.value() * 1000,
+                token_monitor_critical_threshold=self.critical_threshold_spinbox.value() * 1000
+            )
+            print(f"[GUI] Using cached config with updated token monitoring: enabled={config.token_monitor_enabled}, warning={config.token_monitor_warning_threshold}, critical={config.token_monitor_critical_threshold}")
+            self._cached_config = None  # Clear after use
+        else:
+            # Create fresh config
+            config = AgentConfig(
+                api_key=api_key,
+                model="deepseek-reasoner",
+                max_turns=100,
+                temperature=0.2,
+                tool_classes=enabled_classes,
+                max_history_turns=None,  # Pruning removed
+                keep_initial_query=True,  # Pruning removed
+                keep_system_messages=True,
+                initial_input_tokens=self.total_input if self.last_history is not None else 0,
+                initial_output_tokens=self.total_output if self.last_history is not None else 0,
+                token_monitor_enabled=self.token_monitor_checkbox.isChecked(),
+                token_monitor_warning_threshold=self.warning_threshold_spinbox.value() * 1000,
+                token_monitor_critical_threshold=self.critical_threshold_spinbox.value() * 1000
+            )
 
         try:
             if self.controller.is_running:
                 if self.agent_idle:
-                    # Submit new query to already running agent
-                    self.controller.continue_session(query)
+                    # Agent is idle (paused), check if config has changed
+                    current_config = self.controller.get_config()
+                    # Compare configs - check if token monitoring settings or tool classes changed
+                    config_changed = False
+                    # Compare token monitoring settings
+                    if current_config.token_monitor_enabled != config.token_monitor_enabled:
+                        config_changed = True
+                    elif current_config.token_monitor_warning_threshold != config.token_monitor_warning_threshold:
+                        config_changed = True
+                    elif current_config.token_monitor_critical_threshold != config.token_monitor_critical_threshold:
+                        config_changed = True
+                    # Compare tool classes (by name)
+                    current_tool_names = {cls.__name__ for cls in (current_config.tool_classes or [])}
+                    new_tool_names = {cls.__name__ for cls in (config.tool_classes or [])}
+                    if current_tool_names != new_tool_names:
+                        config_changed = True
+                    
+                    if config_changed:
+                        # Config changed, need to restart agent with new config
+                        print(f"[GUI] Config changed, restarting agent with new config")
+                        # Stop current agent
+                        self.controller.stop()
+                        # Wait for thread to finish
+                        while self.controller.is_running:
+                            import time
+                            time.sleep(0.01)
+                        # Start new session with new config
+                        if self.last_history is not None:
+                            self.controller.start(query, config, initial_conversation=self.last_history.copy())
+                        else:
+                            self.controller.start(query, config)
+                            # Reset token totals only for new session without history
+                            self.total_input = 0
+                            self.total_output = 0
+                            self.context_length = 0
+                            self.status_panel.update_context_length(self.context_length)
+                            self.status_panel.update_tokens(self.total_input, self.total_output)
+                    else:
+                        # Config unchanged, just submit new query
+                        self.controller.continue_session(query)
                     self.agent_idle = False
                 else:
                     # Agent is still processing previous query (should not happen)
@@ -486,22 +659,55 @@ class AgentGUI(QMainWindow):
         self.update_buttons(running=True, idle=False)
         self.status_panel.update_status("Running")
     def restart_session(self):
+        """Start a fresh session with current GUI settings (including token monitoring)."""
+        # If agent is running, stop it first
         if self.controller.is_running:
-            self.controller.restart_session()
-            # After restart, agent is idle (waiting for query)
-            self.agent_idle = True
+            self.controller.stop()
+            # Wait briefly for thread to finish
+            import time
+            for _ in range(50):  # max 0.5 seconds
+                if not self.controller.is_running:
+                    break
+                time.sleep(0.01)
+
+        # Clear history and token totals
         self.last_history = None
         self.total_input = 0
         self.total_output = 0
         self.context_length = 0
         self.status_panel.update_context_length(self.context_length)
         self.status_panel.update_tokens(self.total_input, self.total_output)
-        # Update buttons: if controller running, idle; else not running
-        if self.controller.is_running:
-            self.update_buttons(running=True, idle=True)
+
+        # Update buttons - agent is not running
+        self.update_buttons(running=False)
+        self.agent_idle = False
+        
+        # Create new AgentConfig with current GUI settings for next run
+        api_key = os.getenv("DEEPSEEK_API_KEY")
+        if api_key:
+            enabled_names = self.tool_loader.get_enabled_tool_names()
+            tool_name_to_class = {cls.__name__: cls for cls in TOOL_CLASSES}
+            enabled_classes = [tool_name_to_class[name] for name in enabled_names]
+            
+            # Store config for next run (similar to run_agent())
+            self._cached_config = AgentConfig(
+                api_key=api_key,
+                model="deepseek-reasoner",
+                max_turns=100,
+                temperature=0.2,
+                tool_classes=enabled_classes,
+                max_history_turns=None,  # Pruning removed
+                keep_initial_query=True,  # Pruning removed
+                keep_system_messages=True,
+                initial_input_tokens=0,
+                initial_output_tokens=0,
+                token_monitor_enabled=self.token_monitor_checkbox.isChecked(),
+                token_monitor_warning_threshold=self.warning_threshold_spinbox.value() * 1000,
+                token_monitor_critical_threshold=self.critical_threshold_spinbox.value() * 1000
+            )
+            print(f"[GUI] Created new config for next session with token monitoring: enabled={self.token_monitor_checkbox.isChecked()}, warning={self.warning_threshold_spinbox.value() * 1000}, critical={self.critical_threshold_spinbox.value() * 1000}")
         else:
-            self.update_buttons(running=False)
-    
+            self._cached_config = None    
     def stop_agent(self):
         self.controller.request_pause()
         self.status_panel.update_status("Pausing...")
@@ -740,6 +946,23 @@ class AgentGUI(QMainWindow):
         self.status_panel.update_context_length(self.context_length)
         self.status_panel.update_tokens(self.total_input, self.total_output)
         self.update_buttons(running=False)
+    def _update_token_threshold_labels(self):
+        """Update formatted labels for token thresholds."""
+        # Format warning threshold (multiply by 1000 for display)
+        warning_value = self.warning_threshold_spinbox.value() * 1000
+        if warning_value >= 1000:
+            warning_text = f"({warning_value // 1000}k)"
+        else:
+            warning_text = f"({warning_value})"
+        self.warning_formatted_label.setText(warning_text)
+
+        # Format critical threshold (multiply by 1000 for display)
+        critical_value = self.critical_threshold_spinbox.value() * 1000
+        if critical_value >= 1000:
+            critical_text = f"({critical_value // 1000}k)"
+        else:
+            critical_text = f"({critical_value})"
+        self.critical_formatted_label.setText(critical_text)
 
 def main():
     app = QApplication(sys.argv)
