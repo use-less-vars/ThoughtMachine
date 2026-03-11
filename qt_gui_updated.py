@@ -508,6 +508,7 @@ class AgentGUI(QMainWindow):
     
     
     def update_buttons(self, running, idle=False):
+        print(f"[GUI] update_buttons(running={running}, idle={idle}), controller.is_running={self.controller.is_running}, agent_idle={self.agent_idle}")
         if running:
             if idle:
                 self.run_btn.setEnabled(True)
@@ -592,6 +593,7 @@ class AgentGUI(QMainWindow):
         etype = event["type"]
         detail_level = self.detail_combo.currentText()
         # Store conversation history if present
+        print(f"[GUI] display_event: checking history, etype={etype}, has_history={'history' in event}")
         if "history" in event:
             self.last_history = event["history"]
             # For user interaction requests, treat as not running to enable Run button.
@@ -656,6 +658,8 @@ class AgentGUI(QMainWindow):
             self.context_length = usage.get("input", self.context_length)
             self.status_panel.update_tokens(self.total_input, self.total_output)
             self.status_panel.update_context_length(self.context_length)
+            self.agent_idle = True
+            self.update_buttons(running=self.controller.is_running, idle=True)
         elif etype == "user_interaction_requested":
             frame.add_content_line(f"Agent requests interaction: {event.get('message', '')}", style="color: #008080;")
             # Optionally auto-focus the query input
@@ -668,6 +672,10 @@ class AgentGUI(QMainWindow):
             self.status_panel.update_tokens(self.total_input, self.total_output)
             self.agent_idle = True
         elif etype == "token_warning":
+            print(f"[GUI] token_warning event received, has_history={'history' in event}, agent_idle={self.agent_idle}, controller.is_running={self.controller.is_running}")
+            print(f"[GUI] token_warning event, current agent_idle={self.agent_idle}")
+            if self.agent_idle and self.controller.is_running:
+                print("[GUI] WARNING: token_warning but agent_idle=True! This indicates a bug.")
             frame.add_content_line(event["message"], style="color: #FFA500; font-weight: bold;")
             usage = event.get("usage", {})
             self.total_input = usage.get("total_input", self.total_input)
@@ -678,7 +686,12 @@ class AgentGUI(QMainWindow):
                 self.context_length = token_count
                 self.status_panel.update_context_length(self.context_length)
             self.status_panel.update_tokens(self.total_input, self.total_output)
-            self.agent_idle = True
+            # Note: agent_idle NOT set here - token warning is informational, agent continues processing
+            # However, ensure agent is marked as not idle if it's running
+            if self.controller.is_running:
+                self.agent_idle = False
+            # Update buttons to reflect current state
+            self.update_buttons(running=self.controller.is_running, idle=self.agent_idle)
         elif etype == "paused":
             frame.add_content_line("Agent paused, ready for next query.", style="color: #808080;")
             self.agent_idle = True
@@ -691,10 +704,15 @@ class AgentGUI(QMainWindow):
             self.context_length = usage.get("input", self.context_length)
             self.status_panel.update_tokens(self.total_input, self.total_output)
             self.status_panel.update_context_length(self.context_length)
+            self.agent_idle = True
+            self.update_buttons(running=self.controller.is_running, idle=True)
         elif etype == "error":
             frame.add_content_line(f"ERROR: {event.get('message')}", style="color: #FF0000; font-weight: bold;")
             if "traceback" in event and detail_level == "verbose":
                 frame.add_content_line(event['traceback'], style="color: #FF0000;")
+            # Agent has errored, thread will finish soon
+            self.agent_idle = True
+            self.update_buttons(running=self.controller.is_running, idle=True)
         elif etype == "thread_finished":
             frame.add_content_line("Background thread finished.", style="color: #808080;")
         else:

@@ -263,18 +263,21 @@ class Agent:
             state_order = {"low": 0, "medium": 1, "high": 2, "critical": 3}
             if state_order[new_state] > state_order[old_state]:
                 # Create warning message
+                sender = "system"
                 if new_state == "medium":
-                    warning = f"Token usage warning: Conversation is approaching context limits ({total} tokens). You MUST use the SummarizeTool to prune older turns within 3 turns."
+                    warning = f"[SYSTEM] Token usage warning: Conversation is approaching context limits ({total} tokens). As soon as possible, summarize to cause pruning."
                 elif new_state == "high":
-                    warning = f"Token usage warning: Conversation is nearing context window limits ({total} tokens). It is recommended to use the SummarizeTool soon to avoid truncation."
+                    sender = "user"
+                    warning = f"[SYSTEM] Token usage warning: Conversation is nearing context window limits ({total} tokens). Please consider pruning soon when you are at a good point."
                 elif new_state == "critical":
-                    warning = f"Token usage warning: Conversation is at critical context window limits ({total} tokens). Immediate use of the SummarizeTool is advised to prevent loss of context."
+                    sender = "user"
+                    warning = f"[SYSTEM] Token usage warning: Conversation is at critical context window limits ({total} tokens). Please prune now to avoid losing context."
                 else:
                     warning = None
 
                 if warning:
                     # Append as system message
-                    self.conversation.append({"role": "system", "content": warning})
+                    self.conversation.append({"role": sender, "content": warning})
                     # Estimate tokens for warning message and update current count
                     warning_tokens = len(warning) // 4
                     self.current_conversation_tokens += warning_tokens
