@@ -480,28 +480,6 @@ class AgentGUI(QMainWindow):
         self._token_monitor_enabled = self.agent_controls_panel.token_monitor_checkbox.isChecked()
         self.token_monitor_warning_threshold = self.agent_controls_panel.warning_threshold_spinbox.value() * 1000
         self.token_monitor_critical_threshold = self.agent_controls_panel.critical_threshold_spinbox.value() * 1000
-        self.agent_controls_panel = AgentControlsPanel(TOOL_CLASSES)
-        right_layout.addWidget(self.agent_controls_panel)
-        
-        # Connect workspace buttons
-        self.agent_controls_panel.set_workspace_btn.clicked.connect(self.set_workspace)
-        self.agent_controls_panel.clear_workspace_btn.clicked.connect(self.clear_workspace)
-        
-        # Connect token monitor checkbox to update AgentGUI's internal state
-        self.agent_controls_panel.token_monitor_checkbox.stateChanged.connect(
-            lambda state: setattr(self, '_token_monitor_enabled', state == Qt.CheckState.Checked.value)
-        )
-        # Connect threshold spinboxes to update AgentGUI's internal thresholds
-        self.agent_controls_panel.warning_threshold_spinbox.valueChanged.connect(
-            lambda value: setattr(self, 'token_monitor_warning_threshold', value * 1000)
-        )
-        self.agent_controls_panel.critical_threshold_spinbox.valueChanged.connect(
-            lambda value: setattr(self, 'token_monitor_critical_threshold', value * 1000)
-        )
-        # Set initial values
-        self._token_monitor_enabled = self.agent_controls_panel.token_monitor_checkbox.isChecked()
-        self.token_monitor_warning_threshold = self.agent_controls_panel.warning_threshold_spinbox.value() * 1000
-        self.token_monitor_critical_threshold = self.agent_controls_panel.critical_threshold_spinbox.value() * 1000
         
 
         
@@ -908,7 +886,7 @@ class AgentGUI(QMainWindow):
         # Create new AgentConfig with current GUI settings for next run
         api_key = os.getenv("DEEPSEEK_API_KEY")
         if api_key:
-            enabled_names = self.agent_controls_panel.tool_loader.get_enabled_tool_names()
+            enabled_names = self.agent_controls_panel.get_enabled_tool_names()
             tool_name_to_class = {cls.__name__: cls for cls in TOOL_CLASSES}
             enabled_classes = [tool_name_to_class[name] for name in enabled_names]
             
