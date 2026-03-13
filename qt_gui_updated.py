@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit, QListWidget,
     QGroupBox, QCheckBox, QMenuBar, QMenu, QFileDialog,
-    QMessageBox, QScrollArea, QFrame, QComboBox, QSpinBox, QSplitter, QDialog, QSizePolicy
+    QMessageBox, QScrollArea, QFrame, QComboBox, QSpinBox, QDoubleSpinBox, QSplitter, QDialog, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QAction, QFont
@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 from agent_controller import AgentController
 from agent_core import AgentConfig
-from tools import TOOL_CLASSES
+from tools import TOOL_CLASSES, SIMPLIFIED_TOOL_CLASSES
 
 load_dotenv()
 
@@ -195,7 +195,41 @@ class AgentControlsPanel(QGroupBox):
         
         self.controls_layout.addWidget(max_turns_row, row, 0, 1, 4)
         
-        # Row 3: Tool output token limit
+        # Row 3: Temperature control
+        row += 1
+        temperature_row = QWidget()
+        temperature_layout = QHBoxLayout()
+        temperature_row.setLayout(temperature_layout)
+        temperature_layout.setSpacing(5)
+        
+        temperature_layout.addWidget(QLabel("Temperature:"))
+        self.temperature_spinbox = QDoubleSpinBox()
+        self.temperature_spinbox.setRange(0.0, 2.0)
+        self.temperature_spinbox.setValue(0.2)
+        self.temperature_spinbox.setSingleStep(0.1)
+        self.temperature_spinbox.setDecimals(1)
+        temperature_layout.addWidget(self.temperature_spinbox)
+        temperature_layout.addWidget(QLabel(""))
+        
+        self.controls_layout.addWidget(temperature_row, row, 0, 1, 4)
+        
+        # Row 4: Model selection
+        row += 1
+        model_row = QWidget()
+        model_layout = QHBoxLayout()
+        model_row.setLayout(model_layout)
+        model_layout.setSpacing(5)
+        
+        model_layout.addWidget(QLabel("Model:"))
+        self.model_combo = QComboBox()
+        self.model_combo.addItems(["deepseek-reasoner", "gpt-4", "claude-3", "llama-3"])
+        self.model_combo.setCurrentText("deepseek-reasoner")
+        model_layout.addWidget(self.model_combo)
+        model_layout.addStretch()
+        
+        self.controls_layout.addWidget(model_row, row, 0, 1, 4)
+        
+        # Row 5: Tool output token limit
         row += 1
         tool_limit_row = QWidget()
         tool_limit_layout = QHBoxLayout()
@@ -212,7 +246,7 @@ class AgentControlsPanel(QGroupBox):
         
         self.controls_layout.addWidget(tool_limit_row, row, 0, 1, 4)
         
-        # Row 4: Detail combo
+        # Row 6: Detail combo
         row += 1
         detail_row = QWidget()
         detail_layout = QHBoxLayout()
@@ -228,7 +262,7 @@ class AgentControlsPanel(QGroupBox):
         
         self.controls_layout.addWidget(detail_row, row, 0, 1, 4)
         
-        # Row 4: Tool loader (as a sub-group)
+        # Row 7: Tool loader (as a sub-group)
         row += 1
         tool_group = QGroupBox("Tools")
         tool_layout = QGridLayout()
@@ -250,7 +284,16 @@ class AgentControlsPanel(QGroupBox):
         
         # Add stretch to fill remaining space
         tool_layout.setRowStretch(tool_row + 1, 1)
-        self.controls_layout.addWidget(tool_group, row, 0, 1, 4)
+        
+        # Wrap tool group in a scroll area to limit height
+        tool_scroll_area = QScrollArea()
+        tool_scroll_area.setWidgetResizable(True)
+        tool_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        tool_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        tool_scroll_area.setMaximumHeight(400)  # Limit height, show scrollbar if needed
+        tool_scroll_area.setWidget(tool_group)
+        
+        self.controls_layout.addWidget(tool_scroll_area, row, 0, 1, 4)
         
         # Add controls container to main layout
         self.main_layout.addWidget(self.controls_container)
@@ -356,6 +399,63 @@ class AgentControlsPanel(QGroupBox):
         else:
             critical_text = f"({critical_value})"
         self.critical_formatted_label.setText(critical_text)
+    def get_config_dict(self):
+        """Return a dictionary of current control values suitable for JSON serialization."""
+        config = {}
+        config["temperature"] = self.temperature_spinbox.value()
+        config["max_turns"] = self.max_turns_spinbox.value()
+        config["token_monitor_enabled"] = self.token_monitor_checkbox.isChecked()
+        config["warning_threshold"] = self.warning_threshold_spinbox.value()
+        config["critical_threshold"] = self.critical_threshold_spinbox.value()
+        # Workspace path: None if display is "None (unrestricted)"
+        workspace_display = self.workspace_display.text()
+        workspace_path = None if workspace_display == "None (unrestricted)" else workspace_display
+        config["workspace_path"] = workspace_path
+        config["tool_output_limit"] = self.tool_output_limit_spinbox.value()
+        config["model"] = self.model_combo.currentText()
+        config["enabled_tools"] = [name for name, cb in self.tool_checkboxes.items() if cb.isChecked()]
+        return config
+    def set_config_dict(self, config):
+        """Set control values from a configuration dictionary."""
+        # Temperature
+        if "temperature" in config:
+            self.temperature_spinbox.setValue(config["temperature"])
+        # Max turns
+        if "max_turns" in config:
+            self.max_turns_spinbox.setValue(config["max_turns"])
+        # Token monitoring enabled
+        if "token_monitor_enabled" in config:
+            self.token_monitor_checkbox.setChecked(config["token_monitor_enabled"])
+        # Warning threshold (in thousands)
+        if "warning_threshold" in config:
+            self.warning_threshold_spinbox.setValue(config["warning_threshold"])
+        # Critical threshold (in thousands)
+        if "critical_threshold" in config:
+            self.critical_threshold_spinbox.setValue(config["critical_threshold"])
+        # Workspace path
+        if "workspace_path" in config:
+            workspace_path = config["workspace_path"]
+            if workspace_path is None:
+                self.workspace_display.setText("None (unrestricted)")
+            else:
+                # Ensure path is normalized and absolute
+                workspace_path = os.path.normpath(workspace_path)
+                if not os.path.isabs(workspace_path):
+                    workspace_path = os.path.abspath(workspace_path)
+                self.workspace_display.setText(workspace_path)
+        # Tool output limit
+        if "tool_output_limit" in config:
+            self.tool_output_limit_spinbox.setValue(config["tool_output_limit"])
+        # Model selection
+        if "model" in config:
+            index = self.model_combo.findText(config["model"])
+            if index >= 0:
+                self.model_combo.setCurrentIndex(index)
+        # Enabled tools
+        if "enabled_tools" in config:
+            enabled_names = set(config["enabled_tools"])
+            for name, checkbox in self.tool_checkboxes.items():
+                checkbox.setChecked(name in enabled_names)
 
 class StatusPanel(QGroupBox):
     """Shows current status and token usage."""
@@ -437,9 +537,19 @@ class AgentGUI(QMainWindow):
         self.turn_monitor_enabled = True
         self.turn_monitor_warning_threshold = 0.8
         self.turn_monitor_critical_threshold = 0.95
+        # Smart scrolling tracking
+        self._auto_scroll_enabled = True
+        self._user_scrolled_away = False
+        
+        # Configuration auto-save timer
+        self._config_save_timer = QTimer()
+        self._config_save_timer.setSingleShot(True)
+        self._config_save_timer.timeout.connect(self.save_config)
+        self._loading_config = False  # Flag to prevent save during load
 
         self.init_ui()        
         self.setup_polling()
+        self.load_config()
     
     def init_ui(self):
         self.setWindowTitle("Agent Workbench - QT")
@@ -475,7 +585,7 @@ class AgentGUI(QMainWindow):
         
         
         # Agent Controls Panel (replaces individual controls)
-        self.agent_controls_panel = AgentControlsPanel(TOOL_CLASSES)
+        self.agent_controls_panel = AgentControlsPanel(SIMPLIFIED_TOOL_CLASSES)
         right_layout.addWidget(self.agent_controls_panel)
 
         # Connect workspace buttons
@@ -493,6 +603,20 @@ class AgentGUI(QMainWindow):
         self.agent_controls_panel.critical_threshold_spinbox.valueChanged.connect(
             lambda value: setattr(self, 'token_monitor_critical_threshold', value * 1000)
         )
+        # Connect all controls to auto-save configuration
+        self.agent_controls_panel.temperature_spinbox.valueChanged.connect(self._schedule_config_save)
+        self.agent_controls_panel.max_turns_spinbox.valueChanged.connect(self._schedule_config_save)
+        self.agent_controls_panel.tool_output_limit_spinbox.valueChanged.connect(self._schedule_config_save)
+        self.agent_controls_panel.model_combo.currentTextChanged.connect(self._schedule_config_save)
+        self.agent_controls_panel.detail_combo.currentTextChanged.connect(self._schedule_config_save)
+        self.agent_controls_panel.token_monitor_checkbox.stateChanged.connect(self._schedule_config_save)
+        self.agent_controls_panel.warning_threshold_spinbox.valueChanged.connect(self._schedule_config_save)
+        self.agent_controls_panel.critical_threshold_spinbox.valueChanged.connect(self._schedule_config_save)
+        
+        # Connect tool checkboxes
+        for checkbox in self.agent_controls_panel.tool_checkboxes.values():
+            checkbox.stateChanged.connect(self._schedule_config_save)
+        
         # Set initial values
         self._token_monitor_enabled = self.agent_controls_panel.token_monitor_checkbox.isChecked()
         self.token_monitor_warning_threshold = self.agent_controls_panel.warning_threshold_spinbox.value() * 1000
@@ -507,11 +631,16 @@ class AgentGUI(QMainWindow):
         self.output_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         
         self.output_container = QWidget()
+        # Set expanding size policy so container grows with content
+        self.output_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.output_layout = QVBoxLayout(self.output_container)
         self.output_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.output_layout.setSpacing(5)
         
         self.output_scroll_area.setWidget(self.output_container)
+        # Connect scrollbar to track user scrolling
+        scrollbar = self.output_scroll_area.verticalScrollBar()
+        scrollbar.valueChanged.connect(self._on_scrollbar_value_changed)
         right_layout.addWidget(self.output_scroll_area)
         # Query input - Updated: Label above, 6-line text edit
         query_label = QLabel("Query:")
@@ -601,6 +730,40 @@ class AgentGUI(QMainWindow):
         main_layout.addWidget(splitter)
         
         self.create_menu_bar()
+    def load_config(self):
+        """Load configuration from file."""
+        self._loading_config = True
+        try:
+            config_path = "agent_config.json"
+            if os.path.exists(config_path):
+                try:
+                    with open(config_path, 'r') as f:
+                        config = json.load(f)
+                    # Apply configuration to controls panel
+                    self.agent_controls_panel.set_config_dict(config)
+                    print(f"[GUI] Loaded configuration from {config_path}")
+                except Exception as e:
+                    print(f"[GUI] Error loading config: {e}")
+            else:
+                print(f"[GUI] No config file found at {config_path}, using defaults")
+        finally:
+            self._loading_config = False
+    def _schedule_config_save(self):
+        """Schedule a configuration save (debounced)."""
+        if self._loading_config:
+            return  # Don't save while loading config
+        self._config_save_timer.start(1000)  # 1 second debounce
+    
+    def save_config(self):
+        """Save current configuration to file."""
+        config = self.agent_controls_panel.get_config_dict()
+        config_path = "agent_config.json"
+        try:
+            with open(config_path, 'w') as f:
+                json.dump(config, f, indent=2)
+            print(f"[GUI] Saved configuration to {config_path}")
+        except Exception as e:
+            print(f"[GUI] Error saving config: {e}")
     
     def create_menu_bar(self):
         menubar = self.menuBar()
@@ -662,7 +825,10 @@ class AgentGUI(QMainWindow):
             "turn_monitor_enabled": True,
             "turn_monitor_warning_threshold": 0.8,
             "turn_monitor_critical_threshold": 0.95,
-            "workspace_path": workspace_path
+            "workspace_path": workspace_path,
+            "max_turns": self.agent_controls_panel.max_turns_spinbox.value(),
+            "temperature": self.agent_controls_panel.temperature_spinbox.value(),
+            "tool_output_token_limit": self.agent_controls_panel.tool_output_limit_spinbox.value(),
         }
         try:
             with open(filename, 'w') as f:
@@ -728,6 +894,23 @@ class AgentGUI(QMainWindow):
                         workspace_path = os.path.abspath(workspace_path)
                     self.agent_controls_panel.workspace_display.setText(workspace_path)
             
+            # Load temperature, max turns, and tool output limit if available
+            if "temperature" in data:
+                temperature_value = data["temperature"]
+                # Clamp to spinbox range
+                temperature_value = max(0.0, min(2.0, temperature_value))
+                self.agent_controls_panel.temperature_spinbox.setValue(temperature_value)
+            if "max_turns" in data:
+                max_turns_value = data["max_turns"]
+                # Clamp to spinbox range
+                max_turns_value = max(1, min(1000, max_turns_value))
+                self.agent_controls_panel.max_turns_spinbox.setValue(max_turns_value)
+            if "tool_output_token_limit" in data:
+                tool_limit_value = data["tool_output_token_limit"]
+                # Clamp to spinbox range
+                tool_limit_value = max(1000, min(100000, tool_limit_value))
+                self.agent_controls_panel.tool_output_limit_spinbox.setValue(tool_limit_value)
+            
             self.update_buttons(running=False)
             QMessageBox.information(self, "Session Loaded", f"Session loaded from {filename}")
         except Exception as e:
@@ -746,7 +929,7 @@ class AgentGUI(QMainWindow):
             return
 
         enabled_names = self.agent_controls_panel.get_enabled_tool_names()
-        tool_name_to_class = {cls.__name__: cls for cls in TOOL_CLASSES}
+        tool_name_to_class = {cls.__name__: cls for cls in SIMPLIFIED_TOOL_CLASSES}
         enabled_classes = [tool_name_to_class[name] for name in enabled_names]
 
         # Extract workspace path
@@ -762,7 +945,7 @@ class AgentGUI(QMainWindow):
                 api_key=api_key,
                 model=base_config.model,
                 max_turns=self.agent_controls_panel.max_turns_spinbox.value(),
-                temperature=base_config.temperature,
+                temperature=self.agent_controls_panel.temperature_spinbox.value(),
                 tool_classes=enabled_classes,  # Use current tool selection
                 max_history_turns=base_config.max_history_turns,
                 keep_initial_query=base_config.keep_initial_query,
@@ -786,7 +969,7 @@ class AgentGUI(QMainWindow):
                 api_key=api_key,
                 model="deepseek-reasoner",
                 max_turns=self.agent_controls_panel.max_turns_spinbox.value(),
-                temperature=0.2,
+                temperature=self.agent_controls_panel.temperature_spinbox.value(),
                 tool_classes=enabled_classes,
                 max_history_turns=None,  # Pruning removed
                 keep_initial_query=True,  # Pruning removed
@@ -841,8 +1024,10 @@ class AgentGUI(QMainWindow):
                             time.sleep(0.01)
                         # Start new session with new config
                         if self.last_history is not None:
+                            self.display_user_query(query)
                             self.controller.start(query, config, initial_conversation=self.last_history.copy())
                         else:
+                            self.display_user_query(query)
                             self.controller.start(query, config)
                             # Reset token totals only for new session without history
                             self.total_input = 0
@@ -852,6 +1037,7 @@ class AgentGUI(QMainWindow):
                             self.status_panel.update_tokens(self.total_input, self.total_output)
                     else:
                         # Config unchanged, just submit new query
+                        self.display_user_query(query)
                         self.controller.continue_session(query)
                     self.agent_idle = False
                 else:
@@ -862,9 +1048,11 @@ class AgentGUI(QMainWindow):
                 # Start new session
                 if self.last_history is not None:
                     # Continue existing session (with history)
+                    self.display_user_query(query)
                     self.controller.start(query, config, initial_conversation=self.last_history.copy())
                 else:
                     # Start new session
+                    self.display_user_query(query)
                     self.controller.start(query, config)
                     # Reset token totals only for new session
                     self.total_input = 0
@@ -897,6 +1085,12 @@ class AgentGUI(QMainWindow):
         self.context_length = 0
         self.status_panel.update_context_length(self.context_length)
         self.status_panel.update_tokens(self.total_input, self.total_output)
+        # Force save any pending configuration changes
+        self.save_config()
+        # Ensure any pending debounced saves are executed immediately
+        if self._config_save_timer.isActive():
+            self._config_save_timer.stop()
+            self._save_current_config_to_file()
 
         # Update buttons - agent is not running
         self.update_buttons(running=False)
@@ -906,7 +1100,7 @@ class AgentGUI(QMainWindow):
         api_key = os.getenv("DEEPSEEK_API_KEY")
         if api_key:
             enabled_names = self.agent_controls_panel.get_enabled_tool_names()
-            tool_name_to_class = {cls.__name__: cls for cls in TOOL_CLASSES}
+            tool_name_to_class = {cls.__name__: cls for cls in SIMPLIFIED_TOOL_CLASSES}
             enabled_classes = [tool_name_to_class[name] for name in enabled_names]
             
             # Extract workspace path
@@ -917,7 +1111,7 @@ class AgentGUI(QMainWindow):
                 api_key=api_key,
                 model="deepseek-reasoner",
                 max_turns=self.agent_controls_panel.max_turns_spinbox.value(),
-                temperature=0.2,
+                temperature=self.agent_controls_panel.temperature_spinbox.value(),
                 tool_classes=enabled_classes,
                 max_history_turns=None,  # Pruning removed
                 keep_initial_query=True,  # Pruning removed
@@ -1027,6 +1221,14 @@ class AgentGUI(QMainWindow):
         layout.addWidget(close_btn)
         dialog.exec()
 
+    def display_user_query(self, query):
+        """Display a user query in the output area."""
+        frame = EventFrame("USER", "user_query")
+        frame.add_content_line(f"Query: {query}", style="color: #006400; font-weight: bold;")
+        self.output_layout.addWidget(frame)
+        self.output_container.updateGeometry()
+        self._scroll_to_bottom()
+        
     def display_event(self, event):
         etype = event["type"]
         detail_level = self.agent_controls_panel.detail_combo.currentText()
@@ -1169,14 +1371,27 @@ class AgentGUI(QMainWindow):
             frame.add_content_line(str(event))
 
         self.output_layout.addWidget(frame)
+        self.output_container.updateGeometry()
         self._scroll_to_bottom()
 
     def _scroll_to_bottom(self):
-        QTimer.singleShot(0, self._do_scroll_to_bottom)
+        """Scroll to bottom only if auto-scroll is enabled (i.e., user hasn't scrolled away)."""
+        if self._auto_scroll_enabled:
+            QTimer.singleShot(0, self._do_scroll_to_bottom)
 
     def _do_scroll_to_bottom(self):
         scrollbar = self.output_scroll_area.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+
+    def _on_scrollbar_value_changed(self, value):
+        """Track if user has scrolled away from bottom."""
+        scrollbar = self.output_scroll_area.verticalScrollBar()
+        max_val = scrollbar.maximum()
+        # If user is within 10 pixels of bottom, consider them at bottom
+        self._user_scrolled_away = value < max_val - 10
+        # Auto-scroll enabled when user at bottom
+        self._auto_scroll_enabled = not self._user_scrolled_away
+
     # ---- Workspace methods ----
     def set_workspace(self):
         """Open dialog to select workspace directory."""
@@ -1193,12 +1408,16 @@ class AgentGUI(QMainWindow):
             if not os.path.isabs(new_workspace):
                 new_workspace = os.path.abspath(new_workspace)
             self.agent_controls_panel.workspace_display.setText(new_workspace)
+            self._schedule_config_save()
             
     def clear_workspace(self):
         """Clear workspace restriction."""
         self.agent_controls_panel.workspace_display.setText("None (unrestricted)")
-    
-        self.critical_formatted_label.setText(critical_text)
+        self._schedule_config_save()
+    def closeEvent(self, event):
+        """Save configuration before closing the GUI."""
+        self.save_config()
+        super().closeEvent(event)
 
 def main():
     app = QApplication(sys.argv)
