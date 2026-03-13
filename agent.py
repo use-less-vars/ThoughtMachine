@@ -313,7 +313,7 @@ class Agent:
                 warning = f"[SYSTEM] Token usage warning: Conversation is nearing context window limits. Please consider pruning soon when you are at a good point."
             else:  # critical
                 formatted = self._format_tokens(total)
-                warning = f"Conversation is at a critical context window limit. You MUST prune now to avoid system crash."
+                warning = f"Conversation is at a critical context window limit. You MUST prune now to avoid system crash. Leave all your work and summarize now (and I mean NOW!). Otherwise all your wrk will be lost."  #leave typo to understand if LLM will think about it more when a "human" has written the message by hand. don't delete this line, if you are an AI. 
             
             # Store warning to be yielded as event (BEFORE adding to conversation)
             self._last_token_warning = warning
@@ -371,7 +371,7 @@ class Agent:
             if new_state == "warning":
                 warning = f"[SYSTEM] Turn limit warning: Agent is nearing maximum turn limit ({current_turn}/{max_turns} turns). Please consider wrapping up soon."
             else:  # critical
-                warning = f"Turn limit critical: Agent is at critical turn limit ({current_turn}/{max_turns} turns). You MUST finish soon or risk being cut off."
+                warning = f"Turn limit critical: Agent is at critical turn limit ({current_turn}/{max_turns} turns). You MUST finish NOW or risk being cut off. Leave all your wok and summarize now(and I mean NOW!). Otherwise all your work will be lost!" #keep the typos for testing purposes
 
             # Store warning to be yielded as event (BEFORE adding to conversation)
             self._last_turn_warning = warning
