@@ -32,9 +32,58 @@ class AgentController:
         self._pause_requested = False
         self._processing_query = False
 
+    def _cleanup_if_thread_dead(self):
+        """Check if background thread is dead and reset state if needed."""
+        if self.thread is not None and not self.thread.is_alive():
+            # Thread has finished but state wasn't cleaned up
+            self._running = False
+            self.thread = None
+            self.agent = None  # Clear old agent reference
+            self._keep_alive = True
+            self._pause_requested = False
+            self._processing_query = False
+            print(f"[Controller] Cleaned up dead thread, _running={self._running}")
+    def reset(self):
+        """Reset controller to initial state, clearing all queues and events."""
+        # Clear event queue
+        while True:
+            try:
+                self.event_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        # Clear query queue  
+        while True:
+            try:
+                self.query_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        # Reset events
+        self.stop_event.clear()
+        self.pause_event.set()  # start unpaused
+
+        # Reset state
+        self.thread = None
+        self._running = False
+        self._initial_conversation = None
+        self.agent = None
+        self._keep_alive = True
+        self._pause_requested = False
+        self._processing_query = False
+
+        print("[Controller] Reset to initial state")
+
     @property
     def is_running(self):
         """Return True if the agent thread is alive."""
+        # Check both the running flag and thread status
+        if self.thread is not None and self.thread.is_alive():
+            return True
+        # Thread is dead or doesn't exist, ensure state is cleaned up
+        if self._running:
+            # Thread died unexpectedly, clean up
+            self._cleanup_if_thread_dead()
         return self._running
     
     def get_config(self):
@@ -51,12 +100,18 @@ class AgentController:
             initial_conversation: Optional previous conversation history to continue from.
         """
         print(f"[Controller] start called with query: {query[:50]}...")
+        # Clean up any dead thread state
+        self._cleanup_if_thread_dead()
         if self._running:
             raise RuntimeError("Agent is already running. Stop it first.")
 
         # Reset control events
         self.stop_event.clear()
         self.pause_event.set()   # ensure we start unpaused
+        # Reset internal state flags
+        self._keep_alive = True
+        self._pause_requested = False
+        self._processing_query = False
 
         # Store query and config for the background thread
         self._query = query
@@ -77,14 +132,14 @@ class AgentController:
 
     def continue_session(self, query: str):
         """Submit a new query to the already running agent."""
-        if not self._running:
+        if not self.is_running:
             raise RuntimeError("Agent not running. Use start() first.")
         self.resume()
         self.query_queue.put(query)
 
     def request_pause(self):
         """Request agent to pause after current turn."""
-        if not self._running:
+        if not self.is_running:
             raise RuntimeError("Agent not running. Use start() first.")
         if self._processing_query:
             # Agent is currently processing a query, set pause flag
@@ -94,7 +149,7 @@ class AgentController:
             self.event_queue.put({"type": "paused"})
     def restart_session(self):
         """Restart agent with cleared history."""
-        if not self._running:
+        if not self.is_running:
             raise RuntimeError("Agent not running. Use start() first.")
         if self.agent:
             self.agent.request_reset()

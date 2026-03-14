@@ -5,3 +5,9 @@ now run: python3 qt_gui_updated.py and it should run.
 
 It is slow, does not support anything than deepseek, but yeah. I love it, and you can improve it yourself. Ask it what could be improved and it will tell you.  
 
+## Docker Setup
+
+The agent uses a Docker container for secure code execution. To build the required image:
+
+```bash
+docker build -f docker/executor.Dockerfile -t agent-executor .
