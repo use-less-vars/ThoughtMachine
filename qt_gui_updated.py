@@ -1137,6 +1137,7 @@ class AgentGUI(QMainWindow):
                 self.run_btn.setEnabled(False)
                 self.stop_btn.setEnabled(True)
                 self.restart_btn.setEnabled(False)
+                self.status_panel.update_status("Running")
         else:
             self.run_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
@@ -1301,6 +1302,7 @@ class AgentGUI(QMainWindow):
             self.status_panel.update_context_length(self.context_length)
             self.status_panel.update_tokens(self.total_input, self.total_output)
             self.agent_idle = True
+            self.update_buttons(running=True, idle=True)
         elif etype == "token_warning":
             print(f"[GUI] token_warning event received, has_history={'history' in event}, agent_idle={self.agent_idle}, controller.is_running={self.controller.is_running}")
             print(f"[GUI] token_warning event, current agent_idle={self.agent_idle}")
