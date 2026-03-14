@@ -1,4 +1,4 @@
-# tools/docker_command_tool.py
+# tools/docker_code_runner.py
 import os
 import time
 from typing import Literal, Optional, Dict
@@ -17,14 +17,28 @@ except ImportError:
     APIError = Exception
 
 
-class DockerCommandTool(ToolBase):
-    """Execute shell commands in a secure Docker container.
+class DockerCodeRunner(ToolBase):
+    """Execute code, scripts, and shell commands in a secure Docker container.
     
-    The container runs with minimal privileges: dropped capabilities, read-only root filesystem,
-    no network access by default, and non-root user.
-    The workspace directory is mounted as /workspace inside the container.
+    Primary uses:
+    - Run Python scripts and code snippets
+    - Execute shell commands and programs  
+    - Test scripts with full workspace file access
+    - Run build tools, linters, or any executables
+    
+    Security features:
+    - Docker isolation with read-only root filesystem
+    - Dropped Linux capabilities
+    - No network access by default (configurable)
+    - Non-root user execution
+    
+    Workspace access:
+    - Project directory mounted at /workspace
+    - Read/write access to all project files
+    - Environment variable support
+    - Working directory specification
     """
-    tool: Literal["DockerCommandTool"] = "DockerCommandTool"
+    tool: Literal["DockerCodeRunner"] = "DockerCodeRunner"
     
     command: str = Field(
         description="Shell command to execute inside the container (passed to /bin/sh -c)"
