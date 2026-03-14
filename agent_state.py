@@ -278,9 +278,9 @@ class AgentState:
         # If token state is CRITICAL, only allow SummarizeTool
         if self.token_state == TokenState.CRITICAL:
             allowed = ["SummarizeTool"]
-        # If turn state is CRITICAL, only allow FinalizeAndReport
+        # If turn state is CRITICAL, only allow Final or FinalReport tools
         elif self.turn_state == TurnState.CRITICAL:
-            allowed = ["FinalizeAndReport"]
+            allowed = ["Final", "FinalReport"]
         
         return allowed
     
