@@ -517,45 +517,163 @@ class EventFrame(QFrame):
         if use_markdown:
             # Convert markdown to HTML and use rich text format
             html_text = self._markdown_to_html(unescaped_text)
+            
+            # If style is provided, wrap the HTML in a span with inline style
+            # This avoids style sheet overriding HTML formatting
+            if style:
+                # Parse style to ensure it's safe for inline CSS
+                # For now, just wrap with span if style looks simple
+                # (contains only color, font-weight, etc.)
+                # Use single quotes for style attribute to avoid issues with double quotes in style
+                html_text = f"<span style='{style}'>{html_text}</span>"
+                
             label = QLabel(html_text)
             label.setWordWrap(True)
             label.setTextFormat(Qt.TextFormat.RichText)
+            # Don't apply style sheet for markdown labels - already handled inline
         else:
             # Use plain text format
             label = QLabel(unescaped_text)
             label.setWordWrap(True)
             label.setTextFormat(Qt.TextFormat.PlainText)
+            if style:
+                label.setStyleSheet(style)
         
         label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         # Set size policy to allow vertical expansion for wrapped text
         label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
-        if style:
-            label.setStyleSheet(style)
         self.content_layout.addWidget(label)
     
     def _markdown_to_html(self, text):
-        """Convert basic markdown to HTML."""
+        """Convert basic markdown to HTML with headers, lists, links, etc."""
         import re
         
         # Escape HTML special characters
         escaped = html.escape(text)
         
-        # Convert markdown to HTML
+        # Process line by line for block elements
+        lines = escaped.split('\n')
+        result_lines = []
+        in_list = False
+        list_type = None  # 'ul' or 'ol'
+        in_paragraph = False
+        
+        for line in lines:
+            # Headers: # Header 1, ## Header 2, etc.
+            header_match = re.match(r'^(#{1,6})\s+(.+)$', line)
+            if header_match:
+                if in_paragraph:
+                    result_lines.append('<br/>')
+                    in_paragraph = False
+                if in_list:
+                    result_lines.append(f'</{list_type}>')
+                    in_list = False
+                    list_type = None
+                level = len(header_match.group(1))
+                content = header_match.group(2)
+                result_lines.append(f'<h{level}>{content}</h{level}>')
+                continue
+            
+            # Horizontal rule: --- or *** (three or more)
+            if re.match(r'^---+\s*$', line) or re.match(r'^\*\*\*+\s*$', line):
+                if in_paragraph:
+                    result_lines.append('<br/>')
+                    in_paragraph = False
+                if in_list:
+                    result_lines.append(f'</{list_type}>')
+                    in_list = False
+                    list_type = None
+                result_lines.append('<hr/>')
+                continue
+                
+            # Blockquote: > text
+            if line.startswith('> ') or line.startswith('&gt; '):
+                if in_paragraph:
+                    result_lines.append('<br/>')
+                    in_paragraph = False
+                if in_list:
+                    result_lines.append(f'</{list_type}>')
+                    in_list = False
+                    list_type = None
+                content = line[2:] if line.startswith('> ') else line[5:]  # Remove '&gt; ' (5 chars)
+                result_lines.append(f'<blockquote>{content}</blockquote>')
+                continue
+                
+            # Unordered list: - item or * item
+            list_match = re.match(r'^[-*+]\s+(.+)$', line)
+            if list_match:
+                if in_paragraph:
+                    result_lines.append('<br/>')
+                    in_paragraph = False
+                content = list_match.group(1)
+                if not in_list or list_type != 'ul':
+                    if in_list:
+                        result_lines.append(f'</{list_type}>')
+                    result_lines.append('<ul>')
+                    in_list = True
+                    list_type = 'ul'
+                result_lines.append(f'<li>{content}</li>')
+                continue
+                
+            # Ordered list: 1. item
+            ordered_match = re.match(r'^\d+\.\s+(.+)$', line)
+            if ordered_match:
+                if in_paragraph:
+                    result_lines.append('<br/>')
+                    in_paragraph = False
+                content = ordered_match.group(1)
+                if not in_list or list_type != 'ol':
+                    if in_list:
+                        result_lines.append(f'</{list_type}>')
+                    result_lines.append('<ol>')
+                    in_list = True
+                    list_type = 'ol'
+                result_lines.append(f'<li>{content}</li>')
+                continue
+                
+            # Empty line
+            if line.strip() == '':
+                if in_paragraph:
+                    result_lines.append('<br/>')
+                    in_paragraph = False
+                if in_list:
+                    result_lines.append(f'</{list_type}>')
+                    in_list = False
+                    list_type = None
+                continue
+                
+            # Regular text line
+            if not in_paragraph:
+                in_paragraph = True
+            result_lines.append(line)
+        
+        # Close any open structures
+        if in_paragraph:
+            result_lines.append('<br/>')
+        if in_list:
+            result_lines.append(f'</{list_type}>')
+        
+        # Join lines - block elements already have proper HTML
+        escaped = ''.join(result_lines)
+        
+        # Now apply inline formatting
+        # Process code blocks first to protect them from other markdown
+        escaped = re.sub(r'`(.+?)`', r'<code>\\1</code>', escaped)
+        # Handle triple asterisks/underscores (bold+italic)
+        escaped = re.sub(r'\*\*\*(.+?)\*\*\*', r'<b><i>\\1</i></b>', escaped)
+        escaped = re.sub(r'___(.+?)___', r'<b><i>\\1</i></b>', escaped)
         # Bold: **text** or __text__
-        escaped = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', escaped)
-        escaped = re.sub(r'__(.*?)__', r'<b>\1</b>', escaped)
+        escaped = re.sub(r'\*\*(.+?)\*\*', r'<b>\\1</b>', escaped)
+        escaped = re.sub(r'__(.+?)__', r'<b>\\1</b>', escaped)
         # Italic: *text* or _text_
-        escaped = re.sub(r'\*(?!\*)(.*?)\*(?!\*)', r'<i>\1</i>', escaped)
-        escaped = re.sub(r'_(?!_)(.*?)_(?!_)', r'<i>\1</i>', escaped)
+        escaped = re.sub(r'\*(?!\*)(.+?)\*(?!\*)', r'<i>\\1</i>', escaped)
+        escaped = re.sub(r'_(?!_)(.+?)_(?!_)', r'<i>\\1</i>', escaped)
         # Strikethrough: ~~text~~
-        escaped = re.sub(r'~~(.*?)~~', r'<s>\1</s>', escaped)
-        # Inline code: `code`
-        escaped = re.sub(r'`(.*?)`', r'<code>\1</code>', escaped)
-        # Line breaks
-        escaped = escaped.replace('\n', '<br/>')
+        escaped = re.sub(r'~~(.+?)~~', r'<s>\\1</s>', escaped)
+        # Links: [text](url)
+        escaped = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', escaped)
         
         return escaped
-
 class AgentGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1302,7 +1420,7 @@ class AgentGUI(QMainWindow):
             self.update_buttons(running=True, idle=False)
 
         elif etype == "final":
-            frame.add_content_line(f"Final answer: {event['content']}", style="font-weight: bold; color: #000080;")
+            frame.add_content_line(f"Final answer: {event['content']}", style="font-weight: bold; color: #000080;", use_markdown=True)
             if detail_level != "minimal" and "reasoning" in event and event["reasoning"]:
                 frame.add_content_line(f"Reasoning: {event['reasoning']}", style="color: #666666;", use_markdown=True)
             usage = event.get("usage", {})
