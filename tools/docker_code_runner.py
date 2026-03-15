@@ -102,10 +102,10 @@ class DockerCodeRunner(ToolBase):
         default="agent-executor",
         description="Docker image name (default: agent-executor)"
     )
-    network: str = Field(
-        default="none",
-        description="Container network mode: 'none', 'host', 'bridge', or custom network name"
-    )
+    #network: str = Field(
+    #    default="none",
+    #    description="Container network mode: 'none', 'host', 'bridge', or custom network name"
+    #)
     mem_limit: str = Field(
         default="512m",
         description="Memory limit (e.g., '512m', '1g')"
@@ -180,19 +180,20 @@ class DockerCodeRunner(ToolBase):
             delimiter = 'SCRIPT_EOF'
         
         # Write script using heredoc, make executable, run with interpreter
-        # Use /tmp directory with random name
-        script_path = f"/tmp/script_{uuid.uuid4().hex[:8]}.sh"
-        
+        # Use /workspace/tmp directory with random name (writable location)
+        script_dir = "/workspace/tmp"
+        script_path = f"{script_dir}/script_{uuid.uuid4().hex[:8]}.sh"
+
         # Build command:
+        # 0. Ensure script directory exists
         # 1. Write script content to file using heredoc
         # 2. Make executable
         # 3. Execute with specified interpreter
-        command = f'''cat > "{script_path}" << '{delimiter}'
+        command = f'''mkdir -p "{script_dir}" && cat > "{script_path}" << '{delimiter}'
 {script_content}
 {delimiter}
 chmod +x "{script_path}"
-"{interpreter}" "{script_path}"'''
-        
+"{interpreter}" "{script_path}"'''        
         # If interpreter is 'bash' or 'sh', we could also directly run the script
         # But using interpreter ensures proper execution.
         return command
@@ -296,7 +297,7 @@ chmod +x "{script_path}"
             executor = DockerExecutor(
                 workspace_path=workspace,
                 image=self.image,
-                network=self.network,
+                network="none",     #self.network, <-- Disable network for security
                 mem_limit=self.mem_limit,
                 cpu_quota=self.cpu_quota,
                 force_rebuild=self.build,

@@ -58,6 +58,7 @@ class DockerExecutor:
                 image=self.image,
                 name=container_name,
                 volumes={self.workspace_path: {"bind": "/workspace", "mode": "rw"}},
+                tmpfs={"/tmp": "rw,noexec,nosuid,size=64m"},
                 network=self.network,
                 cap_drop=["ALL"],
                 security_opt=["no-new-privileges:true"],
