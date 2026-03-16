@@ -1640,15 +1640,23 @@ class AgentGUI(QMainWindow):
         finally:
             self._loading_config = False
     
-    def save_config(self):
-        """Save current configuration to file."""
+    def save_config(self, immediate=False):
+        """Save current configuration to file.
+        
+        Args:
+            immediate: If True, save immediately; otherwise use debounced save
+        """
         if self._loading_config:
             return
         
         try:
             config = self.agent_controls_panel.get_config_dict()
-            self.config_service.update(config, save=True)
-            print("[GUI] Configuration saved")
+            print(f"[GUI] Saving config: {config} (immediate={immediate})")
+            # Update config in service
+            self.config_service.update(config, save=False)
+            # Save with appropriate immediacy
+            self.config_service.save(immediate=immediate)
+            print("[GUI] Configuration saved to service")
         except Exception as e:
             print(f"[GUI] Error saving config: {e}")
     
@@ -1720,7 +1728,8 @@ class AgentGUI(QMainWindow):
     
     def closeEvent(self, event):
         """Save configuration before closing the GUI."""
-        self.save_config()
+        # Save immediately on close to ensure config is persisted
+        self.save_config(immediate=True)
         # Clean up presenter
         self.presenter.cleanup()
         super().closeEvent(event)
