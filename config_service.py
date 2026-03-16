@@ -296,6 +296,9 @@ class ConfigService:
                 continue
             
             value = config[key]
+            # Skip validation if nullable and value is None
+            if rules.get('nullable', False) and value is None:
+                continue
             
             # Type validation
             if 'type' in rules:
