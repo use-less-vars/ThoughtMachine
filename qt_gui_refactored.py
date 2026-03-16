@@ -13,14 +13,16 @@ import sys
 import os
 import json
 import html
+import datetime
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QLineEdit, QPushButton, QTextEdit, QListWidget, QListView, QStyledItemDelegate,
-    QGroupBox, QCheckBox, QMenuBar, QMenu, QFileDialog, QStyleOptionViewItem,
-    QMessageBox, QScrollArea, QFrame, QComboBox, QSpinBox, QDoubleSpinBox, QSplitter, QDialog, QSizePolicy,QStyle
+    QLabel, QLineEdit, QPushButton, QTextEdit, QListWidget, QStyledItemDelegate,
+    QGroupBox, QCheckBox, QMenuBar, QMenu, QFileDialog, QStyleOptionViewItem, 
+    QMessageBox, QScrollArea, QFrame, QComboBox, QSpinBox, QDoubleSpinBox, QSplitter, QDialog, QSizePolicy, QStyle
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QAbstractListModel, QModelIndex, QVariant, QRect, QPoint, QSize, QSortFilterProxyModel
-from PyQt6.QtGui import QAction, QFont, QTextDocument, QColor, QPainter, QPalette, QAbstractTextDocumentLayout
+from PyQt6.QtGui import QAction, QKeySequence, QFont, QTextDocument, QTextCursor, QColor, QPainter, QPalette, QAbstractTextDocumentLayout, QPageLayout, QPageSize, QShortcut
+from PyQt6.QtPrintSupport import QPrinter
 from dotenv import load_dotenv
 
 from agent_presenter import AgentPresenter, AgentState
@@ -73,21 +75,35 @@ class SystemViewPanel(QGroupBox):
         dir_layout.addWidget(dir_label)
         
         self.dir_display = QLabel(self.current_dir)
+        self.dir_display.setAccessibleName("Current directory")
+        self.dir_display.setAccessibleDescription("Currently selected directory path")
         self.dir_display.setStyleSheet("color: blue;")
         self.dir_display.setWordWrap(True)
         dir_layout.addWidget(self.dir_display, 1)
         
-        change_btn = QPushButton("Change")
-        change_btn.clicked.connect(self.choose_directory)
-        dir_layout.addWidget(change_btn)
+        self.change_btn = QPushButton("Change")
+        self.change_btn.clicked.connect(self.choose_directory)
+        self.change_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.change_btn.setToolTip("Change current directory")
+        self.change_btn.setAccessibleName("Change directory")
+        self.change_btn.setAccessibleDescription("Open dialog to select a different directory")
+        dir_layout.addWidget(self.change_btn)
         layout.addWidget(dir_frame)
         
         self.list_widget = QListWidget()
+        self.list_widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.list_widget.setToolTip("List of files and directories")
+        self.list_widget.setAccessibleName("File list")
+        self.list_widget.setAccessibleDescription("List of files and directories in current directory")
         layout.addWidget(self.list_widget)
         
-        refresh_btn = QPushButton("Refresh")
-        refresh_btn.clicked.connect(self.refresh_list)
-        layout.addWidget(refresh_btn)
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.clicked.connect(self.refresh_list)
+        self.refresh_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.refresh_btn.setToolTip("Refresh file list")
+        self.refresh_btn.setAccessibleName("Refresh")
+        self.refresh_btn.setAccessibleDescription("Refresh the list of files in current directory")
+        layout.addWidget(self.refresh_btn)
         
         self.setLayout(layout)
         self.refresh_list()
@@ -1195,24 +1211,31 @@ class AgentGUI(QMainWindow):
         
         right_layout.addWidget(filter_widget)
 
-        # Create output area for agent events using virtual scrolling
+        # Create output area for agent events as a single selectable text document
         self.event_model = EventModel()
         self.filter_proxy_model = EventFilterProxyModel()
         self.filter_proxy_model.setSourceModel(self.event_model)
-        
-        self.event_list_view = QListView()
-        self.event_list_view.setModel(self.filter_proxy_model)
-        self.event_list_view.setItemDelegate(EventDelegate())
-        self.event_list_view.setVerticalScrollMode(QListView.ScrollMode.ScrollPerPixel)
-        self.event_list_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.event_list_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.event_list_view.setSelectionMode(QListView.SelectionMode.SingleSelection)
-        self.event_list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.event_list_view.customContextMenuRequested.connect(self._on_event_context_menu)
 
-        right_layout.addWidget(self.event_list_view, 4)  # Larger stretch factor        
+        self.output_textedit = QTextEdit()
+        self.output_textedit.setReadOnly(True)
+        self.output_textedit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.output_textedit.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.output_textedit.setAcceptRichText(True)
+        self.output_textedit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.output_textedit.setStyleSheet("""
+            QTextEdit:focus {
+                border: none;
+                outline: none;
+            }
+            QTextEdit {
+                selection-background-color: #3399ff;
+                selection-color: white;
+            }
+        """)
+
+        right_layout.addWidget(self.output_textedit, 4)  # Larger stretch factor
         # Monitor scrollbar to track user scrolling
-        self.event_list_view.verticalScrollBar().valueChanged.connect(self._on_scrollbar_value_changed)        
+        self.output_textedit.verticalScrollBar().valueChanged.connect(self._on_scrollbar_value_changed)
         # Query input and buttons at bottom
         query_frame = QFrame()
         query_frame.setFrameStyle(QFrame.Shape.Box)
@@ -1257,10 +1280,137 @@ class AgentGUI(QMainWindow):
         
         # Create menu bar
         self.create_menu_bar()
-        
+        # Set up accessibility features
+        self.setup_accessibility()
+
         # Update buttons based on initial state
-        self.update_buttons()
-    
+        self.update_buttons()    
+    def setup_accessibility(self):
+        """Set up accessibility features: keyboard navigation, screen reader support, tooltips."""
+        # Set focus policies for interactive widgets
+        # Buttons
+        self.run_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.stop_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.restart_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.pause_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.agent_controls_panel.toggle_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.agent_controls_panel.set_workspace_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.agent_controls_panel.clear_workspace_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # Line edit
+        self.filter_lineedit.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # Combo boxes
+        self.filter_type_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.agent_controls_panel.model_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.agent_controls_panel.detail_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # Spin boxes
+        self.agent_controls_panel.temperature_spinbox.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.agent_controls_panel.max_turns_spinbox.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.agent_controls_panel.warning_threshold_spinbox.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.agent_controls_panel.critical_threshold_spinbox.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.agent_controls_panel.tool_output_limit_spinbox.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # Checkboxes
+        self.agent_controls_panel.token_monitor_checkbox.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        for checkbox in self.agent_controls_panel.tool_checkboxes.values():
+            checkbox.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # Query entry
+        self.query_entry.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # Output text area
+        self.output_textedit.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        
+        # Set accessible names and descriptions
+        self.run_btn.setAccessibleName("Run agent")
+        self.run_btn.setAccessibleDescription("Start executing the agent with the current query")
+        self.stop_btn.setAccessibleName("Stop agent")
+        self.stop_btn.setAccessibleDescription("Stop the currently running agent")
+        self.restart_btn.setAccessibleName("Restart session")
+        self.restart_btn.setAccessibleDescription("Restart the agent session with fresh context")
+        self.pause_btn.setAccessibleName("Pause agent")
+        self.pause_btn.setAccessibleDescription("Pause the currently running agent")
+        self.filter_lineedit.setAccessibleName("Event filter")
+        self.filter_lineedit.setAccessibleDescription("Filter events by text content")
+        self.filter_type_combo.setAccessibleName("Event type filter")
+        self.filter_type_combo.setAccessibleDescription("Filter events by type")
+        self.query_entry.setAccessibleName("Query input")
+        self.query_entry.setAccessibleDescription("Enter your query for the agent")
+        
+        # Additional accessible names for controls
+        self.agent_controls_panel.toggle_button.setAccessibleName("Toggle controls")
+        self.agent_controls_panel.toggle_button.setAccessibleDescription("Show or hide agent controls panel")
+        self.agent_controls_panel.set_workspace_btn.setAccessibleName("Set workspace")
+        self.agent_controls_panel.set_workspace_btn.setAccessibleDescription("Set workspace directory for agent")
+        self.agent_controls_panel.clear_workspace_btn.setAccessibleName("Clear workspace")
+        self.agent_controls_panel.clear_workspace_btn.setAccessibleDescription("Clear workspace restriction")
+        self.agent_controls_panel.token_monitor_checkbox.setAccessibleName("Token monitor")
+        self.agent_controls_panel.token_monitor_checkbox.setAccessibleDescription("Enable token usage warnings")
+        self.agent_controls_panel.warning_threshold_spinbox.setAccessibleName("Warning threshold")
+        self.agent_controls_panel.warning_threshold_spinbox.setAccessibleDescription("Warning threshold in thousands of tokens")
+        self.agent_controls_panel.critical_threshold_spinbox.setAccessibleName("Critical threshold")
+        self.agent_controls_panel.critical_threshold_spinbox.setAccessibleDescription("Critical threshold in thousands of tokens")
+        self.agent_controls_panel.temperature_spinbox.setAccessibleName("Temperature")
+        self.agent_controls_panel.temperature_spinbox.setAccessibleDescription("Temperature for agent responses (0.0-2.0)")
+        self.agent_controls_panel.max_turns_spinbox.setAccessibleName("Max turns")
+        self.agent_controls_panel.max_turns_spinbox.setAccessibleDescription("Maximum number of turns before auto-stop")
+        self.agent_controls_panel.tool_output_limit_spinbox.setAccessibleName("Tool output limit")
+        self.agent_controls_panel.tool_output_limit_spinbox.setAccessibleDescription("Maximum token limit for tool outputs")
+        self.agent_controls_panel.model_combo.setAccessibleName("Model")
+        self.agent_controls_panel.model_combo.setAccessibleDescription("Select AI model")
+        self.agent_controls_panel.detail_combo.setAccessibleName("Detail level")
+        self.agent_controls_panel.detail_combo.setAccessibleDescription("Detail level for agent responses")
+        # Tool checkboxes
+        for name, checkbox in self.agent_controls_panel.tool_checkboxes.items():
+            checkbox.setAccessibleName(f"Tool: {name}")
+            checkbox.setAccessibleDescription(f"Enable or disable {name} tool")
+        
+        # Set tooltips
+        self.run_btn.setToolTip("Run the agent (Ctrl+R)")
+        self.stop_btn.setToolTip("Stop the agent (Ctrl+.)")
+        self.restart_btn.setToolTip("Restart the session (Ctrl+Shift+R)")
+        self.pause_btn.setToolTip("Pause the agent (Ctrl+P)")
+        self.agent_controls_panel.toggle_button.setToolTip("Show/hide agent controls (Ctrl+T)")
+        self.agent_controls_panel.set_workspace_btn.setToolTip("Set workspace directory")
+        self.agent_controls_panel.clear_workspace_btn.setToolTip("Clear workspace restriction")
+        self.filter_lineedit.setToolTip("Filter events by text (Ctrl+F to focus, Esc to clear)")
+        self.query_entry.setToolTip("Enter query for agent (Ctrl+L to focus)")
+        self.filter_type_combo.setToolTip("Filter events by type")
+        self.agent_controls_panel.token_monitor_checkbox.setToolTip("Enable token usage warnings")
+        self.agent_controls_panel.warning_threshold_spinbox.setToolTip("Warning threshold in thousands of tokens")
+        self.agent_controls_panel.critical_threshold_spinbox.setToolTip("Critical threshold in thousands of tokens")
+        self.agent_controls_panel.temperature_spinbox.setToolTip("Temperature for agent responses (0.0-2.0)")
+        self.agent_controls_panel.max_turns_spinbox.setToolTip("Maximum number of turns before auto-stop")
+        self.agent_controls_panel.tool_output_limit_spinbox.setToolTip("Maximum token limit for tool outputs")
+        self.agent_controls_panel.model_combo.setToolTip("Select AI model")
+        self.agent_controls_panel.detail_combo.setToolTip("Detail level for agent responses")
+        
+        # Set tab order (logical top-to-bottom, left-to-right)
+        # Let Qt handle default tab order based on widget creation order.
+        # We'll ensure order by setting focus proxies if needed.
+        
+        # Add keyboard shortcuts
+        self.run_shortcut = QShortcut(QKeySequence("Ctrl+R"), self)
+        self.run_shortcut.activated.connect(self.run_agent)
+        self.stop_shortcut = QShortcut(QKeySequence("Ctrl+."), self)
+        self.stop_shortcut.activated.connect(self.stop_agent)
+        self.pause_shortcut = QShortcut(QKeySequence("Ctrl+P"), self)
+        self.pause_shortcut.activated.connect(self.pause_agent)
+        self.restart_shortcut = QShortcut(QKeySequence("Ctrl+Shift+R"), self)
+        self.restart_shortcut.activated.connect(self.restart_session)
+        
+        # Additional keyboard shortcuts
+        self.focus_query_shortcut = QShortcut(QKeySequence("Ctrl+L"), self)
+        self.focus_query_shortcut.activated.connect(lambda: self.query_entry.setFocus())
+        self.focus_filter_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        self.focus_filter_shortcut.activated.connect(lambda: self.filter_lineedit.setFocus())
+        self.clear_filter_shortcut = QShortcut(QKeySequence("Esc"), self.filter_lineedit)
+        self.clear_filter_shortcut.activated.connect(lambda: self.filter_lineedit.clear())
+        self.toggle_controls_shortcut = QShortcut(QKeySequence("Ctrl+T"), self)
+        self.toggle_controls_shortcut.activated.connect(self.agent_controls_panel.toggle_collapse)
+        
+
+        
+        # Set window accessible name
+        self.setAccessibleName("Agent Workbench")
+        self.setAccessibleDescription("Graphical interface for interacting with ThoughtMachine AI agent")
+
     def setup_signal_connections(self):
         """Connect presenter signals to GUI slots."""
         # Connect presenter signals
@@ -1318,7 +1468,16 @@ class AgentGUI(QMainWindow):
         
         # Add event to model for virtual scrolling
         self.event_model.add_event(event_with_detail)
-        
+
+        # If event passes current filter, add to output text area
+        if self._event_passes_filter(event_with_detail):
+            html = self._format_event_html(event_with_detail)
+            cursor = self.output_textedit.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            if not self.output_textedit.document().isEmpty():
+                cursor.insertHtml("<hr>")
+            cursor.insertHtml(html)
+
         # Handle any UI interactions
         if etype == "user_interaction_requested":
             # Auto-focus the query input
@@ -1380,7 +1539,48 @@ class AgentGUI(QMainWindow):
         filter_text = self.filter_lineedit.text()
         filter_type = self.filter_type_combo.currentText()
         self.filter_proxy_model.set_filter(filter_text, filter_type)
+        self._rebuild_output_document()
     
+    def _rebuild_output_document(self):
+        """Rebuild the output text document from filtered events."""
+        self.output_textedit.clear()
+        delegate = EventDelegate()
+        for row in range(self.filter_proxy_model.rowCount()):
+            index = self.filter_proxy_model.index(row, 0)
+            event = index.data(Qt.ItemDataRole.UserRole)
+            if event:
+                html = delegate._event_to_html(event)
+                # Append HTML with a separator
+                cursor = self.output_textedit.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                if row > 0:
+                    cursor.insertHtml("<hr>")
+                cursor.insertHtml(html)
+
+    def _format_event_html(self, event):
+        """Format event as HTML for display in QTextEdit."""
+        delegate = EventDelegate()
+        return delegate._event_to_html(event)
+
+    def _event_passes_filter(self, event):
+        """Check if event passes current filter criteria."""
+        filter_type = self.filter_proxy_model.filter_type
+        if filter_type != "all":
+            if event.get("type") != filter_type:
+                return False
+        filter_text = self.filter_proxy_model.filter_text
+        if filter_text:
+            content = event.get("content", "").lower()
+            reasoning = event.get("reasoning", "").lower()
+            tool_calls = event.get("tool_calls", [])
+            tool_text = " ".join([tc.get("name", "") + " " + str(tc.get("arguments", "")) for tc in tool_calls]).lower()
+            if (filter_text not in content and
+                filter_text not in reasoning and
+                filter_text not in tool_text and
+                filter_text not in event.get("type", "").lower()):
+                return False
+        return True
+
     @pyqtSlot(str, str)
     def on_error_occurred(self, error_message, traceback):
         """Handle errors from presenter."""
@@ -1442,6 +1642,7 @@ class AgentGUI(QMainWindow):
         
         # Clear event model (virtual scrolling)
         self.event_model.clear()
+        self.output_textedit.clear()
         
         # Reset token counters
         self.total_input = 0
@@ -1566,7 +1767,7 @@ class AgentGUI(QMainWindow):
         """Programmatically scroll to bottom."""
         self._programmatic_scroll = True
         try:
-            scrollbar = self.event_list_view.verticalScrollBar()
+            scrollbar = self.output_textedit.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
         finally:
             self._programmatic_scroll = False
@@ -1577,48 +1778,12 @@ class AgentGUI(QMainWindow):
         if self._programmatic_scroll:
             return
         
-        scrollbar = self.event_list_view.verticalScrollBar()
+        scrollbar = self.output_textedit.verticalScrollBar()
         max_val = scrollbar.maximum()
         # If user is within 10 pixels of bottom, consider them at bottom
         self._user_scrolled_away = value < max_val - 10
         # Auto-scroll enabled when user at bottom
         self._auto_scroll_enabled = not self._user_scrolled_away
-    
-    def _on_event_context_menu(self, position):
-        """Show context menu for event list with copy option."""
-        index = self.event_list_view.indexAt(position)
-        if not index.isValid():
-            return
-        
-        # Get the event data
-        event = index.data(Qt.ItemDataRole.UserRole)
-        if not event:
-            return
-        
-        # Create context menu
-        menu = QMenu()
-        copy_action = menu.addAction("Copy")
-        
-        # Show menu and get selected action
-        selected_action = menu.exec(self.event_list_view.viewport().mapToGlobal(position))
-        
-        if selected_action == copy_action:
-            # Extract plain text from event using the delegate
-            delegate = self.event_list_view.itemDelegate()
-            if hasattr(delegate, '_event_to_plain_text'):
-                plain_text = delegate._event_to_plain_text(event)
-                if plain_text:
-                    clipboard = QApplication.clipboard()
-                    clipboard.setText(plain_text)
-            else:
-                # Fallback: just convert event dict to string
-                import json
-                plain_text = json.dumps(event, indent=2)
-                clipboard = QApplication.clipboard()
-                clipboard.setText(plain_text)
-    
-    # ----- Configuration Management -----
-    
     def load_config(self):
         """Load configuration from file and update controls."""
         self._loading_config = True
@@ -1722,9 +1887,329 @@ class AgentGUI(QMainWindow):
         
         file_menu.addSeparator()
         
+        # Export submenu
+        export_menu = file_menu.addMenu("Export Conversation")
+        
+        export_text_action = QAction("As Plain Text", self)
+        export_text_action.triggered.connect(self.export_conversation_text)
+        export_menu.addAction(export_text_action)
+        
+        export_html_action = QAction("As HTML", self)
+        export_html_action.triggered.connect(self.export_conversation_html)
+        export_menu.addAction(export_html_action)
+        
+        export_pdf_action = QAction("As PDF", self)
+        export_pdf_action.triggered.connect(self.export_conversation_pdf)
+        export_menu.addAction(export_pdf_action)
+        
+        file_menu.addSeparator()
+        
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
+        
+        # View menu
+        view_menu = menu_bar.addMenu("View")
+        
+        # Theme submenu
+        theme_menu = view_menu.addMenu("Theme")
+        
+        light_theme_action = QAction("Light", self)
+        light_theme_action.triggered.connect(lambda: self.set_theme("light"))
+        theme_menu.addAction(light_theme_action)
+        
+        dark_theme_action = QAction("Dark", self)
+        dark_theme_action.triggered.connect(lambda: self.set_theme("dark"))
+        theme_menu.addAction(dark_theme_action)
+        
+        high_contrast_theme_action = QAction("High Contrast", self)
+        high_contrast_theme_action.triggered.connect(lambda: self.set_theme("high_contrast"))
+        theme_menu.addAction(high_contrast_theme_action)
+        
+        # Keyboard shortcuts
+        save_config_action.setShortcut("Ctrl+S")
+        load_config_action.setShortcut("Ctrl+O")
+        exit_action.setShortcut("Ctrl+Q")
+    
+    # ----- Theme Methods -----
+    
+    def set_theme(self, theme_name):
+        """Set application theme."""
+        themes = {
+            "light": "",  # Default Fusion style
+            "dark": """
+                QWidget {
+                    background-color: #2b2b2b;
+                    color: #ffffff;
+                }
+                QGroupBox {
+                    border: 1px solid #555555;
+                    border-radius: 5px;
+                    margin-top: 10px;
+                    padding-top: 10px;
+                }
+                QGroupBox::title {
+                    subcontrol-origin: margin;
+                    left: 10px;
+                    padding: 0 5px 0 5px;
+                }
+                QPushButton {
+                    background-color: #3c3c3c;
+                    border: 1px solid #555555;
+                    border-radius: 3px;
+                    padding: 5px 10px;
+                }
+                QPushButton:hover {
+                    background-color: #4c4c4c;
+                }
+                QPushButton:pressed {
+                    background-color: #2c2c2c;
+                }
+                QLabel {
+                    color: #ffffff;
+                }
+
+                QLineEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+                    background-color: #3c3c3c;
+                    color: #ffffff;
+                    border: 1px solid #555555;
+                    padding: 3px;
+                }
+                QCheckBox {
+                    color: #ffffff;
+                }
+                QScrollBar:vertical {
+                    background-color: #2b2b2b;
+                    width: 15px;
+                }
+                QScrollBar::handle:vertical {
+                    background-color: #555555;
+                    border-radius: 7px;
+                    min-height: 20px;
+                }
+                QScrollBar::handle:vertical:hover {
+                    background-color: #666666;
+                }
+            """,
+            "high_contrast": """
+                QWidget {
+                    background-color: #000000;
+                    color: #ffffff;
+                }
+                QGroupBox {
+                    border: 2px solid #ffffff;
+                    border-radius: 5px;
+                    margin-top: 10px;
+                    padding-top: 10px;
+                }
+                QGroupBox::title {
+                    subcontrol-origin: margin;
+                    left: 10px;
+                    padding: 0 5px 0 5px;
+                    color: #ffff00;
+                }
+                QPushButton {
+                    background-color: #000000;
+                    border: 2px solid #ffffff;
+                    border-radius: 3px;
+                    padding: 5px 10px;
+                    color: #ffffff;
+                }
+                QPushButton:hover {
+                    background-color: #222222;
+                }
+                QPushButton:pressed {
+                    background-color: #444444;
+                }
+                QLabel {
+                    color: #ffffff;
+                }
+
+                QLineEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+                    background-color: #000000;
+                    color: #ffffff;
+                    border: 2px solid #ffffff;
+                    padding: 3px;
+                }
+                QCheckBox {
+                    color: #ffffff;
+                }
+                QCheckBox::indicator {
+                    border: 2px solid #ffffff;
+                }
+                QScrollBar:vertical {
+                    background-color: #000000;
+                    width: 15px;
+                }
+                QScrollBar::handle:vertical {
+                    background-color: #ffffff;
+                    border-radius: 7px;
+                    min-height: 20px;
+                }
+            """
+        }
+        
+        if theme_name in themes:
+            self.setStyleSheet(themes[theme_name])
+            self.current_theme = theme_name
+            print(f"[GUI] Theme set to: {theme_name}")
+        else:
+            print(f"[GUI] Unknown theme: {theme_name}")
+    
+    # ----- Export Methods -----
+    
+    def export_conversation_text(self):
+        """Export conversation as plain text."""
+        file_path, _ = QFileDialog.getSaveFileName(self, "Export Conversation as Text", "", "Text Files (*.txt);;All Files (*)")
+        if not file_path:
+            return
+        
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                # Get all events from the model
+                for i in range(self.event_model.rowCount()):
+                    event = self.event_model.data(self.event_model.index(i), Qt.ItemDataRole.UserRole)
+                    if event:
+                        # Use delegate's plain text conversion method
+                        delegate = EventDelegate()
+                        if hasattr(delegate, '_event_to_plain_text'):
+                            plain_text = delegate._event_to_plain_text(event)
+                            f.write(plain_text)
+                            f.write('\n' + '-'*80 + '\n\n')
+                        else:
+                            # Fallback to JSON representation
+                            import json
+                            f.write(json.dumps(event, indent=2))
+                            f.write('\n' + '-'*80 + '\n\n')
+            
+            QMessageBox.information(self, "Export Successful", f"Conversation exported to {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to export conversation: {e}")
+    
+    def export_conversation_html(self):
+        """Export conversation as HTML."""
+        file_path, _ = QFileDialog.getSaveFileName(self, "Export Conversation as HTML", "", "HTML Files (*.html);;All Files (*)")
+        if not file_path:
+            return
+        
+        try:
+            html_content = '''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Agent Conversation</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; }
+        .event { border: 1px solid #ddd; margin-bottom: 20px; padding: 15px; border-radius: 5px; }
+        .role { font-weight: bold; color: #333; margin-bottom: 5px; }
+        .timestamp { color: #666; font-size: 0.9em; }
+        .content { margin-top: 10px; }
+        pre { background: #f5f5f5; padding: 10px; border-radius: 3px; overflow: auto; }
+        code { font-family: monospace; }
+    </style>
+</head>
+<body>
+    <h1>Agent Conversation</h1>
+    <p>Exported on ''' + datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S') + '''</p>
+'''
+            
+            # Get all events from the model
+            for i in range(self.event_model.rowCount()):
+                event = self.event_model.data(self.event_model.index(i), Qt.ItemDataRole.UserRole)
+                if event:
+                    role = event.get('role', 'unknown')
+                    content = event.get('content', '')
+                    timestamp = event.get('timestamp', '')
+                    
+                    # Escape HTML and wrap in appropriate tags
+                    html_content += f'''<div class="event">
+        <div class="role">{html.escape(role)}</div>
+'''
+                    if timestamp:
+                        html_content += f'''        <div class="timestamp">{html.escape(str(timestamp))}</div>
+'''
+                    
+                    # Format content - preserve line breaks and code blocks
+                    formatted_content = html.escape(content).replace('\n', '<br>\n')
+                    # Simple code block detection
+                    formatted_content = formatted_content.replace('```', '<pre><code>')
+                    
+                    html_content += f'''        <div class="content">{formatted_content}</div>
+    </div>
+'''
+            
+            html_content += '''</body>
+</html>'''
+            
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+            
+            QMessageBox.information(self, "Export Successful", f"Conversation exported to {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to export conversation: {e}")
+    
+    def export_conversation_pdf(self):
+        """Export conversation as PDF."""
+        file_path, _ = QFileDialog.getSaveFileName(self, "Export Conversation as PDF", "", "PDF Files (*.pdf);;All Files (*)")
+        if not file_path:
+            return
+        
+        try:
+            # Create a QTextDocument for PDF rendering
+            doc = QTextDocument()
+            html_content = '''<html>
+<head>
+    <style>
+        body { font-family: sans-serif; }
+        .event { margin-bottom: 20px; }
+        .role { font-weight: bold; color: #333; }
+        .timestamp { color: #666; font-size: 0.9em; }
+        .content { margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <h1>Agent Conversation</h1>
+'''
+            
+            # Get all events from the model
+            for i in range(self.event_model.rowCount()):
+                event = self.event_model.data(self.event_model.index(i), Qt.ItemDataRole.UserRole)
+                if event:
+                    role = event.get('role', 'unknown')
+                    content = event.get('content', '')
+                    timestamp = event.get('timestamp', '')
+                    
+                    html_content += f'''<div class="event">
+    <div class="role">{html.escape(role)}</div>
+'''
+                    if timestamp:
+                        html_content += f'''    <div class="timestamp">{html.escape(str(timestamp))}</div>
+'''
+                    
+                    # Format content for PDF
+                    formatted_content = html.escape(content).replace('\n', '<br>')
+                    html_content += f'''    <div class="content">{formatted_content}</div>
+</div>
+'''
+            
+            html_content += '''</body>
+</html>'''
+            
+            doc.setHtml(html_content)
+            
+            # Create printer and print to PDF
+            printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+            printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+            printer.setOutputFileName(file_path)
+            printer.setPageSize(QPageSize(QPageSize.Size.A4))
+            printer.setPageOrientation(QPageLayout.Orientation.Portrait)
+            
+            # Print the document
+            doc.print(printer)
+            
+            QMessageBox.information(self, "Export Successful", f"Conversation exported to {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to export conversation: {e}")
     
     def closeEvent(self, event):
         """Save configuration before closing the GUI."""
