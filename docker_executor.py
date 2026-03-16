@@ -156,12 +156,6 @@ class DockerExecutor:
             raise error
         
         return exit_code, output
-    def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            # Ignore errors during cleanup
-            pass
     def _ensure_image(self):
         """Build Docker image if it doesn't exist locally or force_rebuild is True."""
         if self.force_rebuild:
