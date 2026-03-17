@@ -1475,6 +1475,9 @@ class AgentGUI(QMainWindow):
         self.agent_controls_panel.token_monitor_checkbox.stateChanged.connect(self._handle_config_change)
         self.agent_controls_panel.warning_threshold_spinbox.valueChanged.connect(self._handle_config_change)
         self.agent_controls_panel.critical_threshold_spinbox.valueChanged.connect(self._handle_config_change)
+        # API key and base URL connections
+        self.agent_controls_panel.api_key_edit.textChanged.connect(self._handle_config_change)
+        self.agent_controls_panel.base_url_edit.textChanged.connect(self._handle_config_change)
         # Turn monitoring connections
         self.agent_controls_panel.turn_monitor_checkbox.stateChanged.connect(self._handle_config_change)
         self.agent_controls_panel.turn_warning_threshold_spinbox.valueChanged.connect(self._handle_config_change)
@@ -1956,7 +1959,11 @@ class AgentGUI(QMainWindow):
     
     def restart_session(self):
         """Restart a fresh session with current GUI settings."""
-        self.presenter.restart_session()
+        # Get current query before clearing
+        query = self.query_entry.toPlainText().strip()
+        
+        # Restart with current query (if any)
+        self.presenter.restart_session(query)
         
         # Clear event model (virtual scrolling)
         self.event_model.clear()

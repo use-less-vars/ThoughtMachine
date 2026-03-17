@@ -258,22 +258,35 @@ class AgentPresenter(QObject):
         """Check if restart is possible (has cached configuration)."""
         return self._cached_config is not None
 
-    def restart_session(self):
-        """Restart a fresh session with cached configuration."""
-        if not self._cached_config:
-            self.error_occurred.emit("No cached configuration for restart", "")
-            return
+    def restart_session(self, query: str = None):
+        """
+        Restart a fresh session with current configuration.
         
+        Args:
+            query: Optional query to start with. If not provided, waits for user input.
+        """
+        # Update cached config with current config to ensure restart uses current settings
+        try:
+            # Create AgentConfig from current config to cache for restart
+            self._cached_config = self.create_agent_config()
+        except Exception as e:
+            self.error_occurred.emit(f"Cannot create config for restart: {str(e)}", "")
+            return
+
         if self.state != AgentState.IDLE:
             self.stop_session()
-        
+
         # Reset controller
         self.controller.reset()
-        
+
         # Update state and status
         self.state = AgentState.IDLE
-        self.status_message.emit("Ready for new session")
-    
+        
+        # If query is provided, start session automatically
+        if query:
+            self.start_session(query)
+        else:
+            self.status_message.emit("Ready for new session")    
     def continue_session(self, query: str):
         """
         Continue an existing session with a new query.
