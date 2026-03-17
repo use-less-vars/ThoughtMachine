@@ -4,7 +4,7 @@ import logging
 import os
 from typing import Optional, Callable, List, Any, Dict, Literal
 from openai import OpenAI
-from pydantic import BaseModel, ValidationError, Field
+from pydantic import BaseModel, ValidationError, Field, field_validator, model_validator
 
 from tools import TOOL_CLASSES, SIMPLIFIED_TOOL_CLASSES
 from tools.base import ToolBase
@@ -32,7 +32,7 @@ class AgentConfig(BaseModel):
     provider_type: Literal["openai_compatible", "anthropic", "openai"] = "openai_compatible"
     provider_config: Dict[str, Any] = Field(default_factory=dict)
     temperature: float = 0.2
-    max_turns: int = 30
+    max_turns: int = 100
     stop_check: Optional[Callable[[], bool]] = None
     tool_classes: Optional[List[type]] = None   #
     initial_conversation: Optional[List[Dict[str, Any]]] = None
@@ -69,6 +69,11 @@ class AgentConfig(BaseModel):
 
     # Tool output limit configuration
     tool_output_token_limit: int = Field(default=10000, description="Maximum token limit for tool outputs (default 10,000 tokens)")
+    # UI detail level configuration
+    detail: Literal["minimal", "normal", "verbose"] = Field(default="normal", description="Detail level for event display")
+
+    # Enabled tools configuration
+    enabled_tools: List[str] = Field(default_factory=lambda: [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES], description="List of enabled tool class names")
 
     class Config:        extra = "ignore"  # Allow backward compatibility with older configs
 def run_agent_stream(query: str, config: AgentConfig):

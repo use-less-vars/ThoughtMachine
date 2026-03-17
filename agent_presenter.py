@@ -84,6 +84,7 @@ class AgentPresenter(QObject):
     
     def _load_default_config(self) -> dict:
         """Return default configuration dictionary."""
+        """Return default configuration dictionary."""
         return {
             "temperature": 0.2,
             "max_turns": 100,
@@ -94,7 +95,11 @@ class AgentPresenter(QObject):
             "tool_output_limit": 10000,
             "model": "deepseek-reasoner",
             "detail": "normal",
-            "enabled_tools": [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES]
+            "enabled_tools": [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES],
+            "api_key": "",
+            "base_url": "https://api.deepseek.com",
+            "provider_type": "openai_compatible",
+            "provider_config": {}
         }
     
     def _load_config(self):
@@ -133,10 +138,10 @@ class AgentPresenter(QObject):
     def create_agent_config(self, config_dict: Optional[dict] = None) -> AgentConfig:
         """
         Create AgentConfig instance from configuration dictionary.
-        
+
         Args:
             config_dict: Optional dictionary to override current config
-            
+
         Returns:
             AgentConfig instance ready for use with controller
         """
@@ -145,34 +150,77 @@ class AgentPresenter(QObject):
             config = {**self._config, **config_dict}
         else:
             config = self._config
-        
+
         # Get API key from config or environment (try OPENAI_API_KEY then DEEPSEEK_API_KEY)
         api_key = config.get("api_key") or os.getenv("OPENAI_API_KEY") or os.getenv("DEEPSEEK_API_KEY")
         if not api_key:
             raise ValueError("Neither OPENAI_API_KEY nor DEEPSEEK_API_KEY environment variables are set, and no api_key in config. Please set one of them or add api_key to config.")
-        
+
         # Create tools list from enabled tool names
         enabled_tools = config.get("enabled_tools", [])
         tool_classes = []
         for cls in SIMPLIFIED_TOOL_CLASSES:
             if cls.__name__ in enabled_tools:
                 tool_classes.append(cls)
+
+        # Build agent_kwargs with proper field mapping
+        agent_kwargs = {}
         
-        # Create AgentConfig
-        agent_config = AgentConfig(
-            api_key=api_key,
-            model=config.get("model", "deepseek-reasoner"),
-            tools=tool_classes,
-            temperature=config.get("temperature", 0.2),
-            max_turns=config.get("max_turns", 100),
-            token_monitor_enabled=config.get("token_monitor_enabled", True),
-            token_monitor_warning_threshold=config.get("warning_threshold", 35) * 1000,
-            token_monitor_critical_threshold=config.get("critical_threshold", 50) * 1000,
-            workspace_path=config.get("workspace_path"),
-            tool_output_limit=config.get("tool_output_limit", 10000),
-            detail=config.get("detail", "normal")
-        )
-        
+        # Always include the API key (from config or environment)
+        agent_kwargs["api_key"] = api_key
+
+        # Direct mappings for other fields
+        direct_mappings = [
+            ("model", "model"),
+            ("provider_type", "provider_type"),
+            ("provider_config", "provider_config"),
+            ("temperature", "temperature"),
+            ("max_turns", "max_turns"),
+            ("workspace_path", "workspace_path"),
+            ("detail", "detail"),
+            ("token_monitor_enabled", "token_monitor_enabled"),
+            ("enabled_tools", "enabled_tools"),
+            ("turn_monitor_enabled", "turn_monitor_enabled"),
+            ("turn_monitor_warning_threshold", "turn_monitor_warning_threshold"),
+            ("turn_monitor_critical_threshold", "turn_monitor_critical_threshold"),
+            ("max_history_turns", "max_history_turns"),
+            ("keep_initial_query", "keep_initial_query"),
+            ("keep_system_messages", "keep_system_messages"),
+        ]
+
+        for config_key, agent_key in direct_mappings:
+            if config_key in config:
+                agent_kwargs[agent_key] = config[config_key]
+
+        # Field renaming for tool output limit (backward compatibility)
+        if "tool_output_token_limit" in config:
+            agent_kwargs["tool_output_token_limit"] = config["tool_output_token_limit"]
+        elif "tool_output_limit" in config:
+            agent_kwargs["tool_output_token_limit"] = config["tool_output_limit"]
+
+        # Handle token monitor thresholds with backward compatibility
+        # Prefer actual token values if present, otherwise convert from thousands
+        if "token_monitor_warning_threshold" in config:
+            agent_kwargs["token_monitor_warning_threshold"] = config["token_monitor_warning_threshold"]
+        elif "warning_threshold" in config:
+            agent_kwargs["token_monitor_warning_threshold"] = config["warning_threshold"] * 1000
+
+        if "token_monitor_critical_threshold" in config:
+            agent_kwargs["token_monitor_critical_threshold"] = config["token_monitor_critical_threshold"]
+        elif "critical_threshold" in config:
+            agent_kwargs["token_monitor_critical_threshold"] = config["critical_threshold"] * 1000
+
+        # Conditional base_url
+        base_url = config.get("base_url")
+        if base_url:
+            agent_kwargs["base_url"] = base_url
+
+        # Add tool_classes (created from enabled_tools)
+        agent_kwargs["tool_classes"] = tool_classes
+
+        # Create AgentConfig instance (AgentConfig will use defaults for missing fields)
+        agent_config = AgentConfig(**agent_kwargs)
+
         return agent_config
     
     def start_session(self, query: str, config: Optional[dict] = None):
@@ -206,6 +254,10 @@ class AgentPresenter(QObject):
             self.error_occurred.emit(f"Failed to start session: {str(e)}", "")
             print(f"[Presenter] Error starting session: {e}")
     
+    def can_restart(self) -> bool:
+        """Check if restart is possible (has cached configuration)."""
+        return self._cached_config is not None
+
     def restart_session(self):
         """Restart a fresh session with cached configuration."""
         if not self._cached_config:

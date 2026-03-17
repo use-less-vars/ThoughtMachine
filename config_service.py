@@ -42,7 +42,7 @@ class ConfigService:
         
         # Validate default config against schema
         if self.schema:
-            self._validate_config(self.default_config, "default configuration")
+            self._validate_config(self.default_config, "default configuration", strict=True)
         
         # Load existing config or create with defaults
         self.load()
@@ -63,7 +63,7 @@ class ConfigService:
                 if self.schema:
                     test_config = self.default_config.copy()
                     test_config.update(loaded)
-                    if not self._validate_config(test_config, "loaded configuration"):
+                    if not self._validate_config(test_config, "loaded configuration", strict=False):
                         print(f"[ConfigService] Loaded config failed validation, using defaults")
                         with self._lock:
                             self._config = self.default_config.copy()
@@ -162,7 +162,7 @@ class ConfigService:
         if validate and self.schema:
             test_config = self.get_all().copy()
             test_config[key] = value
-            if not self._validate_config(test_config, f"set operation for key '{key}'"):
+            if not self._validate_config(test_config, f"set operation for key '{key}'", strict=True):
                 print(f"[ConfigService] Validation failed for key '{key}', value not set")
                 return
         
@@ -191,7 +191,7 @@ class ConfigService:
         if validate and self.schema:
             test_config = self.get_all().copy()
             test_config.update(updates)
-            if not self._validate_config(test_config, "bulk update operation"):
+            if not self._validate_config(test_config, "bulk update operation", strict=True):
                 print("[ConfigService] Validation failed for bulk update, no changes applied")
                 return
         
@@ -258,28 +258,30 @@ class ConfigService:
                 except Exception as e:
                     print(f"[ConfigService] Error in listener: {e}")
     
-    def validate(self, schema: Optional[Dict[str, Any]] = None) -> bool:
+    def validate(self, schema: Optional[Dict[str, Any]] = None, strict: bool = True) -> bool:
         """
         Validate configuration against schema.
         
         Args:
             schema: Validation schema (optional, basic type checking if not provided)
+            strict: If True, unknown keys cause validation failure; if False, unknown keys are ignored
             
         Returns:
             True if valid, False otherwise
         """
-        return self._validate_config(self._config, "current configuration", schema)
+        return self._validate_config(self._config, "current configuration", schema, strict)
     
     def _validate_config(self, config: Dict[str, Any], context: str = "configuration", 
-                         schema: Optional[Dict[str, Any]] = None) -> bool:
+                         schema: Optional[Dict[str, Any]] = None, strict: bool = True) -> bool:
         """
         Validate configuration against schema.
-        
+
         Args:
             config: Configuration dictionary to validate
             context: Description of what's being validated (for error messages)
             schema: Validation schema (optional, uses self.schema if not provided)
-            
+            strict: If True, unknown keys cause validation failure; if False, unknown keys are ignored
+
         Returns:
             True if valid, False otherwise
         """
@@ -334,9 +336,10 @@ class ConfigService:
                 errors.append(f"Key '{key}' must be one of {rules['choices']}, got {value}")
         
         # Check for unknown keys
-        for key in config.keys():
-            if key not in validation_schema:
-                errors.append(f"Unknown configuration key '{key}'")
+        if strict:
+            for key in config.keys():
+                if key not in validation_schema:
+                    errors.append(f"Unknown configuration key '{key}'")
         
         if errors:
             print(f"[ConfigService] Validation errors in {context}:\n" + "\n".join(errors))
@@ -384,39 +387,56 @@ def create_agent_config_service(config_path: str = "agent_config.json") -> Confi
         ConfigService instance with agent defaults
     """
     from tools import SIMPLIFIED_TOOL_CLASSES
-    
-    default_config = {
-        "temperature": 0.2,
-        "max_turns": 100,
-        "token_monitor_enabled": True,
-        "warning_threshold": 35,  # in thousands
-        "critical_threshold": 50,  # in thousands
-        "workspace_path": None,
-        "tool_output_limit": 10000,
-        "provider_type": "openai_compatible",
-        "api_key": "",
-        "base_url": "https://api.deepseek.com",
-        "model": "deepseek-reasoner",
-        "detail": "normal",
-        "enabled_tools": [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES],
-        "provider_config": {}
-    }
-    
+    from agent_core import AgentConfig
+
+    # Create default AgentConfig instance
+    default_agent_config = AgentConfig()
+    # Convert to dict for ConfigService
+    default_config = default_agent_config.model_dump(exclude_none=True)
+    # Ensure backward compatibility: add warning_threshold and critical_threshold (in thousands)
+    default_config["warning_threshold"] = default_agent_config.token_monitor_warning_threshold // 1000
+    default_config["critical_threshold"] = default_agent_config.token_monitor_critical_threshold // 1000
+    # tool_output_limit alias
+    default_config["tool_output_limit"] = default_agent_config.tool_output_token_limit
+    # Remove fields that are not needed for UI/config storage
+    # (ConfigService will ignore extra keys, but we filter to reduce warnings)
+    fields_to_remove = [
+        "initial_input_tokens", "initial_output_tokens",
+        "enable_logging", "log_dir", "log_level", "enable_file_logging",
+        "enable_console_logging", "jsonl_format", "max_file_size_mb", "max_backup_files",
+        "tool_output_token_limit",  # replaced by tool_output_limit alias
+    ]
+    for key in fields_to_remove:
+        default_config.pop(key, None)
+
+    # Schema for validation (simplified, using AgentConfig validation primarily)
     schema = {
         "temperature": {"type": "float", "min": 0.0, "max": 2.0},
         "max_turns": {"type": "int", "min": 1, "max": 500},
         "token_monitor_enabled": {"type": "bool"},
         "warning_threshold": {"type": "int", "min": 1, "max": 200},
         "critical_threshold": {"type": "int", "min": 1, "max": 200},
-        "workspace_path": {"type": "none", "optional": True},
+        "workspace_path": {"type": "str", "nullable": True, "optional": True},
         "tool_output_limit": {"type": "int", "min": 1000, "max": 100000},
+        "tool_output_token_limit": {"type": "int", "min": 1000, "max": 100000, "optional": True},
         "provider_type": {"type": "str", "choices": ["openai_compatible", "anthropic", "openai"]},
         "api_key": {"type": "str", "optional": True},
         "base_url": {"type": "str", "optional": True},
         "model": {"type": "str"},  # Allow any model name
         "detail": {"type": "str", "choices": ["minimal", "normal", "verbose"]},
         "enabled_tools": {"type": "list"},
-        "provider_config": {"type": "dict", "optional": True}
+        "provider_config": {"type": "dict", "optional": True},
+        # Token monitor thresholds in tokens
+        "token_monitor_warning_threshold": {"type": "int", "min": 1000, "max": 200000},
+        "token_monitor_critical_threshold": {"type": "int", "min": 1000, "max": 200000},
+        # Turn monitoring settings (fractions of max_turns)
+        "turn_monitor_enabled": {"type": "bool"},
+        "turn_monitor_warning_threshold": {"type": "float", "min": 0.0, "max": 1.0},
+        "turn_monitor_critical_threshold": {"type": "float", "min": 0.0, "max": 1.0},
+        # Conversation pruning settings
+        "max_history_turns": {"type": "int", "min": 0, "max": 1000, "optional": True, "nullable": True},
+        "keep_initial_query": {"type": "bool"},
+        "keep_system_messages": {"type": "bool"}
     }
-    
+
     return ConfigService(config_path, default_config, schema)

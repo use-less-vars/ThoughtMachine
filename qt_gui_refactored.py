@@ -150,6 +150,11 @@ class AgentControlsPanel(QGroupBox):
             "OpenAI": "openai"
         }
         
+        # Conversation pruning settings
+        self.max_history_turns = 20
+        self.keep_initial_query = True
+        self.keep_system_messages = True
+        
         # Create toggle button for collapse/expand
         self.toggle_button = QPushButton("▼ Show Controls")
         self.toggle_button.setMaximumWidth(120)
@@ -164,29 +169,45 @@ class AgentControlsPanel(QGroupBox):
         
         # Create container widget for controls (hidden when collapsed)
         self.controls_container = QWidget()
-        self.controls_layout = QGridLayout()
+        self.controls_layout = QHBoxLayout()  # Changed from QGridLayout to QHBoxLayout
         self.controls_layout.setSpacing(10)
-        self.controls_layout.setColumnStretch(1, 1)
+        
+        # Create two columns for better use of horizontal space
+        self.left_column = QVBoxLayout()
+        self.left_column.setSpacing(10)
+        self.right_column = QVBoxLayout()
+        self.right_column.setSpacing(10)
+        
+        self.controls_layout.addLayout(self.left_column)
+        self.controls_layout.addLayout(self.right_column)
+        
         self.controls_container.setLayout(self.controls_layout)
+
         
         # Row 0: Workspace controls
-        row = 0
-        self.controls_layout.addWidget(QLabel("Workspace:"), row, 0)
+        workspace_row = QWidget()
+        workspace_layout = QHBoxLayout()
+        workspace_row.setLayout(workspace_layout)
+        
+        workspace_layout.addWidget(QLabel("Workspace:"))
         self.workspace_display = QLabel("None (unrestricted)")
         self.workspace_display.setStyleSheet("color: blue;")
         self.workspace_display.setWordWrap(True)
-        self.controls_layout.addWidget(self.workspace_display, row, 1)
+        workspace_layout.addWidget(self.workspace_display)
         
         self.set_workspace_btn = QPushButton("Set")
         self.set_workspace_btn.setMaximumWidth(60)
-        self.controls_layout.addWidget(self.set_workspace_btn, row, 2)
+        workspace_layout.addWidget(self.set_workspace_btn)
         
         self.clear_workspace_btn = QPushButton("Clear")
         self.clear_workspace_btn.setMaximumWidth(60)
-        self.controls_layout.addWidget(self.clear_workspace_btn, row, 3)
+        workspace_layout.addWidget(self.clear_workspace_btn)
+        
+        # Add workspace row to left column
+        self.left_column.addWidget(workspace_row)
         
         # Row 1: Token monitoring controls
-        row += 1
+
         token_monitor_row = QWidget()
         token_monitor_layout = QHBoxLayout()
         token_monitor_row.setLayout(token_monitor_layout)
@@ -215,10 +236,11 @@ class AgentControlsPanel(QGroupBox):
         self.critical_formatted_label = QLabel("(50k)")
         token_monitor_layout.addWidget(self.critical_formatted_label)
         
-        self.controls_layout.addWidget(token_monitor_row, row, 0, 1, 4)
+        # Add token monitor row to left column
+        self.left_column.addWidget(token_monitor_row)
         
         # Row 2: Max turns control
-        row += 1
+
         max_turns_row = QWidget()
         max_turns_layout = QHBoxLayout()
         max_turns_row.setLayout(max_turns_layout)
@@ -231,10 +253,46 @@ class AgentControlsPanel(QGroupBox):
         max_turns_layout.addWidget(self.max_turns_spinbox)
         max_turns_layout.addWidget(QLabel("turns"))
         
-        self.controls_layout.addWidget(max_turns_row, row, 0, 1, 4)
-        
-        # Row 3: Temperature control
-        row += 1
+        # Add max turns row to left column
+        self.left_column.addWidget(max_turns_row)
+
+        # Row 3: Turn monitoring controls
+
+        turn_monitor_row = QWidget()
+        turn_monitor_layout = QHBoxLayout()
+        turn_monitor_row.setLayout(turn_monitor_layout)
+        turn_monitor_layout.setSpacing(5)
+
+        self.turn_monitor_checkbox = QCheckBox("Turn warnings")
+        self.turn_monitor_checkbox.setChecked(True)
+        turn_monitor_layout.addWidget(self.turn_monitor_checkbox)
+
+        turn_monitor_layout.addWidget(QLabel("Warning:"))
+        self.turn_warning_threshold_spinbox = QDoubleSpinBox()
+        self.turn_warning_threshold_spinbox.setRange(0.0, 1.0)
+        self.turn_warning_threshold_spinbox.setValue(0.8)
+        self.turn_warning_threshold_spinbox.setSingleStep(0.05)
+        self.turn_warning_threshold_spinbox.setDecimals(2)
+        turn_monitor_layout.addWidget(self.turn_warning_threshold_spinbox)
+        self.turn_warning_formatted_label = QLabel("(80)")
+        turn_monitor_layout.addWidget(self.turn_warning_formatted_label)
+        turn_monitor_layout.addWidget(QLabel("turns"))
+
+        turn_monitor_layout.addWidget(QLabel("Critical:"))
+        self.turn_critical_threshold_spinbox = QDoubleSpinBox()
+        self.turn_critical_threshold_spinbox.setRange(0.0, 1.0)
+        self.turn_critical_threshold_spinbox.setValue(0.95)
+        self.turn_critical_threshold_spinbox.setSingleStep(0.05)
+        self.turn_critical_threshold_spinbox.setDecimals(2)
+        turn_monitor_layout.addWidget(self.turn_critical_threshold_spinbox)
+        self.turn_critical_formatted_label = QLabel("(95)")
+        turn_monitor_layout.addWidget(self.turn_critical_formatted_label)
+        turn_monitor_layout.addWidget(QLabel("turns"))
+
+        # Add turn monitor row to left column
+        self.left_column.addWidget(turn_monitor_row)
+
+        # Row 4: Temperature control
         temperature_row = QWidget()
         temperature_layout = QHBoxLayout()
         temperature_row.setLayout(temperature_layout)
@@ -249,10 +307,11 @@ class AgentControlsPanel(QGroupBox):
         temperature_layout.addWidget(self.temperature_spinbox)
         temperature_layout.addWidget(QLabel(""))
         
-        self.controls_layout.addWidget(temperature_row, row, 0, 1, 4)
+        # Add temperature row to left column
+        self.left_column.addWidget(temperature_row)
         
         # Row 4: Provider selection
-        row += 1
+
         provider_row = QWidget()
         provider_layout = QHBoxLayout()
         provider_row.setLayout(provider_layout)
@@ -265,10 +324,11 @@ class AgentControlsPanel(QGroupBox):
         provider_layout.addWidget(self.provider_combo)
         provider_layout.addStretch()
 
-        self.controls_layout.addWidget(provider_row, row, 0, 1, 4)
+        # Add provider row to left column
+        self.left_column.addWidget(provider_row)
 
-        # Row 5: API Key (optional)
-        row += 1
+        # Row 6: API Key (optional)
+
         api_key_row = QWidget()
         api_key_layout = QHBoxLayout()
         api_key_row.setLayout(api_key_layout)
@@ -281,10 +341,11 @@ class AgentControlsPanel(QGroupBox):
         api_key_layout.addWidget(self.api_key_edit)
         api_key_layout.addStretch()
 
-        self.controls_layout.addWidget(api_key_row, row, 0, 1, 4)
+        # Add API key row to right column
+        self.right_column.addWidget(api_key_row)
 
-        # Row 6: Base URL (optional)
-        row += 1
+        # Row 7: Base URL (optional)
+
         base_url_row = QWidget()
         base_url_layout = QHBoxLayout()
         base_url_row.setLayout(base_url_layout)
@@ -296,10 +357,11 @@ class AgentControlsPanel(QGroupBox):
         base_url_layout.addWidget(self.base_url_edit)
         base_url_layout.addStretch()
 
-        self.controls_layout.addWidget(base_url_row, row, 0, 1, 4)
+        # Add base URL row to right column
+        self.right_column.addWidget(base_url_row)
 
-        # Row 7: Model selection
-        row += 1
+        # Row 8: Model selection
+
         model_row = QWidget()
         model_layout = QHBoxLayout()
         model_row.setLayout(model_layout)
@@ -313,9 +375,10 @@ class AgentControlsPanel(QGroupBox):
         model_layout.addWidget(self.model_combo)
         model_layout.addStretch()
 
-        self.controls_layout.addWidget(model_row, row, 0, 1, 4)        
-        # Row 8: Tool output token limit
-        row += 1
+        # Add model row to right column
+        self.right_column.addWidget(model_row)        
+        # Row 9: Tool output token limit
+
         tool_limit_row = QWidget()
         tool_limit_layout = QHBoxLayout()
         tool_limit_row.setLayout(tool_limit_layout)
@@ -329,10 +392,11 @@ class AgentControlsPanel(QGroupBox):
         tool_limit_layout.addWidget(self.tool_output_limit_spinbox)
         tool_limit_layout.addWidget(QLabel("tokens"))
         
-        self.controls_layout.addWidget(tool_limit_row, row, 0, 1, 4)
+        # Add tool limit row to right column
+        self.right_column.addWidget(tool_limit_row)
         
-        # Row 9: Detail combo
-        row += 1
+        # Row 10: Detail combo
+
         detail_row = QWidget()
         detail_layout = QHBoxLayout()
         detail_row.setLayout(detail_layout)
@@ -345,10 +409,11 @@ class AgentControlsPanel(QGroupBox):
         detail_layout.addWidget(self.detail_combo)
         detail_layout.addStretch()
         
-        self.controls_layout.addWidget(detail_row, row, 0, 1, 4)
+        # Add detail row to right column
+        self.right_column.addWidget(detail_row)
         
-        # Row 10: Tool loader (as a sub-group)
-        row += 1
+        # Row 11: Tool loader (as a sub-group)
+
         tool_group = QGroupBox("Tools")
         tool_layout = QGridLayout()
         tool_group.setLayout(tool_layout)
@@ -378,7 +443,12 @@ class AgentControlsPanel(QGroupBox):
         tool_scroll_area.setMaximumHeight(400)  # Limit height, show scrollbar if needed
         tool_scroll_area.setWidget(tool_group)
         
-        self.controls_layout.addWidget(tool_scroll_area, row, 0, 1, 4)
+        # Add tool loader to right column
+        self.right_column.addWidget(tool_scroll_area)
+        
+        # Add stretches to push content to top in both columns
+        self.left_column.addStretch()
+        self.right_column.addStretch()
         
         # Add controls container to main layout
         self.main_layout.addWidget(self.controls_container)
@@ -394,14 +464,28 @@ class AgentControlsPanel(QGroupBox):
         self._critical_threshold_timer.setSingleShot(True)
         self._critical_threshold_timer.timeout.connect(self._adjust_critical_threshold)
         
+        # Turn monitoring debounce timers
+        self._turn_warning_threshold_timer = QTimer()
+        self._turn_warning_threshold_timer.setSingleShot(True)
+        self._turn_warning_threshold_timer.timeout.connect(self._adjust_turn_warning_threshold)
+        self._turn_critical_threshold_timer = QTimer()
+        self._turn_critical_threshold_timer.setSingleShot(True)
+        self._turn_critical_threshold_timer.timeout.connect(self._adjust_turn_critical_threshold)
+        
         # Connect signals
         self.warning_threshold_spinbox.valueChanged.connect(self._on_warning_threshold_changed)
         self.critical_threshold_spinbox.valueChanged.connect(self._on_critical_threshold_changed)
         self.token_monitor_checkbox.stateChanged.connect(self.update_token_monitor_controls)
+        # Turn monitoring connections
+        self.turn_monitor_checkbox.stateChanged.connect(self.update_turn_monitor_controls)
+        self.turn_warning_threshold_spinbox.valueChanged.connect(self._on_turn_warning_threshold_changed)
+        self.turn_critical_threshold_spinbox.valueChanged.connect(self._on_turn_critical_threshold_changed)
         
         # Initial updates
         self.update_token_monitor_controls()
         self._update_token_threshold_labels()
+        self.update_turn_monitor_controls()
+        self._update_turn_threshold_labels()
     
     def toggle_collapse(self):
         """Toggle visibility of controls."""
@@ -485,6 +569,67 @@ class AgentControlsPanel(QGroupBox):
             critical_text = f"({critical_value})"
         self.critical_formatted_label.setText(critical_text)
 
+    def update_turn_monitor_controls(self):
+        """Enable/disable turn monitor threshold controls based on checkbox."""
+        enabled = self.turn_monitor_checkbox.isChecked()
+        self.turn_warning_threshold_spinbox.setEnabled(enabled)
+        self.turn_critical_threshold_spinbox.setEnabled(enabled)
+
+    def _on_turn_warning_threshold_changed(self, value):
+        """Start debounced adjustment of turn warning threshold."""
+        self._turn_warning_threshold_timer.start(500)
+
+    def _adjust_turn_warning_threshold(self):
+        """Ensure turn warning threshold is always lower than critical threshold."""
+        value = self.turn_warning_threshold_spinbox.value()
+        critical = self.turn_critical_threshold_spinbox.value()
+        step = self.turn_warning_threshold_spinbox.singleStep()
+        if value >= critical:
+            # Clamp warning to critical - step (instead of adjusting critical)
+            clamped_value = critical - step
+            if clamped_value < 0.0:
+                clamped_value = 0.0
+            # Temporarily block signals to prevent infinite recursion
+            self.turn_warning_threshold_spinbox.blockSignals(True)
+            self.turn_warning_threshold_spinbox.setValue(clamped_value)
+            self.turn_warning_threshold_spinbox.blockSignals(False)
+        # Update formatted labels
+        self._update_turn_threshold_labels()
+
+    def _on_turn_critical_threshold_changed(self, value):
+        """Start debounced adjustment of turn critical threshold."""
+        self._turn_critical_threshold_timer.start(500)
+
+    def _adjust_turn_critical_threshold(self):
+        """Ensure turn critical threshold is always higher than warning threshold."""
+        value = self.turn_critical_threshold_spinbox.value()
+        warning = self.turn_warning_threshold_spinbox.value()
+        step = self.turn_critical_threshold_spinbox.singleStep()
+        if value <= warning:
+            # Clamp critical to warning + step (instead of adjusting warning)
+            clamped_value = warning + step
+            max_val = self.turn_critical_threshold_spinbox.maximum()
+            if clamped_value > max_val:
+                clamped_value = max_val
+            # Temporarily block signals to prevent infinite recursion
+            self.turn_critical_threshold_spinbox.blockSignals(True)
+            self.turn_critical_threshold_spinbox.setValue(clamped_value)
+            self.turn_critical_threshold_spinbox.blockSignals(False)
+        # Update formatted labels
+        self._update_turn_threshold_labels()
+
+    def _update_turn_threshold_labels(self):
+        """Update formatted labels for turn thresholds."""
+        # Format warning threshold (percentage)
+        warning_value = self.turn_warning_threshold_spinbox.value()
+        warning_text = f"({int(warning_value * 100)})"
+        self.turn_warning_formatted_label.setText(warning_text)
+        
+        # Format critical threshold (percentage)
+        critical_value = self.turn_critical_threshold_spinbox.value()
+        critical_text = f"({int(critical_value * 100)})"
+        self.turn_critical_formatted_label.setText(critical_text)
+
     def update_model_suggestions(self, model_to_set=None):
         """Update model suggestions based on current provider selection.
         
@@ -528,9 +673,13 @@ class AgentControlsPanel(QGroupBox):
         # Provider configuration
         provider_display = self.provider_combo.currentText()
         config["provider_type"] = self._provider_mapping.get(provider_display, "openai_compatible")
-        config["api_key"] = self.api_key_edit.text()
+        # Get API key - store empty string if field is empty
+        config["api_key"] = self.api_key_edit.text().strip()
+        
+        # Get base URL - only include if not empty (empty means use default)
         base_url = self.base_url_edit.text().strip()
-        config["base_url"] = base_url if base_url else "https://api.deepseek.com"
+        if base_url:
+            config["base_url"] = base_url
         config["model"] = self.model_combo.currentText()
         
         # Agent parameters
@@ -539,6 +688,14 @@ class AgentControlsPanel(QGroupBox):
         config["token_monitor_enabled"] = self.token_monitor_checkbox.isChecked()
         config["warning_threshold"] = self.warning_threshold_spinbox.value()
         config["critical_threshold"] = self.critical_threshold_spinbox.value()
+        # Turn monitoring
+        config["turn_monitor_enabled"] = self.turn_monitor_checkbox.isChecked()
+        config["turn_monitor_warning_threshold"] = self.turn_warning_threshold_spinbox.value()
+        config["turn_monitor_critical_threshold"] = self.turn_critical_threshold_spinbox.value()
+        # Conversation pruning (default values)
+        config["max_history_turns"] = 20
+        config["keep_initial_query"] = True
+        config["keep_system_messages"] = True
         # Workspace path: None if display is "None (unrestricted)"
         workspace_display = self.workspace_display.text()
         workspace_path = None if workspace_display == "None (unrestricted)" else workspace_display
@@ -585,6 +742,24 @@ class AgentControlsPanel(QGroupBox):
         # Critical threshold (in thousands)
         if "critical_threshold" in config:
             self.critical_threshold_spinbox.setValue(config["critical_threshold"])
+        # Turn monitoring enabled
+        if "turn_monitor_enabled" in config:
+            self.turn_monitor_checkbox.setChecked(config["turn_monitor_enabled"])
+        # Turn warning threshold
+        if "turn_monitor_warning_threshold" in config:
+            self.turn_warning_threshold_spinbox.setValue(config["turn_monitor_warning_threshold"])
+        # Turn critical threshold
+        if "turn_monitor_critical_threshold" in config:
+            self.turn_critical_threshold_spinbox.setValue(config["turn_monitor_critical_threshold"])
+        # Conversation pruning - max history turns
+        if "max_history_turns" in config:
+            self.max_history_turns = config["max_history_turns"]
+        # Keep initial query
+        if "keep_initial_query" in config:
+            self.keep_initial_query = config["keep_initial_query"]
+        # Keep system messages
+        if "keep_system_messages" in config:
+            self.keep_system_messages = config["keep_system_messages"]
         # Workspace path
         if "workspace_path" in config:
             workspace_path = config["workspace_path"]
@@ -1252,7 +1427,7 @@ class AgentGUI(QMainWindow):
     def init_ui(self):
         """Initialize the user interface (unchanged layout)."""
         self.setWindowTitle("Agent Workbench - QT (Refactored)")
-        self.setGeometry(100, 100, 1400, 900)
+        self.center_window()
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -1300,7 +1475,11 @@ class AgentGUI(QMainWindow):
         self.agent_controls_panel.token_monitor_checkbox.stateChanged.connect(self._handle_config_change)
         self.agent_controls_panel.warning_threshold_spinbox.valueChanged.connect(self._handle_config_change)
         self.agent_controls_panel.critical_threshold_spinbox.valueChanged.connect(self._handle_config_change)
-        
+        # Turn monitoring connections
+        self.agent_controls_panel.turn_monitor_checkbox.stateChanged.connect(self._handle_config_change)
+        self.agent_controls_panel.turn_warning_threshold_spinbox.valueChanged.connect(self._handle_config_change)
+        self.agent_controls_panel.turn_critical_threshold_spinbox.valueChanged.connect(self._handle_config_change)
+
         # Connect tool checkboxes
         for checkbox in self.agent_controls_panel.tool_checkboxes.values():
             checkbox.stateChanged.connect(self._handle_config_change)
@@ -1401,6 +1580,29 @@ class AgentGUI(QMainWindow):
 
         # Update buttons based on initial state
         self.update_buttons()    
+    def center_window(self):
+        """Center the window on screen with appropriate size."""
+        app = QApplication.instance()
+        if not app:
+            # Fallback to fixed geometry
+            self.setGeometry(100, 100, 1400, 900)
+            return
+        screen = app.primaryScreen()
+        if not screen:
+            self.setGeometry(100, 100, 1400, 900)
+            return
+        screen_geometry = screen.availableGeometry()
+        # Use 80% of screen width, 90% of screen height, with max 1400x900
+        width = min(int(screen_geometry.width() * 0.8), 1400)
+        height = min(int(screen_geometry.height() * 0.9), 900)
+        # Ensure minimum size
+        width = max(width, 800)
+        height = max(height, 600)
+        # Center the window
+        x = screen_geometry.x() + (screen_geometry.width() - width) // 2
+        y = screen_geometry.y() + (screen_geometry.height() - height) // 2
+        self.setGeometry(x, y, width, height)
+
     def setup_accessibility(self):
         """Set up accessibility features: keyboard navigation, screen reader support, tooltips."""
         # Set focus policies for interactive widgets
@@ -1805,7 +2007,9 @@ class AgentGUI(QMainWindow):
         else:
             self.run_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
-            self.restart_btn.setEnabled(self.last_history is not None)
+            # Enable restart if we have history OR if presenter has cached config
+            can_restart = self.last_history is not None or (hasattr(self.presenter, 'can_restart') and self.presenter.can_restart())
+            self.restart_btn.setEnabled(can_restart)
             self.pause_btn.setEnabled(False)
             self.status_panel.update_status("Ready")
     

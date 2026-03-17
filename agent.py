@@ -7,6 +7,7 @@ from typing import Optional, List, Dict, Any, TYPE_CHECKING
 
 from pydantic import ValidationError
 from llm_providers.factory import ProviderFactory
+from llm_providers.exceptions import ProviderError
 from tools import SIMPLIFIED_TOOL_CLASSES
 from tools.utils import model_to_openai_tool
 from tools.final import Final
@@ -14,6 +15,7 @@ from tools.request_user_interaction import RequestUserInteraction
 from tools.summarize_tool import SummarizeTool
 from fast_json_repair import loads as repair_loads
 import tiktoken
+import traceback
 
 # Import logging module
 try:
@@ -466,11 +468,35 @@ class Agent:
             
             # Call LLM provider
             formatted_tools = self.provider.format_tools(self.tool_definitions)
-            response = self.provider.chat_completion(
-                messages=messages,
-                tools=formatted_tools,
-                temperature=self.config.temperature,
-            )
+            try:
+                response = self.provider.chat_completion(
+                    messages=messages,
+                    tools=formatted_tools,
+                    temperature=self.config.temperature,
+                )
+            except ProviderError as e:
+                # Update execution state to STOPPED
+                events = self.state.set_execution_state(ExecutionState.STOPPED)
+                for event in events:
+                    self._handle_state_event(event)
+                if self.logger:
+                    self.logger.log_error("PROVIDER_ERROR", str(e))
+                    self.logger.log_agent_end("provider_error", f"Provider error: {e}")
+                    self.logger.close()
+                yield {
+                    "type": "error",
+                    "message": str(e),
+                    "traceback": traceback.format_exc(),
+                    "turn": turn,
+                    "context_length": self.state.current_conversation_tokens,
+                    "usage": {
+                        "input": last_input_tokens,
+                        "output": last_output_tokens,
+                        "total_input": self.total_input_tokens,
+                        "total_output": self.total_output_tokens,
+                    }
+                }
+                return
             
             # Token usage
             usage = response.usage

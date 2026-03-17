@@ -5,6 +5,8 @@ Works with OpenAI, DeepSeek, OpenCode/Big Pickle, and any OpenAI-compatible API.
 from typing import Dict, List, Any, Optional
 import time
 import logging
+import os
+import sys
 
 from openai import OpenAI, APIError, RateLimitError
 import tiktoken
@@ -13,6 +15,8 @@ from .base import LLMProvider, ProviderConfig, LLMResponse
 from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError
 
 logger = logging.getLogger(__name__)
+if os.environ.get('DEBUG_OPENAI'):
+    logger.setLevel(logging.DEBUG)
 
 class OpenAICompatibleProvider(LLMProvider):
     """
@@ -39,13 +43,23 @@ class OpenAICompatibleProvider(LLMProvider):
             "max_retries": config.max_retries,
         }
         
+        # Debug logging
+        logger.debug(f"OpenAI client config: base_url={config.base_url}, model={config.model}, api_key={config.api_key}, timeout={config.timeout}, max_retries={config.max_retries}, extra_headers={config.extra_headers}")
+        print(f"[DEBUG_OPENAI] client config: base_url={config.base_url}, model={config.model}, api_key={config.api_key}, timeout={config.timeout}, max_retries={config.max_retries}, extra_headers={config.extra_headers}", file=sys.stderr)
+        
         if config.base_url:
             client_kwargs["base_url"] = config.base_url
         
         if config.extra_headers:
             client_kwargs["default_headers"] = config.extra_headers
         
+        # Debug logging after headers
+        logger.debug(f"OpenAI client final kwargs: base_url={client_kwargs.get('base_url')}, default_headers={client_kwargs.get('default_headers')}")
+        print(f"[DEBUG_OPENAI] client final kwargs: base_url={client_kwargs.get('base_url')}, default_headers={client_kwargs.get('default_headers')}", file=sys.stderr)
+        
         self.client = OpenAI(**client_kwargs)
+        logger.debug(f"OpenAI client created with base_url={self.client.base_url if hasattr(self.client, 'base_url') else 'default'}")
+        print(f"[DEBUG_OPENAI] client created with base_url={self.client.base_url if hasattr(self.client, 'base_url') else 'default'}", file=sys.stderr)
         
         # Initialize tokenizer for token counting (lazy loading)
         self.encoding = None
@@ -109,6 +123,8 @@ class OpenAICompatibleProvider(LLMProvider):
                 completion_kwargs["tool_choice"] = kwargs.get("tool_choice", "auto")
             
             # Make API call
+            logger.debug(f"OpenAI API call: model={completion_kwargs.get('model')}, temperature={completion_kwargs.get('temperature')}, max_tokens={completion_kwargs.get('max_tokens')}, tools_count={len(tools) if tools else 0}, base_url={self.client.base_url if hasattr(self.client, 'base_url') else 'default'}, api_key={self.config.api_key}")
+            print(f"[DEBUG_OPENAI] API call: model={completion_kwargs.get('model')}, temperature={completion_kwargs.get('temperature')}, max_tokens={completion_kwargs.get('max_tokens')}, tools_count={len(tools) if tools else 0}, base_url={self.client.base_url if hasattr(self.client, 'base_url') else 'default'}, api_key={self.config.api_key}", file=sys.stderr)
             response = self.client.chat.completions.create(**completion_kwargs)
             
             # Parse response
