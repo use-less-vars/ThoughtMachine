@@ -127,6 +127,15 @@ class OpenAICompatibleProvider(LLMProvider):
             print(f"[DEBUG_OPENAI] API call: model={completion_kwargs.get('model')}, temperature={completion_kwargs.get('temperature')}, max_tokens={completion_kwargs.get('max_tokens')}, tools_count={len(tools) if tools else 0}, base_url={self.client.base_url if hasattr(self.client, 'base_url') else 'default'}, api_key={self.config.api_key}", file=sys.stderr)
             response = self.client.chat.completions.create(**completion_kwargs)
             
+            # Debug: Print raw response if environment variable is set
+            import os
+            if os.environ.get('DEBUG_OPENAI'):
+                raw_str = str(response)
+                if len(raw_str) > 1000:
+                    raw_str = raw_str[:1000] + f"... (truncated, total {len(raw_str)} chars)"
+                print(f"[DEBUG_OPENAI_RAW] Raw API response type: {type(response)}", file=sys.stderr)
+                print(f"[DEBUG_OPENAI_RAW] Raw API response: {raw_str}", file=sys.stderr)
+            
             # Parse response
             llm_response = self.parse_response(response, start_time)
             
@@ -142,7 +151,26 @@ class OpenAICompatibleProvider(LLMProvider):
                 raise AuthenticationError(f"Authentication failed: {e}")
             raise ProviderError(f"API error: {e}")
         except Exception as e:
-            raise ProviderError(f"Unexpected error: {e}")
+            # Add more debug info about what was returned
+            import os
+            if os.environ.get('DEBUG_OPENAI'):
+                print(f"[DEBUG_OPENAI_ERROR] Exception type: {type(e)}", file=sys.stderr)
+                print(f"[DEBUG_OPENAI_ERROR] Exception message: {e}", file=sys.stderr)
+                # Try to get the response if it exists in the exception
+                if hasattr(e, 'response'):
+                    try:
+                        resp_text = str(e.response)
+                        if len(resp_text) > 1000:
+                            resp_text = resp_text[:1000] + f"... (truncated, total {len(resp_text)} chars)"
+                        print(f"[DEBUG_OPENAI_ERROR] Exception response: {resp_text}", file=sys.stderr)
+                    except:
+                        pass
+            
+            # Create a ProviderError with the raw response if available
+            err_msg = f"Unexpected error: {e}"
+            if hasattr(e, 'response'):
+                err_msg = f"Unexpected error: {e}. Response: {e.response}"
+            raise ProviderError(err_msg)
     
     def parse_response(self, raw_response: Any, start_time: float) -> LLMResponse:
         """Parse OpenAI-compatible response"""

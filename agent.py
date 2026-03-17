@@ -484,6 +484,18 @@ class Agent:
                     print(f"[DEBUG_RAW_RESPONSE] Raw response type: {type(response.raw_response)}")
                     print(f"[DEBUG_RAW_RESPONSE] Raw response: {raw}")
             except ProviderError as e:
+                # Print debug info for provider errors too
+                import os
+                if os.environ.get('DEBUG_RAW_RESPONSE'):
+                    print(f"[DEBUG_RAW_RESPONSE_ERROR] ProviderError: {e}")
+                    # Try to get raw response if available
+                    if hasattr(e, 'raw_response'):
+                        raw = str(e.raw_response)
+                        if len(raw) > 1000:
+                            raw = raw[:1000] + f"... (truncated, total {len(raw)} chars)"
+                        print(f"[DEBUG_RAW_RESPONSE_ERROR] Raw error response: {raw}")
+                    else:
+                        print(f"[DEBUG_RAW_RESPONSE_ERROR] No raw_response attribute in error")
                 # Update execution state to STOPPED
                 events = self.state.set_execution_state(ExecutionState.STOPPED)
                 for event in events:
