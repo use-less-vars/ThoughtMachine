@@ -474,6 +474,15 @@ class Agent:
                     tools=formatted_tools,
                     temperature=self.config.temperature,
                 )
+                
+                # Debug: Print raw response if environment variable is set
+                import os
+                if os.environ.get('DEBUG_RAW_RESPONSE'):
+                    raw = str(response.raw_response)
+                    if len(raw) > 1000:
+                        raw = raw[:1000] + f"... (truncated, total {len(raw)} chars)"
+                    print(f"[DEBUG_RAW_RESPONSE] Raw response type: {type(response.raw_response)}")
+                    print(f"[DEBUG_RAW_RESPONSE] Raw response: {raw}")
             except ProviderError as e:
                 # Update execution state to STOPPED
                 events = self.state.set_execution_state(ExecutionState.STOPPED)
@@ -526,7 +535,7 @@ class Agent:
                 tool_calls_dict = None
                 if tool_calls:
                     tool_calls_dict = tool_calls
-                self.logger.log_llm_response(content, reasoning, tool_calls_dict, usage_dict)
+                self.logger.log_llm_response(content, reasoning, tool_calls_dict, usage_dict, response.raw_response)
             
             # Build assistant message dict for storage
             assistant_dict = {"role": "assistant", "content": content}

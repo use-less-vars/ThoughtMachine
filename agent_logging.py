@@ -38,6 +38,7 @@ class LogEventType(Enum):
     # LLM interaction
     LLM_REQUEST = "llm_request"
     LLM_RESPONSE = "llm_response"
+    RAW_RESPONSE = "raw_response"
     
     # Tool execution
     TOOL_CALL = "tool_call"
@@ -383,7 +384,8 @@ class AgentLogger:
         content: str,
         reasoning: Optional[str],
         tool_calls: Optional[List[Dict[str, Any]]],
-        usage: Dict[str, int]
+        usage: Dict[str, int],
+        raw_response: Any = None
     ):
         """Log LLM response received."""
         self._log_event(
@@ -396,6 +398,29 @@ class AgentLogger:
                 "tool_call_count": len(tool_calls) if tool_calls else 0,
                 "tool_calls": tool_calls,
                 "usage": usage,
+            },
+            self.current_turn
+        )
+        
+        # Also log raw response for debugging if provided
+        if raw_response is not None:
+            self.log_raw_response(raw_response)
+    
+    def log_raw_response(self, raw_response: Any):
+        """Log raw LLM response for debugging."""
+        # Convert raw response to string representation
+        raw_str = str(raw_response)
+        # Truncate very large responses
+        if len(raw_str) > 5000:
+            raw_str = raw_str[:5000] + "... [truncated]"
+        
+        self._log_event(
+            LogEventType.RAW_RESPONSE,
+            LogLevel.DEBUG,
+            "Raw LLM response for debugging",
+            {
+                "raw_response": raw_str,
+                "raw_response_type": type(raw_response).__name__,
             },
             self.current_turn
         )
