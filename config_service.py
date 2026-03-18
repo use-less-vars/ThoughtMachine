@@ -433,6 +433,7 @@ def create_agent_config_service(config_path: str = "agent_config.json") -> Confi
         "turn_monitor_enabled": {"type": "bool"},
         "turn_monitor_warning_threshold": {"type": "float", "min": 0.0, "max": 1.0},
         "turn_monitor_critical_threshold": {"type": "float", "min": 0.0, "max": 1.0},
+        "critical_countdown_turns": {"type": "int", "min": 0, "max": 20, "optional": True},
         # Conversation pruning settings
         "max_history_turns": {"type": "int", "min": 0, "max": 1000, "optional": True, "nullable": True},
         "keep_initial_query": {"type": "bool"},
