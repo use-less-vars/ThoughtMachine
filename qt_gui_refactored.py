@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit, QListWidget, QStyledItemDelegate,
     QGroupBox, QCheckBox, QMenuBar, QMenu, QFileDialog, QStyleOptionViewItem, 
-    QMessageBox, QScrollArea, QFrame, QComboBox, QSpinBox, QDoubleSpinBox, QSplitter, QDialog, QSizePolicy, QStyle
+    QMessageBox, QScrollArea, QFrame, QComboBox, QSpinBox, QDoubleSpinBox, QSplitter, QDialog, QSizePolicy, QStyle, QInputDialog
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QAbstractListModel, QModelIndex, QVariant, QRect, QPoint, QSize, QSortFilterProxyModel
 from PyQt6.QtGui import QAction, QKeySequence, QFont, QTextDocument, QTextCursor, QColor, QPainter, QPalette, QAbstractTextDocumentLayout, QPageLayout, QPageSize, QShortcut
@@ -54,85 +54,6 @@ class ToolLoaderPanel(QGroupBox):
     
     def get_enabled_tool_names(self):
         return [name for name, cb in self.tool_checkboxes.items() if cb.isChecked()]
-
-
-class SystemViewPanel(QGroupBox):
-    """Simple file browser panel."""
-    def __init__(self):
-        super().__init__("System View")
-        try:
-            self.current_dir = os.getcwd()
-        except FileNotFoundError:
-            # fallback to user's home directory
-            self.current_dir = os.path.expanduser("~")
-        
-        layout = QVBoxLayout()
-        
-        dir_frame = QWidget()
-        dir_layout = QHBoxLayout()
-        dir_frame.setLayout(dir_layout)
-        dir_label = QLabel("Dir:")
-        dir_layout.addWidget(dir_label)
-        
-        self.dir_display = QLabel(self.current_dir)
-        self.dir_display.setAccessibleName("Current directory")
-        self.dir_display.setAccessibleDescription("Currently selected directory path")
-        self.dir_display.setStyleSheet("color: blue;")
-        self.dir_display.setWordWrap(True)
-        dir_layout.addWidget(self.dir_display, 1)
-        
-        self.change_btn = QPushButton("Change")
-        self.change_btn.clicked.connect(self.choose_directory)
-        self.change_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.change_btn.setToolTip("Change current directory")
-        self.change_btn.setAccessibleName("Change directory")
-        self.change_btn.setAccessibleDescription("Open dialog to select a different directory")
-        dir_layout.addWidget(self.change_btn)
-        layout.addWidget(dir_frame)
-        
-        self.list_widget = QListWidget()
-        self.list_widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.list_widget.setToolTip("List of files and directories")
-        self.list_widget.setAccessibleName("File list")
-        self.list_widget.setAccessibleDescription("List of files and directories in current directory")
-        layout.addWidget(self.list_widget)
-        
-        self.refresh_btn = QPushButton("Refresh")
-        self.refresh_btn.clicked.connect(self.refresh_list)
-        self.refresh_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.refresh_btn.setToolTip("Refresh file list")
-        self.refresh_btn.setAccessibleName("Refresh")
-        self.refresh_btn.setAccessibleDescription("Refresh the list of files in current directory")
-        layout.addWidget(self.refresh_btn)
-        
-        self.setLayout(layout)
-        self.refresh_list()
-    
-    def choose_directory(self):
-        new_dir = QFileDialog.getExistingDirectory(self, "Select Directory", self.current_dir)
-        if new_dir:
-            self.current_dir = new_dir
-            self.dir_display.setText(new_dir)
-            self.refresh_list()
-    
-    def refresh_list(self):
-        self.list_widget.clear()
-        try:
-            entries = os.listdir(self.current_dir)
-            for entry in sorted(entries):
-                self.list_widget.addItem(entry)
-        except Exception as e:
-            self.list_widget.addItem(f"Error: {e}")
-
-
-class AgenticHelpersPanel(QGroupBox):
-    """Placeholder for future sub‑agent controls."""
-    def __init__(self):
-        super().__init__("Agentic Helpers")
-        layout = QVBoxLayout()
-        layout.addWidget(QLabel("(Placeholder)"))
-        layout.addStretch()
-        self.setLayout(layout)
 
 
 class AgentControlsPanel(QGroupBox):
@@ -444,6 +365,16 @@ class AgentControlsPanel(QGroupBox):
         tool_scroll_area.setWidget(tool_group)
         
         # Add tool loader to right column
+
+        # MCP Configuration button
+        mcp_config_row = QWidget()
+        mcp_config_layout = QHBoxLayout()
+        mcp_config_row.setLayout(mcp_config_layout)
+        self.mcp_config_btn = QPushButton("MCP Config")
+        self.mcp_config_btn.setMaximumWidth(120)
+        mcp_config_layout.addWidget(self.mcp_config_btn)
+        mcp_config_layout.addStretch()
+        self.right_column.addWidget(mcp_config_row)
         self.right_column.addWidget(tool_scroll_area)
         
         # Add stretches to push content to top in both columns
@@ -480,13 +411,25 @@ class AgentControlsPanel(QGroupBox):
         self.turn_monitor_checkbox.stateChanged.connect(self.update_turn_monitor_controls)
         self.turn_warning_threshold_spinbox.valueChanged.connect(self._on_turn_warning_threshold_changed)
         self.turn_critical_threshold_spinbox.valueChanged.connect(self._on_turn_critical_threshold_changed)
-        
-        # Initial updates
-        self.update_token_monitor_controls()
+        self.mcp_config_btn.clicked.connect(self._open_mcp_config)
+
+        # Initial updates        self.update_token_monitor_controls()
         self._update_token_threshold_labels()
         self.update_turn_monitor_controls()
         self._update_turn_threshold_labels()
     
+    def _open_mcp_config(self):
+        """Open MCP configuration dialog.
+        
+        This dialog allows the user to configure MCP server connections.
+        Changes to the configuration will trigger a tool refresh.
+        """
+        dialog = MCPConfigDialog(self)
+        dialog.exec()
+        # After dialog closes, trigger tool refresh via callback
+        if hasattr(self, 'on_mcp_config_changed') and callable(self.on_mcp_config_changed):
+            self.on_mcp_config_changed()
+
     def toggle_collapse(self):
         """Toggle visibility of controls."""
         self.is_collapsed = not self.is_collapsed
@@ -501,8 +444,57 @@ class AgentControlsPanel(QGroupBox):
     
     def get_enabled_tool_names(self):
         return [name for name, cb in self.tool_checkboxes.items() if cb.isChecked()]
-    
-    def update_token_monitor_controls(self):
+
+    def _rebuild_tool_checkboxes(self):
+        """Rebuild tool checkboxes from the current tool_classes list.
+
+        This method clears existing checkboxes and recreates them based on
+        self.tool_classes. Called when MCP configuration changes.
+        """
+        # Clear existing checkboxes
+        for checkbox in self.tool_checkboxes.values():
+            checkbox.setParent(None)
+            checkbox.deleteLater()
+        self.tool_checkboxes.clear()
+
+        # Recreate checkboxes in the tool group
+        # Find the tool group and layout
+        tool_group = None
+        for i in range(self.right_column.count()):
+            item = self.right_column.itemAt(i)
+            if item and item.widget():
+                widget = item.widget()
+                if isinstance(widget, QGroupBox) and widget.title() == "Tools":
+                    tool_group = widget
+                    break
+
+        if tool_group:
+            tool_layout = tool_group.layout()
+            if tool_layout:
+                # Clear existing widgets from layout
+                while tool_layout.count():
+                    child = tool_layout.takeAt(0)
+                    if child.widget():
+                        child.widget().setParent(None)
+
+                # Re-add checkboxes in 2 columns
+                col = 0
+                tool_row = 0
+                for i, cls in enumerate(self.tool_classes):
+                    checkbox = QCheckBox(cls.__name__)
+                    checkbox.setChecked(True)
+                    tool_layout.addWidget(checkbox, tool_row, col)
+                    self.tool_checkboxes[cls.__name__] = checkbox
+
+                    col += 1
+                    if col >= 2:
+                        col = 0
+                        tool_row += 1
+
+                # Add stretch to fill remaining space
+                tool_layout.setRowStretch(tool_row + 1, 1)
+
+    def update_token_monitor_controls(self):        
         """Enable/disable token monitor threshold controls based on checkbox."""
         enabled = self.token_monitor_checkbox.isChecked()
         self.warning_threshold_spinbox.setEnabled(enabled)
@@ -688,6 +680,8 @@ class AgentControlsPanel(QGroupBox):
         config["token_monitor_enabled"] = self.token_monitor_checkbox.isChecked()
         config["warning_threshold"] = self.warning_threshold_spinbox.value()
         config["critical_threshold"] = self.critical_threshold_spinbox.value()
+        config["token_monitor_warning_threshold"] = self.warning_threshold_spinbox.value() * 1000
+        config["token_monitor_critical_threshold"] = self.critical_threshold_spinbox.value() * 1000
         # Turn monitoring
         config["turn_monitor_enabled"] = self.turn_monitor_checkbox.isChecked()
         config["turn_monitor_warning_threshold"] = self.turn_warning_threshold_spinbox.value()
@@ -739,9 +733,15 @@ class AgentControlsPanel(QGroupBox):
         # Warning threshold (in thousands)
         if "warning_threshold" in config:
             self.warning_threshold_spinbox.setValue(config["warning_threshold"])
+        elif "token_monitor_warning_threshold" in config:
+            # Convert from actual tokens to thousands
+            self.warning_threshold_spinbox.setValue(config["token_monitor_warning_threshold"] // 1000)
         # Critical threshold (in thousands)
         if "critical_threshold" in config:
             self.critical_threshold_spinbox.setValue(config["critical_threshold"])
+        elif "token_monitor_critical_threshold" in config:
+            # Convert from actual tokens to thousands
+            self.critical_threshold_spinbox.setValue(config["token_monitor_critical_threshold"] // 1000)
         # Turn monitoring enabled
         if "turn_monitor_enabled" in config:
             self.turn_monitor_checkbox.setChecked(config["turn_monitor_enabled"])
@@ -785,6 +785,83 @@ class AgentControlsPanel(QGroupBox):
             enabled_names = set(config["enabled_tools"])
             for name, checkbox in self.tool_checkboxes.items():
                 checkbox.setChecked(name in enabled_names)
+
+
+class MCPConfigDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("MCP Configuration")
+        self.mcp_config_path = "mcp_config.json"
+        self.config = self._load_config()
+        self._setup_ui()
+    
+    def _load_config(self):
+        try:
+            with open(self.mcp_config_path, 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {"servers": []}
+    
+    def _save_config(self):
+        with open(self.mcp_config_path, 'w') as f:
+            json.dump(self.config, f, indent=2)
+    
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Server list
+        self.server_list = QListWidget()
+        layout.addWidget(self.server_list)
+        self._refresh_list()
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        self.add_btn = QPushButton("Add")
+        self.remove_btn = QPushButton("Remove")
+        self.save_btn = QPushButton("Save")
+        self.reload_btn = QPushButton("Reload")
+        btn_layout.addWidget(self.add_btn)
+        btn_layout.addWidget(self.remove_btn)
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.save_btn)
+        btn_layout.addWidget(self.reload_btn)
+        layout.addLayout(btn_layout)
+        
+        # Connect signals
+        self.add_btn.clicked.connect(self._add_server)
+        self.remove_btn.clicked.connect(self._remove_server)
+        self.save_btn.clicked.connect(self._save_config)
+        self.reload_btn.clicked.connect(self._reload_config)
+    
+    def _refresh_list(self):
+        self.server_list.clear()
+        for server in self.config.get("servers", []):
+            self.server_list.addItem(f"{server['name']} - {server['host']}")
+    
+    def _add_server(self):
+        name, ok = QInputDialog.getText(self, "Add Server", "Name:")
+        if not ok or not name: return
+        host, ok = QInputDialog.getText(self, "Add Server", "Host URL:")
+        if not ok or not host: return
+        abilities, ok = QInputDialog.getText(self, "Add Server", "Abilities (comma-separated):")
+        if not ok: return
+        self.config.setdefault("servers", []).append({
+            "name": name,
+            "host": host,
+            "abilities": [a.strip() for a in abilities.split(",")]
+        })
+        self._refresh_list()
+    
+    def _remove_server(self):
+        row = self.server_list.currentRow()
+        if row >= 0 and self.config.get("servers"):
+            self.config["servers"].pop(row)
+            self._refresh_list()
+    
+    def _reload_config(self):
+        self.config = self._load_config()
+        self._refresh_list()
+
 
 
 class StatusPanel(QGroupBox):
@@ -1436,17 +1513,14 @@ class AgentGUI(QMainWindow):
         
         splitter = QSplitter(Qt.Orientation.Horizontal)
         
-        # Left panel
-        self.system_view = SystemViewPanel()
-        splitter.addWidget(self.system_view)
+        # Left panel (removed SystemViewPanel)
         
         # Middle panels
         middle_container = QWidget()
         middle_layout = QVBoxLayout()
         middle_container.setLayout(middle_layout)
         
-        self.helpers_panel = AgenticHelpersPanel()
-        middle_layout.addWidget(self.helpers_panel)
+        # Removed AgenticHelpersPanel
         self.status_panel = StatusPanel()
         middle_layout.addWidget(self.status_panel)
         middle_layout.addStretch()
@@ -1460,6 +1534,9 @@ class AgentGUI(QMainWindow):
         # Agent Controls Panel
         self.agent_controls_panel = AgentControlsPanel(SIMPLIFIED_TOOL_CLASSES)
         right_layout.addWidget(self.agent_controls_panel)
+        
+        # Set callback for MCP config changes to refresh tools
+        self.agent_controls_panel.on_mcp_config_changed = self._refresh_tools
         
         # Connect workspace buttons
         self.agent_controls_panel.set_workspace_btn.clicked.connect(self.set_workspace)
@@ -2185,6 +2262,19 @@ class AgentGUI(QMainWindow):
         # Schedule save to ConfigService
         self._schedule_config_save()
         
+    def _refresh_tools(self):
+        """Refresh the available tools from MCP configuration."""
+        import importlib
+        try:
+            import tools
+            importlib.reload(tools)
+            from tools import TOOL_CLASSES
+            self.tool_classes = TOOL_CLASSES
+            self.agent_controls_panel.tool_classes = TOOL_CLASSES
+            self.agent_controls_panel._rebuild_tool_checkboxes()
+            print(f"[GUI] Refreshed tools: {len(TOOL_CLASSES)} tools loaded")
+        except Exception as e:
+            print(f"[GUI] Error refreshing tools: {e}")
     def _schedule_config_save(self):
         """Schedule a debounced configuration save."""
         if not self._loading_config:

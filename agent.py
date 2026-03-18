@@ -528,7 +528,7 @@ class Agent:
                 input_tokens = output_tokens = 0
             self.total_input_tokens += input_tokens
             self.total_output_tokens += output_tokens
-            self.state.current_conversation_tokens = input_tokens
+            self.state.current_conversation_tokens = input_tokens + output_tokens
             last_input_tokens = input_tokens
             last_output_tokens = output_tokens
 
