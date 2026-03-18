@@ -6,3 +6,4 @@ fast-json-repair>=0.1.0
 libcst
 tiktoken
 docker
+mcp

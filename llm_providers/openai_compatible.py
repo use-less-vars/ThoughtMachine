@@ -136,8 +136,41 @@ class OpenAICompatibleProvider(LLMProvider):
                 print(f"[DEBUG_OPENAI_RAW] Raw API response type: {type(response)}", file=sys.stderr)
                 print(f"[DEBUG_OPENAI_RAW] Raw API response: {raw_str}", file=sys.stderr)
             
+            # Debug: Print raw response details before parsing
+            import os
+            if os.environ.get('DEBUG_OPENAI'):
+                print(f"[DEBUG_BEFORE_PARSE] Response type: {type(response)}", file=sys.stderr)
+                if hasattr(response, '__dict__'):
+                    print(f"[DEBUG_BEFORE_PARSE] Response has __dict__, keys: {list(response.__dict__.keys())}", file=sys.stderr)
+                    # Try to get a string representation of the response
+                    try:
+                        import json
+                        resp_json = json.dumps(response.__dict__, default=str, indent=2)
+                        if len(resp_json) > 2000:
+                            resp_json = resp_json[:2000] + "... (truncated)"
+                        print(f"[DEBUG_BEFORE_PARSE] Response JSON: {resp_json}", file=sys.stderr)
+                    except:
+                        pass
+                elif isinstance(response, dict):
+                    print(f"[DEBUG_BEFORE_PARSE] Response is dict, keys: {list(response.keys())}", file=sys.stderr)
+                elif isinstance(response, str):
+                    print(f"[DEBUG_BEFORE_PARSE] WARNING: Response is string, not JSON object: {response[:500]}", file=sys.stderr)
+                else:
+                    print(f"[DEBUG_BEFORE_PARSE] Response repr: {repr(response)[:500]}", file=sys.stderr)
+            
             # Parse response
-            llm_response = self.parse_response(response, start_time)
+            try:
+                llm_response = self.parse_response(response, start_time)
+            except Exception as parse_error:
+                # If parse fails, add more context and re-raise with raw response attached
+                if os.environ.get('DEBUG_OPENAI'):
+                    print(f"[DEBUG_PARSE_ERROR] Failed to parse response: {parse_error}", file=sys.stderr)
+                    print(f"[DEBUG_PARSE_ERROR] Response that caused error: {response}", file=sys.stderr)
+                
+                # Create a ProviderError with the raw response
+                parse_provider_error = ProviderError(f"Failed to parse API response: {parse_error}")
+                parse_provider_error.raw_response = response
+                raise parse_provider_error
             
             # Track usage
             self.track_usage(llm_response)
@@ -145,11 +178,21 @@ class OpenAICompatibleProvider(LLMProvider):
             return llm_response
             
         except RateLimitError as e:
-            raise RateLimitExceeded(f"Rate limit exceeded: {e}")
+            # Include raw response if available
+            rate_limit_error = RateLimitExceeded(f"Rate limit exceeded: {e}")
+            if hasattr(e, 'response'):
+                rate_limit_error.raw_response = e.response
+            raise rate_limit_error
         except APIError as e:
             if "authentication" in str(e).lower() or "api key" in str(e).lower():
-                raise AuthenticationError(f"Authentication failed: {e}")
-            raise ProviderError(f"API error: {e}")
+                auth_error = AuthenticationError(f"Authentication failed: {e}")
+                if hasattr(e, 'response'):
+                    auth_error.raw_response = e.response
+                raise auth_error
+            api_error = ProviderError(f"API error: {e}")
+            if hasattr(e, 'response'):
+                api_error.raw_response = e.response
+            raise api_error
         except Exception as e:
             # Add more debug info about what was returned
             import os
@@ -168,16 +211,61 @@ class OpenAICompatibleProvider(LLMProvider):
             
             # Create a ProviderError with the raw response if available
             err_msg = f"Unexpected error: {e}"
+            provider_error = ProviderError(err_msg)
             if hasattr(e, 'response'):
-                err_msg = f"Unexpected error: {e}. Response: {e.response}"
-            raise ProviderError(err_msg)
+                provider_error.raw_response = e.response
+                provider_error.args = (f"{err_msg}. Response: {e.response}",)
+            
+            # Also attach the actual response object from the API call if it exists
+            if 'response' in locals():
+                provider_error.raw_response = response
+                
+            raise provider_error
     
     def parse_response(self, raw_response: Any, start_time: float) -> LLMResponse:
         """Parse OpenAI-compatible response"""
+        import os
+        import sys
+        
         latency = (time.time() - start_time) * 1000
         
-        message = raw_response.choices[0].message
+        # Debug: print raw response details
+        if os.environ.get('DEBUG_OPENAI'):
+            print(f"[DEBUG_PARSE_RESPONSE] Starting parse, raw_response type: {type(raw_response)}", file=sys.stderr)
+            if hasattr(raw_response, '__dict__'):
+                print(f"[DEBUG_PARSE_RESPONSE] raw_response has __dict__", file=sys.stderr)
+                for key, value in raw_response.__dict__.items():
+                    if key == '_response' or key == 'response':
+                        continue  # Skip large response objects
+                    print(f"[DEBUG_PARSE_RESPONSE]   {key}: {value}", file=sys.stderr)
+            elif isinstance(raw_response, dict):
+                print(f"[DEBUG_PARSE_RESPONSE] raw_response is dict, keys: {list(raw_response.keys())}", file=sys.stderr)
+            elif isinstance(raw_response, str):
+                print(f"[DEBUG_PARSE_RESPONSE] raw_response is string (len={len(raw_response)}): {raw_response[:200]}", file=sys.stderr)
+            else:
+                print(f"[DEBUG_PARSE_RESPONSE] raw_response repr: {repr(raw_response)[:200]}", file=sys.stderr)
         
+        # Check if raw_response is a string (error response from API)
+        if isinstance(raw_response, str):
+            if os.environ.get('DEBUG_OPENAI'):
+                print(f"[DEBUG_PARSE_RESPONSE] ERROR: API returned string instead of JSON: {raw_response}", file=sys.stderr)
+            raise ValueError(f"API returned string instead of JSON response: {raw_response[:200]}")
+        
+        # Check if raw_response has the expected structure
+        if not hasattr(raw_response, 'choices'):
+            if os.environ.get('DEBUG_OPENAI'):
+                print(f"[DEBUG_PARSE_RESPONSE] ERROR: raw_response missing 'choices' attribute", file=sys.stderr)
+                print(f"[DEBUG_PARSE_RESPONSE] raw_response attributes: {dir(raw_response)}", file=sys.stderr)
+                if hasattr(raw_response, '__dict__'):
+                    print(f"[DEBUG_PARSE_RESPONSE] raw_response __dict__ keys: {list(raw_response.__dict__.keys())}", file=sys.stderr)
+            raise AttributeError(f"Response missing 'choices' attribute. Response type: {type(raw_response)}")
+        
+        if not raw_response.choices:
+            if os.environ.get('DEBUG_OPENAI'):
+                print(f"[DEBUG_PARSE_RESPONSE] ERROR: raw_response.choices is empty", file=sys.stderr)
+            raise ValueError("Response has empty choices list")
+        
+        message = raw_response.choices[0].message        
         # Extract tool calls if present
         tool_calls = None
         if hasattr(message, 'tool_calls') and message.tool_calls:

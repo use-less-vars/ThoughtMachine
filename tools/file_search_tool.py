@@ -2,6 +2,7 @@ from .base import ToolBase
 import os
 import re
 import fnmatch
+import bisect
 from pathlib import Path
 from pydantic import Field
 from typing import List, Optional, ClassVar
@@ -28,7 +29,18 @@ class FileSearchTool(ToolBase):
     use_regex: bool = Field(default=False, description="If True, treat pattern as a regular expression.")
     case_sensitive: bool = Field(default=False, description="If True, perform case-sensitive search (default False).")
     max_results: int = Field(default=50, description="Maximum number of matches to return.")
+    exclude_dirs: List[str] = Field(
+        default_factory=lambda: ["__pycache__", ".git", ".svn", ".hg", "node_modules", ".idea", ".vscode", ".pytest_cache", "build", "dist", "*.egg-info", "venv", "env", ".venv"],
+        description="Directory names to exclude from search (exact match or glob patterns)"
+    )
     
+    def _should_exclude_dir(self, dirname: str) -> bool:
+        """Check if a directory should be excluded based on exclude_dirs patterns."""
+        for pattern in self.exclude_dirs:
+            if fnmatch.fnmatch(dirname, pattern):
+                return True
+        return False
+
     def execute(self) -> str:
         try:
             # Determine which files to search
@@ -40,8 +52,10 @@ class FileSearchTool(ToolBase):
                     except ValueError as e:
                         return f"Error: {e}"
                     if os.path.isdir(validated_f):
-                        # treat as directory, expand recursively
+                        # treat as directory, expand recursively with exclusion
                         for root, dirs, files in os.walk(validated_f):
+                            # Modify dirs in-place to exclude unwanted directories
+                            dirs[:] = [d for d in dirs if not self._should_exclude_dir(d)]
                             for file in files:
                                 full_path = os.path.join(root, file)
                                 # Validate each subfile (should be within workspace since root is)
@@ -62,6 +76,8 @@ class FileSearchTool(ToolBase):
                 if not os.path.isdir(validated_dir):
                     return f"Error: '{self.directory}' is not a valid directory."
                 for root, dirs, files in os.walk(validated_dir):
+                    # Modify dirs in-place to exclude unwanted directories
+                    dirs[:] = [d for d in dirs if not self._should_exclude_dir(d)]
                     for file in files:
                         full_path = os.path.join(root, file)
                         # Validate each subfile (should be within workspace since root is)
@@ -125,17 +141,15 @@ class FileSearchTool(ToolBase):
                     file_line_offsets_cache[file_path] = line_offsets
                 except (IOError, PermissionError, UnicodeDecodeError):
                     continue
-                
+
                 # Find all matches
                 for match in regex_pattern.finditer(content):
                     start = match.start()
                     end = match.end()
-                    # Compute line numbers of first and last characters of match
-                    line_start = content.count('\n', 0, start) + 1
-                    if end == start:
-                        line_end = line_start
-                    else:
-                        line_end = content.count('\n', 0, end - 1) + 1
+                    # Compute line numbers efficiently using binary search on offsets
+                    line_start = bisect.bisect_right(line_offsets, start)
+                    # For line_end, use end-1 to get line containing last char
+                    line_end = bisect.bisect_right(line_offsets, end - 1) if end > start else line_start
                     matches.append({
                         'file': file_path,
                         'start': start,
@@ -147,8 +161,7 @@ class FileSearchTool(ToolBase):
                     if len(matches) >= max_results:
                         break
                 if len(matches) >= max_results:
-                    break
-            
+                    break            
             if not matches:
                 return "No matches found."
             
