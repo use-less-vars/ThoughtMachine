@@ -5,6 +5,7 @@ from .base import ToolBase
 class SummarizeTool(ToolBase):
     """Summarize Tool: Write a summary of the conversation and specify how many most recent turns to keep.
     The agent will replace older turns with the summary, preserving the specified number of recent turns."""
+    tool: Literal["SummarizeTool"] = "SummarizeTool"
     
     summary: str = Field(description="The summary text to insert into the conversation history.")
     keep_recent_turns: int = Field(description="Number of most recent turns to keep (excluding the summary).", ge=0)

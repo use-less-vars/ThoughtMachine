@@ -9,6 +9,7 @@ from .base import ToolBase
 class FileEditor(ToolBase):
     """Unified file editor supporting read, write, insert, append, replace, and delete operations.
     Supports single file operations or batch operations across multiple files."""
+    tool: Literal["FileEditor"] = "FileEditor"
     operation: Literal["read", "write", "insert", "append", "replace", "delete", "grep"] = Field(
         description="Operation: read, write, insert, append, replace, delete, or grep."
     )

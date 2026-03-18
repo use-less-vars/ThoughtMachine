@@ -1,5 +1,5 @@
 from pydantic import Field
-from typing import Optional
+from typing import Optional, Literal
 from datetime import datetime
 import os
 from pathlib import Path
@@ -13,6 +13,7 @@ class FinalReport(Final):
     The agent stops after writing the report and returning the final answer.
     This is for task completion with full reporting.
     """
+    tool: Literal["FinalReport"] = "FinalReport"
     content: str = Field(default="Report written successfully.", description="The final answer text")
     report_body: Optional[str] = Field(
         default=None, 

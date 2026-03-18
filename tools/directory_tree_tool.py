@@ -3,7 +3,7 @@ import os
 import pathlib
 import stat
 from pydantic import Field
-from typing import Optional, List, Dict, Any, Tuple, ClassVar
+from typing import Optional, List, Dict, Any, Tuple, ClassVar, Literal
 import time
 
 class DirectoryTreeTool(ToolBase):
@@ -15,6 +15,7 @@ class DirectoryTreeTool(ToolBase):
     - Skips line counting for binary files and large files (>1MB)
     - Optional skip_line_count parameter for performance
     """
+    tool: Literal["DirectoryTreeTool"] = "DirectoryTreeTool"
     
     # Common binary file extensions where line counting should be skipped
     BINARY_EXTENSIONS: ClassVar[set[str]] = {'.pyc', '.pyo', '.so', '.dll', '.exe', '.bin', '.o', '.a', '.lib', '.dylib',

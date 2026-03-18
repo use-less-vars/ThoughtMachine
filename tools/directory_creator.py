@@ -6,6 +6,8 @@ from pydantic import Field
 
 class DirectoryCreator(ToolBase):
     """Create directories"""
+    tool: Literal["DirectoryCreator"] = "DirectoryCreator"
+
     directory_path: str = Field(description="Directory path to create")
     parents: bool = Field(default=True, description="Create parent directories if they don't exist")
     exist_ok: bool = Field(default=True, description="Don't raise error if directory already exists")
@@ -38,3 +40,4 @@ class DirectoryCreator(ToolBase):
                 
         except Exception as e:
             return self._truncate_output(f"Error creating directory: {e}")
+

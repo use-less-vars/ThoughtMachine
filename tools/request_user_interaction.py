@@ -4,6 +4,7 @@ from pydantic import Field
 
 class RequestUserInteraction(ToolBase):
     """Request user interaction tool. Use this when you need to ask the user a question, request clarification, or get additional information in an interactive session."""
+    tool: Literal["RequestUserInteraction"] = "RequestUserInteraction"
     message: str = Field(description="The question or message to present to the user")
 
     def execute(self) -> str:

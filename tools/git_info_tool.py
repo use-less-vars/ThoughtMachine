@@ -14,6 +14,7 @@ class GitInfoTool(ToolBase):
     All operations are read-only and cannot modify the repository.
     """
     tool: Literal["GitInfoTool"] = "GitInfoTool"
+
     
     operation: Literal["status", "diff", "log", "branch", "show", "remote", "blame", "config"] = Field(
         description="Git operation to perform: status, diff, log, branch, show, remote, blame, config"

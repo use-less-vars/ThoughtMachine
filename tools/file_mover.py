@@ -15,6 +15,7 @@ class FileMover(ToolBase):
     - Pattern: pattern='*.tmp', destination_path='temp/', recursive=True
     - Preserve structure: source_paths=['src/a.txt', 'src/b/c.txt'], destination_path='backup/', preserve_structure=True
     """
+    tool: Literal["FileMover"] = "FileMover"
     source_path: Optional[str] = Field(default=None, description="Source file or directory path (single move).")
     source_paths: Optional[List[str]] = Field(default=None, description="List of source file/directory paths (batch move).")
     pattern: Optional[str] = Field(default=None, description="Glob pattern to match multiple files (e.g., '*.tmp', 'data_*.txt').")

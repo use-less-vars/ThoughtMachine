@@ -78,6 +78,7 @@ class DockerCodeRunner(ToolBase):
     """
     tool: Literal["DockerCodeRunner"] = "DockerCodeRunner"
 
+
     # Docker-specific configuration: override base class defaults
     is_docker: bool = Field(default=True)
     container_workspace_path: str = Field(default="/workspace")

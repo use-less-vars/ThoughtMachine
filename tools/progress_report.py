@@ -1,5 +1,5 @@
 from pydantic import Field
-from typing import Optional
+from typing import Optional, Literal
 from datetime import datetime
 import os
 from pathlib import Path
@@ -12,6 +12,7 @@ class ProgressReport(ToolBase):
     Use this tool to document intermediate progress, milestones, or status updates
     during long-running batch jobs. The agent continues executing after writing the report.
     """
+    tool: Literal["ProgressReport"] = "ProgressReport"
     report_body: str = Field(description="The body/content of the progress report")
     report_title: Optional[str] = Field(
         default=None, 

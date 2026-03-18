@@ -22,6 +22,8 @@ class CodeModifier(ToolBase):
     Modify Python code at a structural level.
      Currently supports: add_function, add_method, add_import, add_class, replace_function_body, modify_function.
     """
+    tool: Literal["CodeModifier"] = "CodeModifier"
+
 
     operation: Literal[
          "add_function", "add_method", "add_import", "add_class", "replace_function_body", "modify_function"

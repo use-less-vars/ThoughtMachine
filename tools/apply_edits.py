@@ -1,7 +1,7 @@
 import difflib
 import re
 from pathlib import Path
-from typing import List, Dict, Union, Optional, Tuple
+from typing import List, Dict, Union, Optional, Tuple, Literal
 from pydantic import Field
 from .base import ToolBase
 
@@ -211,6 +211,7 @@ class _ApplyEditsEngine:
 
 class ApplyEdits(ToolBase):
     """Apply search/replace edits to file(s) with resilient matching. Edits are applied sequentially; if any find fails, the file is unchanged."""
+    tool: Literal["ApplyEdits"] = "ApplyEdits"
     file_path: Optional[str] = Field(None, description="Path to the file to edit (optional if files or file_pattern provided)")
     edits: List[dict] = Field(description="List of edit dictionaries. Each edit must have 'find' and 'replace' keys, and optionally 'occurrence' (default 1, 0 for all).")
     files: Optional[List[str]] = Field(None, description="List of file paths to edit (optional if file_path or file_pattern provided)")

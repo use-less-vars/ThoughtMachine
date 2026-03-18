@@ -5,6 +5,7 @@ from .base import ToolBase
 
 class DateTimeTool(ToolBase):
     """Access date and time information and perform datetime operations."""
+    tool: Literal["DateTimeTool"] = "DateTimeTool"
     
     operation: Literal["current_datetime", "current_date", "current_time", "format", "parse", "difference"] = Field(
         description="Operation: current_datetime, current_date, current_time, format, parse, or difference."

@@ -260,11 +260,11 @@ class PydanticModelVisitor(cst.CSTVisitor):
 
 
 class FieldViewer(ToolBase):
-    tool: Literal["FieldViewer"] = "FieldViewer"
     """
     Parse Python files, locate Pydantic model definitions, and display their fields
     with types, docstrings, and line numbers.
     """
+    tool: Literal["FieldViewer"] = "FieldViewer"
     
     file_path: str = Field(description="Path to the Python file to inspect.")
     class_name: Optional[str] = Field(None, description="If provided, show fields only for this class.")

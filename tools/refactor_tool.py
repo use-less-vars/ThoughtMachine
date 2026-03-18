@@ -4,7 +4,7 @@ Combines the structural understanding of CodeModifier with the multi‑file capa
 """
 from pathlib import Path
 from pydantic import Field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Literal
 import difflib
 import tempfile
 import shutil
@@ -67,6 +67,8 @@ class RefactorTool(ToolBase):
     Apply CodeModifier operations to all files matching a glob pattern.
     Supports preview mode and atomic application (all files succeed or none are written).
     """
+    tool: Literal["RefactorTool"] = "RefactorTool"
+
     operation: str = Field(description="Type of refactoring operation. One of: 'add_method', 'rename_function', 'replace_function_body', 'add_import', 'add_class', 'modify_function'.")
     target: str = Field(description="Name of the target code element (e.g., class name, function name).")
     file_pattern: str = Field(description="Glob pattern to select files (e.g., '**/*.py').")

@@ -23,8 +23,8 @@ class PaginateTool(ToolBase):
         page: Page number (1-indexed)
         per_page: Results per page (0 = all)
     """
-
     tool: Literal["PaginateTool"] = "PaginateTool"
+
 
     tool_name: str = Field(
         description="Name of the tool class to paginate (e.g., 'GlobTool', 'DirectoryTreeTool')"

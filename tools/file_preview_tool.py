@@ -2,10 +2,11 @@ from .base import ToolBase
 import os
 import pathlib
 from pydantic import Field
-from typing import Optional, ClassVar
+from typing import Optional, ClassVar, Literal
 
 class FilePreviewTool(ToolBase):
     """Show beginning and end of file with line numbers."""
+    tool: Literal["FilePreviewTool"] = "FilePreviewTool"
     
     # Safety limits
     MAX_HEAD_LINES: ClassVar[int] = 500

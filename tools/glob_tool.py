@@ -33,8 +33,8 @@ class GlobTool(ToolBase):
         exclude_dirs=['__pycache__', '.git', 'node_modules'] skips common artifacts
         page=2, per_page=50 gets the second page of 50 results each
     """
-
     tool: Literal["GlobTool"] = "GlobTool"
+
 
     directory: str = Field(
         description="Root directory to start the glob search (default: current directory)"

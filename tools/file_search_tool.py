@@ -5,12 +5,13 @@ import fnmatch
 import bisect
 from pathlib import Path
 from pydantic import Field
-from typing import List, Optional, ClassVar
+from typing import List, Optional, ClassVar, Literal
 
 class FileSearchTool(ToolBase):
     """Search for patterns across multiple files or directories with regex, multiline, context lines, and line numbers.
     Supports regex (with (?s) flag for dot-matches-newline) and plain text multi-line searches.
     Use file_pattern glob to limit files, or directory/filenames."""
+    tool: Literal["FileSearchTool"] = "FileSearchTool"
     
     # Safety limits
     MAX_FILE_SIZE: ClassVar[int] = 10_000_000  # 10MB
@@ -38,6 +39,15 @@ class FileSearchTool(ToolBase):
         """Check if a directory should be excluded based on exclude_dirs patterns."""
         for pattern in self.exclude_dirs:
             if fnmatch.fnmatch(dirname, pattern):
+                return True
+        return False
+
+    def _is_path_excluded(self, file_path: str) -> bool:
+        """Check if a file path should be excluded based on exclude_dirs patterns."""
+        # Check each directory component
+        path = Path(file_path)
+        for parent in path.parents:
+            if self._should_exclude_dir(parent.name):
                 return True
         return False
 
@@ -88,11 +98,15 @@ class FileSearchTool(ToolBase):
                             # Skip files outside workspace
                             continue
             elif self.file_pattern:
-                # Use glob to find files matching pattern
+                # Use glob to find files matching pattern, respecting workspace and exclusions
                 files_to_search = []
-                for p in Path('.').glob(self.file_pattern):
+                base_path = Path(self.workspace_path or '.')
+                for p in base_path.glob(self.file_pattern):
                     try:
                         validated_path = self._validate_path(str(p))
+                        # Check if file is in excluded directory
+                        if self._is_path_excluded(validated_path):
+                            continue
                         files_to_search.append(validated_path)
                     except ValueError:
                         # Skip files outside workspace

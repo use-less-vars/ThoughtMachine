@@ -3,13 +3,14 @@ import ast
 import os
 import pathlib
 from pydantic import Field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 import logging
 
 logger = logging.getLogger(__name__)
 
 class FileSummaryTool(ToolBase):
     """Extract structural elements from code files using AST parsing."""
+    tool: Literal["FileSummaryTool"] = "FileSummaryTool"
     
     filename: str = Field(description="Path to the file to analyze")
     include_imports: bool = Field(default=True, description="Include import statements in summary")
