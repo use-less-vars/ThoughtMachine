@@ -58,11 +58,12 @@ class ToolLoaderPanel(QGroupBox):
 
 class AgentControlsPanel(QGroupBox):
     """Collapsible panel for agent controls."""
-    def __init__(self, tool_classes):
+    def __init__(self, tool_classes, config_file=None):
         super().__init__("Agent Controls")
         self.tool_classes = tool_classes
         self.tool_checkboxes = {}  # name -> QCheckBox
         self.is_collapsed = True
+        self.config_file = config_file  # Store config file path
         
         # Provider type mapping: GUI display -> internal type
         self._provider_mapping = {
@@ -1298,6 +1299,9 @@ class EventDelegate(QStyledItemDelegate):
                 
         elif etype == "user_query":
             add_line(f"User query: {event.get('content', '')}", style="font-weight: bold; color: #8B008B;", use_markdown=True)
+
+        elif etype == "system":
+            add_line(f"System: {event.get('content', '')}", style="color: #808080; font-style: italic;", use_markdown=True)
             
         elif etype == "stopped":
             add_line("Agent stopped by user.", style="color: #FF8C00;")
@@ -1578,7 +1582,7 @@ class AgentGUI(QMainWindow):
         filter_layout.addWidget(QLabel("Type:"))
         self.filter_type_combo = QComboBox()
         self.filter_type_combo.addItems(["all", "turn", "final", "user_query", "stopped", 
-                                         "user_interaction_requested", "token_warning", 
+                                         "system", "user_interaction_requested", "token_warning", 
                                          "turn_warning", "paused", "max_turns", "error", 
                                          "thread_finished"])
         self.filter_type_combo.currentTextChanged.connect(self._apply_filter)
@@ -2651,10 +2655,41 @@ class AgentGUI(QMainWindow):
     def closeEvent(self, event):
         """Save configuration before closing the GUI."""
         # Save immediately on close to ensure config is persisted
-        self.save_config(immediate=True)
+        self._save_config_to_service()
         # Clean up presenter
         self.presenter.cleanup()
         super().closeEvent(event)
+    def _load_config():
+        def _load_config(self):
+            """Load configuration from file or create default."""
+            try:
+                config = self._config_service.load_config()
+                self._apply_config_to_controls(config)
+                print(f"[GUI] Configuration loaded from {self._config_path}")
+            except Exception as e:
+                print(f"[GUI] Error loading config: {e}, using defaults")
+                # Create default config
+                config = self._config_service.create_default_config()
+                self._apply_config_to_controls(config)
+    def _apply_config_to_controls():
+        def _apply_config_to_controls(self, config):
+            """Apply configuration dictionary to the controls panel."""
+            self._loading_config = True
+            try:
+                self.agent_controls_panel.set_config_dict(config)
+            finally:
+                self._loading_config = False
+    def _save_config_to_service():
+        def _save_config_to_service(self):
+            """Save current configuration to the ConfigService."""
+            try:
+                config = self.agent_controls_panel.get_config_dict()
+                self._config_service.save_config(config)
+                print(f"[GUI] Configuration saved to {self._config_path}")
+            except Exception as e:
+                print(f"[GUI] Error saving config: {e}")
+
+
 
 
 # ----- Main Function -----

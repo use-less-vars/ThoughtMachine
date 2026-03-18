@@ -693,6 +693,21 @@ class Agent:
                 # Apply summary pruning if requested
                 if summary_requested:
                     self._apply_summary_pruning(summary_text, summary_keep_recent_turns)
+                    # Yield system event for GUI to display summary
+                    yield {
+                        "type": "system",
+                        "content": f"Summary pruning applied: kept {summary_keep_recent_turns} recent turns",
+                        "message": f"Summary pruning applied: kept {summary_keep_recent_turns} recent turns",
+                        "summary": summary_text[:500] + ("..." if len(summary_text) > 500 else ""),
+                        "turns_kept": summary_keep_recent_turns,
+                        "context_length": self.state.current_conversation_tokens,
+                        "usage": {
+                            "input": input_tokens,
+                            "output": output_tokens,
+                            "total_input": self.total_input_tokens,
+                            "total_output": self.total_output_tokens,
+                        }
+                    }
                 # Log turn completion
                 if self.logger:
                     turn_usage = {"input": input_tokens, "output": output_tokens}
