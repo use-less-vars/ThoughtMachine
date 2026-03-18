@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
+import typing
 
 
 class TokenState(enum.Enum):
@@ -40,21 +41,26 @@ class SessionState(enum.Enum):
 @dataclass
 class AgentState:
     """Encapsulates all agent states with transition logic."""
-    
+
     # Configuration and dependencies
     config: Any  # AgentConfig
     logger: Optional[Any] = None
-    
+
     # State fields
     token_state: TokenState = TokenState.LOW
     turn_state: TurnState = TurnState.LOW
     execution_state: ExecutionState = ExecutionState.IDLE
     session_state: SessionState = SessionState.NEW
-    
+
     # Resource tracking
     current_conversation_tokens: int = 0
     current_turn: int = 0
     
+    # CRITICAL countdown tracking
+    token_critical_countdown: int = 0
+    turn_critical_countdown: int = 0
+    CRITICAL_COUNTDOWN_TURNS: int = 5  # Configurable number of turns after CRITICAL before restrictions
+
     # Warning tracking
     last_token_warning_state: TokenState = TokenState.LOW
     last_turn_warning_state: TurnState = TurnState.LOW
@@ -62,7 +68,11 @@ class AgentState:
     last_token_warning_count: int = 0
     last_turn_warning: Optional[str] = None
     last_turn_warning_count: int = 0
-    
+
+    # Critical countdown tracking
+    token_critical_countdown: int = 0
+    turn_critical_countdown: int = 0
+    CRITICAL_COUNTDOWN_TURNS: int = 5  # Configurable countdown before restrictions    
 
     
     # Internal event storage
@@ -251,6 +261,8 @@ class AgentState:
         self.last_token_warning_state = TokenState.LOW
         self.last_token_warning = None
         self.last_token_warning_count = 0
+        # Reset token countdown
+        self.token_critical_countdown = 0
         
         # Reset turn state
         self.turn_state = TurnState.LOW
@@ -258,6 +270,8 @@ class AgentState:
         self.last_turn_warning_state = TurnState.LOW
         self.last_turn_warning = None
         self.last_turn_warning_count = 0
+        # Reset turn countdown
+        self.turn_critical_countdown = 0
         
         # Set execution state to IDLE (or keep current?)
         events.extend(self.set_execution_state(ExecutionState.IDLE))
@@ -266,24 +280,148 @@ class AgentState:
         events.extend(self.set_session_state(SessionState.NEW))
         
         return events
+
+    def start_critical_countdown(self, resource: str) -> List[Dict[str, Any]]:
+        """Start the critical countdown for a resource (token or turn).
+
+        Returns a list of events containing the countdown start notification.
+        """
+        countdown = self.CRITICAL_COUNTDOWN_TURNS
+        if resource == "token":
+            self.token_critical_countdown = countdown
+        elif resource == "turn":
+            self.turn_critical_countdown = countdown
+        else:
+            raise ValueError(f"Unknown resource: {resource}")
+
+        warning = (
+            f"[SYSTEM] {resource.upper()} usage is CRITICAL. "
+            f"You have {countdown} turns to work normally before tool restrictions apply. "
+            f"Use SummarizeTool to reduce context or Final/FinalReport to complete work. "
+            f"After countdown: only summary/final tools allowed."
+        )
+
+        # Update the last warning to show countdown
+        if resource == "token":
+            self.last_token_warning = warning
+        else:
+            self.last_turn_warning = warning
+
+        return [{
+            "type": "critical_countdown_start",
+            "resource": resource,
+            "countdown": countdown,
+            "message": warning,
+            "state": "critical_countdown"
+        }]
+
+    def decrement_critical_countdown(self) -> List[Dict[str, Any]]:
+        """Decrement critical countdowns and return any expiration events.
+
+        Call this at the start of each turn to manage countdown timers.
+        """
+        events = []
+
+        # Decrement token countdown if active
+        if self.token_critical_countdown > 0:
+            self.token_critical_countdown -= 1
+            if self.token_critical_countdown == 0:
+                events.append({
+                    "type": "token_critical_active",
+                    "message": "[SYSTEM] Token countdown expired. Tool restrictions now active: only SummarizeTool, Final, FinalReport allowed.",
+                    "resource": "token"
+                })
+
+        # Decrement turn countdown if active
+        if self.turn_critical_countdown > 0:
+            self.turn_critical_countdown -= 1
+            if self.turn_critical_countdown == 0:
+                events.append({
+                    "type": "turn_critical_active",
+                    "message": "[SYSTEM] Turn countdown expired. Tool restrictions now active: only SummarizeTool, Final, FinalReport allowed.",
+                    "resource": "turn"
+                })
+
+        return events
     
-    def get_allowed_tools(self) -> List[str]:
-        """Get list of allowed tool names based on current states.
+    def start_critical_countdown(self, resource: str) -> List[Dict[str, Any]]:
+        """Start a countdown before tool restrictions apply.
         
-        This implements tool restriction logic (optional).
+        Args:
+            resource: Either "token" or "turn"
+            
+        Returns:
+            List of events containing the countdown start notification
+        """
+        countdown = self.CRITICAL_COUNTDOWN_TURNS
+        if resource == "token":
+            self.token_critical_countdown = countdown
+        elif resource == "turn":
+            self.turn_critical_countdown = countdown
+        
+        warning = (
+            f"[SYSTEM] {resource.upper()} usage is CRITICAL. "
+            f"You have {countdown} turns to work normally before tool restrictions apply. "
+            f"Use SummarizeTool to reduce context or Final/FinalReport to complete work. "
+            f"After countdown: only summary/final tools allowed."
+        )
+        return [{
+            "type": f"{resource}_critical_countdown_start",
+            "resource": resource,
+            "countdown": countdown,
+            "message": warning,
+            "state": "critical_countdown"
+        }]
+    
+    def decrement_critical_countdown(self) -> List[Dict[str, Any]]:
+        """Decrement countdown timers and check if they expire.
+        
+        Returns:
+            List of events (e.g., restrictions activated)
+        """
+        events = []
+        
+        # Decrement token countdown if active
+        if self.token_critical_countdown > 0:
+            self.token_critical_countdown -= 1
+            if self.token_critical_countdown == 0:
+                events.append({
+                    "type": "token_critical_active",
+                    "message": "[SYSTEM] Token countdown expired. Tool restrictions now active: only SummarizeTool, Final, FinalReport allowed.",
+                    "restricted": True
+                })
+        
+        # Decrement turn countdown if active
+        if self.turn_critical_countdown > 0:
+            self.turn_critical_countdown -= 1
+            if self.turn_critical_countdown == 0:
+                events.append({
+                    "type": "turn_critical_active",
+                    "message": "[SYSTEM] Turn countdown expired. Tool restrictions now active: only SummarizeTool, Final, FinalReport allowed.",
+                    "restricted": True
+                })
+        
+        return events
+    
+    def get_allowed_tools(self) -> List[str]:        """Get list of allowed tool names based on current states.
+
+        This implements tool restriction logic. Restrictions only apply when
+        countdown has expired (countdown == 0). During countdown, all tools allowed.
         """
         # Default: all tools allowed
         allowed = []
-        
-        # If token state is CRITICAL, only allow SummarizeTool
-        if self.token_state == TokenState.CRITICAL:
-            allowed = ["SummarizeTool"]
-        # If turn state is CRITICAL, only allow Final or FinalReport tools
-        elif self.turn_state == TurnState.CRITICAL:
-            allowed = ["Final", "FinalReport"]
-        
-        return allowed
-    
+
+        # Check if restrictions are active (countdown expired)
+        token_restricted = (self.token_state == TokenState.CRITICAL and
+                            self.token_critical_countdown == 0)
+        turn_restricted = (self.turn_state == TurnState.CRITICAL and
+                           self.turn_critical_countdown == 0)
+
+        # If either resource is restricted, allow only summary/final tools
+        if token_restricted or turn_restricted:
+            allowed = ["SummarizeTool", "Final", "FinalReport"]
+
+        return allowed    
     def is_tool_allowed(self, tool_name: str) -> bool:
         """Check if a specific tool is allowed in current state."""
         allowed = self.get_allowed_tools()

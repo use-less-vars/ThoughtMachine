@@ -1302,6 +1302,11 @@ class EventDelegate(QStyledItemDelegate):
 
         elif etype == "system":
             add_line(f"System: {event.get('content', '')}", style="color: #808080; font-style: italic;", use_markdown=True)
+            # Show full summary if present (from SummarizeTool)
+            if 'summary' in event:
+                add_line(f"<b>Summary:</b> {event['summary']}", style="color: #000000;")
+                # Also add a separator
+                lines.append('<hr>')
             
         elif etype == "stopped":
             add_line("Agent stopped by user.", style="color: #FF8C00;")
@@ -1385,6 +1390,12 @@ class EventDelegate(QStyledItemDelegate):
         elif etype == "user_query":
             add_line(f"User query: {event.get('content', '')}")
             
+        elif etype == "system":
+            add_line(f"System: {event.get('content', '')}")
+            # Show full summary if present (from SummarizeTool)
+            if 'summary' in event:
+                add_line(f"Summary: {event['summary']}")
+                
         elif etype == "stopped":
             add_line("Agent stopped by user.")
         elif etype == "user_interaction_requested":

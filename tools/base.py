@@ -14,6 +14,8 @@ class ToolBase(BaseModel):
     """
     workspace_path: Optional[str] = Field(default=None, description="Root directory for file operations (None = unrestricted)")
     token_limit: Optional[int] = Field(default=None, description="Maximum token limit for tool output (None = no limit)")
+    is_docker: bool = Field(default=False, description="Whether the tool is executing in a Docker container")
+    container_workspace_path: Optional[str] = Field(default=None, description="Workspace path as seen from inside the container (e.g., /workspace)")
 
     def execute(self) -> str:
         raise NotImplementedError

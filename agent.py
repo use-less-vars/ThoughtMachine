@@ -698,7 +698,7 @@ class Agent:
                         "type": "system",
                         "content": f"Summary pruning applied: kept {summary_keep_recent_turns} recent turns",
                         "message": f"Summary pruning applied: kept {summary_keep_recent_turns} recent turns",
-                        "summary": summary_text[:500] + ("..." if len(summary_text) > 500 else ""),
+                        "summary": summary_text,
                         "turns_kept": summary_keep_recent_turns,
                         "context_length": self.state.current_conversation_tokens,
                         "usage": {

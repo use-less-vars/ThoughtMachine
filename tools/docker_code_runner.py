@@ -57,7 +57,7 @@ class DockerCodeRunner(ToolBase):
     Template variables:
     Command supports template variables using {variable_name} syntax.
     Built-in variables:
-    - {workspace}: Workspace directory path
+    - {workspace}: Container workspace directory path (e.g., /workspace)
     - {timestamp}: ISO timestamp
     - {date}: Current date (YYYY-MM-DD)
     - {time}: Current time (HH:MM:SS)
@@ -77,9 +77,12 @@ class DockerCodeRunner(ToolBase):
     - This reduces Docker container overhead while maintaining security isolation.
     """
     tool: Literal["DockerCodeRunner"] = "DockerCodeRunner"
-    
-    command: Optional[str] = Field(
-        default=None,
+
+    # Docker-specific configuration: override base class defaults
+    is_docker: bool = Field(default=True)
+    container_workspace_path: str = Field(default="/workspace")
+
+    command: Optional[str] = Field(        default=None,
         description="Shell command to execute inside the container (passed to /bin/sh -c). If script is provided, this field is ignored."
     )
     timeout: int = Field(
@@ -142,7 +145,7 @@ class DockerCodeRunner(ToolBase):
         """Substitute template variables in command string."""
         # Built-in variables
         builtins = {
-            "workspace": self.workspace_path or os.getcwd(),
+            "workspace": self.container_workspace_path or "/workspace",
             "timestamp": datetime.datetime.now().isoformat(),
             "date": datetime.datetime.now().strftime("%Y-%m-%d"),
             "time": datetime.datetime.now().strftime("%H:%M:%S"),
