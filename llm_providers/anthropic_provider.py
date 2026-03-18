@@ -214,14 +214,21 @@ class AnthropicProvider(LLMProvider):
                     print(f"[DEBUG_PARSE_RESPONSE] raw_response __dict__ keys: {list(raw_response.__dict__.keys())}", file=sys.stderr)
             raise AttributeError(f"Response missing 'content' attribute. Response type: {type(raw_response)}")
         
-        # Extract content        content = ""
+        # Extract content and reasoning
+        content = ""
+        reasoning = ""
         tool_calls = []
-        
+
         for content_block in raw_response.content:
             if content_block.type == "text":
                 content = content_block.text
-            elif content_block.type == "tool_use":
-                # Handle both dictionary and object tool calls
+            elif content_block.type == "thinking":
+                # Extract reasoning from thinking blocks
+                if hasattr(content_block, 'thinking'):
+                    reasoning += content_block.thinking + "\n"
+                elif isinstance(content_block, dict) and 'thinking' in content_block:
+                    reasoning += content_block['thinking'] + "\n"
+            elif content_block.type == "tool_use":                # Handle both dictionary and object tool calls
                 if hasattr(content_block, 'name'):
                     # Object format (Anthropic SDK)
                     name = content_block.name
@@ -252,6 +259,7 @@ class AnthropicProvider(LLMProvider):
         
         return LLMResponse(
             content=content,
+            reasoning=reasoning if reasoning else None,
             tool_calls=tool_calls if tool_calls else None,
             usage=usage,
             raw_response=raw_response,

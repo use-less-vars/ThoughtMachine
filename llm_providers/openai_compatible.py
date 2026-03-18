@@ -265,7 +265,9 @@ class OpenAICompatibleProvider(LLMProvider):
                 print(f"[DEBUG_PARSE_RESPONSE] ERROR: raw_response.choices is empty", file=sys.stderr)
             raise ValueError("Response has empty choices list")
         
-        message = raw_response.choices[0].message        
+        message = raw_response.choices[0].message
+        # Extract content (store locally to avoid mutating message object)
+        content = message.content or ""
         # Extract tool calls if present
         tool_calls = None
         if hasattr(message, 'tool_calls') and message.tool_calls:
@@ -290,8 +292,7 @@ class OpenAICompatibleProvider(LLMProvider):
                         "name": name,
                         "arguments": arguments
                     }
-                })
-        
+                })        
         # Extract usage
         usage = {}
         if hasattr(raw_response, 'usage'):
@@ -301,14 +302,26 @@ class OpenAICompatibleProvider(LLMProvider):
                 "total_tokens": raw_response.usage.total_tokens
             }
         
-        # Extract reasoning content if present (e.g., DeepSeek reasoning)
+        # Extract reasoning content - check multiple attribute names
         reasoning = None
-        if hasattr(message, 'reasoning_content') and message.reasoning_content:
-            reasoning = message.reasoning_content
+        # Try various attribute names used by different providers
+        for attr_name in ('reasoning_content', 'reasoning', 'thinking'):
+            if hasattr(message, attr_name) and getattr(message, attr_name):
+                reasoning = getattr(message, attr_name)
+                break
+        
+        # Fallback: extract reasoning from <think> tags in content
+        if not reasoning:
+            import re
+            think_match = re.search(r'<think>(.*?)</think>', content, flags=re.DOTALL)
+            if think_match:
+                reasoning = think_match.group(1).strip()
+                # Remove the </think> tags from content to avoid duplication
+                content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
         
         return LLMResponse(
-            content=message.content or "",
-            reasoning=reasoning,
+            content=content,
+            reasoning=reasoning if reasoning else None,
             tool_calls=tool_calls,
             usage=usage,
             raw_response=raw_response,
