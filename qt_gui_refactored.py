@@ -1640,26 +1640,30 @@ class AgentGUI(QMainWindow):
         query_layout.addWidget(self.query_entry)
         
         button_layout = QHBoxLayout()
-        self.run_btn = QPushButton("Run")
+        # Run button
+        self.run_btn = QPushButton("RUN")
         self.run_btn.clicked.connect(self.run_agent)
+        self.run_btn.setMinimumWidth(80)
         button_layout.addWidget(self.run_btn)
-        
-        self.stop_btn = QPushButton("Stop")
-        self.stop_btn.clicked.connect(self.stop_agent)
-        self.stop_btn.setEnabled(False)
-        button_layout.addWidget(self.stop_btn)
-        
-        self.restart_btn = QPushButton("Restart")
-        self.restart_btn.clicked.connect(self.restart_session)
-        self.restart_btn.setEnabled(False)
-        button_layout.addWidget(self.restart_btn)
-        
-        self.pause_btn = QPushButton("Pause")
+
+        # Pause button
+        self.pause_btn = QPushButton("PAUSE")
         self.pause_btn.clicked.connect(self.pause_agent)
+        self.pause_btn.setMinimumWidth(80)
         self.pause_btn.setEnabled(False)
         button_layout.addWidget(self.pause_btn)
-        
+
+        button_layout.addStretch()
+
+        # Restart button
+        self.restart_btn = QPushButton("RESTART")
+        self.restart_btn.clicked.connect(self.restart_session)
+        self.restart_btn.setMinimumWidth(80)
+        self.restart_btn.setEnabled(False)
+        button_layout.addWidget(self.restart_btn)
+
         query_layout.addLayout(button_layout)
+
         right_layout.addWidget(query_frame)
         
         splitter.addWidget(right_container)
@@ -1704,7 +1708,6 @@ class AgentGUI(QMainWindow):
         # Set focus policies for interactive widgets
         # Buttons
         self.run_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.stop_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.restart_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.pause_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.agent_controls_panel.toggle_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -1734,8 +1737,6 @@ class AgentGUI(QMainWindow):
         # Set accessible names and descriptions
         self.run_btn.setAccessibleName("Run agent")
         self.run_btn.setAccessibleDescription("Start executing the agent with the current query")
-        self.stop_btn.setAccessibleName("Stop agent")
-        self.stop_btn.setAccessibleDescription("Stop the currently running agent")
         self.restart_btn.setAccessibleName("Restart session")
         self.restart_btn.setAccessibleDescription("Restart the agent session with fresh context")
         self.pause_btn.setAccessibleName("Pause agent")
@@ -1777,7 +1778,6 @@ class AgentGUI(QMainWindow):
         
         # Set tooltips
         self.run_btn.setToolTip("Run the agent (Ctrl+R)")
-        self.stop_btn.setToolTip("Stop the agent (Ctrl+.)")
         self.restart_btn.setToolTip("Restart the session (Ctrl+Shift+R)")
         self.pause_btn.setToolTip("Pause the agent (Ctrl+P)")
         self.agent_controls_panel.toggle_button.setToolTip("Show/hide agent controls (Ctrl+T)")
@@ -1802,8 +1802,6 @@ class AgentGUI(QMainWindow):
         # Add keyboard shortcuts
         self.run_shortcut = QShortcut(QKeySequence("Ctrl+R"), self)
         self.run_shortcut.activated.connect(self.run_agent)
-        self.stop_shortcut = QShortcut(QKeySequence("Ctrl+."), self)
-        self.stop_shortcut.activated.connect(self.stop_agent)
         self.pause_shortcut = QShortcut(QKeySequence("Ctrl+P"), self)
         self.pause_shortcut.activated.connect(self.pause_agent)
         self.restart_shortcut = QShortcut(QKeySequence("Ctrl+Shift+R"), self)
@@ -1864,6 +1862,20 @@ class AgentGUI(QMainWindow):
         elif state == ExecutionState.FINALIZED:
             self.status_panel.update_status("Completed")
             self.update_buttons(running=True, idle=True)
+        elif state == ExecutionState.PAUSING:
+            self.status_panel.update_status("Pausing…")
+            self.update_buttons(running=True, idle=False)
+            self.pause_btn.setEnabled(False)
+        elif state == ExecutionState.STOPPING:
+            self.status_panel.update_status("Stopping…")
+            # Disable all buttons during stop
+            self.run_btn.setEnabled(False)
+            self.restart_btn.setEnabled(False)
+            self.pause_btn.setEnabled(False)
+        elif state == ExecutionState.MAX_TURNS_REACHED:
+            self.status_panel.update_status("Max turns reached")
+            self.update_buttons(running=True, idle=True)
+
     
     @pyqtSlot(dict)
     def display_event(self, event):
@@ -2013,39 +2025,38 @@ class AgentGUI(QMainWindow):
     def run_agent(self):
         """Start or continue agent with current query."""
         query = self.query_entry.toPlainText().strip()
-        if not query:
-            QMessageBox.warning(self, "No Query", "Please enter a query first.")
-            return
-        
+
         # Get current configuration from controls
         config_dict = self.agent_controls_panel.get_config_dict()
-        
+
         # Update presenter configuration
         self.presenter.update_config(config_dict)
-        
+
         # Check current state to decide action
         current_state = self.presenter.state
-        
+
         if current_state == ExecutionState.IDLE:
-            # Start new session
+            # Start new session - require query
+            if not query:
+                QMessageBox.warning(self, "No Query", "Please enter a query first.")
+                return
             self.display_user_query(query)
             self.presenter.start_session(query, config_dict)
             self.query_entry.clear()
-            
+
         elif current_state in [ExecutionState.PAUSED, ExecutionState.WAITING_FOR_USER]:
-            # Continue existing session
-            self.display_user_query(query)
+            # Continue existing session - allow empty query (resume without new input)
+            if query:
+                self.display_user_query(query)
+            else:
+                # Display a placeholder for empty resume
+                self.display_user_query("(resumed)")
             self.presenter.continue_session(query)
             self.query_entry.clear()
-            
+
         else:
-            QMessageBox.warning(self, "Cannot Run", 
-                               f"Cannot run agent in current state: {current_state}")
-    
-    def stop_agent(self):
-        """Stop the current agent session."""
-        self.presenter.stop_session()
-    
+            QMessageBox.warning(self, "Cannot Run",
+                               f"Cannot run agent in current state: {current_state}")    
     def pause_agent(self):
         """Pause the current agent session."""
         self.presenter.pause_session()
@@ -2093,19 +2104,16 @@ class AgentGUI(QMainWindow):
         if running:
             if idle:
                 self.run_btn.setEnabled(True)
-                self.stop_btn.setEnabled(True)
                 self.restart_btn.setEnabled(True)
                 self.pause_btn.setEnabled(False)  # Already paused
                 self.status_panel.update_status("Ready for next query")
             else:
                 self.run_btn.setEnabled(False)
-                self.stop_btn.setEnabled(True)
                 self.restart_btn.setEnabled(False)
                 self.pause_btn.setEnabled(True)
                 self.status_panel.update_status("Running")
         else:
             self.run_btn.setEnabled(True)
-            self.stop_btn.setEnabled(False)
             # Enable restart if we have history OR if presenter has cached config
             can_restart = self.last_history is not None or (hasattr(self.presenter, 'can_restart') and self.presenter.can_restart())
             self.restart_btn.setEnabled(can_restart)

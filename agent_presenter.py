@@ -56,6 +56,7 @@ class AgentPresenter(QObject):
         # Configuration
         self._config = self._load_default_config()
         self._cached_config = None
+        self._restarting = False
         
         # Event processing via signals
         self.controller.event_occurred.connect(self._process_event)
@@ -254,32 +255,27 @@ class AgentPresenter(QObject):
     def restart_session(self, query: str = None):
         """
         Restart a fresh session with current configuration.
-        
-        Args:
-            query: Optional query to start with. If not provided, waits for user input.
+        Does NOT automatically start a new session. After restart, state is IDLE.
         """
         # Update cached config with current config to ensure restart uses current settings
         try:
-            # Create AgentConfig from current config to cache for restart
             self._cached_config = self.create_agent_config()
         except Exception as e:
             self.error_occurred.emit(f"Cannot create config for restart: {str(e)}", "")
             return
 
-        if self.state != ExecutionState.IDLE:
-            self.stop_session()
+        if self.state == ExecutionState.IDLE:
+            # Already idle, just reset to ensure clean state
+            self.controller.reset()
+            self.state = ExecutionState.IDLE
+            self.status_message.emit("Ready for new session")
+            return
 
-        # Reset controller
-        self.controller.reset()
-
-        # Update state and status
-        self.state = ExecutionState.IDLE
-        
-        # If query is provided, start session automatically
-        if query:
-            self.start_session(query)
-        else:
-            self.status_message.emit("Ready for new session")    
+        # Not idle: we need to stop the current session first.
+        self._restarting = True
+        self.controller.stop()
+        self.state = ExecutionState.STOPPING
+        # Status will be updated via state change in GUI.
     def continue_session(self, query: str):
         """
         Continue an existing session with a new query.
@@ -302,15 +298,14 @@ class AgentPresenter(QObject):
         """Request pause of current session."""
         if self.state == ExecutionState.RUNNING:
             self.controller.request_pause()
-            self.status_message.emit("Pause requested")
+            self.state = ExecutionState.PAUSING
         else:
             print(f"[Presenter] Cannot pause in state {self.state}")
     
     def stop_session(self):
         """Stop current session."""
         self.controller.stop()
-        self.state = ExecutionState.STOPPED
-        self.status_message.emit("Session stopped")
+        self.state = ExecutionState.STOPPING
     
     
     def _process_event(self, event: dict):
@@ -377,19 +372,24 @@ class AgentPresenter(QObject):
             self.status_message.emit("Paused")
             
         elif event_type in ["final", "stopped", "max_turns", "thread_finished"]:
-            
             if event_type == "final":
                 self.state = ExecutionState.FINALIZED
                 self.status_message.emit("Completed successfully")
             elif event_type == "max_turns":
                 self.state = ExecutionState.MAX_TURNS_REACHED
                 self.status_message.emit("Max turns reached")
-            else:
-                self.state = ExecutionState.STOPPED
-                if event_type == "stopped":
-                    self.status_message.emit("Stopped")
+            else:  # "stopped" or "thread_finished"
+                if self._restarting:
+                    self._restarting = False
+                    self.controller.reset()
+                    self.state = ExecutionState.IDLE
+                    self.status_message.emit("Ready for new session")
                 else:
-                    self.status_message.emit("Thread finished")
+                    self.state = ExecutionState.STOPPED
+                    if event_type == "stopped":
+                        self.status_message.emit("Stopped")
+                    else:
+                        self.status_message.emit("Thread finished")
             
         elif event_type == "error":
             self.state = ExecutionState.STOPPED
