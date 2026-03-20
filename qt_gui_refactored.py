@@ -41,6 +41,7 @@ class ToolLoaderPanel(QGroupBox):
     def __init__(self, tool_classes):
         super().__init__("Tool Loader")
         self.tool_classes = tool_classes
+
         self.tool_checkboxes = {}  # name -> QCheckBox
         
         layout = QVBoxLayout()
@@ -340,6 +341,7 @@ class AgentControlsPanel(QGroupBox):
         tool_group = QGroupBox("Tools")
         tool_layout = QGridLayout()
         tool_group.setLayout(tool_layout)
+        tool_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding)
         
         # Add tool checkboxes in 2 columns
         col = 0
@@ -362,9 +364,11 @@ class AgentControlsPanel(QGroupBox):
         tool_scroll_area = QScrollArea()
         tool_scroll_area.setWidgetResizable(True)
         tool_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        tool_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        tool_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         tool_scroll_area.setMaximumHeight(400)  # Limit height, show scrollbar if needed
         tool_scroll_area.setWidget(tool_group)
+        self.tool_group = tool_group
+        self.tool_scroll_area = tool_scroll_area
         
         # Add tool loader to right column
 
@@ -421,7 +425,8 @@ class AgentControlsPanel(QGroupBox):
         self._update_turn_threshold_labels()
     
     def _open_mcp_config(self):
-        """Open MCP configuration dialog.
+        """
+Open MCP configuration dialog.
         
         This dialog allows the user to configure MCP server connections.
         Changes to the configuration will trigger a tool refresh.
@@ -460,42 +465,30 @@ class AgentControlsPanel(QGroupBox):
         self.tool_checkboxes.clear()
 
         # Recreate checkboxes in the tool group
-        # Find the tool group and layout
-        tool_group = None
-        for i in range(self.right_column.count()):
-            item = self.right_column.itemAt(i)
-            if item and item.widget():
-                widget = item.widget()
-                if isinstance(widget, QGroupBox) and widget.title() == "Tools":
-                    tool_group = widget
-                    break
-
-        if tool_group:
-            tool_layout = tool_group.layout()
-            if tool_layout:
-                # Clear existing widgets from layout
-                while tool_layout.count():
-                    child = tool_layout.takeAt(0)
-                    if child.widget():
-                        child.widget().setParent(None)
-
-                # Re-add checkboxes in 2 columns
+        tool_layout = self.tool_group.layout()
+        # Clear existing widgets from layout
+        while tool_layout.count():
+            item = tool_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        # Recreate checkboxes
+        col = 0
+        tool_row = 0
+        for i, cls in enumerate(self.tool_classes):
+            checkbox = QCheckBox(cls.__name__)
+            checkbox.setToolTip(cls.__doc__ or "No documentation available")
+            checkbox.setChecked(True)  # Default enabled
+            tool_layout.addWidget(checkbox, tool_row, col)
+            self.tool_checkboxes[cls.__name__] = checkbox
+            col += 1
+            if col >= 2:
                 col = 0
-                tool_row = 0
-                for i, cls in enumerate(self.tool_classes):
-                    checkbox = QCheckBox(cls.__name__)
-                    checkbox.setChecked(True)
-                    tool_layout.addWidget(checkbox, tool_row, col)
-                    self.tool_checkboxes[cls.__name__] = checkbox
-
-                    col += 1
-                    if col >= 2:
-                        col = 0
-                        tool_row += 1
-
-                # Add stretch to fill remaining space
-                tool_layout.setRowStretch(tool_row + 1, 1)
-
+                tool_row += 1
+        # If odd number of tools, add a spacer in the second column
+        if col == 1:
+            tool_layout.addWidget(QWidget(), tool_row, col)
+        # Add stretch to fill remaining space
+        tool_layout.setRowStretch(tool_row + 1, 1)
     def update_token_monitor_controls(self):        
         """Enable/disable token monitor threshold controls based on checkbox."""
         enabled = self.token_monitor_checkbox.isChecked()
@@ -838,20 +831,37 @@ class MCPConfigDialog(QDialog):
     def _refresh_list(self):
         self.server_list.clear()
         for server in self.config.get("servers", []):
-            self.server_list.addItem(f"{server['name']} - {server['host']}")
+            name = server.get('name', 'Unnamed')
+            # Determine display field based on transport
+            transport = server.get('transport', 'http')
+            if transport == 'stdio':
+                display = server.get('command', 'N/A')
+            else:
+                display = server.get('url', server.get('host', 'N/A'))
+            self.server_list.addItem(f"{name} - {display}")
     
     def _add_server(self):
         name, ok = QInputDialog.getText(self, "Add Server", "Name:")
-        if not ok or not name: return
-        host, ok = QInputDialog.getText(self, "Add Server", "Host URL:")
-        if not ok or not host: return
-        abilities, ok = QInputDialog.getText(self, "Add Server", "Abilities (comma-separated):")
-        if not ok: return
-        self.config.setdefault("servers", []).append({
-            "name": name,
-            "host": host,
-            "abilities": [a.strip() for a in abilities.split(",")]
-        })
+        if not ok or not name: 
+            return
+        # Transport selection
+        transports = ["stdio", "http", "sse"]
+        transport, ok = QInputDialog.getItem(self, "Add Server", "Transport:", transports, 0, False)
+        if not ok:
+            return
+        server = {"name": name, "transport": transport}
+        if transport == "stdio":
+            command, ok = QInputDialog.getText(self, "Add Server", "Command (e.g., python):")
+            if ok and command:
+                server["command"] = command
+                args, ok = QInputDialog.getText(self, "Add Server", "Arguments (space-separated):")
+                if ok and args:
+                    server["args"] = args.split()
+        else:
+            url, ok = QInputDialog.getText(self, "Add Server", "URL:")
+            if ok and url:
+                server["url"] = url
+        self.config.setdefault("servers", []).append(server)
         self._refresh_list()
     
     def _remove_server(self):
