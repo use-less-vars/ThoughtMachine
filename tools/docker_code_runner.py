@@ -41,6 +41,7 @@ class DockerCodeRunner(ToolBase):
     - Dropped Linux capabilities
     - No network access by default (configurable)
     - Non-root user execution
+    - Rebuild capability: set build=True to rebuild from Dockerfile before execution (use to add packages)
     
     Workspace access:
     - Project directory mounted at /workspace

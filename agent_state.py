@@ -134,7 +134,7 @@ class AgentState:
                 warning = (
                     f"[SYSTEM] Token usage is at the critical threshold ({formatted} tokens). "
                     f"You have {self.CRITICAL_COUNTDOWN_TURNS} turns to work normally before tool restrictions apply. "
-                    f"Please consider summarizing to reduce context size. "
+                    f"Please consider summarizing to reduce context size. After summarizing, you may continue working. "
                     f"After the countdown ends, only SummarizeTool, Final, and FinalReport will be available."
                 )
 
@@ -207,7 +207,7 @@ class AgentState:
                 warning = (
                     f"[SYSTEM] Turn usage is at the critical threshold ({current_turn}/{max_turns} turns). "
                     f"You have {self.CRITICAL_COUNTDOWN_TURNS} turns to work normally before tool restrictions apply. "
-                    f"Please consider completing your work or summarizing. "
+                    f"Please consider completing your work or summarizing. After summarizing, you may continue working. "
                     f"After the countdown ends, only SummarizeTool, Final, and FinalReport will be available."
                 )
 
@@ -321,7 +321,7 @@ class AgentState:
         warning = (
             f"[SYSTEM] {resource.upper()} usage is CRITICAL. "
             f"You have {countdown} turns to work normally before tool restrictions apply. "
-            f"Use SummarizeTool to reduce context or Final/FinalReport to complete work. "
+            f"Use SummarizeTool to reduce context or Final/FinalReport to complete work. After summarizing, you may continue working. "
             f"After countdown: only summary/final tools allowed."
         )
 
