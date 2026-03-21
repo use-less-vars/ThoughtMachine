@@ -37,8 +37,9 @@ if TYPE_CHECKING:
 from agent_state import AgentState, TokenState, TurnState, ExecutionState, SessionState
 
 class Agent:
-    def __init__(self, config: AgentConfig, initial_conversation=None):
+    def __init__(self, config: AgentConfig, initial_conversation=None, session_id: str = None):
         self.config = config
+        self.session_id = session_id
         
         # Create LLM provider using factory
         provider_config = {
@@ -70,6 +71,8 @@ class Agent:
             self.conversation = initial_conversation.copy()
         else:
             self._ensure_system_prompt()
+        # Initialize context builder for LLM context generation
+        self.context_builder = self._create_context_builder()
         
         # Token totals
         self.total_input_tokens = config.initial_input_tokens
@@ -119,6 +122,14 @@ class Agent:
         
         tokens = self._token_encoder.encode(text)
         return len(tokens)
+
+    def _create_context_builder(self):
+        """Create a ContextBuilder based on configuration."""
+        from session.context_builder import LastNBuilder
+        keep_last = self.config.max_history_turns
+        if keep_last is None:
+            keep_last = 100000  # effectively unlimited
+        return LastNBuilder(keep_last_messages=keep_last, keep_system_prompt=True)
 
     def _load_system_prompt(self):
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -485,7 +496,8 @@ class Agent:
                     if msg.get("reasoning_content") is None:
                         msg["reasoning_content"] = ""
             
-            messages = self.conversation
+            # Build the context for the LLM using the configured builder
+            messages = self.context_builder.build(self.conversation, max_tokens=self.config.max_tokens)
             
             # Log LLM request
             if self.logger:

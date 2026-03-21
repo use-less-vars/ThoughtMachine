@@ -222,7 +222,7 @@ class AgentController(QObject):
                 run_config.initial_conversation = self._initial_conversation
 
             # Create Agent instance
-            agent = Agent(run_config, initial_conversation=self._initial_conversation)
+            agent = Agent(run_config, initial_conversation=self._initial_conversation, session_id=self.current_session_id)
             self.agent = agent  # store for potential reuse
 
             # Main loop: process queries from queue
