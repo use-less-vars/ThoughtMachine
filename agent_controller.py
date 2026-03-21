@@ -30,6 +30,7 @@ class AgentController(QObject):
         self._running = False
         self._initial_conversation = None
         self.agent = None
+        self.current_session_id = None  # For event filtering
         # Query queue for keep-alive mode
         self.query_queue = queue.Queue()
         self._keep_alive = True
@@ -75,26 +76,28 @@ class AgentController(QObject):
         self._keep_alive = True
         self._pause_requested = False
         self._processing_query = False
+        self.current_session_id = None
 
         print("[Controller] Reset to initial state")
 
     @property
     def is_running(self):
-        """Return True if the agent thread is alive."""
-        # Check both the running flag and thread status
+        """Return True if the agent thread is alive and not shutting down."""
+        # If _running is False, agent is definitely not running
+        if not self._running:
+            return False
+        # Check thread status
         if self.thread is not None and self.thread.is_alive():
             return True
         # Thread is dead or doesn't exist, ensure state is cleaned up
-        if self._running:
-            # Thread died unexpectedly, clean up
-            self._cleanup_if_thread_dead()
+        self._cleanup_if_thread_dead()
         return self._running
     
     def get_config(self):
         """Return the current AgentConfig being used."""
         return self._config
 
-    def start(self, query: str, config: AgentConfig, initial_conversation: Optional[List[Dict[str, Any]]] = None):
+    def start(self, query: str, config: AgentConfig, session_id: int, initial_conversation: Optional[List[Dict[str, Any]]] = None):
         """
         Start the agent with the given query and configuration.
 
@@ -121,6 +124,8 @@ class AgentController(QObject):
         self._query = query
         self._config = config
         self._initial_conversation = initial_conversation
+        # Set session ID for event filtering
+        self.current_session_id = session_id
         # Enqueue the initial query
         self.query_queue.put(query)
 
@@ -137,14 +142,16 @@ class AgentController(QObject):
     def continue_session(self, query: str):
         """Submit a new query to the already running agent."""
         if not self.is_running:
-            raise RuntimeError("Agent not running. Use start() first.")
+            # Agent is not running, cannot continue
+            return
         self.resume()
         self.query_queue.put(query)
 
     def request_pause(self):
         """Request agent to pause after current turn."""
         if not self.is_running:
-            raise RuntimeError("Agent not running. Use start() first.")
+            # Agent is not running, nothing to pause
+            return
         if self._processing_query:
             # Agent is currently processing a query, set pause flag
             self.pause()
@@ -154,7 +161,8 @@ class AgentController(QObject):
     def restart_session(self):
         """Restart agent with cleared history."""
         if not self.is_running:
-            raise RuntimeError("Agent not running. Use start() first.")
+            # Agent is not running, cannot restart
+            return
         if self.agent:
             self.agent.request_reset()
         # Also submit a sentinel to trigger reset in queue
@@ -188,9 +196,12 @@ class AgentController(QObject):
 
     def _emit_event(self, event):
         """Emit event both to queue and signal."""
+        # Attach session ID for event filtering
+        event['session_id'] = self.current_session_id
         # Put into queue for compatibility
         self.event_queue.put(event)
         # Emit signal for presenter
+        print(f"[Controller] Emitting event_occurred: {event.get('type')}")
         self.event_occurred.emit(event)
 
     def _run(self):
@@ -244,7 +255,9 @@ class AgentController(QObject):
                     # If this is a terminal event, decide what to do
                     if event["type"] in ("stopped", "error", "max_turns"):
                         # These are fatal, stop the whole agent thread
+                        print(f"[Controller] Terminal event {event['type']} detected, setting _keep_alive=False")
                         self._keep_alive = False
+                        self._running = False  # Mark as not running immediately
                         break
                     elif event["type"] in ("final", "user_interaction_requested"):
                         # Agent has completed this query, pause and wait for next query
@@ -263,18 +276,21 @@ class AgentController(QObject):
                 self._processing_query = False
                 # If _keep_alive becomes False, break outer loop
                 if not self._keep_alive:
+                    print(f"[Controller] _keep_alive=False, breaking outer loop")
                     break
 
         except Exception as e:
             # Catch any unexpected exception and send an error event
             print(f"[Controller] Exception in _run: {e}")
             traceback.print_exc()
+            self._running = False  # Mark as not running before sending error
             self._emit_event({
                 "type": "error",
                 "message": str(e),
                 "traceback": traceback.format_exc()   # helpful for debugging
             })
         finally:
+            print("[Controller] Finally block: thread finishing")
             # Signal that the thread is finishing
             self._emit_event({"type": "thread_finished"})
             self._running = False

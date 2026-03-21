@@ -57,9 +57,13 @@ class AgentPresenter(QObject):
         self._config = self._load_default_config()
         self._cached_config = None
         self._restarting = False
-        
+        self._next_session_id = 1
+        self.current_session_id = None
+
         # Event processing via signals
+        print(f"[Presenter] Connecting controller event_occurred to _process_event")
         self.controller.event_occurred.connect(self._process_event)
+        print(f"[Presenter] Connection made")
         
         # Load saved configuration if available
         self._load_config()
@@ -72,9 +76,11 @@ class AgentPresenter(QObject):
     @state.setter
     def state(self, new_state: ExecutionState):
         """Update state and emit signal."""
+        print(f"[Presenter] state setter: {self._state} -> {new_state}")
         if self._state != new_state:
             self._state = new_state
             self.state_changed.emit(new_state)
+            print(f"[Presenter] state changed signal emitted")
     
     def _load_default_config(self) -> dict:
         """Return default configuration dictionary."""
@@ -235,9 +241,14 @@ class AgentPresenter(QObject):
             
             # Cache config for restart_session
             self._cached_config = agent_config
-            
-            # Start controller
-            self.controller.start(query, agent_config)
+
+            # Generate unique session ID
+            session_id = self._next_session_id
+            self._next_session_id += 1
+            self.current_session_id = session_id
+
+            # Start controller with session ID
+            self.controller.start(query, agent_config, session_id)            
             self.state = ExecutionState.RUNNING
             self.status_message.emit("Session started")
             
@@ -252,30 +263,49 @@ class AgentPresenter(QObject):
         """Check if restart is possible (has cached configuration)."""
         return self._cached_config is not None
 
+    def _finalize_restart(self):
+        """Common restart cleanup: reset controller, counters, and state."""
+        self.controller.reset()
+        self.total_input = 0
+        self.total_output = 0
+        self.context_length = 0
+        self.state = ExecutionState.IDLE
+        self._restarting = False
+        self.current_session_id = None
+        self.status_message.emit("Ready for new session")
+
     def restart_session(self, query: str = None):
         """
         Restart a fresh session with current configuration.
         Does NOT automatically start a new session. After restart, state is IDLE.
         """
-        # Update cached config with current config to ensure restart uses current settings
+        # Refresh config from current GUI
         try:
             self._cached_config = self.create_agent_config()
         except Exception as e:
             self.error_occurred.emit(f"Cannot create config for restart: {str(e)}", "")
             return
 
+        # If already IDLE, finalize immediately
         if self.state == ExecutionState.IDLE:
-            # Already idle, just reset to ensure clean state
-            self.controller.reset()
-            self.state = ExecutionState.IDLE
-            self.status_message.emit("Ready for new session")
+            self._finalize_restart()
             return
 
-        # Not idle: we need to stop the current session first.
+        # Avoid re-entrancy
+        if self._restarting:
+            return
         self._restarting = True
+
+        # Request stop
         self.controller.stop()
+
+        # If controller already stopped (thread dead), finalize now
+        if not self.controller.is_running:
+            self._finalize_restart()
+            return
+
+        # Otherwise, wait for terminal event; state = STOPPING
         self.state = ExecutionState.STOPPING
-        # Status will be updated via state change in GUI.
     def continue_session(self, query: str):
         """
         Continue an existing session with a new query.
@@ -318,7 +348,16 @@ class AgentPresenter(QObject):
         event_type = event.get("type")
         print(f"[Presenter] Processing event: {event_type}")
         
+        # Skip filtering for state/terminal events as they need to be shown regardless
+        state_event_types = ["error", "paused", "stopped", "thread_finished", "final", "max_turns", "user_interaction_requested"]
+        if event_type not in state_event_types:
+            event_session_id = event.get("session_id")
+            if event_session_id is not None and event_session_id != self.current_session_id:
+                print(f"[Presenter] Ignoring event from old session {event_session_id}, current is {self.current_session_id}")
+                return
+        
         # Emit raw event for UI to handle display
+        print(f"[Presenter] Emitting event_received: {event_type}")
         self.event_received.emit(event)
         
         # Update state based on event type
@@ -368,10 +407,12 @@ class AgentPresenter(QObject):
             self.status_message.emit("Waiting for user input")
             
         elif event_type == "paused":
+            print(f"[Presenter] Handling paused event")
             self.state = ExecutionState.PAUSED
             self.status_message.emit("Paused")
             
         elif event_type in ["final", "stopped", "max_turns", "thread_finished"]:
+            print(f"[Presenter] Handling terminal event: {event_type}")
             if event_type == "final":
                 self.state = ExecutionState.FINALIZED
                 self.status_message.emit("Completed successfully")
@@ -380,10 +421,7 @@ class AgentPresenter(QObject):
                 self.status_message.emit("Max turns reached")
             else:  # "stopped" or "thread_finished"
                 if self._restarting:
-                    self._restarting = False
-                    self.controller.reset()
-                    self.state = ExecutionState.IDLE
-                    self.status_message.emit("Ready for new session")
+                    self._finalize_restart()
                 else:
                     self.state = ExecutionState.STOPPED
                     if event_type == "stopped":
