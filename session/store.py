@@ -130,3 +130,7 @@ class FileSystemSessionStore(SessionStore):
             path.unlink()
             return True
         return False
+
+    def get_session_path(self, session_id: str) -> Path:
+        """Get the file path for a given session ID."""
+        return self._get_session_path(session_id)

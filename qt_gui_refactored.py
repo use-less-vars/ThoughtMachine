@@ -1529,7 +1529,7 @@ class AgentGUI(QMainWindow):
     
     def init_ui(self):
         """Initialize the user interface (unchanged layout)."""
-        self.setWindowTitle("Agent Workbench - QT (Refactored)")
+        self.update_window_title()
         self.center_window()
         
         central_widget = QWidget()
@@ -2053,6 +2053,7 @@ class AgentGUI(QMainWindow):
             self.display_user_query(query)
             self.presenter.start_session(query, config_dict)
             self.query_entry.clear()
+            self.update_window_title()
 
         elif current_state in [ExecutionState.PAUSED, ExecutionState.WAITING_FOR_USER]:
             # Continue existing session - allow empty query (resume without new input)
@@ -2075,25 +2076,25 @@ class AgentGUI(QMainWindow):
         """Restart a fresh session with current GUI settings."""
         # Get current query before clearing
         query = self.query_entry.toPlainText().strip()
-        
+
         # Restart with current query (if any)
         self.presenter.restart_session(query)
-        
+
         # Clear event model (virtual scrolling)
         self.event_model.clear()
         self.output_textedit.clear()
-        
+
         # Reset token counters
         self.total_input = 0
         self.total_output = 0
         self.context_length = 0
         self.status_panel.update_tokens(0, 0)
         self.status_panel.update_context_length(0)
-        
+
         # Update UI
         self.status_panel.update_status("Ready for new session")
         self.update_buttons(running=False)
-    
+        self.update_window_title()    
     # ----- UI Helper Methods -----
     
     def update_buttons(self, running=None, idle=False):
@@ -2766,6 +2767,9 @@ class AgentGUI(QMainWindow):
         try:
             success = self.presenter.save_session(file_path)
             if success:
+                # Update session name based on saved file
+                self.presenter.session_name = os.path.basename(file_path)
+                self.update_window_title()
                 QMessageBox.information(self, "Session Saved", f"Session saved to {file_path}")
             else:
                 QMessageBox.warning(self, "Save Failed", "Failed to save session.")
@@ -2779,33 +2783,7 @@ class AgentGUI(QMainWindow):
         )
         if not file_path:
             return
-
-        # Stop any running controller before loading
-        try:
-            if self.presenter.controller and hasattr(self.presenter.controller, 'stop'):
-                self.presenter.controller.stop()
-        except Exception as e:
-            print(f"[GUI] Warning: could not stop controller: {e}")
-
-        try:
-            success = self.presenter.load_session(file_path)
-            if success:
-                # Display the loaded conversation
-                self.display_loaded_conversation()
-                # Reset token counters and context for the loaded session
-                self.presenter.total_input = 0
-                self.presenter.total_output = 0
-                self.presenter.context_length = 0
-                self.total_input = 0
-                self.total_output = 0
-                self.context_length = 0
-                self.status_panel.update_tokens(0, 0)
-                self.status_panel.update_context_length(0)
-                QMessageBox.information(self, "Session Loaded", f"Session loaded from {file_path}")
-            else:
-                QMessageBox.warning(self, "Load Failed", "Failed to load session file.")
-        except Exception as e:
-            QMessageBox.critical(self, "Load Error", f"Failed to load session: {e}")
+        self._load_session_file(file_path)
 
     def manage_sessions(self):
         """Open a dialog to manage saved sessions."""
@@ -2814,7 +2792,7 @@ class AgentGUI(QMainWindow):
             QMessageBox.information(self, "No Sessions", "No saved sessions found.")
             return
 
-        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QListWidget, QDialogButtonBox
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QListWidget, QDialogButtonBox, QPushButton
         dialog = QDialog(self)
         dialog.setWindowTitle("Manage Sessions")
         layout = QVBoxLayout(dialog)
@@ -2830,11 +2808,23 @@ class AgentGUI(QMainWindow):
 
         layout.addWidget(list_widget)
 
-        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Delete | QDialogButtonBox.StandardButton.Close)
-        button_box.button(QDialogButtonBox.StandardButton.Delete).clicked.connect(
-            lambda: self._delete_selected_session(list_widget)
+        # Double‑click to load
+        list_widget.itemDoubleClicked.connect(
+            lambda item: self._load_session_from_list_item(list_widget, item)
         )
-        button_box.button(QDialogButtonBox.StandardButton.Close).clicked.connect(dialog.accept)
+
+        # Custom buttons: Rename and Delete, plus Close
+        button_box = QDialogButtonBox()
+        rename_btn = QPushButton("Rename")
+        delete_btn = QPushButton("Delete")
+        close_btn = QPushButton("Close")
+        button_box.addButton(rename_btn, QDialogButtonBox.ButtonRole.ActionRole)
+        button_box.addButton(delete_btn, QDialogButtonBox.ButtonRole.ActionRole)
+        button_box.addButton(close_btn, QDialogButtonBox.ButtonRole.RejectRole)
+
+        rename_btn.clicked.connect(lambda: self._rename_selected_session(list_widget))
+        delete_btn.clicked.connect(lambda: self._delete_selected_session(list_widget))
+        close_btn.clicked.connect(dialog.accept)
         layout.addWidget(button_box)
 
         dialog.exec()
@@ -2860,6 +2850,35 @@ class AgentGUI(QMainWindow):
             else:
                 QMessageBox.warning(self, "Delete Failed", "Could not delete session.")
 
+    def _rename_selected_session(self, list_widget):
+        """Rename the session selected in the list widget."""
+        current_item = list_widget.currentItem()
+        if not current_item:
+            return
+        session_id = current_item.data(Qt.ItemDataRole.UserRole)
+        if not session_id:
+            return
+
+        # Get current name from display text (everything before ' - ')
+        current_text = current_item.text()
+        current_name = current_text.split(' - ')[0]
+
+        new_name, ok = QInputDialog.getText(
+            self, "Rename Session", "Enter new name:", QLineEdit.EchoMode.Normal, current_name
+        )
+        if ok and new_name.strip():
+            success = self.presenter.rename_session(session_id, new_name.strip())
+            if success:
+                # Update item text: keep preview part
+                preview = current_text.split(' - ', 1)[1] if ' - ' in current_text else ''
+                current_item.setText(f"{new_name.strip()} - {preview}")
+                # If this session is currently loaded, update the window title
+                if self.presenter.current_session and self.presenter.current_session.session_id == session_id:
+                    self.presenter.session_name = new_name.strip()
+                    self.update_window_title()
+            else:
+                QMessageBox.warning(self, "Rename Failed", "Could not rename session.")
+
     def display_loaded_conversation(self):
         """Display the currently loaded conversation (from _initial_conversation)."""
         # Clear current display
@@ -2874,6 +2893,53 @@ class AgentGUI(QMainWindow):
         # Rebuild the event model from the conversation
         for msg in conversation:
             self._append_chat_message(msg['role'], msg['content'], msg.get('tool_calls'), msg.get('tool_call_id'))
+
+    def _load_session_file(self, file_path: str) -> bool:
+        """Load a session from a file and update the UI.
+
+        Returns True if successful, False otherwise.
+        """
+        try:
+            if self.presenter.controller and hasattr(self.presenter.controller, 'stop'):
+                self.presenter.controller.stop()
+        except Exception as e:
+            print(f"[GUI] Warning: could not stop controller: {e}")
+
+        success = self.presenter.load_session(file_path)
+        if success:
+            self.display_loaded_conversation()
+            # Reset token counters and context for the loaded session
+            self.presenter.total_input = 0
+            self.presenter.total_output = 0
+            self.presenter.context_length = 0
+            self.total_input = 0
+            self.total_output = 0
+            self.context_length = 0
+            self.status_panel.update_tokens(0, 0)
+            self.status_panel.update_context_length(0)
+            self.update_window_title()
+            QMessageBox.information(self, "Session Loaded", f"Session loaded from {file_path}")
+        else:
+            QMessageBox.warning(self, "Load Failed", "Failed to load session file.")
+        return success
+
+    def _load_session_from_list_item(self, list_widget, item):
+        """Load the session represented by the given list item (from double‑click)."""
+        session_id = item.data(Qt.ItemDataRole.UserRole)
+        if not session_id:
+            return
+        try:
+            file_path = self.presenter.session_store.get_session_path(session_id)
+            self._load_session_file(str(file_path))
+        except Exception as e:
+            QMessageBox.critical(self, "Load Error", f"Failed to load session: {e}")
+
+    def update_window_title(self):
+        """Update the main window title to reflect the current session name."""
+        name = self.presenter.session_name
+        if not name:
+            name = "Untitled Session"
+        self.setWindowTitle(f"Agent Workbench – {name}")
 
     def _append_chat_message(self, role: str, content: str, tool_calls=None, tool_call_id=None):
         """Append a chat message to the event model and output display.

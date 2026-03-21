@@ -290,7 +290,7 @@ class AgentPresenter(QObject):
     def start_session(self, query: str, config: Optional[dict] = None):
         """
         Start a new agent session.
-        
+
         Args:
             query: User query string
             config: Optional configuration overrides
@@ -298,7 +298,10 @@ class AgentPresenter(QObject):
         if self.state != ExecutionState.IDLE:
             print(f"[Presenter] Cannot start session in state {self.state}")
             return
-        
+
+        # Clear session name for a fresh session
+        self.session_name = None
+
         try:
             # Create agent config
             agent_config = self.create_agent_config(config)
@@ -353,6 +356,7 @@ class AgentPresenter(QObject):
         self._restarting = False
         self.current_session_id = None
         self._initial_conversation = None  # Clear loaded session
+        self.session_name = None  # Clear session name for fresh start
         self.status_message.emit("Ready for new session")
 
     def restart_session(self, query: str = None):
@@ -435,6 +439,9 @@ class AgentPresenter(QObject):
             if session is None:
                 print(f"[Presenter] No session to save")
                 return False
+
+            # Set session name based on the target file name
+            session.metadata['name'] = os.path.basename(filepath)
 
             # Serialize to JSON
             session_dict = session.to_persistable_dict()
@@ -535,6 +542,28 @@ class AgentPresenter(QObject):
             return success
         except Exception as e:
             print(f"[Presenter] Error deleting session: {e}")
+            return False
+
+    def rename_session(self, session_id: str, new_name: str) -> bool:
+        """Rename a session's metadata name.
+
+        Args:
+            session_id: ID of the session to rename
+            new_name: New name for the session
+
+        Returns:
+            True if renamed successfully, False otherwise
+        """
+        try:
+            session = self.session_store.load_session(session_id)
+            if session is None:
+                return False
+            session.metadata['name'] = new_name
+            session.updated_at = datetime.now()
+            self.session_store.save_session(session)
+            return True
+        except Exception as e:
+            print(f"[Presenter] Error renaming session {session_id}: {e}")
             return False
 
     def _build_session_from_current_state(self) -> Optional[Session]:
