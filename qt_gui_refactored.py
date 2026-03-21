@@ -2828,10 +2828,10 @@ class AgentGUI(QMainWindow):
             with open(config_path, 'w') as f:
                 json.dump(config, f, indent=2)
             print(f"[GUI] Configuration saved to {config_path}")
-            self.status_message.emit("Configuration saved")
+            self.presenter.status_message.emit("Configuration saved")
         except Exception as e:
             print(f"[GUI] Error saving config: {e}")
-            self.status_message.emit(f"Config save error: {e}")
+            self.presenter.status_message.emit(f"Config save error: {e}")
 
     def load_config(self):
         """Load application configuration from file."""
@@ -2843,12 +2843,12 @@ class AgentGUI(QMainWindow):
                 # Update presenter config
                 self.presenter.update_config(config)
                 print(f"[GUI] Configuration loaded from {config_path}")
-                self.status_message.emit("Configuration loaded")
+                self.presenter.status_message.emit("Configuration loaded")
             else:
                 print(f"[GUI] Config file not found: {config_path}")
         except Exception as e:
             print(f"[GUI] Error loading config: {e}")
-            self.status_message.emit(f"Config load error: {e}")
+            self.presenter.status_message.emit(f"Config load error: {e}")
 
     # ----- Session Management Methods -----
 
