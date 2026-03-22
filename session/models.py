@@ -97,6 +97,10 @@ class Session:
     agent_context: List[Dict[str, Any]] = field(default_factory=list, compare=False, repr=False)
     containers: List[ContainerMetadata] = field(default_factory=list)
     preset_name: Optional[str] = field(default=None, compare=False)
+    version: int = 1  # Session format version
+    final_content: Optional[str] = None  # Content of the Final tool's result, if any
+    final_reasoning: Optional[str] = None  # Reasoning that preceded the final answer
+
     metadata: Dict[str, Any] = field(default_factory=dict)  # name, tags, notes, etc.
 
     def update_runtime_params(self, **kwargs) -> None:
@@ -123,6 +127,9 @@ class Session:
             'containers': [c.to_dict() for c in self.containers],
             'preset_name': self.preset_name,
             'metadata': self.metadata,
+            'version': self.version,
+            'final_content': self.final_content,
+            'final_reasoning': self.final_reasoning,
         }
         return data
 
@@ -145,6 +152,9 @@ class Session:
         containers = [ContainerMetadata.from_dict(c) for c in containers_data]
 
         metadata = data.get('metadata', {})
+        version = data.get('version', 1)
+        final_content = data.get('final_content')
+        final_reasoning = data.get('final_reasoning')
 
         session = cls(
             session_id=data.get('session_id', str(uuid.uuid4())),
@@ -156,6 +166,9 @@ class Session:
             containers=containers,
             preset_name=data.get('preset_name'),
             metadata=metadata,
+            version=version,
+            final_content=final_content,
+            final_reasoning=final_reasoning,
         )
         # agent_context will be built later by ContextBuilder
         return session

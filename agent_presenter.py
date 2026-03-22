@@ -71,6 +71,8 @@ class AgentPresenter(QObject):
         self.user_history: List[Dict[str, Any]] = []
         self.current_session: Optional[Session] = None
         self.session_name: Optional[str] = None  # Optional user-provided name
+        self.final_content: Optional[str] = None
+        self.final_reasoning: Optional[str] = None
         self._initial_conversation: Optional[List[Dict[str, Any]]] = None  # For loading sessions
 
         # Event processing via signals
@@ -452,11 +454,8 @@ class AgentPresenter(QObject):
 
     # ----- Session Management -----
 
-    def save_session(self, filepath: str) -> bool:
-        """Save current session to a JSON file.
-
-        Args:
-            filepath: Path to save the session file
+    def save_session(self) -> bool:
+        """Save current session to the session store.
 
         Returns:
             True if saved successfully, False otherwise
@@ -468,17 +467,63 @@ class AgentPresenter(QObject):
                 print(f"[Presenter] No session to save")
                 return False
 
-            # Set session name based on the target file name
-            session.metadata['name'] = os.path.basename(filepath)
+            # Ensure we have a session_id (new session if None)
+            if not self.current_session_id:
+                self.current_session_id = session.session_id
+            else:
+                # Preserve the existing session_id
+                session.session_id = self.current_session_id
 
-            # Serialize to JSON
+            # Set current_session reference
+            self.current_session = session
+
+            # Ensure session has a name for listing
+            if not session.metadata.get('name'):
+                created = session.created_at
+                if isinstance(created, datetime):
+                    session.metadata['name'] = f"Session {created:%Y-%m-%d %H:%M}"
+                else:
+                    session.metadata['name'] = "Untitled Session"
+
+            # Save via session store (writes to store directory)
+            self.session_store.save_session(session)
+
+            # Update session name from metadata
+            self.session_name = session.metadata.get('name')
+
+            print(f"[Presenter] Session saved to store: {self.session_store.get_session_path(session.session_id)}")
+            return True
+        except Exception as e:
+            print(f"[Presenter] Error saving session: {e}")
+            traceback.print_exc()
+            return False
+
+    def export_session(self, filepath: str) -> bool:
+        """Export current session to a specified file path (for backup/transfer).
+
+        Args:
+            filepath: Path to export the session JSON file
+
+        Returns:
+            True if exported successfully, False otherwise
+        """
+        try:
+            session = self._build_session_from_current_state()
+            if session is None:
+                print(f"[Presenter] No session to export")
+                return False
+
+            # Use the session's ID if available, otherwise generate a temporary one for export
+            if not session.session_id:
+                session.session_id = str(uuid.uuid4())
+
+            # Serialize to JSON (version already included by to_persistable_dict)
             session_dict = session.to_persistable_dict()
-            # Add session version for future compatibility
-            session_dict['version'] = 1
-            # Convert datetime objects to ISO strings
-            if 'created_at' in session_dict and isinstance(session_dict['created_at'], datetime):
+            # Ensure datetime objects are serialized (they are already isoformat in to_persistable_dict)
+            # But to be safe, convert any datetime that might not be converted
+            if isinstance(session_dict.get('created_at'), datetime):
                 session_dict['created_at'] = session_dict['created_at'].isoformat()
-            if 'updated_at' in session_dict and isinstance(session_dict['updated_at'], datetime):
+            if isinstance(session_dict.get('updated_at'), datetime):
                 session_dict['updated_at'] = session_dict['updated_at'].isoformat()
 
             # Ensure directory exists
@@ -487,10 +532,10 @@ class AgentPresenter(QObject):
             with open(filepath, 'w') as f:
                 json.dump(session_dict, f, indent=2)
 
-            print(f"[Presenter] Session saved to {filepath}")
+            print(f"[Presenter] Session exported to {filepath}")
             return True
         except Exception as e:
-            print(f"[Presenter] Error saving session: {e}")
+            print(f"[Presenter] Error exporting session: {e}")
             traceback.print_exc()
             return False
 
@@ -592,6 +637,9 @@ class AgentPresenter(QObject):
             session.metadata['name'] = new_name
             session.updated_at = datetime.now()
             self.session_store.save_session(session)
+            # If the renamed session is currently loaded, update its metadata in memory
+            if self.current_session and self.current_session.session_id == session_id:
+                self.current_session.metadata['name'] = new_name
             return True
         except Exception as e:
             print(f"[Presenter] Error renaming session {session_id}: {e}")
@@ -623,7 +671,40 @@ class AgentPresenter(QObject):
             return None
 
         # Preserve full conversation including system, user, assistant, and tool messages
-        user_history = conversation.copy()
+        # Normalize tool calls to flattened format for consistency
+        def normalize_tool_call(msg):
+            if msg.get('role') == 'assistant' and 'tool_calls' in msg:
+                normalized = []
+                for tc in msg['tool_calls']:
+                    if 'name' in tc:
+                        # Already flattened; keep as is
+                        normalized.append(tc)
+                    else:
+                        # Convert from OpenAI format (function.name, function.arguments)
+                        function = tc.get('function', {})
+                        normalized.append({
+                            'name': function.get('name', 'Unknown'),
+                            'arguments': function.get('arguments', {}),
+                            'result': tc.get('result', '')
+                        })
+                msg['tool_calls'] = normalized
+            return msg
+
+        user_history = [normalize_tool_call(m.copy()) for m in conversation]
+
+        # Capture runtime parameters from agent if available
+        runtime_params = RuntimeParams()
+        try:
+            agent = self.controller.agent
+            if agent and hasattr(agent, 'runtime_params'):
+                rp = agent.runtime_params
+                runtime_params = RuntimeParams(
+                    temperature=rp.temperature,
+                    max_tokens=rp.max_tokens,
+                    top_p=rp.top_p
+                )
+        except Exception:
+            pass
 
         # Create session object
         now = datetime.now()
@@ -632,9 +713,26 @@ class AgentPresenter(QObject):
             created_at=now,
             updated_at=now,
             config=session_config,
-            runtime_params=RuntimeParams(),  # defaults
-            user_history=user_history
+            runtime_params=runtime_params,
+            user_history=user_history,
+            version=1
         )
+
+        # Preserve metadata and other fields from current_session if available
+        if self.current_session:
+            session.metadata = self.current_session.metadata.copy()
+            session.preset_name = self.current_session.preset_name
+            session.containers = self.current_session.containers.copy()
+            # Preserve original created_at for continuity
+            session.created_at = self.current_session.created_at
+            # Preserve final content and reasoning
+            session.final_content = self.current_session.final_content
+            session.final_reasoning = self.current_session.final_reasoning
+        else:
+            # Use captured final content if available (e.g., final event before first save)
+            session.final_content = self.final_content
+            session.final_reasoning = self.final_reasoning
+
         return session
 
     def _process_event(self, event: dict):
@@ -721,6 +819,13 @@ class AgentPresenter(QObject):
             if event_type == "final":
                 self.state = ExecutionState.FINALIZED
                 self.status_message.emit("Completed successfully")
+
+                # Capture final content and reasoning
+                self.final_content = event.get('content')
+                self.final_reasoning = event.get('reasoning')
+                if self.current_session:
+                    self.current_session.final_content = self.final_content
+                    self.current_session.final_reasoning = self.final_reasoning
             elif event_type == "max_turns":
                 self.state = ExecutionState.MAX_TURNS_REACHED
                 self.status_message.emit("Max turns reached")

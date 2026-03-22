@@ -1391,12 +1391,22 @@ class EventDelegate(QStyledItemDelegate):
                 
             # Show tool calls
             for tc in event.get("tool_calls", []):
+                # Normalize tool call format (support both flattened and OpenAI format)
+                tool_name = tc.get('name')
+                if tool_name is None:
+                    function = tc.get('function', {})
+                    tool_name = function.get('name', 'Unknown')
+                tool_arguments = tc.get('arguments')
+                if tool_arguments is None:
+                    function = tc.get('function', {})
+                    tool_arguments = function.get('arguments', {})
+                
                 if detail_level == "minimal":
-                    add_line(f"🛠️ {tc['name']}", style="color: #0000FF;")
+                    add_line(f"🛠️ {tool_name}", style="color: #0000FF;")
                 else:
-                    add_line(f"🛠️ {tc['name']}", style="color: #0000FF; font-weight: bold;")
+                    add_line(f"🛠️ {tool_name}", style="color: #0000FF; font-weight: bold;")
                     if detail_level == "verbose":
-                        add_line(f"  Arguments: {tc['arguments']}", style="color: #0000AA;")
+                        add_line(f"  Arguments: {tool_arguments}", style="color: #0000AA;")
                 
                 # Result
                 result_text = tc.get('result', '')
@@ -2481,9 +2491,13 @@ class AgentGUI(QMainWindow):
         
         file_menu.addSeparator()
         # Session management actions
-        save_session_action = QAction("Save Session...", self)
+        save_session_action = QAction("Save Session", self)
         save_session_action.triggered.connect(self.save_session)
         file_menu.addAction(save_session_action)
+
+        export_session_action = QAction("Export Session As...", self)
+        export_session_action.triggered.connect(self.export_session)
+        file_menu.addAction(export_session_action)
 
         open_session_action = QAction("Open Session...", self)
         open_session_action.triggered.connect(self.open_session)
@@ -2803,69 +2817,16 @@ class AgentGUI(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Failed to export conversation: {e}")
     
-    # ----- Config Management Methods -----
-
-    def save_config(self, immediate=False):
-        """Save application configuration to file.
-        
-        Args:
-            immediate: If True, save immediately without debouncing.
-        """
-        if not immediate and self._config_save_timer.isActive():
-            # Already scheduled
-            return
-        
-        if not immediate:
-            # Schedule with debounce
-            self._config_save_timer.start()
-            return
-        
-        # Save immediately
-        try:
-            config = self.presenter.get_config()
-            # Save to config file (path is stored in presenter)
-            config_path = getattr(self.presenter, 'config_path', 'agent_config.json')
-            with open(config_path, 'w') as f:
-                json.dump(config, f, indent=2)
-            print(f"[GUI] Configuration saved to {config_path}")
-            self.presenter.status_message.emit("Configuration saved")
-        except Exception as e:
-            print(f"[GUI] Error saving config: {e}")
-            self.presenter.status_message.emit(f"Config save error: {e}")
-
-    def load_config(self):
-        """Load application configuration from file."""
-        try:
-            config_path = getattr(self.presenter, 'config_path', 'agent_config.json')
-            if os.path.exists(config_path):
-                with open(config_path, 'r') as f:
-                    config = json.load(f)
-                # Update presenter config
-                self.presenter.update_config(config)
-                print(f"[GUI] Configuration loaded from {config_path}")
-                self.presenter.status_message.emit("Configuration loaded")
-            else:
-                print(f"[GUI] Config file not found: {config_path}")
-        except Exception as e:
-            print(f"[GUI] Error loading config: {e}")
-            self.presenter.status_message.emit(f"Config load error: {e}")
-
     # ----- Session Management Methods -----
 
     def save_session(self):
-        """Save current session to a file."""
+        """Save current session to the central session store."""
         # Check if there is a session to save
         if not self.presenter.user_history and not self.presenter._initial_conversation:
             QMessageBox.warning(self, "No Session", "No conversation to save.")
             return
 
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Session", "", "Session Files (*.json);;All Files (*)"
-        )
-        if not file_path:
-            return
-
-        # Stop any running controller before loading
+        # Stop any running controller before saving
         try:
             if self.presenter.controller and hasattr(self.presenter.controller, 'stop'):
                 self.presenter.controller.stop()
@@ -2873,16 +2834,37 @@ class AgentGUI(QMainWindow):
             print(f"[GUI] Warning: could not stop controller: {e}")
 
         try:
-            success = self.presenter.save_session(file_path)
+            success = self.presenter.save_session()
             if success:
-                # Update session name based on saved file
-                self.presenter.session_name = os.path.basename(file_path)
+                # session_name is updated by presenter
                 self.update_window_title()
-                QMessageBox.information(self, "Session Saved", f"Session saved to {file_path}")
+                QMessageBox.information(self, "Session Saved", "Session saved to session store.")
             else:
                 QMessageBox.warning(self, "Save Failed", "Failed to save session.")
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"Failed to save session: {e}")
+
+    def export_session(self):
+        """Export current session to a file (user chooses location)."""
+        # Check if there is a session to export
+        if not self.presenter.user_history and not self.presenter._initial_conversation:
+            QMessageBox.warning(self, "No Session", "No conversation to export.")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export Session As", "", "Session Files (*.json);;All Files (*)"
+        )
+        if not file_path:
+            return
+
+        try:
+            success = self.presenter.export_session(file_path)
+            if success:
+                QMessageBox.information(self, "Export Successful", f"Session exported to {file_path}")
+            else:
+                QMessageBox.warning(self, "Export Failed", "Failed to export session.")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to export session: {e}")
 
     def open_session(self):
         """Open a session from a file and load it into the GUI."""
@@ -2988,19 +2970,46 @@ class AgentGUI(QMainWindow):
                 QMessageBox.warning(self, "Rename Failed", "Could not rename session.")
 
     def display_loaded_conversation(self):
-        """Display the currently loaded conversation (from _initial_conversation)."""
+        """Display the currently loaded conversation (full user history)."""
         # Clear current display
         self.event_model.clear()
         self.output_textedit.clear()
 
-        # Use the presenter's _initial_conversation or user_history
-        conversation = self.presenter._initial_conversation or self.presenter.user_history
+        # Use the presenter's user_history to show the full conversation
+        conversation = self.presenter.user_history
         if not conversation:
             return
 
         # Rebuild the event model from the conversation
         for msg in conversation:
-            self._append_chat_message(msg['role'], msg['content'], msg.get('tool_calls'), msg.get('tool_call_id'))
+            # Map reasoning_content to reasoning for display
+            reasoning = msg.get('reasoning_content')
+            self._append_chat_message(
+                msg['role'],
+                msg['content'],
+                msg.get('tool_calls'),
+                msg.get('tool_call_id'),
+                reasoning=reasoning
+            )
+
+        # If the session has a final_content (from Final tool), display it as a final event
+        session = self.presenter.current_session
+        if session and getattr(session, 'final_content', None):
+            final_event = {
+                'type': 'final',
+                'content': session.final_content,
+                'reasoning': getattr(session, 'final_reasoning', '') or '',
+                '_detail_level': self.presenter._config.get('detail', 'normal')
+            }
+            # Add to event model
+            self.event_model.add_event(final_event)
+            # Render and display
+            html = self._event_to_html(final_event)
+            cursor = self.output_textedit.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            if not self.output_textedit.document().isEmpty():
+                cursor.insertHtml("<hr>")
+            cursor.insertHtml(html)
 
     def _load_session_file(self, file_path: str) -> bool:
         """Load a session from a file and update the UI.
@@ -3049,29 +3058,51 @@ class AgentGUI(QMainWindow):
             name = "Untitled Session"
         self.setWindowTitle(f"Agent Workbench – {name}")
 
-    def _append_chat_message(self, role: str, content: str, tool_calls=None, tool_call_id=None):
+    def _append_chat_message(self, role: str, content: str, tool_calls=None, tool_call_id=None, reasoning=None):
         """Append a chat message to the event model and output display.
         
         Args:
-            role: 'user' or 'assistant'
+            role: 'user', 'assistant', or 'tool'
             content: message content
             tool_calls: optional list of tool calls (for assistant)
             tool_call_id: optional tool call ID (for user tool response)
+            reasoning: optional reasoning text (for assistant)
         """
-        # Create event dictionary similar to how the agent emits
-        event = {
-            'type': 'turn',
-            'role': role,
-            'content': content,
-            'timestamp': datetime.datetime.now().isoformat(),
-        }
-        if tool_calls:
-            event['tool_calls'] = tool_calls
-        if tool_call_id:
-            event['tool_call_id'] = tool_call_id
+        # Skip tool messages for now (they should be merged into assistant's turn)
+        if role == 'tool':
+            return
+        
+        # Create event dictionary with appropriate type and fields based on role
+        if role == 'user':
+            event = {
+                'type': 'user_query',
+                'content': content,
+                'timestamp': datetime.datetime.now().isoformat(),
+            }
+        elif role == 'assistant':
+            event = {
+                'type': 'turn',
+                'assistant_content': content,
+                'timestamp': datetime.datetime.now().isoformat(),
+            }
+            if reasoning is not None:
+                event['reasoning'] = reasoning
+            if tool_calls:
+                event['tool_calls'] = tool_calls
+        else:
+            # Fallback for unknown roles
+            event = {
+                'type': 'turn',
+                'assistant_content': content,
+                'timestamp': datetime.datetime.now().isoformat(),
+            }
+            if reasoning is not None:
+                event['reasoning'] = reasoning
+            if tool_calls:
+                event['tool_calls'] = tool_calls
 
         # Add to event model (which triggers delegate rendering)
-        self.event_model.appendEvent(event)
+        self.event_model.add_event(event)
 
         # Also add to output_textedit for immediate display
         # Use the same HTML formatting as display_event
