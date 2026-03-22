@@ -76,7 +76,7 @@ class AgentControlsPanel(QGroupBox):
         }
         
         # Conversation pruning settings
-        self.max_history_turns = 20
+        self.max_history_turns = None
         self.keep_initial_query = True
         self.keep_system_messages = True
         
@@ -767,9 +767,9 @@ Open MCP configuration dialog.
         config["turn_monitor_warning_threshold"] = self.turn_warning_threshold_spinbox.value()
         config["turn_monitor_critical_threshold"] = self.turn_critical_threshold_spinbox.value()
         # Conversation pruning (default values)
-        config["max_history_turns"] = 20
-        config["keep_initial_query"] = True
-        config["keep_system_messages"] = True
+        config["max_history_turns"] = self.max_history_turns
+        config["keep_initial_query"] = self.keep_initial_query
+        config["keep_system_messages"] = self.keep_system_messages
         # Workspace path: None if display is "None (unrestricted)"
         workspace_display = self.workspace_display.text()
         workspace_path = None if workspace_display == "None (unrestricted)" else workspace_display

@@ -437,7 +437,8 @@ def create_agent_config_service(config_path: str = "agent_config.json") -> Confi
         # Conversation pruning settings
         "max_history_turns": {"type": "int", "min": 0, "max": 1000, "optional": True, "nullable": True},
         "keep_initial_query": {"type": "bool"},
-        "keep_system_messages": {"type": "bool"}
+        "keep_system_messages": {"type": "bool"},
+        "preset_name": {"type": "str", "optional": True, "nullable": True}
     }
 
     return ConfigService(config_path, default_config, schema)
