@@ -20,6 +20,7 @@ from tools import SIMPLIFIED_TOOL_CLASSES
 from agent_state import ExecutionState
 from session.models import Session, SessionConfig, RuntimeParams
 from session.store import FileSystemSessionStore
+from session.context_builder import ContextBuilder, LastNBuilder
 
 
 
@@ -66,6 +67,7 @@ class AgentPresenter(QObject):
         self.current_session_id = None
         # Session management
         self.session_store = FileSystemSessionStore()
+        self.context_builder = LastNBuilder(keep_last_messages=100000, keep_system_prompt=True)  # Keep effectively unlimited messages to preserve full session history during loading
         self.user_history: List[Dict[str, Any]] = []
         self.current_session: Optional[Session] = None
         self.session_name: Optional[str] = None  # Optional user-provided name
@@ -287,6 +289,16 @@ class AgentPresenter(QObject):
                 user_history.append(user_msg)
         return user_history
     
+    def _update_user_history(self, event_history: List[Dict[str, Any]]):
+        """
+        Update user_history with current conversation from event.
+        
+        Replaces user_history with the event's history (which may be pruned).
+        This ensures we save exactly what the agent sees.
+        """
+        if event_history:
+            self.user_history = event_history.copy()
+
     def start_session(self, query: str, config: Optional[dict] = None, preset_name: str = None):
         """
         Start a new agent session.
@@ -326,6 +338,9 @@ class AgentPresenter(QObject):
             session_id = self._next_session_id
             self._next_session_id += 1
             self.current_session_id = session_id
+            # Clear user history unless resuming a loaded session
+            if self._initial_conversation is None:
+                self.user_history = []
 
             # Check if we have an initial conversation to resume from
             initial_conversation = None
@@ -368,6 +383,7 @@ class AgentPresenter(QObject):
         self._restarting = False
         self.current_session_id = None
         self._initial_conversation = None  # Clear loaded session
+        self.user_history = []
         self.session_name = None  # Clear session name for fresh start
         self.status_message.emit("Ready for new session")
 
@@ -502,7 +518,10 @@ class AgentPresenter(QObject):
             # Set as current session
             self.current_session = session
             self.session_name = os.path.basename(filepath)
-            self._initial_conversation = session.user_history.copy()
+            # Store full history in user_history
+            self.user_history = session.user_history.copy()
+            # Use context builder to create pruned initial conversation for agent
+            self._initial_conversation = self.context_builder.build(session.user_history)
 
             print(f"[Presenter] Session loaded from {filepath}: {len(session.user_history)} messages")
             return True
@@ -583,15 +602,14 @@ class AgentPresenter(QObject):
         """
         # Get the full conversation from the current session
         conversation = None
-        if self.controller.agent is not None:
-            # Agent is running or exists; get its conversation
-            conversation = self.controller.get_conversation()
-        elif self._initial_conversation is not None:
-            conversation = self._initial_conversation
-        elif self.user_history:
+        if self.user_history:
             conversation = self.user_history
         else:
-            return None
+            conversation = self.controller.get_conversation()
+            if conversation is None:
+                conversation = self._initial_conversation
+                if conversation is None:
+                    return None
 
         if not conversation:
             return None
@@ -682,10 +700,16 @@ class AgentPresenter(QObject):
             if context_length is not None:
                 self.context_length = context_length
                 self.context_updated.emit(self.context_length)
+            # Update user_history with full conversation
+            if "history" in event:
+                self._update_user_history(event["history"])
             
         elif event_type == "user_interaction_requested":
             self.state = ExecutionState.WAITING_FOR_USER
             self.status_message.emit("Waiting for user input")
+            # Update user_history with full conversation
+            if "history" in event:
+                self._update_user_history(event["history"])
             
         elif event_type == "paused":
             print(f"[Presenter] Handling paused event")
@@ -709,6 +733,9 @@ class AgentPresenter(QObject):
                         self.status_message.emit("Stopped")
                     else:
                         self.status_message.emit("Thread finished")
+            # Update user_history with full conversation if present
+            if "history" in event:
+                self._update_user_history(event["history"])
             
         elif event_type == "error":
             self.state = ExecutionState.STOPPED
@@ -716,6 +743,9 @@ class AgentPresenter(QObject):
             traceback = event.get("traceback", "")
             self.error_occurred.emit(error_msg, traceback)
             self.status_message.emit(f"Error: {error_msg}")
+            # Update user_history with full conversation if present
+            if "history" in event:
+                self._update_user_history(event["history"])
         
         # Emit status update for all event types
         self.status_message.emit(f"Event: {event_type}")

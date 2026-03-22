@@ -461,6 +461,7 @@ class Agent:
                     "type": "stopped",
                     "turn": turn,
                     "context_length": self.state.current_conversation_tokens,
+                    "history": self.conversation.copy(),
                     "usage": {"input": last_input_tokens, "output": last_output_tokens,
                               "total_input": self.total_input_tokens, "total_output": self.total_output_tokens}
                 }
@@ -583,6 +584,7 @@ class Agent:
                     "traceback": traceback.format_exc(),
                     "turn": turn,
                     "context_length": self.state.current_conversation_tokens,
+                    "history": self.conversation.copy(),
                     "usage": {
                         "input": last_input_tokens,
                         "output": last_output_tokens,
@@ -613,6 +615,7 @@ class Agent:
                     "traceback": traceback.format_exc(),
                     "turn": turn,
                     "context_length": self.state.current_conversation_tokens,
+                    "history": self.conversation.copy(),
                     "usage": {
                         "input": last_input_tokens,
                         "output": last_output_tokens,
@@ -634,8 +637,10 @@ class Agent:
             self.total_input_tokens += input_tokens
             self.total_output_tokens += output_tokens
             if has_accurate_usage:
-                # Use accurate token counts from provider
-                self.state.current_conversation_tokens = input_tokens + output_tokens
+                # Accurate token counts available from provider
+                # Note: input_tokens + output_tokens represents tokens for this API call
+                # We don't overwrite current_conversation_tokens to maintain accumulation
+                pass
             # Otherwise, keep current conversation tokens (estimated)
             last_input_tokens = input_tokens
             last_output_tokens = output_tokens
@@ -669,8 +674,11 @@ class Agent:
             self.conversation.append(assistant_dict)
             # Estimate tokens for assistant message
             assistant_tokens = self._estimate_tokens(assistant_dict)
-            if not has_accurate_usage:
-                # Only add estimated assistant tokens if we don't have accurate usage
+            if has_accurate_usage:
+                # Use accurate output token count from provider
+                self.state.current_conversation_tokens += output_tokens
+            else:
+                # Use estimated assistant tokens
                 self.state.current_conversation_tokens += assistant_tokens
             
             if self.logger:
@@ -944,6 +952,7 @@ Check system warnings for required actions.'''
                     "type": "final",
                     "content": content,
                      "context_length": self.state.current_conversation_tokens,
+                    "history": self.conversation.copy(),
                     "reasoning": reasoning,
                     "usage": {
                         "input": input_tokens,
@@ -968,6 +977,7 @@ Check system warnings for required actions.'''
             "type": "max_turns",
             "turn": self.config.max_turns,
              "context_length": self.state.current_conversation_tokens,
+            "history": self.conversation.copy(),
             "usage": {"input": last_input_tokens, "output": last_output_tokens,
                       "total_input": self.total_input_tokens, "total_output": self.total_output_tokens}
         }
