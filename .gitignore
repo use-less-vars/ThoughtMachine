@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment & secrets
+.env
+*.key
+*secret*
+openrouter_key.txt
+
+# Logs
+logs/
+*.log
+debug.log
+
+# Temporary files
+temp/
+tmp/
+test_*.py
+test_*.json
+*test*.json
+sess_*.json
+session*.json
+tree_debug.txt
+find.txt
+health_check_write_*.txt
+private_*.txt
+fix_*.py
+
+# IDE and OS
+.DS_Store
+Thumbs.db
+*.bak
+*.tmp
+
+# Sessions (managed by app, not source control)
+~/.thoughtmachine/
+sessions/
+
+# Data files (user-generated, should not be in repo)
+*.jsonl
+*.db
+*.sqlite
+
+# MCP configs (may contain secrets)
+mcp_config.json
+example_mcp_config.json
+
+# AI tasks and documentation (temporary)
+AI_tasks/
+docs/
+user_docs/
+reports/
+MCP_INTEGRATION.md
+MCP_TRANSPORT_IMPLEMENTATION.md
+SECURITY_AUDIT_REPORTS_SYMLINK.md
+
+# System prompt (user-specific)
+system_prompt.txt
+
+# Compiled and distribution
+dist/
+build/
+*.egg-info/
