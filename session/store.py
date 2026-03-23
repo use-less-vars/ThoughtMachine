@@ -55,11 +55,40 @@ class FileSystemSessionStore(SessionStore):
             sessions_dir: Directory to store session files. If None, defaults to
                          ~/.thoughtmachine/sessions
         """
+        print(f"[SessionStore] Initializing with sessions_dir={sessions_dir}")
+        self._original_sessions_dir = sessions_dir  # Store original parameter
         if sessions_dir is None:
             home = os.path.expanduser("~")
             sessions_dir = os.path.join(home, ".thoughtmachine", "sessions")
+            print(f"[SessionStore] Using default directory: {sessions_dir}")
         self.sessions_dir = Path(sessions_dir)
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[SessionStore] Final sessions_dir: {self.sessions_dir}")
+        # Try to create directory, with fallbacks if needed
+        try:
+            self.sessions_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[SessionStore] Directory created/exists: {self.sessions_dir}")
+        except OSError as e:
+            # Only attempt fallbacks if using default directory (not user-provided)
+            if self._original_sessions_dir is None:
+                print(f"[SessionStore] Warning: Could not create default sessions directory at {self.sessions_dir}: {e}")
+                # Try fallback in current working directory
+                try:
+                    import sys
+                    fallback = Path.cwd() / ".thoughtmachine" / "sessions"
+                    fallback.mkdir(parents=True, exist_ok=True)
+                    self.sessions_dir = fallback
+                    print(f"[SessionStore] Using fallback directory: {self.sessions_dir}")
+                except OSError as e2:
+                    print(f"[SessionStore] Warning: Could not create fallback directory at {fallback}: {e2}")
+                    # Try system temp directory as last resort
+                    import tempfile
+                    temp_fallback = Path(tempfile.gettempdir()) / "thoughtmachine_sessions"
+                    temp_fallback.mkdir(parents=True, exist_ok=True)
+                    self.sessions_dir = temp_fallback
+                    print(f"[SessionStore] Using temp directory: {self.sessions_dir}")
+            else:
+                # User-provided directory, re-raise the error
+                raise
 
     def _get_session_path(self, session_id: str) -> Path:
         """Get the file path for a session ID."""
@@ -134,3 +163,45 @@ class FileSystemSessionStore(SessionStore):
     def get_session_path(self, session_id: str) -> Path:
         """Get the file path for a given session ID."""
         return self._get_session_path(session_id)
+
+    def get_current_session_id(self) -> Optional[str]:
+        """
+        Get the ID of the current session from the marker file.
+        Returns None if no marker exists.
+        """
+        marker = self.sessions_dir / ".current_session"
+        print(f"[SessionStore] get_current_session_id: marker={marker}, exists={marker.exists()}")
+        if marker.exists():
+            try:
+                content = marker.read_text().strip()
+                print(f"[SessionStore] Marker content: '{content}'")
+                return content if content else None
+            except Exception as e:
+                print(f"[SessionStore] Error reading current session marker: {e}")
+                return None
+        return None
+
+    def set_current_session_id(self, session_id: Optional[str]) -> None:
+        """
+        Set the current session ID by writing to the marker file.
+        If session_id is None, the marker file is removed.
+        """
+        marker = self.sessions_dir / ".current_session"
+        print(f"[SessionStore] set_current_session_id: marker={marker}, session_id={session_id}")
+        # Ensure session_id is a string if not None
+        if session_id is not None and not isinstance(session_id, str):
+            session_id = str(session_id)
+        
+        if session_id is None:
+            if marker.exists():
+                marker.unlink()
+                print(f"[SessionStore] Removed marker file")
+        else:
+            # Atomic write via temp file
+            temp_path = marker.with_suffix('.tmp')
+            try:
+                temp_path.write_text(session_id)
+                temp_path.replace(marker)
+                print(f"[SessionStore] Wrote marker file with session_id: {session_id}")
+            except Exception as e:
+                print(f"[SessionStore] Error writing current session marker: {e}")

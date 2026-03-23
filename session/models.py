@@ -157,7 +157,7 @@ class Session:
         final_reasoning = data.get('final_reasoning')
 
         session = cls(
-            session_id=data.get('session_id', str(uuid.uuid4())),
+            session_id=str(data.get('session_id', str(uuid.uuid4()))),
             created_at=created_at,
             updated_at=updated_at,
             config=config,

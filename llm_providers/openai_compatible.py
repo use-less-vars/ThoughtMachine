@@ -96,6 +96,93 @@ class OpenAICompatibleProvider(LLMProvider):
             logger.warning(f"Failed to load tokenizer: {e}. Token counting will be approximate.")
             self.encoding = None
 
+    
+    def _normalize_deepseek_tool_calls(self, messages):
+        """Normalize messages for DeepSeek API, ensuring proper IDs and tool call format.
+
+         Key improvements:
+         1. Preserve existing tool call IDs (don't overwrite)
+         2. Only generate new IDs when ID is missing or None
+         3. Convert IDs to strings
+         4. Log mismatches between tool messages and assistant tool calls
+        """
+        import sys
+        messages_with_ids = []
+        
+        # First pass: collect tool_call_ids from tool messages for reference
+        tool_call_ids = []
+        for msg in messages:
+            if msg.get("role") == "tool" and "tool_call_id" in msg:
+                tool_call_ids.append(msg["tool_call_id"])
+        
+        for i, msg in enumerate(messages):
+            msg_copy = msg.copy()
+            
+            # Add message ID if missing (should already have from previous step)
+            if "id" not in msg_copy or msg_copy["id"] is None or not isinstance(msg_copy["id"], str):
+                msg_copy["id"] = str(i)
+            
+            # Normalize tool_calls in assistant messages
+            if msg_copy.get("role") == "assistant" and "tool_calls" in msg_copy:
+                tool_calls = msg_copy["tool_calls"]
+                if tool_calls and isinstance(tool_calls, list):
+                    normalized_tool_calls = []
+                    for j, tc in enumerate(tool_calls):
+                        if not isinstance(tc, dict):
+                            tc = dict(tc) if hasattr(tc, '__dict__') else {"function": {"name": "", "arguments": "{}"}}
+                        
+                        tc_copy = tc.copy() if isinstance(tc, dict) else {}
+                        
+                        # Ensure tool call has an ID - preserve existing IDs
+                        # Only generate new ID if id is missing or None
+                        if "id" not in tc_copy or tc_copy["id"] is None:
+                            # Try to use corresponding tool_call_id from tool messages if available
+                            if j < len(tool_call_ids):
+                                tc_copy["id"] = tool_call_ids[j]
+                            else:
+                                tc_copy["id"] = f"call_{i}_{j}"
+                        # Ensure ID is string
+                        if isinstance(tc_copy["id"], (int, float)):
+                            tc_copy["id"] = str(tc_copy["id"])
+                        
+                        # Ensure type is "function" only if missing
+                        if "type" not in tc_copy:
+                            tc_copy["type"] = "function"
+                        
+                        # Convert flattened format to OpenAI format if needed
+                        if "function" not in tc_copy:
+                            tc_copy["function"] = {
+                                "name": tc_copy.get("name", ""),
+                                "arguments": tc_copy.get("arguments", "{}")
+                            }
+                            # Remove flattened fields but preserve id and type
+                            tc_copy.pop("name", None)
+                            tc_copy.pop("arguments", None)
+                            tc_copy.pop("result", None)
+                        
+                        normalized_tool_calls.append(tc_copy)
+                    
+                    msg_copy["tool_calls"] = normalized_tool_calls
+            
+            # Ensure tool messages have proper structure
+            if msg_copy.get("role") == "tool":
+                if "tool_call_id" not in msg_copy:
+                    # Try to infer from content or previous messages
+                    msg_copy["tool_call_id"] = msg_copy.get("id", f"tool_{i}")
+            
+            messages_with_ids.append(msg_copy)
+        
+        # Debug logging
+        print(f"[DEEPSEEK_TOOL_NORM] Processed {len(messages)} messages", file=sys.stderr)
+        for i, msg in enumerate(messages_with_ids):
+            if msg.get("role") == "assistant" and "tool_calls" in msg:
+                for tc in msg["tool_calls"]:
+                    print(f"[DEEPSEEK_TOOL_NORM] Assistant tool call id={tc.get('id')}", file=sys.stderr)
+            if msg.get("role") == "tool":
+                print(f"[DEEPSEEK_TOOL_NORM] Tool message tool_call_id={msg.get('tool_call_id')}", file=sys.stderr)
+        
+        return messages_with_ids
+
     def chat_completion(
         self, 
         messages: List[Dict[str, str]], 
@@ -106,6 +193,33 @@ class OpenAICompatibleProvider(LLMProvider):
         start_time = time.time()
         
         try:
+            # DeepSeek requires message IDs - add them if missing
+            if "deepseek" in self.config.model.lower() or (self.config.base_url and "deepseek" in self.config.base_url.lower()):
+                print(f"[DEEPSEEK_DEBUG] Processing {len(messages)} messages for DeepSeek", file=sys.stderr)
+                # DeepSeek requires message IDs - add them if missing
+                messages_with_ids = []
+                for i, msg in enumerate(messages):
+                    msg_copy = msg.copy()
+                    # Add ID if missing or None or not string
+                    if "id" not in msg_copy or msg_copy["id"] is None or not isinstance(msg_copy["id"], str):
+                        msg_copy["id"] = str(i)  # DeepSeek expects string IDs
+                    # Also ensure tool messages have proper structure
+                    if msg_copy.get("role") == "tool" and "tool_call_id" in msg_copy:
+                        # Keep tool_call_id, also ensure id field exists
+                        pass
+                    messages_with_ids.append(msg_copy)
+                    print(f"[DEEPSEEK_DEBUG] Message {i}: role={msg_copy.get('role')}, id={msg_copy.get('id')}, has_tool_call_id={'tool_call_id' in msg_copy}", file=sys.stderr)
+                messages = messages_with_ids
+                # Normalize tool calls for DeepSeek
+                messages = self._normalize_deepseek_tool_calls(messages)
+                print(f"[DEEPSEEK_TOOL_NORM] Normalized tool calls in {len(messages)} messages", file=sys.stderr)
+                print(f"[DEBUG_DEEPSEEK] Added IDs to {len(messages)} messages", file=sys.stderr)
+                logger.debug(f"DeepSeek: Added IDs to {len(messages)} messages")
+                print(f"[DEBUG_DEEPSEEK] Added IDs to {len(messages)} messages", file=sys.stderr)
+                # Debug: print all messages with IDs
+                for i, msg in enumerate(messages):
+                    print(f"[DEBUG_DEEPSEEK_AFTER] Message {i}: role={msg.get('role')}, id={msg.get('id')}", file=sys.stderr)
+            
             # Prepare completion kwargs
             completion_kwargs = {
                 "model": self.config.model,
@@ -128,6 +242,11 @@ class OpenAICompatibleProvider(LLMProvider):
             # Make API call
             logger.debug(f"OpenAI API call: model={completion_kwargs.get('model')}, temperature={completion_kwargs.get('temperature')}, max_tokens={completion_kwargs.get('max_tokens')}, tools_count={len(tools) if tools else 0}, base_url={self.client.base_url if hasattr(self.client, 'base_url') else 'default'}, api_key={self.config.api_key}")
             print(f"[DEBUG_OPENAI] API call: model={completion_kwargs.get('model')}, temperature={completion_kwargs.get('temperature')}, max_tokens={completion_kwargs.get('max_tokens')}, tools_count={len(tools) if tools else 0}, base_url={self.client.base_url if hasattr(self.client, 'base_url') else 'default'}, api_key={self.config.api_key}", file=sys.stderr)
+            # Debug: print final messages being sent (DeepSeek only)
+            if "deepseek" in self.config.model.lower() or (self.config.base_url and "deepseek" in self.config.base_url.lower()):
+                print(f"[DEEPSEEK_DEBUG_FINAL] Sending {len(completion_kwargs.get('messages', []))} messages to API", file=sys.stderr)
+                for i, msg in enumerate(completion_kwargs.get('messages', [])):
+                    print(f"[DEEPSEEK_DEBUG_FINAL] Message {i}: {msg}", file=sys.stderr)
             response = self.client.chat.completions.create(**completion_kwargs)
             
             # Debug: Print raw response if environment variable is set

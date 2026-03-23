@@ -67,6 +67,7 @@ class AgentPresenter(QObject):
         self.current_session_id = None
         # Session management
         self.session_store = FileSystemSessionStore()
+        print(f"[Presenter] Session store directory: {self.session_store.sessions_dir}")
         self.context_builder = LastNBuilder(keep_last_messages=100000, keep_system_prompt=True)  # Keep effectively unlimited messages to preserve full session history during loading
         self.user_history: List[Dict[str, Any]] = []
         self.current_session: Optional[Session] = None
@@ -314,8 +315,9 @@ class AgentPresenter(QObject):
             print(f"[Presenter] Cannot start session in state {self.state}")
             return
 
-        # Clear session name for a fresh session
-        self.session_name = None
+        # Clear session name only for a brand new session (no existing session ID)
+        if self.current_session_id is None:
+            self.session_name = None
 
         try:
             # Determine if using preset_name or config dict
@@ -336,10 +338,13 @@ class AgentPresenter(QObject):
                 self._cached_config = agent_config
                 self._cached_preset_name = None
 
-            # Generate unique session ID
-            session_id = self._next_session_id
-            self._next_session_id += 1
-            self.current_session_id = session_id
+            # Determine session ID: reuse current if available, else generate new
+            if self.current_session_id is None:
+                session_id = self._next_session_id
+                self._next_session_id += 1
+                self.current_session_id = str(session_id)
+            else:
+                session_id = str(self.current_session_id)
             # Clear user history unless resuming a loaded session
             if self._initial_conversation is None:
                 self.user_history = []
@@ -376,17 +381,21 @@ class AgentPresenter(QObject):
         return self._cached_config is not None
 
     def _finalize_restart(self):
-        """Common restart cleanup: reset controller, counters, and state."""
+        """Common restart cleanup: reset controller, counters, and state.
+        Preserves current session identity and conversation history.
+        """
         self.controller.reset()
         self.total_input = 0
         self.total_output = 0
         self.context_length = 0
         self.state = ExecutionState.IDLE
         self._restarting = False
-        self.current_session_id = None
-        self._initial_conversation = None  # Clear loaded session
-        self.user_history = []
-        self.session_name = None  # Clear session name for fresh start
+        # Rebuild initial conversation from user_history for continuation
+        if self.user_history:
+            self._initial_conversation = self.context_builder.build(self.user_history)
+        else:
+            self._initial_conversation = None
+        # NOTE: Do NOT clear current_session_id, current_session, session_name, or user_history.
         self.status_message.emit("Ready for new session")
 
     def restart_session(self, query: str = None):
@@ -400,6 +409,14 @@ class AgentPresenter(QObject):
         except Exception as e:
             self.error_occurred.emit(f"Cannot create config for restart: {str(e)}", "")
             return
+
+        # Auto-save current session if exists (silent)
+        if self.current_session_id:
+            try:
+                self.save_session()
+            except Exception as e:
+                print(f"[Presenter] Auto-save before restart failed: {e}")
+                # Continue anyway
 
         # If already IDLE, finalize immediately
         if self.state == ExecutionState.IDLE:
@@ -421,6 +438,42 @@ class AgentPresenter(QObject):
 
         # Otherwise, wait for terminal event; state = STOPPING
         self.state = ExecutionState.STOPPING
+
+    def new_session(self, name: str = None, auto_save_current: bool = True):
+        """Start a brand new session.
+        
+        Args:
+            name: Optional name for the new session. If None, session will be unnamed.
+            auto_save_current: If True, auto-save current session before clearing.
+        """
+        # Auto-save current session if requested and has unsaved changes
+        if auto_save_current and self.has_unsaved_changes():
+            print("[Presenter] Auto-saving current session before starting new session")
+            self.auto_save_current_session()
+        
+        # If agent is running, stop it first (best effort)
+        if self.controller.is_running:
+            self.controller.stop()
+        # Clear session data
+        self.current_session = None
+        self.current_session_id = None
+        self.session_name = name  # Set the provided name
+        self.user_history = []
+        self._initial_conversation = None
+        # Clear marker file (no current session until something is saved)
+        self.session_store.set_current_session_id(None)
+        # Reset counters
+        self.total_input = 0
+        self.total_output = 0
+        self.context_length = 0
+        # Clear final content
+        self.final_content = None
+        self.final_reasoning = None
+        # Ensure state is IDLE
+        self.state = ExecutionState.IDLE
+        self.status_message.emit("Ready for new session")
+        print(f"[Presenter] Started new session{' named ' + name if name else ''}")
+
     def continue_session(self, query: str):
         """
         Continue an existing session with a new query.
@@ -469,10 +522,10 @@ class AgentPresenter(QObject):
 
             # Ensure we have a session_id (new session if None)
             if not self.current_session_id:
-                self.current_session_id = session.session_id
+                self.current_session_id = str(session.session_id)
             else:
                 # Preserve the existing session_id
-                session.session_id = self.current_session_id
+                session.session_id = str(self.current_session_id)
 
             # Set current_session reference
             self.current_session = session
@@ -490,6 +543,9 @@ class AgentPresenter(QObject):
 
             # Update session name from metadata
             self.session_name = session.metadata.get('name')
+
+            # Update current session marker to point to this session
+            self.session_store.set_current_session_id(self.current_session_id)
 
             print(f"[Presenter] Session saved to store: {self.session_store.get_session_path(session.session_id)}")
             return True
@@ -539,15 +595,82 @@ class AgentPresenter(QObject):
             traceback.print_exc()
             return False
 
-    def load_session(self, filepath: str) -> bool:
+    def has_unsaved_changes(self) -> bool:
+        """Check if current session has unsaved changes.
+        
+        Returns True if there is a current session with user history
+        that hasn't been saved (or has changes since last save).
+        For simplicity, we assume any session with user_history has unsaved changes.
+        """
+        # If we have user history, we have something to save
+        if self.user_history:
+            return True
+        # Or if we have a current session ID but no session object loaded
+        if self.current_session_id and not self.current_session:
+            return True
+        # Or if controller has conversation
+        if self.controller.get_conversation():
+            return True
+        return False
+
+    def auto_save_current_session(self, default_name: str = None) -> bool:
+        """Auto-save current session with default name if not already saved.
+        
+        Args:
+            default_name: Default name to use if session has no name.
+                          If None, generates timestamp-based name.
+        
+        Returns:
+            True if saved or no need to save, False on error.
+        """
+        # Check if we have anything to save
+        if not self.has_unsaved_changes():
+            print("[Presenter] No unsaved changes, skipping auto-save")
+            return True
+        
+        # Generate default name if needed
+        if default_name is None:
+            from datetime import datetime
+            default_name = f"{datetime.now():%Y-%m-%d-%H-%M}-unnamed-session"
+        
+        # Save current name if exists
+        original_name = self.session_name
+        # Set default name temporarily
+        self.session_name = default_name
+        
+        try:
+            success = self.save_session()
+            if success:
+                print(f"[Presenter] Auto-saved session as '{default_name}'")
+                # Don't restore original name - the auto-saved session should keep the auto-save name
+                # If original_name was None or empty, we want to keep the auto-save name
+                # If original_name was set, we might want to keep it for the current in-memory session
+                # but the saved session on disk should have the auto-save name.
+                # For now, keep the auto-save name as the session name.
+                # The original_name will be restored when we load the original session later.
+                return True
+            else:
+                print("[Presenter] Auto-save failed")
+                return False
+        except Exception as e:
+            print(f"[Presenter] Error in auto-save: {e}")
+            return False
+        
+    def load_session(self, filepath: str, auto_save: bool = True) -> bool:
         """Load a session from a JSON file.
 
         Args:
             filepath: Path to the session file
+            auto_save: If True, auto-save current session before loading
 
         Returns:
             True if loaded successfully, False otherwise
         """
+        # Auto-save current session before loading new one
+        if auto_save and self.has_unsaved_changes():
+            print("[Presenter] Auto-saving current session before loading new session")
+            self.auto_save_current_session()
+        
         try:
             with open(filepath, 'r') as f:
                 session_dict = json.load(f)
@@ -562,18 +685,55 @@ class AgentPresenter(QObject):
 
             # Set as current session
             self.current_session = session
-            self.session_name = os.path.basename(filepath)
+            self.current_session_id = str(session.session_id)
+            # Use name from metadata if available, else fallback to filename
+            self.session_name = session.metadata.get('name') or os.path.basename(filepath)
             # Store full history in user_history
             self.user_history = session.user_history.copy()
             # Use context builder to create pruned initial conversation for agent
             self._initial_conversation = self.context_builder.build(session.user_history)
 
+            # Mark this session as current
+            self.session_store.set_current_session_id(self.current_session_id)
             print(f"[Presenter] Session loaded from {filepath}: {len(session.user_history)} messages")
             return True
         except Exception as e:
             print(f"[Presenter] Error loading session: {e}")
             traceback.print_exc()
             return False
+
+    def load_current_session(self) -> bool:
+        """Load the session marked as current from the store.
+        Typically called on application startup.
+        """
+        print(f"[Presenter] load_current_session called")
+        session_id = self.session_store.get_current_session_id()
+        print(f"[Presenter] Got session_id from store: {session_id}")
+        if not session_id:
+            print(f"[Presenter] No current session marker")
+            return False
+        print(f"[Presenter] Loading session {session_id} from store")
+        session = self.session_store.load_session(session_id)
+        if session is None:
+            # Stale marker, clear it
+            print(f"[Presenter] Session not found, clearing stale marker")
+            self.session_store.set_current_session_id(None)
+            return False
+        # Set as current session
+        self.current_session = session
+        self.current_session_id = str(session.session_id)
+        # Use name from metadata or format a fallback
+        name = session.metadata.get('name')
+        if not name:
+            if isinstance(session.created_at, datetime):
+                name = f"Session {session.created_at:%Y-%m-%d %H:%M}"
+            else:
+                name = "Untitled Session"
+        self.session_name = name
+        self.user_history = session.user_history.copy()
+        self._initial_conversation = self.context_builder.build(session.user_history)
+        print(f"[Presenter] Current session loaded from store: {session_id} ({self.session_name})")
+        return True
 
     def list_sessions(self) -> List[Dict[str, Any]]:
         """List available sessions from the session store.
@@ -613,6 +773,15 @@ class AgentPresenter(QObject):
             success = self.session_store.delete_session(session_id)
             if success:
                 print(f"[Presenter] Deleted session {session_id}")
+                # If we deleted the current session, clear session state
+                if self.current_session_id == session_id:
+                    self.current_session = None
+                    self.current_session_id = None
+                    self.session_name = None
+                    self.user_history = []
+                    self._initial_conversation = None
+                    # Clear the marker file
+                    self.session_store.set_current_session_id(None)
             else:
                 print(f"[Presenter] Session {session_id} not found")
             return success
@@ -673,22 +842,38 @@ class AgentPresenter(QObject):
         # Preserve full conversation including system, user, assistant, and tool messages
         # Normalize tool calls to flattened format for consistency
         def normalize_tool_call(msg):
-            if msg.get('role') == 'assistant' and 'tool_calls' in msg:
-                normalized = []
-                for tc in msg['tool_calls']:
-                    if 'name' in tc:
-                        # Already flattened; keep as is
-                        normalized.append(tc)
-                    else:
-                        # Convert from OpenAI format (function.name, function.arguments)
-                        function = tc.get('function', {})
-                        normalized.append({
-                            'name': function.get('name', 'Unknown'),
-                            'arguments': function.get('arguments', {}),
-                            'result': tc.get('result', '')
-                        })
-                msg['tool_calls'] = normalized
-            return msg
+                """Normalize tool call to flattened format, preserving id and type."""
+                if msg.get('role') == 'assistant' and 'tool_calls' in msg:
+                    normalized = []
+                    for tc in msg['tool_calls']:
+                        if 'name' in tc:
+                            # Already flattened; preserve id and type if present
+                            flat = {
+                                'name': tc.get('name', 'Unknown'),
+                                'arguments': tc.get('arguments', {}),
+                                'result': tc.get('result', '')
+                            }
+                            if 'id' in tc:
+                                flat['id'] = tc['id']
+                            if 'type' in tc:
+                                flat['type'] = tc['type']
+                            normalized.append(flat)
+                        else:
+                            # Convert from OpenAI format (function.name, function.arguments)
+                            function = tc.get('function', {})
+                            flat = {
+                                'name': function.get('name', 'Unknown'),
+                                'arguments': function.get('arguments', {}),
+                                'result': tc.get('result', '')
+                            }
+                            if 'id' in tc:
+                                flat['id'] = tc['id']
+                            if 'type' in tc:
+                                flat['type'] = tc['type']
+                            normalized.append(flat)
+                    msg['tool_calls'] = normalized
+                return msg
+
 
         user_history = [normalize_tool_call(m.copy()) for m in conversation]
 
@@ -808,11 +993,17 @@ class AgentPresenter(QObject):
             # Update user_history with full conversation
             if "history" in event:
                 self._update_user_history(event["history"])
+            # Auto-save session when waiting for user input
+            if self.has_unsaved_changes():
+                self.auto_save_current_session()
             
         elif event_type == "paused":
             print(f"[Presenter] Handling paused event")
             self.state = ExecutionState.PAUSED
             self.status_message.emit("Paused")
+            # Auto-save session on pause to preserve state
+            if self.has_unsaved_changes():
+                self.auto_save_current_session()
             
         elif event_type in ["final", "stopped", "max_turns", "thread_finished"]:
             print(f"[Presenter] Handling terminal event: {event_type}")
@@ -842,6 +1033,11 @@ class AgentPresenter(QObject):
             if "history" in event:
                 self._update_user_history(event["history"])
             
+            # Auto-save session on terminal events (except during restart)
+            if not (self._restarting and event_type in ["stopped", "thread_finished"]):
+                if self.has_unsaved_changes():
+                    self.auto_save_current_session()
+            
         elif event_type == "error":
             self.state = ExecutionState.STOPPED
             error_msg = event.get("message", "Unknown error")
@@ -851,12 +1047,24 @@ class AgentPresenter(QObject):
             # Update user_history with full conversation if present
             if "history" in event:
                 self._update_user_history(event["history"])
+            
+            # Auto-save session on error
+            if self.has_unsaved_changes():
+                self.auto_save_current_session()
         
         # Emit status update for all event types
         self.status_message.emit(f"Event: {event_type}")
     
     def cleanup(self):
-        """Clean up resources."""
+        """Clean up resources.
+        Automatically saves the current session if it exists.
+        """
         if self.controller.is_running:
             self.controller.stop()
+        # Auto-save current session on close if there are unsaved changes
+        if self.has_unsaved_changes():
+            try:
+                self.auto_save_current_session()
+            except Exception as e:
+                print(f"[Presenter] Auto-save on cleanup failed: {e}")
         self.state = ExecutionState.IDLE

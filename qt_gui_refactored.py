@@ -1641,6 +1641,10 @@ class AgentGUI(QMainWindow):
         self.init_ui()
         self.setup_signal_connections()
         self.load_config()
+        # Auto-load current session on startup if available
+        if self.presenter.load_current_session():
+            self.display_loaded_conversation()
+            self.update_window_title()
     
     def init_ui(self):
         """Initialize the user interface (unchanged layout)."""
@@ -1786,6 +1790,13 @@ class AgentGUI(QMainWindow):
         self.restart_btn.setMinimumWidth(80)
         self.restart_btn.setEnabled(False)
         button_layout.addWidget(self.restart_btn)
+
+        # New Session button
+        self.new_session_btn = QPushButton("NEW SESSION")
+        self.new_session_btn.clicked.connect(self.new_session)
+        self.new_session_btn.setMinimumWidth(80)
+        self.new_session_btn.setEnabled(True)
+        button_layout.addWidget(self.new_session_btn)
 
         query_layout.addLayout(button_layout)
 
@@ -2190,28 +2201,82 @@ class AgentGUI(QMainWindow):
         """Pause the current agent session."""
         self.presenter.pause_session()
     
-    def restart_session(self):
-        """Restart a fresh session with current GUI settings."""
-        # Get current query before clearing
-        query = self.query_entry.toPlainText().strip()
-
-        # Restart with current query (if any)
-        self.presenter.restart_session(query)
-
-        # Clear event model (virtual scrolling)
+    def new_session(self):
+        """Start a completely new session."""
+        from PyQt6.QtWidgets import QInputDialog, QMessageBox
+        
+        # Check if current session has unsaved changes
+        if self.presenter.has_unsaved_changes():
+            # Ask user what to do with current session
+            reply = QMessageBox.question(
+                self,
+                "Unsaved Changes",
+                "Current session has unsaved changes. What would you like to do?",
+                QMessageBox.StandardButton.Discard | 
+                QMessageBox.StandardButton.Save |
+                QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Save
+            )
+            
+            if reply == QMessageBox.StandardButton.Cancel:
+                return
+            elif reply == QMessageBox.StandardButton.Save:
+                # Auto-save with default name
+                success = self.presenter.auto_save_current_session()
+                if not success:
+                    QMessageBox.warning(self, "Save Failed", 
+                                       "Failed to auto-save current session. Starting new session anyway.")
+            # If Discard, just continue
+        
+        # Ask for new session name (optional) with default suggestion
+        from datetime import datetime
+        default_name = f"{datetime.now():%Y-%m-%d-%H-%M}-session"
+        name, ok = QInputDialog.getText(
+            self, "New Session", 
+            "Enter a name for the new session (optional):",
+            text=default_name
+        )
+        
+        if not ok:
+            return  # User cancelled
+        
+        # Clear the query entry
+        self.query_entry.clear()
+        # In presenter, this will stop agent if running and clear session data
+        self.presenter.new_session(name=name if name else None, auto_save_current=False)
+        # Clear UI components
         self.event_model.clear()
         self.output_textedit.clear()
-
         # Reset token counters
         self.total_input = 0
         self.total_output = 0
         self.context_length = 0
         self.status_panel.update_tokens(0, 0)
         self.status_panel.update_context_length(0)
-
         # Update UI
         self.status_panel.update_status("Ready for new session")
         self.update_buttons(running=False)
+        self.update_window_title()
+
+    def restart_session(self):
+        """Restart the agent with current configuration, staying in the same session."""
+        # Get current query (it may be used by presenter? but not needed)
+        query = self.query_entry.toPlainText().strip()
+
+        # Restart the agent (preserves session and conversation)
+        self.presenter.restart_session(query)
+
+        # Reset token counters in GUI to match presenter
+        self.total_input = 0
+        self.total_output = 0
+        self.context_length = 0
+        self.status_panel.update_tokens(0, 0)
+        self.status_panel.update_context_length(0)
+
+        # Update UI status
+        self.status_panel.update_status("Ready for new session")
+        self.update_buttons(running=False)
+        # Note: we do NOT clear the chat display; the conversation history remains visible.
         self.update_window_title()    
     # ----- UI Helper Methods -----
     
@@ -3004,7 +3069,7 @@ class AgentGUI(QMainWindow):
             # Add to event model
             self.event_model.add_event(final_event)
             # Render and display
-            html = self._event_to_html(final_event)
+            html = self._format_event_html(final_event)
             cursor = self.output_textedit.textCursor()
             cursor.movePosition(QTextCursor.MoveOperation.End)
             if not self.output_textedit.document().isEmpty():
@@ -3016,13 +3081,38 @@ class AgentGUI(QMainWindow):
 
         Returns True if successful, False otherwise.
         """
+        from PyQt6.QtWidgets import QMessageBox
+        
+        # Check if current session has unsaved changes
+        if self.presenter.has_unsaved_changes():
+            # Ask user what to do with current session
+            reply = QMessageBox.question(
+                self,
+                "Unsaved Changes",
+                "Current session has unsaved changes. Save before loading new session?",
+                QMessageBox.StandardButton.Save | 
+                QMessageBox.StandardButton.Discard |
+                QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Save
+            )
+            
+            if reply == QMessageBox.StandardButton.Cancel:
+                return False
+            elif reply == QMessageBox.StandardButton.Save:
+                # Auto-save with default name
+                success_save = self.presenter.auto_save_current_session()
+                if not success_save:
+                    QMessageBox.warning(self, "Save Failed", 
+                                       "Failed to auto-save current session. Loading new session anyway.")
+            # If Discard, just continue (no auto-save)
+        
         try:
             if self.presenter.controller and hasattr(self.presenter.controller, 'stop'):
                 self.presenter.controller.stop()
         except Exception as e:
             print(f"[GUI] Warning: could not stop controller: {e}")
 
-        success = self.presenter.load_session(file_path)
+        success = self.presenter.load_session(file_path, auto_save=False)  # Already handled above
         if success:
             self.display_loaded_conversation()
             # Reset token counters and context for the loaded session
