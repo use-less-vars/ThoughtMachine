@@ -934,9 +934,12 @@ class AgentPresenter(QObject):
         state_event_types = ["error", "paused", "stopped", "thread_finished", "final", "max_turns", "user_interaction_requested"]
         if event_type not in state_event_types:
             event_session_id = event.get("session_id")
-            if event_session_id is not None and event_session_id != self.current_session_id:
-                print(f"[Presenter] Ignoring event from old session {event_session_id}, current is {self.current_session_id}")
-                return
+            # Ensure both session IDs are strings for comparison to avoid type mismatch issues
+            if event_session_id is not None:
+                event_session_id = str(event_session_id)
+                if event_session_id != self.current_session_id:
+                    print(f"[Presenter] Ignoring event from old session {event_session_id}, current is {self.current_session_id}")
+                    return
         
         # Emit raw event for UI to handle display
         print(f"[Presenter] Emitting event_received: {event_type}")

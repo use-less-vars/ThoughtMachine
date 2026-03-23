@@ -183,6 +183,72 @@ class OpenAICompatibleProvider(LLMProvider):
         
         return messages_with_ids
 
+    def _normalize_stepfun_tool_calls(self, messages):
+        """Normalize messages for StepFun API via OpenRouter.
+        
+        StepFun expects tool calls to have either 'function' field (when type='function') 
+        or 'custom' field (when type='custom'). OpenRouter may add 'index' field.
+        This ensures tool calls have the required structure.
+        """
+        import sys
+        messages_normalized = []
+        
+        for i, msg in enumerate(messages):
+            msg_copy = msg.copy()
+            
+            # Normalize tool_calls in assistant messages
+            if msg_copy.get("role") == "assistant" and "tool_calls" in msg_copy:
+                tool_calls = msg_copy["tool_calls"]
+                if tool_calls and isinstance(tool_calls, list):
+                    normalized_tool_calls = []
+                    for j, tc in enumerate(tool_calls):
+                        if not isinstance(tc, dict):
+                            tc = dict(tc) if hasattr(tc, '__dict__') else {}
+                        
+                        tc_copy = tc.copy() if isinstance(tc, dict) else {}
+                        
+                        # Preserve index field if present (added by OpenRouter)
+                        # Ensure type field
+                        if "type" not in tc_copy:
+                            tc_copy["type"] = "function"
+                        
+                        # StepFun validation expects 'custom' type with 'custom' field
+                        # Convert function tool calls to custom format
+                        if tc_copy.get("type") == "function":
+                            # Move function data to custom field
+                            if "function" in tc_copy:
+                                tc_copy["custom"] = tc_copy.pop("function")
+                            else:
+                                # Try to construct from flattened fields
+                                tc_copy["custom"] = {
+                                    "name": tc_copy.get("name", ""),
+                                    "arguments": tc_copy.get("arguments", "{}")
+                                }
+                                # Remove flattened fields
+                                tc_copy.pop("name", None)
+                                tc_copy.pop("arguments", None)
+                                tc_copy.pop("result", None)
+                            # Change type to custom
+                            tc_copy["type"] = "custom"
+                        elif tc_copy.get("type") == "custom":
+                            if "custom" not in tc_copy:
+                                tc_copy["custom"] = {}
+                        
+                        normalized_tool_calls.append(tc_copy)
+                    
+                    msg_copy["tool_calls"] = normalized_tool_calls
+            
+            messages_normalized.append(msg_copy)
+        
+        # Debug logging
+        print(f"[STEPFUN_TOOL_NORM] Processed {len(messages)} messages", file=sys.stderr)
+        for i, msg in enumerate(messages_normalized):
+            if msg.get("role") == "assistant" and "tool_calls" in msg:
+                for tc in msg["tool_calls"]:
+                    print(f"[STEPFUN_TOOL_NORM] Assistant tool call id={tc.get('id')}, type={tc.get('type')}, has_function={'function' in tc}, has_custom={'custom' in tc}, index={tc.get('index')}", file=sys.stderr)
+        
+        return messages_normalized
+
     def chat_completion(
         self, 
         messages: List[Dict[str, str]], 
@@ -220,6 +286,11 @@ class OpenAICompatibleProvider(LLMProvider):
                 for i, msg in enumerate(messages):
                     print(f"[DEBUG_DEEPSEEK_AFTER] Message {i}: role={msg.get('role')}, id={msg.get('id')}", file=sys.stderr)
             
+            # StepFun requires proper tool call structure
+            if "stepfun" in self.config.model.lower():
+                print(f"[STEPFUN_DEBUG] Processing {len(messages)} messages for StepFun", file=sys.stderr)
+                messages = self._normalize_stepfun_tool_calls(messages)
+            
             # Prepare completion kwargs
             completion_kwargs = {
                 "model": self.config.model,
@@ -247,6 +318,12 @@ class OpenAICompatibleProvider(LLMProvider):
                 print(f"[DEEPSEEK_DEBUG_FINAL] Sending {len(completion_kwargs.get('messages', []))} messages to API", file=sys.stderr)
                 for i, msg in enumerate(completion_kwargs.get('messages', [])):
                     print(f"[DEEPSEEK_DEBUG_FINAL] Message {i}: {msg}", file=sys.stderr)
+            # Debug: print final messages being sent (StepFun only)
+            if "stepfun" in self.config.model.lower():
+                print(f"[STEPFUN_DEBUG_FINAL] Sending {len(completion_kwargs.get('messages', []))} messages to API", file=sys.stderr)
+                for i, msg in enumerate(completion_kwargs.get('messages', [])):
+                    print(f"[STEPFUN_DEBUG_FINAL] Message {i}: {msg}", file=sys.stderr)
+            
             response = self.client.chat.completions.create(**completion_kwargs)
             
             # Debug: Print raw response if environment variable is set
