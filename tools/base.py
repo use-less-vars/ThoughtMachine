@@ -108,6 +108,9 @@ class ToolBase(BaseModel):
 
             # Convert to absolute paths
             workspace_abs = os.path.abspath(self.workspace_path)
+            # If workspace is provided, treat relative paths as relative to workspace
+            if not os.path.isabs(path):
+                path = os.path.join(workspace_abs, path)
             target_abs = os.path.abspath(path)
 
             # Ensure target is within workspace

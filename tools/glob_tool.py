@@ -83,9 +83,15 @@ class GlobTool(ToolBase):
 
     def _get_files(self) -> List[Path]:
         """Perform the glob search with exclusions."""
-        base_path = Path(self.directory).expanduser().resolve()
+        # Validate directory path is within workspace
+        try:
+            validated_dir = self._validate_path(self.directory)
+        except ValueError as e:
+            raise ValueError(f"Directory validation failed: {e}")
+        
+        base_path = Path(validated_dir).expanduser().resolve()
         if not base_path.exists():
-            raise ValueError(f"Directory does not exist: {self.directory}")
+            raise ValueError(f"Directory does not exist: {validated_dir}")
 
         # Prepare exclude patterns
         exclude_patterns = self.exclude_dirs
@@ -134,6 +140,13 @@ class GlobTool(ToolBase):
     def execute(self) -> str:
         """Execute the glob search and return formatted results."""
         try:
+            # Validate directory (also validates workspace access)
+            try:
+                validated_dir = self._validate_path(self.directory)
+                base_dir = Path(validated_dir).expanduser().resolve()
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+            
             paths = self._get_files()
 
             # Pagination
@@ -153,7 +166,7 @@ class GlobTool(ToolBase):
                 suffix = " (dir)" if p.is_dir() else ""
                 # Compute relative path with compatibility for Python < 3.9
                 try:
-                    rel_path = p.relative_to(Path(self.directory).resolve())
+                    rel_path = p.relative_to(base_dir)
                 except ValueError:
                     rel_path = p
                 lines.append(f"{rel_path}{suffix}")

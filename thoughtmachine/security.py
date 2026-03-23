@@ -77,24 +77,31 @@ def _redact_sensitive_data(data: Any) -> Any:
 def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] = None) -> str:
     """
     Validate that a given path is within the allowed workspace.
-    
+
     Args:
         path: The path to validate (can be relative or absolute)
         mode: Access mode ('read', 'write', etc.) for logging
         workspace_path: Root directory for file operations. If None, no restrictions.
-    
+
     Returns:
         Absolute normalized path if valid.
-    
+
     Raises:
         PathOutsideWorkspaceError: If path is outside workspace.
         ValueError: For invalid inputs.
     """
+    original_path = path
+    
+    # If workspace_path is provided, treat relative paths as relative to workspace_path
+    if workspace_path is not None and not os.path.isabs(path):
+        # Join with workspace_path
+        path = os.path.join(workspace_path, path)
+    
     # First, get absolute path of the requested location (without following symlinks)
     try:
         requested_abs = os.path.abspath(path)
     except Exception as e:
-        raise ValueError(f"Invalid path '{path}': {e}")
+        raise ValueError(f"Invalid path '{original_path}': {e}")
     
     # Use requested_abs as the path to validate
     target_abs = requested_abs
@@ -105,7 +112,7 @@ def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] =
             return os.path.realpath(target_abs)
         except Exception:
             return target_abs
-    
+
     workspace_abs = os.path.abspath(workspace_path)
     workspace_abs = os.path.realpath(workspace_abs)
     
@@ -116,26 +123,26 @@ def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] =
         # Paths are on different drives (Windows)
         _log_security_event(
             event_type=LogEventType.SECURITY_VIOLATION if LOGGING_AVAILABLE else None,
-            message=f"Path violation attempt: '{path}' is outside workspace '{workspace_abs}' (different drive)",
+            message=f"Path violation attempt: '{original_path}' is outside workspace '{workspace_abs}' (different drive)",
             level=LogLevel.WARNING if LOGGING_AVAILABLE else logging.WARNING,
             data={
-                "path": path,
+                "path": original_path,
                 "resolved_path": target_abs,
                 "workspace": workspace_abs,
                 "mode": mode,
                 "reason": "different_drive"
             }
         )
-        raise PathOutsideWorkspaceError(f"Path {path} is outside workspace {workspace_abs}")
+        raise PathOutsideWorkspaceError(f"Path {original_path} is outside workspace {workspace_abs}")
     
     # Check for directory traversal attempts
     if target_rel.startswith("..") or os.path.isabs(target_rel):
         _log_security_event(
             event_type=LogEventType.SECURITY_VIOLATION if LOGGING_AVAILABLE else None,
-            message=f"Path violation attempt: '{path}' resolves to outside workspace '{workspace_abs}'",
+            message=f"Path violation attempt: '{original_path}' resolves to outside workspace '{workspace_abs}'",
             level=LogLevel.WARNING if LOGGING_AVAILABLE else logging.WARNING,
             data={
-                "path": path,
+                "path": original_path,
                 "resolved_path": target_abs,
                 "workspace": workspace_abs,
                 "mode": mode,
@@ -143,7 +150,7 @@ def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] =
                 "reason": "traversal"
             }
         )
-        raise PathOutsideWorkspaceError(f"Path {path} is outside workspace {workspace_abs}")
+        raise PathOutsideWorkspaceError(f"Path {original_path} is outside workspace {workspace_abs}")
     
     # Try to get canonical path (following symlinks) for return value
     # If symlink points outside workspace or is broken, that's OK - we already validated
@@ -163,10 +170,10 @@ def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] =
     
     _log_security_event(
         event_type=LogEventType.FILE_ACCESS if LOGGING_AVAILABLE else None,
-        message=f"File access allowed: {mode} on '{path}'",
+        message=f"File access allowed: {mode} on '{original_path}'",
         level=LogLevel.INFO if LOGGING_AVAILABLE else logging.INFO,
         data={
-            "path": path,
+            "path": original_path,
             "resolved_path": canonical_abs,
             "workspace": workspace_abs,
             "operation": mode,
@@ -175,7 +182,6 @@ def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] =
     )
     
     return canonical_abs
-
 
 def setup_docker_sandbox(
     image: str,

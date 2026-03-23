@@ -21,8 +21,13 @@ class FileSummaryTool(ToolBase):
     
     def execute(self) -> str:
         try:
-            # Resolve the file path
-            file_path = pathlib.Path(self.filename)
+            # Validate file path is within workspace
+            try:
+                validated_path = self._validate_path(self.filename)
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+            
+            file_path = pathlib.Path(validated_path)
             if not file_path.exists():
                 return self._truncate_output(f"Error: File '{self.filename}' does not exist.")
             if not file_path.is_file():

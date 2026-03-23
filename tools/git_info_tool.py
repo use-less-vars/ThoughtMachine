@@ -98,8 +98,14 @@ class GitInfoTool(ToolBase):
         try:
             # Determine working directory
             if self.working_dir:
-                repo_root = Path(self.working_dir).expanduser().resolve()
+                # Validate working_dir is within workspace
+                try:
+                    validated_working_dir = self._validate_path(self.working_dir)
+                except ValueError as e:
+                    return self._truncate_output(f"Error: {e}")
+                repo_root = Path(validated_working_dir).expanduser().resolve()
             elif self.workspace_path:
+                # workspace_path is already validated by agent
                 repo_root = Path(self.workspace_path).expanduser().resolve()
             else:
                 repo_root = Path.cwd()
@@ -185,8 +191,17 @@ class GitInfoTool(ToolBase):
             # If only commit1 is specified, compare commit1 to working tree
             pass
         if self.file_path:
-            args.append("--")
-            args.append(self.file_path)
+            # Validate file path is within workspace
+            try:
+                # Compute absolute path relative to repo_root
+                file_abs = (repo_root / self.file_path).resolve()
+                validated_abs = self._validate_path(str(file_abs))
+                # Convert to path relative to repo_root for git
+                file_rel = Path(validated_abs).relative_to(repo_root)
+                args.append("--")
+                args.append(str(file_rel))
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
         output = self._run_git(repo_root, args)
         return self._truncate_output(output)
     
@@ -202,8 +217,17 @@ class GitInfoTool(ToolBase):
         if self.grep:
             args.append(f"--grep={self.grep}")
         if self.file_path:
-            args.append("--")
-            args.append(self.file_path)
+            # Validate file path is within workspace
+            try:
+                # Compute absolute path relative to repo_root
+                file_abs = (repo_root / self.file_path).resolve()
+                validated_abs = self._validate_path(str(file_abs))
+                # Convert to path relative to repo_root for git
+                file_rel = Path(validated_abs).relative_to(repo_root)
+                args.append("--")
+                args.append(str(file_rel))
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
         output = self._run_git(repo_root, args)
         return self._truncate_output(output)
     
@@ -233,13 +257,23 @@ class GitInfoTool(ToolBase):
         """Run git blame."""
         if not self.file_path:
             return "Error: file_path is required for blame operation"
+        # Validate file path is within workspace
+        try:
+            # Compute absolute path relative to repo_root
+            file_abs = (repo_root / self.file_path).resolve()
+            validated_abs = self._validate_path(str(file_abs))
+            # Convert to path relative to repo_root for git
+            file_rel = Path(validated_abs).relative_to(repo_root)
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        
         args = ["blame"]
         if self.line_start and self.line_end:
             args.append(f"-L{self.line_start},{self.line_end}")
         elif self.line_start:
             args.append(f"-L{self.line_start},+1")
         args.append("--")
-        args.append(self.file_path)
+        args.append(str(file_rel))
         output = self._run_git(repo_root, args)
         return self._truncate_output(output)
     

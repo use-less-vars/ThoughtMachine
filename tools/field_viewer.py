@@ -274,20 +274,26 @@ class FieldViewer(ToolBase):
     
     def execute(self) -> str:
         try:
+            # Validate file path is within workspace
+            try:
+                validated_path = self._validate_path(self.file_path)
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+            
             # Validate file exists
-            if not os.path.exists(self.file_path):
-                return self._truncate_output(f"Error: File '{self.file_path}' does not exist.")
-            if not os.path.isfile(self.file_path):
-                return self._truncate_output(f"Error: '{self.file_path}' is not a file.")
+            if not os.path.exists(validated_path):
+                return self._truncate_output(f"Error: File '{validated_path}' does not exist.")
+            if not os.path.isfile(validated_path):
+                return self._truncate_output(f"Error: '{validated_path}' is not a file.")
             
             # Read file content
             try:
-                with open(self.file_path, 'r', encoding='utf-8') as f:
+                with open(validated_path, 'r', encoding='utf-8') as f:
                     content = f.read()
             except UnicodeDecodeError:
                 # Try with different encoding
                 try:
-                    with open(self.file_path, 'r', encoding='latin-1') as f:
+                    with open(validated_path, 'r', encoding='latin-1') as f:
                         content = f.read()
                 except Exception as e:
                     return self._truncate_output(f"Error reading file '{self.file_path}': {e}")
