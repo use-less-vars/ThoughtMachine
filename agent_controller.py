@@ -98,15 +98,14 @@ class AgentController(QObject):
         """Return the current AgentConfig being used."""
         return self._config
 
-    def start(self, query: str, config: AgentConfig = None, session_id: int = None, initial_conversation: Optional[List[Dict[str, Any]]] = None, preset_name: str = None, **overrides):
+    def start(self, query: str, config: AgentConfig = None, session=None, preset_name: str = None, **overrides):
         """
         Start the agent with the given query and configuration.
 
         Args:
             query: The user query string.
             config: An AgentConfig instance (api_key, model, etc.). Mutually exclusive with preset_name.
-            session_id: Optional session ID for tracking.
-            initial_conversation: Optional previous conversation history to continue from.
+            session: Optional Session instance to associate with this run (for history persistence).
             preset_name: Name of a preset to use instead of config. If provided, config is ignored.
             **overrides: Additional config overrides when using preset_name.
         """
@@ -129,7 +128,7 @@ class AgentController(QObject):
             if config is not None:
                 raise ValueError("Cannot specify both config and preset_name")
             from agent import Agent
-            agent = Agent.from_preset(preset_name, session_id=session_id, initial_conversation=initial_conversation, **overrides)
+            agent = Agent.from_preset(preset_name, session=session, **overrides)
             # Extract the config from the created agent
             resolved_config = agent.config
             # Store the agent directly (no need to create a new one in _run)
@@ -143,9 +142,9 @@ class AgentController(QObject):
         # Store query and config for the background thread
         self._query = query
         self._config = resolved_config
-        self._initial_conversation = initial_conversation
-        # Set session ID for event filtering
-        self.current_session_id = session_id
+        self._session = session
+        # Set session ID for event filtering (use session.session_id if available)
+        self.current_session_id = session.session_id if session is not None else None
         # Enqueue the initial query
         self.query_queue.put(query)
 
@@ -182,7 +181,8 @@ class AgentController(QObject):
     def get_conversation(self) -> Optional[List[Dict[str, Any]]]:
         """Return the current conversation from the agent, if available."""
         if self.agent:
-            return self.agent.conversation.copy()
+            # If using a session, the conversation is the session's user_history
+            return self.agent.conversation.copy() if self.agent.conversation is not None else None
         return None
 
     def update_runtime_params(self, **kwargs):
@@ -252,24 +252,22 @@ class AgentController(QObject):
                 agent = self._agent_override
                 # Inject stop_check into the agent's config
                 agent.config.stop_check = should_stop
-                if self._initial_conversation is not None:
-                    agent.conversation = self._initial_conversation.copy()
-                    agent._ensure_system_prompt()
-                    # Reset state to CONTINUING if we have initial conversation
-                    from session.models import SessionState
-                    events = agent.state.set_session_state(SessionState.CONTINUING)
-                    for event in events:
-                        agent._handle_state_event(event)
+                # If we have a session, ensure agent is linked to it
+                if hasattr(self, '_session') and self._session is not None:
+                    agent.session = self._session
+                    agent.conversation = self._session.user_history
+                    if len(self._session.user_history) > 0:
+                        from session.models import SessionState
+                        events = agent.state.set_session_state(SessionState.CONTINUING)
+                        for event in events:
+                            agent._handle_state_event(event)
                 self.agent = agent
             else:
                 # Inject the stop_check into a copy of the config to avoid mutating the original
                 run_config = self._config.model_copy() if hasattr(self._config, 'model_copy') else self._config
                 run_config.stop_check = should_stop
-                if self._initial_conversation is not None:
-                    run_config.initial_conversation = self._initial_conversation
-
-                # Create Agent instance
-                agent = Agent(run_config, initial_conversation=self._initial_conversation, session_id=self.current_session_id)
+                # Create Agent instance with session if available
+                agent = Agent(run_config, session=self._session if hasattr(self, '_session') else None)
                 self.agent = agent  # store for potential reuse
 
             # Main loop: process queries from queue

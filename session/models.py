@@ -92,6 +92,10 @@ class Session:
     ))
     runtime_params: RuntimeParams = field(default_factory=RuntimeParams)
     user_history: List[Dict[str, Any]] = field(default_factory=list)
+    # Token usage tracking
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    context_length: int = 0
     # agent_context is not persisted; it's derived from user_history on load.
     # But we may keep a cached version during runtime.
     agent_context: List[Dict[str, Any]] = field(default_factory=list, compare=False, repr=False)
@@ -100,6 +104,9 @@ class Session:
     version: int = 1  # Session format version
     final_content: Optional[str] = None  # Content of the Final tool's result, if any
     final_reasoning: Optional[str] = None  # Reasoning that preceded the final answer
+
+    # Runtime reference to the active Agent instance (not persisted)
+    agent_instance: Optional[Any] = field(default=None, compare=False, repr=False)
 
     metadata: Dict[str, Any] = field(default_factory=dict)  # name, tags, notes, etc.
 
@@ -130,6 +137,9 @@ class Session:
             'version': self.version,
             'final_content': self.final_content,
             'final_reasoning': self.final_reasoning,
+            'total_input_tokens': self.total_input_tokens,
+            'total_output_tokens': self.total_output_tokens,
+            'context_length': self.context_length,
         }
         return data
 
@@ -169,6 +179,42 @@ class Session:
             version=version,
             final_content=final_content,
             final_reasoning=final_reasoning,
+            total_input_tokens=data.get('total_input_tokens', 0),
+            total_output_tokens=data.get('total_output_tokens', 0),
+            context_length=data.get('context_length', 0),
         )
         # agent_context will be built later by ContextBuilder
         return session
+
+    def add_message(self, role: str, content: str, **kwargs) -> None:
+        """
+        Add a message to the session's user_history.
+        Automatically updates the updated_at timestamp.
+        """
+        message = {"role": role, "content": content, **kwargs}
+        self.user_history.append(message)
+        self.updated_at = datetime.now()
+
+    def create_agent(self, config):
+        """
+        Create an Agent instance associated with this session.
+        The agent will use this session's user_history as its conversation source.
+        """
+        # Import here to avoid circular dependencies
+        from agent import Agent
+        # Create the agent with this session and the provided config.
+        # Agent now accepts a session parameter and uses session.user_history directly.
+        agent = Agent(config, session=self)
+        self.agent_instance = agent
+        return agent
+
+    def get_history_subset(self, max_tokens: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Build a context subset from the user_history using the configured ContextBuilder.
+        Returns a list of messages suitable for sending to the LLM.
+        """
+        from session.context_builder import LastNBuilder
+        # For now, use LastNBuilder with effectively unlimited keep_last_messages
+        # to preserve full session history during processing (pruning only by max_tokens)
+        builder = LastNBuilder(keep_last_messages=100000, keep_system_prompt=True)
+        return builder.build(self.user_history, max_tokens=max_tokens)

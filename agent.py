@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+from datetime import datetime
 from typing import Optional, List, Dict, Any, TYPE_CHECKING
 
 from pydantic import ValidationError
@@ -38,10 +39,18 @@ if TYPE_CHECKING:
 from agent_state import AgentState, TokenState, TurnState, ExecutionState, SessionState
 
 class Agent:
-    def __init__(self, config: AgentConfig, initial_conversation=None, session_id: str = None):
+    def __init__(self, config: AgentConfig, session=None, initial_conversation=None, session_id: str = None):
         self.config = config
-        self.session_id = session_id
-        
+        self.session = session
+        if session is not None:
+            # Use session's user_history as the conversation source (no copy)
+            self.session_id = session.session_id
+            self.conversation = session.user_history
+        else:
+            self.session = None
+            self.session_id = session_id
+            self.conversation = initial_conversation.copy() if initial_conversation else []
+
         # Create LLM provider using factory
         provider_config = {
             "api_key": config.api_key,
@@ -71,20 +80,16 @@ class Agent:
         # Prepare tool definitions
         self.tool_classes = config.tool_classes if config.tool_classes is not None else SIMPLIFIED_TOOL_CLASSES
         self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
-        
-        # Initialize conversation
-        self.conversation = []
-        if initial_conversation is not None:
-            self.conversation = initial_conversation.copy()
-        else:
-            self._ensure_system_prompt()
+
+        # Ensure system prompt is present (only if conversation is empty or no system)
+        self._ensure_system_prompt()
         # Initialize context builder for LLM context generation
         self.context_builder = self._create_context_builder()
-        
+
         # Token totals
         self.total_input_tokens = config.initial_input_tokens
         self.total_output_tokens = config.initial_output_tokens
-        
+
         # Stop check
         self.stop_check = config.stop_check
         # Keep-alive queue and flags
@@ -93,19 +98,22 @@ class Agent:
         self._should_reset = False
         # State management
         self.state = AgentState(self.config, self.logger)
-        
-        # Set session state based on initial_conversation
-        if initial_conversation is not None and len(initial_conversation) > 0:
-            # Continuing an existing session
-            events = self.state.set_session_state(SessionState.CONTINUING)
-            for event in events:
-                self._handle_state_event(event)
+
+        # Set session state based on whether we have existing history
+        if self.session is not None:
+            if len(self.session.user_history) > 0:
+                events = self.state.set_session_state(SessionState.CONTINUING)
+                for event in events:
+                    self._handle_state_event(event)
+            # else: new session with no history, keep default NEW state
         else:
-            # New session (already defaults to NEW in AgentState)
-            pass
-        
-        self._token_encoder = None
-        
+            if initial_conversation is not None and len(initial_conversation) > 0:
+                events = self.state.set_session_state(SessionState.CONTINUING)
+                for event in events:
+                    self._handle_state_event(event)
+            # else: new session
+
+        self._token_encoder = None        
     def _estimate_tokens(self, text_or_message):
         """Estimate token count for a string or message dict using tiktoken."""
         if self._token_encoder is None:
@@ -165,9 +173,14 @@ class Agent:
                 system_prompt = self._load_system_prompt()
             self.conversation.insert(0, {"role": "system", "content": system_prompt})
 
-    
+    def _add_to_conversation(self, message: Dict[str, Any]) -> None:
+        """Add a message to the conversation, updating session timestamp if using a session."""
+        self.conversation.append(message)
+        if self.session is not None:
+            self.session.updated_at = datetime.now()
+
     def reset(self):
-        self.conversation = []
+        self.conversation.clear()
         self._ensure_system_prompt()
         self.total_input_tokens = self.config.initial_input_tokens
         self.total_output_tokens = self.config.initial_output_tokens
@@ -202,7 +215,7 @@ class Agent:
             sender = event.get("sender", "system")
             # Append warning as user message
             warning_msg = {"role": sender, "content": warning}
-            self.conversation.append(warning_msg)
+            self._add_to_conversation(warning_msg)
             # Estimate tokens for warning message and update state
             warning_tokens = self._estimate_tokens(warning_msg)
             self.state.current_conversation_tokens += warning_tokens
@@ -211,7 +224,7 @@ class Agent:
             warning = event.get("message", event.get("warning", ""))
             sender = event.get("sender", "system")
             warning_msg = {"role": sender, "content": warning}
-            self.conversation.append(warning_msg)
+            self._add_to_conversation(warning_msg)
             warning_tokens = self._estimate_tokens(warning_msg)
             self.state.current_conversation_tokens += warning_tokens
         elif event.get("type") in ("critical_countdown_start", "token_critical_active", "turn_critical_active"):
@@ -219,7 +232,7 @@ class Agent:
             message = event.get("message", "")
             sender = event.get("sender", "system")
             warning_msg = {"role": sender, "content": message}
-            self.conversation.append(warning_msg)
+            self._add_to_conversation(warning_msg)
             warning_tokens = self._estimate_tokens(warning_msg)
             self.state.current_conversation_tokens += warning_tokens
         elif event.get("type") == "execution_state_change":
@@ -428,7 +441,7 @@ class Agent:
             self.logger.log_agent_start(query, config_data)
         # Append user message
         user_msg = {"role": "user", "content": query}
-        self.conversation.append(user_msg)
+        self._add_to_conversation(user_msg)
         # Estimate tokens for the new user message (including JSON structure) and update current count
         estimated_tokens = self._estimate_tokens(user_msg)
         self.state.current_conversation_tokens += estimated_tokens
@@ -472,7 +485,7 @@ class Agent:
                 if event["type"] == "turn_warning":
                     # Add warning message to conversation as user message
                     warning_msg = {"role": "user", "content": event["message"]}
-                    self.conversation.append(warning_msg)
+                    self._add_to_conversation(warning_msg)
                     # Update token count for warning message
                     warning_tokens = self._estimate_tokens(warning_msg)
                     self.state.current_conversation_tokens += warning_tokens
@@ -496,7 +509,7 @@ class Agent:
                 if event["type"] == "token_warning":
                     # Add warning message to conversation as user message
                     warning_msg = {"role": "user", "content": event["message"]}
-                    self.conversation.append(warning_msg)
+                    self._add_to_conversation(warning_msg)
                     # Update token count for warning message
                     warning_tokens = self._estimate_tokens(warning_msg)
                     self.state.current_conversation_tokens += warning_tokens
@@ -671,7 +684,7 @@ class Agent:
             if tool_calls:
                 assistant_dict["tool_calls"] = tool_calls
             
-            self.conversation.append(assistant_dict)
+            self._add_to_conversation(assistant_dict)
             # Estimate tokens for assistant message
             assistant_tokens = self._estimate_tokens(assistant_dict)
             if has_accurate_usage:
@@ -727,7 +740,7 @@ Possible reasons: Token or turn limits exceeded with active restrictions.
 Check system warnings for required actions.'''
                         
                         # Append tool result with error
-                        self.conversation.append({
+                        self._add_to_conversation({
                             "role": "tool",
                             "tool_call_id": tool_call["id"],
                             "content": tool_result
@@ -756,7 +769,7 @@ Check system warnings for required actions.'''
                             tool_result = f"Invalid JSON in arguments: {e}. Raw: {arguments_str}"
                             if self.logger:
                                 self.logger.log_error("JSON_DECODE_ERROR", f"Failed to parse JSON for {tool_name}: {e}")
-                            self.conversation.append({
+                            self._add_to_conversation({
                                 "role": "tool",
                                 "tool_call_id": tool_call["id"],
                                 "content": tool_result
@@ -818,7 +831,7 @@ Check system warnings for required actions.'''
                         self.logger.log_tool_result(tool_name, tool_result, tool_call["id"])
                     
                     # Append tool result
-                    self.conversation.append({
+                    self._add_to_conversation({
                         "role": "tool",
                         "tool_call_id": tool_call["id"],
                         "content": tool_result
@@ -981,9 +994,8 @@ Check system warnings for required actions.'''
             "usage": {"input": last_input_tokens, "output": last_output_tokens,
                       "total_input": self.total_input_tokens, "total_output": self.total_output_tokens}
         }
-    def from_preset():
-        @classmethod
-        def from_preset(cls, preset_name_or_obj, api_key: str = "", base_url: str = "https://api.deepseek.com", session_id: str = None, initial_conversation=None, **overrides):
+    @classmethod
+    def from_preset(cls, preset_name_or_obj, api_key: str = "", base_url: str = "https://api.deepseek.com", session: Optional['Session'] = None, **overrides):
             """
         Create an Agent instance from a preset configuration.
 
@@ -991,8 +1003,7 @@ Check system warnings for required actions.'''
             preset_name_or_obj: Either a preset name (str) to load, or a Preset object.
             api_key: API key for the LLM provider (overrides preset if provided).
             base_url: Base URL for the LLM provider (overrides preset if provided).
-            session_id: Optional session ID for tracking.
-            initial_conversation: Optional conversation history to continue from.
+            session: Optional Session object to bind to the agent.
             **overrides: Additional AgentConfig fields to override preset values.
 
         Returns:
@@ -1056,4 +1067,4 @@ Check system warnings for required actions.'''
             config = AgentConfig(**config_data)
 
             # Create Agent instance
-            return cls(config, initial_conversation=initial_conversation, session_id=session_id)
+            return cls(config, session=session)

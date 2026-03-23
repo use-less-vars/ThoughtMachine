@@ -149,6 +149,21 @@ class AgentPresenter(QObject):
     def update_config(self, config_updates: dict):
         """Update configuration with partial updates."""
         self._config.update(config_updates)
+    def _bind_session(self, session: Session):
+        """Bind a Session object as the source of truth for conversation state."""
+        self.current_session = session
+        self.user_history = session.user_history  # Reference, not copy
+        self._initial_conversation = None
+        # Update UI state from session metadata if needed
+        self.session_name = session.metadata.get('name')
+        self.current_session_id = session.session_id
+        # Set session_store's current ID
+        self.session_store.set_current_session_id(session.session_id)
+        # Sync token usage counters from session
+        self.total_input = session.total_input_tokens
+        self.total_output = session.total_output_tokens
+        self.context_length = session.context_length
+
         self.config_changed.emit(self._config.copy())
     
     def create_agent_config(self, config_dict: Optional[dict] = None) -> AgentConfig:
@@ -296,11 +311,16 @@ class AgentPresenter(QObject):
         """
         Update user_history with current conversation from event.
         
-        Replaces user_history with the event's history (which may be pruned).
-        This ensures we save exactly what the agent sees.
+        Replaces user_history contents in-place with the event's history (which may be pruned).
+        This ensures we save exactly what the agent sees and preserves references.
         """
         if event_history:
-            self.user_history = event_history.copy()
+            # Mutate in-place to preserve existing list references (e.g., agent.conversation)
+            self.user_history[:] = event_history
+            # If a session is bound, its user_history should be the same object (via _bind_session)
+            # No need to reassign; but ensure consistency if it was somehow detached
+            if self.current_session is not None and self.current_session.user_history is not self.user_history:
+                self.current_session.user_history = self.user_history
 
     def start_session(self, query: str, config: Optional[dict] = None, preset_name: str = None):
         """
@@ -320,57 +340,50 @@ class AgentPresenter(QObject):
             self.session_name = None
 
         try:
-            # Determine if using preset_name or config dict
+            # Resolve configuration and cache for restart
             if preset_name is not None:
-                # preset_name takes precedence; config may be None or provide overrides
-                agent_config = None  # not used
-                # Cache preset_name for restart (maybe store a derived config? For restart, we can create a minimal config)
-                # For simplicity, we'll store a placeholder; restart_session uses _cached_config, which expects AgentConfig
-                # We'll create a dummy AgentConfig from the preset for caching
                 from agent import Agent
-                temp_agent = Agent.from_preset(preset_name, session_id=None)
-                self._cached_config = temp_agent.config
+                overrides = config if config is not None else {}
+                temp_agent = Agent.from_preset(preset_name, session=None, **overrides)
+                agent_config = temp_agent.config
+                self._cached_config = agent_config
                 self._cached_preset_name = preset_name
-                # Apply any overrides to the temporary config if needed? Not necessary for start, but restart will use preset
             else:
-                # Create agent config from dict
                 agent_config = self.create_agent_config(config)
                 self._cached_config = agent_config
                 self._cached_preset_name = None
 
-            # Determine session ID: reuse current if available, else generate new
-            if self.current_session_id is None:
-                session_id = self._next_session_id
-                self._next_session_id += 1
-                self.current_session_id = str(session_id)
+            # Ensure we have a bound session (should be bound via new_session or load_session)
+            if self.current_session is None:
+                session_config = self._build_session_config(agent_config)
+                new_session = Session(
+                    session_id=str(uuid.uuid4()),
+                    config=session_config,
+                    user_history=[],
+                    metadata={}
+                )
+                self._bind_session(new_session)
+
+            # Clear any initial conversation flag
+            self._initial_conversation = None
+
+            # Start the agent with the bound session
+            if preset_name is not None:
+                self.controller.start(
+                    query,
+                    session=self.current_session,
+                    preset_name=preset_name,
+                    **({} if config is None else config)
+                )
             else:
-                session_id = str(self.current_session_id)
-            # Clear user history unless resuming a loaded session
-            if self._initial_conversation is None:
-                self.user_history = []
-
-            # Check if we have an initial conversation to resume from
-            initial_conversation = None
-            if self._initial_conversation is not None:
-                initial_conversation = self._initial_conversation
-                # For a resumed session, we may need to prepend the current query if it's not empty
-                # However, the controller expects the query to be the first message if initial_conversation is None
-                # If initial_conversation is provided, the query will be enqueued separately? Actually controller.start
-                # enqueues the query regardless. For resumed sessions, the query is typically empty or we want to
-                # continue the conversation. Let's handle this: if initial_conversation exists, we likely want to
-                # ignore the query or treat it as an additional user message. For now, pass initial_conversation and
-                # let the controller handle it - it will start with that context and then process the query.
-
-            # Start controller with session ID and optional initial conversation
-            self.controller.start(query, agent_config, session_id, initial_conversation, preset_name=preset_name, **({} if config is None else config))            
+                self.controller.start(
+                    query,
+                    config=agent_config,
+                    session=self.current_session
+                )
             self.state = ExecutionState.RUNNING
             self.status_message.emit("Session started")
-            
-            # Clear the initial conversation flag after using it
-            self._initial_conversation = None
-            
 
-            
         except Exception as e:
             self.state = ExecutionState.STOPPED
             self.error_occurred.emit(f"Failed to start session: {str(e)}", "")
@@ -388,6 +401,10 @@ class AgentPresenter(QObject):
         self.total_input = 0
         self.total_output = 0
         self.context_length = 0
+        if self.current_session is not None:
+            self.current_session.total_input_tokens = 0
+            self.current_session.total_output_tokens = 0
+            self.current_session.context_length = 0
         self.state = ExecutionState.IDLE
         self._restarting = False
         # Rebuild initial conversation from user_history for continuation
@@ -454,18 +471,16 @@ class AgentPresenter(QObject):
         # If agent is running, stop it first (best effort)
         if self.controller.is_running:
             self.controller.stop()
-        # Clear session data
-        self.current_session = None
-        self.current_session_id = None
-        self.session_name = name  # Set the provided name
-        self.user_history = []
-        self._initial_conversation = None
-        # Clear marker file (no current session until something is saved)
-        self.session_store.set_current_session_id(None)
-        # Reset counters
-        self.total_input = 0
-        self.total_output = 0
-        self.context_length = 0
+        # Create a fresh Session with a generated UUID and default config
+        agent_config = self.create_agent_config()
+        session_config = self._build_session_config(agent_config)
+        session = Session(
+            session_id=str(uuid.uuid4()),
+            config=session_config,
+            user_history=[],
+            metadata={'name': name} if name else {}
+        )
+        self._bind_session(session)
         # Clear final content
         self.final_content = None
         self.final_reasoning = None
@@ -683,18 +698,10 @@ class AgentPresenter(QObject):
             # Reconstruct Session object
             session = Session.from_persistable_dict(session_dict)
 
-            # Set as current session
-            self.current_session = session
-            self.current_session_id = str(session.session_id)
-            # Use name from metadata if available, else fallback to filename
-            self.session_name = session.metadata.get('name') or os.path.basename(filepath)
-            # Store full history in user_history
-            self.user_history = session.user_history.copy()
-            # Use context builder to create pruned initial conversation for agent
-            self._initial_conversation = self.context_builder.build(session.user_history)
-
-            # Mark this session as current
-            self.session_store.set_current_session_id(self.current_session_id)
+            self._bind_session(session)
+            # If session name was not set by binding (i.e., metadata lacks name), use fallback
+            if not self.session_name:
+                self.session_name = os.path.basename(filepath)
             print(f"[Presenter] Session loaded from {filepath}: {len(session.user_history)} messages")
             return True
         except Exception as e:
@@ -722,16 +729,13 @@ class AgentPresenter(QObject):
         # Set as current session
         self.current_session = session
         self.current_session_id = str(session.session_id)
-        # Use name from metadata or format a fallback
-        name = session.metadata.get('name')
-        if not name:
+        self._bind_session(session)
+        # If session name was not set by binding, format a fallback
+        if not self.session_name:
             if isinstance(session.created_at, datetime):
-                name = f"Session {session.created_at:%Y-%m-%d %H:%M}"
+                self.session_name = f"Session {session.created_at:%Y-%m-%d %H:%M}"
             else:
-                name = "Untitled Session"
-        self.session_name = name
-        self.user_history = session.user_history.copy()
-        self._initial_conversation = self.context_builder.build(session.user_history)
+                self.session_name = "Untitled Session"
         print(f"[Presenter] Current session loaded from store: {session_id} ({self.session_name})")
         return True
 
@@ -948,6 +952,9 @@ class AgentPresenter(QObject):
             config=session_config,
             runtime_params=runtime_params,
             user_history=user_history,
+            total_input_tokens=self.total_input,
+            total_output_tokens=self.total_output,
+            context_length=self.context_length,
             version=1
         )
 
@@ -1020,6 +1027,9 @@ class AgentPresenter(QObject):
             if input_tokens is not None and output_tokens is not None:
                 self.total_input = input_tokens
                 self.total_output = output_tokens
+                if self.current_session is not None:
+                    self.current_session.total_input_tokens = input_tokens
+                    self.current_session.total_output_tokens = output_tokens
                 self.tokens_updated.emit(self.total_input, self.total_output)
             
             # Update context length if available (either directly or in usage dict)
@@ -1033,6 +1043,8 @@ class AgentPresenter(QObject):
             
             if context_length is not None:
                 self.context_length = context_length
+                if self.current_session is not None:
+                    self.current_session.context_length = context_length
                 self.context_updated.emit(self.context_length)
             # Update user_history with full conversation
             if "history" in event:
