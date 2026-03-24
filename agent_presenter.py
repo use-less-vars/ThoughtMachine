@@ -68,6 +68,7 @@ class AgentPresenter(QObject):
         # Session management
         self.session_store = FileSystemSessionStore()
         self._dirty = False  # Tracks unsaved changes since last save
+        self._name_explicitly_set = False  # Tracks whether the session has been explicitly named by the user
         print(f"[Presenter] Session store directory: {self.session_store.sessions_dir}")
         self.context_builder = LastNBuilder(keep_last_messages=100000, keep_system_prompt=True)  # Keep effectively unlimited messages to preserve full session history during loading
         self.user_history: List[Dict[str, Any]] = []
@@ -166,6 +167,7 @@ class AgentPresenter(QObject):
         self.context_length = session.context_length
         # Mark as clean (no unsaved changes)
         self._dirty = False
+        self._name_explicitly_set = bool(session.metadata.get('name'))
 
         self.config_changed.emit(self._config.copy())
     
@@ -568,6 +570,7 @@ class AgentPresenter(QObject):
             self.session_store.set_current_session_id(self.current_session_id)
             # Mark as clean after successful save
             self._dirty = False
+            self._name_explicitly_set = True
 
             print(f"[Presenter] Session saved to store: {self.session_store.get_session_path(session.session_id)}")
             return True
@@ -632,39 +635,25 @@ class AgentPresenter(QObject):
         Returns:
             True if saved or no need to save, False on error.
         """
-        # Check if we have anything to save
         if not self.has_unsaved_changes():
             print("[Presenter] No unsaved changes, skipping auto-save")
             return True
         
-        # Generate default name if needed
-        if default_name is None:
-            from datetime import datetime
-            default_name = f"{datetime.now():%Y-%m-%d-%H-%M}-unnamed-session"
-        
-        # Save current name if exists
-        original_name = self.session_name
-        # Set default name temporarily
-        self.session_name = default_name
+        # Only auto-save if the session has an explicit name set by the user
+        if not self._name_explicitly_set:
+            return False
         
         try:
             success = self.save_session()
             if success:
-                print(f"[Presenter] Auto-saved session as '{default_name}'")
-                # Don't restore original name - the auto-saved session should keep the auto-save name
-                # If original_name was None or empty, we want to keep the auto-save name
-                # If original_name was set, we might want to keep it for the current in-memory session
-                # but the saved session on disk should have the auto-save name.
-                # For now, keep the auto-save name as the session name.
-                # The original_name will be restored when we load the original session later.
+                print("[Presenter] Auto-saved session successfully")
                 return True
             else:
                 print("[Presenter] Auto-save failed")
                 return False
         except Exception as e:
             print(f"[Presenter] Error in auto-save: {e}")
-            return False
-        
+            return False        
     def load_session(self, filepath: str, auto_save: bool = True) -> bool:
         """Load a session from a JSON file.
 
