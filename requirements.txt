@@ -8,4 +8,4 @@ tiktoken
 docker
 modelcontextprotocol
 mcp
-yaml
+PyYAML
