@@ -79,11 +79,5 @@ class AgentConfig(BaseModel):
     enabled_tools: List[str] = Field(default_factory=lambda: [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES], description="List of enabled tool class names")
 
     class Config:        extra = "ignore"  # Allow backward compatibility with older configs
-def run_agent_stream(query: str, config: AgentConfig):
-    """
-    Backward compatibility wrapper that creates an Agent instance and processes the query.
-    """
-    from agent import Agent
-    agent = Agent(config, initial_conversation=config.initial_conversation)
-    yield from agent.process_query(query)
+
     

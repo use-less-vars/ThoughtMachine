@@ -32,7 +32,7 @@ def debug_log(msg: str):
     timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
     with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
         f.write(f"[{timestamp}] {msg}\n")
-    print(f"[DEBUG] {msg}")  # Also print for immediate visibility
+    # print(f"[DEBUG] {msg}")  # Also print for immediate visibility
 
 from qt_gui.utils.constants import MAX_RESULT_LENGTH
 
@@ -319,7 +319,7 @@ class SessionTab(QWidget):
     def on_state_changed(self, state):
         """Handle agent state changes."""
         debug_log(f"on_state_changed: {state}, _closing={self._closing}")
-        print(f"[GUI] State changed to: {state}")
+        # print(f"[GUI] State changed to: {state}")
         if self._closing:
             debug_log("on_state_changed: skipping due to _closing")
             return
@@ -366,7 +366,7 @@ class SessionTab(QWidget):
         detail_level = self.agent_controls_panel.detail_combo.currentText()
 
         # Store conversation history if present
-        print(f"[GUI] display_event: checking history, etype={etype}, has_history={'history' in event}")
+        # print(f"[GUI] display_event: checking history, etype={etype}, has_history={'history' in event}")
         if "history" in event:
             self.last_history = event["history"]
 
@@ -440,7 +440,7 @@ class SessionTab(QWidget):
     @pyqtSlot(str)
     def on_status_message(self, message):
         """Handle status messages."""
-        print(f"[GUI] Status: {message}")
+        # print(f"[GUI] Status: {message}")
         # Could update a status bar if we add one
 
     def _format_event_html(self, event):
@@ -472,7 +472,8 @@ class SessionTab(QWidget):
         """Handle errors from presenter."""
         QMessageBox.critical(self, "Agent Error", f"Error: {error_message}")
         if traceback:
-            print(f"[GUI] Error traceback: {traceback}")
+            # print(f"[GUI] Error traceback: {traceback}")
+            pass
 
     @pyqtSlot(dict)
     def on_config_changed(self, config):
@@ -612,7 +613,7 @@ class SessionTab(QWidget):
                 ExecutionState.FINALIZED
             ]
         
-        print(f"[GUI] update_buttons(running={running}, idle={idle}), state={self.presenter.state}")
+        # print(f"[GUI] update_buttons(running={running}, idle={idle}), state={self.presenter.state}")
         
         if running:
             if idle:
@@ -633,7 +634,7 @@ class SessionTab(QWidget):
     
     def display_user_query(self, query):
         """Display a user query in the output area."""
-        print(f"[GUI] display_user_query: '{query[:50]}...'")
+        # print(f"[GUI] display_user_query: '{query[:50]}...'")
         # Create a synthetic event for user query
         event = {
             "type": "user_query",
@@ -723,10 +724,11 @@ class SessionTab(QWidget):
             # Update presenter configuration
             self.presenter.update_config(config)
             
-            print("[GUI] Configuration loaded")
+            # print("[GUI] Configuration loaded")
             
         except Exception as e:
-            print(f"[GUI] Error loading config: {e}")
+            # print(f"[GUI] Error loading config: {e}")
+            pass
         finally:
             self._loading_config = False
     
@@ -743,14 +745,14 @@ class SessionTab(QWidget):
         try:
             config = self.agent_controls_panel.get_config_dict()
             debug_log(f"save_config: config keys: {list(config.keys())}")
-            print(f"[GUI] Saving config: {config} (immediate={immediate})")
+            # print(f"[GUI] Saving config: {config} (immediate={immediate})")
             # Use config bridge for saving
             self.config_bridge.save_config(config, immediate=immediate)
             debug_log("save_config: bridge save completed")
-            print("[GUI] Configuration saved via bridge")
+            # print("[GUI] Configuration saved via bridge")
         except Exception as e:
             debug_log(f"save_config error: {e}")
-            print(f"[GUI] Error saving config: {e}")    
+            # print(f"[GUI] Error saving config: {e}")    
     def _update_model_suggestions(self):
         """Update model suggestions based on selected provider."""
         # Delegate to the controls panel's method
@@ -782,9 +784,10 @@ class SessionTab(QWidget):
             self.tool_classes = TOOL_CLASSES
             self.agent_controls_panel.tool_classes = TOOL_CLASSES
             self.agent_controls_panel._rebuild_tool_checkboxes()
-            print(f"[GUI] Refreshed tools: {len(TOOL_CLASSES)} tools loaded")
+            # print(f"[GUI] Refreshed tools: {len(TOOL_CLASSES)} tools loaded")
         except Exception as e:
-            print(f"[GUI] Error refreshing tools: {e}")
+            # print(f"[GUI] Error refreshing tools: {e}")
+            pass
     def _schedule_config_save(self):
         """Schedule a debounced configuration save."""
         if not self._loading_config:
@@ -905,9 +908,10 @@ class SessionTab(QWidget):
         """Set application theme."""
         if apply_theme(self.window(), theme_name):
             self.current_theme = theme_name
-            print(f"[GUI] Theme set to: {theme_name}")
+            # print(f"[GUI] Theme set to: {theme_name}")
         else:
-            print(f"[GUI] Unknown theme: {theme_name}")
+            # print(f"[GUI] Unknown theme: {theme_name}")
+            pass
     
     # ----- Export Methods -----
     
@@ -1419,7 +1423,8 @@ class SessionTab(QWidget):
             if self.presenter.controller and hasattr(self.presenter.controller, 'stop'):
                 self.presenter.controller.stop()
         except Exception as e:
-            print(f"[GUI] Warning: could not stop controller: {e}")
+            # print(f"[GUI] Warning: could not stop controller: {e}")
+            pass
 
         success = self.presenter.load_session(file_path, auto_save=False)  # Already handled above
         if success:
@@ -1507,7 +1512,8 @@ class SessionTab(QWidget):
             if success:
                 self.update_window_title()
         except Exception as e:
-            print(f"[SessionTab] Auto-save error: {e}")
+            # print(f"[SessionTab] Auto-save error: {e}")
+            pass
 
     def _append_chat_message(self, role: str, content: str, tool_calls=None, tool_call_id=None, reasoning=None):
         """Append a chat message to the event model and output display.
@@ -1629,7 +1635,7 @@ class SessionTab(QWidget):
             self.presenter.controller.stop()
             debug_log("closeEvent: controller stopped")
         # self.presenter.state = ExecutionState.IDLE  # Disabled to avoid infinite loop
-        print("[GUI] closeEvent: skipping state reset to avoid infinite loop")
+        # print("[GUI] closeEvent: skipping state reset to avoid infinite loop")
         # Auto-save session and cleanup presenter
         debug_log("closeEvent: calling presenter.cleanup")
         self.presenter.cleanup()

@@ -210,21 +210,7 @@ class AgentController(QObject):
         self.pause_event.set()
         self._pause_requested = False
 
-    def get_event(self, block=False, timeout=None):
-        """
-        Retrieve an event from the queue.
 
-        Args:
-            block: If True, wait until an event is available.
-            timeout: Maximum time to wait when block=True (None = wait forever).
-
-        Returns:
-            The next event dict, or None if no event is available (when block=False).
-        """
-        try:
-            return self.event_queue.get(block=block, timeout=timeout)
-        except queue.Empty:
-            return None
 
     def _emit_event(self, event):
         """Emit event both to queue and signal."""

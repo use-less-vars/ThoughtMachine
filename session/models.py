@@ -111,6 +111,11 @@ class Session:
 
     metadata: Dict[str, Any] = field(default_factory=dict)  # name, tags, notes, etc.
 
+    def __post_init__(self):
+        # Ensure context_length reflects token counts if not already set
+        if self.context_length == 0:
+            self.context_length = self.total_input_tokens + self.total_output_tokens
+
     def update_runtime_params(self, **kwargs) -> None:
         """Update mutable runtime parameters."""
         for key, value in kwargs.items():

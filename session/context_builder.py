@@ -6,7 +6,7 @@ allowing the agent to operate within token limits while preserving the full
 conversation for the user's view.
 """
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import tiktoken
 
 
@@ -108,10 +108,143 @@ class LastNBuilder(ContextBuilder):
 class SummaryBuilder(ContextBuilder):
     """
     Advanced strategy: keep recent messages + a summary of earlier conversation.
-    Not implemented in Phase 0, but placeholder for future.
+    
+    Looks for summary system messages in user_history and assembles context as:
+    - Main system prompt (first non-summary system message)
+    - Most recent summary message (if any)
+    - Most recent N turns after summary (where N = pruning_keep_recent_turns from summary metadata)
     """
 
+    def __init__(self, default_keep_turns: int = 5):
+        """Initialize with default number of turns to keep when no summary exists."""
+        self.default_keep_turns = default_keep_turns
+
     def build(self, user_history: List[Dict[str, Any]], max_tokens: Optional[int] = None) -> List[Dict[str, Any]]:
-        # For now, fall back to LastNBuilder
-        # In future: generate or retrieve a summary of earlier messages, prepend as system message
-        return LastNBuilder().build(user_history, max_tokens)
+        """
+        Build context from full history, respecting summaries.
+        
+        If no summary found, falls back to LastNBuilder with default_keep_turns.
+        """
+        if not user_history:
+            return []
+        
+        # Find main system prompt and latest summary
+        main_prompt, summary_idx, summary_msg = self._find_main_prompt_and_summary(user_history)
+        
+        # Determine how many turns to keep
+        keep_turns = self.default_keep_turns
+        if summary_msg is not None:
+            keep_turns = summary_msg.get('pruning_keep_recent_turns', self.default_keep_turns)
+        
+        # Get messages after summary (or all messages if no summary)
+        if summary_idx >= 0:
+            # Summary will be added separately, so take messages after summary
+            post_summary = user_history[summary_idx + 1:]  # excludes summary
+        else:
+            post_summary = user_history
+        
+        # Filter out system messages from post-summary (except we'll add main_prompt and summary)
+        non_system = [msg for msg in post_summary if msg.get('role') != 'system']
+        
+        # Group into turns
+        turns = self._group_messages_into_turns(non_system)
+        
+        # Keep only most recent keep_turns turns
+        if keep_turns < len(turns):
+            turns = turns[-keep_turns:]
+        
+        # Assemble context
+        context = []
+        if main_prompt:
+            context.append(main_prompt)
+        if summary_msg is not None:
+            context.append(summary_msg)
+        
+        # Flatten kept turns
+        for turn in turns:
+            context.extend(turn)
+        
+        # If max_tokens is provided, further truncate from oldest turns
+        if max_tokens is not None:
+            context = self._truncate_to_max_tokens(context, max_tokens, preserve_system=True)
+        
+        return context
+    
+    def _find_main_prompt_and_summary(self, user_history: List[Dict[str, Any]]) -> \
+            Tuple[Optional[Dict[str, Any]], int, Optional[Dict[str, Any]]]:
+        """
+        Find main system prompt and latest summary.
+        
+        Returns:
+            (main_prompt, summary_index, summary_message)
+            summary_index is -1 if no summary found
+        """
+        main_prompt = None
+        summary_idx = -1
+        summary_msg = None
+        
+        # First pass: find main prompt (first non-summary system message)
+        for msg in user_history:
+            if msg.get('role') == 'system':
+                content = msg.get('content', '')
+                if 'Summary of previous conversation:' not in content:
+                    main_prompt = msg
+                    break
+        
+        # Second pass: find latest summary (scan from end)
+        for i in range(len(user_history) - 1, -1, -1):
+            msg = user_history[i]
+            if msg.get('role') == 'system' and \
+               'Summary of previous conversation:' in msg.get('content', ''):
+                summary_idx = i
+                summary_msg = msg
+                break
+        
+        return main_prompt, summary_idx, summary_msg
+    
+    def _group_messages_into_turns(self, messages: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        """Group messages into conversation turns (user + assistant + tool responses)."""
+        turns = []
+        current_turn = []
+        
+        for msg in messages:
+            role = msg.get('role')
+            if role == 'user':
+                if current_turn:
+                    turns.append(current_turn)
+                    current_turn = []
+                current_turn.append(msg)
+            elif role == 'assistant':
+                current_turn.append(msg)
+            elif role == 'tool':
+                current_turn.append(msg)
+            # system messages already filtered out
+        
+        if current_turn:
+            turns.append(current_turn)
+            
+        return turns
+    
+    def _truncate_to_max_tokens(self, messages: List[Dict[str, Any]], max_tokens: int, 
+                               preserve_system: bool = True) -> List[Dict[str, Any]]:
+        """Truncate messages from the beginning (oldest) until under max_tokens."""
+        try:
+            encoder = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            encoder = None
+        
+        total = sum(self._estimate_tokens(msg, encoder) for msg in messages)
+        
+        # Start from index 0, but skip system messages if preserve_system=True
+        idx_to_remove = 0
+        while total > max_tokens and idx_to_remove < len(messages):
+            if preserve_system and messages[idx_to_remove].get('role') == 'system':
+                idx_to_remove += 1
+                continue
+                
+            # Remove this message
+            removed_msg = messages.pop(idx_to_remove)
+            total -= self._estimate_tokens(removed_msg, encoder)
+            # Note: idx_to_remove stays the same because list shifted
+        
+        return messages

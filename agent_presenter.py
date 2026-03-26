@@ -12,15 +12,15 @@ import uuid
 from datetime import datetime
 import traceback
 from typing import Optional, List, Dict, Any
-from enum import Enum, auto
-from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+
+from PyQt6.QtCore import QObject, pyqtSignal
 from agent_controller import AgentController
 from agent_core import AgentConfig
 from tools import SIMPLIFIED_TOOL_CLASSES
 from agent_state import ExecutionState
 from session.models import Session, SessionConfig, RuntimeParams
 from session.store import FileSystemSessionStore
-from session.context_builder import ContextBuilder, LastNBuilder
+from session.context_builder import LastNBuilder
 
 
 
@@ -284,16 +284,7 @@ class AgentPresenter(QObject):
 
         return agent_config
 
-    def _load_default_system_prompt(self) -> str:
-        """Load the default system prompt from agent_core.py default.
-        """
-        # Create a minimal AgentConfig with defaults to get the default system_prompt
-        try:
-            default_config = AgentConfig(api_key="dummy")
-            return default_config.system_prompt
-        except Exception as e:
-            print(f"[Presenter] Error loading default system prompt: {e}")
-            return "You are a helpful assistant."
+
 
     def _build_session_config(self, agent_config: AgentConfig) -> SessionConfig:
         """Build SessionConfig from an AgentConfig instance."""
@@ -316,25 +307,7 @@ class AgentPresenter(QObject):
         )
         return session_config
 
-    def _extract_user_history(self, conversation: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Extract user/assistant messages from conversation, excluding system.
-        """
-        user_history = []
-        for msg in conversation:
-            role = msg.get("role", "")
-            if role in ["user", "assistant", "tool"]:
-                # Copy only essential fields to keep session size manageable
-                user_msg = {
-                    "role": role,
-                    "content": msg.get("content", "")
-                }
-                # Preserve tool_calls and tool_call_id if present
-                if "tool_calls" in msg:
-                    user_msg["tool_calls"] = msg["tool_calls"]
-                if "tool_call_id" in msg:
-                    user_msg["tool_call_id"] = msg["tool_call_id"]
-                user_history.append(user_msg)
-        return user_history
+
     
     def _update_user_history(self, event_history: List[Dict[str, Any]]):
         """
@@ -422,9 +395,7 @@ class AgentPresenter(QObject):
             self.error_occurred.emit(f"Failed to start session: {str(e)}", "")
             print(f"[Presenter] Error starting session: {e}")
     
-    def can_restart(self) -> bool:
-        """Check if restart is possible (has cached configuration)."""
-        return self._cached_config is not None
+
 
     def _finalize_restart(self):
         """Common restart cleanup: reset controller and state.
@@ -492,7 +463,7 @@ class AgentPresenter(QObject):
             return
 
         # Otherwise, wait for terminal event; state = STOPPING
-        self.state = ExecutionState.STOPPING
+
 
     def new_session(self, name: str = None, auto_save_current: bool = True):
         """Start a brand new session.
@@ -554,9 +525,7 @@ class AgentPresenter(QObject):
         else:
             print(f"[Presenter] Cannot pause in state {self.state}")
     
-    def stop_session(self):
-        """Stop current session."""
-        self.controller.stop()
+
         self.state = ExecutionState.STOPPING
 
     # ----- Session Management -----
