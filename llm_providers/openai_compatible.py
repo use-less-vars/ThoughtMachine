@@ -387,7 +387,7 @@ class OpenAICompatibleProvider(LLMProvider):
         try:
             # DeepSeek requires message IDs - add them if missing
             if "deepseek" in self.config.model.lower() or (self.config.base_url and "deepseek" in self.config.base_url.lower()):
-                print(f"[DEEPSEEK_DEBUG] Processing {len(messages)} messages for DeepSeek", file=sys.stderr)
+                #print(f"[DEEPSEEK_DEBUG] Processing {len(messages)} messages for DeepSeek", file=sys.stderr)
                 # DeepSeek requires message IDs - add them if missing
                 messages_with_ids = []
                 for i, msg in enumerate(messages):
@@ -400,30 +400,31 @@ class OpenAICompatibleProvider(LLMProvider):
                         # Keep tool_call_id, also ensure id field exists
                         pass
                     messages_with_ids.append(msg_copy)
-                    print(f"[DEEPSEEK_DEBUG] Message {i}: role={msg_copy.get('role')}, id={msg_copy.get('id')}, has_tool_call_id={'tool_call_id' in msg_copy}", file=sys.stderr)
+                    #print(f"[DEEPSEEK_DEBUG] Message {i}: role={msg_copy.get('role')}, id={msg_copy.get('id')}, has_tool_call_id={'tool_call_id' in msg_copy}", file=sys.stderr)
                 messages = messages_with_ids
                 # Normalize tool calls for DeepSeek
                 messages = self._normalize_deepseek_tool_calls(messages)
-                print(f"[DEEPSEEK_TOOL_NORM] Normalized tool calls in {len(messages)} messages", file=sys.stderr)
-                print(f"[DEBUG_DEEPSEEK] Added IDs to {len(messages)} messages", file=sys.stderr)
+                #print(f"[DEEPSEEK_TOOL_NORM] Normalized tool calls in {len(messages)} messages", file=sys.stderr)
+                #print(f"[DEBUG_DEEPSEEK] Added IDs to {len(messages)} messages", file=sys.stderr)
                 logger.debug(f"DeepSeek: Added IDs to {len(messages)} messages")
-                print(f"[DEBUG_DEEPSEEK] Added IDs to {len(messages)} messages", file=sys.stderr)
+                #print(f"[DEBUG_DEEPSEEK] Added IDs to {len(messages)} messages", file=sys.stderr)
                 # Debug: print all messages with IDs
                 for i, msg in enumerate(messages):
-                    print(f"[DEBUG_DEEPSEEK_AFTER] Message {i}: role={msg.get('role')}, id={msg.get('id')}", file=sys.stderr)
-            
+                    #print(f"[DEBUG_DEEPSEEK_AFTER] Message {i}: role={msg.get('role')}, id={msg.get('id')}", file=sys.stderr)
+                    pass
+                    
             # StepFun requires proper tool call structure
-            print(f"[STEPFUN_CHECK_DEBUG] Checking if model contains 'stepfun': model='{self.config.model.lower()}', base_url='{self.config.base_url}'", file=sys.stderr)
+            #print(f"[STEPFUN_CHECK_DEBUG] Checking if model contains 'stepfun': model='{self.config.model.lower()}', base_url='{self.config.base_url}'", file=sys.stderr)
             # Check for StepFun via OpenRouter or directly
             is_stepfun = "stepfun" in self.config.model.lower()
             is_openrouter = self.config.base_url and "openrouter" in self.config.base_url.lower()
-            print(f"[STEPFUN_CHECK_DEBUG] is_stepfun={is_stepfun}, is_openrouter={is_openrouter}", file=sys.stderr)
+            #print(f"[STEPFUN_CHECK_DEBUG] is_stepfun={is_stepfun}, is_openrouter={is_openrouter}", file=sys.stderr)
             
             # If using OpenRouter with StepFun model, we need special handling
             # OpenRouter expects standard OpenAI format (type='function' with 'function' field)
             # but StepFun returns 'custom' format. We need to convert between them.
             if is_stepfun or (is_openrouter and is_stepfun):
-                print(f"[STEPFUN_DEBUG] Processing {len(messages)} messages for StepFun (OpenRouter: {is_openrouter})", file=sys.stderr)
+                #print(f"[STEPFUN_DEBUG] Processing {len(messages)} messages for StepFun (OpenRouter: {is_openrouter})", file=sys.stderr)
                 messages = self._normalize_stepfun_tool_calls(messages, is_openrouter=is_openrouter)
             
             # Prepare completion kwargs
@@ -447,24 +448,27 @@ class OpenAICompatibleProvider(LLMProvider):
             
             # Make API call
             logger.debug(f"OpenAI API call: model={completion_kwargs.get('model')}, temperature={completion_kwargs.get('temperature')}, max_tokens={completion_kwargs.get('max_tokens')}, tools_count={len(tools) if tools else 0}, base_url={self.client.base_url if hasattr(self.client, 'base_url') else 'default'}, api_key={self.config.api_key}")
-            print(f"[DEBUG_OPENAI] API call: model={completion_kwargs.get('model')}, temperature={completion_kwargs.get('temperature')}, max_tokens={completion_kwargs.get('max_tokens')}, tools_count={len(tools) if tools else 0}, base_url={self.client.base_url if hasattr(self.client, 'base_url') else 'default'}, api_key={self.config.api_key}", file=sys.stderr)
+            #print(f"[DEBUG_OPENAI] API call: model={completion_kwargs.get('model')}, temperature={completion_kwargs.get('temperature')}, max_tokens={completion_kwargs.get('max_tokens')}, tools_count={len(tools) if tools else 0}, base_url={self.client.base_url if hasattr(self.client, 'base_url') else 'default'}, api_key={self.config.api_key}", file=sys.stderr)
             # Debug: print final messages being sent (DeepSeek only)
             if "deepseek" in self.config.model.lower() or (self.config.base_url and "deepseek" in self.config.base_url.lower()):
-                print(f"[DEEPSEEK_DEBUG_FINAL] Sending {len(completion_kwargs.get('messages', []))} messages to API", file=sys.stderr)
+                #print(f"[DEEPSEEK_DEBUG_FINAL] Sending {len(completion_kwargs.get('messages', []))} messages to API", file=sys.stderr)
                 for i, msg in enumerate(completion_kwargs.get('messages', [])):
-                    print(f"[DEEPSEEK_DEBUG_FINAL] Message {i}: {msg}", file=sys.stderr)
+                    #print(f"[DEEPSEEK_DEBUG_FINAL] Message {i}: {msg}", file=sys.stderr)
+                    pass
             # Debug: print final messages being sent (StepFun only)
-            print(f"[API_CALL_DEBUG] Model: {self.config.model}, Base URL: {self.config.base_url}", file=sys.stderr)
+            #print(f"[API_CALL_DEBUG] Model: {self.config.model}, Base URL: {self.config.base_url}", file=sys.stderr)
             if "stepfun" in self.config.model.lower():
-                print(f"[STEPFUN_DEBUG_FINAL] Sending {len(completion_kwargs.get('messages', []))} messages to API", file=sys.stderr)
+                #print(f"[STEPFUN_DEBUG_FINAL] Sending {len(completion_kwargs.get('messages', []))} messages to API", file=sys.stderr)
                 for i, msg in enumerate(completion_kwargs.get('messages', [])):
-                    print(f"[STEPFUN_DEBUG_FINAL] Message {i}: {msg}", file=sys.stderr)
+                    #print(f"[STEPFUN_DEBUG_FINAL] Message {i}: {msg}", file=sys.stderr)
+                    pass
             else:
                 # Still log messages for debugging
-                print(f"[API_CALL_DEBUG] Sending {len(completion_kwargs.get('messages', []))} messages", file=sys.stderr)
+                #print(f"[API_CALL_DEBUG] Sending {len(completion_kwargs.get('messages', []))} messages", file=sys.stderr)
                 for i, msg in enumerate(completion_kwargs.get('messages', [])):
                     if msg.get("role") == "assistant" and "tool_calls" in msg:
-                        print(f"[API_CALL_DEBUG] Message {i} has tool_calls: {msg['tool_calls']}", file=sys.stderr)
+                        #print(f"[API_CALL_DEBUG] Message {i} has tool_calls: {msg['tool_calls']}", file=sys.stderr)
+                        pass
             
             response = self.client.chat.completions.create(**completion_kwargs)
             
@@ -474,8 +478,8 @@ class OpenAICompatibleProvider(LLMProvider):
                 raw_str = str(response)
                 if len(raw_str) > 1000:
                     raw_str = raw_str[:1000] + f"... (truncated, total {len(raw_str)} chars)"
-                print(f"[DEBUG_OPENAI_RAW] Raw API response type: {type(response)}", file=sys.stderr)
-                print(f"[DEBUG_OPENAI_RAW] Raw API response: {raw_str}", file=sys.stderr)
+                #print(f"[DEBUG_OPENAI_RAW] Raw API response type: {type(response)}", file=sys.stderr)
+                #print(f"[DEBUG_OPENAI_RAW] Raw API response: {raw_str}", file=sys.stderr)
             
             # Debug: Print raw response details before parsing
             import os
@@ -622,7 +626,8 @@ class OpenAICompatibleProvider(LLMProvider):
         # Check if raw_response is a string (error response from API)
         if isinstance(raw_response, str):
             if os.environ.get('DEBUG_OPENAI'):
-                print(f"[DEBUG_PARSE_RESPONSE] ERROR: API returned string instead of JSON: {raw_response}", file=sys.stderr)
+                #print(f"[DEBUG_PARSE_RESPONSE] ERROR: API returned string instead of JSON: {raw_response}", file=sys.stderr)
+                pass
             raise ValueError(f"API returned string instead of JSON response: {raw_response[:200]}")
         
         # Check if raw_response has the expected structure
@@ -646,28 +651,30 @@ class OpenAICompatibleProvider(LLMProvider):
         tool_calls = None
         if hasattr(message, 'tool_calls') and message.tool_calls:
             tool_calls = []
-            print(f"[PARSE_RESPONSE_DEBUG] Processing {len(message.tool_calls)} tool calls from response", file=sys.stderr)
+            #print(f"[PARSE_RESPONSE_DEBUG] Processing {len(message.tool_calls)} tool calls from response", file=sys.stderr)
             for idx, tc in enumerate(message.tool_calls):
                 # DEBUG: Log raw tool call structure
-                print(f"[PARSE_RESPONSE_DEBUG] Tool call {idx} raw: type={type(tc)}", file=sys.stderr)
+                #print(f"[PARSE_RESPONSE_DEBUG] Tool call {idx} raw: type={type(tc)}", file=sys.stderr)
                 if hasattr(tc, '__dict__'):
-                    print(f"[PARSE_RESPONSE_DEBUG] Tool call {idx} attributes: {list(tc.__dict__.keys())}", file=sys.stderr)
+                    #print(f"[PARSE_RESPONSE_DEBUG] Tool call {idx} attributes: {list(tc.__dict__.keys())}", file=sys.stderr)
+                    pass
                 elif isinstance(tc, dict):
-                    print(f"[PARSE_RESPONSE_DEBUG] Tool call {idx} dict keys: {list(tc.keys())}", file=sys.stderr)
+                    #print(f"[PARSE_RESPONSE_DEBUG] Tool call {idx} dict keys: {list(tc.keys())}", file=sys.stderr)
+                    pass
                 
                 # Handle both dictionary and object tool calls
                 if hasattr(tc, 'function'):
                     # Object format (OpenAI SDK)
-                    print(f"[PARSE_RESPONSE_DEBUG] Tool call {idx} has 'function' attribute", file=sys.stderr)
+                    #print(f"[PARSE_RESPONSE_DEBUG] Tool call {idx} has 'function' attribute", file=sys.stderr)
                     name = tc.function.name
                     arguments = tc.function.arguments
                     tc_id = tc.id
                 else:
                     # Dictionary format
-                    print(f"[PARSE_RESPONSE_DEBUG] Tool call {idx} checking dict format", file=sys.stderr)
+                    #print(f"[PARSE_RESPONSE_DEBUG] Tool call {idx} checking dict format", file=sys.stderr)
                     # Check for different tool call formats
                     if 'custom' in tc:
-                        print(f"[PARSE_RESPONSE_DEBUG] Tool call {idx} has 'custom' field: {tc.get('custom')}", file=sys.stderr)
+                        #print(f"[PARSE_RESPONSE_DEBUG] Tool call {idx} has 'custom' field: {tc.get('custom')}", file=sys.stderr)
                         custom_data = tc.get('custom', {})
                         name = custom_data.get('name')
                         arguments = custom_data.get('arguments')
@@ -684,7 +691,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 elif isinstance(tc, dict) and 'type' in tc:
                     tc_type = tc.get('type')
                 
-                print(f"[PARSE_RESPONSE_DEBUG] Tool call {idx} parsed: id={tc_id}, name={name}, original_type={tc_type}", file=sys.stderr)
+                #print(f"[PARSE_RESPONSE_DEBUG] Tool call {idx} parsed: id={tc_id}, name={name}, original_type={tc_type}", file=sys.stderr)
                 
                 # Check if we're using OpenRouter with StepFun
                 # If so, convert to standard OpenAI format (type='function' with 'function' field)
@@ -694,7 +701,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 # Build tool call - convert to function format for OpenRouter
                 # StepFun via OpenRouter expects standard OpenAI format
                 if is_openrouter and is_stepfun and tc_type == "custom":
-                    print(f"[PARSE_RESPONSE_DEBUG] Converting StepFun custom format to OpenAI function format for OpenRouter", file=sys.stderr)
+                    #print(f"[PARSE_RESPONSE_DEBUG] Converting StepFun custom format to OpenAI function format for OpenRouter", file=sys.stderr)
                     tool_calls.append({
                         "id": tc_id,
                         "type": "function",
@@ -707,7 +714,7 @@ class OpenAICompatibleProvider(LLMProvider):
                     # Preserve original format
                     # Ensure tc_type is valid ('function' or 'custom')
                     if tc_type not in ['function', 'custom']:
-                        print(f"[PARSE_RESPONSE_DEBUG] Warning: unknown tool call type '{tc_type}', defaulting to 'function'", file=sys.stderr)
+                        #print(f"[PARSE_RESPONSE_DEBUG] Warning: unknown tool call type '{tc_type}', defaulting to 'function'", file=sys.stderr)
                         tc_type = 'function'
                     
                     tool_calls.append({
@@ -718,7 +725,7 @@ class OpenAICompatibleProvider(LLMProvider):
                             "arguments": arguments
                         }
                     })        
-        print(f"[PARSE_RESPONSE_DEBUG] Final tool_calls: {tool_calls}", file=sys.stderr)
+        #print(f"[PARSE_RESPONSE_DEBUG] Final tool_calls: {tool_calls}", file=sys.stderr)
         
         # Extract usage
         usage = {}

@@ -29,26 +29,18 @@ class ContextBuilder(ABC):
 
     def _estimate_tokens(self, message: Dict[str, Any], encoder: Optional[tiktoken.Encoding] = None) -> int:
         """Estimate token count for a message."""
+        import json
         if encoder is None:
             try:
                 encoder = tiktoken.get_encoding("cl100k_base")  # OpenAI default
             except Exception:
                 # Fallback: rough estimate
-                return len(str(message)) // 4
+                return len(json.dumps(message)) // 4
 
-        content = message.get("content", "")
-        if isinstance(content, str):
-            return len(encoder.encode(content))
-        else:
-            # For multimodal content, sum tokens
-            total = 0
-            for part in content:
-                if isinstance(part, str):
-                    total += len(encoder.encode(part))
-                elif isinstance(part, dict):
-                    # Estimate for images etc. - crude fallback
-                    total += 100
-            return total
+        # Tokenize the entire message as JSON to include all fields (role, content, tool_calls, etc.)
+        # This matches how the OpenAI API counts tokens for the message object
+        message_json = json.dumps(message)
+        return len(encoder.encode(message_json))
 
 
 class LastNBuilder(ContextBuilder):

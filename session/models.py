@@ -104,6 +104,7 @@ class Session:
     version: int = 1  # Session format version
     final_content: Optional[str] = None  # Content of the Final tool's result, if any
     final_reasoning: Optional[str] = None  # Reasoning that preceded the final answer
+    summary: Optional[Dict[str, Any]] = field(default=None, compare=False, repr=False)  # Summary system message (from pruning)
 
     # Runtime reference to the active Agent instance (not persisted)
     agent_instance: Optional[Any] = field(default=None, compare=False, repr=False)
@@ -137,6 +138,7 @@ class Session:
             'version': self.version,
             'final_content': self.final_content,
             'final_reasoning': self.final_reasoning,
+            'summary': self.summary,
             'total_input_tokens': self.total_input_tokens,
             'total_output_tokens': self.total_output_tokens,
             'context_length': self.context_length,
@@ -179,6 +181,7 @@ class Session:
             version=version,
             final_content=final_content,
             final_reasoning=final_reasoning,
+            summary=data.get('summary'),
             total_input_tokens=data.get('total_input_tokens', 0),
             total_output_tokens=data.get('total_output_tokens', 0),
             context_length=data.get('context_length', 0),

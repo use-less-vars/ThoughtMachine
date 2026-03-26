@@ -68,7 +68,7 @@ class AgentPresenter(QObject):
         # Session management
         self.session_store = FileSystemSessionStore()
         self._dirty = False  # Tracks unsaved changes since last save
-        self._name_explicitly_set = False  # Tracks whether the session has been explicitly named by the user
+
         self._external_file_path = None  # Path to external file if session was saved via Save As
         print(f"[Presenter] Session store directory: {self.session_store.sessions_dir}")
         self.context_builder = LastNBuilder(keep_last_messages=100000, keep_system_prompt=True)  # Keep effectively unlimited messages to preserve full session history during loading
@@ -168,7 +168,7 @@ class AgentPresenter(QObject):
         self.context_length = session.context_length
         # Mark as clean (no unsaved changes)
         self._dirty = False
-        self._name_explicitly_set = bool(session.metadata.get('name'))
+
         # Restore external file path from metadata if present
         external_file_path = session.metadata.get('external_file_path')
         if external_file_path:
@@ -322,7 +322,7 @@ class AgentPresenter(QObject):
         user_history = []
         for msg in conversation:
             role = msg.get("role", "")
-            if role in ["user", "assistant"]:
+            if role in ["user", "assistant", "tool"]:
                 # Copy only essential fields to keep session size manageable
                 user_msg = {
                     "role": role,
@@ -602,7 +602,7 @@ class AgentPresenter(QObject):
             self.session_store.set_current_session_id(self.current_session_id)
             # Mark as clean after successful save
             self._dirty = False
-            self._name_explicitly_set = True
+
 
             print(f"[Presenter] Session saved to store: {self.session_store.get_session_path(session.session_id)}")
             # Also export to external file if set
@@ -682,9 +682,7 @@ class AgentPresenter(QObject):
             print("[Presenter] No unsaved changes, skipping auto-save")
             return True
         
-        # Only auto-save if the session has an explicit name set by the user
-        if not self._name_explicitly_set:
-            return False
+
         
         try:
             success = self.save_session()
@@ -734,11 +732,11 @@ class AgentPresenter(QObject):
 
             self._bind_session(session)
             self._update_external_file_path(filepath)
-            self._name_explicitly_set = True
+
             # If session name was not set by binding (i.e., metadata lacks name), use fallback
             if not self.session_name:
                 self.session_name = os.path.basename(filepath)
-                self._name_explicitly_set = True
+    
             print(f"[Presenter] Session loaded from {filepath}: {len(session.user_history)} messages")
             return True
         except Exception as e:
@@ -879,7 +877,7 @@ class AgentPresenter(QObject):
                 self.current_session.updated_at = datetime.now()
                 self.session_store.save_session(self.current_session)
                 self.session_name = new_name
-                self._name_explicitly_set = True
+
                 return True
             else:
                 # Session not currently loaded, load from store

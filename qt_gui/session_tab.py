@@ -1148,7 +1148,7 @@ class SessionTab(QWidget):
         success = self.presenter.rename_session(session_id, new_name)
         if success:
             self.presenter.session_name = new_name
-            self.presenter._name_explicitly_set = True
+
             debug_log(f"save_session_as: calling update_window_title and _update_tab_label after rename success")
             self.update_window_title()
             self._update_tab_label()
@@ -1156,7 +1156,7 @@ class SessionTab(QWidget):
         else:
             # Metadata rename failed but file was saved, still inform user
             self.presenter.session_name = new_name
-            self.presenter._name_explicitly_set = True
+
             debug_log(f"save_session_as: calling update_window_title and _update_tab_label after rename failed")
             self.update_window_title()
             self._update_tab_label()
@@ -1519,8 +1519,24 @@ class SessionTab(QWidget):
             tool_call_id: optional tool call ID (for user tool response)
             reasoning: optional reasoning text (for assistant)
         """
-        # Skip tool messages for now (they should be merged into assistant's turn)
+        # Handle tool messages (tool results)
         if role == 'tool':
+            # Create tool result event
+            event = {
+                'type': 'tool_result',
+                'content': content,
+                'tool_call_id': tool_call_id,
+                'timestamp': datetime.datetime.now().isoformat(),
+            }
+            # Add to event model
+            self.event_model.add_event(event)
+            # Also add to output_textedit
+            html = self._format_event_html(event)
+            cursor = self.output_textedit.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            if not self.output_textedit.document().isEmpty():
+                cursor.insertHtml("<hr>")
+            cursor.insertHtml(html)
             return
         
         # Create event dictionary with appropriate type and fields based on role

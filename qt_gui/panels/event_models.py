@@ -232,6 +232,10 @@ class EventDelegate(QStyledItemDelegate):
         elif etype == "user_query":
             add_line(f"User query: {event.get('content', '')}", style="font-weight: bold; color: #8B008B;", use_markdown=True)
 
+        elif etype == "tool_result":
+            tool_call_id = event.get('tool_call_id', 'unknown')
+            add_line(f"Tool result (call id: {tool_call_id}): {event.get('content', '')}", style="color: #006400;", use_markdown=True)
+
         elif etype == "system":
             add_line(f"System: {event.get('content', '')}", style="color: #808080; font-style: italic;", use_markdown=True)
             # Show full summary if present (from SummarizeTool)
