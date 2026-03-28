@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 # prune_conversation_history imported inside process_query method
 from agent_state import AgentState, ExecutionState, SessionState
 import logging
+import os
 logger = logging.getLogger(__name__)
 
 class Agent:
@@ -207,6 +208,102 @@ class Agent:
 
         # Calculate initial token count for the conversation
         self._update_conversation_token_estimate()        
+    
+    def _debug_context(self, stage: str, messages: List[Dict[str, Any]] = None, 
+                      context_builder = None, usage = None):
+        """Debug helper for context monitoring.
+        
+        Shows:
+        1. Full history (session.user_history if available) with metadata
+        2. Runtime context being built (what gets sent to LLM)
+        3. Token estimates vs actual usage from LLM response
+        4. Relationship between full history and runtime context
+        """
+        if not os.environ.get('DEBUG_CONTEXT'):
+            return
+            
+        logger.debug(f"\n=== DEBUG_CONTEXT: {stage} ===")
+        
+        # Show full history if session exists
+        if self.session is not None:
+            full_history = self.session.user_history
+            logger.debug(f"Full session history: {len(full_history)} messages")
+            for i, msg in enumerate(full_history):
+                role = msg.get('role', 'NO_ROLE')
+                content_preview = str(msg.get('content', ''))[:60].replace('\n', ' ')
+                metadata = {k: v for k, v in msg.items() if k not in ['role', 'content', 'tool_calls', 'tool_call_id', 'name', 'reasoning_content']}
+                meta_str = f" {metadata}" if metadata else ""
+                if role == 'tool':
+                    tool_call_id = msg.get('tool_call_id', 'NO_ID')
+                    logger.debug(f"  [{i}] {role}: tool_call_id={tool_call_id}, content={content_preview}...{meta_str}")
+                elif role == 'assistant':
+                    tool_calls = msg.get('tool_calls')
+                    if tool_calls:
+                        logger.debug(f"  [{i}] {role}: HAS TOOL_CALLS {len(tool_calls)}, content={content_preview}...{meta_str}")
+                    else:
+                        logger.debug(f"  [{i}] {role}: {content_preview}...{meta_str}")
+                else:
+                    logger.debug(f"  [{i}] {role}: {content_preview}...{meta_str}")
+        
+        # Show current conversation (what agent sees)
+        logger.debug(f"\nAgent conversation: {len(self.conversation)} messages")
+        for i, msg in enumerate(self.conversation):
+            role = msg.get('role', 'NO_ROLE')
+            content_preview = str(msg.get('content', ''))[:60].replace('\n', ' ')
+            if role == 'tool':
+                tool_call_id = msg.get('tool_call_id', 'NO_ID')
+                logger.debug(f"  [{i}] {role}: tool_call_id={tool_call_id}, content={content_preview}...")
+            elif role == 'assistant':
+                tool_calls = msg.get('tool_calls')
+                if tool_calls:
+                    logger.debug(f"  [{i}] {role}: HAS TOOL_CALLS {len(tool_calls)}, content={content_preview}...")
+                else:
+                    logger.debug(f"  [{i}] {role}: {content_preview}...")
+            else:
+                logger.debug(f"  [{i}] {role}: {content_preview}...")
+        
+        # Show runtime context if provided
+        if messages is not None:
+            logger.debug(f"\nRuntime context (sent to LLM): {len(messages)} messages")
+            estimated_tokens = 0
+            for i, msg in enumerate(messages):
+                role = msg.get('role', 'NO_ROLE')
+                content_preview = str(msg.get('content', ''))[:60].replace('\n', ' ')
+                estimated_tokens += self._estimate_tokens(msg)
+                if role == 'tool':
+                    tool_call_id = msg.get('tool_call_id', 'NO_ID')
+                    logger.debug(f"  [{i}] {role}: tool_call_id={tool_call_id}, content={content_preview}...")
+                elif role == 'assistant':
+                    tool_calls = msg.get('tool_calls')
+                    if tool_calls:
+                        logger.debug(f"  [{i}] {role}: HAS TOOL_CALLS {len(tool_calls)}, content={content_preview}...")
+                    else:
+                        logger.debug(f"  [{i}] {role}: {content_preview}...")
+                else:
+                    logger.debug(f"  [{i}] {role}: {content_preview}...")
+            logger.debug(f"Estimated tokens for runtime context: ~{estimated_tokens}")
+        
+        # Show token usage comparison if available
+        if usage is not None:
+            logger.debug(f"\nToken usage from LLM:")
+            logger.debug(f"  Input tokens: {usage.get('prompt_tokens', 'N/A')}")
+            logger.debug(f"  Output tokens: {usage.get('completion_tokens', 'N/A')}")
+            logger.debug(f"  Total tokens: {usage.get('total_tokens', 'N/A')}")
+            if messages is not None:
+                estimated = sum(self._estimate_tokens(msg) for msg in messages)
+                actual = usage.get('prompt_tokens')
+                if actual is not None:
+                    diff = actual - estimated
+                    logger.debug(f"  Estimated vs Actual input tokens: {estimated} vs {actual} (diff: {diff:+d})")
+        
+        # Show context builder info
+        if context_builder is not None:
+            logger.debug(f"\nContext builder type: {type(context_builder).__name__}")
+            if hasattr(context_builder, 'token_limit'):
+                logger.debug(f"Context builder token_limit: {context_builder.token_limit}")
+        
+        logger.debug(f"=== END DEBUG_CONTEXT ===\n")
+    
     def reset_rate_limiting(self):
         """Reset rate limiting state when user restarts the agent."""
         self.rate_limit_delay = 1.0
@@ -363,7 +460,7 @@ class Agent:
             else:
                 logging.warning("Creating HistoryProvider without session")
             return None
-        token_limit = self.config.max_tokens
+        token_limit = self._get_max_context_tokens()
         if self.logger and hasattr(self.logger, 'py_logger'):
             self.logger.py_logger.info(f"[CONTEXT_BUILDER] Creating HistoryProvider with token_limit={token_limit}")
         return HistoryProvider(session=self.session, token_limit=token_limit)
@@ -1000,7 +1097,15 @@ class Agent:
                 else:
                     logger.debug(f"  [{i}] {role}: {content_preview}...")
             logger.debug("=== END DEBUG ===\n")
+            
+            # Debug context monitoring
+            self._debug_context("before_build", context_builder=self.context_builder)
+            
             messages = self.context_builder.build(self.conversation, max_tokens=max_context_tokens)
+            
+            # Debug context monitoring: show runtime context
+            self._debug_context("after_build", messages=messages, context_builder=self.context_builder)
+            
             if self.logger and hasattr(self.logger, 'py_logger'):
                 # Estimate token count for messages
                 import tiktoken
@@ -1271,6 +1376,10 @@ class Agent:
             
             # Token usage
             usage = response.usage
+            
+            # Debug context monitoring: show actual token usage from LLM
+            self._debug_context("after_llm_response", messages=messages, usage=usage, context_builder=self.context_builder)
+            
             if usage:
                 input_tokens = usage.get("prompt_tokens", 0) or 0
                 output_tokens = usage.get("completion_tokens", 0) or 0

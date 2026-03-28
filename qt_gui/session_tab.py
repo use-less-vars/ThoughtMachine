@@ -75,6 +75,12 @@ class SessionTab(QWidget):
         self._auto_save_timer.setInterval(120000)  # 2 minutes
         self._auto_save_timer.timeout.connect(self._auto_save_session)
         self._auto_save_timer.start()
+        
+        # Conversation changed debounce timer (prevents excessive rebuilds)
+        self._conversation_debounce_timer = QTimer(self)
+        self._conversation_debounce_timer.setSingleShot(True)
+        self._conversation_debounce_timer.setInterval(100)  # 100ms debounce
+        self._conversation_debounce_timer.timeout.connect(self._on_conversation_debounced)
 
         # Initialize output and query panels
         self.output_panel = OutputPanel(self)
@@ -363,7 +369,15 @@ class SessionTab(QWidget):
     @pyqtSlot(dict)
     def display_event(self, event):
         """Display an event from presenter (similar to original display_event)."""
+        import os
+        debug_enabled = os.environ.get('THOUGHTMACHINE_DEBUG') == '1'
         etype = event["type"]
+        if debug_enabled:
+            print(f"[SessionTab] display_event: type={etype}, content preview={str(event.get('content', ''))[:50]}...")
+            print(f"[SessionTab] Event model has {self.event_model.rowCount()} events total")
+        if etype == "token_update":
+            # Token updates are handled by tokens_updated signal, skip display
+            return
         detail_level = self.agent_controls_panel.detail_combo.currentText()
 
         # Store conversation history if present
@@ -375,17 +389,8 @@ class SessionTab(QWidget):
         event_with_detail = event.copy()
         event_with_detail["_detail_level"] = detail_level
 
-        # Add event to model for virtual scrolling
-        self.event_model.add_event(event_with_detail)
-
-        # If event passes current filter, add to output text area
-        if self._event_passes_filter(event_with_detail):
-            html = self._format_event_html(event_with_detail)
-            cursor = self.output_textedit.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            if not self.output_textedit.document().isEmpty():
-                cursor.insertHtml("<hr>")
-            cursor.insertHtml(html)
+        # Delegate to output panel for display
+        self.output_panel.display_event(event_with_detail)
 
         # Handle any UI interactions
         if etype == "user_interaction_requested":
@@ -423,8 +428,7 @@ class SessionTab(QWidget):
             self.total_output = output_tokens
             self.status_panel.update_tokens(self.total_input, self.total_output)
 
-        # Auto-scroll to bottom
-        self.output_panel._scroll_to_bottom()
+
     @pyqtSlot(int, int)
     def on_tokens_updated(self, total_input, total_output):
         """Handle token count updates."""
@@ -449,24 +453,7 @@ class SessionTab(QWidget):
         delegate = EventDelegate()
         return delegate._event_to_html(event)
 
-    def _event_passes_filter(self, event):
-        """Check if event passes current filter criteria."""
-        filter_type = self.filter_proxy_model.filter_type
-        if filter_type != "all":
-            if event.get("type") != filter_type:
-                return False
-        filter_text = self.filter_proxy_model.filter_text
-        if filter_text:
-            content = event.get("content", "").lower()
-            reasoning = event.get("reasoning", "").lower()
-            tool_calls = event.get("tool_calls", [])
-            tool_text = " ".join([tc.get("name", "") + " " + str(tc.get("arguments", "")) for tc in tool_calls]).lower()
-            if (filter_text not in content and
-                filter_text not in reasoning and
-                filter_text not in tool_text and
-                filter_text not in event.get("type", "").lower()):
-                return False
-        return True
+
 
     @pyqtSlot(str, str)
     def on_error_occurred(self, error_message, traceback):
@@ -485,6 +472,16 @@ class SessionTab(QWidget):
     @pyqtSlot()
     def on_conversation_changed(self):
         """Handle conversation changes from presenter."""
+        # Debounce to prevent excessive rebuilds
+        self._conversation_debounce_timer.start()
+    
+    def _on_conversation_debounced(self):
+        """Debounced handler for conversation changes."""
+        # Only rebuild if agent is IDLE
+        # When agent is running/paused, we get events via display_event()
+        if self.presenter.state != ExecutionState.IDLE:
+            return
+        
         # Refresh conversation display
         self.display_loaded_conversation()
     # ----- Agent Control Methods -----
@@ -579,8 +576,7 @@ class SessionTab(QWidget):
         # In presenter, this will stop agent if running and clear session data
         self.presenter.new_session(name=name if name else None, auto_save_current=False)
         # Clear UI components
-        self.event_model.clear()
-        self.output_textedit.clear()
+        self.output_panel.clear_output()
         # Reset token counters
         self.total_input = 0
         self.total_output = 0
@@ -648,19 +644,8 @@ class SessionTab(QWidget):
             "content": query,
             "_detail_level": self.agent_controls_panel.detail_combo.currentText()
         }
-        # Add event to model for virtual scrolling
-        self.event_model.add_event(event)
-        
-        # If event passes current filter, add to output text area
-        if self._event_passes_filter(event):
-            html = self._format_event_html(event)
-            cursor = self.output_textedit.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            if not self.output_textedit.document().isEmpty():
-                cursor.insertHtml("<hr>")
-            cursor.insertHtml(html)
-        
-        self.output_panel._scroll_to_bottom()
+        # Delegate to output panel for display
+        self.output_panel.display_event(event)
     
     def _create_result_widget(self, result_text, full_text):
         """
@@ -1308,8 +1293,7 @@ class SessionTab(QWidget):
     def display_loaded_conversation(self):
         """Display the currently loaded conversation (full user history)."""
         # Clear current display
-        self.event_model.clear()
-        self.output_textedit.clear()
+        self.output_panel.clear_output()
 
         # Use the presenter's user_history to show the full conversation
         # Update status panel with current token totals and context length from presenter
@@ -1324,19 +1308,21 @@ class SessionTab(QWidget):
         if not conversation:
             return
 
-        # Rebuild the event model from the conversation
+        # Collect events from conversation
+        events = []
         for msg in conversation:
             # Map reasoning_content to reasoning for display
             reasoning = msg.get('reasoning_content')
-            self._append_chat_message(
+            event = self._create_chat_event(
                 msg['role'],
                 msg['content'],
                 msg.get('tool_calls'),
                 msg.get('tool_call_id'),
                 reasoning=reasoning
             )
+            events.append(event)
 
-        # If the session has a final_content (from Final tool), display it as a final event
+        # If the session has a final_content (from Final tool), add it as a final event
         session = self.presenter.current_session
         if session and getattr(session, 'final_content', None):
             final_event = {
@@ -1345,15 +1331,12 @@ class SessionTab(QWidget):
                 'reasoning': getattr(session, 'final_reasoning', '') or '',
                 '_detail_level': self.presenter._config.get('detail', 'normal')
             }
-            # Add to event model
-            self.event_model.add_event(final_event)
-            # Render and display
-            html = self._format_event_html(final_event)
-            cursor = self.output_textedit.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            if not self.output_textedit.document().isEmpty():
-                cursor.insertHtml("<hr>")
-            cursor.insertHtml(html)
+            events.append(final_event)
+        
+        # Delegate batch display to output panel
+        if events:
+            self.output_panel.display_loaded_conversation(events)
+
 
     def _load_session_file(self, file_path: str) -> bool:
         """Load a session from a file and update the UI.
@@ -1522,8 +1505,8 @@ class SessionTab(QWidget):
             # print(f"[SessionTab] Auto-save error: {e}")
             pass
 
-    def _append_chat_message(self, role: str, content: str, tool_calls=None, tool_call_id=None, reasoning=None):
-        """Append a chat message to the event model and output display.
+    def _create_chat_event(self, role: str, content: str, tool_calls=None, tool_call_id=None, reasoning=None):
+        """Create a chat event dictionary for the given role and content.
         
         Args:
             role: 'user', 'assistant', or 'tool'
@@ -1531,26 +1514,24 @@ class SessionTab(QWidget):
             tool_calls: optional list of tool calls (for assistant)
             tool_call_id: optional tool call ID (for user tool response)
             reasoning: optional reasoning text (for assistant)
+        
+        Returns:
+            Dictionary representing the event
         """
+        # Get detail level from presenter config
+        detail_level = 'normal'
+        if hasattr(self, 'presenter') and self.presenter and hasattr(self.presenter, '_config'):
+            detail_level = self.presenter._config.get('detail', 'normal')
+        
         # Handle tool messages (tool results)
         if role == 'tool':
-            # Create tool result event
-            event = {
+            return {
                 'type': 'tool_result',
                 'content': content,
                 'tool_call_id': tool_call_id,
                 'timestamp': datetime.datetime.now().isoformat(),
+                '_detail_level': detail_level
             }
-            # Add to event model
-            self.event_model.add_event(event)
-            # Also add to output_textedit
-            html = self._format_event_html(event)
-            cursor = self.output_textedit.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            if not self.output_textedit.document().isEmpty():
-                cursor.insertHtml("<hr>")
-            cursor.insertHtml(html)
-            return
         
         # Create event dictionary with appropriate type and fields based on role
         if role == 'user':
@@ -1558,12 +1539,14 @@ class SessionTab(QWidget):
                 'type': 'user_query',
                 'content': content,
                 'timestamp': datetime.datetime.now().isoformat(),
+                '_detail_level': detail_level
             }
         elif role == 'assistant':
             event = {
                 'type': 'turn',
                 'assistant_content': content,
                 'timestamp': datetime.datetime.now().isoformat(),
+                '_detail_level': detail_level
             }
             if reasoning is not None:
                 event['reasoning'] = reasoning
@@ -1575,23 +1558,30 @@ class SessionTab(QWidget):
                 'type': 'turn',
                 'assistant_content': content,
                 'timestamp': datetime.datetime.now().isoformat(),
+                '_detail_level': detail_level
             }
             if reasoning is not None:
                 event['reasoning'] = reasoning
             if tool_calls:
                 event['tool_calls'] = tool_calls
+        
+        return event
+    
+    def _append_chat_message(self, role: str, content: str, tool_calls=None, tool_call_id=None, reasoning=None):
+        """Append a chat message to the event model and output display.
+        
+        Args:
+            role: 'user', 'assistant', or 'tool'
+            content: message content
+            tool_calls: optional list of tool calls (for assistant)
+            tool_call_id: optional tool call ID (for user tool response)
+            reasoning: optional reasoning text (for assistant)
+        """
+        event = self._create_chat_event(role, content, tool_calls, tool_call_id, reasoning)
+        # Delegate to output panel for display
+        self.output_panel.display_event(event)
 
-        # Add to event model (which triggers delegate rendering)
-        self.event_model.add_event(event)
 
-        # Also add to output_textedit for immediate display
-        # Use the same HTML formatting as display_event
-        html = self._format_event_html(event)
-        cursor = self.output_textedit.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        if not self.output_textedit.document().isEmpty():
-            cursor.insertHtml("<hr>")
-        cursor.insertHtml(html)
 
     def closeEvent(self, event):
         """Handle closing the tab with save/discard prompts for unsaved changes."""

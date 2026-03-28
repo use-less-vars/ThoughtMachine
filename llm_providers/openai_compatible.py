@@ -106,7 +106,8 @@ class OpenAICompatibleProvider(LLMProvider):
          3. Convert IDs to strings
          4. Log mismatches between tool messages and assistant tool calls
         """
-        import sys
+        import sys, os
+        debug_enabled = os.environ.get('THOUGHTMACHINE_DEBUG') == '1'
         messages_with_ids = []
         
         # First pass: collect tool_call_ids from tool messages for reference
@@ -173,13 +174,14 @@ class OpenAICompatibleProvider(LLMProvider):
             messages_with_ids.append(msg_copy)
         
         # Debug logging
-        print(f"[DEEPSEEK_TOOL_NORM] Processed {len(messages)} messages", file=sys.stderr)
-        for i, msg in enumerate(messages_with_ids):
-            if msg.get("role") == "assistant" and "tool_calls" in msg:
-                for tc in msg["tool_calls"]:
-                    print(f"[DEEPSEEK_TOOL_NORM] Assistant tool call id={tc.get('id')}", file=sys.stderr)
-            if msg.get("role") == "tool":
-                print(f"[DEEPSEEK_TOOL_NORM] Tool message tool_call_id={msg.get('tool_call_id')}", file=sys.stderr)
+        if debug_enabled:
+            print(f"[DEEPSEEK_TOOL_NORM] Processed {len(messages)} messages", file=sys.stderr)
+            for i, msg in enumerate(messages_with_ids):
+                if msg.get("role") == "assistant" and "tool_calls" in msg:
+                    for tc in msg["tool_calls"]:
+                        print(f"[DEEPSEEK_TOOL_NORM] Assistant tool call id={tc.get('id')}", file=sys.stderr)
+                if msg.get("role") == "tool":
+                    print(f"[DEEPSEEK_TOOL_NORM] Tool message tool_call_id={msg.get('tool_call_id')}", file=sys.stderr)
         
         return messages_with_ids
 
@@ -193,16 +195,19 @@ class OpenAICompatibleProvider(LLMProvider):
         When is_openrouter=True, convert to standard OpenAI format (type='function' with 'function' field)
         since OpenRouter expects that format.
         """
-        import sys
-        print(f"[STEPFUN_NORM_DEBUG] Normalizing with is_openrouter={is_openrouter}", file=sys.stderr)
+        import sys, os
+        debug_enabled = os.environ.get('THOUGHTMACHINE_DEBUG') == '1'
+        if debug_enabled:
+            print(f"[STEPFUN_NORM_DEBUG] Normalizing with is_openrouter={is_openrouter}", file=sys.stderr)
         
         messages_normalized = []
         
         # DEBUG: Log input
-        print(f"[STEPFUN_NORM_DEBUG] Starting normalization of {len(messages)} messages", file=sys.stderr)
-        for idx, msg in enumerate(messages):
-            if msg.get("role") == "assistant" and "tool_calls" in msg:
-                print(f"[STEPFUN_NORM_DEBUG] Message {idx} has tool_calls: {msg['tool_calls']}", file=sys.stderr)
+        if debug_enabled:
+            print(f"[STEPFUN_NORM_DEBUG] Starting normalization of {len(messages)} messages", file=sys.stderr)
+            for idx, msg in enumerate(messages):
+                if msg.get("role") == "assistant" and "tool_calls" in msg:
+                    print(f"[STEPFUN_NORM_DEBUG] Message {idx} has tool_calls: {msg['tool_calls']}", file=sys.stderr)
         
         for i, msg in enumerate(messages):
             msg_copy = msg.copy()
@@ -219,7 +224,8 @@ class OpenAICompatibleProvider(LLMProvider):
                         tc_copy = tc.copy() if isinstance(tc, dict) else {}
                         
                         # DEBUG: Log original tool call
-                        print(f"[STEPFUN_NORM_DEBUG] Tool call {j} before: {tc_copy}", file=sys.stderr)
+                        if debug_enabled:
+                            print(f"[STEPFUN_NORM_DEBUG] Tool call {j} before: {tc_copy}", file=sys.stderr)
                         
                         # Preserve index field if present (added by OpenRouter)
                         # Ensure type field
@@ -351,7 +357,8 @@ class OpenAICompatibleProvider(LLMProvider):
                                     }
                         
                         # DEBUG: Log after normalization
-                        print(f"[STEPFUN_NORM_DEBUG] Tool call {j} after: {tc_copy}", file=sys.stderr)
+                        if debug_enabled:
+                            print(f"[STEPFUN_NORM_DEBUG] Tool call {j} after: {tc_copy}", file=sys.stderr)
                         
                         normalized_tool_calls.append(tc_copy)
                     
@@ -360,18 +367,20 @@ class OpenAICompatibleProvider(LLMProvider):
             messages_normalized.append(msg_copy)
         
         # Debug logging
-        print(f"[STEPFUN_TOOL_NORM] Processed {len(messages)} messages", file=sys.stderr)
-        for i, msg in enumerate(messages_normalized):
-            if msg.get("role") == "assistant" and "tool_calls" in msg:
-                for tc in msg["tool_calls"]:
-                    print(f"[STEPFUN_TOOL_NORM] Assistant tool call id={tc.get('id')}, type={tc.get('type')}, has_function={'function' in tc}, has_custom={'custom' in tc}, index={tc.get('index')}", file=sys.stderr)
+        if debug_enabled:
+            print(f"[STEPFUN_TOOL_NORM] Processed {len(messages)} messages", file=sys.stderr)
+            for i, msg in enumerate(messages_normalized):
+                if msg.get("role") == "assistant" and "tool_calls" in msg:
+                    for tc in msg["tool_calls"]:
+                        print(f"[STEPFUN_TOOL_NORM] Assistant tool call id={tc.get('id')}, type={tc.get('type')}, has_function={'function' in tc}, has_custom={'custom' in tc}, index={tc.get('index')}", file=sys.stderr)
         
         # DEBUG: Log final messages
-        print(f"[STEPFUN_NORM_DEBUG] Final normalized messages:", file=sys.stderr)
-        for idx, msg in enumerate(messages_normalized):
-            print(f"[STEPFUN_NORM_DEBUG] Message {idx}: role={msg.get('role')}", file=sys.stderr)
-            if msg.get("role") == "assistant" and "tool_calls" in msg:
-                print(f"[STEPFUN_NORM_DEBUG]   tool_calls: {msg['tool_calls']}", file=sys.stderr)
+        if debug_enabled:
+            print(f"[STEPFUN_NORM_DEBUG] Final normalized messages:", file=sys.stderr)
+            for idx, msg in enumerate(messages_normalized):
+                print(f"[STEPFUN_NORM_DEBUG] Message {idx}: role={msg.get('role')}", file=sys.stderr)
+                if msg.get("role") == "assistant" and "tool_calls" in msg:
+                    print(f"[STEPFUN_NORM_DEBUG]   tool_calls: {msg['tool_calls']}", file=sys.stderr)
         
         return messages_normalized
 

@@ -1061,7 +1061,8 @@ class AgentPresenter(QObject):
         
         # Emit raw event for UI to handle display
         print(f"[Presenter] Emitting event_received: {event_type}")
-        self.event_received.emit(event)
+        if event_type != "token_update":
+            self.event_received.emit(event)
         
         # Update state based on event type
         if event_type == "turn":

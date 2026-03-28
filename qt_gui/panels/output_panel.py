@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (
     QTextEdit, QFrame, QScrollArea
 )
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QTextDocument, QTextCursor
+
 
 # Import from other extracted modules
 from qt_gui.panels.event_models import EventModel, EventFilterProxyModel, EventDelegate
@@ -30,6 +30,17 @@ class OutputPanel(QWidget):
         self.total_input = 0
         self.total_output = 0
         self.context_length = 0
+        
+        # Filter state tracking
+        self._last_filter_text = ""
+        self._last_filter_type = "all"
+        
+        # Batch event updates for performance
+        self._pending_events = []
+        self._batch_update_timer = QTimer(self)
+        self._batch_update_timer.setSingleShot(True)
+        self._batch_update_timer.setInterval(50)  # 50ms batch delay
+        self._batch_update_timer.timeout.connect(self._process_batched_events)
 
         self.init_ui()
         self.setup_signal_connections()
@@ -97,81 +108,92 @@ class OutputPanel(QWidget):
         delegate = EventDelegate()
         return delegate._event_to_html(event)
 
-    def _event_passes_filter(self, event):
-        """Check if event matches current filter criteria."""
-        filter_text = self.filter_lineedit.text().lower()
-        filter_type = self.filter_type_combo.currentText()
 
-        # Type filter
-        if filter_type != "all":
-            if event.get("type") != filter_type:
-                return False
-
-        # Text filter
-        if filter_text:
-            content = event.get("content", "").lower()
-            reasoning = event.get("reasoning", "").lower()
-            tool_calls = event.get("tool_calls", [])
-            tool_text = " ".join([
-                tc.get("name", "") + " " + str(tc.get("arguments", ""))
-                for tc in tool_calls
-            ]).lower()
-
-            if (filter_text not in content and
-                filter_text not in reasoning and
-                filter_text not in tool_text):
-                if filter_text not in event.get("type", "").lower():
-                    return False
-
-        return True
 
     def _apply_filter(self):
         """Apply current filter settings and rebuild output."""
-        self.filter_proxy_model.set_filter(
-            self.filter_lineedit.text(),
-            self.filter_type_combo.currentText()
-        )
+        import traceback
+        import os
+        debug_enabled = os.environ.get('THOUGHTMACHINE_DEBUG') == '1'
+        filter_text = self.filter_lineedit.text()
+        filter_type = self.filter_type_combo.currentText()
+        # Skip if filter hasn't changed
+        if filter_text == self._last_filter_text and filter_type == self._last_filter_type:
+            return
+        self._last_filter_text = filter_text
+        self._last_filter_type = filter_type
+        if debug_enabled:
+            print(f"[OutputPanel] _apply_filter: text='{filter_text}', type='{filter_type}'")
+            traceback.print_stack(limit=10)
+        self.filter_proxy_model.set_filter(filter_text, filter_type)
         self._rebuild_output_document()
+        self.smart_scroller.deferred_scroll_to_bottom()
 
     def _rebuild_output_document(self):
         """Rebuild the output text document from filtered events."""
-        self.output_textedit.clear()
+        import traceback
+        import os
+        debug_enabled = os.environ.get('THOUGHTMACHINE_DEBUG') == '1'
+        if debug_enabled:
+            print("[OutputPanel] _rebuild_output_document called from:")
+            traceback.print_stack(limit=10)
+        row_count = self.filter_proxy_model.rowCount()
+        source_row_count = self.event_model.rowCount()
+        if debug_enabled:
+            print(f"[OutputPanel] _rebuild_output_document: source rows={source_row_count}, filtered rows={row_count}")
+        
+        # Build complete HTML document
+        html_parts = []
         delegate = EventDelegate()
-        for row in range(self.filter_proxy_model.rowCount()):
+        for row in range(row_count):
             index = self.filter_proxy_model.index(row, 0)
             event = index.data(Qt.ItemDataRole.UserRole)
             if event:
                 html = delegate._event_to_html(event)
-                cursor = self.output_textedit.textCursor()
-                cursor.movePosition(QTextCursor.MoveOperation.End)
-                if row > 0:
-                    cursor.insertHtml("<hr>")
-                cursor.insertHtml(html)
+                html_parts.append(html)
+        
+        # Set entire document at once
+        self.smart_scroller.pause_tracking()
+        try:
+            self.output_textedit.clear()
+            if html_parts:
+                # Join HTML parts (no separator needed as each part is self-contained)
+                full_html = "".join(html_parts)
+                self.output_textedit.setHtml(full_html)
+        finally:
+            self.smart_scroller.resume_tracking()
 
     def display_event(self, event):
         """Add an event to the output display."""
-        # Add to model
+        # Add to model immediately
         self.event_model.add_event(event)
-
-        # If event passes filter, add to output
-        if self._event_passes_filter(event):
-            html = self._format_event_html(event)
-            cursor = self.output_textedit.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            if not self.output_textedit.document().isEmpty():
-                cursor.insertHtml("<hr>")
-            cursor.insertHtml(html)
-
-        self.smart_scroller.scroll_to_bottom()
+        
+        # Batch display updates for performance
+        self._pending_events.append(event)
+        self._batch_update_timer.start()
+    
+    def _process_batched_events(self):
+        """Process batched events and rebuild output."""
+        if not self._pending_events:
+            return
+        
+        # Clear the pending list
+        events = self._pending_events.copy()
+        self._pending_events.clear()
+        
+        # Rebuild output document with all events
+        self._rebuild_output_document()
+        self.smart_scroller.deferred_scroll_to_bottom()
 
     def _scroll_to_bottom(self):
         """Scroll output to bottom (for backward compatibility)."""
-        self.smart_scroller.scroll_to_bottom()
+        self.smart_scroller.deferred_scroll_to_bottom()
 
     def clear_output(self):
         """Clear all output."""
         self.event_model.clear()
         self.output_textedit.clear()
+        self._pending_events.clear()
 
 
     def update_tokens(self, total_input, total_output):
@@ -192,5 +214,11 @@ class OutputPanel(QWidget):
     def display_loaded_conversation(self, events):
         """Display a loaded conversation from history."""
         self.clear_output()
+        # Add all events to the model first
         for event in events:
-            self.display_event(event)
+            self.event_model.add_event(event)
+        # Reset auto-scroll for loaded content
+        self.smart_scroller.reset_auto_scroll()
+        # Rebuild document once
+        self._rebuild_output_document()
+        self.smart_scroller.deferred_scroll_to_bottom()

@@ -8,6 +8,8 @@ conversation for the user's view.
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, Tuple
 import tiktoken
+import os
+import logging
 
 
 class ContextBuilder(ABC):
@@ -82,6 +84,17 @@ class LastNBuilder(ContextBuilder):
         if max_tokens is not None:
             context = self._truncate_to_max_tokens(context, max_tokens)
 
+        # Debug output
+        if os.environ.get('DEBUG_CONTEXT'):
+            logging.debug(f'[DEBUG_CONTEXT] SummaryBuilder.build returning {len(context)} context messages')
+            # Show token estimate
+            try:
+                encoder = tiktoken.get_encoding("cl100k_base")
+                total_tokens = sum(self._estimate_tokens(msg, encoder) for msg in context)
+                logging.debug(f'[DEBUG_CONTEXT] Estimated token count for context: {total_tokens}')
+            except Exception:
+                pass
+        
         return context
 
     def _truncate_to_max_tokens(self, messages: List[Dict[str, Any]], max_tokens: int) -> List[Dict[str, Any]]:
@@ -125,6 +138,15 @@ class SummaryBuilder(ContextBuilder):
         
         If no summary found, falls back to LastNBuilder with default_keep_turns.
         """
+        # Debug context building
+        if os.environ.get('DEBUG_CONTEXT'):
+            logging.debug(f'[DEBUG_CONTEXT] SummaryBuilder.build called with {len(user_history)} history messages')
+            if user_history:
+                for i, msg in enumerate(user_history):
+                    role = msg.get('role', 'unknown')
+                    content_preview = str(msg.get('content', ''))[:100].replace('\n', ' ')
+                    logging.debug(f'  [{i}] role={role}, content: {content_preview}')
+        
         if not user_history:
             return []
         
@@ -167,6 +189,17 @@ class SummaryBuilder(ContextBuilder):
         # If max_tokens is provided, further truncate from oldest turns
         if max_tokens is not None:
             context = self._truncate_to_max_tokens(context, max_tokens, preserve_system=True)
+        
+        # Debug output
+        if os.environ.get('DEBUG_CONTEXT'):
+            logging.debug(f'[DEBUG_CONTEXT] SummaryBuilder.build returning {len(context)} context messages')
+            # Show token estimate
+            try:
+                encoder = tiktoken.get_encoding("cl100k_base")
+                total_tokens = sum(self._estimate_tokens(msg, encoder) for msg in context)
+                logging.debug(f'[DEBUG_CONTEXT] Estimated token count for context: {total_tokens}')
+            except Exception:
+                pass
         
         return context
     
