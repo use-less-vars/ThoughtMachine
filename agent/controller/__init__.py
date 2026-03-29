@@ -3,7 +3,7 @@ import threading
 import os
 import queue
 import traceback
-from agent_core import AgentConfig
+from agent.config import AgentConfig
 from agent import Agent
 from typing import Optional, List, Dict, Any
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -332,6 +332,7 @@ class AgentController(QObject):
             self._running = False  # Mark as not running before sending error
             self._emit_event({
                 "type": "error",
+                "error_type": "CONTROLLER_ERROR",
                 "message": str(e),
                 "traceback": traceback.format_exc()   # helpful for debugging
             })

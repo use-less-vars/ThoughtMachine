@@ -1,32 +1,17 @@
-# agent_core.py
-import json
-import logging
-import os
+# agent/config/models.py
+"""
+Configuration models for the ThoughtMachine agent.
+"""
+
 from typing import Optional, Callable, List, Any, Dict, Literal
-from openai import OpenAI
-from pydantic import BaseModel, ValidationError, Field, field_validator, model_validator
+from pydantic import BaseModel, Field
 
-from tools import TOOL_CLASSES, SIMPLIFIED_TOOL_CLASSES
-from tools.base import ToolBase
-from tools.final import Final
-from tools.request_user_interaction import RequestUserInteraction
-from tools.utils import model_to_openai_tool
-from fast_json_repair import loads as repair_loads
-import typing
+from tools import SIMPLIFIED_TOOL_CLASSES
 
-
-# Import logging module
-try:
-    from agent_logging import create_logger, AgentLogger, LogEventType, LogLevel
-    LOGGING_AVAILABLE = True
-except ImportError:
-    LOGGING_AVAILABLE = False
-    create_logger = None
-    AgentLogger = None
-    LogEventType = None
-    LogLevel = None 
 
 class AgentConfig(BaseModel):
+    """Main configuration model for the ThoughtMachine agent."""
+    
     api_key: str = ""
     base_url: str = "https://api.deepseek.com"
     model: str = "deepseek-reasoner"
@@ -35,7 +20,7 @@ class AgentConfig(BaseModel):
     temperature: float = 0.2
     max_turns: int = 100
     stop_check: Optional[Callable[[], bool]] = None
-    tool_classes: Optional[List[type]] = None   #
+    tool_classes: Optional[List[type]] = None
     initial_conversation: Optional[List[Dict[str, Any]]] = None
     max_history_turns: Optional[int] = None
     max_tokens: Optional[int] = None
@@ -76,8 +61,10 @@ class AgentConfig(BaseModel):
     detail: Literal["minimal", "normal", "verbose"] = Field(default="normal", description="Detail level for event display")
 
     # Enabled tools configuration
-    enabled_tools: List[str] = Field(default_factory=lambda: [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES], description="List of enabled tool class names")
+    enabled_tools: List[str] = Field(
+        default_factory=lambda: [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES], 
+        description="List of enabled tool class names"
+    )
 
-    class Config:        extra = "ignore"  # Allow backward compatibility with older configs
-
-    
+    class Config:
+        extra = "ignore"  # Allow backward compatibility with older configs

@@ -15,9 +15,9 @@ from PyQt6.QtGui import QAction, QKeySequence, QFont, QTextDocument, QTextCursor
 from PyQt6.QtPrintSupport import QPrinter
 from dotenv import load_dotenv
 
-from agent_presenter import AgentPresenter
-from agent_state import ExecutionState
-from config_service import create_agent_config_service
+from agent.presenter.refactored_agent_presenter import RefactoredAgentPresenter
+from agent.core.state import ExecutionState
+from agent.config.service import create_agent_config_service
 from qt_gui.config.config_bridge import GUIConfigBridge
 from session.store import FileSystemSessionStore
 from tools import TOOL_CLASSES, SIMPLIFIED_TOOL_CLASSES
@@ -52,7 +52,7 @@ class SessionTab(QWidget):
         super().__init__(parent)
 
         # Initialize presenter and config service
-        self.presenter = AgentPresenter()
+        self.presenter = RefactoredAgentPresenter()
         if session_store is not None:
             self.presenter.session_store = session_store
         self.config_bridge = GUIConfigBridge(create_agent_config_service())

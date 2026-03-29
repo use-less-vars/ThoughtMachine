@@ -15,7 +15,7 @@ from datetime import datetime
 
 # Try to import the AgentLogger for structured logging
 try:
-    from agent_logging import AgentLogger, LogEventType, LogLevel
+    from agent.logging import AgentLogger, LogEventType, LogLevel
     LOGGING_AVAILABLE = True
 except ImportError:
     LOGGING_AVAILABLE = False

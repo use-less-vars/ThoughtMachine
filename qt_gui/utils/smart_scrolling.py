@@ -1,6 +1,6 @@
-"""Smart scrolling management for QTextEdit widgets."""
+"""Smart scrolling management for scrollable widgets (QTextEdit, QListView, etc)."""
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer
-from PyQt6.QtWidgets import QTextEdit
+from PyQt6.QtWidgets import QAbstractScrollArea
 import os
 
 # Debug flag for verbose logging
@@ -8,7 +8,7 @@ debug_enabled = os.environ.get('THOUGHTMACHINE_DEBUG') == '1'
 
 
 class SmartScroller(QObject):
-    """Manages auto-scrolling behavior for a QTextEdit.
+    """Manages auto-scrolling behavior for a scrollable widget.
     
     Features:
     - Auto-scroll to bottom when new content is added
@@ -17,10 +17,10 @@ class SmartScroller(QObject):
     - Programmatic scroll support with re-entrancy guard
     """
     
-    def __init__(self, text_edit: QTextEdit):
-        """Initialize smart scroller for a text edit widget."""
+    def __init__(self, scroll_area: QAbstractScrollArea):
+        """Initialize smart scroller for a scrollable widget."""
         super().__init__()
-        self._text_edit = text_edit
+        self._scroll_area = scroll_area
         self._auto_scroll_enabled = True
         self._user_scrolled_away = False
         self._programmatic_scroll = False
@@ -31,7 +31,7 @@ class SmartScroller(QObject):
         self._scroll_retry_count = 0  # Track scroll retry attempts
 
         # Connect to scrollbar changes
-        scrollbar = self._text_edit.verticalScrollBar()
+        scrollbar = self._scroll_area.verticalScrollBar()
         scrollbar.valueChanged.connect(self._on_scrollbar_value_changed)
         self._previous_max = scrollbar.maximum()        
     def _on_scrollbar_value_changed(self, value: int):
@@ -40,7 +40,7 @@ class SmartScroller(QObject):
         if self._programmatic_scroll or self._pause_count > 0:
             return
         
-        scrollbar = self._text_edit.verticalScrollBar()
+        scrollbar = self._scroll_area.verticalScrollBar()
         max_val = scrollbar.maximum()
         
         # Check if content grew while user was at bottom
@@ -112,7 +112,7 @@ class SmartScroller(QObject):
         """Programmatically scroll to bottom with robust retry logic."""
         if debug_enabled:
             print(f"[SmartScroller] _do_scroll_to_bottom, programmatic_scroll=True")
-        scrollbar = self._text_edit.verticalScrollBar()
+        scrollbar = self._scroll_area.verticalScrollBar()
         max_val = scrollbar.maximum()
         current_val = scrollbar.value()
         if debug_enabled:
@@ -179,7 +179,7 @@ class SmartScroller(QObject):
         """Reset auto-scroll state to enabled (e.g., after loading new content)."""
         self._user_scrolled_away = False
         self._auto_scroll_enabled = True
-        self._previous_max = self._text_edit.verticalScrollBar().maximum()
+        self._previous_max = self._scroll_area.verticalScrollBar().maximum()
     
     def pause_tracking(self):
         """Temporarily ignore scrollbar changes (e.g., during document rebuild)."""
@@ -196,7 +196,7 @@ class SmartScroller(QObject):
             self._pause_count -= 1
         
         # Update current state after resume
-        scrollbar = self._text_edit.verticalScrollBar()
+        scrollbar = self._scroll_area.verticalScrollBar()
         max_val = scrollbar.maximum()
         value = scrollbar.value()
         self._previous_max = max_val

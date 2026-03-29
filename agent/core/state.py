@@ -4,6 +4,7 @@ import enum
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 import typing
+from agent import events as ev
 
 
 class TokenState(enum.Enum):
@@ -81,6 +82,14 @@ class AgentState:
         if hasattr(self.config, 'critical_countdown_turns'):
             self.CRITICAL_COUNTDOWN_TURNS = self.config.critical_countdown_turns
     
+    def _create_event(self, event_type, data):
+        """Create a typed event and convert to legacy dictionary format."""
+        # Create typed event
+        event = ev.create_event(event_type, data, source="agent_state")
+        # Convert to legacy dict format
+        legacy_dict = ev.convert_to_legacy_format(event)
+        return legacy_dict
+
     def _format_tokens(self, tokens: int) -> str:
         """Format token count in thousands with 'k' suffix."""
         if tokens >= 1000:
@@ -147,13 +156,15 @@ class AgentState:
             if self.logger:
                 self.logger.log_token_warning(old_state.value, new_state.value, total_tokens, warning)
             
-            # Create event
-            events.append({
-                "type": "token_warning",
-                "message": warning,
+            # Create typed event
+            token_warning_data = {
+                "old_state": old_state.value,
+                "new_state": new_state.value,
                 "token_count": total_tokens,
+                "warning_message": warning,
                 "state": new_state.value
-            })
+            }
+            events.append(self._create_event("token_warning", token_warning_data))
         
         # Reset last warning state if we drop below warning threshold
         if new_state == TokenState.LOW:
@@ -220,13 +231,15 @@ class AgentState:
             if self.logger:
                 self.logger.log_turn_warning(old_state.value, new_state.value, current_turn, warning)
             
-            # Create event
-            events.append({
-                "type": "turn_warning",
-                "message": warning,
+            # Create typed event
+            turn_warning_data = {
+                "old_state": old_state.value,
+                "new_state": new_state.value,
                 "turn_count": current_turn,
+                "warning_message": warning,
                 "state": new_state.value
-            })
+            }
+            events.append(self._create_event("turn_warning", turn_warning_data))
         
         # Reset last warning state if we drop below warning threshold
         if new_state == TurnState.LOW:
@@ -246,12 +259,12 @@ class AgentState:
         if self.logger:
             self.logger.log_execution_state_change(old_state.value, new_state.value)
         
-        # Generate event for GUI
-        return [{
-            "type": "execution_state_change",
+        # Generate typed event for GUI
+        execution_state_data = {
             "old_state": old_state.value,
             "new_state": new_state.value
-        }]
+        }
+        return [self._create_event("execution_state_change", execution_state_data)]
     
     def set_session_state(self, new_state: SessionState) -> List[Dict[str, Any]]:
         """Transition to a new session state.
@@ -265,12 +278,12 @@ class AgentState:
         if self.logger:
             self.logger.log_session_state_change(old_state.value, new_state.value)
         
-        # Generate event for GUI
-        return [{
-            "type": "session_state_change",
+        # Generate typed event for GUI
+        session_state_data = {
             "old_state": old_state.value,
             "new_state": new_state.value
-        }]
+        }
+        return [self._create_event("session_state_change", session_state_data)]
     
     def reset(self) -> List[Dict[str, Any]]:
         """Reset all states to initial values.
@@ -331,13 +344,15 @@ class AgentState:
         else:
             self.last_turn_warning = warning
 
-        return [{
-            "type": "critical_countdown_start",
+        # Create typed event
+        countdown_data = {
             "resource": resource,
             "countdown": countdown,
             "message": warning,
             "state": "critical_countdown"
-        }]
+        }
+        event_type = "token_critical_countdown_start" if resource == "token" else "turn_critical_countdown_start"
+        return [self._create_event(event_type, countdown_data)]
 
     def decrement_critical_countdown(self) -> List[Dict[str, Any]]:
         """Decrement critical countdowns and return any expiration events.
@@ -350,21 +365,23 @@ class AgentState:
         if self.token_critical_countdown > 0:
             self.token_critical_countdown -= 1
             if self.token_critical_countdown == 0:
-                events.append({
-                    "type": "token_critical_active",
+                # Create typed event
+                token_critical_data = {
                     "message": "[SYSTEM] Token countdown expired. Tool restrictions now active: only SummarizeTool, Final, FinalReport allowed.",
                     "resource": "token"
-                })
+                }
+                events.append(self._create_event("token_critical_countdown_expired", token_critical_data))
 
         # Decrement turn countdown if active
         if self.turn_critical_countdown > 0:
             self.turn_critical_countdown -= 1
             if self.turn_critical_countdown == 0:
-                events.append({
-                    "type": "turn_critical_active",
+                # Create typed event
+                turn_critical_data = {
                     "message": "[SYSTEM] Turn countdown expired. Tool restrictions now active: only SummarizeTool, Final, FinalReport allowed.",
                     "resource": "turn"
-                })
+                }
+                events.append(self._create_event("turn_critical_countdown_expired", turn_critical_data))
 
         return events
     

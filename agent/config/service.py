@@ -399,7 +399,7 @@ def create_agent_config_service(config_path: str = "agent_config.json") -> Confi
         ConfigService instance with agent defaults
     """
     from tools import SIMPLIFIED_TOOL_CLASSES
-    from agent_core import AgentConfig
+    from agent.config import AgentConfig
 
     # Create default AgentConfig instance
     default_agent_config = AgentConfig()

@@ -1,0 +1,228 @@
+"""
+StateBridge: Configuration management, session binding, and token tracking.
+
+Handles:
+- Configuration loading/saving/updating
+- AgentConfig creation from configuration dictionaries  
+- Session binding and external file path management
+- Token total tracking (input, output, context)
+"""
+
+import os
+import json
+from datetime import datetime
+from typing import Optional, Dict, Any, List
+
+from agent.config import AgentConfig, load_default_config, load_config, save_config, update_config
+from tools import SIMPLIFIED_TOOL_CLASSES
+from session.models import Session, SessionConfig, RuntimeParams
+
+
+class StateBridge:
+    """Bridge between configuration, session state, and token tracking."""
+    
+    def __init__(self, config_path: str = "agent_config.json"):
+        self.config_path = config_path
+        self._config = load_default_config()
+        
+        # Token tracking
+        self.total_input = 0
+        self.total_output = 0
+        self.context_length = 0
+        
+        # Session state
+        self.current_session: Optional[Session] = None
+        self.current_session_id: Optional[str] = None
+        self.session_name: Optional[str] = None
+        self._external_file_path: Optional[str] = None
+        
+        # Load saved configuration if available
+        self._config = load_config(self.config_path)
+    
+    # Configuration methods
+    def get_config(self) -> dict:
+        """Return current configuration dictionary."""
+        return self._config.copy()
+    
+    def update_config(self, config_updates: dict) -> dict:
+        """Update configuration with partial updates."""
+        self._config = update_config(self._config, config_updates)
+        return self._config
+    
+    def save_config(self, config: Optional[dict] = None) -> bool:
+        """Save configuration to file."""
+        config_to_save = config or self._config
+        return save_config(config_to_save, self.config_path)
+    
+    def load_config(self) -> dict:
+        """Load configuration from file."""
+        self._config = load_config(self.config_path)
+        return self._config
+    
+    # AgentConfig creation
+    def create_agent_config(self, config_dict: Optional[dict] = None, 
+                           total_input: int = 0, total_output: int = 0) -> AgentConfig:
+        """
+        Create AgentConfig instance from configuration dictionary.
+        
+        Args:
+            config_dict: Optional dictionary to override current config
+            total_input: Current total input tokens for initial values
+            total_output: Current total output tokens for initial values
+            
+        Returns:
+            AgentConfig instance ready for use with controller
+        """
+        # Merge config_dict with current config if provided
+        if config_dict is not None:
+            config = {**self._config, **config_dict}
+        else:
+            config = self._config
+        
+        # Get API key from config or environment
+        api_key = config.get("api_key") or os.getenv("OPENAI_API_KEY") or os.getenv("DEEPSEEK_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "Neither OPENAI_API_KEY nor DEEPSEEK_API_KEY environment variables are set, "
+                "and no api_key in config. Please set one of them or add api_key to config."
+            )
+        
+        # Create tools list from enabled tool names
+        enabled_tools = config.get("enabled_tools", [])
+        tool_classes = []
+        for tool_cls in SIMPLIFIED_TOOL_CLASSES:
+            if tool_cls.__name__ in enabled_tools:
+                tool_classes.append(tool_cls)
+        
+        # Build agent_kwargs with proper field mapping
+        agent_kwargs = {}
+        agent_kwargs["api_key"] = api_key
+        
+        # Direct mappings for other fields
+        direct_mappings = [
+            ("model", "model"),
+            ("provider_type", "provider_type"),
+            ("provider_config", "provider_config"),
+            ("temperature", "temperature"),
+            ("max_turns", "max_turns"),
+            ("workspace_path", "workspace_path"),
+            ("detail", "detail"),
+            ("token_monitor_enabled", "token_monitor_enabled"),
+            ("enabled_tools", "enabled_tools"),
+            ("turn_monitor_enabled", "turn_monitor_enabled"),
+            ("turn_monitor_warning_threshold", "turn_monitor_warning_threshold"),
+            ("turn_monitor_critical_threshold", "turn_monitor_critical_threshold"),
+            ("max_history_turns", "max_history_turns"),
+            ("keep_initial_query", "keep_initial_query"),
+            ("keep_system_messages", "keep_system_messages"),
+            ("system_prompt", "system_prompt"),
+        ]
+        
+        for config_key, agent_key in direct_mappings:
+            if config_key in config:
+                agent_kwargs[agent_key] = config[config_key]
+        
+        # Field renaming for tool output limit (backward compatibility)
+        if "tool_output_token_limit" in config:
+            agent_kwargs["tool_output_token_limit"] = config["tool_output_token_limit"]
+        elif "tool_output_limit" in config:
+            agent_kwargs["tool_output_token_limit"] = config["tool_output_limit"]
+        
+        # Handle token monitor thresholds with backward compatibility
+        if "token_monitor_warning_threshold" in config:
+            agent_kwargs["token_monitor_warning_threshold"] = config["token_monitor_warning_threshold"]
+        elif "warning_threshold" in config:
+            agent_kwargs["token_monitor_warning_threshold"] = config["warning_threshold"] * 1000
+        
+        if "token_monitor_critical_threshold" in config:
+            agent_kwargs["token_monitor_critical_threshold"] = config["token_monitor_critical_threshold"]
+        elif "critical_threshold" in config:
+            agent_kwargs["token_monitor_critical_threshold"] = config["critical_threshold"] * 1000
+        
+        # Conditional base_url
+        base_url = config.get("base_url")
+        if base_url:
+            agent_kwargs["base_url"] = base_url
+        
+        # Add tool_classes
+        agent_kwargs["tool_classes"] = tool_classes
+        
+        # Create AgentConfig instance
+        agent_config = AgentConfig(**agent_kwargs)
+        
+        # Propagate token totals as initial values for the agent
+        agent_config.initial_input_tokens = total_input
+        agent_config.initial_output_tokens = total_output
+        
+        return agent_config
+    
+    # Session binding
+    def bind_session(self, session: Session) -> None:
+        """Bind a Session object as the source of truth for conversation state."""
+        self.current_session = session
+        self.current_session_id = session.session_id
+        self.session_name = session.metadata.get('name')
+        
+        # Sync token usage counters from session
+        self.total_input = session.total_input_tokens
+        self.total_output = session.total_output_tokens
+        self.context_length = session.context_length
+        
+        # Restore external file path from metadata if present
+        external_file_path = session.metadata.get('external_file_path')
+        if external_file_path:
+            self._external_file_path = os.path.abspath(external_file_path)
+        else:
+            self._external_file_path = None
+    
+    def update_external_file_path(self, filepath: Optional[str]) -> None:
+        """Update external file path in session metadata."""
+        self._external_file_path = filepath
+        if self.current_session:
+            if filepath:
+                self.current_session.metadata['external_file_path'] = filepath
+            else:
+                self.current_session.metadata.pop('external_file_path', None)
+    
+    # Token management
+    def update_token_totals(self, input_tokens: int, output_tokens: int) -> None:
+        """Update token totals and sync with current session."""
+        self.total_input = input_tokens
+        self.total_output = output_tokens
+        if self.current_session:
+            self.current_session.total_input_tokens = input_tokens
+            self.current_session.total_output_tokens = output_tokens
+    
+    def update_context_length(self, context_length: int) -> None:
+        """Update context length and sync with current session."""
+        self.context_length = context_length
+        if self.current_session:
+            self.current_session.context_length = context_length
+    
+    @property
+    def user_history(self) -> List[Dict[str, Any]]:
+        """User conversation history from current session."""
+        if self.current_session:
+            return self.current_session.user_history
+        return []
+    
+    # Session configuration building
+    def build_session_config(self, agent_config: AgentConfig) -> SessionConfig:
+        """Build SessionConfig from an AgentConfig instance."""
+        # Extract runtime params
+        runtime_params = RuntimeParams(
+            temperature=agent_config.temperature,
+            max_tokens=agent_config.max_tokens if hasattr(agent_config, 'max_tokens') else None,
+            top_p=agent_config.top_p if hasattr(agent_config, 'top_p') else None
+        )
+        
+        # Build SessionConfig
+        session_config = SessionConfig(
+            model=agent_config.model,
+            system_prompt=agent_config.system_prompt,
+            toolset=[cls.__name__ for cls in agent_config.tool_classes],
+            safety_settings=None,
+            initial_params=runtime_params
+        )
+        return session_config
+

@@ -10,7 +10,7 @@ from PyQt6.QtGui import QPainter, QPalette, QTextDocument
 # Import from other extracted modules
 from qt_gui.panels.markdown_renderer import MarkdownRenderer
 
-from qt_gui.utils.constants import MAX_RESULT_LENGTH
+from qt_gui.utils.constants import MAX_RESULT_LENGTH, MAX_TOOL_RESULTS_PER_TURN, MAX_LINES_PER_RESULT, ENABLE_RESULT_TRUNCATION
 
 
 class EventModel(QAbstractListModel):
@@ -196,7 +196,11 @@ class EventDelegate(QStyledItemDelegate):
                 add_line(f"Reasoning: {event['reasoning']}", style="color: #666666;", use_markdown=True)
 
             # Show tool calls
-            for tc in event.get("tool_calls", []):
+            # Show tool calls
+            tool_calls = event.get("tool_calls", [])
+            # Limit number of displayed tool calls
+            display_calls = tool_calls[:MAX_TOOL_RESULTS_PER_TURN] if ENABLE_RESULT_TRUNCATION else tool_calls
+            for i, tc in enumerate(display_calls):
                 # Normalize tool call format (support both flattened and OpenAI format)
                 tool_name = tc.get('name')
                 if tool_name is None:
@@ -218,11 +222,26 @@ class EventDelegate(QStyledItemDelegate):
                 result_text = tc.get('result', '')
                 # Truncate if needed
                 unescaped_result = html.unescape(result_text)
-                if len(unescaped_result) > MAX_RESULT_LENGTH:
-                    truncated = unescaped_result[:MAX_RESULT_LENGTH] + "..."
-                    add_line(f"Result: {truncated}", style="color: #006400;", title=unescaped_result)
+                if ENABLE_RESULT_TRUNCATION:
+                    # Limit lines
+                    lines_result = unescaped_result.split('\n')
+                    if len(lines_result) > MAX_LINES_PER_RESULT:
+                        lines_result = lines_result[:MAX_LINES_PER_RESULT]
+                        lines_result.append("...")
+                        unescaped_result = '\n'.join(lines_result)
+                    # Limit characters
+                    if len(unescaped_result) > MAX_RESULT_LENGTH:
+                        truncated = unescaped_result[:MAX_RESULT_LENGTH] + "..."
+                        add_line(f"Result: {truncated}", style="color: #006400;", title=unescaped_result)
+                    else:
+                        add_line(f"Result: {unescaped_result}", style="color: #006400;")
                 else:
                     add_line(f"Result: {unescaped_result}", style="color: #006400;")
+            
+            # Show truncation message if we limited tool calls
+            if ENABLE_RESULT_TRUNCATION and len(tool_calls) > MAX_TOOL_RESULTS_PER_TURN:
+                remaining = len(tool_calls) - MAX_TOOL_RESULTS_PER_TURN
+                add_line(f"... and {remaining} more tool calls", style="color: #666666; font-style: italic;")
 
         elif etype == "final":
             add_line(f"Final answer: {event['content']}", style="font-weight: bold; color: #000080;", use_markdown=True)
@@ -233,8 +252,22 @@ class EventDelegate(QStyledItemDelegate):
             add_line(f"User query: {event.get('content', '')}", style="font-weight: bold; color: #8B008B;", use_markdown=True)
 
         elif etype == "tool_result":
+            # Handle both legacy and new formats
+            tool_name = event.get('tool_name', event.get('name', 'unknown'))
             tool_call_id = event.get('tool_call_id', 'unknown')
-            add_line(f"Tool result (call id: {tool_call_id}): {event.get('content', '')}", style="color: #006400;", use_markdown=True)
+            # Try content first (legacy), then result (new)
+            result_text = event.get('content', event.get('result', ''))
+            success = event.get('success', True)
+            error = event.get('error')
+            
+            display_name = tool_name if tool_name != 'unknown' else f"call {tool_call_id}"
+            
+            if error:
+                add_line(f"❌ Tool {display_name} failed: {error}", style="color: #FF0000;", use_markdown=True)
+            elif not success:
+                add_line(f"⚠️ Tool {display_name} returned warning: {result_text}", style="color: #FFA500;", use_markdown=True)
+            else:
+                add_line(f"✅ Tool {display_name} result: {result_text}", style="color: #006400;", use_markdown=True)
 
         elif etype == "system":
             add_line(f"System: {event.get('content', '')}", style="color: #808080; font-style: italic;", use_markdown=True)
@@ -272,6 +305,122 @@ class EventDelegate(QStyledItemDelegate):
             html_content += line
 
         html_content += '</div>'
+        return html_content
+
+    def _turn_to_html(self, turn_num, turn_data):
+        """Convert turn data to HTML representation with grouped events."""
+        html_content = f'<div style="border: 1px solid #ddd; border-radius: 5px; margin: 10px 0; overflow: hidden;">'
+        
+        # Turn header
+        html_content += f'<div style="background-color: #f0f0f0; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid #ddd;">Turn {turn_num}</div>'
+        
+        # Content area
+        html_content += '<div style="padding: 10px;">'
+        
+        # User query (purple)
+        user_query = turn_data.get('user_query')
+        if user_query:
+            content = user_query.get('content', '')
+            if content:
+                html_content += f'<div style="color: #8B008B; font-weight: bold; margin-bottom: 8px;">User: {html.escape(content)}</div>'
+        
+        # Assistant content (grey)
+        assistant = turn_data.get('assistant')
+        if assistant:
+            content = assistant.get('assistant_content', '')
+            if content:
+                html_content += f'<div style="color: #000000; margin-bottom: 8px;">Assistant: {html.escape(content)}</div>'
+            
+            # Reasoning (grey)
+            reasoning = assistant.get('reasoning', '')
+            if reasoning:
+                html_content += f'<div style="color: #666666; font-style: italic; margin-bottom: 8px; padding-left: 10px; border-left: 2px solid #ccc;">Reasoning: {html.escape(reasoning)}</div>'
+        
+        # Tool calls (blue) and results (green)
+        tool_calls = turn_data.get('tool_calls', [])
+        tool_results = turn_data.get('tool_results', [])
+        
+        # Match tool calls with results
+        for i, tool_call in enumerate(tool_calls):
+            tool_name = tool_call.get('tool_name')
+            if tool_name is None:
+                tool_name = tool_call.get('name', 'Unknown')
+            # Ensure tool_name is string
+            tool_name = str(tool_name) if tool_name is not None else 'Unknown'
+            arguments = tool_call.get('arguments', {})
+            
+            html_content += f'<div style="color: #0000FF; font-weight: bold; margin: 8px 0 4px 0;">🛠️ {html.escape(tool_name)}</div>'
+            
+            # Show arguments if available
+            if arguments:
+                html_content += f'<div style="color: #0000AA; font-size: 0.9em; margin-left: 10px; margin-bottom: 4px;">Arguments: {html.escape(str(arguments))}</div>'
+            
+            # Find matching result
+            result_text = ''
+            for result in tool_results:
+                # Match by tool_name or name field
+                result_tool_name = result.get('tool_name', result.get('name'))
+                if result_tool_name == tool_name:
+                    # Try result field first, then content field for backward compatibility
+                    result_text = result.get('result', result.get('content', ''))
+                    break
+            # If no result found in tool_results, check if tool_call has result
+            if not result_text:
+                result_text = tool_call.get('result', '')
+            
+            # Ensure result_text is string
+            result_text = str(result_text) if result_text is not None else ''
+            if result_text:
+                # Truncate result if needed - use hardcoded constants to avoid import issues
+                MAX_RESULT_LENGTH = 200
+                MAX_LINES_PER_RESULT = 5
+                ENABLE_RESULT_TRUNCATION = True
+                
+                unescaped_result = html.unescape(result_text)
+                
+                if ENABLE_RESULT_TRUNCATION:
+                    # Limit lines
+                    lines_result = unescaped_result.split('\n')
+                    if len(lines_result) > MAX_LINES_PER_RESULT:
+                        lines_result = lines_result[:MAX_LINES_PER_RESULT]
+                        lines_result.append("...")
+                        unescaped_result = '\n'.join(lines_result)
+                    
+                    # Limit characters
+                    if len(unescaped_result) > MAX_RESULT_LENGTH:
+                        truncated = unescaped_result[:MAX_RESULT_LENGTH] + "..."
+                        html_content += f'<div style="color: #006400; margin-left: 10px; font-size: 0.9em;" title="{html.escape(unescaped_result)}">Result: {html.escape(truncated)}</div>'
+                    else:
+                        html_content += f'<div style="color: #006400; margin-left: 10px; font-size: 0.9em;">Result: {html.escape(unescaped_result)}</div>'
+                else:
+                    html_content += f'<div style="color: #006400; margin-left: 10px; font-size: 0.9em;">Result: {html.escape(unescaped_result)}</div>'
+            
+            html_content += '<div style="margin-bottom: 8px;"></div>'  # Spacer
+        
+        # Final output (blue)
+        final = turn_data.get('final')
+        if final:
+            content = final.get('content', '')
+            if content:
+                html_content += f'<div style="color: #000080; font-weight: bold; margin-top: 12px; padding-top: 8px; border-top: 1px solid #ddd;">Final: {html.escape(content)}</div>'
+        
+        # Other events (system messages, warnings, etc.)
+        other_events = turn_data.get('other_events', [])
+        for event in other_events:
+            etype = event.get('type', 'unknown')
+            content = event.get('content', event.get('message', ''))
+            
+            if etype == 'system':
+                html_content += f'<div style="color: #808080; font-style: italic; margin-top: 8px;">System: {html.escape(content)}</div>'
+            elif etype in ['token_warning', 'turn_warning', 'rate_limit_warning']:
+                html_content += f'<div style="color: #FFA500; font-weight: bold; margin-top: 8px;">⚠️ {html.escape(content)}</div>'
+            elif etype == 'error':
+                html_content += f'<div style="color: #FF0000; font-weight: bold; margin-top: 8px;">❌ {html.escape(content)}</div>'
+            elif etype == 'user_interaction_requested':
+                html_content += f'<div style="color: #008080; margin-top: 8px;">👤 {html.escape(content)}</div>'
+        
+        html_content += '</div>'  # Close content area
+        html_content += '</div>'  # Close turn container
         return html_content
 
     def _event_to_plain_text(self, event):

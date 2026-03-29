@@ -9,3 +9,8 @@ docker
 modelcontextprotocol
 mcp
 PyYAML
+anthropic
+pytest
+sseclient
+beautifulsoup4
+lxml

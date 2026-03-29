@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
 from queue import Queue, Empty
 
 if TYPE_CHECKING:
-    from agent_core import AgentConfig
+    from agent.config import AgentConfig
 
 
 # Session file version

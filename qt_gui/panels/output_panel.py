@@ -5,12 +5,13 @@ from PyQt6.QtWidgets import (
     QTextEdit, QFrame, QScrollArea
 )
 from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QTextCursor
 
 
 # Import from other extracted modules
 from qt_gui.panels.event_models import EventModel, EventFilterProxyModel, EventDelegate
 from qt_gui.panels.markdown_renderer import MarkdownRenderer
-from qt_gui.utils.constants import MAX_RESULT_LENGTH
+from qt_gui.utils.constants import MAX_RESULT_LENGTH, MAX_TOOL_RESULTS_PER_TURN, MAX_LINES_PER_RESULT, ENABLE_RESULT_TRUNCATION
 from qt_gui.utils.smart_scrolling import SmartScroller
 
 
@@ -99,16 +100,6 @@ class OutputPanel(QWidget):
         self.filter_lineedit.textChanged.connect(self._apply_filter)
         self.filter_type_combo.currentTextChanged.connect(self._apply_filter)
 
-    def _format_event_html(self, event):
-        """Convert event dictionary to HTML representation."""
-        etype = event.get('type', 'unknown')
-        detail_level = event.get('_detail_level', 'normal')
-
-        # Use EventDelegate's method for consistent formatting
-        delegate = EventDelegate()
-        return delegate._event_to_html(event)
-
-
 
     def _apply_filter(self):
         """Apply current filter settings and rebuild output."""
@@ -126,42 +117,90 @@ class OutputPanel(QWidget):
             print(f"[OutputPanel] _apply_filter: text='{filter_text}', type='{filter_type}'")
             traceback.print_stack(limit=10)
         self.filter_proxy_model.set_filter(filter_text, filter_type)
+        # Rebuild the output document with filtered events
         self._rebuild_output_document()
+        # Still trigger auto-scroll if enabled
         self.smart_scroller.deferred_scroll_to_bottom()
+
+    def _format_event_html(self, event):
+        """Format event as HTML for display in QTextEdit."""
+        delegate = EventDelegate()
+        return delegate._event_to_html(event)
+
+    def _event_passes_filter(self, event):
+        """Check if event passes current filter criteria."""
+        filter_type = self.filter_proxy_model.filter_type
+        if filter_type != "all":
+            if event.get("type") != filter_type:
+                return False
+        filter_text = self.filter_proxy_model.filter_text
+        if filter_text:
+            content = event.get("content", "").lower()
+            reasoning = event.get("reasoning", "").lower()
+            tool_calls = event.get("tool_calls", [])
+            tool_text = " ".join([tc.get("name", "") + " " + str(tc.get("arguments", "")) for tc in tool_calls]).lower()
+            if (filter_text not in content and
+                filter_text not in reasoning and
+                filter_text not in tool_text and
+                filter_text not in event.get("type", "").lower()):
+                return False
+        return True
 
     def _rebuild_output_document(self):
         """Rebuild the output text document from filtered events."""
-        import traceback
-        import os
-        debug_enabled = os.environ.get('THOUGHTMACHINE_DEBUG') == '1'
-        if debug_enabled:
-            print("[OutputPanel] _rebuild_output_document called from:")
-            traceback.print_stack(limit=10)
-        row_count = self.filter_proxy_model.rowCount()
-        source_row_count = self.event_model.rowCount()
-        if debug_enabled:
-            print(f"[OutputPanel] _rebuild_output_document: source rows={source_row_count}, filtered rows={row_count}")
-        
-        # Build complete HTML document
-        html_parts = []
+        self.output_textedit.clear()
         delegate = EventDelegate()
-        for row in range(row_count):
+        
+        # Group events by turn
+        turns = {}
+        for row in range(self.filter_proxy_model.rowCount()):
             index = self.filter_proxy_model.index(row, 0)
             event = index.data(Qt.ItemDataRole.UserRole)
-            if event:
-                html = delegate._event_to_html(event)
-                html_parts.append(html)
+            if not event:
+                continue
+                
+            etype = event.get('type', 'unknown')
+            turn_num = event.get('turn', 0)
+            
+            # Initialize turn group if not exists
+            if turn_num not in turns:
+                turns[turn_num] = {
+                    'user_query': None,
+                    'assistant': None,
+                    'tool_calls': [],
+                    'tool_results': [],
+                    'final': None,
+                    'other_events': []
+                }
+            
+            # Categorize event
+            if etype == 'user_query':
+                turns[turn_num]['user_query'] = event
+            elif etype == 'turn':
+                turns[turn_num]['assistant'] = event
+            elif etype == 'tool_call':
+                turns[turn_num]['tool_calls'].append(event)
+            elif etype == 'tool_result':
+                turns[turn_num]['tool_results'].append(event)
+            elif etype == 'final':
+                turns[turn_num]['final'] = event
+            else:
+                turns[turn_num]['other_events'].append(event)
         
-        # Set entire document at once
-        self.smart_scroller.pause_tracking()
-        try:
-            self.output_textedit.clear()
-            if html_parts:
-                # Join HTML parts (no separator needed as each part is self-contained)
-                full_html = "".join(html_parts)
-                self.output_textedit.setHtml(full_html)
-        finally:
-            self.smart_scroller.resume_tracking()
+        # Sort turns by number
+        sorted_turns = sorted(turns.items())
+        
+        # Render each turn as a cohesive block
+        for i, (turn_num, turn_data) in enumerate(sorted_turns):
+            html = delegate._turn_to_html(turn_num, turn_data)
+            if html:
+                cursor = self.output_textedit.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                if i > 0:  # Add separator between turns, not before first turn
+                    cursor.insertHtml("<hr style='margin: 20px 0; border: 1px solid #ccc;'>")
+                cursor.insertHtml(html)
+
+
 
     def display_event(self, event):
         """Add an event to the output display."""
@@ -173,16 +212,17 @@ class OutputPanel(QWidget):
         self._batch_update_timer.start()
     
     def _process_batched_events(self):
-        """Process batched events and rebuild output."""
+        """Process batched events by rebuilding the entire output document."""
         if not self._pending_events:
             return
         
-        # Clear the pending list
-        events = self._pending_events.copy()
+        # Clear pending events (they're already added to model in display_event)
         self._pending_events.clear()
         
-        # Rebuild output document with all events
+        # Rebuild entire output document to ensure proper turn grouping
         self._rebuild_output_document()
+        
+        # Scroll to bottom if auto-scroll enabled
         self.smart_scroller.deferred_scroll_to_bottom()
 
     def _scroll_to_bottom(self):
@@ -219,6 +259,6 @@ class OutputPanel(QWidget):
             self.event_model.add_event(event)
         # Reset auto-scroll for loaded content
         self.smart_scroller.reset_auto_scroll()
-        # Rebuild document once
+        # Rebuild output document with all events
         self._rebuild_output_document()
         self.smart_scroller.deferred_scroll_to_bottom()

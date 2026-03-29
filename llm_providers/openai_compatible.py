@@ -726,10 +726,13 @@ class OpenAICompatibleProvider(LLMProvider):
                         #print(f"[PARSE_RESPONSE_DEBUG] Warning: unknown tool call type '{tc_type}', defaulting to 'function'", file=sys.stderr)
                         tc_type = 'function'
                     
+                    # Normalize to 'function' key for internal use
+                    # The 'custom' type is for StepFun API compatibility, but our tool executor
+                    # expects 'function' key
                     tool_calls.append({
                         "id": tc_id,
-                        "type": tc_type,
-                        tc_type: {  # Use dynamic key: 'function' or 'custom'
+                        "type": "function",  # Always use 'function' type internally
+                        "function": {  # Always use 'function' key
                             "name": name,
                             "arguments": arguments
                         }

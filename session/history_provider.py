@@ -11,6 +11,27 @@ from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 import logging
 import os
+import sys
+
+# Import our clean debug logging
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + "/../")
+try:
+    from debug_pruning import (
+        debug_log, log_session_history, log_history_provider_reconstruction,
+        log_message_insertion, log_pruning_operation, log_token_count,
+        log_summary_operation, truncate_message
+    )
+    DEBUG_PRUNING_AVAILABLE = True
+except ImportError:
+    DEBUG_PRUNING_AVAILABLE = False
+    debug_log = lambda *args, **kwargs: None
+    log_session_history = lambda *args, **kwargs: None
+    log_history_provider_reconstruction = lambda *args, **kwargs: None
+    log_message_insertion = lambda *args, **kwargs: None
+    log_pruning_operation = lambda *args, **kwargs: None
+    log_token_count = lambda *args, **kwargs: None
+    log_summary_operation = lambda *args, **kwargs: None
+    truncate_message = lambda entry, max_len: str(entry)[:max_len]
 
 from .models import Session
 from .context_builder import ContextBuilder, SummaryBuilder
@@ -74,10 +95,20 @@ class HistoryProvider:
             max_tokens=self.token_limit
         )
         
-        # Debug output
-        if DEBUG_CONTEXT:
+        # Debug output - use our clean debug logging
+        if DEBUG_CONTEXT and DEBUG_PRUNING_AVAILABLE:
+            debug_log('history_provider', 
+                     f'get_context_for_llm: {len(self.session.user_history)} history → {len(context)} context')
+            if self.token_limit:
+                debug_log('history_provider', f'Token limit: {self.token_limit}')
+            
+            # Log session history with our clean format
+            log_session_history(self.session.user_history, 'Session history')
+            log_history_provider_reconstruction('HistoryProvider', 
+                                              self.session.user_history, context)
+        elif DEBUG_CONTEXT:
+            # Fallback to old debug logging
             logger.debug(f'[DEBUG_CONTEXT] HistoryProvider.get_context_for_llm: full history={len(self.session.user_history)} messages, context={len(context)} messages')
-            # Show token count if token_limit set
             if self.token_limit:
                 logger.debug(f'[DEBUG_CONTEXT] Token limit: {self.token_limit}')
         
@@ -152,15 +183,25 @@ class HistoryProvider:
         self.session.updated_at = datetime.now()
         self._cached_context = None
         
-        # Debug output
-        if DEBUG_CONTEXT:
+        # Debug output - use our clean debug logging
+        if DEBUG_CONTEXT and DEBUG_PRUNING_AVAILABLE:
+            # Get surrounding messages for context
+            history_len = len(self.session.user_history)
+            surrounding_start = max(0, history_len - 3)  # Last 3 messages before insertion
+            surrounding_end = history_len  # Up to current length (before new message)
+            surrounding = self.session.user_history[surrounding_start:surrounding_end]
+            
+            log_message_insertion(message, history_len, surrounding)
+            
+            # Also show updated session history
+            log_session_history(self.session.user_history, 'After adding message')
+        elif DEBUG_CONTEXT:
             logger.debug(f'[DEBUG_CONTEXT] HistoryProvider.add_message: role={message.get("role")}, type={message.get("type", "N/A")}, tool_calls={message.get("tool_calls", "N/A")}')
-        
+
         # Log the addition
         role = message.get('role', 'unknown')
         content_preview = str(message.get('content', ''))[:100]
-        logger.debug(f"HistoryProvider added {role} message: {content_preview}")
-    
+        logger.debug(f"HistoryProvider added {role} message: {content_preview}")    
     def check_token_limit(self) -> Tuple[bool, Optional[str]]:
         """
         Check if token limit is approaching or exceeded.
@@ -176,6 +217,11 @@ class HistoryProvider:
         # Estimate tokens in current context
         context = self.get_context_for_llm()
         token_count = self._estimate_context_tokens(context)
+        
+        # Log token count with our clean debug logging
+        if DEBUG_PRUNING_AVAILABLE:
+            log_token_count('HistoryProvider.check_token_limit', token_count, 
+                          f'{token_count}/{self.token_limit} ({token_count/self.token_limit*100:.1f}%)')
         
         # Simple heuristic: warn at 80% of limit, prune at 95%
         warning_threshold = self.token_limit * 0.8
@@ -213,6 +259,12 @@ class HistoryProvider:
         
         # Also update session.summary field for backward compatibility
         self.session.summary = summary_msg
+        
+        # Log summary creation with our clean debug logging
+        if DEBUG_PRUNING_AVAILABLE:
+            log_summary_operation('Created summary', summary_msg)
+            debug_log('pruning', f'Keeping {keep_recent_turns} recent turns after summary')
+            log_session_history(self.session.user_history, 'After adding summary')
         
         logger.info(f"Created summary: {summary_text[:100]}... (keeping {keep_recent_turns} recent turns)")
         return summary_msg
