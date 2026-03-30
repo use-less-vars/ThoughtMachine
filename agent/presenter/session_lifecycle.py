@@ -61,9 +61,17 @@ class SessionLifecycle:
     def state(self, new_state: ExecutionState):
         """Update execution state."""
         if self._state != new_state:
+            old_state = self._state
             self._state = new_state
             if os.environ.get('THOUGHTMACHINE_DEBUG'):
-                print(f"[SessionLifecycle] state changed: {self._state} -> {new_state}")
+                print(f"[SessionLifecycle] state changed: {old_state} -> {new_state}")
+            # Notify callback if set
+            if self._session_callback:
+                try:
+                    self._session_callback(old_state, new_state)
+                except Exception as e:
+                    if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                        print(f"[SessionLifecycle] Error in state callback: {e}")
     
     # Session operations
     def start_session(self, query: str, config: Optional[dict] = None, preset_name: str = None):

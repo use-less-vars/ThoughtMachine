@@ -58,6 +58,8 @@ class RefactoredAgentPresenter(QObject):
         
         # Create lifecycle and event processor with dependencies
         self.session_lifecycle = SessionLifecycle(self.state_bridge, self.controller)
+        # Set up state change callback
+        self.session_lifecycle._session_callback = self._on_session_state_change
         self.event_processor = EventProcessor(
             self.state_bridge, 
             self.session_lifecycle, 
@@ -88,6 +90,17 @@ class RefactoredAgentPresenter(QObject):
         
         # Connect session lifecycle state changes
         # (StateBridge manages session state internally)
+
+    @property
+    def state(self) -> ExecutionState:
+        """Current agent state (delegates to session lifecycle)."""
+        return self.session_lifecycle.state
+
+    def _on_session_state_change(self, old_state: ExecutionState, new_state: ExecutionState):
+        """Callback when session lifecycle state changes."""
+        # Update GUI integration state to emit signal
+        if self.gui_integration.state != new_state:
+            self.gui_integration.state = new_state
 
     def _handle_controller_event(self, event: Dict[str, Any]):
         """Forward controller events to event processor."""

@@ -197,10 +197,20 @@ class EventProcessor:
     
     def _process_execution_state_change_event(self, event: Dict[str, Any]) -> None:
         """Process execution state change event."""
-        # Update session lifecycle state if needed
-        new_state = event.get("new_state")
-        if new_state and self.gui_integration:
-            self.gui_integration.emit_status_message(f"Execution state changed to: {new_state}")
+        # Update session lifecycle state
+        new_state_str = event.get("new_state")
+        if new_state_str:
+            # Convert string to ExecutionState enum
+            try:
+                new_state = ExecutionState(new_state_str)
+                self.session_lifecycle.state = new_state
+                if self.gui_integration:
+                    self.gui_integration.state = new_state
+                    self.gui_integration.emit_status_message(f"Execution state changed to: {new_state.value}")
+            except ValueError:
+                # Invalid state string, log but continue
+                if self.gui_integration:
+                    self.gui_integration.emit_status_message(f"Invalid execution state: {new_state_str}")
         
         # Update conversation history
         if "history" in event:
