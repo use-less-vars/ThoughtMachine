@@ -121,6 +121,17 @@ class Agent:
             self.session_id = session_id
             self.conversation = initial_conversation.copy() if initial_conversation else []
         
+        # Initialize display turn counter based on existing conversation
+        # Count user messages (excluding system warnings) to get current turn number
+        user_msg_count = 0
+        for msg in self.conversation:
+            if msg.get('role') == 'user':
+                content = msg.get('content', '')
+                # Don't count system warning messages
+                if not content.startswith('[SYSTEM]'):
+                    user_msg_count += 1
+        self._display_turn = user_msg_count
+        
         # Initialize modular components
         self.token_counter = TokenCounter(config)
         self.llm_client = LLMClient(config, session, self.logger)
@@ -443,11 +454,14 @@ class Agent:
         # Emit token update event for real-time tracking
         yield self._create_token_update_event()
         
+        # Increment display turn counter for this query
+        self._display_turn = getattr(self, '_display_turn', 0) + 1
+        
         # Emit user query event for GUI display
         yield {
             "type": "user_query",
             "content": query,
-            "turn": 0  # User query is at turn 0 before assistant responses start
+            "turn": self._display_turn  # Unique turn number for this query
         }
 
         prev_conversation_len = len(self.conversation)
@@ -484,7 +498,7 @@ class Agent:
                     self.logger.close()
                 yield {
                     "type": "stopped",
-                    "turn": turn,
+                    "turn": self._display_turn,
                     "context_length": self.state.current_conversation_tokens,
                     "history": self.session.user_history.copy() if self.session is not None else self.conversation.copy(),
                     "usage": {"input": last_input_tokens, "output": last_output_tokens,
@@ -508,6 +522,7 @@ class Agent:
                     "type": event["type"],
                     "message": event.get("message", event.get("warning", "")),
                     "turn_count": event.get("turn_count", turn),
+                    "turn": self._display_turn,  # Add turn for GUI grouping
                     "context_length": self.state.current_conversation_tokens,
                     "usage": {
                         "input": last_input_tokens,
@@ -538,6 +553,7 @@ class Agent:
                     "type": event["type"],
                     "message": event.get("message", event.get("warning", "")),
                     "token_count": event.get("token_count", self.state.current_conversation_tokens),
+                    "turn": self._display_turn,  # Add turn for GUI grouping
                     "context_length": self.state.current_conversation_tokens,
                     "usage": {
                         "input": last_input_tokens,
@@ -732,7 +748,7 @@ class Agent:
                     "wait_time": wait_time,
                     "turn_delay": self.rate_limit_delay,
                     "rate_limit_count": self.rate_limit_count,
-                    "turn": turn,
+                    "turn": self._display_turn,
                 }
                 
                 # Wait the initial wait time
@@ -763,7 +779,7 @@ class Agent:
                     "error_type": "PROVIDER_ERROR",
                     "message": str(e),
                     "traceback": traceback.format_exc(),
-                    "turn": turn,
+                    "turn": self._display_turn,
                     "context_length": self.state.current_conversation_tokens,
                     "history": self.session.user_history.copy() if self.session is not None else self.conversation.copy(),
                     "usage": {
@@ -797,7 +813,7 @@ class Agent:
                     "error_type": "UNEXPECTED_ERROR",
                     "message": str(e),
                     "traceback": traceback.format_exc(),
-                    "turn": turn,
+                    "turn": self._display_turn,
                     "context_length": self.state.current_conversation_tokens,
                     "history": self.session.user_history.copy() if self.session is not None else self.conversation.copy(),
                     "usage": {
@@ -830,7 +846,7 @@ class Agent:
                 "content": content,
                 "assistant_content": content,  # For display in EventDelegate
                 "tool_calls": [],  # Tool calls emitted as separate events
-                "turn": turn,
+                "turn": self._display_turn,  # Use display turn for grouping
                 "context_length": self.state.current_conversation_tokens,
                 "usage": {
                     "input": last_input_tokens,
@@ -867,7 +883,7 @@ class Agent:
                         "result": result,
                         "success": success,
                         "error": error,
-                        "turn": turn
+                        "turn": self._display_turn  # Use display turn for grouping
                     })
                 
                 # Yield tool call events (without results)
@@ -908,7 +924,7 @@ class Agent:
                     yield {
                         "type": "final",
                         "content": content,
-                        "turn": turn,
+                        "turn": self._display_turn,
                         "context_length": self.state.current_conversation_tokens,
                         "usage": {
                             "input": last_input_tokens,
@@ -930,7 +946,7 @@ class Agent:
                     yield {
                         "type": "user_interaction_requested",
                         "message": "Waiting for user input",
-                        "turn": turn,
+                        "turn": self._display_turn,
                         "context_length": self.state.current_conversation_tokens
                     }
                     return
@@ -964,7 +980,7 @@ class Agent:
                 yield {
                     "type": "final",
                     "content": content,
-                    "turn": turn,
+                    "turn": self._display_turn,
                     "context_length": self.state.current_conversation_tokens,
                     "usage": {
                         "input": last_input_tokens,

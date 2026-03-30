@@ -49,6 +49,53 @@ class ContextBuilder(ABC):
         message_json = json.dumps(message)
         return len(encoder.encode(message_json))
 
+    @staticmethod
+    def _cleanup_orphaned_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove tool messages that don't follow an assistant message with tool_calls.
+        
+        This prevents "Tool results must follow an assistant tool call" errors from the LLM.
+        Returns a new list with orphaned tool messages removed.
+        """
+        if not messages:
+            return messages
+        
+        result = []
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            role = msg.get('role')
+            
+            if role != 'tool':
+                # Not a tool message, keep it
+                result.append(msg)
+                i += 1
+                continue
+            
+            # This is a tool message. Look backwards in result to find the preceding assistant.
+            found_assistant_with_tool_calls = False
+            for j in range(len(result) - 1, -1, -1):
+                prev_msg = result[j]
+                prev_role = prev_msg.get('role')
+                if prev_role == 'assistant':
+                    # Check if this assistant has tool_calls
+                    if prev_msg.get('tool_calls'):
+                        found_assistant_with_tool_calls = True
+                    # Stop searching at previous assistant (tool messages belong to nearest assistant)
+                    break
+                elif prev_role == 'user':
+                    # No assistant between user and tool -> orphaned
+                    break
+            
+            if found_assistant_with_tool_calls:
+                result.append(msg)  # Keep valid tool message
+            else:
+                # Orphaned tool message - skip it
+                tool_call_id = msg.get('tool_call_id', 'unknown')
+                logger.warning(f'[DEBUG_CONTEXT] Removing orphaned tool message: {tool_call_id}')
+            i += 1
+        
+        return result
+
 
 class LastNBuilder(ContextBuilder):
     """Simple strategy: keep the last N messages (or last N turns)."""
@@ -88,6 +135,9 @@ class LastNBuilder(ContextBuilder):
         # If max_tokens is provided, attempt to honor it by further truncating
         if max_tokens is not None:
             context = self._truncate_to_max_tokens(context, max_tokens)
+
+        # Clean up any orphaned tool messages that may have been created by truncation
+        context = self._cleanup_orphaned_tool_messages(context)
 
         # Debug output
         if DEBUG_CONTEXT:
@@ -227,6 +277,9 @@ class SummaryBuilder(ContextBuilder):
         # If max_tokens is provided, further truncate from oldest turns
         if max_tokens is not None:
             context = self._truncate_to_max_tokens(context, max_tokens, preserve_system=True)
+        
+        # Clean up any orphaned tool messages that may have been created by truncation
+        context = self._cleanup_orphaned_tool_messages(context)
         
         # Debug output
         if os.environ.get('DEBUG_CONTEXT'):

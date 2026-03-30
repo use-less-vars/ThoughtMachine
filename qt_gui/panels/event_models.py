@@ -40,6 +40,31 @@ class EventModel(QAbstractListModel):
 
     def add_event(self, event):
         """Add an event to the model."""
+        # Check for duplicate user_query events with same turn number
+        # GUI creates synthetic events, agent sends real events - replace synthetic with real
+        etype = event.get('type', '')
+        if etype == 'user_query':
+            turn = event.get('turn', 0)
+            # Look for existing user_query with same turn
+            for i, existing_event in enumerate(self.events):
+                if existing_event.get('type') == 'user_query' and existing_event.get('turn', 0) == turn:
+                    # Debug: print replacement
+                    import os
+                    if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+                        old_content = existing_event.get('content', '')[:50]
+                        new_content = event.get('content', '')[:50]
+                        print(f"[EventModel] Replacing user_query turn={turn}: '{old_content}...' -> '{new_content}...'")
+                    # Replace existing event
+                    self.beginRemoveRows(QModelIndex(), i, i)
+                    self.events.pop(i)
+                    self.endRemoveRows()
+                    # Insert new event at same position
+                    self.beginInsertRows(QModelIndex(), i, i)
+                    self.events.insert(i, event)
+                    self.endInsertRows()
+                    return
+        
+        # No duplicate found, append normally
         position = len(self.events)
         self.beginInsertRows(QModelIndex(), position, position)
         self.events.append(event)

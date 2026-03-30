@@ -66,6 +66,7 @@ class SessionTab(QWidget):
         # State tracking
         self.last_history = None
         self._cached_config = None  # Config created by restart_session for next run
+        self._display_turn = 0  # Counter for GUI grouping of events per user query
 
         self._loading_config = False  # Flag to prevent save during load
         self._closing = False  # Flag to prevent reentrant close
@@ -507,6 +508,8 @@ class SessionTab(QWidget):
             if not query:
                 QMessageBox.warning(self, "No Query", "Please enter a query first.")
                 return
+            # Increment turn counter for new user query
+            self._display_turn += 1
             self.display_user_query(query)
             self.presenter.start_session(query, config_dict, preset_name=preset_name)
             self.query_entry.clear()
@@ -515,9 +518,11 @@ class SessionTab(QWidget):
         elif current_state in [ExecutionState.PAUSED, ExecutionState.WAITING_FOR_USER]:
             # Continue existing session - allow empty query (resume without new input)
             if query:
+                # New user input when continuing - increment turn counter
+                self._display_turn += 1
                 self.display_user_query(query)
             else:
-                # Display a placeholder for empty resume
+                # Display a placeholder for empty resume (no new turn)
                 self.display_user_query("(resumed)")
             self.presenter.continue_session(query)
             self.query_entry.clear()
@@ -577,10 +582,11 @@ class SessionTab(QWidget):
         self.presenter.new_session(name=name if name else None, auto_save_current=False)
         # Clear UI components
         self.output_panel.clear_output()
-        # Reset token counters
+        # Reset token counters and turn counter
         self.total_input = 0
         self.total_output = 0
         self.context_length = 0
+        self._display_turn = 0  # Reset turn counter for new session
         self.status_panel.update_tokens(0, 0)
         self.status_panel.update_context_length(0)
         # Update UI
@@ -592,6 +598,18 @@ class SessionTab(QWidget):
         """Restart the agent with current configuration, staying in the same session."""
         # Get current query (it may be used by presenter? but not needed)
         query = self.query_entry.toPlainText().strip()
+
+        # Sync turn counter with existing events before restart
+        from PyQt6.QtCore import Qt
+        max_turn = 0
+        for i in range(self.event_model.rowCount()):
+            index = self.event_model.index(i, 0)
+            event = self.event_model.data(index, Qt.ItemDataRole.UserRole)
+            if event:
+                turn = event.get('turn', 0)
+                if turn > max_turn:
+                    max_turn = turn
+        self._display_turn = max_turn  # Next query will increment from here
 
         # Restart the agent (preserves session and conversation)
         self.presenter.restart_session(query)
@@ -635,13 +653,14 @@ class SessionTab(QWidget):
             self.pause_btn.setEnabled(False)
             self.status_panel.update_status("Ready")
     
-    def display_user_query(self, query):
+    def display_user_query(self, query, turn=None):
         """Display a user query in the output area."""
         # print(f"[GUI] display_user_query: '{query[:50]}...'")
         # Create a synthetic event for user query
         event = {
             "type": "user_query",
             "content": query,
+            "turn": self._display_turn if turn is None else turn,
             "_detail_level": self.agent_controls_panel.detail_combo.currentText()
         }
         # Delegate to output panel for display
@@ -1627,6 +1646,7 @@ class SessionTab(QWidget):
             event = {
                 'type': 'user_query',
                 'content': content,
+                'turn': self._display_turn,
                 'timestamp': datetime.datetime.now().isoformat(),
                 '_detail_level': detail_level
             }

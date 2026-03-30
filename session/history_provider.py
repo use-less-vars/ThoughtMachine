@@ -133,36 +133,13 @@ class HistoryProvider:
             if len(context) > max_to_show:
                 logger.info(f'  ... and {len(context) - max_to_show} more messages')
         
-        # Validate tool message ordering
-        valid = True
-        for i, msg in enumerate(context):
-            role = msg.get('role')
-            if role == 'tool':
-                # Check previous messages backwards until we find an assistant message
-                found_assistant_with_tool_calls = False
-                for j in range(i-1, -1, -1):
-                    prev_msg = context[j]
-                    prev_role = prev_msg.get('role')
-                    if prev_role == 'assistant':
-                        # Check if this assistant has tool_calls
-                        if prev_msg.get('tool_calls'):
-                            found_assistant_with_tool_calls = True
-                        # Stop searching at previous assistant
-                        break
-                    elif prev_role == 'user':
-                        # No assistant between user and tool -> invalid
-                        break
-                if not found_assistant_with_tool_calls:
-                    logger.warning(
-                        f'[DEBUG_HISTORY_PROVIDER] Tool message at index {i} '
-                        f'does not follow assistant message with tool_calls'
-                    )
-                    if DEBUG_HISTORY_PROVIDER:
-                        logger.warning(f'  Tool message: {msg}')
-                    valid = False
-        
-        if not valid:
-            logger.error('[DEBUG_HISTORY_PROVIDER] Context validation failed: tool messages without preceding assistant tool_calls')
+        # Clean up any orphaned tool messages to prevent LLM errors
+        original_len = len(context)
+        context = ContextBuilder._cleanup_orphaned_tool_messages(context)
+        if DEBUG_HISTORY_PROVIDER and len(context) != original_len:
+            logger.warning(
+                f'[DEBUG_HISTORY_PROVIDER] Removed {original_len - len(context)} orphaned tool messages from context'
+            )
         
         self._cached_context = context
         return context
