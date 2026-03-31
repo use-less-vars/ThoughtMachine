@@ -54,6 +54,8 @@ class _ApplyEditsEngine:
         # Find all matches
         matches = list(re.finditer(find_text, content))
         if not matches:
+            if occurrence == 0:
+                return content  # Nothing to replace
             raise ValueError(
                 f"Edit {edit_index}: Could not find regex pattern in content."
             )
@@ -109,6 +111,8 @@ class _ApplyEditsEngine:
         # If no exact match, try normalized matching
         matches = self._find_normalized_block(content, find_text)
         if not matches:
+            if occurrence == 0:
+                return content  # Nothing to replace
             # Provide helpful error with closest normalized block
             norm_find_lines = self._normalize_lines(find_text)
             content_lines = content.splitlines()

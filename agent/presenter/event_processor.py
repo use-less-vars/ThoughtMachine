@@ -125,7 +125,7 @@ class EventProcessor:
     
     def _process_user_interaction_event(self, event: Dict[str, Any]) -> None:
         """Process user interaction request event."""
-        self.session_lifecycle.state = ExecutionState.PAUSED
+        self.session_lifecycle.state = ExecutionState.WAITING_FOR_USER
         if self.gui_integration:
             self.gui_integration.emit_status_message("Waiting for user input")
         

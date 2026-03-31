@@ -51,48 +51,124 @@ class ContextBuilder(ABC):
 
     @staticmethod
     def _cleanup_orphaned_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Remove tool messages that don't follow an assistant message with tool_calls.
+        """Remove orphaned tool messages and fix incomplete tool call sequences.
         
-        This prevents "Tool results must follow an assistant tool call" errors from the LLM.
-        Returns a new list with orphaned tool messages removed.
+        This prevents "Tool results must follow an assistant tool call" and 
+        "insufficient tool messages following tool_calls message" errors from the LLM.
+        
+        Handles three cases:
+        1. Tool messages without a preceding assistant with tool_calls (orphaned)
+        2. Tool messages that don't match any tool_call_id from the preceding assistant
+        3. Assistant messages with tool_calls that don't have complete tool responses
+        4. Duplicate tool messages for the same tool_call_id
+        
+        Returns a new list with valid message sequences only.
         """
         if not messages:
             return messages
         
         result = []
         i = 0
-        while i < len(messages):
+        n = len(messages)
+        
+        while i < n:
             msg = messages[i]
             role = msg.get('role')
             
-            if role != 'tool':
-                # Not a tool message, keep it
+            if role == 'assistant' and msg.get('tool_calls'):
+                # Found an assistant with tool calls
+                tool_calls = msg.get('tool_calls', [])
+                # Create mapping of tool_call_id to tool call for validation
+                tool_call_id_to_call = {}
+                for tc in tool_calls:
+                    tc_id = tc.get('id')
+                    if tc_id:
+                        tool_call_id_to_call[tc_id] = tc
+                
+                # Collect all tool messages that follow this assistant
+                # (before the next non-tool message)
+                tool_messages = []
+                j = i + 1
+                while j < n and messages[j].get('role') == 'tool':
+                    tool_messages.append(messages[j])
+                    j += 1
+                
+                # Map each tool_call_id to the first matching tool message
+                tool_call_id_to_message = {}
+                extra_tool_messages = []  # Duplicates or non-matching
+                
+                for tool_msg in tool_messages:
+                    tool_call_id = tool_msg.get('tool_call_id')
+                    if tool_call_id in tool_call_id_to_call:
+                        # First message for this tool_call_id? Keep it
+                        if tool_call_id not in tool_call_id_to_message:
+                            tool_call_id_to_message[tool_call_id] = tool_msg
+                        else:
+                            # Duplicate tool message for same tool_call_id
+                            extra_tool_messages.append(tool_msg)
+                            logger.warning(f'[DEBUG_CONTEXT] Removing duplicate tool message for tool_call_id: {tool_call_id}')
+                    else:
+                        # Tool message doesn't match any tool call from this assistant
+                        extra_tool_messages.append(tool_msg)
+                        logger.warning(f'[DEBUG_CONTEXT] Removing tool message with non-matching tool_call_id: {tool_call_id}')
+                
+                # Check if we have at least one tool message for each tool call
+                if len(tool_call_id_to_message) < len(tool_call_id_to_call):
+                    # Incomplete: some tool calls missing responses
+                    # Remove tool_calls field from assistant
+                    cleaned_msg = msg.copy()
+                    cleaned_msg.pop('tool_calls', None)
+                    result.append(cleaned_msg)
+                    missing_count = len(tool_call_id_to_call) - len(tool_call_id_to_message)
+                    logger.warning(f'[DEBUG_CONTEXT] Removing incomplete tool sequence: {len(tool_call_id_to_call)} calls but only {len(tool_call_id_to_message)} valid tool messages ({missing_count} missing)')
+                    # Skip all tool messages (they're orphaned)
+                    i = j
+                else:
+                    # Complete: each tool call has at least one response
+                    # Keep assistant with tool_calls
+                    result.append(msg)
+                    # Add tool messages in the order of tool calls
+                    for tc in tool_calls:
+                        tc_id = tc.get('id')
+                        if tc_id and tc_id in tool_call_id_to_message:
+                            result.append(tool_call_id_to_message[tc_id])
+                    # Skip all tool messages (we've added the ones we need)
+                    i = j
+            elif role == 'tool':
+                # This is a tool message without a preceding assistant with tool_calls
+                # Look backwards in result to find if there's an assistant with tool_calls
+                # that could own this tool message
+                found_matching_assistant = False
+                tool_call_id = msg.get('tool_call_id')
+                
+                # Search backwards through result
+                for j in range(len(result) - 1, -1, -1):
+                    prev_msg = result[j]
+                    prev_role = prev_msg.get('role')
+                    if prev_role == 'assistant':
+                        # Check if this assistant has tool_calls that match our tool_call_id
+                        tool_calls = prev_msg.get('tool_calls', [])
+                        tool_call_ids = {tc.get('id') for tc in tool_calls if tc.get('id')}
+                        if tool_call_id in tool_call_ids:
+                            found_matching_assistant = True
+                        # Stop searching at previous assistant
+                        break
+                    elif prev_role == 'user':
+                        # No assistant between user and tool
+                        break
+                
+                if found_matching_assistant:
+                    # This tool message belongs to an assistant we've already processed
+                    # It should have been added with that assistant, so it's a duplicate
+                    logger.warning(f'[DEBUG_CONTEXT] Removing duplicate tool message: {tool_call_id}')
+                else:
+                    # Orphaned tool message - skip it
+                    logger.warning(f'[DEBUG_CONTEXT] Removing orphaned tool message: {tool_call_id}')
+                i += 1
+            else:
+                # Not a tool message or assistant with tool_calls, keep it
                 result.append(msg)
                 i += 1
-                continue
-            
-            # This is a tool message. Look backwards in result to find the preceding assistant.
-            found_assistant_with_tool_calls = False
-            for j in range(len(result) - 1, -1, -1):
-                prev_msg = result[j]
-                prev_role = prev_msg.get('role')
-                if prev_role == 'assistant':
-                    # Check if this assistant has tool_calls
-                    if prev_msg.get('tool_calls'):
-                        found_assistant_with_tool_calls = True
-                    # Stop searching at previous assistant (tool messages belong to nearest assistant)
-                    break
-                elif prev_role == 'user':
-                    # No assistant between user and tool -> orphaned
-                    break
-            
-            if found_assistant_with_tool_calls:
-                result.append(msg)  # Keep valid tool message
-            else:
-                # Orphaned tool message - skip it
-                tool_call_id = msg.get('tool_call_id', 'unknown')
-                logger.warning(f'[DEBUG_CONTEXT] Removing orphaned tool message: {tool_call_id}')
-            i += 1
         
         return result
 
@@ -153,7 +229,11 @@ class LastNBuilder(ContextBuilder):
         return context
 
     def _truncate_to_max_tokens(self, messages: List[Dict[str, Any]], max_tokens: int) -> List[Dict[str, Any]]:
-        """Truncate messages from the beginning (oldest) until under max_tokens."""
+        """Truncate messages until under max_tokens.
+        
+        By default removes from beginning (oldest). If remove_from_end=True,
+        removes from end (newest) instead.
+        """
         try:
             encoder = tiktoken.get_encoding("cl100k_base")
         except Exception:
@@ -180,7 +260,12 @@ class SummaryBuilder(ContextBuilder):
     Looks for summary system messages in user_history and assembles context as:
     - Main system prompt (first non-summary system message)
     - Most recent summary message (if any)
-    - Most recent N turns after summary (where N = pruning_keep_recent_turns from summary metadata)
+    - First N turns after summary (where N = pruning_keep_recent_turns from summary metadata)
+      These are the turns that were kept from BEFORE the summarization event.
+    - All newer turns that occurred after those kept turns
+    
+    When token limits require truncation and a summary exists, removes from the
+    end (newest messages) first to preserve the originally-kept turns.
     """
 
     def __init__(self, default_keep_turns: int = 5):
@@ -238,27 +323,24 @@ class SummaryBuilder(ContextBuilder):
 
         # Determine which turns to keep
         if summary_msg is not None and keep_turns > 0:
-            # We have a summary: keep the first `keep_turns` turns after summary (the "kept turns")
-            # plus any additional newer turns after those (if any), but we need to respect token limits.
-            # We keep the kept turns (first keep_turns turns after summary) and then
-            # the most recent turns from the remaining turns, up to double keep_turns total turns.
-            # This ensures the agent sees the context that was kept during summarization
-            # plus recent continuation, while limiting overall context size.
-            max_total_turns = keep_turns * 2  # Allow some additional context beyond kept turns
+            # We have a summary: keep_turns refers to turns from BEFORE the summary that were kept
+            # These are the first `keep_turns` turns after the summary.
+            # We MUST keep all of these originally-kept turns.
+            # All newer turns (after the kept turns) are also included, subject to token limits.
             
-            if len(turns) <= max_total_turns:
-                # All turns fit within limit
-                selected_turns = turns
-            else:
-                # Need to select subset: first keep_turns (kept turns) plus newest turns after them
+            # Always keep the originally-kept turns
+            if len(turns) >= keep_turns:
                 kept_turns = turns[:keep_turns]
-                # Newer turns after kept turns
                 newer_turns = turns[keep_turns:]
-                # Take the newest turns from newer_turns
-                newer_to_keep = max_total_turns - keep_turns
-                selected_turns = kept_turns + newer_turns[-newer_to_keep:]
                 
-            turns = selected_turns
+                # Start with kept turns + ALL newer turns
+                # Token limits will trim from newest first if needed (remove_from_end=True)
+                selected_turns = kept_turns + newer_turns
+                
+                turns = selected_turns
+            else:
+                # Fewer turns than keep_turns (shouldn't happen but handle gracefully)
+                turns = turns
         else:
             # No summary or keep_turns == 0: keep only most recent keep_turns turns
             if keep_turns < len(turns):
@@ -274,9 +356,13 @@ class SummaryBuilder(ContextBuilder):
         for turn in turns:
             context.extend(turn)
         
-        # If max_tokens is provided, further truncate from oldest turns
+        # If max_tokens is provided, further truncate
+        # When there's a summary, remove newest turns first (after summary) to preserve originally-kept turns
+        # When no summary, remove oldest turns first
         if max_tokens is not None:
-            context = self._truncate_to_max_tokens(context, max_tokens, preserve_system=True)
+            context = self._truncate_to_max_tokens(context, max_tokens, 
+                                                  preserve_system=True, 
+                                                  remove_from_end=(summary_msg is not None))
         
         # Clean up any orphaned tool messages that may have been created by truncation
         context = self._cleanup_orphaned_tool_messages(context)
@@ -378,8 +464,12 @@ class SummaryBuilder(ContextBuilder):
         return turns
     
     def _truncate_to_max_tokens(self, messages: List[Dict[str, Any]], max_tokens: int, 
-                               preserve_system: bool = True) -> List[Dict[str, Any]]:
-        """Truncate messages from the beginning (oldest) until under max_tokens."""
+                               preserve_system: bool = True, remove_from_end: bool = False) -> List[Dict[str, Any]]:
+        """Truncate messages until under max_tokens.
+        
+        By default removes from beginning (oldest) and preserves system messages.
+        If remove_from_end=True, removes from end (newest) instead.
+        """
         try:
             encoder = tiktoken.get_encoding("cl100k_base")
         except Exception:
@@ -387,16 +477,38 @@ class SummaryBuilder(ContextBuilder):
         
         total = sum(self._estimate_tokens(msg, encoder) for msg in messages)
         
-        # Start from index 0, but skip system messages if preserve_system=True
-        idx_to_remove = 0
-        while total > max_tokens and idx_to_remove < len(messages):
-            if preserve_system and messages[idx_to_remove].get('role') == 'system':
-                idx_to_remove += 1
-                continue
-                
-            # Remove this message
-            removed_msg = messages.pop(idx_to_remove)
-            total -= self._estimate_tokens(removed_msg, encoder)
-            # Note: idx_to_remove stays the same because list shifted
+        if remove_from_end:
+            # Remove from end (newest) first
+            while total > max_tokens and len(messages) > 0:
+                # Skip system messages at the end (though there shouldn't be any)
+                if preserve_system and messages[-1].get('role') == 'system':
+                    # Move to previous message
+                    # But first check if we're stuck (all messages are system)
+                    if all(msg.get('role') == 'system' for msg in messages):
+                        break
+                    # Try the next message from end
+                    for i in range(2, len(messages) + 1):
+                        if not (preserve_system and messages[-i].get('role') == 'system'):
+                            removed_msg = messages.pop(-i)
+                            total -= self._estimate_tokens(removed_msg, encoder)
+                            break
+                    else:
+                        # All remaining messages are system
+                        break
+                else:
+                    removed_msg = messages.pop()
+                    total -= self._estimate_tokens(removed_msg, encoder)
+        else:
+            # Remove from beginning (oldest) first
+            idx_to_remove = 0
+            while total > max_tokens and idx_to_remove < len(messages):
+                if preserve_system and messages[idx_to_remove].get('role') == 'system':
+                    idx_to_remove += 1
+                    continue
+                    
+                # Remove this message
+                removed_msg = messages.pop(idx_to_remove)
+                total -= self._estimate_tokens(removed_msg, encoder)
+                # Note: idx_to_remove stays the same because list shifted
         
         return messages

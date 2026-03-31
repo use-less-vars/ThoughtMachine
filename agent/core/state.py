@@ -23,16 +23,18 @@ class TurnState(enum.Enum):
 
 class ExecutionState(enum.Enum):
     """Unified execution state for agent and GUI."""
-    IDLE = "idle"                     # Ready to start
-    STARTING = "starting"             # Starting up (optional intermediate)
-    RUNNING = "running"              # Actively processing
-    PAUSING = "pausing"              # Pause requested, completing current turn
-    PAUSED = "paused"                # Paused, can resume
-    STOPPING = "stopping"            # Stop requested, cleaning up
-    STOPPED = "stopped"              # Stopped (error, max_turns, etc.)
-    WAITING_FOR_USER = "waiting_for_user"  # Needs user input
-    FINALIZED = "finalized"          # Completed successfully (final tool)
-    MAX_TURNS_REACHED = "max_turns_reached"  # Max turns reached
+    IDLE = "idle"                     # Initial state, ready for input
+    RUNNING = "running"              # Actively processing an atomic turn
+    PAUSING = "pausing"              # Pause requested, finishing current turn
+    PAUSED = "paused"                # Paused after turn completion, ready for input
+    WAITING_FOR_USER = "waiting_for_user"  # Waiting for user interaction (RequestUserInteraction)
+    FINALIZED = "finalized"          # Completed with Final/FinalReport, ready for input
+    STOPPED = "stopped"              # Stopped (error)
+    MAX_TURNS_REACHED = "max_turns_reached"  # Max turns reached, ready for input
+    
+    # States that accept new queries: IDLE, PAUSED, WAITING_FOR_USER, FINALIZED, MAX_TURNS_REACHED
+    # Terminal error state: STOPPED
+    # Active states: RUNNING, PAUSING
 
 
 class SessionState(enum.Enum):

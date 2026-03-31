@@ -178,7 +178,12 @@ class HistoryProvider:
         # Log the addition
         role = message.get('role', 'unknown')
         content_preview = str(message.get('content', ''))[:100]
-        logger.debug(f"HistoryProvider added {role} message: {content_preview}")    
+        logger.debug(f"HistoryProvider added {role} message: {content_preview}")
+    
+    def clear_cache(self) -> None:
+        """Explicitly clear the cached context."""
+        self._cached_context = None
+    
     def check_token_limit(self) -> Tuple[bool, Optional[str]]:
         """
         Check if token limit is approaching or exceeded.

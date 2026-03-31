@@ -1327,10 +1327,9 @@ class SessionTab(QWidget):
         if not conversation:
             return
 
-        # Collect events from conversation with proper turn numbering
+        # Collect events from conversation with simple turn numbering
         events = []
         current_turn = 0
-        in_turn = False  # Whether we're currently processing a turn (user->assistant->tools)
         
         for msg in conversation:
             role = msg['role']
@@ -1342,10 +1341,9 @@ class SessionTab(QWidget):
             # Start new turn on user messages
             if role == 'user':
                 current_turn += 1
-                in_turn = True
             
-            # Assign turn number
-            turn = current_turn if in_turn else 0
+            # Assign turn number (0 for system messages, current_turn for others)
+            turn = 0 if role == 'system' else current_turn
             
             # Handle system messages separately (no turn)
             if role == 'system':

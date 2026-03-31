@@ -590,7 +590,43 @@ def convert_from_legacy_format(legacy_dict: Dict[str, Any]) -> BaseEvent:
         # (they may still be in the dict from legacy conversion)
         cleaned_dict.pop("message", None)
         cleaned_dict.pop("warning", None)
-    
+        
+        # Ensure required fields for warning events
+        if event_type_str == "token_warning":
+            # Ensure old_state and new_state exist
+            if "old_state" not in cleaned_dict:
+                # Try to infer from state field or use defaults
+                state = cleaned_dict.get("state", "warning")
+                cleaned_dict["old_state"] = "low"
+                cleaned_dict["new_state"] = state
+            if "new_state" not in cleaned_dict:
+                # If new_state missing but old_state present, infer from state
+                state = cleaned_dict.get("state", "warning")
+                cleaned_dict["new_state"] = state
+            # Ensure token_count exists (default 0)
+            if "token_count" not in cleaned_dict:
+                cleaned_dict["token_count"] = 0
+            # Ensure warning_message exists (default empty)
+            if "warning_message" not in cleaned_dict:
+                cleaned_dict["warning_message"] = ""
+        elif event_type_str == "turn_warning":
+            # Ensure old_state and new_state exist
+            if "old_state" not in cleaned_dict:
+                # Try to infer from state field or use defaults
+                state = cleaned_dict.get("state", "warning")
+                cleaned_dict["old_state"] = "low"
+                cleaned_dict["new_state"] = state
+            if "new_state" not in cleaned_dict:
+                # If new_state missing but old_state present, infer from state
+                state = cleaned_dict.get("state", "warning")
+                cleaned_dict["new_state"] = state
+            # Ensure turn_count exists (default 0)
+            if "turn_count" not in cleaned_dict:
+                cleaned_dict["turn_count"] = 0
+            # Ensure warning_message exists (default empty)
+            if "warning_message" not in cleaned_dict:
+                cleaned_dict["warning_message"] = ""
+
     # Handle error events missing error_type
     elif event_type_str == "error":
         # If error_type is missing, try to infer from message or use default

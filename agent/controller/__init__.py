@@ -41,8 +41,12 @@ class AgentController(QObject):
 
     def _cleanup_if_thread_dead(self):
         """Check if background thread is dead and reset state if needed."""
+        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+            print(f"[Controller] _cleanup_if_thread_dead called, thread={'alive' if self.thread and self.thread.is_alive() else 'dead/None'}")
         if self.thread is not None and not self.thread.is_alive():
             # Thread has finished but state wasn't cleaned up
+            if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                print(f"[Controller] Thread dead, cleaning up state")
             self._running = False
             self.thread = None
             self.agent = None  # Clear old agent reference
@@ -89,12 +93,20 @@ class AgentController(QObject):
         """Return True if the agent thread is alive and not shutting down."""
         # If _running is False, agent is definitely not running
         if not self._running:
+            if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                print(f"[Controller] is_running: _running=False, returning False (thread alive={self.thread.is_alive() if self.thread else False})")
             return False
         # Check thread status
         if self.thread is not None and self.thread.is_alive():
+            if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                print(f"[Controller] is_running: thread alive, returning True (_running={self._running}, pause_event.is_set={self.pause_event.is_set()}, _pause_requested={self._pause_requested})")
             return True
         # Thread is dead or doesn't exist, ensure state is cleaned up
+        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+            print(f"[Controller] is_running: thread dead or None, cleaning up (thread={self.thread})")
         self._cleanup_if_thread_dead()
+        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+            print(f"[Controller] is_running: after cleanup, _running={self._running}")
         return self._running
     
     def get_config(self):
@@ -163,23 +175,60 @@ class AgentController(QObject):
 
     def continue_session(self, query: str):
         """Submit a new query to the already running agent."""
+        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+            print(f"[Controller] continue_session called: query='{query[:50]}...' is_running={self.is_running} pause_event.is_set={self.pause_event.is_set()}")
+        if os.environ.get('PAUSE_DEBUG'):
+            print(f"[PAUSE_FLOW] Controller.continue_session: query='{query[:50]}...', is_running={self.is_running}, pause_event.is_set={self.pause_event.is_set()}, _pause_requested={self._pause_requested}")
         if not self.is_running:
             # Agent is not running, cannot continue
-            return
+            debug_msg = f"[Controller] Agent not running, cannot continue. _running={self._running}, thread alive={self.thread.is_alive() if self.thread else False}"
+            if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                print(debug_msg)
+            if os.environ.get('PAUSE_DEBUG'):
+                print(f"[PAUSE_FLOW] Controller.continue_session: {debug_msg}")
+            raise RuntimeError(f"Agent controller not running: {debug_msg}")
+        if os.environ.get('PAUSE_DEBUG'):
+            print(f"[PAUSE_FLOW] Controller.continue_session: calling resume() and queuing query")
         self.resume()
         self.query_queue.put(query)
+        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+            print(f"[Controller] Query queued, queue size approx {self.query_queue.qsize()}")
+        if os.environ.get('PAUSE_DEBUG'):
+            print(f"[PAUSE_FLOW] Controller.continue_session: query queued, queue size={self.query_queue.qsize()}")
 
     def request_pause(self):
         """Request agent to pause after current turn."""
+        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+            print(f"[Controller] request_pause called: is_running={self.is_running} _processing_query={self._processing_query} pause_event.is_set={self.pause_event.is_set()}")
         if not self.is_running:
             # Agent is not running, nothing to pause
+            if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                print("[Controller] Agent not running, nothing to pause")
             return
         if self._processing_query:
             # Agent is currently processing a query, set pause flag
+            if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                print("[Controller] Agent processing query, calling pause()")
             self.pause()
         else:
             # Agent is idle, send paused event directly
+            if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                print("[Controller] Agent idle, sending paused event directly")
+            # Clear pause_event to prevent processing and mark as paused
+            self.pause_event.clear()
+            self._pause_requested = True
+            # Signal agent to pause after current turn
+            if hasattr(self, 'agent') and self.agent is not None and hasattr(self.agent, 'request_pause'):
+                self.agent.request_pause()
             self._emit_event({"type": "paused"})
+            # Clean up orphaned tool sequences
+            if hasattr(self, 'agent') and self.agent is not None:
+                from session.context_builder import ContextBuilder
+                if hasattr(self.agent, 'conversation'):
+                    original_len = len(self.agent.conversation)
+                    self.agent.conversation = ContextBuilder._cleanup_orphaned_tool_messages(self.agent.conversation)
+                    if original_len != len(self.agent.conversation) and os.environ.get('THOUGHTMACHINE_DEBUG'):
+                        print(f"[Controller] Cleaned {original_len - len(self.agent.conversation)} orphaned tool messages on idle pause")
 
     def get_conversation(self) -> Optional[List[Dict[str, Any]]]:
         """Return the current conversation from the agent, if available."""
@@ -205,13 +254,40 @@ class AgentController(QObject):
 
     def pause(self):
         """Pause the agent before the next turn (finishes current turn first)."""
+        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+            print(f"[Controller] pause() called, clearing pause_event, setting _pause_requested=True")
         self.pause_event.clear()
         self._pause_requested = True
+        # Signal agent to pause after current turn
+        if hasattr(self, 'agent') and self.agent is not None and hasattr(self.agent, 'request_pause'):
+            self.agent.request_pause()
+        # Clean up any orphaned tool sequences in the agent
+        if hasattr(self, 'agent') and self.agent is not None:
+            # Import the cleanup method
+            from session.context_builder import ContextBuilder
+            # Clean up conversation in agent
+            if hasattr(self.agent, 'conversation'):
+                original_len = len(self.agent.conversation)
+                self.agent.conversation = ContextBuilder._cleanup_orphaned_tool_messages(self.agent.conversation)
+                if original_len != len(self.agent.conversation) and os.environ.get('THOUGHTMACHINE_DEBUG'):
+                    print(f"[Controller] Cleaned {original_len - len(self.agent.conversation)} orphaned tool messages on pause")
 
     def resume(self):
         """Resume a paused agent."""
+        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+            print(f"[Controller] resume() called, setting pause_event, clearing _pause_requested")
+        if os.environ.get('PAUSE_DEBUG'):
+            print(f"[PAUSE_FLOW] Controller.resume: setting pause_event, clearing _pause_requested")
         self.pause_event.set()
         self._pause_requested = False
+        # Also clear pause request flag in agent if it exists
+        if hasattr(self, 'agent') and self.agent is not None:
+            if hasattr(self.agent, '_pause_requested'):
+                if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                    print(f"[Controller] Clearing agent._pause_requested (was {self.agent._pause_requested})")
+                if os.environ.get('PAUSE_DEBUG'):
+                    print(f"[PAUSE_FLOW] Controller.resume: clearing agent._pause_requested")
+                self.agent._pause_requested = False
 
 
 
@@ -233,11 +309,27 @@ class AgentController(QObject):
         try:
             # Define the stop_check function that the agent will call before each turn
             def should_stop():
-                # If paused, wait until pause_event is set again
+                # Check if we should stop
                 if os.environ.get('THOUGHTMACHINE_DEBUG'):
-                    print(f"[Controller] should_stop called, pause_event.is_set={self.pause_event.is_set()}, stop_event.is_set={self.stop_event.is_set()}")
-                self.pause_event.wait()   # blocks while paused
-                return self.stop_event.is_set()
+                    print(f"[Controller] should_stop called, pause_event.is_set={self.pause_event.is_set()}, stop_event.is_set={self.stop_event.is_set()}, _pause_requested={self._pause_requested}")
+                # If stop event is set, return True immediately
+                if self.stop_event.is_set():
+                    if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                        print("[Controller] should_stop: stop_event is set, returning True")
+                    return True
+                # If paused (pause_event cleared), wait until resumed
+                if not self.pause_event.is_set():
+                    if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                        print("[Controller] should_stop: pause_event not set, waiting...")
+                    self.pause_event.wait()  # blocks while paused
+                    if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                        print("[Controller] should_stop: resumed from pause, checking stop_event")
+                    # After resume, check stop_event again
+                    return self.stop_event.is_set()
+                # Not paused and not stopped
+                if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                    print("[Controller] should_stop: not paused, returning False")
+                return False
 
             # If an agent was pre-created (from preset), use it directly
             if hasattr(self, '_agent_override') and self._agent_override is not None:
@@ -264,14 +356,22 @@ class AgentController(QObject):
 
             # Main loop: process queries from queue
             while self._keep_alive:
-                # Wait for next query
+                # Check if we should stop (paused or stopped)
+                if should_stop():
+                    # Agent is paused or stopped, continue loop (will block in should_stop)
+                    continue
+                
+                # Wait for next query (only if not paused)
+                if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                    print(f"[Controller] Before query_queue.get, queue size: {self.query_queue.qsize()}")
                 try:
                     query = self.query_queue.get(timeout=1.0)
+                    if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                        print(f"[Controller] Got query from queue: '{query[:50]}...'")
                 except queue.Empty:
-                    # Check if we should stop (treat as pause)
-                    if self.stop_event.is_set():
-                        self.stop_event.clear()
-                        self._emit_event({"type": "paused"})
+                    # Queue empty, continue loop
+                    if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                        print(f"[Controller] Queue empty after timeout")
                     continue
 
                 if query == "[RESET]":
@@ -292,12 +392,18 @@ class AgentController(QObject):
                         print(f"[Controller] Event: {event['type']}")
                     # Put each event into the queue for the GUI to pick up
                     self._emit_event(event)
+                    if event["type"] == "paused":
+                        self._pause_requested = False
+                        # Agent has paused, break out of event loop to allow new queries
+                        break
 
                     # If this is a terminal event, decide what to do
                     if event["type"] in ("stopped", "error", "max_turns"):
                         # Treat as pause, keep thread alive
                         if os.environ.get('THOUGHTMACHINE_DEBUG'):
                             print(f"[Controller] Terminal event {event['type']} detected, treating as pause")
+                        # Clear pause request flag
+                        self._pause_requested = False
                         # Send paused event to inform GUI
                         self._emit_event({"type": "paused"})
                         break
@@ -310,12 +416,13 @@ class AgentController(QObject):
                         break
                     # For other events (turn), continue processing
                     # Check if pause requested after a turn
-                    if event["type"] == "turn" and self._pause_requested:
-                        if os.environ.get('THOUGHTMACHINE_DEBUG'):
-                            print("[Controller] Pause requested, breaking after turn")
-                        self._pause_requested = False
-                        self._emit_event({"type": "paused"})
-                        break
+                    # Temporarily disabled: pause detection after turn now handled by agent
+                    # if event["type"] == "turn" and self._pause_requested:
+                    #     if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                    #         print("[Controller] Pause requested, breaking after turn")
+                    #     self._pause_requested = False
+                    #     self._emit_event({"type": "paused"})
+                    #     break
 
                 self._processing_query = False
                 # If _keep_alive becomes False, break outer loop

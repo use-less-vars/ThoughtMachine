@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from fast_json_repair import loads as repair_loads
 from tools.final import Final
+from agent.core.turn_transaction import TurnTransaction
 from tools.request_user_interaction import RequestUserInteraction
 from tools.summarize_tool import SummarizeTool
 
@@ -66,7 +67,8 @@ class ToolExecutor:
         tool_calls: List[Dict[str, Any]], 
         add_to_conversation_func,
         update_token_func,
-        agent_id: int
+        agent_id: int,
+        turn_transaction: Optional[TurnTransaction] = None
     ) -> Tuple[List[Dict[str, Any]], bool, bool, Optional[str], Optional[int]]:
         """
         Execute multiple tool calls from an assistant message.
@@ -76,6 +78,7 @@ class ToolExecutor:
             add_to_conversation_func: Function to add messages to conversation.
             update_token_func: Function to update token count and yield events.
             agent_id: ID of the agent for security checks.
+            turn_transaction: Optional TurnTransaction to buffer messages (if None, use add_to_conversation_func).
             
         Returns:
             Tuple of:
@@ -93,7 +96,13 @@ class ToolExecutor:
         summary_requested = False
         summary_text = None
         summary_keep_recent_turns = 0
-        
+
+        # Function to add tool result message (buffered or immediate)
+        def add_tool_result(message):
+            if turn_transaction is not None:
+                turn_transaction.add_tool_result(message)
+            else:
+                add_to_conversation_func(message)
         for tool_call in tool_calls:
             tool_name = tool_call["function"]["name"]
             
@@ -102,7 +111,7 @@ class ToolExecutor:
                 tool_result = self._create_tool_rejection_message(tool_name)
                 
                 # Append tool result with error
-                add_to_conversation_func({
+                add_tool_result({
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
                     "content": tool_result
@@ -131,7 +140,7 @@ class ToolExecutor:
                     tool_result = f"Invalid JSON in arguments: {e}. Raw: {arguments_str}"
                     if self.logger:
                         self.logger.log_error("JSON_DECODE_ERROR", f"Failed to parse JSON for {tool_name}: {e}")
-                    add_to_conversation_func({
+                    add_tool_result({
                         "role": "tool",
                         "tool_call_id": tool_call["id"],
                         "content": tool_result
@@ -188,7 +197,7 @@ class ToolExecutor:
                 self.logger.log_tool_result(tool_name, tool_result, tool_call["id"])
             
             # Append tool result
-            add_to_conversation_func({
+            add_tool_result({
                 "role": "tool",
                 "tool_call_id": tool_call["id"],
                 "content": tool_result

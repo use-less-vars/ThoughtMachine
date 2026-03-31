@@ -195,18 +195,28 @@ class SessionLifecycle:
         Args:
             query: User query string
         """
-        if self.state not in [ExecutionState.PAUSED, ExecutionState.WAITING_FOR_USER]:
-            if os.environ.get('THOUGHTMACHINE_DEBUG'):
-                print(f"[SessionLifecycle] Cannot continue session in state {self.state}")
-            return
-
+        # States that accept new queries: IDLE, PAUSED, WAITING_FOR_USER, FINALIZED, MAX_TURNS_REACHED
+        # But for continue_session (existing session), IDLE might mean session was never started
+        # Actually, let controller handle whether it can accept queries
+        # The controller checks is_running and other internal state
+        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+            print(f"[SessionLifecycle] continue_session called in state {self.state}")
+        # We'll let controller decide; just pass query through
         try:
             self.controller.continue_session(query)
             self.state = ExecutionState.RUNNING
+            if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                print(f"[SessionLifecycle] continue_session successful, state set to RUNNING")
             # Status message will be emitted through event processing
         except Exception as e:
             # Error will be emitted through event processing
-            pass
+            if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                print(f"[SessionLifecycle] Error in continue_session: {e}")
+            if os.environ.get('PAUSE_DEBUG'):
+                print(f"[PAUSE_FLOW] SessionLifecycle.continue_session: controller rejected query: {e}")
+            # Don't set state to RUNNING since controller failed to accept query
+            # Re-raise the exception so presenter can handle it
+            raise
 
     def pause_session(self):
         """Request pause of current session."""

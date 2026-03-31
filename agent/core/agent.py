@@ -30,13 +30,15 @@ from tools.request_user_interaction import RequestUserInteraction
 from tools.summarize_tool import SummarizeTool
 from fast_json_repair import loads as repair_loads
 from session.models import RuntimeParams
+from session.context_builder import ContextBuilder
 
 from agent.core.state import AgentState, ExecutionState, SessionState
 from agent import events as ev
 from .token_counter import TokenCounter
-from .llm_client import LLMClient
+from .llm_client import LLMClient, LLMError
 from .conversation_manager import ConversationManager
 from .tool_executor import ToolExecutor
+from .turn_transaction import TurnTransaction
 from .debug_context import DebugContext
 
 # Import our clean debug logging for pruning/history flow
@@ -67,6 +69,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Debug flag for pause/resume debugging
+PAUSE_DEBUG = os.environ.get('PAUSE_DEBUG') == '1'
+def pause_debug(msg):
+    if PAUSE_DEBUG:
+        print(f"[PAUSE_DEBUG] {msg}")
+
 
 class Agent:
     """Modular agent coordinating specialized components."""
@@ -87,6 +95,7 @@ class Agent:
         """
         self.config = config
         self.session = session
+        self._conversation = []  # Private storage for session-less mode
         
         # Initialize logging if available
         self.logger = None
@@ -103,23 +112,23 @@ class Agent:
             # Initialize security module with logger if available
             try:
                 from thoughtmachine.security import CapabilityRegistry, set_logger as security_set_logger
-                SECURITY_AVAILABLE = True
+                self.security_available = True
                 security_set_logger(self.logger)
             except ImportError:
-                SECURITY_AVAILABLE = False
+                self.security_available = False
         else:
-            SECURITY_AVAILABLE = False
+            self.security_available = False
         
         # Set up conversation
         if session is not None:
             self.session_id = session.session_id
-            self.conversation = session.user_history
+            self._conversation = session.user_history
             # Reconstruct pruned conversation: sysprompt + most recent summary + recent turns
-            self._reconstruct_pruned_conversation_from_session()
+            # No-op with HistoryProvider: runtime context is built dynamically.
         else:
             self.session = None
             self.session_id = session_id
-            self.conversation = initial_conversation.copy() if initial_conversation else []
+            self._conversation = initial_conversation.copy() if initial_conversation else []
         
         # Initialize display turn counter based on existing conversation
         # Count user messages (excluding system warnings) to get current turn number
@@ -148,7 +157,7 @@ class Agent:
             config, 
             None,  # state will be set after initialization
             self.logger,
-            SECURITY_AVAILABLE
+            self.security_available
         )
         
         # Initialize provider via LLMClient
@@ -188,6 +197,7 @@ class Agent:
         self._next_query_queue = queue.Queue()
         self._paused = False
         self._should_reset = False
+        self._pause_requested = False
         
         # Rate limiting state (to be moved to LLMClient in future)
         self.rate_limit_delay = 1.0  # seconds between turns when rate limited
@@ -208,6 +218,37 @@ class Agent:
         # Calculate initial token count for the conversation
         self._update_conversation_token_estimate()
     
+    @property
+    def conversation(self):
+        """Single source of truth for conversation data.
+        
+        Returns:
+            When session exists: session.user_history
+            When no session: internal _conversation list
+        """
+        if self.session is not None:
+            return self.session.user_history
+        return self._conversation
+    
+    @conversation.setter
+    def conversation(self, value):
+        """Control how conversation is replaced.
+        
+        When session exists: replaces contents of session.user_history in-place,
+        updates session.updated_at, and invalidates HistoryProvider cache.
+        
+        When no session: assigns to _conversation.
+        """
+        if self.session is not None:
+            # Replace contents of session.user_history in-place to maintain reference
+            self.session.user_history[:] = value
+            self.session.updated_at = datetime.now()
+            # Invalidate HistoryProvider cache
+            if hasattr(self, 'context_builder') and self.context_builder is not None and hasattr(self.context_builder, '_cached_context'):
+                self.context_builder._cached_context = None
+        else:
+            self._conversation = value
+    
     def _initialize_session_state(self):
         """Initialize session state based on existing history."""
         if self.session is not None:
@@ -221,16 +262,6 @@ class Agent:
                 for event in events:
                     list(self._handle_state_event(event))
     
-    def _reconstruct_pruned_conversation_from_session(self):
-        """No-op with HistoryProvider: runtime context is built dynamically."""
-        # With HistoryProvider, we keep the full append-only history in self.conversation
-        # and let HistoryProvider build runtime context when needed.
-        # This method is kept for backward compatibility but does nothing.
-        logger.debug("[DEBUG_RECONSTRUCT] _reconstruct_pruned_conversation_from_session is no-op with HistoryProvider")
-        # Ensure self.conversation references session.user_history if session exists
-        if self.session is not None and self.conversation is not self.session.user_history:
-            self.conversation = self.session.user_history
-            logger.debug(f"[DEBUG_RECONSTRUCT] Updated conversation reference to session.user_history ({len(self.conversation)} messages)")
     
     def _handle_state_event(self, event):
         """Process a state event (e.g., token warning, turn warning).
@@ -278,6 +309,8 @@ class Agent:
                 self.logger.py_logger.debug(
                     f"Execution state change: {old_state} -> {new_state}"
                 )
+            # Pass through to controller for GUI updates
+            yield event
         elif event.get("type") == "session_state_change":
             # Log session state changes
             old_state = event.get("old_state")
@@ -286,22 +319,32 @@ class Agent:
                 self.logger.py_logger.debug(
                     f"Session state change: {old_state} -> {new_state}"
                 )
+            # Pass through to controller for GUI updates
+            yield event
         elif event.get("type") == "state_change":
             # Just log state changes for now
             if self.logger:
                 self.logger.py_logger.debug(
                     f"State change: {event.get('old_state')} -> {event.get('new_state')}"
                 )
+            # Pass through to controller for GUI updates
+            yield event
     
     def _update_conversation_token_estimate(self):
         """Update current_conversation_tokens by estimating tokens for runtime context."""
         # Get runtime context from HistoryProvider (main prompt + latest summary + recent turns)
-        if self.context_builder is None:
+        if not hasattr(self, 'context_builder') or self.context_builder is None:
             runtime_context = self.conversation
         elif hasattr(self.context_builder, 'get_context_for_llm'):
             runtime_context = self.context_builder.get_context_for_llm()
         else:
             runtime_context = self.context_builder.build(self.conversation)
+        
+        # Clean orphaned tool messages for accurate token estimation
+        original_len = len(runtime_context)
+        runtime_context = ContextBuilder._cleanup_orphaned_tool_messages(runtime_context)
+        if original_len != len(runtime_context):
+            logger.warning(f'[DEBUG_CONTEXT] Token estimate: cleaned {original_len - len(runtime_context)} orphaned tool messages')
         
         estimated_tokens = 0
         for msg in runtime_context:
@@ -316,16 +359,12 @@ class Agent:
                 f"[TOKEN_ESTIMATE] Updated runtime context token estimate: {estimated_tokens} tokens (from {len(runtime_context)}/{len(self.conversation)} messages)"
             )    
     def _add_to_conversation(self, message):
-        """Add a message to the conversation history (session)."""
-        if self.session is None:
-            self.conversation.append(message)
-            return
-        
-        # Use HistoryProvider.add_message if available (ensures cache invalidation)
-        if self.context_builder is not None and hasattr(self.context_builder, 'add_message'):
-            self.context_builder.add_message(message)
-        else:
-            self.conversation.append(message)
+        """Add a message via conversation_manager (ensures cache invalidation)."""
+        pause_debug(f"_add_to_conversation called for {message.get('role')}...")
+        # Delegate to conversation_manager
+        updated = self.conversation_manager.add_message(message, self.conversation)
+        # Update reference via property setter
+        self.conversation = updated
     
     def _estimate_tokens(self, message):
         """Estimate tokens for a message."""
@@ -402,14 +441,106 @@ class Agent:
         self.rate_limit_delay = 1.0
         self.rate_limit_count = 0
         self.rate_limit_active = False
-    
+
+    def restart(self, new_config: AgentConfig):
+        """
+        Reload agent configuration while preserving conversation history.
+        
+        This allows switching LLM providers, models, or other configuration
+        without losing the conversation context.
+        
+        Args:
+            new_config: New AgentConfig to apply
+        """
+        from agent.config import AgentConfig  # Import here to avoid circular imports
+        
+        # Validate config
+        if not isinstance(new_config, AgentConfig):
+            raise TypeError(f"new_config must be AgentConfig, got {type(new_config)}")
+        
+        # Preserve conversation history
+        current_conversation = self.conversation.copy()
+        
+        # Preserve token counts
+        token_counts = self._token_counts.copy()
+        
+        # Reset execution state to IDLE
+        self.state.set_execution_state(ExecutionState.IDLE)
+        
+        # Clear input queue
+        self._next_query_queue = queue.Queue()
+        
+        # Reset pause flags
+        self._paused = False
+        self._pause_requested = False
+        self._should_reset = False
+        
+        # Update config reference
+        self.config = new_config
+        
+        # Reinitialize components with new config
+        self.token_counter = TokenCounter(new_config)
+        self.llm_client = LLMClient(new_config, self.session, self.logger)
+        self.provider = self.llm_client.provider
+        
+        # Update runtime parameters
+        self.runtime_params = RuntimeParams(
+            temperature=new_config.temperature,
+            max_tokens=new_config.max_tokens,
+            top_p=None  # not in config
+        )
+        
+        # Update tool classes
+        self.tool_classes = new_config.tool_classes if new_config.tool_classes is not None else SIMPLIFIED_TOOL_CLASSES
+        self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
+        
+        # Recreate tool executor
+        self.tool_executor = ToolExecutor(
+            self.tool_classes,
+            new_config,
+            self.state,  # state remains the same
+            self.logger,
+            self.security_available
+        )
+        
+        # Recreate context builder
+        max_context_tokens = self._get_max_context_tokens()
+        self.context_builder = self.llm_client.create_context_builder(token_limit=max_context_tokens)
+        if self.context_builder:
+            self.conversation_manager.context_builder = self.context_builder
+        
+        # Re-ensure system prompt with new LLM client
+        self.conversation = self.llm_client.ensure_system_prompt(current_conversation)
+        
+        # Restore token counts
+        self._token_counts = token_counts
+        
+        # Reset rate limiting state
+        self.reset_rate_limiting()
+        
+        # Log restart
+        if self.logger:
+            self.logger.log_info("AGENT_RESTART", f"Configuration reloaded, provider: {self.provider}")
+
+    def request_pause(self):
+        """Request pause at the next atomic turn boundary."""
+        pause_debug(f"request_pause called, setting _pause_requested=True")
+        self._pause_requested = True
+
     def process_query(self, query):
         """Process a user query, appending it to conversation and running the agent.
         Yields events as dicts."""
+        pause_debug(f"process_query called with query: '{query[:50]}...'")
+        pause_debug(f"Current execution state: {self.state.execution_state}")
+        pause_debug(f"Conversation length before adding query: {len(self.conversation)}")
         # Ensure system prompt present
         self.conversation = self.llm_client.ensure_system_prompt(self.conversation)
+
+        # Clear any pending pause request when starting new query
+        pause_debug(f"Clearing _pause_requested (was {self._pause_requested})")
+        self._pause_requested = False
         
-        # Update execution state: use intermediate STARTING state when starting fresh
+        # Update execution state based on current state
         current_exec_state = self.state.execution_state
         if current_exec_state == ExecutionState.RUNNING:
             # This shouldn't happen, but handle gracefully
@@ -422,12 +553,7 @@ class Agent:
                 for yielded_event in self._handle_state_event(event):
                     yield yielded_event
         else:
-            # Starting from IDLE, STOPPED, etc. - use STARTING intermediate state
-            events = self.state.set_execution_state(ExecutionState.STARTING)
-            for event in events:
-                for yielded_event in self._handle_state_event(event):
-                    yield yielded_event
-            # Immediately transition to RUNNING
+            # Starting from IDLE, STOPPED, FINALIZED, or MAX_TURNS_REACHED
             events = self.state.set_execution_state(ExecutionState.RUNNING)
             for event in events:
                 for yielded_event in self._handle_state_event(event):
@@ -446,8 +572,10 @@ class Agent:
             }
             self.logger.log_agent_start(query, config_data)
         # Append user message
+        pause_debug(f"Adding user message to conversation: '{query[:50]}...'")
         user_msg = {"role": "user", "content": query}
         self._add_to_conversation(user_msg)
+        pause_debug(f"After adding user message, conversation length: {len(self.conversation)}")
         # Estimate tokens for the new user message (including JSON structure) and update current count
         estimated_tokens = self._estimate_tokens(user_msg)
         self.state.current_conversation_tokens += estimated_tokens
@@ -583,7 +711,7 @@ class Agent:
             # Debug context monitoring
             self.debug_context.debug_context("before_build", context_builder=self.context_builder)
             
-            if self.context_builder is not None:
+            if hasattr(self, 'context_builder') and self.context_builder is not None:
                 messages = self.context_builder.build(
                     self.conversation,
                     max_tokens=max_context_tokens
@@ -593,6 +721,12 @@ class Agent:
             
             # Debug context monitoring: show runtime context
             self.debug_context.debug_context("after_build", messages=messages, context_builder=self.context_builder)
+            
+            # Final safety cleanup: remove any orphaned tool messages that might have slipped through
+            original_len = len(messages)
+            messages = ContextBuilder._cleanup_orphaned_tool_messages(messages)
+            if original_len != len(messages):
+                logger.warning(f'[DEBUG_CONTEXT] Agent: cleaned {original_len - len(messages)} orphaned tool messages from final context')
             
             if self.logger and hasattr(self.logger, 'py_logger'):
                 # Estimate token count for messages
@@ -642,6 +776,8 @@ class Agent:
                     "type": "token_warning",
                     "message": error,
                     "token_count": request_tokens,
+                    "old_state": "low",
+                    "new_state": "critical",
                     "state": "critical",
                     "request_tokens": request_tokens,
                     "model_context_window": model_context_window
@@ -666,6 +802,8 @@ class Agent:
                     "type": "token_warning",
                     "message": warning,
                     "token_count": request_tokens,
+                    "old_state": "low",
+                    "new_state": "critical",
                     "state": "critical",
                     "request_tokens": request_tokens,
                     "model_context_window": model_context_window
@@ -689,6 +827,8 @@ class Agent:
                     "type": "token_warning",
                     "message": warning,
                     "token_count": request_tokens,
+                    "old_state": "low",
+                    "new_state": "warning",
                     "state": "warning",
                     "request_tokens": request_tokens,
                     "model_context_window": model_context_window
@@ -758,25 +898,26 @@ class Agent:
                 # Continue to next turn with delay between turns
                 break
                 
-            except ProviderError as e:
-                # Handle other provider errors (non-rate-limit)
-                # Update execution state: transition through PAUSING intermediate state
-                events = self.state.set_execution_state(ExecutionState.PAUSING)
+            except (ProviderError, LLMError) as e:
+                # Handle provider errors (including LLMError for provider-independent errors)
+                # Update execution state to STOPPED (error state)
+                events = self.state.set_execution_state(ExecutionState.STOPPED)
                 for event in events:
                     for yielded_event in self._handle_state_event(event):
                         yield yielded_event
-                # Then transition to PAUSED
-                events = self.state.set_execution_state(ExecutionState.PAUSED)
-                for event in events:
-                    for yielded_event in self._handle_state_event(event):
-                        yield yielded_event
+                
+                # Determine error type
+                error_type = "PROVIDER_ERROR"
+                if isinstance(e, LLMError):
+                    error_type = e.error_type.upper()  # e.g., "AUTHENTICATION_ERROR"
+                
                 if self.logger:
-                    self.logger.log_error("PROVIDER_ERROR", str(e))
+                    self.logger.log_error(error_type, str(e))
                     self.logger.log_agent_end("provider_error", f"Provider error: {e}")
                     self.logger.close()
                 yield {
                     "type": "error",
-                    "error_type": "PROVIDER_ERROR",
+                    "error_type": error_type,
                     "message": str(e),
                     "traceback": traceback.format_exc(),
                     "turn": self._display_turn,
@@ -794,13 +935,8 @@ class Agent:
                 # Catch any other unexpected exception
                 logger.exception(f"[Agent] Unexpected exception in process_query: {e}")
 
-                # Update execution state: transition through PAUSING intermediate state
-                events = self.state.set_execution_state(ExecutionState.PAUSING)
-                for event in events:
-                    for yielded_event in self._handle_state_event(event):
-                        yield yielded_event
-                # Then transition to PAUSED
-                events = self.state.set_execution_state(ExecutionState.PAUSED)
+                # Update execution state to STOPPED (error state)
+                events = self.state.set_execution_state(ExecutionState.STOPPED)
                 for event in events:
                     for yielded_event in self._handle_state_event(event):
                         yield yielded_event
@@ -825,23 +961,55 @@ class Agent:
                 }
                 return
             
-            # Extract response content and tool calls from LLMResponse
+            # Extract response content, reasoning, and tool calls from LLMResponse
             content = response.content or ""
+            reasoning = response.reasoning
             tool_calls = response.tool_calls
             
-            # Add assistant message to conversation
+            # Check for pause request before starting turn
+            pause_debug(f"Checking pause request before turn: _pause_requested={self._pause_requested}")
+            if self._pause_requested:
+                pause_debug(f"Pause detected! Transitioning to PAUSING then PAUSED")
+                # Update execution state: transition through PAUSING intermediate state
+                events = self.state.set_execution_state(ExecutionState.PAUSING)
+                for event in events:
+                    for yielded_event in self._handle_state_event(event):
+                        yield yielded_event
+                # Then transition to PAUSED
+                events = self.state.set_execution_state(ExecutionState.PAUSED)
+                for event in events:
+                    for yielded_event in self._handle_state_event(event):
+                        yield yielded_event
+                # Clear pause request flag
+                pause_debug(f"Clearing _pause_requested after pause")
+                self._pause_requested = False
+                # Yield pause event
+                yield {
+                    "type": "paused",
+                    "turn": self._display_turn,
+                    "context_length": self.state.current_conversation_tokens,
+                }
+                return
+            
+            # Create turn transaction for atomic buffering of the turn (assistant message + tool results)
+            turn_transaction = TurnTransaction(self.session, self.context_builder)
+            
+            # Add assistant message to transaction (buffered)
             assistant_msg = {"role": "assistant", "content": content}
+            if reasoning is not None:
+                assistant_msg["reasoning_content"] = reasoning
+            elif tool_calls:
+                assistant_msg["reasoning_content"] = ""  # Empty string for tool calls without reasoning
             if tool_calls:
                 assistant_msg["tool_calls"] = tool_calls
-            self._add_to_conversation(assistant_msg)
+            turn_transaction.add_assistant_message(assistant_msg)
             
             # Update token estimate with assistant message
             for event in self._update_tokens_and_yield():
-                yield event
-            
+                yield event            
             # Yield turn event (GUI expects "turn" type)
             # Note: tool_calls are emitted as separate events, so we set tool_calls to empty list
-            yield {
+            turn_event = {
                 "type": "turn",
                 "content": content,
                 "assistant_content": content,  # For display in EventDelegate
@@ -855,6 +1023,11 @@ class Agent:
                     "total_output": self.total_output_tokens
                 }
             }
+            if reasoning is not None:
+                turn_event["reasoning"] = reasoning
+            elif tool_calls:
+                turn_event["reasoning"] = ""  # Empty string for tool calls without reasoning
+            yield turn_event
             
             # Execute tool calls if present
             if tool_calls:
@@ -863,7 +1036,8 @@ class Agent:
                     tool_calls,
                     add_to_conversation_func=self._add_to_conversation,
                     update_token_func=self._update_tokens_and_yield,
-                    agent_id=0
+                    agent_id=0,
+                    turn_transaction=turn_transaction
                 )
                 
                 # Process tools and determine success/error
@@ -908,20 +1082,19 @@ class Agent:
                         "turn": tool["turn"]
                     }
                 
+                # Commit buffered tool results
+                if turn_transaction:
+                    turn_transaction.commit()
+                
                 # Handle final detection
                 if final_detected:
-                    # Update execution state: transition through PAUSING intermediate state
-                    events = self.state.set_execution_state(ExecutionState.PAUSING)
-                    for event in events:
-                        for yielded_event in self._handle_state_event(event):
-                            yield yielded_event
-                    # Then transition to PAUSED
-                    events = self.state.set_execution_state(ExecutionState.PAUSED)
+                    # Update execution state to FINALIZED (completed with Final/FinalReport)
+                    events = self.state.set_execution_state(ExecutionState.FINALIZED)
                     for event in events:
                         for yielded_event in self._handle_state_event(event):
                             yield yielded_event
                     # Yield final event
-                    yield {
+                    final_event = {
                         "type": "final",
                         "content": content,
                         "turn": self._display_turn,
@@ -933,12 +1106,17 @@ class Agent:
                             "total_output": self.total_output_tokens
                         }
                     }
+                    if reasoning is not None:
+                        final_event["reasoning"] = reasoning
+                    elif tool_calls:
+                        final_event["reasoning"] = ""  # Empty string for tool calls without reasoning
+                    yield final_event
                     return
                 
                 # Handle user interaction request
                 if user_interaction_requested:
-                    # Update execution state to WAITING_FOR_USER
-                    events = self.state.set_execution_state(ExecutionState.PAUSED)
+                    # Update execution state to WAITING_FOR_USER (waiting for user input)
+                    events = self.state.set_execution_state(ExecutionState.WAITING_FOR_USER)
                     for event in events:
                         for yielded_event in self._handle_state_event(event):
                             yield yielded_event
@@ -961,9 +1139,36 @@ class Agent:
                     for event in self._update_tokens_and_yield():
                         yield event
             
+            # Check pause request
+            pause_debug(f"Checking pause request after turn processing: _pause_requested={self._pause_requested}")
+            if self._pause_requested:
+                pause_debug(f"Pause detected after turn processing! Transitioning to PAUSING then PAUSED")
+                # Update execution state: transition through PAUSING intermediate state
+                events = self.state.set_execution_state(ExecutionState.PAUSING)
+                for event in events:
+                    for yielded_event in self._handle_state_event(event):
+                        yield yielded_event
+                # Then transition to PAUSED
+                events = self.state.set_execution_state(ExecutionState.PAUSED)
+                for event in events:
+                    for yielded_event in self._handle_state_event(event):
+                        yield yielded_event
+                # Clear pause request flag
+                pause_debug(f"Clearing _pause_requested after pause (after turn processing)")
+                self._pause_requested = False
+                # Yield pause event
+                yield {
+                    "type": "paused",
+                    "turn": self._display_turn,
+                    "context_length": self.state.current_conversation_tokens,
+                }
+                return
+            
             # Check if we should continue (no tool calls, or tool calls didn't result in user interaction/final)
             if not tool_calls:
                 # No tool calls means the assistant gave a direct answer - we can stop
+                if turn_transaction and turn_transaction.has_assistant_message():
+                    turn_transaction.commit()
                 # Update execution state: transition through PAUSING intermediate state
                 events = self.state.set_execution_state(ExecutionState.PAUSING)
                 for event in events:
@@ -977,7 +1182,7 @@ class Agent:
                 if self.logger:
                     self.logger.log_agent_end("completed", "Assistant provided direct answer with no tool calls")
                     self.logger.close()
-                yield {
+                final_event = {
                     "type": "final",
                     "content": content,
                     "turn": self._display_turn,
@@ -989,6 +1194,11 @@ class Agent:
                         "total_output": self.total_output_tokens
                     }
                 }
+                if reasoning is not None:
+                    final_event["reasoning"] = reasoning
+                elif tool_calls:
+                    final_event["reasoning"] = ""  # Empty string for tool calls without reasoning
+                yield final_event
                 return
     
     def _apply_summary_pruning(self, summary: str, keep_recent_turns: int):
@@ -1078,7 +1288,7 @@ class Agent:
             self.conversation = user_history
         
         # Clear HistoryProvider cache since we modified user_history directly
-        if self.context_builder is not None and hasattr(self.context_builder, '_cached_context'):
+        if hasattr(self, 'context_builder') and self.context_builder is not None and hasattr(self.context_builder, '_cached_context'):
             self.context_builder._cached_context = None
         
         # Log the pruning action

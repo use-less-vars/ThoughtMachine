@@ -9,7 +9,26 @@ import logging
 from typing import Optional, List, Dict, Any
 
 from llm_providers.factory import ProviderFactory
-from llm_providers.exceptions import ProviderError, RateLimitExceeded
+from llm_providers.exceptions import (
+    ProviderError,
+    RateLimitExceeded,
+    AuthenticationError,
+    ModelNotFoundError,
+    TokenLimitExceededError,
+    ProviderTimeoutError,
+    InvalidConfigError,
+    ProviderNotFoundError,
+    ToolFormatError
+)
+
+
+class LLMError(ProviderError):
+    """Generic LLM error for provider-independent error handling."""
+    def __init__(self, error_type: str, message: str, original_exception: Exception = None):
+        self.error_type = error_type
+        self.message = message
+        self.original_exception = original_exception
+        super().__init__(f"{error_type}: {message}")
 
 
 class LLMClient:
@@ -121,7 +140,7 @@ class LLMClient:
             
         Raises:
             RateLimitExceeded: If rate limit is hit.
-            ProviderError: For other provider errors.
+            LLMError: For provider-independent errors (authentication, timeout, etc.).
         """
         try:
             response = self.provider.chat_completion(
@@ -131,11 +150,29 @@ class LLMClient:
             )
             return response
         except RateLimitExceeded as e:
-            # Re-raise for handling by caller
+            # Re-raise for handling by caller (agent has special rate limit handling)
             raise
         except ProviderError as e:
-            # Re-raise for handling by caller
-            raise
+            # Map provider-specific errors to generic LLMError
+            error_mapping = {
+                AuthenticationError: "authentication_error",
+                ModelNotFoundError: "model_not_found",
+                TokenLimitExceededError: "token_limit_exceeded",
+                ProviderTimeoutError: "timeout",
+                InvalidConfigError: "invalid_config",
+                ProviderNotFoundError: "provider_not_found",
+                ToolFormatError: "tool_format_error",
+            }
+            error_type = "provider_error"
+            for provider_exception, generic_type in error_mapping.items():
+                if isinstance(e, provider_exception):
+                    error_type = generic_type
+                    break
+            raise LLMError(
+                error_type=error_type,
+                message=str(e),
+                original_exception=e
+            )
     
     def format_tools(self, tool_definitions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
