@@ -10,7 +10,7 @@ Defines the core concepts:
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-import uuid
+import uuid, hashlib, json
 
 
 class ObservableList(list):
@@ -173,6 +173,8 @@ class Session:
 
     metadata: Dict[str, Any] = field(default_factory=dict)  # name, tags, notes, etc.
     _conversation_changed_callbacks: List[Any] = field(default_factory=list, compare=False, repr=False)
+    _conversation_version: int = field(default=0, compare=False, repr=False)  # Increments on each history change
+    conversation_hash: str = field(default="", compare=False, repr=False)  # Hash of current conversation content
 
     def __post_init__(self):
         # Ensure context_length reflects token counts if not already set
@@ -180,6 +182,12 @@ class Session:
             self.context_length = self.total_input_tokens + self.total_output_tokens
         # Wrap user_history with observable list
         self._wrap_user_history()
+        # Compute initial conversation hash
+        try:
+            conv_str = self._normalize_conversation_for_hash(self.user_history)
+            self.conversation_hash = hashlib.md5(conv_str.encode()).hexdigest()[:8]
+        except Exception:
+            self.conversation_hash = ""
 
     def _wrap_user_history(self):
         """Wrap user_history with ObservableList if not already wrapped."""
@@ -189,9 +197,24 @@ class Session:
             # Ensure callback is set
             self.user_history.callback = self._on_conversation_changed
 
+    @staticmethod
+    def _normalize_conversation_for_hash(conversation: List[Dict[str, Any]]) -> str:
+        """Create normalized JSON representation for consistent hashing.
+        
+        Strips transient fields and ensures consistent ordering for stable hashing.
+        """
+        from .utils import normalize_conversation_for_hash as normalize
+        return normalize(conversation)
     def _on_conversation_changed(self):
         """Called when user_history is mutated."""
         self.updated_at = datetime.now()
+        self._conversation_version += 1
+        # Update conversation hash
+        try:
+            conv_str = self._normalize_conversation_for_hash(self.user_history)
+            self.conversation_hash = hashlib.md5(conv_str.encode()).hexdigest()[:8]
+        except Exception:
+            self.conversation_hash = ""
         for callback in self._conversation_changed_callbacks:
             try:
                 callback()
@@ -208,6 +231,19 @@ class Session:
         """Remove a previously registered callback."""
         if callback in self._conversation_changed_callbacks:
             self._conversation_changed_callbacks.remove(callback)
+
+    @property
+    def conversation_version(self) -> int:
+        """Get current conversation version (increments on each change)."""
+        return self._conversation_version
+
+    def get_conversation_snapshot(self) -> List[Dict[str, Any]]:
+        """
+        Get immutable snapshot of conversation.
+        Returns deep copy to ensure immutability.
+        """
+        import copy
+        return copy.deepcopy(self.user_history)
 
     def update_runtime_params(self, **kwargs) -> None:
         """Update mutable runtime parameters."""

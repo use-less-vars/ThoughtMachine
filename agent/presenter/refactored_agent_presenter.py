@@ -293,6 +293,17 @@ class RefactoredAgentPresenter(QObject):
         """Initial conversation for session loading (backward compatibility)."""
         return self.session_lifecycle._initial_conversation
 
+    def get_conversation_snapshot(self) -> Optional[List[Dict[str, Any]]]:
+        """Get current conversation snapshot from session.
+        
+        Returns:
+            List of conversation messages or None if no session.
+        """
+        session = self.current_session
+        if session:
+            return session.get_conversation_snapshot()
+        return None
+
     @property
     def session_store(self):
         """Session store for GUI access."""

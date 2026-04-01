@@ -105,9 +105,7 @@ class EventProcessor:
             if self.gui_integration:
                 self.gui_integration.emit_context_updated(context_length)
         
-        # Update conversation history
-        if "history" in event:
-            self._update_user_history(event["history"])
+
     
     def _process_token_update_event(self, event: Dict[str, Any]) -> None:
         """Process a token update event."""
@@ -129,9 +127,7 @@ class EventProcessor:
         if self.gui_integration:
             self.gui_integration.emit_status_message("Waiting for user input")
         
-        # Update conversation history
-        if "history" in event:
-            self._update_user_history(event["history"])
+
         
         # Auto-save if needed
         if self.session_lifecycle.has_unsaved_changes():
@@ -175,9 +171,7 @@ class EventProcessor:
                     message = "Paused" if event_type == "stopped" else "Thread finished"
                     self.gui_integration.emit_status_message(message)
         
-        # Update conversation history
-        if "history" in event:
-            self._update_user_history(event["history"])
+
         
         # Auto-save if needed
         self.session_lifecycle.auto_save_current_session()
@@ -192,9 +186,7 @@ class EventProcessor:
             self.gui_integration.emit_error_occurred(error_msg, traceback_text)
             self.gui_integration.emit_status_message(f"Error: {error_msg}")
         
-        # Update conversation history
-        if "history" in event:
-            self._update_user_history(event["history"])
+
         
         # Auto-save if needed
         self.session_lifecycle.auto_save_current_session()
@@ -216,9 +208,7 @@ class EventProcessor:
                 if self.gui_integration:
                     self.gui_integration.emit_status_message(f"Invalid execution state: {new_state_str}")
         
-        # Update conversation history
-        if "history" in event:
-            self._update_user_history(event["history"])
+
     
     def _process_session_state_change_event(self, event: Dict[str, Any]) -> None:
         """Process session state change event."""
@@ -227,9 +217,7 @@ class EventProcessor:
         if new_state and self.gui_integration:
             self.gui_integration.emit_status_message(f"Session state changed to: {new_state}")
         
-        # Update conversation history
-        if "history" in event:
-            self._update_user_history(event["history"])
+
     
     def _process_token_warning_event(self, event: Dict[str, Any]) -> None:
         """Process token warning event."""
@@ -242,9 +230,7 @@ class EventProcessor:
             if hasattr(self.gui_integration, 'emit_warning'):
                 self.gui_integration.emit_warning(f"Token usage warning: {token_count} tokens")
         
-        # Update conversation history
-        if "history" in event:
-            self._update_user_history(event["history"])
+
     
     def _process_turn_warning_event(self, event: Dict[str, Any]) -> None:
         """Process turn warning event."""
@@ -257,9 +243,7 @@ class EventProcessor:
             if hasattr(self.gui_integration, 'emit_warning'):
                 self.gui_integration.emit_warning(f"Turn limit warning: {turn_count} turns")
         
-        # Update conversation history
-        if "history" in event:
-            self._update_user_history(event["history"])
+
     
     def _process_critical_countdown_event(self, event: Dict[str, Any], event_type: str) -> None:
         """Process critical countdown event."""
@@ -273,9 +257,7 @@ class EventProcessor:
             if hasattr(self.gui_integration, 'emit_warning'):
                 self.gui_integration.emit_warning(f"{resource.upper()} critical: {action}")
         
-        # Update conversation history
-        if "history" in event:
-            self._update_user_history(event["history"])
+
     
     def _extract_token_counts(self, event: Dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
         """Extract token counts from event."""
@@ -311,44 +293,4 @@ class EventProcessor:
             context_length = event["usage"]["current_conversation_tokens"]
         return context_length
     
-    def _update_user_history(self, event_history: list) -> None:
-        """
-        Update user_history with current conversation from event.
-
-        Replaces user_history contents in-place with the event's history (which may be pruned).
-        This ensures we save exactly what the agent sees and preserves references.
-        """
-        if event_history:
-            if os.environ.get('THOUGHTMACHINE_DEBUG'):
-                print(f"[EventProcessor] _update_user_history: event_history length={len(event_history)}, current_session exists={self.state_bridge.current_session is not None}")
-                if self.state_bridge.current_session:
-                    print(f"[EventProcessor]   session.user_history length={len(self.state_bridge.current_session.user_history)}")
-                    if len(event_history) > 0:
-                        last_msg = event_history[-1]
-                        print(f"[EventProcessor]   event_history last message role={last_msg.get('role')}, content preview={str(last_msg.get('content', ''))[:50]}...")
-                    if len(self.state_bridge.current_session.user_history) > 0:
-                        last_session_msg = self.state_bridge.current_session.user_history[-1]
-                        print(f"[EventProcessor]   session.user_history last message role={last_session_msg.get('role')}, content preview={str(last_session_msg.get('content', ''))[:50]}...")
-            # Mutate in-place to preserve existing list references
-            session = self.state_bridge.current_session
-            if session:
-                # If session has user_history, update it directly
-                session.user_history[:] = event_history
-                # Mark session as dirty
-                self.session_lifecycle.mark_dirty()
-                if os.environ.get('THOUGHTMACHINE_DEBUG'):
-                    print(f"[EventProcessor] Updated existing session user_history, marked dirty")
-                # Emit conversation changed signal
-                if self.gui_integration:
-                    self.gui_integration.emit_conversation_changed()
-            else:
-                # No session bound, create a new session with the conversation
-                if os.environ.get('THOUGHTMACHINE_DEBUG'):
-                    print(f"[EventProcessor] No session bound, will create session via session_lifecycle")
-                # Update state_bridge.user_history directly so session can be built later
-                self.state_bridge.user_history = event_history
-                # Mark session as dirty to trigger auto-save
-                self.session_lifecycle.mark_dirty()
-                if os.environ.get('THOUGHTMACHINE_DEBUG'):
-                    print(f"[EventProcessor] Updated state_bridge.user_history and marked dirty (no session yet)")
 

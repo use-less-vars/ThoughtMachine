@@ -137,6 +137,7 @@ class Agent:
                 if not content.startswith('[SYSTEM]'):
                     user_msg_count += 1
         self._display_turn = user_msg_count
+        self._conversation_start_time = time.time()
         
         # Initialize modular components
         self.token_counter = TokenCounter(config)
@@ -256,22 +257,23 @@ class Agent:
     @conversation.setter
     def conversation(self, value):
         """Control how conversation is replaced.
-        
+
         When session exists: replaces contents of session.user_history in-place,
         updates session.updated_at, and invalidates HistoryProvider cache.
-        
+
         When no session: assigns to _conversation.
         """
         if self._session is not None:
             # Replace contents of session.user_history in-place to maintain reference
             self._session.user_history[:] = value
             self._session.updated_at = datetime.now()
+            # Manually trigger conversation changed to update version/hash
+            self._session._on_conversation_changed()
             # Invalidate HistoryProvider cache
             if hasattr(self, 'context_builder') and self.context_builder is not None and hasattr(self.context_builder, '_cached_context'):
                 self.context_builder._cached_context = None
         else:
-            self._conversation = value
-    
+            self._conversation = value    
     def _initialize_session_state(self):
         """Initialize session state based on existing history."""
         if self.session is not None:
@@ -333,8 +335,8 @@ class Agent:
                     f"Execution state change: {old_state} -> {new_state}"
                 )
             # Pass through to controller for GUI updates
-            if "history" not in event:
-                event["history"] = self._get_history_for_event()
+            # Always add conversation data (version and history)
+            self._add_conversation_data_to_event(event)
             yield event
         elif event.get("type") == "session_state_change":
             # Log session state changes
@@ -345,8 +347,8 @@ class Agent:
                     f"Session state change: {old_state} -> {new_state}"
                 )
             # Pass through to controller for GUI updates
-            if "history" not in event:
-                event["history"] = self._get_history_for_event()
+            # Use full conversation data with version tracking
+            self._add_conversation_data_to_event(event)
             yield event
         elif event.get("type") == "state_change":
             # Just log state changes for now
@@ -355,8 +357,8 @@ class Agent:
                     f"State change: {event.get('old_state')} -> {event.get('new_state')}"
                 )
             # Pass through to controller for GUI updates
-            if "history" not in event:
-                event["history"] = self._get_history_for_event()
+            # Always add conversation data (version and history)
+            self._add_conversation_data_to_event(event)
             yield event
     
     def _update_conversation_token_estimate(self):
@@ -396,6 +398,11 @@ class Agent:
         # Update reference via property setter
         self.conversation = updated
         pause_debug(f"After add, conversation length: {len(self.conversation)}")
+        # Invalidate context builder cache to ensure fresh snapshot for events
+        if hasattr(self, 'context_builder') and self.context_builder is not None:
+            if hasattr(self.context_builder, '_cached_context'):
+                self.context_builder._cached_context = None
+                pause_debug(f"Cleared context builder cache after adding {message.get('role')} message")
     
     def _estimate_tokens(self, message):
         """Estimate tokens for a message."""
@@ -408,7 +415,7 @@ class Agent:
             tool_tokens: Optional token count for tool result (ignored, we recalculate).
         """
         self._update_conversation_token_estimate()
-        yield {
+        event_dict = {
             "type": "token_update",
             "context_length": self.state.current_conversation_tokens,
             "usage": {
@@ -418,6 +425,8 @@ class Agent:
                 "total_output": self.total_output_tokens
             }
         }
+        self._add_conversation_data_to_event(event_dict)
+        yield event_dict
     
     # Token tracking properties (unified with session)
     @property
@@ -458,21 +467,59 @@ class Agent:
         
         return max_context
     
-    def _get_history_for_event(self):
-        """Get history copy for inclusion in events."""
+    def _get_conversation_data_for_event(self) -> Dict[str, Any]:
+        """
+        Get conversation data for events with version tracking.
+        Returns dict with conversation metadata for version tracking.
+        """
+        # Base conversation data
         if self.session is not None:
-            return self.session.user_history.copy()
-        return self.conversation.copy()
+            base_data = {
+                'conversation_version': self.session.conversation_version,
+                'conversation_hash': self.session.conversation_hash,
+            }
+        else:
+            # No session, use local conversation with synthetic version
+            import hashlib
+            from session.utils import normalize_conversation_for_hash
+            conv_str = normalize_conversation_for_hash(self.conversation)
+            version_hash = hashlib.md5(conv_str.encode()).hexdigest()[:8]
+            version = int(version_hash, 16) if version_hash else 0
+            base_data = {
+                'conversation_version': version,
+                'conversation_hash': version_hash,
+            }
+        
+        # Add required conversation metadata for GUI
+        conversation_id = self.session_id if self.session_id else base_data.get('conversation_hash', '')
+        conversation_timestamp = getattr(self, '_conversation_start_time', time.time())
+        conversation_tokens = self.state.current_conversation_tokens
+        conversation_turns = self.state.current_turn
+        
+        # Merge all data
+        return {
+            **base_data,
+            'conversation_id': conversation_id,
+            'conversation_timestamp': conversation_timestamp,
+            'conversation_tokens': conversation_tokens,
+            'conversation_turns': conversation_turns,
+        }
+
+    def _add_conversation_data_to_event(self, event: Dict[str, Any]) -> None:
+        """Add conversation version and history to event."""
+        conv_data = self._get_conversation_data_for_event()
+        event.update(conv_data)
 
     def _create_token_update_event(self) -> dict:
         """Create token update event."""
-        return {
+        event = {
             "type": "token_update",
             "context_length": self.state.current_conversation_tokens,
-            "history": self._get_history_for_event(),
             "total_input": self.total_input_tokens,
             "total_output": self.total_output_tokens
         }
+        self._add_conversation_data_to_event(event)
+        return event
     
     def reset_rate_limiting(self):
         """Reset rate limiting state."""
@@ -632,11 +679,13 @@ class Agent:
         self._display_turn = getattr(self, '_display_turn', 0) + 1
         
         # Emit user query event for GUI display
-        yield {
+        event_dict = {
             "type": "user_query",
             "content": query,
             "turn": self._display_turn  # Unique turn number for this query
         }
+        self._add_conversation_data_to_event(event_dict)
+        yield event_dict
 
         prev_conversation_len = len(self.conversation)
         last_input_tokens = 0
@@ -670,14 +719,15 @@ class Agent:
                     self.logger.log_stop_signal()
                     self.logger.log_agent_end("stopped", "Stop signal received")
                     self.logger.close()
-                yield {
+                stopped_event = {
                     "type": "stopped",
                     "turn": self._display_turn,
                     "context_length": self.state.current_conversation_tokens,
-                    "history": self.session.user_history.copy() if self.session is not None else self.conversation.copy(),
                     "usage": {"input": last_input_tokens, "output": last_output_tokens,
                               "total_input": self.total_input_tokens, "total_output": self.total_output_tokens}
                 }
+                self._add_conversation_data_to_event(stopped_event)
+                yield stopped_event
                 return            
             # Turn monitoring warning
             turn_events = self.state.update_turn_state(turn)
@@ -692,13 +742,12 @@ class Agent:
                     # Emit token update event for real-time tracking
                     yield self._create_token_update_event()
                 # Yield event with usage info
-                yield {
+                event_dict = {
                     "type": event["type"],
                     "message": event.get("message", event.get("warning", "")),
                     "turn_count": event.get("turn_count", turn),
                     "turn": self._display_turn,  # Add turn for GUI grouping
                     "context_length": self.state.current_conversation_tokens,
-                    "history": self._get_history_for_event(),
                     "usage": {
                         "input": last_input_tokens,
                         "output": last_output_tokens,
@@ -706,6 +755,8 @@ class Agent:
                         "total_output": self.total_output_tokens,
                     }
                 }
+                self._add_conversation_data_to_event(event_dict)
+                yield event_dict
 
             # Update conversation token estimate from scratch to prevent drift
             self._update_conversation_token_estimate()
@@ -724,13 +775,12 @@ class Agent:
                     # Emit token update event for real-time tracking
                     yield self._create_token_update_event()
                 # Yield event with usage info
-                yield {
+                event_dict = {
                     "type": event["type"],
                     "message": event.get("message", event.get("warning", "")),
                     "token_count": event.get("token_count", self.state.current_conversation_tokens),
                     "turn": self._display_turn,  # Add turn for GUI grouping
                     "context_length": self.state.current_conversation_tokens,
-                    "history": self._get_history_for_event(),
                     "usage": {
                         "input": last_input_tokens,
                         "output": last_output_tokens,
@@ -738,6 +788,8 @@ class Agent:
                         "total_output": self.total_output_tokens,
                     }
                 }
+                self._add_conversation_data_to_event(event_dict)
+                yield event_dict
             
             # Ensure any assistant message with tool_calls has reasoning_content field
             for msg in self.conversation:
@@ -827,17 +879,18 @@ class Agent:
                 # Emit token update event for real-time tracking
                 yield self._create_token_update_event()
                 # Yield error event
-                yield {
+                event_dict = {
                     "type": "token_warning",
                     "message": error,
                     "token_count": request_tokens,
                     "old_state": "low",
                     "new_state": "critical",
                     "state": "critical",
-                    "history": self._get_history_for_event(),
                     "request_tokens": request_tokens,
                     "model_context_window": model_context_window
                 }
+                self._add_conversation_data_to_event(event_dict)
+                yield event_dict
                 # Still attempt API call but it will likely fail
                 if self.logger:
                     self.logger.log_token_warning(
@@ -854,17 +907,18 @@ class Agent:
                 # Emit token update event for real-time tracking
                 yield self._create_token_update_event()
                 # Yield token warning event
-                yield {
+                event_dict = {
                     "type": "token_warning",
                     "message": warning,
                     "token_count": request_tokens,
                     "old_state": "low",
                     "new_state": "critical",
                     "state": "critical",
-                    "history": self._get_history_for_event(),
                     "request_tokens": request_tokens,
                     "model_context_window": model_context_window
                 }
+                self._add_conversation_data_to_event(event_dict)
+                yield event_dict
                 if self.logger:
                     self.logger.log_token_warning(
                         "low", "critical", request_tokens,
@@ -880,17 +934,18 @@ class Agent:
                 # Emit token update event for real-time tracking
                 yield self._create_token_update_event()
                 # Yield token warning event
-                yield {
+                event_dict = {
                     "type": "token_warning",
                     "message": warning,
                     "token_count": request_tokens,
                     "old_state": "low",
                     "new_state": "warning",
                     "state": "warning",
-                    "history": self._get_history_for_event(),
                     "request_tokens": request_tokens,
                     "model_context_window": model_context_window
                 }
+                self._add_conversation_data_to_event(event_dict)
+                yield event_dict
                 if self.logger:
                     self.logger.log_token_warning(
                         "low", "warning", request_tokens,
@@ -940,15 +995,16 @@ class Agent:
                     self.logger.log_error("RATE_LIMIT", f"Rate limit exceeded, waiting {wait_time}s, delay between turns: {self.rate_limit_delay}s")
                 
                 # Yield rate limit warning event
-                yield {
+                event_dict = {
                     "type": "rate_limit_warning",
                     "message": f"Rate limit exceeded. Waiting {wait_time}s before retrying. Delay between turns: {self.rate_limit_delay}s",
                     "wait_time": wait_time,
                     "turn_delay": self.rate_limit_delay,
                     "rate_limit_count": self.rate_limit_count,
                     "turn": self._display_turn,
-                    "history": self._get_history_for_event(),
                 }
+                self._add_conversation_data_to_event(event_dict)
+                yield event_dict
                 
                 # Wait the initial wait time
                 import time
@@ -974,14 +1030,13 @@ class Agent:
                     self.logger.log_error(error_type, str(e))
                     self.logger.log_agent_end("provider_error", f"Provider error: {e}")
                     self.logger.close()
-                yield {
+                event_dict = {
                     "type": "error",
                     "error_type": error_type,
                     "message": str(e),
                     "traceback": traceback.format_exc(),
                     "turn": self._display_turn,
                     "context_length": self.state.current_conversation_tokens,
-                    "history": self.session.user_history.copy() if self.session is not None else self.conversation.copy(),
                     "usage": {
                         "input": last_input_tokens,
                         "output": last_output_tokens,
@@ -989,6 +1044,8 @@ class Agent:
                         "total_output": self.total_output_tokens,
                     }
                 }
+                self._add_conversation_data_to_event(event_dict)
+                yield event_dict
                 return
             except Exception as e:
                 # Catch any other unexpected exception
@@ -1003,14 +1060,13 @@ class Agent:
                     self.logger.log_error("UNEXPECTED_ERROR", str(e))
                     self.logger.log_agent_end("unexpected_error", f"Unexpected error: {e}")
                     self.logger.close()
-                yield {
+                event_dict = {
                     "type": "error",
                     "error_type": "UNEXPECTED_ERROR",
                     "message": str(e),
                     "traceback": traceback.format_exc(),
                     "turn": self._display_turn,
                     "context_length": self.state.current_conversation_tokens,
-                    "history": self.session.user_history.copy() if self.session is not None else self.conversation.copy(),
                     "usage": {
                         "input": last_input_tokens,
                         "output": last_output_tokens,
@@ -1018,6 +1074,8 @@ class Agent:
                         "total_output": self.total_output_tokens,
                     }
                 }
+                self._add_conversation_data_to_event(event_dict)
+                yield event_dict
                 return
             
             # Extract response content, reasoning, and tool calls from LLMResponse
@@ -1043,11 +1101,13 @@ class Agent:
                 pause_debug(f"Clearing _pause_requested after pause")
                 self._pause_requested = False
                 # Yield pause event
-                yield {
+                pause_event = {
                     "type": "paused",
                     "turn": self._display_turn,
                     "context_length": self.state.current_conversation_tokens,
                 }
+                self._add_conversation_data_to_event(pause_event)
+                yield pause_event
                 return
             
             # Create turn transaction for atomic buffering of the turn (assistant message + tool results)
@@ -1075,7 +1135,6 @@ class Agent:
                 "tool_calls": [],  # Tool calls emitted as separate events
                 "turn": self._display_turn,  # Use display turn for grouping
                 "context_length": self.state.current_conversation_tokens,
-                "history": self._get_history_for_event(),
                 "usage": {
                     "input": last_input_tokens,
                     "output": last_output_tokens,
@@ -1087,6 +1146,7 @@ class Agent:
                 turn_event["reasoning"] = reasoning
             elif tool_calls:
                 turn_event["reasoning"] = ""  # Empty string for tool calls without reasoning
+            self._add_conversation_data_to_event(turn_event)
             yield turn_event
             
             # Execute tool calls if present
@@ -1122,7 +1182,7 @@ class Agent:
                 
                 # Yield tool call events (without results)
                 for tool in processed_tools:
-                    yield {
+                    event_dict = {
                         "type": "tool_call",
                         "tool_name": tool["name"],
                         "arguments": tool["arguments"],
@@ -1130,10 +1190,12 @@ class Agent:
                         "error": tool["error"],
                         "turn": tool["turn"]
                     }
+                    self._add_conversation_data_to_event(event_dict)
+                    yield event_dict
                 
                 # Yield tool result events
                 for tool in processed_tools:
-                    yield {
+                    event_dict = {
                         "type": "tool_result",
                         "tool_name": tool["name"],
                         "result": tool["result"],
@@ -1141,6 +1203,8 @@ class Agent:
                         "error": tool["error"],
                         "turn": tool["turn"]
                     }
+                    self._add_conversation_data_to_event(event_dict)
+                    yield event_dict
                 
                 # Commit buffered tool results
                 if turn_transaction:
@@ -1159,7 +1223,6 @@ class Agent:
                         "content": content,
                         "turn": self._display_turn,
                         "context_length": self.state.current_conversation_tokens,
-                        "history": self._get_history_for_event(),
                         "usage": {
                             "input": last_input_tokens,
                             "output": last_output_tokens,
@@ -1171,6 +1234,7 @@ class Agent:
                         final_event["reasoning"] = reasoning
                     elif tool_calls:
                         final_event["reasoning"] = ""  # Empty string for tool calls without reasoning
+                    self._add_conversation_data_to_event(final_event)
                     yield final_event
                     return
                 
@@ -1182,13 +1246,14 @@ class Agent:
                         for yielded_event in self._handle_state_event(event):
                             yield yielded_event
                     # Yield user interaction requested event
-                    yield {
+                    event_dict = {
                         "type": "user_interaction_requested",
                         "message": "Waiting for user input",
                         "turn": self._display_turn,
                         "context_length": self.state.current_conversation_tokens,
-                        "history": self._get_history_for_event()
                     }
+                    self._add_conversation_data_to_event(event_dict)
+                    yield event_dict
                     return
                 
                 # Handle summary request
@@ -1219,11 +1284,13 @@ class Agent:
                 pause_debug(f"Clearing _pause_requested after pause (after turn processing)")
                 self._pause_requested = False
                 # Yield pause event
-                yield {
+                pause_event = {
                     "type": "paused",
                     "turn": self._display_turn,
                     "context_length": self.state.current_conversation_tokens,
                 }
+                self._add_conversation_data_to_event(pause_event)
+                yield pause_event
                 return
             
             # Check if we should continue (no tool calls, or tool calls didn't result in user interaction/final)
@@ -1249,7 +1316,6 @@ class Agent:
                     "content": content,
                     "turn": self._display_turn,
                     "context_length": self.state.current_conversation_tokens,
-                    "history": self._get_history_for_event(),
                     "usage": {
                         "input": last_input_tokens,
                         "output": last_output_tokens,
@@ -1261,6 +1327,7 @@ class Agent:
                     final_event["reasoning"] = reasoning
                 elif tool_calls:
                     final_event["reasoning"] = ""  # Empty string for tool calls without reasoning
+                self._add_conversation_data_to_event(final_event)
                 yield final_event
                 return
     
