@@ -83,6 +83,8 @@ class SessionLifecycle:
             config: Optional configuration overrides
             preset_name: Optional preset name to use instead of config
         """
+        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+            print(f"[SessionLifecycle] start_session called, state={self.state}, current_session exists={self.state_bridge.current_session is not None}")
         if self.state != ExecutionState.IDLE:
             if os.environ.get('THOUGHTMACHINE_DEBUG'):
                 print(f"[SessionLifecycle] Cannot start session in state {self.state}")
@@ -161,8 +163,7 @@ class SessionLifecycle:
         if auto_save_current and self.has_unsaved_changes():
             if os.environ.get('THOUGHTMACHINE_DEBUG'):
                 print("[SessionLifecycle] Auto-saving current session before starting new session")
-            # Auto-save will be implemented when save_session is added
-            pass
+            self.auto_save_current_session()
         
         # If agent is running, stop it first (best effort)
         if self.controller.is_running:
@@ -300,6 +301,8 @@ class SessionLifecycle:
         Returns:
             True if saved successfully, False otherwise
         """
+        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+            print(f"[SessionLifecycle] save_session called, has_unsaved_changes={self.has_unsaved_changes()}, current_session_id={self.state_bridge.current_session_id}")
         try:
             # Build session from current state
             session = self._build_session_from_current_state()
@@ -379,8 +382,7 @@ class SessionLifecycle:
         if auto_save and self.has_unsaved_changes():
             if os.environ.get('THOUGHTMACHINE_DEBUG'):
                 print("[SessionLifecycle] Auto-saving current session before loading new session")
-            # Auto-save will be implemented when auto_save_current_session is added
-            pass
+            self.auto_save_current_session()
 
         try:
             # Convert to absolute path for consistency
@@ -563,6 +565,8 @@ class SessionLifecycle:
 
     def _build_session_from_current_state(self):
         """Construct a Session object from current presenter state."""
+        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+            print(f"[SessionLifecycle] _build_session_from_current_state: user_history length={len(self.state_bridge.user_history) if self.state_bridge.user_history else 0}, current_session_id={self.state_bridge.current_session_id}, current_session exists={self.state_bridge.current_session is not None}")
         # Get the full conversation from the current session
         conversation = None
         if self.state_bridge.user_history:
@@ -573,6 +577,8 @@ class SessionLifecycle:
             if conversation is None:
                 conversation = self._initial_conversation
                 if conversation is None:
+                    if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                        print(f"[SessionLifecycle] _build_session_from_current_state: No conversation found")
                     return None
 
         if not conversation:
@@ -624,6 +630,8 @@ class SessionLifecycle:
         Returns:
             True if saved or no need to save, False on error.
         """
+        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+            print(f"[SessionLifecycle] auto_save_current_session called, dirty={self._dirty}, current_session_id={self.state_bridge.current_session_id}, current_session exists={self.state_bridge.current_session is not None}")
         if not self.has_unsaved_changes():
             if os.environ.get('THOUGHTMACHINE_DEBUG'):
                 print("[SessionLifecycle] No unsaved changes, skipping auto-save")

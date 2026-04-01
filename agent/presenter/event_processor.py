@@ -135,8 +135,7 @@ class EventProcessor:
         
         # Auto-save if needed
         if self.session_lifecycle.has_unsaved_changes():
-            # This will be implemented when session lifecycle has auto-save
-            pass
+            self.session_lifecycle.auto_save_current_session()
     
     def _process_paused_event(self, event: Dict[str, Any]) -> None:
         """Process paused event."""
@@ -146,8 +145,7 @@ class EventProcessor:
         
         # Auto-save if needed
         if self.session_lifecycle.has_unsaved_changes():
-            # This will be implemented when session lifecycle has auto-save
-            pass
+            self.session_lifecycle.auto_save_current_session()
     
     def _process_terminal_event(self, event: Dict[str, Any], event_type: str) -> None:
         """Process terminal event (final, stopped, max_turns, thread_finished)."""
@@ -180,7 +178,10 @@ class EventProcessor:
         # Update conversation history
         if "history" in event:
             self._update_user_history(event["history"])
-    
+        
+        # Auto-save if needed
+        self.session_lifecycle.auto_save_current_session()
+
     def _process_error_event(self, event: Dict[str, Any]) -> None:
         """Process error event."""
         self.session_lifecycle.state = ExecutionState.PAUSED
@@ -194,6 +195,9 @@ class EventProcessor:
         # Update conversation history
         if "history" in event:
             self._update_user_history(event["history"])
+        
+        # Auto-save if needed
+        self.session_lifecycle.auto_save_current_session()
     
     def _process_execution_state_change_event(self, event: Dict[str, Any]) -> None:
         """Process execution state change event."""
@@ -315,6 +319,16 @@ class EventProcessor:
         This ensures we save exactly what the agent sees and preserves references.
         """
         if event_history:
+            if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                print(f"[EventProcessor] _update_user_history: event_history length={len(event_history)}, current_session exists={self.state_bridge.current_session is not None}")
+                if self.state_bridge.current_session:
+                    print(f"[EventProcessor]   session.user_history length={len(self.state_bridge.current_session.user_history)}")
+                    if len(event_history) > 0:
+                        last_msg = event_history[-1]
+                        print(f"[EventProcessor]   event_history last message role={last_msg.get('role')}, content preview={str(last_msg.get('content', ''))[:50]}...")
+                    if len(self.state_bridge.current_session.user_history) > 0:
+                        last_session_msg = self.state_bridge.current_session.user_history[-1]
+                        print(f"[EventProcessor]   session.user_history last message role={last_session_msg.get('role')}, content preview={str(last_session_msg.get('content', ''))[:50]}...")
             # Mutate in-place to preserve existing list references
             session = self.state_bridge.current_session
             if session:
@@ -322,11 +336,19 @@ class EventProcessor:
                 session.user_history[:] = event_history
                 # Mark session as dirty
                 self.session_lifecycle.mark_dirty()
+                if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                    print(f"[EventProcessor] Updated existing session user_history, marked dirty")
                 # Emit conversation changed signal
                 if self.gui_integration:
                     self.gui_integration.emit_conversation_changed()
             else:
-                # No session bound, this shouldn't happen but handle gracefully
+                # No session bound, create a new session with the conversation
                 if os.environ.get('THOUGHTMACHINE_DEBUG'):
-                    print("[EventProcessor] WARNING: No session bound when updating user history")
+                    print(f"[EventProcessor] No session bound, will create session via session_lifecycle")
+                # Update state_bridge.user_history directly so session can be built later
+                self.state_bridge.user_history = event_history
+                # Mark session as dirty to trigger auto-save
+                self.session_lifecycle.mark_dirty()
+                if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                    print(f"[EventProcessor] Updated state_bridge.user_history and marked dirty (no session yet)")
 

@@ -8,6 +8,12 @@ import os
 import logging
 from typing import List, Dict, Any, Optional
 
+# Debug flag for pause/resume debugging
+PAUSE_DEBUG = os.environ.get('PAUSE_DEBUG') == '1'
+def pause_debug(msg):
+    if PAUSE_DEBUG:
+        print(f"[PAUSE_DEBUG] {msg}")
+
 
 class DebugContext:
     """Debug helper for context monitoring."""

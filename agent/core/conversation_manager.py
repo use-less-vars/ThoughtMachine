@@ -9,6 +9,8 @@ import logging
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
+from .debug_context import pause_debug
+
 
 class ConversationManager:
     """Manages conversation history, message grouping, and pruning operations."""
@@ -37,20 +39,27 @@ class ConversationManager:
         Returns:
             Updated conversation list.
         """
+        pause_debug(f"ConversationManager.add_message called. session exists: {self.session is not None}, context_builder exists: {self.context_builder is not None}")
+        pause_debug(f"Message role: {message.get('role')}, content preview: {str(message.get('content', ''))[:50]}...")
+        pause_debug(f"Current conversation length: {len(conversation)}")
+        if self.context_builder is not None:
+            pause_debug(f"context_builder type: {type(self.context_builder)}")
         if self.session is None:
-            # Fallback for agent without session (should not happen in normal use)
+            pause_debug("No session, appending directly to conversation")
             conversation.append(message)
             return conversation
         
         # Use HistoryProvider.add_message if available (ensures cache invalidation)
         if self.context_builder is not None and hasattr(self.context_builder, 'add_message'):
+            pause_debug(f"Delegating to context_builder.add_message. Type: {type(self.context_builder)}")
             self.context_builder.add_message(message)
         else:
             # Fallback: append directly
+            pause_debug("FALLBACK: No context_builder with add_message, appending directly to session.user_history")
             self.session.user_history.append(message)
             self.session.updated_at = datetime.now()
-        
         # Return the session's user_history
+        pause_debug(f"Returning session.user_history length: {len(self.session.user_history)}")
         return self.session.user_history
     
     def group_messages_into_turns(self, messages: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:

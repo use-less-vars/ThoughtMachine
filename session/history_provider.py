@@ -77,12 +77,22 @@ class HistoryProvider:
     """Manages conversation history for token-limited LLM context windows."""
     
     def __init__(self, session: Session, token_limit: Optional[int] = None):
-        self.session = session
+        self._session = session
         self.token_limit = token_limit
         self._cached_context: Optional[List[Dict[str, Any]]] = None
         
         # Use SummaryBuilder for context assembly
         self.context_builder = SummaryBuilder()
+    
+    @property
+    def session(self):
+        return self._session
+    
+    @session.setter
+    def session(self, value):
+        self._session = value
+        # Clear cache when session changes
+        self._cached_context = None
         
     def get_context_for_llm(self) -> List[Dict[str, Any]]:
         """Return messages suitable for LLM context (pruned view)."""
@@ -156,6 +166,8 @@ class HistoryProvider:
     
     def add_message(self, message: Dict[str, Any]) -> None:
         """Append message to session.user_history."""
+        session_id = self.session.session_id if self.session and hasattr(self.session, 'session_id') else 'no-id'
+        print(f"[HISTORY_DEBUG] HistoryProvider.add_message called: role={message.get('role')}, session_id={session_id}, history_len={len(self.session.user_history) if self.session else 'no session'}")
         self.session.user_history.append(message)
         self.session.updated_at = datetime.now()
         self._cached_context = None

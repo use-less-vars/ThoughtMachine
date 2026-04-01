@@ -98,12 +98,15 @@ class FileSystemSessionStore(SessionStore):
 
     def save_session(self, session: Session) -> None:
         """Save a session to a JSON file."""
+        logger.debug(f"[SessionStore] Saving session {session.session_id}")
         # Update the updated_at timestamp
         session.updated_at = datetime.now()
         data = session.to_persistable_dict()
         path = self._get_session_path(session.session_id)
+        logger.debug(f"[SessionStore] Writing to {path}")
         with open(path, 'w') as f:
             json.dump(data, f, indent=2, default=str)  # default=str handles datetime
+        logger.debug(f"[SessionStore] Session {session.session_id} saved to {path}")
 
     def load_session(self, session_id: str) -> Optional[Session]:
         """Load a session from a JSON file."""

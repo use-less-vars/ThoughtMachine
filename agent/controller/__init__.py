@@ -317,15 +317,11 @@ class AgentController(QObject):
                     if os.environ.get('THOUGHTMACHINE_DEBUG'):
                         print("[Controller] should_stop: stop_event is set, returning True")
                     return True
-                # If paused (pause_event cleared), wait until resumed
+                # If paused (pause_event cleared), return "PAUSED" instead of blocking
                 if not self.pause_event.is_set():
                     if os.environ.get('THOUGHTMACHINE_DEBUG'):
-                        print("[Controller] should_stop: pause_event not set, waiting...")
-                    self.pause_event.wait()  # blocks while paused
-                    if os.environ.get('THOUGHTMACHINE_DEBUG'):
-                        print("[Controller] should_stop: resumed from pause, checking stop_event")
-                    # After resume, check stop_event again
-                    return self.stop_event.is_set()
+                        print("[Controller] should_stop: pause_event not set, returning \"PAUSED\"")
+                    return "PAUSED"
                 # Not paused and not stopped
                 if os.environ.get('THOUGHTMACHINE_DEBUG'):
                     print("[Controller] should_stop: not paused, returning False")
@@ -357,8 +353,18 @@ class AgentController(QObject):
             # Main loop: process queries from queue
             while self._keep_alive:
                 # Check if we should stop (paused or stopped)
-                if should_stop():
-                    # Agent is paused or stopped, continue loop (will block in should_stop)
+                stop_result = should_stop()
+                if stop_result:
+                    if stop_result == "PAUSED":
+                        # Paused, block here until resumed
+                        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                            print("[Controller] PAUSED returned, waiting on pause_event")
+                        self.pause_event.wait()
+                        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                            print("[Controller] Resumed from pause_event.wait()")
+                        continue
+                    # Otherwise stopped (True)
+                    # Agent is stopped, continue loop
                     continue
                 
                 # Wait for next query (only if not paused)
@@ -415,14 +421,14 @@ class AgentController(QObject):
                         self._emit_event({"type": "paused"})
                         break
                     # For other events (turn), continue processing
-                    # Check if pause requested after a turn
-                    # Temporarily disabled: pause detection after turn now handled by agent
-                    # if event["type"] == "turn" and self._pause_requested:
-                    #     if os.environ.get('THOUGHTMACHINE_DEBUG'):
-                    #         print("[Controller] Pause requested, breaking after turn")
-                    #     self._pause_requested = False
-                    #     self._emit_event({"type": "paused"})
-                    #     break
+                    # Check if we're paused between events
+                    if not self.pause_event.is_set():
+                        # We're paused, break out of loop
+                        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                            print("[Controller] pause_event not set between events, breaking loop")
+                        self._pause_requested = False
+                        self._emit_event({"type": "paused"})
+                        break
 
                 self._processing_query = False
                 # If _keep_alive becomes False, break outer loop

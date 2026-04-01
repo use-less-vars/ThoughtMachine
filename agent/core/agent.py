@@ -70,10 +70,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Debug flag for pause/resume debugging
-PAUSE_DEBUG = os.environ.get('PAUSE_DEBUG') == '1'
-def pause_debug(msg):
-    if PAUSE_DEBUG:
-        print(f"[PAUSE_DEBUG] {msg}")
+from .debug_context import PAUSE_DEBUG, pause_debug
 
 
 class Agent:
@@ -94,7 +91,7 @@ class Agent:
             session_id: Session ID if no session provided.
         """
         self.config = config
-        self.session = session
+        self._session = session  # Use private attribute with property
         self._conversation = []  # Private storage for session-less mode
         
         # Initialize logging if available
@@ -126,7 +123,7 @@ class Agent:
             # Reconstruct pruned conversation: sysprompt + most recent summary + recent turns
             # No-op with HistoryProvider: runtime context is built dynamically.
         else:
-            self.session = None
+            self._session = None
             self.session_id = session_id
             self._conversation = initial_conversation.copy() if initial_conversation else []
         
@@ -219,6 +216,32 @@ class Agent:
         self._update_conversation_token_estimate()
     
     @property
+    def session(self):
+        """Get session property."""
+        return self._session
+    
+    @session.setter
+    def session(self, value):
+        """Set session property, updating context_builder if needed."""
+        self._session = value
+        # Update llm_client session
+        if hasattr(self, 'llm_client') and self.llm_client is not None:
+            self.llm_client.session = value
+        # If context_builder exists and has session attribute, update it
+        if hasattr(self, 'context_builder') and self.context_builder is not None and hasattr(self.context_builder, 'session'):
+            self.context_builder.session = value
+        # Create context_builder if it doesn't exist and we have a session
+        elif value is not None and hasattr(self, 'llm_client') and self.llm_client is not None:
+            # Create a new context_builder with the session
+            self.context_builder = self.llm_client.create_context_builder()
+            # Update conversation_manager.context_builder
+            if hasattr(self, 'conversation_manager') and self.conversation_manager is not None:
+                self.conversation_manager.context_builder = self.context_builder
+        # Update conversation_manager session
+        if hasattr(self, 'conversation_manager') and self.conversation_manager is not None:
+            self.conversation_manager.session = value
+    
+    @property
     def conversation(self):
         """Single source of truth for conversation data.
         
@@ -226,8 +249,8 @@ class Agent:
             When session exists: session.user_history
             When no session: internal _conversation list
         """
-        if self.session is not None:
-            return self.session.user_history
+        if self._session is not None:
+            return self._session.user_history
         return self._conversation
     
     @conversation.setter
@@ -239,10 +262,10 @@ class Agent:
         
         When no session: assigns to _conversation.
         """
-        if self.session is not None:
+        if self._session is not None:
             # Replace contents of session.user_history in-place to maintain reference
-            self.session.user_history[:] = value
-            self.session.updated_at = datetime.now()
+            self._session.user_history[:] = value
+            self._session.updated_at = datetime.now()
             # Invalidate HistoryProvider cache
             if hasattr(self, 'context_builder') and self.context_builder is not None and hasattr(self.context_builder, '_cached_context'):
                 self.context_builder._cached_context = None
@@ -310,6 +333,8 @@ class Agent:
                     f"Execution state change: {old_state} -> {new_state}"
                 )
             # Pass through to controller for GUI updates
+            if "history" not in event:
+                event["history"] = self._get_history_for_event()
             yield event
         elif event.get("type") == "session_state_change":
             # Log session state changes
@@ -320,6 +345,8 @@ class Agent:
                     f"Session state change: {old_state} -> {new_state}"
                 )
             # Pass through to controller for GUI updates
+            if "history" not in event:
+                event["history"] = self._get_history_for_event()
             yield event
         elif event.get("type") == "state_change":
             # Just log state changes for now
@@ -328,6 +355,8 @@ class Agent:
                     f"State change: {event.get('old_state')} -> {event.get('new_state')}"
                 )
             # Pass through to controller for GUI updates
+            if "history" not in event:
+                event["history"] = self._get_history_for_event()
             yield event
     
     def _update_conversation_token_estimate(self):
@@ -361,10 +390,12 @@ class Agent:
     def _add_to_conversation(self, message):
         """Add a message via conversation_manager (ensures cache invalidation)."""
         pause_debug(f"_add_to_conversation called for {message.get('role')}...")
+        pause_debug(f"Before add, conversation length: {len(self.conversation)}")
         # Delegate to conversation_manager
         updated = self.conversation_manager.add_message(message, self.conversation)
         # Update reference via property setter
         self.conversation = updated
+        pause_debug(f"After add, conversation length: {len(self.conversation)}")
     
     def _estimate_tokens(self, message):
         """Estimate tokens for a message."""
@@ -427,11 +458,18 @@ class Agent:
         
         return max_context
     
+    def _get_history_for_event(self):
+        """Get history copy for inclusion in events."""
+        if self.session is not None:
+            return self.session.user_history.copy()
+        return self.conversation.copy()
+
     def _create_token_update_event(self) -> dict:
         """Create token update event."""
         return {
             "type": "token_update",
             "context_length": self.state.current_conversation_tokens,
+            "history": self._get_history_for_event(),
             "total_input": self.total_input_tokens,
             "total_output": self.total_output_tokens
         }
@@ -533,6 +571,14 @@ class Agent:
         pause_debug(f"process_query called with query: '{query[:50]}...'")
         pause_debug(f"Current execution state: {self.state.execution_state}")
         pause_debug(f"Conversation length before adding query: {len(self.conversation)}")
+        pause_debug(f"context_builder exists: {self.context_builder is not None}")
+        if self.context_builder and hasattr(self.context_builder, 'session'):
+            pause_debug(f"context_builder.session: {self.context_builder.session}")
+            if self.context_builder.session:
+                pause_debug(f"context_builder.session.session_id: {self.context_builder.session.session_id}")
+        pause_debug(f"agent.session: {self.session}")
+        if self.session:
+            pause_debug(f"agent.session.session_id: {self.session.session_id}")
         # Ensure system prompt present
         self.conversation = self.llm_client.ensure_system_prompt(self.conversation)
 
@@ -652,6 +698,7 @@ class Agent:
                     "turn_count": event.get("turn_count", turn),
                     "turn": self._display_turn,  # Add turn for GUI grouping
                     "context_length": self.state.current_conversation_tokens,
+                    "history": self._get_history_for_event(),
                     "usage": {
                         "input": last_input_tokens,
                         "output": last_output_tokens,
@@ -683,6 +730,7 @@ class Agent:
                     "token_count": event.get("token_count", self.state.current_conversation_tokens),
                     "turn": self._display_turn,  # Add turn for GUI grouping
                     "context_length": self.state.current_conversation_tokens,
+                    "history": self._get_history_for_event(),
                     "usage": {
                         "input": last_input_tokens,
                         "output": last_output_tokens,
@@ -721,6 +769,13 @@ class Agent:
             
             # Debug context monitoring: show runtime context
             self.debug_context.debug_context("after_build", messages=messages, context_builder=self.context_builder)
+            
+            # Debug: print messages being sent to LLM
+            pause_debug(f"Messages being sent to LLM ({len(messages)}):")
+            for i, msg in enumerate(messages):
+                role = msg.get('role', 'unknown')
+                content_preview = str(msg.get('content', ''))[:100]
+                pause_debug(f"  [{i}] {role}: {content_preview}...")
             
             # Final safety cleanup: remove any orphaned tool messages that might have slipped through
             original_len = len(messages)
@@ -779,6 +834,7 @@ class Agent:
                     "old_state": "low",
                     "new_state": "critical",
                     "state": "critical",
+                    "history": self._get_history_for_event(),
                     "request_tokens": request_tokens,
                     "model_context_window": model_context_window
                 }
@@ -805,6 +861,7 @@ class Agent:
                     "old_state": "low",
                     "new_state": "critical",
                     "state": "critical",
+                    "history": self._get_history_for_event(),
                     "request_tokens": request_tokens,
                     "model_context_window": model_context_window
                 }
@@ -830,6 +887,7 @@ class Agent:
                     "old_state": "low",
                     "new_state": "warning",
                     "state": "warning",
+                    "history": self._get_history_for_event(),
                     "request_tokens": request_tokens,
                     "model_context_window": model_context_window
                 }
@@ -889,6 +947,7 @@ class Agent:
                     "turn_delay": self.rate_limit_delay,
                     "rate_limit_count": self.rate_limit_count,
                     "turn": self._display_turn,
+                    "history": self._get_history_for_event(),
                 }
                 
                 # Wait the initial wait time
@@ -1016,6 +1075,7 @@ class Agent:
                 "tool_calls": [],  # Tool calls emitted as separate events
                 "turn": self._display_turn,  # Use display turn for grouping
                 "context_length": self.state.current_conversation_tokens,
+                "history": self._get_history_for_event(),
                 "usage": {
                     "input": last_input_tokens,
                     "output": last_output_tokens,
@@ -1099,6 +1159,7 @@ class Agent:
                         "content": content,
                         "turn": self._display_turn,
                         "context_length": self.state.current_conversation_tokens,
+                        "history": self._get_history_for_event(),
                         "usage": {
                             "input": last_input_tokens,
                             "output": last_output_tokens,
@@ -1125,7 +1186,8 @@ class Agent:
                         "type": "user_interaction_requested",
                         "message": "Waiting for user input",
                         "turn": self._display_turn,
-                        "context_length": self.state.current_conversation_tokens
+                        "context_length": self.state.current_conversation_tokens,
+                        "history": self._get_history_for_event()
                     }
                     return
                 
@@ -1187,6 +1249,7 @@ class Agent:
                     "content": content,
                     "turn": self._display_turn,
                     "context_length": self.state.current_conversation_tokens,
+                    "history": self._get_history_for_event(),
                     "usage": {
                         "input": last_input_tokens,
                         "output": last_output_tokens,

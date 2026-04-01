@@ -35,6 +35,7 @@ class StateBridge:
         self.current_session_id: Optional[str] = None
         self.session_name: Optional[str] = None
         self._external_file_path: Optional[str] = None
+        self._pending_user_history: List[Dict[str, Any]] = []
         
         # Load saved configuration if available
         self._config = load_config(self.config_path)
@@ -163,6 +164,11 @@ class StateBridge:
         self.current_session_id = session.session_id
         self.session_name = session.metadata.get('name')
         
+        # Copy any pending user history to the session
+        if self._pending_user_history and not session.user_history:
+            session.user_history[:] = self._pending_user_history
+        self._pending_user_history.clear()
+        
         # Sync token usage counters from session
         self.total_input = session.total_input_tokens
         self.total_output = session.total_output_tokens
@@ -204,7 +210,15 @@ class StateBridge:
         """User conversation history from current session."""
         if self.current_session:
             return self.current_session.user_history
-        return []
+        return self._pending_user_history
+    
+    @user_history.setter
+    def user_history(self, history: List[Dict[str, Any]]) -> None:
+        """Set user conversation history."""
+        if self.current_session:
+            self.current_session.user_history[:] = history
+        else:
+            self._pending_user_history[:] = history
     
     # Session configuration building
     def build_session_config(self, agent_config: AgentConfig) -> SessionConfig:
