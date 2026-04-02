@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from fast_json_repair import loads as repair_loads
 from tools.final import Final
+from tools.final_report import FinalReport
 from agent.core.turn_transaction import TurnTransaction
 from tools.request_user_interaction import RequestUserInteraction
 from tools.summarize_tool import SummarizeTool
@@ -269,7 +270,7 @@ class ToolExecutor:
             tool_result = tool_instance.execute()
             
             # Check for special tool types
-            if isinstance(tool_instance, Final):
+            if isinstance(tool_instance, Final) or isinstance(tool_instance, FinalReport):
                 return {
                     'result': tool_result,
                     'tool_type': 'final',

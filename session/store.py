@@ -6,6 +6,8 @@ that stores each session as a JSON file in a configured directory.
 """
 import json
 import os
+import re
+import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import List, Optional, Dict, Any
@@ -14,6 +16,42 @@ import logging
 logger = logging.getLogger(__name__)
 
 from .models import Session
+
+
+def _sanitize_filename(name: str, max_length: int = 100) -> str:
+    """Sanitize a string to be safe for use as a filename.
+    
+    Removes or replaces characters that are problematic on common filesystems.
+    """
+    # Replace path separators and other problematic characters
+    name = re.sub(r'[\\/*?:"<>|]', '_', name)
+    # Replace any non-ASCII characters?
+    # Keep spaces, dots, hyphens, underscores, alphanumeric
+    # Collapse multiple underscores
+    name = re.sub(r'_+', '_', name)
+    # Strip leading/trailing spaces and underscores
+    name = name.strip(' _')
+    # Ensure not empty
+    if not name:
+        name = 'Untitled'
+    # Truncate to max length
+    if len(name) > max_length:
+        # Try to cut at word boundary
+        truncated = name[:max_length].rsplit(' ', 1)[0]
+        if len(truncated) < max_length // 2:
+            truncated = name[:max_length]
+        name = truncated.strip(' _')
+    return name
+
+
+def _generate_friendly_filename(session_id: str, session_name: str) -> str:
+    """Generate a friendly filename for a session.
+    
+    Format: {sanitized_name}_{short_id}.json
+    """
+    sanitized = _sanitize_filename(session_name)
+    short_id = session_id[:6]  # First 6 chars of UUID
+    return f"{sanitized}_{short_id}.json"
 
 
 class SessionStore(ABC):
@@ -46,7 +84,7 @@ class SessionStore(ABC):
 class FileSystemSessionStore(SessionStore):
     """
     File-system based session store.
-    Saves each session as a JSON file in the sessions_dir: {session_id}.json
+    Saves each session as a JSON file in the sessions_dir with friendly filenames: {sanitized_name}_{short_id}.json
     """
 
     def __init__(self, sessions_dir: Optional[str] = None):
@@ -96,26 +134,67 @@ class FileSystemSessionStore(SessionStore):
         """Get the file path for a session ID."""
         return self.sessions_dir / f"{session_id}.json"
 
+    def _find_session_path(self, session_id: str) -> Optional[Path]:
+        """Find the actual file path for a session ID by scanning JSON files."""
+        for file_path in self.sessions_dir.glob("*.json"):
+            try:
+                with open(file_path, 'r') as f:
+                    data = json.load(f)
+                if data.get('session_id') == session_id:
+                    return file_path
+            except Exception:
+                continue
+        return None
+
+    def _get_friendly_path(self, session: Session) -> Path:
+        """Get friendly filename path for a session."""
+        name = session.metadata.get('name', 'Untitled Session')
+        filename = _generate_friendly_filename(session.session_id, name)
+        return self.sessions_dir / filename
+
     def save_session(self, session: Session) -> None:
         """Save a session to a JSON file."""
         logger.debug(f"[SessionStore] Saving session {session.session_id}")
         # Update the updated_at timestamp
         session.updated_at = datetime.now()
         data = session.to_persistable_dict()
-        path = self._get_session_path(session.session_id)
-        logger.debug(f"[SessionStore] Writing to {path}")
-        with open(path, 'w') as f:
+        
+        # Remove external_file_path from metadata if present (legacy concept)
+        if 'metadata' in data and 'external_file_path' in data['metadata']:
+            del data['metadata']['external_file_path']
+        
+        # Determine the friendly filename
+        new_path = self._get_friendly_path(session)
+        
+        # Find existing file (if any)
+        old_path = self._find_session_path(session.session_id)
+        
+        # If there's an existing file and it's different from new_path, rename it
+        if old_path is not None and old_path != new_path:
+            logger.debug(f"[SessionStore] Renaming session file from {old_path} to {new_path}")
+            # Ensure we don't overwrite another session's file (should not happen due to unique short ID)
+            if new_path.exists():
+                logger.warning(f"[SessionStore] Target file {new_path} already exists, overwriting")
+            old_path.rename(new_path)
+        
+        # Write the session data
+        logger.debug(f"[SessionStore] Writing to {new_path}")
+        with open(new_path, 'w') as f:
             json.dump(data, f, indent=2, default=str)  # default=str handles datetime
-        logger.debug(f"[SessionStore] Session {session.session_id} saved to {path}")
+        
+        logger.debug(f"[SessionStore] Session {session.session_id} saved to {new_path}")
 
     def load_session(self, session_id: str) -> Optional[Session]:
         """Load a session from a JSON file."""
-        path = self._get_session_path(session_id)
-        if not path.exists():
+        path = self._find_session_path(session_id)
+        if path is None or not path.exists():
             return None
         try:
             with open(path, 'r') as f:
                 data = json.load(f)
+            # Remove external_file_path from metadata if present (legacy concept)
+            if 'metadata' in data and 'external_file_path' in data['metadata']:
+                del data['metadata']['external_file_path']
             return Session.from_persistable_dict(data)
         except Exception as e:
             # Log error? For now return None
@@ -159,14 +238,18 @@ class FileSystemSessionStore(SessionStore):
 
     def delete_session(self, session_id: str) -> bool:
         """Delete a session file."""
-        path = self._get_session_path(session_id)
-        if path.exists():
+        path = self._find_session_path(session_id)
+        if path is not None and path.exists():
             path.unlink()
             return True
         return False
 
     def get_session_path(self, session_id: str) -> Path:
         """Get the file path for a given session ID."""
+        path = self._find_session_path(session_id)
+        if path is not None:
+            return path
+        # Session not saved yet, return the default path (for compatibility)
         return self._get_session_path(session_id)
 
     def get_current_session_id(self) -> Optional[str]:
