@@ -20,10 +20,11 @@ class ObservableList(list):
         self.callback = callback
 
     def _notify(self):
-        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
             import sys, traceback
             sys.stderr.write(f'[ObservableList] _notify called, callback={self.callback}\n')
-            traceback.print_stack(limit=5, file=sys.stderr)
+            # Don't print stack trace - too verbose
+            # traceback.print_stack(limit=5, file=sys.stderr)
         if self.callback:
             self.callback()
 
@@ -197,7 +198,7 @@ class Session:
 
     def _wrap_user_history(self):
         """Wrap user_history with ObservableList if not already wrapped."""
-        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
             import sys
             sys.stderr.write(f'[Session] _wrap_user_history called, session_id={self.session_id}, is_ObservableList={isinstance(self.user_history, ObservableList)}\n')
         if not isinstance(self.user_history, ObservableList):
@@ -231,7 +232,7 @@ class Session:
         return normalize(conversation)
     def _on_conversation_changed(self):
         """Called when user_history is mutated."""
-        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
             import sys
             sys.stderr.write(f'[Session] _on_conversation_changed called, session_id={self.session_id}, callbacks={len(self._conversation_changed_callbacks)}\n')
         self.updated_at = datetime.now()

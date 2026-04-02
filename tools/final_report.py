@@ -55,6 +55,7 @@ class FinalReport(Final):
                 f.write(report_body)
             
             # Return final message (content inherited from Final)
-            return self._truncate_output(self.content)
+            # Final tools should not truncate their output
+            return self.content
         except Exception as e:
-            return self._truncate_output(f"Failed to write final report: {e}")
+            return f"Failed to write final report: {e}"

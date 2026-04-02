@@ -8,4 +8,5 @@ class Final(ToolBase):
     content: str = Field(description="The final answer text")
 
     def execute(self) -> str:
-        return self._truncate_output(self.content)
+        # Final tools should not truncate their output
+        return self.content

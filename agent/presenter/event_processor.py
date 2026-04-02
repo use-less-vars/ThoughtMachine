@@ -28,7 +28,7 @@ class EventProcessor:
         self.session_lifecycle = session_lifecycle
         self.gui_integration = gui_integration
         
-        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
             print(f"[EventProcessor] Initialized")
     
     def process_event(self, event: Dict[str, Any]) -> None:
@@ -41,11 +41,11 @@ class EventProcessor:
         # Convert to typed event for consistent handling
         typed_event = ev.convert_from_legacy_format(event)
         event_type = typed_event.type.value
-        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
             print(f"[EventProcessor] Processing event: {event_type}")
         
         # Skip filtering for state/terminal events as they need to be shown regardless
-        state_event_types = ["error", "paused", "stopped", "thread_finished", "final", "max_turns", "user_interaction_requested", "rate_limit_warning", "token_warning", "turn_warning"]
+        state_event_types = ["error", "paused", "stopped", "thread_finished", "final", "max_turns", "user_interaction_requested", "rate_limit_warning", "token_warning", "turn_warning", "user_query"]
         if event_type not in state_event_types:
             event_session_id = event.get("session_id")
             # Ensure both session IDs are strings for comparison to avoid type mismatch issues
@@ -53,7 +53,7 @@ class EventProcessor:
                 event_session_id = str(event_session_id)
                 current_id = self.state_bridge.current_session_id
                 if current_id and event_session_id != str(current_id):
-                    if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                    if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                         print(f"[EventProcessor] Ignoring event from old session {event_session_id}")
                     return        
         # Emit event to GUI if integration available

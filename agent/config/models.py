@@ -48,6 +48,7 @@ class AgentConfig(BaseModel):
     enable_file_logging: bool = Field(default=True, description="Write logs to files")
     enable_console_logging: bool = Field(default=False, description="Print logs to console")
     jsonl_format: bool = Field(default=True, description="Use JSONL format for log files")
+    log_categories: List[str] = Field(default_factory=lambda: ["SESSION", "LLM", "TOOLS"], description="List of log categories to enable (SESSION, UI, LLM, TOOLS, SECURITY, PERFORMANCE). Can be overridden by AGENT_LOG_CATEGORIES environment variable.")
     max_file_size_mb: int = Field(default=10, description="Maximum log file size in MB before rotation")
     max_backup_files: int = Field(default=5, description="Maximum number of backup log files to keep")
     session_id: Optional[str] = Field(default=None, description="Unique session ID for logging (auto-generated if None)")

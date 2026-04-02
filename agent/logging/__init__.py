@@ -9,7 +9,16 @@ import os
 import threading
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
+
+# Optional dependency for system monitoring
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    psutil = None
+    PSUTIL_AVAILABLE = False
+from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING, Deque, Tuple
+from collections import deque
 from queue import Queue, Empty
 
 if TYPE_CHECKING:
@@ -27,6 +36,16 @@ class LogLevel(Enum):
     WARNING = "WARNING"
     ERROR = "ERROR"
     CRITICAL = "CRITICAL"
+
+
+class LogCategory(Enum):
+    """Categories for log events."""
+    SESSION = "SESSION"
+    UI = "UI"
+    LLM = "LLM"
+    TOOLS = "TOOLS"
+    SECURITY = "SECURITY"
+    PERFORMANCE = "PERFORMANCE"
 
 
 class LogEventType(Enum):
@@ -68,7 +87,64 @@ class LogEventType(Enum):
     DOCKER_SANDBOX = "docker_sandbox"
     CAPABILITY_CHECK = "capability_check"
     ERROR = "error"
+    
+    # Performance monitoring
+    LATENCY_MEASUREMENT = "latency_measurement"
+    TOKEN_USAGE_TREND = "token_usage_trend"
+    MEMORY_USAGE = "memory_usage"
+    THROUGHPUT_METRIC = "throughput_metric"
+    RESOURCE_UTILIZATION = "resource_utilization"
 
+
+# Mapping from LogEventType to LogCategory
+EVENT_TYPE_TO_CATEGORY = {
+    # Agent lifecycle
+    LogEventType.AGENT_START: LogCategory.SESSION,
+    LogEventType.AGENT_END: LogCategory.SESSION,
+    
+    # LLM interaction
+    LogEventType.LLM_REQUEST: LogCategory.LLM,
+    LogEventType.LLM_RESPONSE: LogCategory.LLM,
+    LogEventType.RAW_RESPONSE: LogCategory.LLM,
+    
+    # Tool execution
+    LogEventType.TOOL_CALL: LogCategory.TOOLS,
+    LogEventType.TOOL_RESULT: LogCategory.TOOLS,
+    
+    # Conversation management
+    LogEventType.CONVERSATION_UPDATE: LogCategory.SESSION,
+    LogEventType.CONVERSATION_PRUNE: LogCategory.SESSION,
+    LogEventType.TOKEN_WARNING: LogCategory.UI,
+    LogEventType.TURN_WARNING: LogCategory.UI,
+    
+    # Turn lifecycle
+    LogEventType.TURN_START: LogCategory.SESSION,
+    LogEventType.TURN_COMPLETE: LogCategory.SESSION,
+    
+    # Control flow
+    LogEventType.USER_INTERACTION_REQUESTED: LogCategory.UI,
+    LogEventType.FINAL_DETECTED: LogCategory.SESSION,
+    LogEventType.STOP_SIGNAL: LogCategory.SESSION,
+    LogEventType.MAX_TURNS_REACHED: LogCategory.SESSION,
+    LogEventType.EXECUTION_STATE_CHANGE: LogCategory.SESSION,
+    LogEventType.SESSION_STATE_CHANGE: LogCategory.SESSION,
+    
+    # Security and observability
+    LogEventType.FILE_ACCESS: LogCategory.SECURITY,
+    LogEventType.SECURITY_VIOLATION: LogCategory.SECURITY,
+    LogEventType.DOCKER_SANDBOX: LogCategory.SECURITY,
+    LogEventType.CAPABILITY_CHECK: LogCategory.SECURITY,
+    
+    # Error handling
+    LogEventType.ERROR: LogCategory.UI,
+    
+    # Performance monitoring
+    LogEventType.LATENCY_MEASUREMENT: LogCategory.PERFORMANCE,
+    LogEventType.TOKEN_USAGE_TREND: LogCategory.PERFORMANCE,
+    LogEventType.MEMORY_USAGE: LogCategory.PERFORMANCE,
+    LogEventType.THROUGHPUT_METRIC: LogCategory.PERFORMANCE,
+    LogEventType.RESOURCE_UTILIZATION: LogCategory.PERFORMANCE,
+}
 
 class AgentLogger:
     """
@@ -105,6 +181,15 @@ class AgentLogger:
             session_id: Unique identifier for this agent session (auto-generated if None)
         """
         self.config = config
+        # Convert config categories to LogCategory enum
+        self.enabled_categories = [LogCategory(cat) for cat in config.log_categories]
+        
+        # Override with environment variable if set
+        env_categories = os.environ.get('AGENT_LOG_CATEGORIES')
+        if env_categories:
+            env_list = [cat.strip().upper() for cat in env_categories.split(',') if cat.strip()]
+            if env_list:
+                self.enabled_categories = [LogCategory(cat) for cat in env_list]
         self.log_dir = os.path.abspath(log_dir)
         self.log_level = LogLevel(log_level) if isinstance(log_level, str) else log_level
         self.enable_file_logging = enable_file_logging
@@ -142,6 +227,9 @@ class AgentLogger:
         self.current_turn = 0
         self.total_input_tokens = 0
         self.total_output_tokens = 0
+        
+        # Performance monitoring: track recent token usage for trend analysis
+        self.recent_token_usage: Deque[Tuple[int, int, float]] = deque(maxlen=10)  # (input_tokens, output_tokens, timestamp)
         
     def _to_python_log_level(self, level: LogLevel) -> int:
         """Convert LogLevel to Python logging level."""
@@ -190,6 +278,16 @@ class AgentLogger:
         msg_priority = level_priority.get(level, 20)
         return msg_priority >= current_priority
     
+    def _should_log_event(self, event_type: LogEventType, level: LogLevel) -> bool:
+        """Check if an event should be logged based on level and category."""
+        if not self._should_log(level):
+            return False
+        category = EVENT_TYPE_TO_CATEGORY.get(event_type)
+        if category is None:
+            # If mapping missing, allow logging (default behavior)
+            return True
+        return category in self.enabled_categories
+
     def _write_jsonl(self, event: Dict[str, Any]):
         """Write a JSONL entry to the log file."""
         if not self.enable_file_logging or not self._file_handle:
@@ -267,7 +365,7 @@ class AgentLogger:
             data: Structured data for the event
             turn: Current turn number (if applicable)
         """
-        if not self._should_log(level):
+        if not self._should_log_event(event_type, level):
             return
         
         # Build event dictionary
@@ -342,29 +440,91 @@ class AgentLogger:
     
     def log_turn_complete(self, turn: int, usage: Dict[str, int]):
         """Log completion of a turn."""
-        self.total_input_tokens += usage.get("input", 0)
-        self.total_output_tokens += usage.get("output", 0)
+        turn_input = usage.get("input", 0)
+        turn_output = usage.get("output", 0)
+        self.total_input_tokens += turn_input
+        self.total_output_tokens += turn_output
+        
+        # Record token usage for trend analysis
+        self.recent_token_usage.append((turn_input, turn_output, datetime.now().timestamp()))
+        
+        # Analyze token trends periodically (every 5 turns or when deque is full)
+        if len(self.recent_token_usage) >= 5 and len(self.recent_token_usage) % 5 == 0:
+            self._analyze_token_trends()
+        
         self._log_event(
             LogEventType.TURN_COMPLETE,
             LogLevel.DEBUG,
             f"Turn {turn} completed",
             {
                 "turn": turn,
-                "turn_input_tokens": usage.get("input", 0),
-                "turn_output_tokens": usage.get("output", 0),
+                "turn_input_tokens": turn_input,
+                "turn_output_tokens": turn_output,
                 "cumulative_input_tokens": self.total_input_tokens,
                 "cumulative_output_tokens": self.total_output_tokens,
             }
         )
     
+    def _analyze_token_trends(self):
+        """Analyze recent token usage patterns and log trends."""
+        if len(self.recent_token_usage) < 2:
+            return  # Need at least 2 data points
+        
+        # Extract data
+        inputs = [item[0] for item in self.recent_token_usage]
+        outputs = [item[1] for item in self.recent_token_usage]
+        timestamps = [item[2] for item in self.recent_token_usage]
+        
+        # Calculate totals per turn
+        totals = [inp + out for inp, out in zip(inputs, outputs)]
+        
+        # Compute simple trends
+        avg_input = sum(inputs) / len(inputs) if inputs else 0
+        avg_output = sum(outputs) / len(outputs) if outputs else 0
+        avg_total = sum(totals) / len(totals) if totals else 0
+        
+        # Determine trend direction
+        if len(totals) >= 3:
+            recent_totals = totals[-3:]
+            if recent_totals[2] > recent_totals[1] > recent_totals[0]:
+                trend = "increasing"
+            elif recent_totals[2] < recent_totals[1] < recent_totals[0]:
+                trend = "decreasing"
+            else:
+                # Check for spikes (sudden increase > 2x average)
+                if any(t > avg_total * 2 for t in recent_totals):
+                    trend = "spiking"
+                else:
+                    trend = "stable"
+        else:
+            trend = "stable"
+        
+        # Calculate period (time window covered)
+        period_seconds = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else 60.0
+        
+        # Log token usage trend
+        self.log_token_usage_trend(
+            current_tokens=int(avg_total),
+            trend=trend,
+            period_seconds=period_seconds,
+            metadata={
+                "avg_input_tokens": avg_input,
+                "avg_output_tokens": avg_output,
+                "avg_total_tokens": avg_total,
+                "sample_size": len(self.recent_token_usage),
+                "input_tokens_history": inputs,
+                "output_tokens_history": outputs,
+            }
+        )
+
     def log_llm_request(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]):
         """Log LLM request being sent."""
         # Sanitize large data for logging
         sanitized_messages = []
         for msg in messages:
             sanitized_msg = msg.copy()
-            if "content" in sanitized_msg and len(sanitized_msg["content"]) > 1000:
-                sanitized_msg["content"] = sanitized_msg["content"][:1000] + "... [truncated]"
+            if "content" in sanitized_msg and len(sanitized_msg["content"]) > 10000:
+                sanitized_msg["content"] = sanitized_msg["content"][:10000] + "... [truncated]"
             sanitized_messages.append(sanitized_msg)
         
         # Count tools but don't include full schemas
@@ -417,8 +577,8 @@ class AgentLogger:
         # Convert raw response to string representation
         raw_str = str(raw_response)
         # Truncate very large responses
-        if len(raw_str) > 5000:
-            raw_str = raw_str[:5000] + "... [truncated]"
+        if len(raw_str) > 50000:
+            raw_str = raw_str[:50000] + "... [truncated]"
         
         self._log_event(
             LogEventType.RAW_RESPONSE,
@@ -449,8 +609,8 @@ class AgentLogger:
         """Log tool result."""
         # Truncate large results
         result_str = str(result)
-        if len(result_str) > 2000:
-            result_str = result_str[:2000] + "... [truncated]"
+        if len(result_str) > 20000:
+            result_str = result_str[:20000] + "... [truncated]"
         
         self._log_event(
             LogEventType.TOOL_RESULT,
@@ -515,8 +675,8 @@ class AgentLogger:
             data["exit_code"] = exit_code
         if output_preview is not None:
             # Truncate output preview
-            if len(output_preview) > 1000:
-                output_preview = output_preview[:1000] + "... [truncated]"
+            if len(output_preview) > 10000:
+                output_preview = output_preview[:10000] + "... [truncated]"
             data["output_preview"] = output_preview
         
         self._log_event(
@@ -686,6 +846,257 @@ class AgentLogger:
             self.current_turn
         )
     
+    def log_performance_metric(
+        self,
+        metric_name: str,
+        value: float,
+        unit: str,
+        tags: Optional[Dict[str, Any]] = None,
+        description: str = "",
+    ):
+        """
+        Log a performance metric.
+        
+        Args:
+            metric_name: Name of the metric (e.g., "latency", "throughput", "memory")
+            value: Numeric value of the metric
+            unit: Unit of measurement (e.g., "ms", "tokens", "MB", "requests/sec")
+            tags: Key-value pairs for categorization
+            description: Human-readable description
+        """
+        data = {
+            "metric_name": metric_name,
+            "value": value,
+            "unit": unit,
+            "tags": tags or {},
+            "description": description,
+        }
+        self._log_event(
+            LogEventType.LATENCY_MEASUREMENT if "latency" in metric_name.lower() else LogEventType.THROUGHPUT_METRIC,
+            LogLevel.INFO,
+            f"Performance metric: {metric_name} = {value} {unit}",
+            data,
+            self.current_turn
+        )
+
+    def log_latency(self, operation: str, duration_ms: float, metadata: Optional[Dict[str, Any]] = None):
+        """Log latency measurement for an operation."""
+        self.log_performance_metric(
+            metric_name=f"latency.{operation}",
+            value=duration_ms,
+            unit="ms",
+            tags={"operation": operation},
+            description=f"Latency for {operation}",
+        )
+        if metadata:
+            # Also log detailed event with metadata
+            self._log_event(
+                LogEventType.LATENCY_MEASUREMENT,
+                LogLevel.DEBUG,
+                f"Latency for {operation}: {duration_ms} ms",
+                {"operation": operation, "duration_ms": duration_ms, "metadata": metadata},
+                self.current_turn
+            )
+
+    def log_memory_usage(self, memory_mb: float, memory_percent: Optional[float] = None, 
+                         process_memory: bool = True, metadata: Optional[Dict[str, Any]] = None):
+        """Log memory usage."""
+        tags = {"process_memory": process_memory}
+        if metadata:
+            tags.update(metadata)
+        
+        self.log_performance_metric(
+            metric_name="memory.usage",
+            value=memory_mb,
+            unit="MB",
+            tags=tags,
+            description=f"Memory usage: {memory_mb} MB" + 
+                       (f" ({memory_percent}%)" if memory_percent else ""),
+        )
+        
+        if memory_percent is not None:
+            self.log_performance_metric(
+                metric_name="memory.percent",
+                value=memory_percent,
+                unit="%",
+                tags=tags,
+                description=f"Memory percentage: {memory_percent}%",
+            )
+
+    def log_token_usage_trend(self, current_tokens: int, trend: str, 
+                             period_seconds: float = 60.0, 
+                             metadata: Optional[Dict[str, Any]] = None):
+        """Log token usage trend over time."""
+        valid_trends = ["increasing", "decreasing", "stable", "spiking", "draining"]
+        if trend not in valid_trends:
+            trend = "unknown"
+        
+        tags = {"trend": trend, "period_seconds": period_seconds}
+        if metadata:
+            tags.update(metadata)
+        
+        self.log_performance_metric(
+            metric_name="tokens.usage",
+            value=float(current_tokens),
+            unit="tokens",
+            tags=tags,
+            description=f"Token usage: {current_tokens} tokens, trend: {trend}",
+        )
+        
+        # Also log specific event
+        self._log_event(
+            LogEventType.TOKEN_USAGE_TREND,
+            LogLevel.INFO,
+            f"Token usage trend: {trend} ({current_tokens} tokens over {period_seconds}s)",
+            {"current_tokens": current_tokens, "trend": trend, "period_seconds": period_seconds},
+            self.current_turn
+        )
+
+    def log_throughput(self, metric_name: str, value: float, 
+                      window_seconds: float = 60.0, 
+                      metadata: Optional[Dict[str, Any]] = None):
+        """Log throughput metric (e.g., turns per minute)."""
+        tags = {"window_seconds": window_seconds}
+        if metadata:
+            tags.update(metadata)
+        
+        self.log_performance_metric(
+            metric_name=f"throughput.{metric_name}",
+            value=value,
+            unit=f"{metric_name}/sec",
+            tags=tags,
+            description=f"Throughput: {value} {metric_name}/sec over {window_seconds}s",
+        )
+        
+        # Also log specific event
+        self._log_event(
+            LogEventType.THROUGHPUT_METRIC,
+            LogLevel.INFO,
+            f"Throughput: {value} {metric_name}/sec over {window_seconds}s",
+            {"metric_name": metric_name, "value": value, "window_seconds": window_seconds},
+            self.current_turn
+        )
+
+    def log_resource_utilization(self, 
+                               cpu_percent: Optional[float] = None,
+                               memory_percent: Optional[float] = None,
+                               disk_usage: Optional[Dict[str, Any]] = None,
+                               network_io: Optional[Dict[str, Any]] = None,
+                               metadata: Optional[Dict[str, Any]] = None):
+        """Log system resource utilization."""
+        data = {}
+        if cpu_percent is not None:
+            data["cpu_percent"] = cpu_percent
+            self.log_performance_metric(
+                metric_name="cpu.usage",
+                value=cpu_percent,
+                unit="%",
+                tags={"resource": "cpu"},
+                description=f"CPU usage: {cpu_percent}%",
+            )
+        
+        if memory_percent is not None:
+            data["memory_percent"] = memory_percent
+            self.log_performance_metric(
+                metric_name="memory.system_percent",
+                value=memory_percent,
+                unit="%",
+                tags={"resource": "memory"},
+                description=f"System memory usage: {memory_percent}%",
+            )
+        
+        if disk_usage:
+            data["disk_usage"] = disk_usage
+            # Log disk usage metrics
+            for key, val in disk_usage.items():
+                if isinstance(val, (int, float)):
+                    self.log_performance_metric(
+                        metric_name=f"disk.{key}",
+                        value=float(val),
+                        unit="bytes" if "bytes" in key else "count",
+                        tags={"resource": "disk"},
+                        description=f"Disk {key}: {val}",
+                    )
+        
+        if network_io:
+            data["network_io"] = network_io
+            # Log network metrics
+            for key, val in network_io.items():
+                if isinstance(val, (int, float)):
+                    self.log_performance_metric(
+                        metric_name=f"network.{key}",
+                        value=float(val),
+                        unit="bytes" if "bytes" in key else "packets",
+                        tags={"resource": "network"},
+                        description=f"Network {key}: {val}",
+                    )
+        
+        if data:
+            self._log_event(
+                LogEventType.RESOURCE_UTILIZATION,
+                LogLevel.INFO,
+                "System resource utilization",
+                data,
+                self.current_turn
+            )
+
+    def log_system_resources(self):
+        """Log system resource usage (memory, CPU, etc.) if psutil is available."""
+        if not PSUTIL_AVAILABLE:
+            return
+        
+        try:
+            # Get process memory
+            process = psutil.Process()
+            process_memory = process.memory_info()
+            memory_mb = process_memory.rss / (1024 * 1024)  # RSS in MB
+            
+            # Get process memory percent
+            memory_percent = process.memory_percent()
+            
+            # Log process memory
+            self.log_memory_usage(
+                memory_mb=memory_mb,
+                memory_percent=memory_percent,
+                process_memory=True,
+                metadata={
+                    "process_id": process.pid,
+                    "process_name": process.name(),
+                }
+            )
+            
+            # Get system-wide memory
+            system_memory = psutil.virtual_memory()
+            system_memory_percent = system_memory.percent
+            system_memory_total = system_memory.total / (1024 * 1024)  # MB
+            system_memory_used = system_memory.used / (1024 * 1024)    # MB
+            
+            # Get CPU usage
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            
+            # Log resource utilization
+            self.log_resource_utilization(
+                cpu_percent=cpu_percent,
+                memory_percent=system_memory_percent,
+                disk_usage=None,  # Could add disk usage if needed
+                network_io=None,  # Could add network IO if needed
+                metadata={
+                    "system_memory_total_mb": system_memory_total,
+                    "system_memory_used_mb": system_memory_used,
+                    "process_memory_mb": memory_mb,
+                }
+            )
+            
+        except Exception as e:
+            # Don't crash if monitoring fails
+            self._log_event(
+                LogEventType.PERFORMANCE_METRIC,
+                LogLevel.WARNING,
+                f"Failed to collect system resources: {e}",
+                {"error": str(e)},
+                self.current_turn
+            )
+
     def close(self):
         """Close log file and cleanup."""
         with self._lock:

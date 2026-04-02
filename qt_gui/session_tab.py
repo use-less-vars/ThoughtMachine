@@ -138,7 +138,7 @@ class SessionTab(QWidget):
         self.presenter.save_session()
         self.update_window_title()
         
-        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
             print(f"[SessionTab] Created new session: {self.session.session_id}")
     
     def load_session_by_id(self, session_id: str) -> bool:
@@ -166,7 +166,7 @@ class SessionTab(QWidget):
             
             self.update_window_title()
             
-            if os.environ.get('THOUGHTMACHINE_DEBUG'):
+            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                 print(f"[SessionTab] Loaded session: {session_id}")
             return True
         else:
@@ -1451,6 +1451,15 @@ class SessionTab(QWidget):
         if not conversation:
             return
 
+        # Build mapping of tool_call_id -> tool_name from assistant messages
+        tool_call_id_to_name = {}
+        for msg in conversation:
+            if msg['role'] == 'assistant' and msg.get('tool_calls'):
+                for tc in msg['tool_calls']:
+                    func = tc.get('function', {})
+                    tool_name = func.get('name', 'unknown')
+                    tool_call_id_to_name[tc.get('id')] = tool_name
+        
         # Collect events from conversation with simple turn numbering
         events = []
         current_turn = 0
@@ -1489,51 +1498,14 @@ class SessionTab(QWidget):
                     'timestamp': datetime.datetime.now().isoformat(),
                     '_detail_level': self.presenter._config.get('detail', 'normal')
                 }
+                # Add tool_name from mapping
+                if tool_call_id and tool_call_id in tool_call_id_to_name:
+                    event['tool_name'] = tool_call_id_to_name[tool_call_id]
                 event['turn'] = turn
                 events.append(event)
                 continue
             
-            # Handle assistant messages with tool_calls
-            if role == 'assistant' and tool_calls:
-                # Create assistant turn event (without embedded tool_calls)
-                event = {
-                    'type': 'turn',
-                    'assistant_content': content,
-                    'timestamp': datetime.datetime.now().isoformat(),
-                    '_detail_level': self.presenter._config.get('detail', 'normal')
-                }
-                if reasoning is not None:
-                    event['reasoning'] = reasoning
-                event['turn'] = turn
-                events.append(event)
-                
-                # Create separate tool_call events for each tool call
-                for tc in tool_calls:
-                    # Extract function name and arguments from OpenAI format
-                    func = tc.get('function', {})
-                    tool_name = func.get('name', 'unknown')
-                    arguments = func.get('arguments', {})
-                    # Try to parse JSON arguments if string
-                    if isinstance(arguments, str):
-                        try:
-                            arguments = json.loads(arguments)
-                        except:
-                            pass
-                    
-                    tool_event = {
-                        'type': 'tool_call',
-                        'tool_name': tool_name,
-                        'arguments': arguments,
-                        'turn': turn,
-                        'timestamp': datetime.datetime.now().isoformat(),
-                        '_detail_level': self.presenter._config.get('detail', 'normal')
-                    }
-                    # Store tool_call_id for matching with tool results
-                    tool_event['tool_call_id'] = tc.get('id')
-                    events.append(tool_event)
-                continue
-            
-            # For other roles (user, assistant without tool_calls), use _create_chat_event
+            # For all other roles (user, assistant with or without tool_calls), use _create_chat_event
             event = self._create_chat_event(
                 role, content, tool_calls, tool_call_id, reasoning=reasoning
             )
@@ -1663,7 +1635,7 @@ class SessionTab(QWidget):
             # print(f"[SessionTab] Auto-save error: {e}")
             pass
 
-    def _create_chat_event(self, role: str, content: str, tool_calls=None, tool_call_id=None, reasoning=None):
+    def _create_chat_event(self, role: str, content: str, tool_calls=None, tool_call_id=None, reasoning=None, tool_name=None):
         """Create a chat event dictionary for the given role and content.
         
         Args:
@@ -1672,6 +1644,7 @@ class SessionTab(QWidget):
             tool_calls: optional list of tool calls (for assistant)
             tool_call_id: optional tool call ID (for user tool response)
             reasoning: optional reasoning text (for assistant)
+            tool_name: optional tool name (for tool results)
         
         Returns:
             Dictionary representing the event
@@ -1680,17 +1653,19 @@ class SessionTab(QWidget):
         detail_level = 'normal'
         if hasattr(self, 'presenter') and self.presenter and hasattr(self.presenter, '_config'):
             detail_level = self.presenter._config.get('detail', 'normal')
-        
+
         # Handle tool messages (tool results)
         if role == 'tool':
-            return {
+            event = {
                 'type': 'tool_result',
                 'content': content,
                 'tool_call_id': tool_call_id,
                 'timestamp': datetime.datetime.now().isoformat(),
                 '_detail_level': detail_level
             }
-        
+            if tool_name:
+                event['tool_name'] = tool_name
+            return event        
         # Create event dictionary with appropriate type and fields based on role
         if role == 'system':
             event = {
@@ -1733,7 +1708,7 @@ class SessionTab(QWidget):
         
         return event
     
-    def _append_chat_message(self, role: str, content: str, tool_calls=None, tool_call_id=None, reasoning=None):
+    def _append_chat_message(self, role: str, content: str, tool_calls=None, tool_call_id=None, reasoning=None, tool_name=None):
         """Append a chat message to the event model and output display.
         
         Args:
@@ -1742,8 +1717,9 @@ class SessionTab(QWidget):
             tool_calls: optional list of tool calls (for assistant)
             tool_call_id: optional tool call ID (for user tool response)
             reasoning: optional reasoning text (for assistant)
+            tool_name: optional tool name (for tool results)
         """
-        event = self._create_chat_event(role, content, tool_calls, tool_call_id, reasoning)
+        event = self._create_chat_event(role, content, tool_calls, tool_call_id, reasoning, tool_name)
         # Delegate to output panel for display
         self.output_panel.display_event(event)
 
@@ -1775,7 +1751,7 @@ class SessionTab(QWidget):
         self._auto_save_timer.stop()
 
         # Always attempt to save session before closing
-        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
             import sys
             sys.stderr.write(f'[SessionTab] closeEvent: attempting to save session, user_history length={len(self.presenter.user_history) if self.presenter.user_history else 0}, current_session_id={self.presenter.current_session_id}\n')
 

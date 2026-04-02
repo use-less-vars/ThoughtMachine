@@ -210,7 +210,7 @@ class EventDelegate(QStyledItemDelegate):
         
         # DEBUG
         import os
-        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
             print(f"[EventDelegate] _event_to_html called for type={etype}, suppress_title_bar={suppress_title_bar}")
 
         # Helper to add a content line
@@ -307,6 +307,8 @@ class EventDelegate(QStyledItemDelegate):
                 if result_text:
                     # Truncate if needed
                     unescaped_result = html.unescape(result_text)
+                    # Replace any HTML line breaks with newlines for consistent splitting
+                    unescaped_result = unescaped_result.replace('<br>', '\n').replace('<br/>', '\n').replace('<br />', '\n')
                     
                     # Process line breaks: replace newlines with <br> for HTML display
                     lines_result = unescaped_result.split('\n')
@@ -402,6 +404,8 @@ class EventDelegate(QStyledItemDelegate):
                 if result_text:
                     # Truncate if needed
                     unescaped_result = html.unescape(result_text)
+                    # Replace any HTML line breaks with newlines for consistent splitting
+                    unescaped_result = unescaped_result.replace('<br>', '\n').replace('<br/>', '\n').replace('<br />', '\n')
                     
                     # Process line breaks: replace newlines with <br> for HTML display
                     lines_result = unescaped_result.split('\n')
@@ -555,6 +559,8 @@ class EventDelegate(QStyledItemDelegate):
                 # Truncate result if needed
                 
                 unescaped_result = html.unescape(result_text)
+                # Replace any HTML line breaks with newlines for consistent splitting
+                unescaped_result = unescaped_result.replace('<br>', '\n').replace('<br/>', '\n').replace('<br />', '\n')
                 
                 if ENABLE_RESULT_TRUNCATION:
                     # Limit lines

@@ -29,15 +29,24 @@ class MarkdownRenderer:
             html_result = doc.toHtml()
 
             # Extract just the body content (Qt adds full HTML document)
-            # Look for <body> tag
-            body_start = html_result.find('<body>')
-            body_end = html_result.find('</body>')
-            if body_start != -1 and body_end != -1:
-                # Extract body content plus 6 for '<body>'
-                body_content = html_result[body_start + 6:body_end]
+            # Look for <body> tag case-insensitively
+            import re
+            body_match = re.search(r'<body[^>]*>(.*?)</body>', html_result, re.IGNORECASE | re.DOTALL)
+            if body_match:
+                body_content = body_match.group(1).strip()
                 # Also need to include any styles in the head
                 # For simplicity, we'll just use the body content
-                html_result = body_content.strip()
+                html_result = body_content
+            else:
+                # If no body tag found, strip any DOCTYPE, html, head tags
+                # Remove DOCTYPE declaration
+                html_result = re.sub(r'<!DOCTYPE[^>]*>', '', html_result, flags=re.IGNORECASE)
+                # Remove <html> tags
+                html_result = re.sub(r'<html[^>]*>', '', html_result, flags=re.IGNORECASE)
+                html_result = re.sub(r'</html>', '', html_result, flags=re.IGNORECASE)
+                # Remove <head> tags and everything between them
+                html_result = re.sub(r'<head[^>]*>.*?</head>', '', html_result, flags=re.IGNORECASE | re.DOTALL)
+                html_result = html_result.strip()
 
             # Apply style if provided
             if style and html_result:

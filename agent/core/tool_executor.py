@@ -85,6 +85,7 @@ class ToolExecutor:
             Tuple of:
             - executed_tools: List of executed tool information
             - final_detected: Whether a Final tool was executed
+            - final_content: Content from Final/FinalReport tool if final_detected is True, otherwise None
             - user_interaction_requested: Whether RequestUserInteraction was called
             - summary_text: Summary text if SummarizeTool was called
             - summary_keep_recent_turns: Number of turns to keep for summarization
@@ -220,6 +221,7 @@ class ToolExecutor:
         return (
             executed_tools,
             final_detected,
+            final_content,
             user_interaction_requested,
             summary_text if summary_requested else None,
             summary_keep_recent_turns if summary_requested else None

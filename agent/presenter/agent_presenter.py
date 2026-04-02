@@ -61,10 +61,10 @@ class RefactoredAgentPresenter(QObject):
         # Set up state change callback
         self.session_lifecycle._session_callback = self._on_session_state_change
         # Set up conversation change callback
-        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
             print(f"[AgentPresenter] Setting conversation callback")
         self.session_lifecycle._conversation_callback = lambda: self.gui_integration.emit_conversation_changed()
-        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
             print(f"[AgentPresenter] Conversation callback set")
 
         self.event_processor = EventProcessor(
@@ -78,7 +78,7 @@ class RefactoredAgentPresenter(QObject):
         
         
         
-        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
             print(f"[RefactoredAgentPresenter] Initialized with modular architecture")
 
     def _connect_signals(self):

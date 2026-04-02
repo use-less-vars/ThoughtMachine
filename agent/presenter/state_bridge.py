@@ -165,10 +165,10 @@ class StateBridge:
         self.session_name = session.metadata.get('name')
         
         # Copy any pending user history to the session
-        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
             print(f'[StateBridge] bind_session: pending_history={len(self._pending_user_history)}, session.user_history length={len(session.user_history)}, is_ObservableList={isinstance(session.user_history, ObservableList)}')
         if self._pending_user_history and not session.user_history:
-            if os.environ.get('THOUGHTMACHINE_DEBUG'):
+            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                 print(f'[StateBridge] Performing slice assignment: session.user_history[:] = pending_user_history (len={len(self._pending_user_history)})')
             session.user_history[:] = self._pending_user_history
         self._pending_user_history.clear()

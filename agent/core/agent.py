@@ -664,6 +664,8 @@ class Agent:
                 "keep_system_messages": self.config.keep_system_messages,
             }
             self.logger.log_agent_start(query, config_data)
+            # Log initial system resources
+            self.logger.log_system_resources()
         # Append user message
         pause_debug(f"Adding user message to conversation: '{query[:50]}...'")
         user_msg = {"role": "user", "content": query}
@@ -693,8 +695,12 @@ class Agent:
         
         for turn in range(self.config.max_turns):
             # Log turn start
+            turn_start_time = time.time()
             if self.logger:
                 self.logger.log_turn_start(turn)
+                # Log system resources every 5 turns to monitor performance
+                if turn % 5 == 0:
+                    self.logger.log_system_resources()
             
             # Decrement critical countdowns
             countdown_events = self.state.decrement_critical_countdown()
@@ -717,6 +723,7 @@ class Agent:
 
                 if self.logger:
                     self.logger.log_stop_signal()
+                    self.logger.log_system_resources()
                     self.logger.log_agent_end("stopped", "Stop signal received")
                     self.logger.close()
                 stopped_event = {
@@ -856,7 +863,7 @@ class Agent:
                 if delay > 0:
                     if self.logger and hasattr(self.logger, 'py_logger'):
                         self.logger.py_logger.info(f"[RATE_LIMIT] Applying rate limit delay: {delay}s between turns")
-                    import time
+
                     time.sleep(delay)
             
             # Format tools
@@ -962,11 +969,23 @@ class Agent:
                 if self.runtime_params.top_p is not None:
                     chat_kwargs["top_p"] = self.runtime_params.top_p
                 
+                # Measure LLM latency
+                llm_start_time = time.time()
                 response = self.llm_client.chat_completion(
                     messages=messages,
                     tools=tools if tools else None,
                     **chat_kwargs
                 )
+                llm_duration_ms = (time.time() - llm_start_time) * 1000
+                
+                # Log LLM latency
+                if self.logger:
+                    self.logger.log_latency("llm_call", llm_duration_ms, {
+                        "turn": turn,
+                        "request_tokens": request_tokens,
+                        "model": self.config.model,
+                        "has_tools": bool(tools)
+                    })
                 
                 # Update input/output token totals
                 input_tokens = response.usage.get('prompt_tokens', 0) if response.usage else 0
@@ -1007,7 +1026,7 @@ class Agent:
                 yield event_dict
                 
                 # Wait the initial wait time
-                import time
+
                 time.sleep(wait_time)
                 
                 # Continue to next turn with delay between turns
@@ -1028,6 +1047,7 @@ class Agent:
                 
                 if self.logger:
                     self.logger.log_error(error_type, str(e))
+                    self.logger.log_system_resources()
                     self.logger.log_agent_end("provider_error", f"Provider error: {e}")
                     self.logger.close()
                 event_dict = {
@@ -1058,6 +1078,7 @@ class Agent:
                         yield yielded_event
                 if self.logger:
                     self.logger.log_error("UNEXPECTED_ERROR", str(e))
+                    self.logger.log_system_resources()
                     self.logger.log_agent_end("unexpected_error", f"Unexpected error: {e}")
                     self.logger.close()
                 event_dict = {
@@ -1108,6 +1129,16 @@ class Agent:
                 }
                 self._add_conversation_data_to_event(pause_event)
                 yield pause_event
+                # Log turn completion
+                turn_duration = time.time() - turn_start_time
+                if self.logger:
+                    self.logger.log_system_resources()
+                    self.logger.log_turn_complete(turn, {
+                        "input": last_input_tokens,
+                        "output": last_output_tokens,
+                        "duration_ms": turn_duration * 1000,
+                        "context_tokens": self.state.current_conversation_tokens
+                    })
                 return
             
             # Create turn transaction for atomic buffering of the turn (assistant message + tool results)
@@ -1152,7 +1183,7 @@ class Agent:
             # Execute tool calls if present
             if tool_calls:
                 # Execute tool calls
-                executed_tools, final_detected, user_interaction_requested, summary_text, summary_keep_recent_turns = self.tool_executor.execute_tool_calls(
+                executed_tools, final_detected, final_content, user_interaction_requested, summary_text, summary_keep_recent_turns = self.tool_executor.execute_tool_calls(
                     tool_calls,
                     add_to_conversation_func=self._add_to_conversation,
                     update_token_func=self._update_tokens_and_yield,
@@ -1220,7 +1251,7 @@ class Agent:
                     # Yield final event
                     final_event = {
                         "type": "final",
-                        "content": content,
+                        "content": final_content if final_content is not None else content,
                         "turn": self._display_turn,
                         "context_length": self.state.current_conversation_tokens,
                         "usage": {
@@ -1236,6 +1267,16 @@ class Agent:
                         final_event["reasoning"] = ""  # Empty string for tool calls without reasoning
                     self._add_conversation_data_to_event(final_event)
                     yield final_event
+                    # Log turn completion
+                    turn_duration = time.time() - turn_start_time
+                    if self.logger:
+                        self.logger.log_system_resources()
+                        self.logger.log_turn_complete(turn, {
+                            "input": last_input_tokens,
+                            "output": last_output_tokens,
+                            "duration_ms": turn_duration * 1000,
+                            "context_tokens": self.state.current_conversation_tokens
+                        })
                     return
                 
                 # Handle user interaction request
@@ -1254,6 +1295,16 @@ class Agent:
                     }
                     self._add_conversation_data_to_event(event_dict)
                     yield event_dict
+                    # Log turn completion
+                    turn_duration = time.time() - turn_start_time
+                    if self.logger:
+                        self.logger.log_system_resources()
+                        self.logger.log_turn_complete(turn, {
+                            "input": last_input_tokens,
+                            "output": last_output_tokens,
+                            "duration_ms": turn_duration * 1000,
+                            "context_tokens": self.state.current_conversation_tokens
+                        })
                     return
                 
                 # Handle summary request
@@ -1291,6 +1342,16 @@ class Agent:
                 }
                 self._add_conversation_data_to_event(pause_event)
                 yield pause_event
+                # Log turn completion
+                turn_duration = time.time() - turn_start_time
+                if self.logger:
+                    self.logger.log_system_resources()
+                    self.logger.log_turn_complete(turn, {
+                        "input": last_input_tokens,
+                        "output": last_output_tokens,
+                        "duration_ms": turn_duration * 1000,
+                        "context_tokens": self.state.current_conversation_tokens
+                    })
                 return
             
             # Check if we should continue (no tool calls, or tool calls didn't result in user interaction/final)
@@ -1309,6 +1370,7 @@ class Agent:
                     for yielded_event in self._handle_state_event(event):
                         yield yielded_event
                 if self.logger:
+                    self.logger.log_system_resources()
                     self.logger.log_agent_end("completed", "Assistant provided direct answer with no tool calls")
                     self.logger.close()
                 final_event = {
@@ -1792,6 +1854,7 @@ class Agent:
             "enable_file_logging": overrides.get("enable_file_logging", True),
             "enable_console_logging": overrides.get("enable_console_logging", False),
             "jsonl_format": overrides.get("jsonl_format", True),
+            "log_categories": overrides.get("log_categories", ["SESSION", "LLM", "TOOLS"]),
             "max_file_size_mb": overrides.get("max_file_size_mb", 10),
             "max_backup_files": overrides.get("max_backup_files", 5),
         }

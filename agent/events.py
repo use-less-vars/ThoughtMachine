@@ -512,7 +512,7 @@ def _map_legacy_event_type(event_type_str: str) -> EventType:
     """Map legacy event type strings to standardized EventType."""
     import os
     import sys
-    if os.environ.get('THOUGHTMACHINE_DEBUG'):
+    if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
         sys.stderr.write(f"[events] _map_legacy_event_type: '{event_type_str}'\n")
     mapping = {
         "tool_call": EventType.TOOL_CALL,
@@ -535,7 +535,7 @@ def _map_legacy_event_type(event_type_str: str) -> EventType:
     }
     result = mapping.get(event_type_str)
     if result is None:
-        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
             sys.stderr.write(f"[events] No mapping for '{event_type_str}', attempting direct EventType creation\n")
         result = EventType(event_type_str)
     return result
