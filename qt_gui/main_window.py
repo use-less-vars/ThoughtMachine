@@ -38,27 +38,17 @@ class AgentGUI(QMainWindow):
         main_layout.addWidget(self.tab_widget)
         self.restore_open_sessions()
         if self.tab_widget.count() == 0:
-            self.new_tab(auto_load_current=True)  # create initial tab
+            self.new_tab()  # create initial tab
         self.create_menu_bar()
 
-    def new_tab(self, session_id=None, auto_load_current=False):
+    def new_tab(self, session_id=None):
         from qt_gui.session_tab import SessionTab
-        tab = SessionTab(session_store=self.session_store, auto_load_current=auto_load_current)
-        if session_id:
-            try:
-                success = tab.presenter.load_session_by_id(session_id)
-                if success:
-                    tab.display_loaded_conversation()
-                else:
-                    print(f"[GUI] Session {session_id} not found in store")
-            except Exception as e:
-                print(f"[GUI] Failed to load session {session_id}: {e}")
+        tab = SessionTab(session_store=self.session_store, session_id=session_id)
         index = self.tab_widget.addTab(tab, tab.presenter.session_name or "Untitled")
         self.tab_widget.setCurrentWidget(tab)
         # Update tab label after adding to tab widget
-        if session_id:
-            tab.update_window_title()
-            tab._update_tab_label()
+        tab.update_window_title()
+        tab._update_tab_label()
 
     def restore_open_sessions(self):
         """Restore previously open sessions from open_sessions.json."""
@@ -104,7 +94,7 @@ class AgentGUI(QMainWindow):
     def open_session_in_new_tab(self, file_path):
         """Open a session file in a new tab."""
         from qt_gui.session_tab import SessionTab
-        tab = SessionTab(session_store=self.session_store, auto_load_current=False)
+        tab = SessionTab(session_store=self.session_store)
         try:
             success = tab.presenter.load_session(file_path)
             if success:

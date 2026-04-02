@@ -48,9 +48,12 @@ from qt_gui.panels.event_models import EventDelegate, EventModel, EventFilterPro
 
 # --- Main GUI class (refactored to use Presenter) ---
 class SessionTab(QWidget):
-    def __init__(self, parent=None, session_store=None, auto_load_current=True):
+    def __init__(self, parent=None, session_store=None, session_id=None):
         super().__init__(parent)
 
+        # Session ownership - Tab owns the Session
+        self.session = None
+        
         # Initialize presenter and config service
         self.presenter = RefactoredAgentPresenter()
         if session_store is not None:
@@ -68,6 +71,7 @@ class SessionTab(QWidget):
         self.last_history = None
         self._cached_config = None  # Config created by restart_session for next run
         self._display_turn = 0  # Counter for GUI grouping of events per user query
+        self._display_retry_count = 0  # Counter for deferred display retries
 
         self._loading_config = False  # Flag to prevent save during load
         self._closing = False  # Flag to prevent reentrant close
@@ -78,12 +82,6 @@ class SessionTab(QWidget):
         self._auto_save_timer.timeout.connect(self._auto_save_session)
         self._auto_save_timer.start()
         
-        # Conversation changed debounce timer (prevents excessive rebuilds)
-        self._conversation_debounce_timer = QTimer(self)
-        self._conversation_debounce_timer.setSingleShot(True)
-        self._conversation_debounce_timer.setInterval(100)  # 100ms debounce
-        self._conversation_debounce_timer.timeout.connect(self._on_conversation_debounced)
-
         # Initialize output and query panels
         self.output_panel = OutputPanel(self)
         self.query_panel = QueryPanel(self)
@@ -98,22 +96,85 @@ class SessionTab(QWidget):
         self.run_btn = self.query_panel.run_btn
         self.pause_btn = self.query_panel.pause_btn
         self.restart_btn = self.query_panel.restart_btn
-
+        
+        # Create or load session
+        if session_id:
+            self.load_session_by_id(session_id)
+        else:
+            self.create_new_session()
+        
+        # Conversation changed debounce timer (prevents excessive rebuilds)
+        self._conversation_debounce_timer = QTimer(self)
+        self._conversation_debounce_timer.setSingleShot(True)
+        self._conversation_debounce_timer.setInterval(100)  # 100ms debounce
+        self._conversation_debounce_timer.timeout.connect(self._on_conversation_debounced)
+        
         self.init_ui()
         self.setup_signal_connections()
         self.load_config()
-        # Auto-load current session on startup if requested and available
-        if auto_load_current and self.presenter.load_current_session():
-            self.display_loaded_conversation()
+    def create_new_session(self):
+        """Create fresh session with auto-generated name."""
+        from session.models import Session, SessionConfig
+        import uuid
+        from datetime import datetime
+        
+        # Create default session config
+        agent_config = self.presenter.create_agent_config()
+        session_config = self.presenter._build_session_config(agent_config)
+        
+        # Create session with auto-generated name (ensure_name will set it)
+        self.session = Session(
+            session_id=str(uuid.uuid4()),
+            config=session_config,
+            user_history=[],
+            metadata={}
+        )
+        # Session.ensure_name() is called in __post_init__
+        
+        # Bind session to presenter
+        self.presenter.bind_session(self.session)
+        
+        # Auto-save the empty session
+        self.presenter.save_session()
+        self.update_window_title()
+        
+        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+            print(f"[SessionTab] Created new session: {self.session.session_id}")
+    
+    def load_session_by_id(self, session_id: str) -> bool:
+        """Load a session by ID from the session store."""
+        try:
+            # Load session via presenter
+            success = self.presenter.load_session_by_id(session_id)
+        except Exception as e:
+            print(f"[SessionTab] Error loading session {session_id}: {e}")
+            self.create_new_session()
+            return False
+        
+        if success:
+            # Get the loaded session from presenter
+            # The session is stored in state_bridge.current_session
+            self.session = self.presenter.state_bridge.current_session
+            
+            # Try to display, but don't fail if UI not ready
+            # display_loaded_conversation will handle deferred display
+            try:
+                self.display_loaded_conversation()
+            except Exception as e:
+                print(f"[SessionTab] Error displaying session {session_id}: {e}")
+                # Continue anyway - session is loaded
+            
             self.update_window_title()
-        # If no session is loaded (new tab), create a new empty session with default name
-        if not self.presenter.current_session_id and not self.presenter.session_name:
-            from datetime import datetime
-            default_name = f"Session {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-            self.presenter.new_session(name=default_name, auto_save_current=True)
-            # Auto-save the empty session
-            self.presenter.save_session()
-            self.update_window_title()
+            
+            if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                print(f"[SessionTab] Loaded session: {session_id}")
+            return True
+        else:
+            # If loading fails, create new session
+            print(f"[SessionTab] Failed to load session {session_id}, creating new")
+            self.create_new_session()
+            return False
+    
     def init_ui(self):
         """Initialize the user interface (unchanged layout)."""
         self.update_window_title()
@@ -555,7 +616,7 @@ class SessionTab(QWidget):
         # Clear the query entry
         self.query_entry.clear()
         # In presenter, this will stop agent if running and clear session data
-        self.presenter.new_session(name=name if name else None, auto_save_current=False)
+        self.presenter.new_session(name=name if name else None)
         # Clear UI components
         self.output_panel.clear_output()
         # Reset token counters and turn counter
@@ -1138,6 +1199,43 @@ class SessionTab(QWidget):
             QMessageBox.warning(self, "Invalid Name", "Please enter a valid session name.")
             return
         
+        # Check if saving within the sessions directory
+        from pathlib import Path
+        sessions_dir = Path(self.presenter.session_store.sessions_dir)
+        target_path = Path(file_path)
+        
+        try:
+            if target_path.parent.samefile(sessions_dir):
+                # User is saving to the sessions directory
+                # Check if a session with this name already exists
+                existing_sessions = self.presenter.list_sessions()
+                for session in existing_sessions:
+                    if session.get('name', '').lower() == new_name.lower():
+                        reply = QMessageBox.question(
+                            self, "Replace Session?",
+                            f"A session named '{new_name}' already exists. Replace it?",
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                        )
+                        if reply != QMessageBox.StandardButton.Yes:
+                            return
+                        break
+                
+                # Warn about duplicate files
+                reply = QMessageBox.warning(
+                    self, "Save in Sessions Directory",
+                    f"Saving to the sessions directory will create a duplicate file.\n"
+                    f"Original: {session_id}.json\n"
+                    f"New: {filename}.json\n\n"
+                    f"Consider using 'Rename Session' from the Session Manager instead.\n\n"
+                    f"Do you want to continue?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+        except Exception as e:
+            # If path comparison fails, continue anyway
+            print(f"[SessionTab] Error checking sessions directory: {e}")
+        
         # First export the session to the chosen file path (ensures file is written)
         export_success = self.presenter.export_session(file_path, set_as_external=True)
         if not export_success:
@@ -1153,6 +1251,29 @@ class SessionTab(QWidget):
             debug_log(f"save_session_as: calling update_window_title and _update_tab_label after rename success")
             self.update_window_title()
             self._update_tab_label()
+            
+            # If saved to sessions directory, offer to delete the original
+            try:
+                if target_path.parent.samefile(sessions_dir):
+                    reply = QMessageBox.question(
+                        self, "Delete Original?",
+                        f"Successfully saved as '{new_name}'.\n"
+                        f"Original file: {session_id}.json\n"
+                        f"Would you like to delete the original file to avoid duplicates?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    if reply == QMessageBox.StandardButton.Yes:
+                        delete_success = self.presenter.delete_session(session_id)
+                        if delete_success:
+                            QMessageBox.information(self, "Original Deleted", 
+                                f"Original session file deleted.\n"
+                                f"Your session is now saved as '{new_name}'.")
+                        else:
+                            QMessageBox.warning(self, "Delete Failed", 
+                                "Could not delete original session file.")
+            except Exception as e:
+                print(f"[SessionTab] Error checking for delete: {e}")
+                
             QMessageBox.information(self, "Session Saved", f"Session saved as '{new_name}' to {file_path}")
         else:
             # Metadata rename failed but file was saved, still inform user
@@ -1175,6 +1296,26 @@ class SessionTab(QWidget):
         )
         if not file_path:
             return
+        
+        # Check if exporting to the sessions directory
+        from pathlib import Path
+        try:
+            sessions_dir = Path(self.presenter.session_store.sessions_dir)
+            target_path = Path(file_path)
+            
+            if target_path.parent.samefile(sessions_dir):
+                reply = QMessageBox.warning(
+                    self, "Export to Sessions Directory",
+                    f"Exporting to the sessions directory will create a duplicate file.\n\n"
+                    f"Consider using 'Save Session As' instead if you want to rename the session.\n\n"
+                    f"Do you want to continue?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+        except Exception as e:
+            # If path comparison fails, continue anyway
+            print(f"[SessionTab] Error checking sessions directory during export: {e}")
 
         try:
             success = self.presenter.export_session(file_path)
@@ -1279,6 +1420,18 @@ class SessionTab(QWidget):
         current_text = current_item.text()
         current_name = current_text.split(' - ')[0]
 
+        # Show explanation about rename (metadata only, not filename)
+        from PyQt6.QtWidgets import QMessageBox
+        reply = QMessageBox.information(
+            self, "Rename Session",
+            f"Renaming will change the display name in the UI, but the filename will remain:\n"
+            f"{session_id}.json\n\n"
+            f"This helps avoid filename conflicts. Continue?",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel
+        )
+        if reply != QMessageBox.StandardButton.Ok:
+            return
+        
         new_name, ok = QInputDialog.getText(
             self, "Rename Session", "Enter new name:", QLineEdit.EchoMode.Normal, current_name
         )
@@ -1292,11 +1445,31 @@ class SessionTab(QWidget):
                 if self.presenter.current_session and self.presenter.current_session.session_id == session_id:
                     self.presenter.session_name = new_name.strip()
                     self.update_window_title()
+                
+                QMessageBox.information(
+                    self, "Session Renamed",
+                    f"Session renamed to '{new_name.strip()}'.\n"
+                    f"Filename remains: {session_id}.json"
+                )
             else:
                 QMessageBox.warning(self, "Rename Failed", "Could not rename session.")
 
     def display_loaded_conversation(self):
         """Display the currently loaded conversation (full user history)."""
+        # If UI panels are not initialized yet, defer until they are
+        if not hasattr(self, 'output_panel') or self.output_panel is None or \
+           not hasattr(self, 'status_panel') or self.status_panel is None:
+            # Try again after a short delay, but limit retries
+            self._display_retry_count += 1
+            if self._display_retry_count > 10:
+                print(f"[SessionTab] Warning: Too many display retries ({self._display_retry_count}), giving up")
+                return
+            QTimer.singleShot(0, self.display_loaded_conversation)
+            return
+        
+        # Reset retry counter since we're about to display successfully
+        self._display_retry_count = 0
+        
         # Clear current display
         self.output_panel.clear_output()
 
@@ -1437,7 +1610,7 @@ class SessionTab(QWidget):
             # print(f"[GUI] Warning: could not stop controller: {e}")
             pass
 
-        success = self.presenter.load_session(file_path, auto_save=False)  # Already handled above
+        success = self.presenter.load_session(file_path)  # Auto-save is always performed
         if success:
             self.display_loaded_conversation()
             # Window title and UI updated by display_loaded_conversation

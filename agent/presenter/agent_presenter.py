@@ -148,9 +148,9 @@ class RefactoredAgentPresenter(QObject):
         """Start a new agent session."""
         self.session_lifecycle.start_session(query, config, preset_name)
     
-    def new_session(self, name: str = None, auto_save_current: bool = True):
+    def new_session(self, name: str = None):
         """Start a brand new session."""
-        self.session_lifecycle.new_session(name, auto_save_current)
+        self.session_lifecycle.new_session(name)
     
     def continue_session(self, query: str):
         """Continue an existing session with a new query."""
@@ -168,17 +168,16 @@ class RefactoredAgentPresenter(QObject):
         """Save current session to the session store."""
         return self.session_lifecycle.save_session()
     
-    def load_session(self, filepath: str, auto_save: bool = True) -> bool:
+    def load_session(self, filepath: str) -> bool:
         """Load a session from a JSON file.
 
         Args:
             filepath: Path to the session file
-            auto_save: If True, auto-save current session before loading
 
         Returns:
             True if loaded successfully, False otherwise
         """
-        return self.session_lifecycle.load_session(filepath, auto_save)
+        return self.session_lifecycle.load_session(filepath)
     
     def load_session_by_id(self, session_id: str) -> bool:
         """Load a session by ID from the session store."""
@@ -215,9 +214,9 @@ class RefactoredAgentPresenter(QObject):
         """Rename a session's metadata name."""
         return self.session_lifecycle.rename_session(session_id, new_name)
     
-    def auto_save_current_session(self, default_name: str = None) -> bool:
-        """Auto-save current session with default name if not already saved."""
-        return self.session_lifecycle.auto_save_current_session(default_name)
+    def auto_save_current_session(self) -> bool:
+        """Auto-save current session."""
+        return self.session_lifecycle.auto_save_current_session()
     
 
 
@@ -229,7 +228,7 @@ class RefactoredAgentPresenter(QObject):
         """Update external file path for auto-save."""
         self.state_bridge.update_external_file_path(filepath)
 
-    def _bind_session(self, session: Session) -> None:
+    def bind_session(self, session: Session) -> None:
         """Bind a session to the presenter."""
         self.state_bridge.bind_session(session)
 

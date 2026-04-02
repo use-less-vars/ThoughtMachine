@@ -186,6 +186,8 @@ class Session:
             self.context_length = self.total_input_tokens + self.total_output_tokens
         # Wrap user_history with observable list
         self._wrap_user_history()
+        # Ensure session has a name
+        self.ensure_name()
         # Compute initial conversation hash
         try:
             conv_str = self._normalize_conversation_for_hash(self.user_history)
@@ -204,6 +206,21 @@ class Session:
             # Ensure callback is set
             self.user_history.callback = self._on_conversation_changed
 
+    def ensure_name(self):
+        """Ensure session has a name for display/persistence.
+        
+        If metadata doesn't have a 'name' key, generates a default name
+        based on creation timestamp.
+        """
+        name = self.metadata.get('name', '')
+        if not name or not str(name).strip():
+            from datetime import datetime
+            # Use created_at if available, otherwise current time
+            if isinstance(self.created_at, datetime):
+                timestamp = self.created_at
+            else:
+                timestamp = datetime.now()
+            self.metadata['name'] = f"Session {timestamp:%Y-%m-%d %H:%M}"
     @staticmethod
     def _normalize_conversation_for_hash(conversation: List[Dict[str, Any]]) -> str:
         """Create normalized JSON representation for consistent hashing.

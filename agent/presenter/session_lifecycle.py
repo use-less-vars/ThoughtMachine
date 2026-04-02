@@ -92,6 +92,14 @@ class SessionLifecycle:
         """Mark session as clean (no unsaved changes). Dummy method after removing dirty tracking."""
         if os.environ.get('THOUGHTMACHINE_DEBUG'):
             print(f'[SessionLifecycle] mark_clean called (dummy method - dirty tracking removed)')
+    
+    def has_unsaved_changes(self) -> bool:
+        """Check if current session has unsaved changes.
+        
+        Returns:
+            Always returns False (dirty tracking removed).
+        """
+        return False
     # Session operations
     def start_session(self, query: str, config: Optional[dict] = None, preset_name: str = None):
         """
@@ -143,6 +151,8 @@ class SessionLifecycle:
                     user_history=[],
                     metadata={}
                 )
+                # Ensure session has a name
+                new_session.ensure_name()
                 self.state_bridge.bind_session(new_session)
                 # Register callback for conversation changes
                 self._register_session_callbacks(new_session)
@@ -173,18 +183,16 @@ class SessionLifecycle:
             if os.environ.get('THOUGHTMACHINE_DEBUG'):
                 print(f"[SessionLifecycle] Error starting session: {e}")
 
-    def new_session(self, name: str = None, auto_save_current: bool = True):
+    def new_session(self, name: str = None):
         """Start a brand new session.
         
         Args:
             name: Optional name for the new session. If None, session will be unnamed.
-            auto_save_current: If True, auto-save current session before clearing.
         """
-        # Auto-save current session if requested
-        if auto_save_current:
-            if os.environ.get('THOUGHTMACHINE_DEBUG'):
-                print("[SessionLifecycle] Auto-saving current session before starting new session")
-            self.auto_save_current_session()
+        # Always auto-save current session before starting new session
+        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+            print("[SessionLifecycle] Auto-saving current session before starting new session")
+        self.auto_save_current_session()
         
         # If agent is running, stop it first (best effort)
         if self.controller.is_running:
@@ -198,6 +206,8 @@ class SessionLifecycle:
             user_history=[],
             metadata={'name': name} if name else {}
         )
+        # Ensure session has a name
+        session.ensure_name()
         self.state_bridge.bind_session(session)
         # Register callback for conversation changes
         self._register_session_callbacks(session)
@@ -325,7 +335,7 @@ class SessionLifecycle:
             True if saved successfully, False otherwise
         """
         if os.environ.get('THOUGHTMACHINE_DEBUG'):
-            print(f"[SessionLifecycle] save_session called, has_unsaved_changes=False, current_session_id={self.state_bridge.current_session_id}")
+            print(f"[SessionLifecycle] save_session called, current_session_id={self.state_bridge.current_session_id}")
         try:
             # Build session from current state
             session = self._build_session_from_current_state()
@@ -345,12 +355,7 @@ class SessionLifecycle:
             self.state_bridge.current_session = session
 
             # Ensure session has a name for listing
-            if not session.metadata.get('name'):
-                created = session.created_at
-                if isinstance(created, datetime):
-                    session.metadata['name'] = f"Session {created:%Y-%m-%d %H:%M}"
-                else:
-                    session.metadata['name'] = "Untitled Session"
+            session.ensure_name()
 
             # Save via session store (writes to store directory)
             print(f"[SessionLifecycle] About to save session {session.session_id} to store")
@@ -380,21 +385,19 @@ class SessionLifecycle:
             return False
 
     
-    def load_session(self, filepath: str, auto_save: bool = True) -> bool:
+    def load_session(self, filepath: str) -> bool:
         """Load a session from a JSON file.
 
         Args:
             filepath: Path to the session file
-            auto_save: If True, auto-save current session before loading
 
         Returns:
             True if loaded successfully, False otherwise
         """
-        # Auto-save current session before loading new one
-        if auto_save:
-            if os.environ.get('THOUGHTMACHINE_DEBUG'):
-                print("[SessionLifecycle] Auto-saving current session before loading new session")
-            self.auto_save_current_session()
+        # Always auto-save current session before loading new one
+        if os.environ.get('THOUGHTMACHINE_DEBUG'):
+            print("[SessionLifecycle] Auto-saving current session before loading new session")
+        self.auto_save_current_session()
 
         try:
             # Convert to absolute path for consistency
@@ -410,7 +413,10 @@ class SessionLifecycle:
 
             # Reconstruct Session object
             session = Session.from_persistable_dict(session_dict)
-
+            
+            # Ensure session has a name
+            session.ensure_name()
+            
             self.state_bridge.bind_session(session)
             # Register callback for conversation changes
             self._register_session_callbacks(session)
@@ -443,6 +449,8 @@ class SessionLifecycle:
         # Set as current session
         self.state_bridge.current_session = session
         self.state_bridge.current_session_id = str(session.session_id)
+        # Ensure session has a name
+        session.ensure_name()
         self.state_bridge.bind_session(session)
         # Register callback for conversation changes
         self._register_session_callbacks(session)
@@ -619,6 +627,8 @@ class SessionLifecycle:
             user_history=conversation,
             metadata={'name': self.state_bridge.session_name} if self.state_bridge.session_name else {}
         )
+        # Ensure session has a name
+        session.ensure_name()
         
         # Copy token totals and context length if available
         if self.state_bridge.total_input > 0:
@@ -639,19 +649,14 @@ class SessionLifecycle:
         
         return session
 
-    def auto_save_current_session(self, default_name: str = None) -> bool:
-        """Auto-save current session with default name if not already saved.
-
-        Args:
-            default_name: Default name to use if session has no name.
-                          If None, generates timestamp-based name.
-
+    def auto_save_current_session(self) -> bool:
+        """Auto-save current session.
+        
         Returns:
-            True if saved or no need to save, False on error.
+            True if saved successfully, False on error.
         """
         if os.environ.get('THOUGHTMACHINE_DEBUG'):
-            print(f"[SessionLifecycle] auto_save_current_session called, dirty=False (tracking removed), current_session_id={self.state_bridge.current_session_id}, current_session exists={self.state_bridge.current_session is not None}")
-        # Event-driven auto-save: always attempt to save on terminal events
+            print(f"[SessionLifecycle] auto_save_current_session called, current_session_id={self.state_bridge.current_session_id}, current_session exists={self.state_bridge.current_session is not None}")        # Event-driven auto-save: always attempt to save on terminal events
         # The save_session() method will handle cases where there's nothing to save
         if os.environ.get('THOUGHTMACHINE_DEBUG'):
             print("[SessionLifecycle] Attempting auto-save (event-driven)")
