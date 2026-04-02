@@ -508,8 +508,10 @@ class SessionTab(QWidget):
     @pyqtSlot(str)
     def on_status_message(self, message):
         """Handle status messages."""
-        # print(f"[GUI] Status: {message}")
-        # Could update a status bar if we add one
+        # Show message in main window status bar for 2 seconds
+        main_window = self.window()
+        if main_window:
+            main_window.statusBar().showMessage(message, 2000)
 
     def _format_event_html(self, event):
         """Format event as HTML for display in QTextEdit."""
@@ -997,7 +999,7 @@ class SessionTab(QWidget):
                             f.write(json.dumps(event, indent=2))
                             f.write('\n' + '-'*80 + '\n\n')
             
-            QMessageBox.information(self, "Export Successful", f"Conversation exported to {file_path}")
+            self.presenter.gui_integration.emit_status_message(f"Conversation exported to {file_path}")
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Failed to export conversation: {e}")
     
@@ -1059,7 +1061,7 @@ class SessionTab(QWidget):
             with open(file_path, 'w', encoding='utf-8') as f:
                 f.write(html_content)
             
-            QMessageBox.information(self, "Export Successful", f"Conversation exported to {file_path}")
+            self.presenter.gui_integration.emit_status_message(f"Conversation exported to {file_path}")
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Failed to export conversation: {e}")
     
@@ -1122,7 +1124,7 @@ class SessionTab(QWidget):
             # Print the document
             doc.print(printer)
             
-            QMessageBox.information(self, "Export Successful", f"Conversation exported to {file_path}")
+            self.presenter.gui_integration.emit_status_message(f"Conversation exported to {file_path}")
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Failed to export conversation: {e}")
     
@@ -1147,7 +1149,7 @@ class SessionTab(QWidget):
             if success:
                 # session_name is updated by presenter
                 self.update_window_title()
-                QMessageBox.information(self, "Session Saved", "Session saved to session store.")
+                self.presenter.gui_integration.emit_status_message("Session saved")
             else:
                 QMessageBox.warning(self, "Save Failed", "Failed to save session.")
         except Exception as e:
@@ -1200,89 +1202,59 @@ class SessionTab(QWidget):
             return
         
         # Check if saving within the sessions directory
-        from pathlib import Path
         sessions_dir = Path(self.presenter.session_store.sessions_dir)
         target_path = Path(file_path)
         
+        is_in_sessions_dir = False
         try:
-            if target_path.parent.samefile(sessions_dir):
-                # User is saving to the sessions directory
-                # Check if a session with this name already exists
-                existing_sessions = self.presenter.list_sessions()
-                for session in existing_sessions:
-                    if session.get('name', '').lower() == new_name.lower():
-                        reply = QMessageBox.question(
-                            self, "Replace Session?",
-                            f"A session named '{new_name}' already exists. Replace it?",
-                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                        )
-                        if reply != QMessageBox.StandardButton.Yes:
-                            return
-                        break
-                
-                # Warn about duplicate files
-                reply = QMessageBox.warning(
-                    self, "Save in Sessions Directory",
-                    f"Saving to the sessions directory will create a duplicate file.\n"
-                    f"Original: {session_id}.json\n"
-                    f"New: {filename}.json\n\n"
-                    f"Consider using 'Rename Session' from the Session Manager instead.\n\n"
-                    f"Do you want to continue?",
+            is_in_sessions_dir = target_path.parent.samefile(sessions_dir)
+        except Exception as e:
+            # If path comparison fails, assume not in sessions directory
+            print(f"[SessionTab] Error checking sessions directory: {e}")
+        
+        if is_in_sessions_dir:
+            # User is saving to the sessions directory (rename session)
+            # Check if a session with this name already exists
+            existing_sessions = self.presenter.list_sessions()
+            for session in existing_sessions:
+                if session.get('name', '').lower() == new_name.lower():
+                    reply = QMessageBox.question(
+                        self, "Overwrite Session?",
+                        f"A session named '{new_name}' already exists. Overwrite it?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    if reply != QMessageBox.StandardButton.Yes:
+                        return
+                    break
+            
+            # Rename session (which will rename the file)
+            success = self.presenter.rename_session(session_id, new_name)
+            if success:
+                self.presenter.session_name = new_name
+                self.update_window_title()
+                self._update_tab_label()
+                # Show status message
+                self.presenter.gui_integration.emit_status_message(f"Session saved as '{new_name}'")
+            else:
+                QMessageBox.warning(self, "Rename Failed", "Failed to rename session.")
+        else:
+            # Export to external location
+            # Check if file already exists (QFileDialog may have warned, but we check again)
+            if target_path.exists():
+                reply = QMessageBox.question(
+                    self, "Overwrite File?",
+                    f"The file '{target_path.name}' already exists. Overwrite it?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
                 )
                 if reply != QMessageBox.StandardButton.Yes:
                     return
-        except Exception as e:
-            # If path comparison fails, continue anyway
-            print(f"[SessionTab] Error checking sessions directory: {e}")
-        
-        # First export the session to the chosen file path (ensures file is written)
-        export_success = self.presenter.export_session(file_path, set_as_external=True)
-        if not export_success:
-            QMessageBox.warning(self, "Save Failed", "Failed to save session to the selected location.")
-            return
-        
-        # Then rename metadata in store (if file is within sessions directory)
-        # This updates the session name displayed in UI
-        success = self.presenter.rename_session(session_id, new_name)
-        if success:
-            self.presenter.session_name = new_name
-
-            debug_log(f"save_session_as: calling update_window_title and _update_tab_label after rename success")
-            self.update_window_title()
-            self._update_tab_label()
             
-            # If saved to sessions directory, offer to delete the original
-            try:
-                if target_path.parent.samefile(sessions_dir):
-                    reply = QMessageBox.question(
-                        self, "Delete Original?",
-                        f"Successfully saved as '{new_name}'.\n"
-                        f"Original file: {session_id}.json\n"
-                        f"Would you like to delete the original file to avoid duplicates?",
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                    )
-                    if reply == QMessageBox.StandardButton.Yes:
-                        delete_success = self.presenter.delete_session(session_id)
-                        if delete_success:
-                            QMessageBox.information(self, "Original Deleted", 
-                                f"Original session file deleted.\n"
-                                f"Your session is now saved as '{new_name}'.")
-                        else:
-                            QMessageBox.warning(self, "Delete Failed", 
-                                "Could not delete original session file.")
-            except Exception as e:
-                print(f"[SessionTab] Error checking for delete: {e}")
-                
-            QMessageBox.information(self, "Session Saved", f"Session saved as '{new_name}' to {file_path}")
-        else:
-            # Metadata rename failed but file was saved, still inform user
-            self.presenter.session_name = new_name
-
-            debug_log(f"save_session_as: calling update_window_title and _update_tab_label after rename failed")
-            self.update_window_title()
-            self._update_tab_label()
-            QMessageBox.information(self, "Session Saved", f"Session saved as '{new_name}' to {file_path} (metadata update failed)")
+            # Export the session
+            success = self.presenter.export_session(file_path, set_as_external=False)
+            if success:
+                self.presenter.gui_integration.emit_status_message(f"Session exported to {target_path.name}")
+            else:
+                QMessageBox.warning(self, "Save Failed", "Failed to save session to the selected location.")
 
     def export_session(self):
         """Export current session to a file (user chooses location)."""
@@ -1290,37 +1262,34 @@ class SessionTab(QWidget):
         if not self.presenter.user_history and not self.presenter._initial_conversation:
             QMessageBox.warning(self, "No Session", "No conversation to export.")
             return
-
+        
         file_path, _ = QFileDialog.getSaveFileName(
             self, "Export Session As", "", "Session Files (*.json);;All Files (*)"
         )
         if not file_path:
             return
         
-        # Check if exporting to the sessions directory
+        # Ensure .json extension
+        if not file_path.lower().endswith('.json'):
+            file_path += '.json'
+        
         from pathlib import Path
-        try:
-            sessions_dir = Path(self.presenter.session_store.sessions_dir)
-            target_path = Path(file_path)
-            
-            if target_path.parent.samefile(sessions_dir):
-                reply = QMessageBox.warning(
-                    self, "Export to Sessions Directory",
-                    f"Exporting to the sessions directory will create a duplicate file.\n\n"
-                    f"Consider using 'Save Session As' instead if you want to rename the session.\n\n"
-                    f"Do you want to continue?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                )
-                if reply != QMessageBox.StandardButton.Yes:
-                    return
-        except Exception as e:
-            # If path comparison fails, continue anyway
-            print(f"[SessionTab] Error checking sessions directory during export: {e}")
-
+        target_path = Path(file_path)
+        
+        # Check if file already exists (QFileDialog may have warned, but we check again)
+        if target_path.exists():
+            reply = QMessageBox.question(
+                self, "Overwrite File?",
+                f"The file '{target_path.name}' already exists. Overwrite it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        
         try:
             success = self.presenter.export_session(file_path)
             if success:
-                QMessageBox.information(self, "Export Successful", f"Session exported to {file_path}")
+                self.presenter.gui_integration.emit_status_message(f"Exported to {target_path.name}")
             else:
                 QMessageBox.warning(self, "Export Failed", "Failed to export session.")
         except Exception as e:
@@ -1346,7 +1315,7 @@ class SessionTab(QWidget):
         """Open a dialog to manage saved sessions."""
         sessions = self.presenter.list_sessions()
         if not sessions:
-            QMessageBox.information(self, "No Sessions", "No saved sessions found.")
+            self.presenter.gui_integration.emit_status_message("No saved sessions found.")
             return
 
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QListWidget, QDialogButtonBox, QPushButton
@@ -1422,7 +1391,7 @@ class SessionTab(QWidget):
 
         # Show explanation about rename (metadata only, not filename)
         from PyQt6.QtWidgets import QMessageBox
-        reply = QMessageBox.information(
+        reply = QMessageBox.question(
             self, "Rename Session",
             f"Renaming will change the display name in the UI, but the filename will remain:\n"
             f"{session_id}.json\n\n"
@@ -1445,12 +1414,8 @@ class SessionTab(QWidget):
                 if self.presenter.current_session and self.presenter.current_session.session_id == session_id:
                     self.presenter.session_name = new_name.strip()
                     self.update_window_title()
+                self.presenter.gui_integration.emit_status_message(f"Session renamed to '{new_name.strip()}' (filename unchanged)")
                 
-                QMessageBox.information(
-                    self, "Session Renamed",
-                    f"Session renamed to '{new_name.strip()}'.\n"
-                    f"Filename remains: {session_id}.json"
-                )
             else:
                 QMessageBox.warning(self, "Rename Failed", "Could not rename session.")
 
@@ -1615,7 +1580,7 @@ class SessionTab(QWidget):
             self.display_loaded_conversation()
             # Window title and UI updated by display_loaded_conversation
             self.update_window_title()
-            QMessageBox.information(self, "Session Loaded", f"Session loaded from {file_path}")
+            self.presenter.gui_integration.emit_status_message(f"Session loaded from {file_path}")
         else:
             QMessageBox.warning(self, "Load Failed", "Failed to load session file.")
         return success

@@ -66,6 +66,10 @@ class TurnContainerManager:
             html = self.delegate._event_to_html(event, suppress_turn_header=suppress_turn_header, 
                                               suppress_title_bar=suppress_title_bar)
             if html:
+                # DEBUG: Print HTML
+                import os
+                if os.environ.get('THOUGHTMACHINE_DEBUG'):
+                    print(f"[TurnContainer] Inserting HTML for {etype}, turn {turn_num}: {html[:200]}...")
                 cursor = self.output_widget.textCursor()
                 cursor.movePosition(QTextCursor.MoveOperation.End)
                 # Close container for turn 0 events
@@ -75,8 +79,8 @@ class TurnContainerManager:
                 # Add separator only if there's already content AND we're still in the same turn
                 # (don't add separator right after turn header)
                 if self.output_widget.document().characterCount() > 0 and self.last_appended_turn == turn_num:
-                    # Light separator for events within same turn
-                    cursor.insertHtml("<hr style='margin: 3px 0; border: none; border-top: 1px dotted #eee;'>")
+                    # Minimal separator for events within same turn
+                    cursor.insertHtml("<div style='margin: 8px 0;'></div>")
                 cursor.insertHtml(html)
                 self.last_appended_turn = turn_num
         

@@ -41,8 +41,12 @@ class MarkdownRenderer:
 
             # Apply style if provided
             if style and html_result:
-                # Wrap in span with inline style
-                html_result = f'<span style="{style}">{html_result}</span>'
+                # Wrap in div with inline style (span is inline, div is block)
+                # Check if content likely contains block elements
+                if any(tag in html_result for tag in ['<div', '<p>', '<h1', '<h2', '<h3', '<h4', '<h5', '<h6', '<ul', '<ol', '<li', '<blockquote', '<pre', '<hr', '<br>']):
+                    html_result = f'<div style="{style}">{html_result}</div>'
+                else:
+                    html_result = f'<span style="{style}">{html_result}</span>'
 
             return html_result
 
@@ -188,6 +192,11 @@ class MarkdownRenderer:
 
         # Apply style if provided
         if style:
-            escaped = f'<span style="{style}">{escaped}</span>'
+            # Wrap in div with inline style (span is inline, div is block)
+            # Check if content likely contains block elements
+            if any(tag in escaped for tag in ['<div', '<p>', '<h1', '<h2', '<h3', '<h4', '<h5', '<h6', '<ul', '<ol', '<li', '<blockquote', '<pre', '<hr', '<br>']):
+                escaped = f'<div style="{style}">{escaped}</div>'
+            else:
+                escaped = f'<span style="{style}">{escaped}</span>'
 
         return escaped

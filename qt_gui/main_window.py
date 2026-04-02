@@ -65,7 +65,8 @@ class AgentGUI(QMainWindow):
             # Filter out session IDs that no longer exist
             existing_ids = []
             for sid in session_ids:
-                if (self.session_store.sessions_dir / f"{sid}.json").exists():
+                # Use session store's path resolution (supports friendly filenames)
+                if self.session_store.get_session_path(sid).exists():
                     existing_ids.append(sid)
                 else:
                     print(f"[GUI] Session {sid} no longer exists, skipping")
