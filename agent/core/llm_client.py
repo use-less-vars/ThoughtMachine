@@ -7,6 +7,7 @@ Extracted from agent.py to separate LLM communication concerns.
 import os
 import logging
 from typing import Optional, List, Dict, Any
+from agent.logging.debug_log import debug_log
 
 from llm_providers.factory import ProviderFactory
 from llm_providers.exceptions import (

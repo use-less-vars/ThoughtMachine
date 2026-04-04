@@ -13,6 +13,7 @@ import tiktoken
 
 from .base import LLMProvider, ProviderConfig, LLMResponse
 from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError
+from agent.logging.debug_log import debug_log
 
 logger = logging.getLogger(__name__)
 if os.environ.get('DEBUG_OPENAI'):
@@ -45,7 +46,7 @@ class OpenAICompatibleProvider(LLMProvider):
         
         # Debug logging
         logger.debug(f"OpenAI client config: base_url={config.base_url}, model={config.model}, api_key={config.api_key}, timeout={config.timeout}, max_retries={config.max_retries}, extra_headers={config.extra_headers}")
-        print(f"[DEBUG_OPENAI] client config: base_url={config.base_url}, model={config.model}, api_key={config.api_key}, timeout={config.timeout}, max_retries={config.max_retries}, extra_headers={config.extra_headers}", file=sys.stderr)
+        debug_log(f"client config: base_url={config.base_url}, model={config.model}, api_key={config.api_key}, timeout={config.timeout}, max_retries={config.max_retries}, extra_headers={config.extra_headers}", component="OPENAI")
         
         if config.base_url:
             client_kwargs["base_url"] = config.base_url
@@ -55,11 +56,11 @@ class OpenAICompatibleProvider(LLMProvider):
         
         # Debug logging after headers
         logger.debug(f"OpenAI client final kwargs: base_url={client_kwargs.get('base_url')}, default_headers={client_kwargs.get('default_headers')}")
-        print(f"[DEBUG_OPENAI] client final kwargs: base_url={client_kwargs.get('base_url')}, default_headers={client_kwargs.get('default_headers')}", file=sys.stderr)
+        debug_log(f"client final kwargs: base_url={client_kwargs.get('base_url')}, default_headers={client_kwargs.get('default_headers')}", component="OPENAI")
         
         self.client = OpenAI(**client_kwargs)
         logger.debug(f"OpenAI client created with base_url={self.client.base_url if hasattr(self.client, 'base_url') else 'default'}")
-        print(f"[DEBUG_OPENAI] client created with base_url={self.client.base_url if hasattr(self.client, 'base_url') else 'default'}", file=sys.stderr)
+        debug_log(f"client created with base_url={self.client.base_url if hasattr(self.client, 'base_url') else 'default'}", component="OPENAI")
         
         # Initialize tokenizer for token counting (lazy loading)
         self.encoding = None
@@ -175,13 +176,13 @@ class OpenAICompatibleProvider(LLMProvider):
         
         # Debug logging
         if debug_enabled:
-            print(f"[DEEPSEEK_TOOL_NORM] Processed {len(messages)} messages", file=sys.stderr)
+            debug_log(f"Processed {len(messages)} messages", component="")
             for i, msg in enumerate(messages_with_ids):
                 if msg.get("role") == "assistant" and "tool_calls" in msg:
                     for tc in msg["tool_calls"]:
-                        print(f"[DEEPSEEK_TOOL_NORM] Assistant tool call id={tc.get('id')}", file=sys.stderr)
+                        debug_log(f"Assistant tool call id={tc.get('id')}", component="")
                 if msg.get("role") == "tool":
-                    print(f"[DEEPSEEK_TOOL_NORM] Tool message tool_call_id={msg.get('tool_call_id')}", file=sys.stderr)
+                    debug_log(f"Tool message tool_call_id={msg.get('tool_call_id')}", component="")
         
         return messages_with_ids
 
@@ -198,16 +199,16 @@ class OpenAICompatibleProvider(LLMProvider):
         import sys, os
         debug_enabled = os.environ.get('THOUGHTMACHINE_DEBUG') == '1'
         if debug_enabled:
-            print(f"[STEPFUN_NORM_DEBUG] Normalizing with is_openrouter={is_openrouter}", file=sys.stderr)
+            debug_log(f"Normalizing with is_openrouter={is_openrouter}", component="STEPFUN")
         
         messages_normalized = []
         
         # DEBUG: Log input
         if debug_enabled:
-            print(f"[STEPFUN_NORM_DEBUG] Starting normalization of {len(messages)} messages", file=sys.stderr)
+            debug_log(f"Starting normalization of {len(messages)} messages", component="STEPFUN")
             for idx, msg in enumerate(messages):
                 if msg.get("role") == "assistant" and "tool_calls" in msg:
-                    print(f"[STEPFUN_NORM_DEBUG] Message {idx} has tool_calls: {msg['tool_calls']}", file=sys.stderr)
+                    debug_log(f"Message {idx} has tool_calls: {msg['tool_calls']}", component="STEPFUN")
         
         for i, msg in enumerate(messages):
             msg_copy = msg.copy()
@@ -225,7 +226,7 @@ class OpenAICompatibleProvider(LLMProvider):
                         
                         # DEBUG: Log original tool call
                         if debug_enabled:
-                            print(f"[STEPFUN_NORM_DEBUG] Tool call {j} before: {tc_copy}", file=sys.stderr)
+                            debug_log(f"Tool call {j} before: {tc_copy}", component="STEPFUN")
                         
                         # Preserve index field if present (added by OpenRouter)
                         # Ensure type field
@@ -358,7 +359,7 @@ class OpenAICompatibleProvider(LLMProvider):
                         
                         # DEBUG: Log after normalization
                         if debug_enabled:
-                            print(f"[STEPFUN_NORM_DEBUG] Tool call {j} after: {tc_copy}", file=sys.stderr)
+                            debug_log(f"Tool call {j} after: {tc_copy}", component="STEPFUN")
                         
                         normalized_tool_calls.append(tc_copy)
                     
@@ -368,19 +369,19 @@ class OpenAICompatibleProvider(LLMProvider):
         
         # Debug logging
         if debug_enabled:
-            print(f"[STEPFUN_TOOL_NORM] Processed {len(messages)} messages", file=sys.stderr)
+            debug_log(f"Processed {len(messages)} messages", component="STEPFUN")
             for i, msg in enumerate(messages_normalized):
                 if msg.get("role") == "assistant" and "tool_calls" in msg:
                     for tc in msg["tool_calls"]:
-                        print(f"[STEPFUN_TOOL_NORM] Assistant tool call id={tc.get('id')}, type={tc.get('type')}, has_function={'function' in tc}, has_custom={'custom' in tc}, index={tc.get('index')}", file=sys.stderr)
+                        debug_log(f"Assistant tool call id={tc.get('id')}, type={tc.get('type')}, has_function={'function' in tc}, has_custom={'custom' in tc}, index={tc.get('index')}", component="STEPFUN")
         
         # DEBUG: Log final messages
         if debug_enabled:
-            print(f"[STEPFUN_NORM_DEBUG] Final normalized messages:", file=sys.stderr)
+            debug_log(f"Final normalized messages:", component="STEPFUN")
             for idx, msg in enumerate(messages_normalized):
-                print(f"[STEPFUN_NORM_DEBUG] Message {idx}: role={msg.get('role')}", file=sys.stderr)
+                debug_log(f"Message {idx}: role={msg.get('role')}", component="STEPFUN")
                 if msg.get("role") == "assistant" and "tool_calls" in msg:
-                    print(f"[STEPFUN_NORM_DEBUG]   tool_calls: {msg['tool_calls']}", file=sys.stderr)
+                    debug_log(f"  tool_calls: {msg['tool_calls']}", component="STEPFUN")
         
         return messages_normalized
 
@@ -493,24 +494,24 @@ class OpenAICompatibleProvider(LLMProvider):
             # Debug: Print raw response details before parsing
             import os
             if os.environ.get('DEBUG_OPENAI'):
-                print(f"[DEBUG_BEFORE_PARSE] Response type: {type(response)}", file=sys.stderr)
+                debug_log(f"Response type: {type(response)}", component="OPENAI")
                 if hasattr(response, '__dict__'):
-                    print(f"[DEBUG_BEFORE_PARSE] Response has __dict__, keys: {list(response.__dict__.keys())}", file=sys.stderr)
+                    debug_log(f"Response has __dict__, keys: {list(response.__dict__.keys())}", component="OPENAI")
                     # Try to get a string representation of the response
                     try:
                         import json
                         resp_json = json.dumps(response.__dict__, default=str, indent=2)
                         if len(resp_json) > 2000:
                             resp_json = resp_json[:2000] + "... (truncated)"
-                        print(f"[DEBUG_BEFORE_PARSE] Response JSON: {resp_json}", file=sys.stderr)
+                        debug_log(f"Response JSON: {resp_json}", component="OPENAI")
                     except:
                         pass
                 elif isinstance(response, dict):
-                    print(f"[DEBUG_BEFORE_PARSE] Response is dict, keys: {list(response.keys())}", file=sys.stderr)
+                    debug_log(f"Response is dict, keys: {list(response.keys())}", component="OPENAI")
                 elif isinstance(response, str):
-                    print(f"[DEBUG_BEFORE_PARSE] WARNING: Response is string, not JSON object: {response[:500]}", file=sys.stderr)
+                    debug_log(f"WARNING: Response is string, not JSON object: {response[:500]}", component="OPENAI", level="WARNING")
                 else:
-                    print(f"[DEBUG_BEFORE_PARSE] Response repr: {repr(response)[:500]}", file=sys.stderr)
+                    debug_log(f"Response repr: {repr(response)[:500]}", component="OPENAI")
             
             # Parse response
             try:
@@ -518,8 +519,8 @@ class OpenAICompatibleProvider(LLMProvider):
             except Exception as parse_error:
                 # If parse fails, add more context and re-raise with raw response attached
                 if os.environ.get('DEBUG_OPENAI'):
-                    print(f"[DEBUG_PARSE_ERROR] Failed to parse response: {parse_error}", file=sys.stderr)
-                    print(f"[DEBUG_PARSE_ERROR] Response that caused error: {response}", file=sys.stderr)
+                    debug_log(f"Failed to parse response: {parse_error}", component="OPENAI", level="ERROR")
+                    debug_log(f"Response that caused error: {response}", component="OPENAI", level="ERROR")
                 
                 # Create a ProviderError with the raw response
                 parse_provider_error = ProviderError(f"Failed to parse API response: {parse_error}")
@@ -541,35 +542,35 @@ class OpenAICompatibleProvider(LLMProvider):
             # Debug logging for authentication errors
             import os
             if os.environ.get('DEBUG_OPENAI'):
-                print(f"[DEBUG_AUTH_ERROR] APIError caught: {e}", file=sys.stderr)
-                print(f"[DEBUG_AUTH_ERROR] Error type: {type(e)}", file=sys.stderr)
-                print(f"[DEBUG_AUTH_ERROR] Error string: {str(e)}", file=sys.stderr)
+                debug_log(f"APIError caught: {e}", component="OPENAI")
+                debug_log(f"Error type: {type(e)}", component="OPENAI")
+                debug_log(f"Error string: {str(e)}", component="OPENAI")
                 if hasattr(e, 'response'):
                     try:
                         resp_text = str(e.response)
                         if len(resp_text) > 1000:
                             resp_text = resp_text[:1000] + f"... (truncated, total {len(resp_text)} chars)"
-                        print(f"[DEBUG_AUTH_ERROR] Error response: {resp_text}", file=sys.stderr)
+                        debug_log(f"Error response: {resp_text}", component="OPENAI")
                     except:
                         pass
             # Special handling for DeepSeek authentication via APIConnectionError
             if isinstance(e, APIConnectionError):
                 # Debug logging
                 if os.environ.get('DEBUG_OPENAI'):
-                    print(f"[DEBUG_APICONNECTION] APIConnectionError caught: {e}", file=sys.stderr)
-                    print(f"[DEBUG_APICONNECTION] Base URL: {self.config.base_url}", file=sys.stderr)
+                    debug_log(f"APIConnectionError caught: {e}", component="OPENAI")
+                    debug_log(f"Base URL: {self.config.base_url}", component="OPENAI")
                 # Check if this is a DeepSeek endpoint
                 base_url = str(self.config.base_url or "").lower()
                 if "deepseek" in base_url:
                     if os.environ.get('DEBUG_OPENAI'):
-                        print(f"[DEBUG_APICONNECTION] Treating as DeepSeek authentication error", file=sys.stderr)
+                        debug_log(f"Treating as DeepSeek authentication error", component="OPENAI")
                     auth_error = AuthenticationError(f"Authentication failed (DeepSeek connection error): {e}")
                     if hasattr(e, 'response'):
                         auth_error.raw_response = e.response
                     raise auth_error
                 else:
                     if os.environ.get('DEBUG_OPENAI'):
-                        print(f"[DEBUG_APICONNECTION] Not DeepSeek, passing through as API error", file=sys.stderr)
+                        debug_log(f"Not DeepSeek, passing through as API error", component="OPENAI")
             
             if "authentication" in str(e).lower() or "api key" in str(e).lower():
                 auth_error = AuthenticationError(f"Authentication failed: {e}")
@@ -584,15 +585,15 @@ class OpenAICompatibleProvider(LLMProvider):
             # Add more debug info about what was returned
             import os
             if os.environ.get('DEBUG_OPENAI'):
-                print(f"[DEBUG_OPENAI_ERROR] Exception type: {type(e)}", file=sys.stderr)
-                print(f"[DEBUG_OPENAI_ERROR] Exception message: {e}", file=sys.stderr)
+                debug_log(f"Exception type: {type(e)}", component="OPENAI")
+                debug_log(f"Exception message: {e}", component="OPENAI")
                 # Try to get the response if it exists in the exception
                 if hasattr(e, 'response'):
                     try:
                         resp_text = str(e.response)
                         if len(resp_text) > 1000:
                             resp_text = resp_text[:1000] + f"... (truncated, total {len(resp_text)} chars)"
-                        print(f"[DEBUG_OPENAI_ERROR] Exception response: {resp_text}", file=sys.stderr)
+                        debug_log(f"Exception response: {resp_text}", component="OPENAI")
                     except:
                         pass
             
@@ -618,19 +619,19 @@ class OpenAICompatibleProvider(LLMProvider):
         
         # Debug: print raw response details
         if os.environ.get('DEBUG_OPENAI'):
-            print(f"[DEBUG_PARSE_RESPONSE] Starting parse, raw_response type: {type(raw_response)}", file=sys.stderr)
+            debug_log(f"[DEBUG_PARSE_RESPONSE] Starting parse, raw_response type: {type(raw_response)}", component="openai")
             if hasattr(raw_response, '__dict__'):
-                print(f"[DEBUG_PARSE_RESPONSE] raw_response has __dict__", file=sys.stderr)
+                debug_log(f"[DEBUG_PARSE_RESPONSE] raw_response has __dict__", component="openai")
                 for key, value in raw_response.__dict__.items():
                     if key == '_response' or key == 'response':
                         continue  # Skip large response objects
-                    print(f"[DEBUG_PARSE_RESPONSE]   {key}: {value}", file=sys.stderr)
+                    debug_log(f"[DEBUG_PARSE_RESPONSE]   {key}: {value}", component="openai")
             elif isinstance(raw_response, dict):
-                print(f"[DEBUG_PARSE_RESPONSE] raw_response is dict, keys: {list(raw_response.keys())}", file=sys.stderr)
+                debug_log(f"[DEBUG_PARSE_RESPONSE] raw_response is dict, keys: {list(raw_response.keys())}", component="openai")
             elif isinstance(raw_response, str):
-                print(f"[DEBUG_PARSE_RESPONSE] raw_response is string (len={len(raw_response)}): {raw_response[:200]}", file=sys.stderr)
+                debug_log(f"[DEBUG_PARSE_RESPONSE] raw_response is string (len={len(raw_response)}): {raw_response[:200]}", component="openai")
             else:
-                print(f"[DEBUG_PARSE_RESPONSE] raw_response repr: {repr(raw_response)[:200]}", file=sys.stderr)
+                debug_log(f"[DEBUG_PARSE_RESPONSE] raw_response repr: {repr(raw_response)[:200]}", component="openai")
         
         # Check if raw_response is a string (error response from API)
         if isinstance(raw_response, str):
@@ -642,15 +643,15 @@ class OpenAICompatibleProvider(LLMProvider):
         # Check if raw_response has the expected structure
         if not hasattr(raw_response, 'choices'):
             if os.environ.get('DEBUG_OPENAI'):
-                print(f"[DEBUG_PARSE_RESPONSE] ERROR: raw_response missing 'choices' attribute", file=sys.stderr)
-                print(f"[DEBUG_PARSE_RESPONSE] raw_response attributes: {dir(raw_response)}", file=sys.stderr)
+                debug_log(f"[DEBUG_PARSE_RESPONSE] ERROR: raw_response missing 'choices' attribute", component="openai")
+                debug_log(f"[DEBUG_PARSE_RESPONSE] raw_response attributes: {dir(raw_response)}", component="openai")
                 if hasattr(raw_response, '__dict__'):
-                    print(f"[DEBUG_PARSE_RESPONSE] raw_response __dict__ keys: {list(raw_response.__dict__.keys())}", file=sys.stderr)
+                    debug_log(f"[DEBUG_PARSE_RESPONSE] raw_response __dict__ keys: {list(raw_response.__dict__.keys())}", component="openai")
             raise AttributeError(f"Response missing 'choices' attribute. Response type: {type(raw_response)}")
         
         if not raw_response.choices:
             if os.environ.get('DEBUG_OPENAI'):
-                print(f"[DEBUG_PARSE_RESPONSE] ERROR: raw_response.choices is empty", file=sys.stderr)
+                debug_log(f"[DEBUG_PARSE_RESPONSE] ERROR: raw_response.choices is empty", component="openai")
             raise ValueError("Response has empty choices list")
         
         message = raw_response.choices[0].message

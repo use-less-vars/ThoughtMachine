@@ -9,10 +9,10 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer
 
 # Import from other extracted modules
-from qt_gui.panels.mcp_config import MCPConfigDialog
-from qt_gui.panels.markdown_renderer import MarkdownRenderer
-from qt_gui.utils.constants import MAX_RESULT_LENGTH
-from qt_gui.debug_log import debug_log
+from .mcp_config import MCPConfigDialog
+from .markdown_renderer import MarkdownRenderer
+from ..utils.constants import MAX_RESULT_LENGTH
+from ..debug_log import debug_log
 
 
 
@@ -418,9 +418,9 @@ class AgentControlsPanel(QGroupBox):
                             # Store the filepath as user data
                             self.preset_combo.addItem(name, filepath)
                     except Exception as e:
-                        debug_log(f"Error loading preset {filepath}: {e}")
+                        debug_log(f"Error loading preset {filepath}: {e}", level="ERROR")
         else:
-            debug_log(f"Presets directory '{presets_dir}' not found.")
+            debug_log(f"Presets directory '{presets_dir}' not found.", level="WARNING")
 
     def _on_preset_changed(self, index):
         """Handle preset selection change.
@@ -437,7 +437,7 @@ class AgentControlsPanel(QGroupBox):
             with open(filepath, 'r') as f:
                 preset_data = yaml.safe_load(f)
         except Exception as e:
-            debug_log(f"Error loading preset {filepath}: {e}")
+            debug_log(f"Error loading preset {filepath}: {e}", level="ERROR")
             return
 
         # Apply preset values to controls

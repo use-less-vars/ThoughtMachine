@@ -168,6 +168,25 @@ class HistoryProvider:
         """Append message to session.user_history."""
         session_id = self.session.session_id if self.session and hasattr(self.session, 'session_id') else 'no-id'
         print(f"[HISTORY_DEBUG] HistoryProvider.add_message called: role={message.get('role')}, session_id={session_id}, history_len={len(self.session.user_history) if self.session else 'no session'}")
+        # Debug timestamp ordering
+        if DEBUG_CONTEXT:
+            prev_timestamp = None
+            if self.session.user_history:
+                prev_msg = self.session.user_history[-1]
+                prev_timestamp = prev_msg.get('created_at')
+                print(f"[TIMESTAMP_DEBUG] Previous message created_at: {prev_timestamp}")
+            current_timestamp = message.get('created_at')
+            print(f"[TIMESTAMP_DEBUG] Adding message created_at: {current_timestamp}")
+            if prev_timestamp and current_timestamp:
+                # Compare timestamps (assuming ISO format strings)
+                if prev_timestamp > current_timestamp:
+                    print(f"[TIMESTAMP_WARNING] Timestamp ordering violation! Previous {prev_timestamp} > current {current_timestamp}")
+        # Ensure message has a sequence number for ordering
+        if 'seq' not in message:
+            message['seq'] = self.session._get_next_seq()
+            if DEBUG_CONTEXT:
+                print(f"[SEQ_DEBUG] Assigned seq={message['seq']} to message")
+        
         self.session.user_history.append(message)
         self.session.updated_at = datetime.now()
         self._cached_context = None

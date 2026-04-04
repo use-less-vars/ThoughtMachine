@@ -9,12 +9,12 @@ from PyQt6.QtGui import QTextCursor
 
 
 # Import from other extracted modules
-from qt_gui.panels.event_models import EventModel, EventFilterProxyModel, EventDelegate
-from qt_gui.panels.turn_container_manager import TurnContainerManager
-from qt_gui.panels.markdown_renderer import MarkdownRenderer
-from qt_gui.utils.constants import MAX_RESULT_LENGTH, MAX_TOOL_RESULTS_PER_TURN, MAX_LINES_PER_RESULT, ENABLE_RESULT_TRUNCATION, INTERNAL_EVENT_TYPES
-from qt_gui.debug_log import debug_log
-from qt_gui.utils.smart_scrolling import SmartScroller
+from .event_models import EventModel, EventFilterProxyModel, EventDelegate
+from .turn_container_manager import TurnContainerManager
+from .markdown_renderer import MarkdownRenderer
+from ..utils.constants import MAX_RESULT_LENGTH, MAX_TOOL_RESULTS_PER_TURN, MAX_LINES_PER_RESULT, ENABLE_RESULT_TRUNCATION, INTERNAL_EVENT_TYPES
+from ..debug_log import debug_log
+from ..utils.smart_scrolling import SmartScroller
 
 
 
@@ -52,6 +52,26 @@ class OutputPanel(QWidget):
         self.init_ui()
         self.turn_container_manager = TurnContainerManager(self.output_textedit, self.filter_proxy_model)
         self.setup_signal_connections()
+
+    def _normalize_turn(self, turn_val):
+        """Convert turn value to integer for consistent comparison."""
+        if turn_val is None:
+            return 0
+        # Handle int/float turn values
+        if isinstance(turn_val, (int, float)):
+            return int(turn_val)
+        # Handle string turn values
+        if isinstance(turn_val, str):
+            try:
+                return int(turn_val)
+            except (ValueError, TypeError):
+                # Try to convert float string
+                try:
+                    return int(float(turn_val))
+                except (ValueError, TypeError):
+                    return 0
+        # Fallback
+        return 0
 
     def init_ui(self):
         """Initialize the output panel UI."""
@@ -121,9 +141,9 @@ class OutputPanel(QWidget):
         self._last_filter_text = filter_text
         self._last_filter_type = filter_type
         if debug_enabled:
-            debug_log(f"[OutputPanel] _apply_filter: text='{filter_text}', type='{filter_type}'")
+            debug_log(f"[OutputPanel] _apply_filter: text='{filter_text}', type='{filter_type}'", level="DEBUG")
             stack_str = "".join(traceback.format_stack(limit=10))
-            debug_log(f"Stack trace:\n{stack_str}")
+            debug_log(f"Stack trace:\n{stack_str}", level="DEBUG")
         self.filter_proxy_model.set_filter(filter_text, filter_type)
         # Rebuild the output document with filtered events
         self._rebuild_output_document()
@@ -152,7 +172,7 @@ class OutputPanel(QWidget):
                 continue
                 
             etype = event.get('type', 'unknown')
-            turn_num = event.get('turn', 0)
+            turn_num = self._normalize_turn(event.get('turn', 0))
             
             # Initialize turn group if not exists
             if turn_num not in turns:
@@ -205,6 +225,9 @@ class OutputPanel(QWidget):
 
     def display_event(self, event):
         """Add an event to the output display."""
+        # Debug logging for user_query events
+        if event.get('type') == 'user_query':
+            debug_log(f"[TIMESTAMP_DEBUG] OutputPanel.display_event: user_query event, turn={event.get('turn')}, created_at={event.get('created_at')}", level="DEBUG")
         # Add to model immediately
         self.event_model.add_event(event)
         
@@ -237,6 +260,7 @@ class OutputPanel(QWidget):
             "content": f"⏳ Processing your query: {query[:50]}{'...' if len(query) > 50 else ''}",
             "turn": turn_number,
             "timestamp": datetime.now().isoformat(),
+            "created_at": datetime.now().isoformat(),
             "_detail_level": "normal",
             "_is_processing_indicator": True  # Marker to identify processing events
         }
@@ -297,22 +321,93 @@ class OutputPanel(QWidget):
         
         # Sort events chronologically for correct display order
         # Priority: created_at timestamp > turn number > original order
-        def get_event_order(event):
-            # First try created_at timestamp (microsecond precision)
-            if "created_at" in event:
-                return event["created_at"]
-            # Fall back to turn number (events within same turn)
-            if "turn" in event:
-                return event["turn"]
-            # Fall back to 0 for events without turn
+        import datetime
+        from ..debug_log import debug_log
+
+        # Debug: print timestamps before sorting
+        debug_log(f"[TIMESTAMP_DEBUG] display_loaded_conversation: received {len(events)} events", level="DEBUG")
+        for i, event in enumerate(events):
+            created_at = event.get('created_at')
+            turn = event.get('turn')
+            event_type = event.get('type', 'unknown')
+            debug_log(f"[TIMESTAMP_DEBUG] Event {i}: type={event_type}, created_at={created_at}, turn={turn}", level="DEBUG")
+
+        def normalize_timestamp(ts):           
+            """Convert timestamp to float for consistent comparison."""
+            if ts is None:
+                return 0.0
+            # Handle float/int timestamps
+            if isinstance(ts, (int, float)):
+                return float(ts)
+            # Handle ISO string timestamps
+            if isinstance(ts, str):
+                try:
+                    # Try to parse ISO format
+                    dt = datetime.datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                    return dt.timestamp()
+                except (ValueError, AttributeError):
+                    # Try to convert numeric string
+                    try:
+                        return float(ts)
+                    except (ValueError, TypeError):
+                        return 0.0
+            # Fallback
+            return 0.0
+        
+        def normalize_turn(turn_val):
+            """Convert turn value to integer for consistent comparison."""
+            if turn_val is None:
+                return 0
+            # Handle int/float turn values
+            if isinstance(turn_val, (int, float)):
+                return int(turn_val)
+            # Handle string turn values
+            if isinstance(turn_val, str):
+                try:
+                    return int(turn_val)
+                except (ValueError, TypeError):
+                    # Try to convert float string
+                    try:
+                        return int(float(turn_val))
+                    except (ValueError, TypeError):
+                        return 0
+            # Fallback
             return 0
         
-        sorted_events = sorted(events, key=get_event_order)
+        def get_event_order(event):
+            # Priority: created_at timestamp > turn number > original order
+            # Use tuple (priority, value) to ensure comparable types
+            if "created_at" in event:
+                ts = event["created_at"]
+                normalized = normalize_timestamp(ts)
+                return (0, normalized)  # timestamp priority 0
+            if "turn" in event:
+                return (1, normalize_turn(event["turn"]))        # turn priority 1
+            return (2, 0)                        # fallback priority 2
         
+        sorted_events = sorted(events, key=get_event_order)
+
+        # Debug: print timestamps after sorting
+        debug_log(f"[TIMESTAMP_DEBUG] After sorting: {len(sorted_events)} events", level="DEBUG")
+        for i, event in enumerate(sorted_events):
+            created_at = event.get('created_at')
+            turn = event.get('turn')
+            event_type = event.get('type', 'unknown')
+            order_tuple = get_event_order(event)
+            debug_log(f"[TIMESTAMP_DEBUG] Sorted event {i}: type={event_type}, created_at={created_at}, turn={turn}, order_key={order_tuple}", level="DEBUG")
+        
+        # Verify ordering
+        prev_order = None
+        for i, event in enumerate(sorted_events):
+            current_order = get_event_order(event)
+            if prev_order is not None:
+                if current_order < prev_order:
+                    debug_log(f"[TIMESTAMP_WARNING] Order violation at position {i}: {current_order} < {prev_order}", level="WARNING")
+            prev_order = current_order
+
         # Add all events to the model first
         for event in sorted_events:
-            self.event_model.add_event(event)
-        # Reset auto-scroll for loaded content
+            self.event_model.add_event(event)        # Reset auto-scroll for loaded content
         self.smart_scroller.reset_auto_scroll()
         # Append events incrementally for consistent rendering
         self.turn_container_manager.append_new_events()

@@ -7,12 +7,13 @@ Extracted from agent.py to separate debugging concerns.
 import os
 import logging
 from typing import List, Dict, Any, Optional
+from agent.logging.debug_log import debug_log
 
 # Debug flag for pause/resume debugging
 PAUSE_DEBUG = os.environ.get('PAUSE_DEBUG') == '1'
 def pause_debug(msg):
     if PAUSE_DEBUG:
-        print(f"[PAUSE_DEBUG] {msg}")
+        debug_log(f"{msg}", level="WARNING", component="PAUSE_DEBUG")
 
 
 class DebugContext:

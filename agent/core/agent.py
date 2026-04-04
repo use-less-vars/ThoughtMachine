@@ -20,6 +20,7 @@ import traceback
 import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Any, TYPE_CHECKING, Generator
+from agent.logging.debug_log import debug_log
 
 from pydantic import ValidationError
 from llm_providers.exceptions import ProviderError, RateLimitExceeded
@@ -514,7 +515,16 @@ class Agent:
     def _add_conversation_data_to_event(self, event: Dict[str, Any]) -> None:
         """Add conversation version and history to event."""
         # Add timestamp for chronological ordering
-        event["created_at"] = time.time()
+        current_time = time.time()
+        event["created_at"] = current_time
+        # Also add timestamp field for compatibility with GUI
+        if "timestamp" not in event:
+            event["timestamp"] = current_time
+        
+        # Add monotonic sequence number if session exists
+        if self.session:
+            event["seq"] = self.session._get_next_seq()
+        
         conv_data = self._get_conversation_data_for_event()
         event.update(conv_data)
 
@@ -689,13 +699,16 @@ class Agent:
         self._display_turn = getattr(self, '_display_turn', 0) + 1
         
         # Emit user query event for GUI display
-        print(f"[Agent.user_query] query='{query[:50]}...', _display_turn={self._display_turn}")
+        debug_log(f"query='{query[:50]}...', _display_turn={self._display_turn}", level="WARNING", component="Agent.user_query")
         event_dict = {
             "type": "user_query",
             "content": query,
             "turn": self._display_turn  # Unique turn number for this query
         }
         self._add_conversation_data_to_event(event_dict)
+        # Ensure event has all fields GUI expects
+        if "timestamp" not in event_dict:
+            event_dict["timestamp"] = event_dict.get("created_at", time.time())
         yield event_dict
 
         prev_conversation_len = len(self.conversation)

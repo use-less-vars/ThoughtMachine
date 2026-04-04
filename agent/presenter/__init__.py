@@ -13,6 +13,7 @@ from .state_bridge import StateBridge
 from .session_lifecycle import SessionLifecycle
 from .event_processor import EventProcessor
 from .gui_integration import GUIIntegration
+from agent.logging.debug_log import debug_log
 
 __all__ = [
     'StateBridge',

@@ -2,8 +2,8 @@
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QTextCursor
 
-from qt_gui.panels.event_models import EventDelegate
-from qt_gui.debug_log import debug_log
+from .event_models import EventDelegate
+from ..debug_log import debug_log
 
 
 class TurnContainerManager:
@@ -36,6 +36,26 @@ class TurnContainerManager:
         self.last_appended_turn = -1
         self.open_turn_container = None
     
+    def _normalize_turn(self, turn_val):
+        """Convert turn value to integer for consistent comparison."""
+        if turn_val is None:
+            return 0
+        # Handle int/float turn values
+        if isinstance(turn_val, (int, float)):
+            return int(turn_val)
+        # Handle string turn values
+        if isinstance(turn_val, str):
+            try:
+                return int(turn_val)
+            except (ValueError, TypeError):
+                # Try to convert float string
+                try:
+                    return int(float(turn_val))
+                except (ValueError, TypeError):
+                    return 0
+        # Fallback
+        return 0
+
     def append_new_events(self):
         """Append new events to output widget incrementally."""
         current_row_count = self.proxy_model.rowCount()
@@ -50,7 +70,7 @@ class TurnContainerManager:
                 continue
                 
             etype = event.get('type', 'unknown')
-            turn_num = event.get('turn', 0)
+            turn_num = self._normalize_turn(event.get('turn', 0))
             
             # Add turn header if this is a new turn
             if turn_num != self.last_displayed_turn and turn_num > 0:
@@ -70,8 +90,8 @@ class TurnContainerManager:
                 # DEBUG: Print HTML
                 import os
                 if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                    debug_log(f"[TurnContainer] Inserting HTML for {etype}, turn {turn_num}: {repr(html[:500])}")
-                    debug_log(f"[TurnContainer] HTML length: {len(html)}")
+                    debug_log(f"[TurnContainer] Inserting HTML for {etype}, turn {turn_num}: {repr(html[:500])}", level="DEBUG")
+                    debug_log(f"[TurnContainer] HTML length: {len(html)}", level="DEBUG")
                 cursor = self.output_widget.textCursor()
                 cursor.movePosition(QTextCursor.MoveOperation.End)
                 # Close container for turn 0 events

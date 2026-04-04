@@ -13,6 +13,7 @@ import uuid
 import os
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Callable
+from agent.logging.debug_log import debug_log
 
 from agent.controller import AgentController
 from agent.core.state import ExecutionState
@@ -49,21 +50,17 @@ class SessionLifecycle:
         self._cached_config = None
         self._cached_preset_name = None
         
-        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            print(f"[SessionLifecycle] Initialized")
+        debug_log(f"Initialized", level="DEBUG", component="SessionLifecycle")
     
     def _register_session_callbacks(self, session):
         """Register callbacks on a session for change tracking."""
-        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            print(f"[SessionLifecycle] Registering callbacks for session {session.session_id}")
+        debug_log(f"Registering callbacks for session {session.session_id}", level="DEBUG", component="SessionLifecycle")
         # Register conversation change callback if set
         if self._conversation_callback:
             session.connect_conversation_changed(self._conversation_callback)
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] Registered conversation callback, callbacks count: {len(session._conversation_changed_callbacks)}")
+            debug_log(f"Registered conversation callback, callbacks count: {len(session._conversation_changed_callbacks)}", level="DEBUG", component="SessionLifecycle")
         else:
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] No conversation callback set")
+            debug_log(f"No conversation callback set", level="DEBUG", component="SessionLifecycle")
         # Note: dirty tracking removed, but ObservableList callbacks still needed for UI refresh
     # State management
     @property
@@ -77,21 +74,19 @@ class SessionLifecycle:
         if self._state != new_state:
             old_state = self._state
             self._state = new_state
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] state changed: {old_state} -> {new_state}")
+            debug_log(f"state changed: {old_state} -> {new_state}", level="DEBUG", component="SessionLifecycle")
             # Notify callback if set
             if self._session_callback:
                 try:
                     self._session_callback(old_state, new_state)
                 except Exception as e:
-                    if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                        print(f"[SessionLifecycle] Error in state callback: {e}")
+                    debug_log(f"Error in state callback: {e}", level="DEBUG", component="SessionLifecycle")
     
 
     def mark_clean(self) -> None:
         """Mark session as clean (no unsaved changes). Dummy method after removing dirty tracking."""
         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            print(f'[SessionLifecycle] mark_clean called (dummy method - dirty tracking removed)')
+            debug_log(f'mark_clean called (dummy method - dirty tracking removed)', level="DEBUG", component="SessionLifecycle")
     
     def has_unsaved_changes(self) -> bool:
         """Check if current session has unsaved changes.
@@ -110,11 +105,9 @@ class SessionLifecycle:
             config: Optional configuration overrides
             preset_name: Optional preset name to use instead of config
         """
-        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            print(f"[SessionLifecycle] start_session called, state={self.state}, current_session exists={self.state_bridge.current_session is not None}")
+        debug_log(f"start_session called, state={self.state}, current_session exists={self.state_bridge.current_session is not None}", level="DEBUG", component="SessionLifecycle")
         if self.state != ExecutionState.IDLE:
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] Cannot start session in state {self.state}")
+            debug_log(f"Cannot start session in state {self.state}", level="DEBUG", component="SessionLifecycle")
             return
 
         # Clear session name only for a brand new session (no existing session ID)
@@ -180,8 +173,7 @@ class SessionLifecycle:
         except Exception as e:
             self.state = ExecutionState.PAUSED
             # Error will be emitted through event processing
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] Error starting session: {e}")
+            debug_log(f"Error starting session: {e}", level="DEBUG", component="SessionLifecycle")
 
     def new_session(self, name: str = None):
         """Start a brand new session.
@@ -191,7 +183,7 @@ class SessionLifecycle:
         """
         # Always auto-save current session before starting new session
         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            print("[SessionLifecycle] Auto-saving current session before starting new session")
+            debug_log(f'Auto-saving current session before starting new session', level="DEBUG", component="SessionLifecycle")
         self.auto_save_current_session()
         
         # If agent is running, stop it first (best effort)
@@ -219,8 +211,7 @@ class SessionLifecycle:
         # Ensure state is IDLE
         self.state = ExecutionState.IDLE
         # Status message will be emitted through event processing
-        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            print(f"[SessionLifecycle] Started new session{' named ' + name if name else ''}")
+        debug_log(f"Started new session{' named ' + name if name else ''}", level="DEBUG", component="SessionLifecycle")
 
     def continue_session(self, query: str):
         """
@@ -233,21 +224,18 @@ class SessionLifecycle:
         # But for continue_session (existing session), IDLE might mean session was never started
         # Actually, let controller handle whether it can accept queries
         # The controller checks is_running and other internal state
-        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            print(f"[SessionLifecycle] continue_session called in state {self.state}")
+        debug_log(f"continue_session called in state {self.state}", level="DEBUG", component="SessionLifecycle")
         # We'll let controller decide; just pass query through
         try:
             self.controller.continue_session(query)
             self.state = ExecutionState.RUNNING
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] continue_session successful, state set to RUNNING")
+            debug_log(f"continue_session successful, state set to RUNNING", level="DEBUG", component="SessionLifecycle")
             # Status message will be emitted through event processing
         except Exception as e:
             # Error will be emitted through event processing
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] Error in continue_session: {e}")
+            debug_log(f"Error in continue_session: {e}", level="DEBUG", component="SessionLifecycle")
             if os.environ.get('PAUSE_DEBUG'):
-                print(f"[PAUSE_FLOW] SessionLifecycle.continue_session: controller rejected query: {e}")
+                debug_log(f"SessionLifecycle.continue_session: controller rejected query: {e}", level="WARNING", component="PAUSE_FLOW")
             # Don't set state to RUNNING since controller failed to accept query
             # Re-raise the exception so presenter can handle it
             raise
@@ -258,8 +246,7 @@ class SessionLifecycle:
             self.controller.request_pause()
             self.state = ExecutionState.PAUSING
         else:
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] Cannot pause in state {self.state}")
+            debug_log(f"Cannot pause in state {self.state}", level="DEBUG", component="SessionLifecycle")
 
     def _finalize_restart(self):
         """Common restart cleanup: reset controller and state."""
@@ -269,11 +256,9 @@ class SessionLifecycle:
             if hasattr(agent, 'reset_rate_limiting'):
                 try:
                     agent.reset_rate_limiting()
-                    if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                        print(f"[SessionLifecycle] Reset rate limiting on agent before restart")
+                    debug_log(f"Reset rate limiting on agent before restart", level="DEBUG", component="SessionLifecycle")
                 except Exception as e:
-                    if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                        print(f"[SessionLifecycle] Failed to reset rate limiting: {e}")
+                    debug_log(f"Failed to reset rate limiting: {e}", level="DEBUG", component="SessionLifecycle")
         self.controller.reset()
         self.state = ExecutionState.IDLE
         self._restarting = False
@@ -304,8 +289,7 @@ class SessionLifecycle:
                 # Save will be implemented when save_session is added
                 pass
             except Exception as e:
-                if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                    print(f"[SessionLifecycle] Auto-save before restart failed: {e}")
+                debug_log(f"Auto-save before restart failed: {e}", level="DEBUG", component="SessionLifecycle")
                 # Continue anyway
 
         # If already IDLE, finalize immediately
@@ -334,14 +318,12 @@ class SessionLifecycle:
         Returns:
             True if saved successfully, False otherwise
         """
-        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            print(f"[SessionLifecycle] save_session called, current_session_id={self.state_bridge.current_session_id}")
+        debug_log(f"save_session called, current_session_id={self.state_bridge.current_session_id}", level="DEBUG", component="SessionLifecycle")
         try:
             # Build session from current state
             session = self._build_session_from_current_state()
             if session is None:
-                if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                    print(f"[SessionLifecycle] No session to save")
+                debug_log(f"No session to save", level="DEBUG", component="SessionLifecycle")
                 return False
 
             # Ensure we have a session_id (new session if None)
@@ -358,7 +340,7 @@ class SessionLifecycle:
             session.ensure_name()
 
             # Save via session store (writes to store directory)
-            print(f"[SessionLifecycle] About to save session {session.session_id} to store")
+            debug_log(f"About to save session {session.session_id} to store", level="WARNING", component="SessionLifecycle")
             self.session_store.save_session(session)
 
             # Update session name from metadata
@@ -366,21 +348,19 @@ class SessionLifecycle:
 
             # Update current session marker to point to this session
             self.session_store.set_current_session_id(self.state_bridge.current_session_id)
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] Session saved to store: {self.session_store.get_session_path(session.session_id)}")
+            debug_log(f"Session saved to store: {self.session_store.get_session_path(session.session_id)}", level="DEBUG", component="SessionLifecycle")
             # Also export to external file if set
             if self.state_bridge._external_file_path:
                 try:
                     # Export will be implemented when export_session is added
                     pass
                 except Exception as e:
-                    if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                        print(f"[SessionLifecycle] Failed to export to external file: {e}")
+                    debug_log(f"Failed to export to external file: {e}", level="DEBUG", component="SessionLifecycle")
             return True
         except Exception as e:
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                 import traceback
-                print(f"[SessionLifecycle] Error saving session: {e}")
+                debug_log(f"Error saving session: {e}", level="ERROR", component="SessionLifecycle")
                 traceback.print_exc()
             return False
 
@@ -396,7 +376,7 @@ class SessionLifecycle:
         """
         # Always auto-save current session before loading new one
         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            print("[SessionLifecycle] Auto-saving current session before loading new session")
+            debug_log(f'Auto-saving current session before loading new session', level="DEBUG", component="SessionLifecycle")
         self.auto_save_current_session()
 
         try:
@@ -408,8 +388,7 @@ class SessionLifecycle:
             # Check session version
             version = session_dict.get('version', 0)
             if version != 1:
-                if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                    print(f"[SessionLifecycle] Warning: Session version {version} is not current (1). Attempting to load anyway.")
+                debug_log(f"Warning: Session version {version} is not current (1). Attempting to load anyway.", level="DEBUG", component="SessionLifecycle")
 
             # Reconstruct Session object
             session = Session.from_persistable_dict(session_dict)
@@ -426,24 +405,20 @@ class SessionLifecycle:
             if not self.state_bridge.session_name:
                 self.state_bridge.session_name = os.path.basename(filepath)
 
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] Session loaded from {filepath}: {len(session.user_history)} messages")
+            debug_log(f"Session loaded from {filepath}: {len(session.user_history)} messages", level="DEBUG", component="SessionLifecycle")
             return True
         except Exception as e:
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] Error loading session: {e}")
+            debug_log(f"Error loading session: {e}", level="DEBUG", component="SessionLifecycle")
             import traceback
             traceback.print_exc()
             return False
 
     def load_session_by_id(self, session_id: str) -> bool:
         """Load a session by ID from the session store."""
-        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            print(f"[SessionLifecycle] Loading session {session_id} from store")
+        debug_log(f"Loading session {session_id} from store", level="DEBUG", component="SessionLifecycle")
         session = self.session_store.load_session(session_id)
         if session is None:
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] Session {session_id} not found")
+            debug_log(f"Session {session_id} not found", level="DEBUG", component="SessionLifecycle")
             return False
 
         # Set as current session
@@ -466,8 +441,7 @@ class SessionLifecycle:
                 self.state_bridge.session_name = f"Session {session.created_at:%Y-%m-%d %H:%M}"
             else:
                 self.state_bridge.session_name = "Untitled Session"
-        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            print(f"[SessionLifecycle] Session loaded from store: {session_id} ({self.state_bridge.session_name})")
+        debug_log(f"Session loaded from store: {session_id} ({self.state_bridge.session_name})", level="DEBUG", component="SessionLifecycle")
         return True
 
     def export_session(self, filepath: str, set_as_external: bool = False) -> bool:
@@ -486,8 +460,7 @@ class SessionLifecycle:
             filepath = os.path.abspath(filepath)
             session = self._build_session_from_current_state()
             if session is None:
-                if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                    print(f"[SessionLifecycle] No session to export")
+                debug_log(f"No session to export", level="DEBUG", component="SessionLifecycle")
                 return False
 
             # Use the session's ID if available, otherwise generate a temporary one for export
@@ -508,15 +481,13 @@ class SessionLifecycle:
             with open(filepath, 'w') as f:
                 json.dump(session_dict, f, indent=2)
 
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] Session exported to {filepath}")
+            debug_log(f"Session exported to {filepath}", level="DEBUG", component="SessionLifecycle")
             if set_as_external:
                 self.state_bridge.update_external_file_path(filepath)
             # Note: we do NOT clear dirty flag because export does not affect session store
             return True
         except Exception as e:
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] Error exporting session: {e}")
+            debug_log(f"Error exporting session: {e}", level="DEBUG", component="SessionLifecycle")
             import traceback
             traceback.print_exc()
             return False
@@ -529,12 +500,10 @@ class SessionLifecycle:
         """
         try:
             sessions = self.session_store.list_sessions()
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] Listed {len(sessions)} sessions")
+            debug_log(f"Listed {len(sessions)} sessions", level="DEBUG", component="SessionLifecycle")
             return sessions
         except Exception as e:
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] Error listing sessions: {e}")
+            debug_log(f"Error listing sessions: {e}", level="DEBUG", component="SessionLifecycle")
             return []
 
     def delete_session(self, session_id: str) -> bool:
@@ -546,15 +515,12 @@ class SessionLifecycle:
         try:
             success = self.session_store.delete_session(session_id)
             if success:
-                if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                    print(f"[SessionLifecycle] Deleted session {session_id}")
+                debug_log(f"Deleted session {session_id}", level="DEBUG", component="SessionLifecycle")
             else:
-                if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                    print(f"[SessionLifecycle] Session {session_id} not found for deletion")
+                debug_log(f"Session {session_id} not found for deletion", level="DEBUG", component="SessionLifecycle")
             return success
         except Exception as e:
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] Error deleting session: {e}")
+            debug_log(f"Error deleting session: {e}", level="DEBUG", component="SessionLifecycle")
             return False
 
     def rename_session(self, session_id: str, new_name: str) -> bool:
@@ -567,8 +533,7 @@ class SessionLifecycle:
         try:
             session = self.session_store.load_session(session_id)
             if session is None:
-                if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                    print(f"[SessionLifecycle] Session {session_id} not found for rename")
+                debug_log(f"Session {session_id} not found for rename", level="DEBUG", component="SessionLifecycle")
                 return False
 
             # Update name in metadata
@@ -579,18 +544,15 @@ class SessionLifecycle:
             if self.state_bridge.current_session_id == session_id:
                 self.state_bridge.session_name = new_name
 
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] Renamed session {session_id} to {new_name}")
+            debug_log(f"Renamed session {session_id} to {new_name}", level="DEBUG", component="SessionLifecycle")
             return True
         except Exception as e:
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] Error renaming session: {e}")
+            debug_log(f"Error renaming session: {e}", level="DEBUG", component="SessionLifecycle")
             return False
 
     def _build_session_from_current_state(self):
         """Construct a Session object from current presenter state."""
-        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            print(f"[SessionLifecycle] _build_session_from_current_state: user_history length={len(self.state_bridge.user_history) if self.state_bridge.user_history else 0}, current_session_id={self.state_bridge.current_session_id}, current_session exists={self.state_bridge.current_session is not None}")
+        debug_log(f"_build_session_from_current_state: user_history length={len(self.state_bridge.user_history) if self.state_bridge.user_history else 0}, current_session_id={self.state_bridge.current_session_id}, current_session exists={self.state_bridge.current_session is not None}", level="DEBUG", component="SessionLifecycle")
         # Get the full conversation from the current session
         conversation = None
         if self.state_bridge.user_history is not None:
@@ -607,8 +569,7 @@ class SessionLifecycle:
                 # We have a session but no conversation (empty session)
                 conversation = []
             else:
-                if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                    print(f"[SessionLifecycle] _build_session_from_current_state: No conversation found and no current session")
+                debug_log(f"_build_session_from_current_state: No conversation found and no current session", level="DEBUG", component="SessionLifecycle")
                 return None
 
         # Build session config from current agent config
@@ -616,8 +577,7 @@ class SessionLifecycle:
             agent_config = self.state_bridge.create_agent_config()
             session_config = self.state_bridge.build_session_config(agent_config)
         except Exception as e:
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] Error building session config: {e}")
+            debug_log(f"Error building session config: {e}", level="DEBUG", component="SessionLifecycle")
             return None
 
         # Create session with current state
@@ -655,31 +615,28 @@ class SessionLifecycle:
         Returns:
             True if saved successfully, False on error.
         """
-        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            print(f"[SessionLifecycle] auto_save_current_session called, current_session_id={self.state_bridge.current_session_id}, current_session exists={self.state_bridge.current_session is not None}")        # Event-driven auto-save: always attempt to save on terminal events
+        debug_log(f"auto_save_current_session called, current_session_id={self.state_bridge.current_session_id}, current_session exists={self.state_bridge.current_session is not None}", level="DEBUG", component="SessionLifecycle")        # Event-driven auto-save: always attempt to save on terminal events
         # The save_session() method will handle cases where there's nothing to save
         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            print("[SessionLifecycle] Attempting auto-save (event-driven)")
+            debug_log(f'Attempting auto-save (event-driven)', level="DEBUG", component="SessionLifecycle")
 
         try:
             success = self.save_session()
             if success:
                 if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                    print("[SessionLifecycle] Auto-saved session successfully")
+                    debug_log(f'Auto-saved session successfully', level="DEBUG", component="SessionLifecycle")
                 # Also export to external file if set
                 if self.state_bridge._external_file_path:
                     try:
                         self.export_session(self.state_bridge._external_file_path, set_as_external=False)
                     except Exception as e:
-                        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                            print(f"[SessionLifecycle] Failed to export to external file: {e}")
+                        debug_log(f"Failed to export to external file: {e}", level="DEBUG", component="SessionLifecycle")
                 return True
             else:
                 if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                    print("[SessionLifecycle] Auto-save failed")
+                    debug_log(f'Auto-save failed', level="DEBUG", component="SessionLifecycle")
                 return False
         except Exception as e:
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                print(f"[SessionLifecycle] Error in auto-save: {e}")
+            debug_log(f"Error in auto-save: {e}", level="DEBUG", component="SessionLifecycle")
             return False
 

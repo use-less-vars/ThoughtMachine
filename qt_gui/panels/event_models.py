@@ -1,5 +1,6 @@
 """Event model, filter proxy, and delegate for event list display."""
 import html
+import datetime
 from PyQt6.QtCore import Qt, QModelIndex, QVariant, QSortFilterProxyModel, QSize, QPoint, QAbstractListModel
 from PyQt6.QtWidgets import (
     QStyledItemDelegate, QStyleOptionViewItem, QStyle,
@@ -8,10 +9,10 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QPainter, QPalette, QTextDocument
 
 # Import from other extracted modules
-from qt_gui.panels.markdown_renderer import MarkdownRenderer
+from .markdown_renderer import MarkdownRenderer
 
-from qt_gui.utils.constants import MAX_RESULT_LENGTH, MAX_TOOL_RESULTS_PER_TURN, MAX_LINES_PER_RESULT, ENABLE_RESULT_TRUNCATION, INTERNAL_EVENT_TYPES
-from qt_gui.debug_log import debug_log
+from ..utils.constants import MAX_RESULT_LENGTH, MAX_TOOL_RESULTS_PER_TURN, MAX_LINES_PER_RESULT, ENABLE_RESULT_TRUNCATION, INTERNAL_EVENT_TYPES
+from ..debug_log import debug_log
 
 
 class EventModel(QAbstractListModel):
@@ -45,6 +46,7 @@ class EventModel(QAbstractListModel):
         etype = event.get('type', '')
         
         if etype == 'user_query':
+            debug_log(f"[TIMESTAMP_DEBUG] EventModel.add_event: user_query event, turn={event.get('turn')}, created_at={event.get('created_at')}, timestamp={event.get('timestamp')}", level="DEBUG")
             # First, remove any processing indicators for this turn
             turn = event.get('turn', None)
             if turn is not None:
@@ -72,6 +74,13 @@ class EventModel(QAbstractListModel):
         # Get event ordering key
         event_order = self._get_event_order_key(event)
         
+        # Debug logging for user_query events
+        if event.get('type') == 'user_query':
+            debug_log(f"[TIMESTAMP_DEBUG] EventModel._find_insertion_position: user_query event order={event_order}, created_at={event.get('created_at')}, turn={event.get('turn')}", level="DEBUG")
+            for i, existing_event in enumerate(self.events):
+                existing_order = self._get_event_order_key(existing_event)
+                debug_log(f"  [{i}] existing event type={existing_event.get('type')}, order={existing_order}, created_at={existing_event.get('created_at')}, turn={existing_event.get('turn')}", level="DEBUG")
+        
         # Find first position where existing event has greater order key
         for i, existing_event in enumerate(self.events):
             existing_order = self._get_event_order_key(existing_event)
@@ -81,17 +90,47 @@ class EventModel(QAbstractListModel):
         # If no greater event found, append at end
         return len(self.events)
     
+    def _normalize_timestamp(self, ts):
+        """Convert timestamp to float for consistent comparison."""
+        if ts is None:
+            return 0.0
+        # Handle float/int timestamps
+        if isinstance(ts, (int, float)):
+            return float(ts)
+        # Handle ISO string timestamps
+        if isinstance(ts, str):
+            try:
+                # Try to parse ISO format
+                dt = datetime.datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                return dt.timestamp()
+            except (ValueError, AttributeError):
+                # Try to convert numeric string
+                try:
+                    return float(ts)
+                except (ValueError, TypeError):
+                    return 0.0
+        # Fallback
+        return 0.0
+
     def _get_event_order_key(self, event):
         """Get a sortable key for event ordering."""
+        # Debug logging for user_query events
+        if event.get('type') == 'user_query':
+            debug_log(f"[TIMESTAMP_DEBUG] EventModel._get_event_order_key: user_query event, created_at={event.get('created_at')}, normalized={self._normalize_timestamp(event.get('created_at')) if 'created_at' in event else 'N/A'}, turn={event.get('turn')}", level="DEBUG")
+        
         # Priority: created_at timestamp > turn number > type-based fallback
         
         # 1. created_at timestamp (microsecond precision)
         if "created_at" in event:
-            return (1, event["created_at"])
+            return (1, self._normalize_timestamp(event["created_at"]))
         
         # 2. turn number (events within same turn need sub-ordering)
         if "turn" in event:
-            turn = event["turn"]
+            # Normalize turn to integer for consistent comparison
+            try:
+                turn = int(event["turn"])
+            except (ValueError, TypeError):
+                turn = 0
             # Within same turn, order by event type to maintain logical flow
             type_order = {
                 "user_query": 0,
@@ -257,7 +296,7 @@ class EventDelegate(QStyledItemDelegate):
         # DEBUG
         import os
         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            debug_log(f"[EventDelegate] _event_to_html called for type={etype}, suppress_title_bar={suppress_title_bar}")
+            debug_log(f"[EventDelegate] _event_to_html called for type={etype}, suppress_title_bar={suppress_title_bar}", level="DEBUG")
 
         # Helper to add a content line
         lines = []

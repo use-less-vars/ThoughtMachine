@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
+from agent.logging.debug_log import debug_log
 
 logger = logging.getLogger(__name__)
 

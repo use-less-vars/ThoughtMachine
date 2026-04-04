@@ -7,6 +7,7 @@ Extracted from agent.py to separate token-related concerns.
 import json
 import tiktoken
 from typing import Optional, List, Dict, Any
+from agent.logging.debug_log import debug_log
 
 
 class TokenCounter:

@@ -16,6 +16,7 @@ from enum import Enum
 from collections import Counter
 
 from . import LogEventType, LogCategory, EVENT_TYPE_TO_CATEGORY
+from .debug_log import debug_log
 
 
 class LogAnalyzer:
@@ -48,9 +49,9 @@ class LogAnalyzer:
                             event = json.loads(line)
                             events.append(event)
                         except json.JSONDecodeError as e:
-                            print(f"Warning: Could not parse line: {e}", file=sys.stderr)
+                            debug_log(f"Warning: Could not parse line: {e}", level="WARNING", component="LogAnalyzer")
         except FileNotFoundError:
-            print(f"Error: Log file not found: {self.log_file_path}", file=sys.stderr)
+            debug_log(f"Error: Log file not found: {self.log_file_path}", level="ERROR", component="LogAnalyzer")
             return []
         
         self.events = events

@@ -8,13 +8,14 @@ import yaml
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 from pathlib import Path
+from agent.logging.debug_log import debug_log
 
 # Assume yaml is available; if not, we'll handle ImportError at runtime
 try:
     import yaml
 except ImportError:
     yaml = None
-    print("[WARN] PyYAML not installed; presets will not be available.")
+    debug_log("[WARN] PyYAML not installed; presets will not be available.", level="WARNING", component="PresetLoader")
 
 
 @dataclass
@@ -54,7 +55,7 @@ class PresetLoader:
     def _load_all(self):
         """Load all YAML files in the presets directory."""
         if not self.presets_dir.exists():
-            print(f"[INFO] Presets directory {self.presets_dir} not found; no presets loaded.")
+            debug_log(f"[INFO] Presets directory {self.presets_dir} not found; no presets loaded.", level="INFO", component="PresetLoader")
             return
 
         if yaml is None:
@@ -65,13 +66,13 @@ class PresetLoader:
                 with open(yaml_file, 'r') as f:
                     data = yaml.safe_load(f)
                 if not data:
-                    print(f"[WARN] Preset file {yaml_file} is empty; skipping.")
+                    debug_log(f"[WARN] Preset file {yaml_file} is empty; skipping.", level="WARNING", component="PresetLoader")
                     continue
                 # Validate required fields
                 required = ["name", "system_prompt", "model"]
                 missing = [k for k in required if k not in data]
                 if missing:
-                    print(f"[WARN] Preset {yaml_file} missing required fields: {missing}; skipping.")
+                    debug_log(f"[WARN] Preset {yaml_file} missing required fields: {missing}; skipping.", level="WARNING", component="PresetLoader")
                     continue
                 preset = Preset(
                     name=data["name"],
@@ -83,7 +84,7 @@ class PresetLoader:
                 )
                 self._presets[preset.name] = preset
             except Exception as e:
-                print(f"[ERROR] Failed to load preset {yaml_file}: {e}")
+                debug_log(f"[ERROR] Failed to load preset {yaml_file}: {e}", level="ERROR", component="PresetLoader")
 
     def list_presets(self) -> List[str]:
         """Return list of preset names."""

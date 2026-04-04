@@ -55,13 +55,13 @@ class AgentGUI(QMainWindow):
         """Restore previously open sessions from open_sessions.json."""
         open_sessions_path = self.session_store.sessions_dir / "open_sessions.json"
         if not open_sessions_path.exists():
-            debug_log(f"No open sessions file at {open_sessions_path}")
+            debug_log(f"No open sessions file at {open_sessions_path}", level="DEBUG")
             return
         try:
             with open(open_sessions_path, 'r') as f:
                 session_ids = json.load(f)
             if not isinstance(session_ids, list):
-                debug_log(f"Invalid open_sessions.json content: {session_ids}")
+                debug_log(f"Invalid open_sessions.json content: {session_ids}", level="WARNING")
                 return
             # Filter out session IDs that no longer exist
             existing_ids = []
@@ -70,13 +70,13 @@ class AgentGUI(QMainWindow):
                 if self.session_store.get_session_path(sid).exists():
                     existing_ids.append(sid)
                 else:
-                    debug_log(f"Session {sid} no longer exists, skipping")
+                    debug_log(f"Session {sid} no longer exists, skipping", level="WARNING")
             # Create tabs for each session ID
             for sid in existing_ids:
                 self.new_tab(session_id=sid)
-            debug_log(f"Restored {len(existing_ids)} open sessions")
+            debug_log(f"Restored {len(existing_ids)} open sessions", level="INFO")
         except Exception as e:
-            debug_log(f"Failed to restore open sessions: {e}")
+            debug_log(f"Failed to restore open sessions: {e}", level="ERROR")
 
     def save_open_sessions(self):
         """Save list of open session IDs to open_sessions.json."""

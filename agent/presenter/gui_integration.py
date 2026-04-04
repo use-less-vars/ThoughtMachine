@@ -6,6 +6,7 @@ Separates Qt dependencies from business logic.
 """
 
 from typing import Optional, Dict, Any
+from agent.logging.debug_log import debug_log
 
 from PyQt6.QtCore import QObject, pyqtSignal
 from agent.core.state import ExecutionState

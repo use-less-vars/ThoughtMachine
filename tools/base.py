@@ -70,7 +70,11 @@ class ToolBase(BaseModel):
             import os
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                 import sys
-                print(f"DEBUG: {message}", file=sys.stderr)
+                trunc_limit = int(os.environ.get('THOUGHTMACHINE_DEBUG_TRUNCATION', 100))
+                msg = f"DEBUG: {message}"
+                if trunc_limit > 0 and len(msg) > trunc_limit:
+                    msg = msg[:trunc_limit] + "..."
+                print(msg, file=sys.stderr)
 
     def _log_tool_warning(self, message: str, data: Optional[Dict[str, Any]] = None, tool_call_id: Optional[str] = None):
         """Log tool warning using structured logging or fallback."""

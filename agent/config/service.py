@@ -8,6 +8,7 @@ import json
 import threading
 from typing import Dict, Any, Optional, Callable
 from datetime import datetime
+from agent.logging.debug_log import debug_log
 
 
 class ConfigService:
@@ -64,7 +65,7 @@ class ConfigService:
                     test_config = self.default_config.copy()
                     test_config.update(loaded)
                     if not self._validate_config(test_config, "loaded configuration", strict=False):
-                        print(f"[ConfigService] Loaded config failed validation, using defaults")
+                        debug_log(f"Loaded config failed validation, using defaults", level="WARNING", component="ConfigService")
                         with self._lock:
                             self._config = self.default_config.copy()
                         return False
@@ -74,17 +75,17 @@ class ConfigService:
                     self._config = self.default_config.copy()
                     self._config.update(loaded)
                 
-                print(f"[ConfigService] Loaded config from {self.config_path}")
+                debug_log(f"Loaded config from {self.config_path}", level="WARNING", component="ConfigService")
                 self._notify_listeners()
                 return True
             else:
-                print(f"[ConfigService] Config file not found, using defaults")
+                debug_log(f"Config file not found, using defaults", level="WARNING", component="ConfigService")
                 with self._lock:
                     self._config = self.default_config.copy()
                 return False
                 
         except Exception as e:
-            print(f"[ConfigService] Error loading config: {e}")
+            debug_log(f"Error loading config: {e}", level="ERROR", component="ConfigService")
             with self._lock:
                 self._config = self.default_config.copy()
             return False
@@ -99,14 +100,14 @@ class ConfigService:
         Returns:
             True if saved (or scheduled), False on error
         """
-        print(f"[ConfigService DEBUG] save called: immediate={immediate}, thread={threading.get_ident()}")
+        debug_log(f"save called: immediate={immediate}, thread={threading.get_ident()}", level="WARNING", component="ConfigService DEBUG")
         if immediate:
             result = self._do_save()
-            print(f"[ConfigService DEBUG] save immediate result: {result}")
+            debug_log(f"save immediate result: {result}", level="WARNING", component="ConfigService DEBUG")
             return result
         else:
             self._schedule_save()
-            print(f"[ConfigService DEBUG] save scheduled, thread={threading.get_ident()}")
+            debug_log(f"save scheduled, thread={threading.get_ident()}", level="WARNING", component="ConfigService DEBUG")
             return True
     
     def _do_save(self) -> bool:
@@ -114,27 +115,27 @@ class ConfigService:
         import threading
         import time
         thread_id = threading.get_ident()
-        print(f"[ConfigService DEBUG] _do_save start, thread {thread_id}, lock={self._lock}")
+        debug_log(f"_do_save start, thread {thread_id}, lock={self._lock}", level="WARNING", component="ConfigService DEBUG")
         try:
-            print(f"[ConfigService DEBUG] _do_save acquiring lock, thread {thread_id}")
+            debug_log(f"_do_save acquiring lock, thread {thread_id}", level="WARNING", component="ConfigService DEBUG")
             with self._lock:
-                print(f"[ConfigService DEBUG] _do_save lock acquired, thread {thread_id}")
+                debug_log(f"_do_save lock acquired, thread {thread_id}", level="WARNING", component="ConfigService DEBUG")
                 config_to_save = self._config.copy()
-                print(f"[ConfigService DEBUG] _do_save config copied, thread {thread_id}")
-            print(f"[ConfigService DEBUG] _do_save lock released, thread {thread_id}")
+                debug_log(f"_do_save config copied, thread {thread_id}", level="WARNING", component="ConfigService DEBUG")
+            debug_log(f"_do_save lock released, thread {thread_id}", level="WARNING", component="ConfigService DEBUG")
             # Ensure directory exists
             os.makedirs(os.path.dirname(os.path.abspath(self.config_path)), exist_ok=True)
 
             with open(self.config_path, 'w') as f:
                 json.dump(config_to_save, f, indent=2)
 
-            print(f"[ConfigService] Saved config to {self.config_path}")
-            print(f"[ConfigService DEBUG] _do_save completed, thread {thread_id}")
+            debug_log(f"Saved config to {self.config_path}", level="WARNING", component="ConfigService")
+            debug_log(f"_do_save completed, thread {thread_id}", level="WARNING", component="ConfigService DEBUG")
             return True
 
         except Exception as e:
-            print(f"[ConfigService] Error saving config: {e}")
-            print(f"[ConfigService DEBUG] _do_save error, thread {thread_id}: {e}")
+            debug_log(f"Error saving config: {e}", level="ERROR", component="ConfigService")
+            debug_log(f"_do_save error, thread {thread_id}: {e}", level="ERROR", component="ConfigService DEBUG")
             return False    
     def _schedule_save(self):
         """Schedule a debounced save."""
@@ -175,7 +176,7 @@ class ConfigService:
             test_config = self.get_all().copy()
             test_config[key] = value
             if not self._validate_config(test_config, f"set operation for key '{key}'", strict=True):
-                print(f"[ConfigService] Validation failed for key '{key}', value not set")
+                debug_log(f"Validation failed for key '{key}', value not set", level="WARNING", component="ConfigService")
                 return
         
         with self._lock:
@@ -204,7 +205,7 @@ class ConfigService:
             test_config = self.get_all().copy()
             test_config.update(updates)
             if not self._validate_config(test_config, "bulk update operation", strict=True):
-                print("[ConfigService] Validation failed for bulk update, no changes applied")
+                debug_log(f"Validation failed for bulk update, no changes applied", level="WARNING", component="ConfigService")
                 return
         
         changed = False
@@ -261,14 +262,14 @@ class ConfigService:
                 try:
                     listener(None, None, None)
                 except Exception as e:
-                    print(f"[ConfigService] Error in listener: {e}")
+                    debug_log(f"Error in listener: {e}", level="ERROR", component="ConfigService")
         else:
             # Specific key change
             for listener in self._listeners:
                 try:
                     listener(key, old_value, new_value)
                 except Exception as e:
-                    print(f"[ConfigService] Error in listener: {e}")
+                    debug_log(f"Error in listener: {e}", level="ERROR", component="ConfigService")
     
     def validate(self, schema: Optional[Dict[str, Any]] = None, strict: bool = True) -> bool:
         """
@@ -354,7 +355,7 @@ class ConfigService:
                     errors.append(f"Unknown configuration key '{key}'")
         
         if errors:
-            print(f"[ConfigService] Validation errors in {context}:\n" + "\n".join(errors))
+            debug_log(f"Validation errors in {context}:\n" + "\n".join(errors), level="WARNING", component="ConfigService")
             return False
         
         return True

@@ -15,10 +15,12 @@ from anthropic import APIError, RateLimitError
 from .base import LLMProvider, ProviderConfig, LLMResponse
 from .tool_converter import ToolFormatConverter
 from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError
+from agent.logging.debug_log import debug_log
 
 logger = logging.getLogger(__name__)
 if os.environ.get('DEBUG_ANTHROPIC'):
     logger.setLevel(logging.DEBUG)
+
 
 class AnthropicProvider(LLMProvider):
     """
@@ -89,7 +91,7 @@ class AnthropicProvider(LLMProvider):
             
             # Make API call
             logger.debug(f"Anthropic API call: model={api_kwargs.get('model')}, temperature={api_kwargs.get('temperature')}, max_tokens={api_kwargs.get('max_tokens')}, tools_count={len(tools) if tools else 0}, api_key={self.config.api_key}")
-            print(f"[DEBUG_ANTHROPIC] API call: model={api_kwargs.get('model')}, temperature={api_kwargs.get('temperature')}, max_tokens={api_kwargs.get('max_tokens')}, tools_count={len(tools) if tools else 0}, api_key={self.config.api_key}", file=sys.stderr)
+            debug_log(f"[DEBUG_ANTHROPIC] API call: model={api_kwargs.get('model')}, temperature={api_kwargs.get('temperature')}, max_tokens={api_kwargs.get('max_tokens')}, tools_count={len(tools) if tools else 0}, api_key={self.config.api_key}", component="anthropic")
             response = self.client.messages.create(**api_kwargs)
             
             # Debug: Print raw response if environment variable is set
@@ -97,29 +99,29 @@ class AnthropicProvider(LLMProvider):
                 raw_str = str(response)
                 if len(raw_str) > 1000:
                     raw_str = raw_str[:1000] + f"... (truncated, total {len(raw_str)} chars)"
-                print(f"[DEBUG_ANTHROPIC_RAW] Raw API response type: {type(response)}", file=sys.stderr)
-                print(f"[DEBUG_ANTHROPIC_RAW] Raw API response: {raw_str}", file=sys.stderr)
+                debug_log(f"[DEBUG_ANTHROPIC_RAW] Raw API response type: {type(response)}", component="anthropic")
+                debug_log(f"[DEBUG_ANTHROPIC_RAW] Raw API response: {raw_str}", component="anthropic")
             
             # Debug: Print raw response details before parsing
             if os.environ.get('DEBUG_ANTHROPIC'):
-                print(f"[DEBUG_BEFORE_PARSE] Response type: {type(response)}", file=sys.stderr)
+                debug_log(f"[DEBUG_BEFORE_PARSE] Response type: {type(response)}", component="anthropic")
                 if hasattr(response, '__dict__'):
-                    print(f"[DEBUG_BEFORE_PARSE] Response has __dict__, keys: {list(response.__dict__.keys())}", file=sys.stderr)
+                    debug_log(f"[DEBUG_BEFORE_PARSE] Response has __dict__, keys: {list(response.__dict__.keys())}", component="anthropic")
                     # Try to get a string representation of the response
                     try:
                         import json
                         resp_json = json.dumps(response.__dict__, default=str, indent=2)
                         if len(resp_json) > 2000:
                             resp_json = resp_json[:2000] + "... (truncated)"
-                        print(f"[DEBUG_BEFORE_PARSE] Response JSON: {resp_json}", file=sys.stderr)
+                        debug_log(f"[DEBUG_BEFORE_PARSE] Response JSON: {resp_json}", component="anthropic")
                     except:
                         pass
                 elif isinstance(response, dict):
-                    print(f"[DEBUG_BEFORE_PARSE] Response is dict, keys: {list(response.keys())}", file=sys.stderr)
+                    debug_log(f"[DEBUG_BEFORE_PARSE] Response is dict, keys: {list(response.keys())}", component="anthropic")
                 elif isinstance(response, str):
-                    print(f"[DEBUG_BEFORE_PARSE] WARNING: Response is string, not JSON object: {response[:500]}", file=sys.stderr)
+                    debug_log(f"[DEBUG_BEFORE_PARSE] WARNING: Response is string, not JSON object: {response[:500]}", component="anthropic")
                 else:
-                    print(f"[DEBUG_BEFORE_PARSE] Response repr: {repr(response)[:500]}", file=sys.stderr)
+                    debug_log(f"[DEBUG_BEFORE_PARSE] Response repr: {repr(response)[:500]}", component="anthropic")
             
             # Parse response
             llm_response = self.parse_response(response, start_time)
@@ -132,18 +134,18 @@ class AnthropicProvider(LLMProvider):
         except RateLimitError as e:
             # Add debug logging
             if os.environ.get('DEBUG_ANTHROPIC'):
-                print(f"[DEBUG_ANTHROPIC_ERROR] RateLimitError: {e}", file=sys.stderr)
+                debug_log(f"[DEBUG_ANTHROPIC_ERROR] RateLimitError: {e}", component="anthropic")
             raise RateLimitExceeded(f"Rate limit exceeded: {e}")
         except APIError as e:
             # Add debug logging
             if os.environ.get('DEBUG_ANTHROPIC'):
-                print(f"[DEBUG_ANTHROPIC_ERROR] APIError: {e}", file=sys.stderr)
+                debug_log(f"[DEBUG_ANTHROPIC_ERROR] APIError: {e}", component="anthropic")
                 if hasattr(e, 'response'):
                     try:
                         resp_text = str(e.response)
                         if len(resp_text) > 1000:
                             resp_text = resp_text[:1000] + f"... (truncated, total {len(resp_text)} chars)"
-                        print(f"[DEBUG_ANTHROPIC_ERROR] APIError response: {resp_text}", file=sys.stderr)
+                        debug_log(f"[DEBUG_ANTHROPIC_ERROR] APIError response: {resp_text}", component="anthropic")
                     except:
                         pass
             
@@ -160,15 +162,15 @@ class AnthropicProvider(LLMProvider):
         except Exception as e:
             # Add more debug info about what was returned
             if os.environ.get('DEBUG_ANTHROPIC'):
-                print(f"[DEBUG_ANTHROPIC_ERROR] Exception type: {type(e)}", file=sys.stderr)
-                print(f"[DEBUG_ANTHROPIC_ERROR] Exception message: {e}", file=sys.stderr)
+                debug_log(f"[DEBUG_ANTHROPIC_ERROR] Exception type: {type(e)}", component="anthropic")
+                debug_log(f"[DEBUG_ANTHROPIC_ERROR] Exception message: {e}", component="anthropic")
                 # Try to get the response if it exists in the exception
                 if hasattr(e, 'response'):
                     try:
                         resp_text = str(e.response)
                         if len(resp_text) > 1000:
                             resp_text = resp_text[:1000] + f"... (truncated, total {len(resp_text)} chars)"
-                        print(f"[DEBUG_ANTHROPIC_ERROR] Exception response: {resp_text}", file=sys.stderr)
+                        debug_log(f"[DEBUG_ANTHROPIC_ERROR] Exception response: {resp_text}", component="anthropic")
                     except:
                         pass
             
@@ -185,33 +187,33 @@ class AnthropicProvider(LLMProvider):
 
         # Debug: print raw response details
         if os.environ.get('DEBUG_ANTHROPIC'):
-            print(f"[DEBUG_PARSE_RESPONSE] Starting parse, raw_response type: {type(raw_response)}", file=sys.stderr)
+            debug_log(f"[DEBUG_PARSE_RESPONSE] Starting parse, raw_response type: {type(raw_response)}", component="anthropic")
             if hasattr(raw_response, '__dict__'):
-                print(f"[DEBUG_PARSE_RESPONSE] raw_response has __dict__", file=sys.stderr)
+                debug_log(f"[DEBUG_PARSE_RESPONSE] raw_response has __dict__", component="anthropic")
                 for key, value in raw_response.__dict__.items():
                     if key == '_response' or key == 'response':
                         continue  # Skip large response objects
-                    print(f"[DEBUG_PARSE_RESPONSE]   {key}: {value}", file=sys.stderr)
+                    debug_log(f"[DEBUG_PARSE_RESPONSE]   {key}: {value}", component="anthropic")
             elif isinstance(raw_response, dict):
-                print(f"[DEBUG_PARSE_RESPONSE] raw_response is dict, keys: {list(raw_response.keys())}", file=sys.stderr)
+                debug_log(f"[DEBUG_PARSE_RESPONSE] raw_response is dict, keys: {list(raw_response.keys())}", component="anthropic")
             elif isinstance(raw_response, str):
-                print(f"[DEBUG_PARSE_RESPONSE] raw_response is string (len={len(raw_response)}): {raw_response[:200]}", file=sys.stderr)
+                debug_log(f"[DEBUG_PARSE_RESPONSE] raw_response is string (len={len(raw_response)}): {raw_response[:200]}", component="anthropic")
             else:
-                print(f"[DEBUG_PARSE_RESPONSE] raw_response repr: {repr(raw_response)[:200]}", file=sys.stderr)
+                debug_log(f"[DEBUG_PARSE_RESPONSE] raw_response repr: {repr(raw_response)[:200]}", component="anthropic")
         
         # Check if raw_response is a string (error response from API)
         if isinstance(raw_response, str):
             if os.environ.get('DEBUG_ANTHROPIC'):
-                print(f"[DEBUG_PARSE_RESPONSE] ERROR: API returned string instead of JSON: {raw_response}", file=sys.stderr)
+                debug_log(f"[DEBUG_PARSE_RESPONSE] ERROR: API returned string instead of JSON: {raw_response}", component="anthropic")
             raise ValueError(f"API returned string instead of JSON response: {raw_response[:200]}")
         
         # Check if raw_response has the expected structure for Anthropic
         if not hasattr(raw_response, 'content'):
             if os.environ.get('DEBUG_ANTHROPIC'):
-                print(f"[DEBUG_PARSE_RESPONSE] ERROR: raw_response missing 'content' attribute", file=sys.stderr)
-                print(f"[DEBUG_PARSE_RESPONSE] raw_response attributes: {dir(raw_response)}", file=sys.stderr)
+                debug_log(f"[DEBUG_PARSE_RESPONSE] ERROR: raw_response missing 'content' attribute", component="anthropic")
+                debug_log(f"[DEBUG_PARSE_RESPONSE] raw_response attributes: {dir(raw_response)}", component="anthropic")
                 if hasattr(raw_response, '__dict__'):
-                    print(f"[DEBUG_PARSE_RESPONSE] raw_response __dict__ keys: {list(raw_response.__dict__.keys())}", file=sys.stderr)
+                    debug_log(f"[DEBUG_PARSE_RESPONSE] raw_response __dict__ keys: {list(raw_response.__dict__.keys())}", component="anthropic")
             raise AttributeError(f"Response missing 'content' attribute. Response type: {type(raw_response)}")
         
         # Extract content and reasoning

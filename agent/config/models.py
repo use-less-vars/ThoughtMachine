@@ -5,6 +5,7 @@ Configuration models for the ThoughtMachine agent.
 
 from typing import Optional, Callable, List, Any, Dict, Literal
 from pydantic import BaseModel, Field
+from agent.logging.debug_log import debug_log
 
 from tools import SIMPLIFIED_TOOL_CLASSES
 

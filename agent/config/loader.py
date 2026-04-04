@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 import logging
+from agent.logging.debug_log import debug_log
 
 from .models import AgentConfig
 

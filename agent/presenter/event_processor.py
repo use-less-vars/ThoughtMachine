@@ -7,6 +7,7 @@ Designed to be used with GUI integration for signal emission.
 
 import os
 from typing import Dict, Any, Optional
+from agent.logging.debug_log import debug_log
 
 from agent.core.state import ExecutionState
 from agent import events as ev
@@ -28,8 +29,7 @@ class EventProcessor:
         self.session_lifecycle = session_lifecycle
         self.gui_integration = gui_integration
         
-        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            print(f"[EventProcessor] Initialized")
+        debug_log(f"Initialized", level="DEBUG", component="EventProcessor")
     
     def process_event(self, event: Dict[str, Any]) -> None:
         """
@@ -41,8 +41,7 @@ class EventProcessor:
         # Convert to typed event for consistent handling
         typed_event = ev.convert_from_legacy_format(event)
         event_type = typed_event.type.value
-        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            print(f"[EventProcessor] Processing event: {event_type}")
+        debug_log(f"Processing event: {event_type}", level="DEBUG", component="EventProcessor")
         
         # Skip filtering for state/terminal events as they need to be shown regardless
         state_event_types = ["error", "paused", "stopped", "thread_finished", "final", "max_turns", "user_interaction_requested", "rate_limit_warning", "token_warning", "turn_warning", "user_query"]
@@ -53,8 +52,7 @@ class EventProcessor:
                 event_session_id = str(event_session_id)
                 current_id = self.state_bridge.current_session_id
                 if current_id and event_session_id != str(current_id):
-                    if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                        print(f"[EventProcessor] Ignoring event from old session {event_session_id}")
+                    debug_log(f"Ignoring event from old session {event_session_id}", level="DEBUG", component="EventProcessor")
                     return        
         # Emit event to GUI if integration available
         if self.gui_integration and event_type != "token_update":
@@ -137,8 +135,7 @@ class EventProcessor:
     def _process_user_query_event(self, event: Dict[str, Any]) -> None:
         """Process user query event."""
         # Log the event for debugging
-        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            print(f"[EventProcessor] Processing user_query event")
+        debug_log(f"Processing user_query event", level="DEBUG", component="EventProcessor")
         # No special processing needed - event is already emitted to GUI
     
     def _process_paused_event(self, event: Dict[str, Any]) -> None:

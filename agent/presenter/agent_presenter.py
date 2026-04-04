@@ -11,6 +11,7 @@ This version delegates to separate modules:
 import os
 from typing import Optional, Dict, Any, List
 from datetime import datetime
+from agent.logging.debug_log import debug_log
 
 from PyQt6.QtCore import QObject, pyqtSignal
 from agent.controller import AgentController
@@ -61,11 +62,9 @@ class RefactoredAgentPresenter(QObject):
         # Set up state change callback
         self.session_lifecycle._session_callback = self._on_session_state_change
         # Set up conversation change callback
-        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            print(f"[AgentPresenter] Setting conversation callback")
+        debug_log(f"Setting conversation callback", level="DEBUG", component="AgentPresenter")
         self.session_lifecycle._conversation_callback = lambda: self.gui_integration.emit_conversation_changed()
-        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            print(f"[AgentPresenter] Conversation callback set")
+        debug_log(f"Conversation callback set", level="DEBUG", component="AgentPresenter")
 
         self.event_processor = EventProcessor(
             self.state_bridge, 
@@ -78,8 +77,7 @@ class RefactoredAgentPresenter(QObject):
         
         
         
-        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            print(f"[RefactoredAgentPresenter] Initialized with modular architecture")
+        debug_log(f"Initialized with modular architecture", level="DEBUG", component="AgentPresenter")
 
     def _connect_signals(self):
         """Connect module signals to presenter signals."""

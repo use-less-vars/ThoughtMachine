@@ -17,13 +17,31 @@ from thoughtmachine.security import merge_security_config, get_default_security_
 class ObservableList(list):
     """A list that notifies a callback when mutated."""
     def __init__(self, iterable=(), callback=None):
-        super().__init__(iterable)
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+            import sys
+            sys.stderr.write(f'[ObservableList.__init__] Creating ObservableList, input type={type(iterable)}, len={len(iterable) if hasattr(iterable, "__len__") else "N/A"}\n')
+        try:
+            super().__init__(iterable)
+            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+                import sys
+                sys.stderr.write(f'[ObservableList.__init__] Success, list length={len(self)}\n')
+        except Exception as e:
+            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+                import sys
+                sys.stderr.write(f'[ObservableList.__init__] ERROR during initialization: {e}\n')
+            # Re-raise the exception after logging
+            raise
         self.callback = callback
 
     def _notify(self):
         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
             import sys, traceback
-            sys.stderr.write(f'[ObservableList] _notify called, callback={self.callback}\n')
+            # Get truncation limit from environment, default 100
+            trunc_limit = int(os.environ.get('THOUGHTMACHINE_DEBUG_TRUNCATION', 100))
+            callback_str = str(self.callback)
+            if trunc_limit > 0 and len(callback_str) > trunc_limit:
+                callback_str = callback_str[:trunc_limit] + "..."
+            sys.stderr.write(f'[ObservableList] _notify called, callback={callback_str}\n')
             # Don't print stack trace - too verbose
             # traceback.print_stack(limit=5, file=sys.stderr)
         if self.callback:
@@ -170,6 +188,7 @@ class Session:
     containers: List[ContainerMetadata] = field(default_factory=list)
     preset_name: Optional[str] = field(default=None, compare=False)
     version: int = 1  # Session format version
+    next_seq: int = 0  # Next sequence number for messages
     final_content: Optional[str] = None  # Content of the Final tool's result, if any
     final_reasoning: Optional[str] = None  # Reasoning that preceded the final answer
     summary: Optional[Dict[str, Any]] = field(default=None, compare=False, repr=False)  # Summary system message (from pruning)
@@ -202,12 +221,31 @@ class Session:
         """Wrap user_history with ObservableList if not already wrapped."""
         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
             import sys
-            sys.stderr.write(f'[Session] _wrap_user_history called, session_id={self.session_id}, is_ObservableList={isinstance(self.user_history, ObservableList)}\n')
+            sys.stderr.write(f'[Session] _wrap_user_history called, session_id={self.session_id}, is_ObservableList={isinstance(self.user_history, ObservableList)}, type={type(self.user_history)}, len={len(self.user_history) if hasattr(self.user_history, "__len__") else "N/A"}\n')
         if not isinstance(self.user_history, ObservableList):
-            self.user_history = ObservableList(self.user_history, callback=self._on_conversation_changed)
+            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+                import sys
+                sys.stderr.write(f'[Session] _wrap_user_history: Creating ObservableList from current user_history\n')
+            new_list = ObservableList(self.user_history, callback=self._on_conversation_changed)
+            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+                import sys
+                sys.stderr.write(f'[Session] _wrap_user_history: Created ObservableList, len={len(new_list)}\n')
+            self.user_history = new_list
         else:
             # Ensure callback is set
             self.user_history.callback = self._on_conversation_changed
+            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+                import sys
+                sys.stderr.write(f'[Session] _wrap_user_history: Already ObservableList, len={len(self.user_history)}, setting callback\n')
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+            import sys
+            sys.stderr.write(f'[Session] _wrap_user_history: after, len={len(self.user_history)}\n')
+
+    def _get_next_seq(self) -> int:
+        """Return the next sequence number and increment the counter."""
+        seq = self.next_seq
+        self.next_seq += 1
+        return seq
 
     def ensure_name(self):
         """Ensure session has a name for display/persistence.
@@ -325,6 +363,25 @@ class Session:
         runtime_params = RuntimeParams.from_dict(runtime_params_data) if runtime_params_data else RuntimeParams()
 
         user_history = data.get('user_history', [])
+        # Ensure each message has a created_at timestamp and sequence number
+        max_seq = 0
+        for i, msg in enumerate(user_history):
+            if isinstance(msg, dict):
+                if "created_at" not in msg:
+                    # Use session's updated_at as default (approximate)
+                    msg["created_at"] = updated_at.isoformat()
+                # Assign seq if missing, preserving existing seq if present
+                if "seq" not in msg:
+                    msg["seq"] = i  # fallback: use index order
+                else:
+                    # Keep existing seq, but track maximum
+                    try:
+                        max_seq = max(max_seq, int(msg["seq"]))
+                    except (ValueError, TypeError):
+                        msg["seq"] = i
+                        max_seq = max(max_seq, i)
+        # Compute next sequence number
+        next_seq_value = max(data.get('next_seq', 0), max_seq + 1)
         containers_data = data.get('containers', [])
         containers = [ContainerMetadata.from_dict(c) for c in containers_data]
 
@@ -352,6 +409,7 @@ class Session:
             summary=data.get('summary'),
             total_input_tokens=data.get('total_input_tokens', 0),
             total_output_tokens=data.get('total_output_tokens', 0),
+            next_seq=next_seq_value,
             context_length=data.get('context_length', 0),
         )
         # agent_context will be built later by ContextBuilder
@@ -363,6 +421,12 @@ class Session:
         Automatically updates the updated_at timestamp.
         """
         message = {"role": role, "content": content, **kwargs}
+        # Add timestamp if not already present
+        if "created_at" not in message:
+            message["created_at"] = datetime.now().isoformat()
+        # Add sequence number if not already present
+        if "seq" not in message:
+            message["seq"] = self._get_next_seq()
         self.user_history.append(message)
         self.updated_at = datetime.now()
 

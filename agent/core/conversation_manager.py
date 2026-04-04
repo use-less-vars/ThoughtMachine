@@ -7,7 +7,9 @@ Extracted from agent.py to separate conversation management concerns.
 import os
 import logging
 from datetime import datetime
+import time
 from typing import List, Dict, Any, Optional
+from agent.logging.debug_log import debug_log
 
 from .debug_context import pause_debug
 
@@ -44,6 +46,10 @@ class ConversationManager:
         pause_debug(f"Current conversation length: {len(conversation)}")
         if self.context_builder is not None:
             pause_debug(f"context_builder type: {type(self.context_builder)}")
+        # Ensure message has a timestamp
+        if "created_at" not in message:
+            message["created_at"] = time.time()
+        
         if self.session is None:
             pause_debug("No session, appending directly to conversation")
             conversation.append(message)

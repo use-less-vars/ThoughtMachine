@@ -11,6 +11,7 @@ Key concepts:
 """
 
 from __future__ import annotations
+from agent.logging.debug_log import debug_log
 
 import enum
 import json
@@ -520,14 +521,14 @@ class EventBus:
                 try:
                     callback(event)
                 except Exception as e:
-                    print(f"Error in event subscriber for {event.type}: {e}")
+                    debug_log(f"Error in event subscriber for {event.type}: {e}", level="ERROR", component="EventBus")
         
         # Notify wildcard subscribers
         for callback in self._wildcard_subscribers:
             try:
                 callback(event)
             except Exception as e:
-                print(f"Error in wildcard event subscriber: {e}")
+                debug_log(f"Error in wildcard event subscriber: {e}", level="ERROR", component="EventBus")
     
     def publish_dict(self, event_dict: Dict[str, Any]):
         """Publish an event from dictionary format."""
@@ -544,7 +545,12 @@ def _map_legacy_event_type(event_type_str: str) -> EventType:
     import os
     import sys
     if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-        sys.stderr.write(f"[events] _map_legacy_event_type: '{event_type_str}'\n")
+        import os
+        trunc_limit = int(os.environ.get('THOUGHTMACHINE_DEBUG_TRUNCATION', 100))
+        msg = f"[events] _map_legacy_event_type: '{event_type_str}'"
+        if trunc_limit > 0 and len(msg) > trunc_limit:
+            msg = msg[:trunc_limit] + "..."
+        sys.stderr.write(msg + '\n')
     mapping = {
         "tool_call": EventType.TOOL_CALL,
         "tool_result": EventType.TOOL_RESULT,
@@ -567,7 +573,12 @@ def _map_legacy_event_type(event_type_str: str) -> EventType:
     result = mapping.get(event_type_str)
     if result is None:
         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            sys.stderr.write(f"[events] No mapping for '{event_type_str}', attempting direct EventType creation\n")
+            import os
+            trunc_limit = int(os.environ.get('THOUGHTMACHINE_DEBUG_TRUNCATION', 100))
+            msg = f"[events] No mapping for '{event_type_str}', attempting direct EventType creation"
+            if trunc_limit > 0 and len(msg) > trunc_limit:
+                msg = msg[:trunc_limit] + "..."
+            sys.stderr.write(msg + '\n')
         result = EventType(event_type_str)
     return result
 

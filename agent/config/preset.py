@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import logging
+from agent.logging.debug_log import debug_log
 
 logger = logging.getLogger(__name__)
 

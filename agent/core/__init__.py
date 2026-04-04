@@ -10,6 +10,7 @@ from .llm_client import LLMClient
 from .tool_executor import ToolExecutor
 from .conversation_manager import ConversationManager
 from .debug_context import DebugContext
+from agent.logging.debug_log import debug_log
 
 __all__ = [
     'Agent',

@@ -8,6 +8,7 @@ import json
 from typing import List, Dict, Any, Optional, Tuple
 import logging
 from pydantic import ValidationError
+from agent.logging.debug_log import debug_log
 
 from fast_json_repair import loads as repair_loads
 from tools.final import Final

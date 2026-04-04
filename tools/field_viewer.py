@@ -223,21 +223,37 @@ class PydanticModelVisitor(cst.CSTVisitor):
     def _code_for_node(self, node: cst.CSTNode) -> Optional[str]:
         """Convert node to source code."""
         if self.debug:
-            sys.stderr.write(f"DEBUG _code_for_node: {type(node).__name__}\n")
+            msg = f"DEBUG _code_for_node: {type(node).__name__}"
+            trunc_limit = 200  # Limit for internal debug
+            if trunc_limit > 0 and len(msg) > trunc_limit:
+                msg = msg[:trunc_limit] + "..."
+            sys.stderr.write(msg + '\n')
         # Handle Annotation nodes separately (they wrap type annotations)
         if isinstance(node, cst.Annotation):
             # Extract the actual type annotation
             node = node.annotation
             if self.debug:
-                sys.stderr.write(f"DEBUG   -> unwrapped to {type(node).__name__}\n")
+                msg = f"DEBUG   -> unwrapped to {type(node).__name__}"
+                trunc_limit = 200  # Limit for internal debug
+                if trunc_limit > 0 and len(msg) > trunc_limit:
+                    msg = msg[:trunc_limit] + "..."
+                sys.stderr.write(msg + '\n')
         try:
             result = cst.Module([]).code_for_node(node).strip()
             if self.debug:
-                sys.stderr.write(f"DEBUG   -> result: '{result}'\n")
+                msg = f"DEBUG   -> result: '{result}'"
+                trunc_limit = 200  # Limit for internal debug
+                if trunc_limit > 0 and len(msg) > trunc_limit:
+                    msg = msg[:trunc_limit] + "..."
+                sys.stderr.write(msg + '\n')
             return result
         except Exception as e:
             if self.debug:
-                sys.stderr.write(f"DEBUG   -> error: {e}\n")
+                msg = f"DEBUG   -> error: {e}"
+                trunc_limit = 200  # Limit for internal debug
+                if trunc_limit > 0 and len(msg) > trunc_limit:
+                    msg = msg[:trunc_limit] + "..."
+                sys.stderr.write(msg + '\n')
             return None
 
     def _is_in_pydantic_model(self) -> bool:

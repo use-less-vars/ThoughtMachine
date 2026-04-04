@@ -9,6 +9,7 @@ import os
 import threading
 from datetime import datetime
 from enum import Enum
+from agent.logging.debug_log import debug_log
 
 # Optional dependency for system monitoring
 try:
@@ -311,7 +312,7 @@ class AgentLogger:
                 self._file_handle = open(self.log_file_path, 'a', encoding='utf-8')
                 self._current_file_size = os.path.getsize(self.log_file_path) if os.path.exists(self.log_file_path) else 0
             except Exception as e:
-                print(f"Failed to open log file {self.log_file_path}: {e}")
+                debug_log(f"Failed to open log file {self.log_file_path}: {e}", level="ERROR", component="AgentLogger")
                 self.enable_file_logging = False
     
     def _should_log(self, level: LogLevel) -> bool:
@@ -362,7 +363,7 @@ class AgentLogger:
                     self._rotate_log_file()
                     
             except Exception as e:
-                print(f"Failed to write log entry: {e}")
+                debug_log(f"Failed to write log entry: {e}", level="ERROR", component="AgentLogger")
     
     def _rotate_log_file(self):
         """Rotate log file when it reaches maximum size."""
@@ -389,7 +390,7 @@ class AgentLogger:
                 self._current_file_size = 0
                 
             except Exception as e:
-                print(f"Failed to rotate log file: {e}")
+                debug_log(f"Failed to rotate log file: {e}", level="ERROR", component="AgentLogger")
                 # Try to reopen original file
                 try:
                     self._file_handle = open(self.log_file_path, 'a', encoding='utf-8')
@@ -1291,5 +1292,5 @@ def create_logger(config: 'AgentConfig') -> Optional[AgentLogger]:
         )
         return logger
     except Exception as e:
-        print(f"Failed to create logger: {e}")
+        debug_log(f"Failed to create logger: {e}", level="ERROR", component="AgentLogger")
         return None

@@ -6,5 +6,6 @@ Public API:
 """
 
 from .core.agent import Agent
+from agent.logging.debug_log import debug_log
 
 __all__ = ["Agent"]

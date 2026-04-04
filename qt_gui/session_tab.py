@@ -21,6 +21,7 @@ from agent.config.service import create_agent_config_service
 from qt_gui.config.config_bridge import GUIConfigBridge
 from session.store import FileSystemSessionStore
 from tools import TOOL_CLASSES, SIMPLIFIED_TOOL_CLASSES
+from pathlib import Path
 
 load_dotenv()
 
@@ -90,6 +91,10 @@ class SessionTab(QWidget):
         self.pause_btn = self.query_panel.pause_btn
         self.restart_btn = self.query_panel.restart_btn
         
+        # Initialize UI and connect signals
+        self.init_ui()
+        self.setup_signal_connections()
+        
         # Create or load session
         if session_id:
             self.load_session_by_id(session_id)
@@ -102,8 +107,6 @@ class SessionTab(QWidget):
         self._conversation_debounce_timer.setInterval(100)  # 100ms debounce
         self._conversation_debounce_timer.timeout.connect(self._on_conversation_debounced)
         
-        self.init_ui()
-        self.setup_signal_connections()
         self.load_config()
     def create_new_session(self):
         """Create fresh session with auto-generated name."""
@@ -132,39 +135,45 @@ class SessionTab(QWidget):
         self.update_window_title()
         
         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            debug_log(f"Created new session: {self.session.session_id}")
+            debug_log(f"Created new session: {self.session.session_id}", level="DEBUG")
     
     def load_session_by_id(self, session_id: str) -> bool:
         """Load a session by ID from the session store."""
+        from .debug_log import debug_log
+        debug_log(f"load_session_by_id called with session_id: {session_id}", level="DEBUG")
         try:
             # Load session via presenter
+            debug_log(f"Calling presenter.load_session_by_id({session_id})", level="DEBUG")
             success = self.presenter.load_session_by_id(session_id)
         except Exception as e:
-            debug_log(f"Error loading session {session_id}: {e}")
+            debug_log(f"Error loading session {session_id}: {e}", level="ERROR")
             self.create_new_session()
             return False
         
         if success:
+            debug_log(f"presenter.load_session_by_id returned success", level="DEBUG")
             # Get the loaded session from presenter
             # The session is stored in state_bridge.current_session
             self.session = self.presenter.state_bridge.current_session
+            debug_log(f"Session loaded, id: {self.session.session_id if self.session else 'None'}", level="DEBUG")
             
             # Try to display, but don't fail if UI not ready
             # display_loaded_conversation will handle deferred display
             try:
+                debug_log(f"Calling display_loaded_conversation()", level="DEBUG")
                 self.display_loaded_conversation()
+                debug_log(f"display_loaded_conversation() completed", level="DEBUG")
             except Exception as e:
-                debug_log(f"Error displaying session {session_id}: {e}")
+                debug_log(f"Error displaying session {session_id}: {e}", level="ERROR")
                 # Continue anyway - session is loaded
             
             self.update_window_title()
             
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                debug_log(f"Loaded session: {session_id}")
+            debug_log(f"Loaded session: {session_id}", level="DEBUG")
             return True
         else:
             # If loading fails, create new session
-            debug_log(f"Failed to load session {session_id}, creating new")
+            debug_log(f"Failed to load session {session_id}, creating new", level="WARNING")
             self.create_new_session()
             return False
     
@@ -381,10 +390,10 @@ class SessionTab(QWidget):
     @pyqtSlot(ExecutionState)
     def on_state_changed(self, state):
         """Handle agent state changes."""
-        debug_log(f"on_state_changed: {state}, _closing={self._closing}")
+        debug_log(f"on_state_changed: {state}, _closing={self._closing}", level="DEBUG")
         # print(f"[GUI] State changed to: {state}")
         if self._closing:
-            debug_log("on_state_changed: skipping due to _closing")
+            debug_log("on_state_changed: skipping due to _closing", level="DEBUG")
             return
 
         # Update UI based on state
@@ -429,11 +438,15 @@ class SessionTab(QWidget):
         debug_enabled = os.environ.get('THOUGHTMACHINE_DEBUG') == '1'
         etype = event["type"]
         if debug_enabled:
-            debug_log(f"display_event: type={etype}, content preview={str(event.get('content', ''))[:50]}...")
-            debug_log(f"Event model has {self.event_model.rowCount()} events total")
+            debug_log(f"display_event: type={etype}, content preview={str(event.get('content', ''))[:50]}...", level="DEBUG")
+            debug_log(f"Event model has {self.event_model.rowCount()} events total", level="DEBUG")
         if etype == "token_update":
             # Token updates are handled by tokens_updated signal, skip display
             return
+        
+        # Debug logging for user_query events
+        if etype == "user_query":
+            debug_log(f"[TIMESTAMP_DEBUG] SessionTab.display_event: user_query event, turn={event.get('turn')}, created_at={event.get('created_at')}", level="DEBUG")
         detail_level = self.agent_controls_panel.detail_combo.currentText()
 
         # Store conversation history if present
@@ -785,21 +798,21 @@ class SessionTab(QWidget):
         Args:
             immediate: If True, save immediately; otherwise use debounced save
         """
-        debug_log(f"save_config called: immediate={immediate}, _loading_config={self._loading_config}")
+        debug_log(f"save_config called: immediate={immediate}, _loading_config={self._loading_config}", level="DEBUG")
         # print(f"[SessionTab] save_config called, immediate={immediate}")  # Removed to reduce console spam
         if self._loading_config:
             return
 
         try:
             config = self.agent_controls_panel.get_config_dict()
-            debug_log(f"save_config: config keys: {list(config.keys())}")
+            debug_log(f"save_config: config keys: {list(config.keys())}", level="DEBUG")
             # print(f"[GUI] Saving config: {config} (immediate={immediate})")
             # Use config bridge for saving
             self.config_bridge.save_config(config, immediate=immediate)
-            debug_log("save_config: bridge save completed")
+            debug_log("save_config: bridge save completed", level="DEBUG")
             # print("[GUI] Configuration saved via bridge")
         except Exception as e:
-            debug_log(f"save_config error: {e}")
+            debug_log(f"save_config error: {e}", level="ERROR")
             # print(f"[GUI] Error saving config: {e}")    
     def _update_model_suggestions(self):
         """Update model suggestions based on selected provider."""
@@ -980,12 +993,12 @@ class SessionTab(QWidget):
                         if hasattr(delegate, '_event_to_plain_text'):
                             plain_text = delegate._event_to_plain_text(event)
                             f.write(plain_text)
-                            f.write('\n' + '-'*80 + '\n\n')
+                            f.write('                            ' + '-'*80 + '                                                        ')
                         else:
                             # Fallback to JSON representation
                             import json
                             f.write(json.dumps(event, indent=2))
-                            f.write('\n' + '-'*80 + '\n\n')
+                            f.write('                            ' + '-'*80 + '                                                        ')
             
             self.presenter.gui_integration.emit_status_message(f"Conversation exported to {file_path}")
         except Exception as e:
@@ -1035,7 +1048,7 @@ class SessionTab(QWidget):
 '''
                     
                     # Format content - preserve line breaks and code blocks
-                    formatted_content = html.escape(content).replace('\n', '<br>\n')
+                    formatted_content = html.escape(content).replace('                    ', '<br>                    ')
                     # Simple code block detection
                     formatted_content = formatted_content.replace('```', '<pre><code>')
                     
@@ -1092,7 +1105,7 @@ class SessionTab(QWidget):
 '''
                     
                     # Format content for PDF
-                    formatted_content = html.escape(content).replace('\n', '<br>')
+                    formatted_content = html.escape(content).replace('                    ', '<br>')
                     html_content += f'''    <div class="content">{formatted_content}</div>
 </div>
 '''
@@ -1130,7 +1143,7 @@ class SessionTab(QWidget):
             if self.presenter.controller and hasattr(self.presenter.controller, 'stop'):
                 self.presenter.controller.stop()
         except Exception as e:
-            debug_log(f"Warning: could not stop controller: {e}")
+            debug_log(f"Warning: could not stop controller: {e}", level="WARNING")
 
         try:
             success = self.presenter.save_session()
@@ -1145,7 +1158,7 @@ class SessionTab(QWidget):
 
     def save_session_as(self):
         """Rename/relocate existing session (Save As)."""
-        debug_log(f"save_session_as called, current session_name={self.presenter.session_name}")
+        debug_log(f"save_session_as called, current session_name={self.presenter.session_name}", level="DEBUG")
         # Check if there is a session to rename
         if not self.presenter.user_history and not self.presenter._initial_conversation:
             QMessageBox.warning(self, "No Session", "No conversation to rename.")
@@ -1198,7 +1211,7 @@ class SessionTab(QWidget):
             is_in_sessions_dir = target_path.parent.samefile(sessions_dir)
         except Exception as e:
             # If path comparison fails, assume not in sessions directory
-            debug_log(f"Error checking sessions directory: {e}")
+            debug_log(f"Error checking sessions directory: {e}", level="WARNING")
         
         if is_in_sessions_dir:
             # User is saving to the sessions directory (rename session)
@@ -1381,8 +1394,8 @@ class SessionTab(QWidget):
         from PyQt6.QtWidgets import QMessageBox
         reply = QMessageBox.question(
             self, "Rename Session",
-            f"Renaming will change the display name in the UI, but the filename will remain:\n"
-            f"{session_id}.json\n\n"
+            f"Renaming will change the display name in the UI, but the filename will remain:            "
+            f"{session_id}.json                        "
             f"This helps avoid filename conflicts. Continue?",
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel
         )
@@ -1409,19 +1422,24 @@ class SessionTab(QWidget):
 
     def display_loaded_conversation(self):
         """Display the currently loaded conversation (full user history)."""
+        from .debug_log import debug_log
+        debug_log(f"display_loaded_conversation called, output_panel exists: {hasattr(self, "output_panel")}, status_panel exists: {hasattr(self, "status_panel")}", level="DEBUG")
         # If UI panels are not initialized yet, defer until they are
+        # Both output_panel and status_panel are needed for display
         if not hasattr(self, 'output_panel') or self.output_panel is None or \
            not hasattr(self, 'status_panel') or self.status_panel is None:
+            debug_log(f"UI panels not ready, output_panel: {hasattr(self, "output_panel")}, status_panel: {hasattr(self, "status_panel")}, retry count: {self._display_retry_count}", level="DEBUG")
             # Try again after a short delay, but limit retries
             self._display_retry_count += 1
             if self._display_retry_count > 10:
-                debug_log(f"Warning: Too many display retries ({self._display_retry_count}), giving up")
+                debug_log(f"Warning: Too many display retries ({self._display_retry_count}), giving up", level="WARNING")
                 return
             QTimer.singleShot(0, self.display_loaded_conversation)
             return
         
         # Reset retry counter since we're about to display successfully
         self._display_retry_count = 0
+        debug_log(f"UI panels ready, proceeding to display conversation", level="DEBUG")
         
         # Clear current display
         self.output_panel.clear_output()
@@ -1432,21 +1450,66 @@ class SessionTab(QWidget):
         self.total_input = self.presenter.total_input
         self.total_output = self.presenter.total_output
         self.context_length = self.presenter.context_length
-        self.status_panel.update_tokens(self.presenter.total_input, self.presenter.total_output)
-        self.status_panel.update_context_length(self.presenter.context_length)
+        if hasattr(self, 'status_panel') and self.status_panel is not None:
+            self.status_panel.update_tokens(self.presenter.total_input, self.presenter.total_output)
+            self.status_panel.update_context_length(self.presenter.context_length)
 
         conversation = self.presenter.user_history
+        debug_log(f"Loaded conversation length: {len(conversation)}", level="DEBUG")
         if not conversation:
+            debug_log(f"Conversation is empty, returning", level="DEBUG")
             return
+        
+        # Sort messages by sequence number (seq) for monotonic ordering, fallback to timestamp
+        def get_sort_key(msg):
+            # First priority: sequence number (monotonic)
+            seq = msg.get('seq')
+            if seq is not None:
+                return (0, seq)  # Type 0 for seq ordering
+            
+            # Second priority: timestamp
+            created_at = msg.get('created_at')
+            if created_at is None:
+                return (1, 0.0)  # Type 1 for timestamp ordering, default timestamp
+            
+            # Handle float/int timestamps
+            if isinstance(created_at, (int, float)):
+                return (1, float(created_at))
+            
+            # Handle ISO string timestamps
+            if isinstance(created_at, str):
+                try:
+                    # Try to parse ISO format
+                    dt = datetime.datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                    return (1, dt.timestamp())
+                except (ValueError, AttributeError):
+                    # Try to convert numeric string
+                    try:
+                        return (1, float(created_at))
+                    except (ValueError, TypeError):
+                        return (1, 0.0)
+            
+            # Fallback
+            return (1, 0.0)
+        
+        conversation = sorted(conversation, key=get_sort_key)
+        
+        # Find maximum sequence number for final event ordering
+        max_seq = max((msg.get('seq', 0) for msg in conversation), default=0)
 
         # Build mapping of tool_call_id -> tool_name from assistant messages
         tool_call_id_to_name = {}
+        tool_call_id_to_content = {}
         for msg in conversation:
             if msg['role'] == 'assistant' and msg.get('tool_calls'):
                 for tc in msg['tool_calls']:
                     func = tc.get('function', {})
                     tool_name = func.get('name', 'unknown')
                     tool_call_id_to_name[tc.get('id')] = tool_name
+            elif msg['role'] == 'tool':
+                tool_call_id = msg.get('tool_call_id')
+                if tool_call_id:
+                    tool_call_id_to_content[tool_call_id] = msg.get('content', '')
         
         # Collect events from conversation with simple turn numbering
         events = []
@@ -1459,6 +1522,16 @@ class SessionTab(QWidget):
             tool_calls = msg.get('tool_calls')
             tool_call_id = msg.get('tool_call_id')
             
+            # For assistant messages, check if any tool calls are Final and have result content
+            if role == 'assistant' and tool_calls and (not content or content == ''):
+                for tc in tool_calls:
+                    tc_id = tc.get('id')
+                    if tc_id in tool_call_id_to_name and tool_call_id_to_name.get(tc_id) == 'Final':
+                        # Found Final tool call, try to get content from tool result
+                        if tc_id in tool_call_id_to_content:
+                            content = tool_call_id_to_content[tc_id]
+                            break
+            
             # Start new turn on user messages
             if role == 'user':
                 current_turn += 1
@@ -1468,23 +1541,29 @@ class SessionTab(QWidget):
             
             # Handle system messages separately (no turn)
             if role == 'system':
+                msg_timestamp = msg.get('created_at', datetime.datetime.now().isoformat())
                 event = {
                     'type': 'system',
                     'content': content,
-                    'timestamp': datetime.datetime.now().isoformat(),
-                    '_detail_level': self.presenter._config.get('detail', 'normal')
+                    'created_at': msg_timestamp,
+                    'timestamp': msg_timestamp,
+                    '_detail_level': self.presenter._config.get('detail', 'normal'),
+                    'seq': msg.get('seq')
                 }
                 events.append(event)
                 continue
             
             # Handle tool messages (tool results)
             if role == 'tool':
+                msg_timestamp = msg.get('created_at', datetime.datetime.now().isoformat())
                 event = {
                     'type': 'tool_result',
                     'content': content,
                     'tool_call_id': tool_call_id,
-                    'timestamp': datetime.datetime.now().isoformat(),
-                    '_detail_level': self.presenter._config.get('detail', 'normal')
+                    'created_at': msg_timestamp,
+                    'timestamp': msg_timestamp,
+                    '_detail_level': self.presenter._config.get('detail', 'normal'),
+                    'seq': msg.get('seq')
                 }
                 # Add tool_name from mapping
                 if tool_call_id and tool_call_id in tool_call_id_to_name:
@@ -1494,8 +1573,9 @@ class SessionTab(QWidget):
                 continue
             
             # For all other roles (user, assistant with or without tool_calls), use _create_chat_event
+            msg_timestamp = msg.get('created_at', datetime.datetime.now().isoformat())
             event = self._create_chat_event(
-                role, content, tool_calls, tool_call_id, reasoning=reasoning
+                role, content, tool_calls, tool_call_id, reasoning=reasoning, timestamp=msg_timestamp, seq=msg.get('seq'), turn=turn
             )
             event['turn'] = turn
             events.append(event)
@@ -1505,9 +1585,12 @@ class SessionTab(QWidget):
         if session and getattr(session, 'final_content', None):
             final_event = {
                 'type': 'final',
+                'created_at': datetime.datetime.now().isoformat(),
+                'timestamp': datetime.datetime.now().isoformat(),
                 'content': session.final_content,
                 'reasoning': getattr(session, 'final_reasoning', '') or '',
-                '_detail_level': self.presenter._config.get('detail', 'normal')
+                '_detail_level': self.presenter._config.get('detail', 'normal'),
+                'turn': current_turn
             }
             events.append(final_event)
         
@@ -1518,10 +1601,11 @@ class SessionTab(QWidget):
         # Delegate batch display to output panel
         if events:
             # Debug: print event count and structure
-            debug_log(f"display_loaded_conversation: Created {len(events)} events from {len(conversation)} messages, setting _display_turn to {self._display_turn}")
+            debug_log(f"display_loaded_conversation: Created {len(events)} events from {len(conversation)} messages, setting _display_turn to {self._display_turn}", level="DEBUG")
             if events:
-                debug_log(f"First event type: {events[0].get('type')}, turn: {events[0].get('turn', 'N/A')}")
-                debug_log(f"Event types: {[e.get('type') for e in events[:5]]}")
+                debug_log(f"First event type: {events[0].get('type')}, turn: {events[0].get('turn', 'N/A')}", level="DEBUG")
+                debug_log(f"Event types: {[e.get('type') for e in events[:5]]}", level="DEBUG")
+            debug_log(f"Calling output_panel.display_loaded_conversation with {len(events)} events", level="DEBUG")
             self.output_panel.display_loaded_conversation(events)
 
 
@@ -1566,7 +1650,7 @@ class SessionTab(QWidget):
         parent = self.parent()
         while parent is not None:
             if isinstance(parent, QTabWidget):
-                debug_log(f"_find_tab_widget: found QTabWidget at {parent}")
+                debug_log(f"_find_tab_widget: found QTabWidget at {parent}", level="DEBUG")
                 return parent
             parent = parent.parent()
         # Fallback: search through window
@@ -1574,46 +1658,46 @@ class SessionTab(QWidget):
         if main_window:
             tab_widgets = main_window.findChildren(QTabWidget)
             if tab_widgets:
-                debug_log(f"_find_tab_widget: fallback found {len(tab_widgets)} QTabWidgets")
+                debug_log(f"_find_tab_widget: fallback found {len(tab_widgets)} QTabWidgets", level="DEBUG")
                 return tab_widgets[0]
-        debug_log("_find_tab_widget: no QTabWidget found")
+        debug_log("_find_tab_widget: no QTabWidget found", level="DEBUG")
         return None
 
     def update_window_title(self):
         """Update the main window title to reflect the current session name."""
-        debug_log(f"update_window_title called, session_name={self.presenter.session_name}")
+        debug_log(f"update_window_title called, session_name={self.presenter.session_name}", level="DEBUG")
         name = self.presenter.session_name
         if not name:
             name = "Untitled Session"
         # Set the main window title
         main_window = self.window()
         if main_window and main_window != self:
-            debug_log(f"Setting window title to: ThoughtMachine – {name}")
+            debug_log(f"Setting window title to: ThoughtMachine – {name}", level="DEBUG")
             main_window.setWindowTitle(f"ThoughtMachine – {name}")
         # Update tab text if we're in a QTabWidget
         tab_widget = self._find_tab_widget()
         if tab_widget:
             idx = tab_widget.indexOf(self)
-            debug_log(f"Tab widget found, index={idx}, name={name}")
+            debug_log(f"Tab widget found, index={idx}, name={name}", level="DEBUG")
             if idx >= 0:
-                debug_log(f"Setting tab text at index {idx} to {name}")
+                debug_log(f"Setting tab text at index {idx} to {name}", level="DEBUG")
                 tab_widget.setTabText(idx, name)
         else:
-            debug_log("No tab widget found in update_window_title")
+            debug_log("No tab widget found in update_window_title", level="DEBUG")
 
     def _update_tab_label(self):
         """Update the tab label in the main tab widget."""
-        debug_log(f"_update_tab_label called, session_name={self.presenter.session_name}")
+        debug_log(f"_update_tab_label called, session_name={self.presenter.session_name}", level="DEBUG")
         tab_widget = self._find_tab_widget()
         if tab_widget:
             idx = tab_widget.indexOf(self)
-            debug_log(f"_update_tab_label: tab widget found, index={idx}")
+            debug_log(f"_update_tab_label: tab widget found, index={idx}", level="DEBUG")
             if idx >= 0:
                 name = self.presenter.session_name or "Untitled"
-                debug_log(f"_update_tab_label: setting tab text to {name}")
+                debug_log(f"_update_tab_label: setting tab text to {name}", level="DEBUG")
                 tab_widget.setTabText(idx, name)
         else:
-            debug_log("_update_tab_label: no tab widget found")
+            debug_log("_update_tab_label: no tab widget found", level="DEBUG")
 
     def _auto_save_session(self):
         """Auto-save the current session periodically."""
@@ -1627,7 +1711,7 @@ class SessionTab(QWidget):
             # print(f"[SessionTab] Auto-save error: {e}")
             pass
 
-    def _create_chat_event(self, role: str, content: str, tool_calls=None, tool_call_id=None, reasoning=None, tool_name=None):
+    def _create_chat_event(self, role: str, content: str, tool_calls=None, tool_call_id=None, reasoning=None, tool_name=None, timestamp=None, seq=None, turn=None):
         """Create a chat event dictionary for the given role and content.
         
         Args:
@@ -1637,6 +1721,9 @@ class SessionTab(QWidget):
             tool_call_id: optional tool call ID (for user tool response)
             reasoning: optional reasoning text (for assistant)
             tool_name: optional tool name (for tool results)
+            timestamp: optional timestamp (ISO format string)
+            seq: optional sequence number for ordering
+            turn: optional turn number (if None, uses self._display_turn for user role)
         
         Returns:
             Dictionary representing the event
@@ -1645,16 +1732,21 @@ class SessionTab(QWidget):
         detail_level = 'normal'
         if hasattr(self, 'presenter') and self.presenter and hasattr(self.presenter, '_config'):
             detail_level = self.presenter._config.get('detail', 'normal')
-
+        
+        ts = timestamp or datetime.datetime.now().isoformat()
+        
         # Handle tool messages (tool results)
-        if role == 'tool':
+        if role == "tool":
             event = {
                 'type': 'tool_result',
                 'content': content,
                 'tool_call_id': tool_call_id,
-                'timestamp': datetime.datetime.now().isoformat(),
+                'created_at': ts,
+                'timestamp': ts,
                 '_detail_level': detail_level
             }
+            if seq is not None:
+                event['seq'] = seq
             if tool_name:
                 event['tool_name'] = tool_name
             return event        
@@ -1663,24 +1755,35 @@ class SessionTab(QWidget):
             event = {
                 'type': 'system',
                 'content': content,
-                'timestamp': datetime.datetime.now().isoformat(),
+                'created_at': ts,
+                'timestamp': ts,
                 '_detail_level': detail_level
             }
+            if seq is not None:
+                event['seq'] = seq
         elif role == 'user':
+            turn_to_use = turn if turn is not None else self._display_turn
+            debug_log(f"[TIMESTAMP_DEBUG] Creating synthetic user_query event: turn={turn_to_use}, created_at={ts}, timestamp={ts}", level="DEBUG")
             event = {
                 'type': 'user_query',
                 'content': content,
-                'turn': self._display_turn,
-                'timestamp': datetime.datetime.now().isoformat(),
+                'turn': turn_to_use,
+                'created_at': ts,
+                'timestamp': ts,
                 '_detail_level': detail_level
             }
+            if seq is not None:
+                event['seq'] = seq
         elif role == 'assistant':
             event = {
                 'type': 'turn',
                 'assistant_content': content,
-                'timestamp': datetime.datetime.now().isoformat(),
+                'created_at': ts,
+                'timestamp': ts,
                 '_detail_level': detail_level
             }
+            if seq is not None:
+                event['seq'] = seq
             if reasoning is not None:
                 event['reasoning'] = reasoning
             if tool_calls:
@@ -1690,9 +1793,12 @@ class SessionTab(QWidget):
             event = {
                 'type': 'turn',
                 'assistant_content': content,
-                'timestamp': datetime.datetime.now().isoformat(),
+                'created_at': ts,
+                'timestamp': ts,
                 '_detail_level': detail_level
             }
+            if seq is not None:
+                event['seq'] = seq
             if reasoning is not None:
                 event['reasoning'] = reasoning
             if tool_calls:
@@ -1711,7 +1817,7 @@ class SessionTab(QWidget):
             reasoning: optional reasoning text (for assistant)
             tool_name: optional tool name (for tool results)
         """
-        event = self._create_chat_event(role, content, tool_calls, tool_call_id, reasoning, tool_name)
+        event = self._create_chat_event(role, content, tool_calls, tool_call_id, reasoning, tool_name, seq=None)
         # Delegate to output panel for display
         self.output_panel.display_event(event)
 
@@ -1719,10 +1825,10 @@ class SessionTab(QWidget):
 
     def closeEvent(self, event):
         """Handle closing the tab with save/discard prompts for unsaved changes."""
-        debug_log("closeEvent: started")
+        debug_log("closeEvent: started", level="DEBUG")
         # Prevent re-entrant calls
         if self._closing:
-            debug_log("closeEvent: already closing, ignoring")
+            debug_log("closeEvent: already closing, ignoring", level="DEBUG")
             event.ignore()
             return
         # Set closing flag immediately to prevent re-entrance
@@ -1737,42 +1843,45 @@ class SessionTab(QWidget):
             self.presenter.error_occurred.disconnect(self.on_error_occurred)
             self.presenter.config_changed.disconnect(self.on_config_changed)
         except Exception as e:
-            debug_log(f"closeEvent: error disconnecting signals: {e}")
+            debug_log(f"closeEvent: error disconnecting signals: {e}", level="WARNING")
         from PyQt6.QtWidgets import QInputDialog
         # Stop auto-save timer to prevent interference during close
         self._auto_save_timer.stop()
 
         # Always attempt to save session before closing
         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            import sys
-            sys.stderr.write(f'[SessionTab] closeEvent: attempting to save session, user_history length={len(self.presenter.user_history) if self.presenter.user_history else 0}, current_session_id={self.presenter.current_session_id}\n')
+            trunc_limit = int(os.environ.get('THOUGHTMACHINE_DEBUG_TRUNCATION', 100))
+            msg = f'[SessionTab] closeEvent: attempting to save session, user_history length={len(self.presenter.user_history) if self.presenter.user_history else 0}, current_session_id={self.presenter.current_session_id}'
+            if trunc_limit > 0 and len(msg) > trunc_limit:
+                msg = msg[:trunc_limit] + "..."
+            sys.stderr.write(msg)
 
-        debug_log("closeEvent: proceeding with closing")
+        debug_log("closeEvent: proceeding with closing", level="DEBUG")
         # Proceed with closing
         # self._closing = True already set at beginning
         # Save UI configuration
-        debug_log("closeEvent: calling save_config")
+        debug_log("closeEvent: calling save_config", level="DEBUG")
         self.save_config(immediate=True)
-        debug_log("closeEvent: save_config returned")
+        debug_log("closeEvent: save_config returned", level="DEBUG")
         # Stop controller if running and reset state (without auto-saving)
         if self.presenter.controller.is_running:
-            debug_log("closeEvent: stopping controller")
+            debug_log("closeEvent: stopping controller", level="DEBUG")
             self.presenter.controller.stop()
-            debug_log("closeEvent: controller stopped")
+            debug_log("closeEvent: controller stopped", level="DEBUG")
         # self.presenter.state = ExecutionState.IDLE  # Disabled to avoid infinite loop
         # print("[GUI] closeEvent: skipping state reset to avoid infinite loop")
         # Auto-save session before cleanup
-        debug_log("closeEvent: attempting to save session")
+        debug_log("closeEvent: attempting to save session", level="DEBUG")
         try:
             self.presenter.save_session()
-            debug_log("closeEvent: save_session completed")
+            debug_log("closeEvent: save_session completed", level="DEBUG")
         except Exception as e:
-            debug_log(f"closeEvent: save_session failed: {e}")
+            debug_log(f"closeEvent: save_session failed: {e}", level="ERROR")
         
         # Cleanup presenter
-        debug_log("closeEvent: calling presenter.cleanup")
+        debug_log("closeEvent: calling presenter.cleanup", level="DEBUG")
         self.presenter.cleanup()
-        debug_log("closeEvent: presenter.cleanup returned")
+        debug_log("closeEvent: presenter.cleanup returned", level="DEBUG")
         # Remove this tab from the parent QTabWidget
         parent = self.parent()
         if parent and hasattr(parent, 'removeTab'):
@@ -1782,3 +1891,5 @@ class SessionTab(QWidget):
         self.deleteLater()
         event.accept()
         super().closeEvent(event)
+        
+        
