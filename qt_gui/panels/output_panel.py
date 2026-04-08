@@ -20,6 +20,8 @@ from ..utils.smart_scrolling import SmartScroller
 
 class OutputPanel(QWidget):
     """Panel containing event display, filtering, and query controls."""
+    # Special tools that should have blue styling, no truncation, full markdown
+    SPECIAL_TOOLS = ["Final", "FinalReport", "RequestUserInteraction"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -48,9 +50,13 @@ class OutputPanel(QWidget):
         # Processing indicator tracking
         self._processing_indicators = {}  # turn_number -> event_index
         
+        # Tool call mapping for special styling
+        self._tool_call_map = {}  # tool_call_id -> tool_name
+        
 
         self.init_ui()
         self.turn_container_manager = TurnContainerManager(self.output_textedit, self.filter_proxy_model)
+        self.markdown_renderer = MarkdownRenderer()
         self.setup_signal_connections()
 
     def _normalize_turn(self, turn_val):
@@ -285,6 +291,186 @@ class OutputPanel(QWidget):
             # Actual removal will happen when real user_query replaces it
             del self._processing_indicators[turn_number]
     
+    # Message display methods for direct rendering from user_history
+    def display_message(self, message: dict):
+        """Display a message from user_history (role-based routing)."""
+        role = message.get('role')
+        debug_log(f"display_message: role={role}, content preview={str(message.get('content', ''))[:50]}", level="DEBUG")
+        if role == 'user':
+            self.display_user_message(message)
+        elif role == 'assistant':
+            self.display_assistant_message(message)
+        elif role == 'tool':
+            self.display_tool_result(message)
+        elif role == 'system':
+            self.display_system_message(message)
+        else:
+            debug_log(f"Unknown message role: {role}", level="WARNING")
+    
+    def display_user_message(self, message: dict):
+        """Display a user message."""
+        content = message.get('content', '')
+        created_at = message.get('created_at', '')
+        self._append_html(
+            f'<div style="border: 1px solid #cc99ff; border-radius: 5px; margin-bottom: 8px; overflow: hidden;">'
+            f'<div style="background-color: #f0e6ff; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid #cc99ff;">User</div>'
+            f'<div style="padding: 10px;">'
+            f'{self._render_content(content)}'
+            f'</div>'
+            f'</div>'
+        )
+    
+    def display_assistant_message(self, message: dict):
+        """Display an assistant message with optional tool calls."""
+        content = message.get('content', '')
+        tool_calls = message.get('tool_calls', [])
+        
+        debug_log(f"display_assistant_message: content length={len(content)}, tool_calls count={len(tool_calls)}", level="DEBUG")
+        
+        self._append_html(
+            f'<div style="border: 1px solid #99ccff; border-radius: 5px; margin-bottom: 8px; overflow: hidden;">'
+            f'<div style="background-color: #e6f3ff; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid #99ccff;">Assistant</div>'
+            f'<div style="padding: 10px;">'
+            f'{self._render_content(content)}'
+            f'</div>'
+            f'</div>'
+        )
+        
+        # Display tool calls if present
+        for i, tool_call in enumerate(tool_calls):
+            debug_log(f"display_assistant_message: calling display_tool_call {i}", level="DEBUG")
+            self.display_tool_call(tool_call)
+    
+    def display_tool_call(self, tool_call: dict):
+        """Display a tool call (called from assistant message)."""
+        tool_name = tool_call.get('function', {}).get('name', 'unknown')
+        arguments = tool_call.get('function', {}).get('arguments', '{}')
+        tool_call_id = tool_call.get('id', '')
+        
+        debug_log(f"display_tool_call: tool_name={tool_name}, arguments length={len(str(arguments))}", level="DEBUG")
+        
+        # Store mapping for tool result styling
+        if tool_call_id:
+            self._tool_call_map[tool_call_id] = tool_name
+        
+        # Special tools that should have blue styling, no truncation, full markdown
+        SPECIAL_TOOLS = self.SPECIAL_TOOLS
+        debug_log(f"display_tool_call: SPECIAL_TOOLS={SPECIAL_TOOLS}, tool_name in SPECIAL_TOOLS={tool_name in SPECIAL_TOOLS}", level="DEBUG")
+        
+        if tool_name in SPECIAL_TOOLS:
+            self._append_html(
+                f'<div style="margin-left: 20px; margin-top: 8px; margin-bottom: 8px; border-left: 4px solid #3498db; background-color: #eef4ff; padding: 8px; border-radius: 4px;">'
+                f'<div style="color: #0000FF; font-weight: bold;">Tool: {tool_name}</div>'
+                f'<div style="color: #666666; font-size: 0.9em;">Arguments: {html.escape(arguments)}</div>'
+                f'</div>'
+            )
+        else:
+            # Regular tool: truncate arguments, monospace font
+            args_str = str(arguments)
+            if len(args_str) > 200:
+                args_str = args_str[:200] + '...'
+            escaped_args = html.escape(args_str)
+            self._append_html(
+                f'<div style="margin-left: 20px; margin-top: 5px; margin-bottom: 5px;">'
+                f'<div style="color: #006400; font-weight: bold;">Tool: {tool_name}</div>'
+                f'<div style="color: #666666; font-size: 0.9em; font-family: monospace, monospace;">Arguments: {escaped_args}</div>'
+                f'</div>'
+            )
+    
+    def display_tool_result(self, message: dict):
+        """Display a tool result message."""
+        content = message.get('content', '')
+        tool_call_id = message.get('tool_call_id', '')
+        
+        debug_log(f"display_tool_result: tool_call_id={tool_call_id}, content length={len(content)}", level="DEBUG")
+        
+        # Look up tool name for special styling
+        tool_name = self._tool_call_map.get(tool_call_id, '')
+        debug_log(f"display_tool_result: found tool_name='{tool_name}' from _tool_call_map (size={len(self._tool_call_map)})", level="DEBUG")
+        SPECIAL_TOOLS = self.SPECIAL_TOOLS
+        debug_log(f"display_tool_result: SPECIAL_TOOLS={SPECIAL_TOOLS}, tool_name in SPECIAL_TOOLS={tool_name in SPECIAL_TOOLS}", level="DEBUG")
+        
+        if tool_name in SPECIAL_TOOLS:
+            self._append_html(
+                f'<div style="margin-left: 20px; margin-top: 8px; margin-bottom: 10px; border-left: 4px solid #3498db; background-color: #eef4ff; padding: 8px; border-radius: 4px;">'
+                f'<div style="color: #0000FF; font-weight: bold;">Tool Result ({tool_name})</div>'
+                f'<div style="color: #0000FF;">{self._render_content(content)}</div>'
+                f'</div>'
+            )
+        else:
+            # Regular tool: truncate plain text, HTML escape, monospace font
+            truncated_content = self._truncate_plain_text(content, tool_name)
+            escaped_content = html.escape(truncated_content)
+            self._append_html(
+                f'<div style="margin-left: 20px; margin-top: 5px; margin-bottom: 10px;">'
+                f'<div style="color: #006400; font-weight: bold;">Tool Result</div>'
+                f'<div style="color: #006400; font-family: monospace, monospace; white-space: pre-wrap;">{escaped_content}</div>'
+                f'</div>'
+            )
+    
+    def display_system_message(self, message: dict):
+        """Display a system message."""
+        content = message.get('content', '')
+        
+        self._append_html(
+            f'<div style="color: #808080; font-style: italic; margin-bottom: 8px;">'
+            f'System: {self._render_content(content)}'
+            f'</div>'
+        )
+    
+    def _render_content(self, content: str) -> str:
+        """Render message content to HTML (handles markdown)."""
+        if not content:
+            return ''
+        # Use the existing markdown renderer
+        return self.markdown_renderer.markdown_to_html(content)
+    
+    def _truncate_plain_text(self, content: str, tool_name: str = '') -> str:
+        """Truncate plain text content for regular tool results."""
+        if not content:
+            return ''
+        
+        # Don't truncate special tools
+        if tool_name in self.SPECIAL_TOOLS:
+            return content
+        
+        # Check if truncation is enabled
+        if not ENABLE_RESULT_TRUNCATION:
+            return content
+        
+        lines = content.split('\n')
+        
+        # Limit number of lines
+        if len(lines) > MAX_LINES_PER_RESULT:
+            lines = lines[:MAX_LINES_PER_RESULT]
+            lines.append('...')
+        
+        # Process each line
+        truncated_lines = []
+        total_chars = 0
+        for line in lines:
+            # Check total character limit
+            if total_chars + len(line) > MAX_RESULT_LENGTH:
+                truncated_lines.append('...')
+                break
+            
+            # Limit line length
+            if len(line) > 100:
+                line = line[:100] + '...'
+            
+            truncated_lines.append(line)
+            total_chars += len(line)
+        
+        return '\n'.join(truncated_lines)
+    
+    def _append_html(self, html: str):
+        """Append HTML to the output text edit."""
+        cursor = self.output_textedit.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        cursor.insertHtml(html)
+        # Scroll to bottom
+        self.smart_scroller.deferred_scroll_to_bottom()
+    
     # Note: _render_pending_turns removed in favor of incremental per-event rendering
 
     def _scroll_to_bottom(self):
@@ -298,6 +484,9 @@ class OutputPanel(QWidget):
         self._pending_events.clear()
         # Reset incremental state
         self.turn_container_manager.reset()
+        # Clear tool call mapping
+        self._tool_call_map.clear()
+        debug_log("clear_output: cleared _tool_call_map", level="DEBUG")
 
 
     def update_tokens(self, total_input, total_output):
@@ -315,100 +504,3 @@ class OutputPanel(QWidget):
         # This will be connected to status panel's update_status method
         pass
 
-    def display_loaded_conversation(self, events):
-        """Display a loaded conversation from history."""
-        self.clear_output()
-        
-        # Sort events chronologically for correct display order
-        # Priority: created_at timestamp > turn number > original order
-        import datetime
-        from ..debug_log import debug_log
-
-        # Debug: print timestamps before sorting
-        debug_log(f"[TIMESTAMP_DEBUG] display_loaded_conversation: received {len(events)} events", level="DEBUG")
-        for i, event in enumerate(events):
-            created_at = event.get('created_at')
-            turn = event.get('turn')
-            event_type = event.get('type', 'unknown')
-            debug_log(f"[TIMESTAMP_DEBUG] Event {i}: type={event_type}, created_at={created_at}, turn={turn}", level="DEBUG")
-
-        def normalize_timestamp(ts):           
-            """Convert timestamp to float for consistent comparison."""
-            if ts is None:
-                return 0.0
-            # Handle float/int timestamps
-            if isinstance(ts, (int, float)):
-                return float(ts)
-            # Handle ISO string timestamps
-            if isinstance(ts, str):
-                try:
-                    # Try to parse ISO format
-                    dt = datetime.datetime.fromisoformat(ts.replace('Z', '+00:00'))
-                    return dt.timestamp()
-                except (ValueError, AttributeError):
-                    # Try to convert numeric string
-                    try:
-                        return float(ts)
-                    except (ValueError, TypeError):
-                        return 0.0
-            # Fallback
-            return 0.0
-        
-        def normalize_turn(turn_val):
-            """Convert turn value to integer for consistent comparison."""
-            if turn_val is None:
-                return 0
-            # Handle int/float turn values
-            if isinstance(turn_val, (int, float)):
-                return int(turn_val)
-            # Handle string turn values
-            if isinstance(turn_val, str):
-                try:
-                    return int(turn_val)
-                except (ValueError, TypeError):
-                    # Try to convert float string
-                    try:
-                        return int(float(turn_val))
-                    except (ValueError, TypeError):
-                        return 0
-            # Fallback
-            return 0
-        
-        def get_event_order(event):
-            # Priority: created_at timestamp > turn number > original order
-            # Use tuple (priority, value) to ensure comparable types
-            if "created_at" in event:
-                ts = event["created_at"]
-                normalized = normalize_timestamp(ts)
-                return (0, normalized)  # timestamp priority 0
-            if "turn" in event:
-                return (1, normalize_turn(event["turn"]))        # turn priority 1
-            return (2, 0)                        # fallback priority 2
-        
-        sorted_events = sorted(events, key=get_event_order)
-
-        # Debug: print timestamps after sorting
-        debug_log(f"[TIMESTAMP_DEBUG] After sorting: {len(sorted_events)} events", level="DEBUG")
-        for i, event in enumerate(sorted_events):
-            created_at = event.get('created_at')
-            turn = event.get('turn')
-            event_type = event.get('type', 'unknown')
-            order_tuple = get_event_order(event)
-            debug_log(f"[TIMESTAMP_DEBUG] Sorted event {i}: type={event_type}, created_at={created_at}, turn={turn}, order_key={order_tuple}", level="DEBUG")
-        
-        # Verify ordering
-        prev_order = None
-        for i, event in enumerate(sorted_events):
-            current_order = get_event_order(event)
-            if prev_order is not None:
-                if current_order < prev_order:
-                    debug_log(f"[TIMESTAMP_WARNING] Order violation at position {i}: {current_order} < {prev_order}", level="WARNING")
-            prev_order = current_order
-
-        # Add all events to the model first
-        for event in sorted_events:
-            self.event_model.add_event(event)        # Reset auto-scroll for loaded content
-        self.smart_scroller.reset_auto_scroll()
-        # Append events incrementally for consistent rendering
-        self.turn_container_manager.append_new_events()
-        self.smart_scroller.deferred_scroll_to_bottom()

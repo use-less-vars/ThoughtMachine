@@ -54,17 +54,14 @@ class RefactoredAgentPresenter(QObject):
         self.state_bridge = StateBridge()
         self.gui_integration = GUIIntegration()
         self.controller = AgentController()
-        self._final_content = None
-        self._final_reasoning = None
         
         # Create lifecycle and event processor with dependencies
         self.session_lifecycle = SessionLifecycle(self.state_bridge, self.controller)
         # Set up state change callback
         self.session_lifecycle._session_callback = self._on_session_state_change
-        # Set up conversation change callback
-        debug_log(f"Setting conversation callback", level="DEBUG", component="AgentPresenter")
-        self.session_lifecycle._conversation_callback = lambda: self.gui_integration.emit_conversation_changed()
-        debug_log(f"Conversation callback set", level="DEBUG", component="AgentPresenter")
+        # Set up conversation change callback - DISABLED for Phase 6 (direct session callback used instead)
+        # Note: SessionTab will register its own callback via _setup_session_callback()
+        debug_log(f"Not setting conversation callback - GUI will register its own", level="DEBUG", component="AgentPresenter")
 
         self.event_processor = EventProcessor(
             self.state_bridge, 
@@ -315,35 +312,6 @@ class RefactoredAgentPresenter(QObject):
     def session_store(self, store):
         """Allow GUI to inject a session store (e.g., for testing)."""
         self.session_lifecycle.session_store = store
-
-    @property
-    def final_content(self) -> Optional[str]:
-        """Final content from last agent response."""
-        if self.current_session and self.current_session.final_content:
-            return self.current_session.final_content
-        return self._final_content
-
-    @final_content.setter
-    def final_content(self, content: Optional[str]):
-        """Set final content."""
-        self._final_content = content
-        if self.current_session:
-            self.current_session.final_content = content
-    
-
-    @property
-    def final_reasoning(self) -> Optional[str]:
-        """Final reasoning from last agent response."""
-        if self.current_session and self.current_session.final_reasoning:
-            return self.current_session.final_reasoning
-        return self._final_reasoning
-
-    @final_reasoning.setter
-    def final_reasoning(self, reasoning: Optional[str]):
-        """Set final reasoning."""
-        self._final_reasoning = reasoning
-        if self.current_session:
-            self.current_session.final_reasoning = reasoning
 
     # Other methods
 

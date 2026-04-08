@@ -55,6 +55,7 @@ class SessionLifecycle:
     def _register_session_callbacks(self, session):
         """Register callbacks on a session for change tracking."""
         debug_log(f"Registering callbacks for session {session.session_id}", level="DEBUG", component="SessionLifecycle")
+        debug_log(f"Registering callbacks: user_history id={id(session.user_history)}", level="DEBUG", component="SessionLifecycle")
         # Register conversation change callback if set
         if self._conversation_callback:
             session.connect_conversation_changed(self._conversation_callback)
@@ -204,11 +205,7 @@ class SessionLifecycle:
         # Register callback for conversation changes
         self._register_session_callbacks(session)
         self.state_bridge.update_external_file_path(None)
-        # Clear final content and timestamp
-        if self.state_bridge.current_session:
-            self.state_bridge.current_session.final_content = None
-            self.state_bridge.current_session.final_reasoning = None
-            self.state_bridge.current_session.final_timestamp = None
+
         # Ensure state is IDLE
         self.state = ExecutionState.IDLE
         # Status message will be emitted through event processing
@@ -599,10 +596,6 @@ class SessionLifecycle:
         if self.state_bridge.context_length > 0:
             session.context_length = self.state_bridge.context_length
         
-        # Copy final content if available
-        if self.state_bridge.current_session:
-            session.final_content = self.state_bridge.current_session.final_content
-            session.final_reasoning = self.state_bridge.current_session.final_reasoning
         
         # Add external file path to metadata if set
         if self.state_bridge._external_file_path:

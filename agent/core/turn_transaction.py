@@ -15,6 +15,7 @@ import logging
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from agent.logging.debug_log import debug_log
+from session.models import ObservableList
 
 logger = logging.getLogger(__name__)
 
@@ -93,12 +94,21 @@ class TurnTransaction:
         
         # 1. Assistant message
         commit_messages.append(self._assistant_message)
+        # Debug log for Final tool calls
+        tool_calls = self._assistant_message.get('tool_calls', [])
+        for tc in tool_calls:
+            if tc.get('name') in ('Final', 'FinalReport', 'RequestUserInteraction'):
+                logger.debug(f"TurnTransaction committing {tc['name']} tool call with result in commit_messages")
+                break
         
         # 2. All tool calls and results (interleaved as they were added)
         commit_messages.extend(self._tool_calls_buffer)
         
         # Atomic write to session.user_history
         if self.session:
+            debug_log(f"[TurnTransaction] Extending user_history with {len(commit_messages)} messages")
+            debug_log(f"[TurnTransaction] user_history type: {type(self.session.user_history).__name__}, is ObservableList: {isinstance(self.session.user_history, ObservableList)}")
+            debug_log(f"[TurnTransaction] user_history id: {id(self.session.user_history)}")
             self.session.user_history.extend(commit_messages)
             self.session.updated_at = datetime.now()
         

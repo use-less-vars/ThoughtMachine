@@ -16,6 +16,7 @@ from agent import events as ev
 
 class EventProcessor:
     """Processes events from controller and updates state."""
+    MESSAGE_EVENT_TYPES = {"turn", "tool_call", "tool_result", "final", "user_query", "llm_request", "llm_response", "raw_response"}
     
     def __init__(self, state_bridge, session_lifecycle, gui_integration=None):
         """
@@ -56,8 +57,18 @@ class EventProcessor:
                     debug_log(f"Ignoring event from old session {event_session_id}", level="DEBUG", component="EventProcessor")
                     return        
         # Emit event to GUI if integration available
-        if self.gui_integration and event_type != "token_update":
-            self.gui_integration.emit_event_received(event)
+        if self.gui_integration:
+            debug_log(f"GUI integration available, checking emission for {event_type}", level="DEBUG", component="EventProcessor")
+            if event_type != "token_update" and event_type not in self.MESSAGE_EVENT_TYPES:
+                debug_log(f"Emitting event to GUI: {event_type}", level="DEBUG", component="EventProcessor")
+                self.gui_integration.emit_event_received(event)
+            else:
+                if event_type == "token_update":
+                    debug_log(f"Skipping token_update event (handled separately)", level="DEBUG", component="EventProcessor")
+                else:
+                    debug_log(f"[EVENT_FILTER] Skipping content event: {event_type}", level="DEBUG", component="EventProcessor")
+        else:
+            debug_log(f"No GUI integration, skipping emission for {event_type}", level="DEBUG", component="EventProcessor")
         
         # Process event based on type
         if event_type == "turn":

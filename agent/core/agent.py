@@ -1275,6 +1275,7 @@ class Agent:
                     for event in events:
                         for yielded_event in self._handle_state_event(event):
                             yield yielded_event
+
                     # Yield final event
                     final_event = {
                         "type": "final",
@@ -1294,6 +1295,7 @@ class Agent:
                         final_event["reasoning"] = ""  # Empty string for tool calls without reasoning
                     self._add_conversation_data_to_event(final_event)
                     yield final_event
+
                     # Log turn completion
                     turn_duration = time.time() - turn_start_time
                     if self.logger:
@@ -1313,15 +1315,7 @@ class Agent:
                     for event in events:
                         for yielded_event in self._handle_state_event(event):
                             yield yielded_event
-                    # Yield user interaction requested event with actual message from tool
-                    event_dict = {
-                        "type": "user_interaction_requested",
-                        "message": user_interaction_message if user_interaction_message else "Waiting for user input",
-                        "turn": self._display_turn,
-                        "context_length": self.state.current_conversation_tokens,
-                    }
-                    self._add_conversation_data_to_event(event_dict)
-                    yield event_dict
+
                     # Log turn completion
                     turn_duration = time.time() - turn_start_time
                     if self.logger:
@@ -1400,6 +1394,7 @@ class Agent:
                     self.logger.log_system_resources()
                     self.logger.log_agent_end("completed", "Assistant provided direct answer with no tool calls")
                     self.logger.close()
+
                 final_event = {
                     "type": "final",
                     "content": content,
