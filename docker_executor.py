@@ -176,13 +176,19 @@ class DockerExecutor:
         if not os.path.exists(dockerfile_path):
             raise RuntimeError(f"Dockerfile not found at {dockerfile_path}")
 
-        print(f"Building Docker image {self.image} from {dockerfile_path}")
-        print(f"Build context directory: {dockerfile_dir}")
-        print(f"Absolute path: {os.path.abspath(dockerfile_dir)}")
-        print(f"Requirements.txt exists: {os.path.exists(os.path.join(dockerfile_dir, 'requirements.txt'))}")
-        print(f"Files in build context:")
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+            print(f"Building Docker image {self.image} from {dockerfile_path}")
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+            print(f"Build context directory: {dockerfile_dir}")
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+            print(f"Absolute path: {os.path.abspath(dockerfile_dir)}")
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+            print(f"Requirements.txt exists: {os.path.exists(os.path.join(dockerfile_dir, 'requirements.txt'))}")
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+            print(f"Files in build context:")
         for f in os.listdir(dockerfile_dir):
-            print(f"  {f}")
+            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+                print(f"  {f}")
         image, build_logs = self.client.images.build(
             path=dockerfile_dir,
             dockerfile="docker/executor.Dockerfile",
@@ -194,5 +200,6 @@ class DockerExecutor:
             if "stream" in chunk:
                 line = chunk["stream"].strip()
                 if line:
-                    print(f"Build: {line}")
+                    if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+                        print(f"Build: {line}")
         return image

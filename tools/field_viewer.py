@@ -9,6 +9,7 @@ import libcst.metadata
 from typing import Dict, List, Optional, Set, Tuple, Any, Union, Literal
 from pydantic import Field
 from .base import ToolBase
+from agent.logging.debug_log import debug_log
 import os
 import sys
 import json
@@ -227,7 +228,7 @@ class PydanticModelVisitor(cst.CSTVisitor):
             trunc_limit = 200  # Limit for internal debug
             if trunc_limit > 0 and len(msg) > trunc_limit:
                 msg = msg[:trunc_limit] + "..."
-            sys.stderr.write(msg + '\n')
+            debug_log(msg, level="DEBUG", component="FieldViewer")
         # Handle Annotation nodes separately (they wrap type annotations)
         if isinstance(node, cst.Annotation):
             # Extract the actual type annotation
@@ -237,7 +238,7 @@ class PydanticModelVisitor(cst.CSTVisitor):
                 trunc_limit = 200  # Limit for internal debug
                 if trunc_limit > 0 and len(msg) > trunc_limit:
                     msg = msg[:trunc_limit] + "..."
-                sys.stderr.write(msg + '\n')
+                debug_log(msg, level="DEBUG", component="FieldViewer")
         try:
             result = cst.Module([]).code_for_node(node).strip()
             if self.debug:
@@ -245,7 +246,7 @@ class PydanticModelVisitor(cst.CSTVisitor):
                 trunc_limit = 200  # Limit for internal debug
                 if trunc_limit > 0 and len(msg) > trunc_limit:
                     msg = msg[:trunc_limit] + "..."
-                sys.stderr.write(msg + '\n')
+                debug_log(msg, level="DEBUG", component="FieldViewer")
             return result
         except Exception as e:
             if self.debug:
@@ -253,7 +254,7 @@ class PydanticModelVisitor(cst.CSTVisitor):
                 trunc_limit = 200  # Limit for internal debug
                 if trunc_limit > 0 and len(msg) > trunc_limit:
                     msg = msg[:trunc_limit] + "..."
-                sys.stderr.write(msg + '\n')
+                debug_log(msg, level="DEBUG", component="FieldViewer")
             return None
 
     def _is_in_pydantic_model(self) -> bool:

@@ -246,8 +246,7 @@ class FileSearchTool(ToolBase):
                 output_lines.append("")
             
             header = f"Found {len(matches)} matches for pattern '{self.pattern}'"
-            # Debug: show values
-            header += f" [DEBUG: self.max_results={self.max_results}, max_results={max_results}, self.MAX_RESULTS={self.MAX_RESULTS}]"
+
             if self.max_results != max_results:
                 header += f" (clamped from {self.max_results} to {max_results})"
             if self.use_regex:

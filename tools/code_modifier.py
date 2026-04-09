@@ -6,7 +6,9 @@ from typing import Optional, Literal, Dict, Any, List
 from pydantic import Field, model_validator
 import libcst as cst
 if not hasattr(cst, 'ImportFrom') or not hasattr(cst.ImportFrom, 'relative'):
-    print("Warning: Your libcst version may be incompatible. Expected >=0.4.0")
+    import os
+    if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+        print("Warning: Your libcst version may be incompatible. Expected >=0.4.0")
 import libcst.matchers as m
 import os
 import textwrap

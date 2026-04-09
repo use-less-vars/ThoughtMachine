@@ -59,14 +59,11 @@ class EventProcessor:
         # Emit event to GUI if integration available
         if self.gui_integration:
             debug_log(f"GUI integration available, checking emission for {event_type}", level="DEBUG", component="EventProcessor")
-            if event_type != "token_update" and event_type not in self.MESSAGE_EVENT_TYPES:
+            if event_type != "token_update":
                 debug_log(f"Emitting event to GUI: {event_type}", level="DEBUG", component="EventProcessor")
                 self.gui_integration.emit_event_received(event)
             else:
-                if event_type == "token_update":
-                    debug_log(f"Skipping token_update event (handled separately)", level="DEBUG", component="EventProcessor")
-                else:
-                    debug_log(f"[EVENT_FILTER] Skipping content event: {event_type}", level="DEBUG", component="EventProcessor")
+                debug_log(f"Skipping token_update event (handled separately)", level="DEBUG", component="EventProcessor")
         else:
             debug_log(f"No GUI integration, skipping emission for {event_type}", level="DEBUG", component="EventProcessor")
         

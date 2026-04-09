@@ -356,7 +356,7 @@ chmod +x "{script_path}"
 
         except Exception as e:
             import traceback
-            traceback.print_exc()   # This will print the stack trace to the console
+
             duration = time.time() - start_time
             return self._build_json_response(
                 success=False,
@@ -402,7 +402,9 @@ chmod +x "{script_path}"
                 if "stream" in chunk:
                     line = chunk["stream"].strip()
                     if line:
-                        print(f"Build: {line}")
+                        import os
+                        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+                            print(f"Build: {line}")
             return image
         except DockerException as e:
             raise RuntimeError(f"Failed to build Docker image: {e}")

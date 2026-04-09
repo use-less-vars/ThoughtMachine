@@ -303,26 +303,18 @@ class Agent:
         """
         if event.get("type") == "token_warning":
             # Note: token_warning events from AgentState have "message" field
-            warning = event.get("message", event.get("warning", ""))
-            sender = event.get("sender", "system")
-            # Append warning as user message
-            warning_msg = {"role": sender, "content": warning}
-            self._add_to_conversation(warning_msg)
-            # Estimate tokens for warning message and update state
-            warning_tokens = self._estimate_tokens(warning_msg)
-            self.state.current_conversation_tokens += warning_tokens
-            # Emit token update event for real-time tracking
-            yield self._create_token_update_event()
+            # Warning messages are already added to conversation in the main loop
+            # (see user_query method), so we don't need to add them here.
+            # Token counting is already done in the main loop.
+            # Just yield the event for GUI display.
+            pass
         elif event.get("type") == "turn_warning":
             # Note: turn_warning events from AgentState have "message" field
-            warning = event.get("message", event.get("warning", ""))
-            sender = event.get("sender", "system")
-            warning_msg = {"role": sender, "content": warning}
-            self._add_to_conversation(warning_msg)
-            warning_tokens = self._estimate_tokens(warning_msg)
-            self.state.current_conversation_tokens += warning_tokens
-            # Emit token update event for real-time tracking
-            yield self._create_token_update_event()
+            # Warning messages are already added to conversation in the main loop
+            # (see user_query method), so we don't need to add them here.
+            # Token counting is already done in the main loop.
+            # Just yield the event for GUI display.
+            pass
         elif event.get("type") in ("token_critical_countdown_start", "turn_critical_countdown_start", "token_critical_countdown_expired", "turn_critical_countdown_expired"):
             # Handle countdown events - inject as system message
             message = event.get("message", "")
@@ -762,8 +754,8 @@ class Agent:
             turn_events = self.state.update_turn_state(turn)
             for event in turn_events:
                 if event["type"] == "turn_warning":
-                    # Add warning message to conversation as user message
-                    warning_msg = {"role": "user", "content": event.get("message", event.get("warning", ""))}
+                    # Add warning message to conversation as system message
+                    warning_msg = {"role": "system", "content": event.get("message", event.get("warning", ""))}
                     self._add_to_conversation(warning_msg)
                     # Update token count for warning message
                     warning_tokens = self._estimate_tokens(warning_msg)
@@ -795,8 +787,8 @@ class Agent:
             token_events = self.state.update_token_state(self.state.current_conversation_tokens)
             for event in token_events:
                 if event["type"] == "token_warning":
-                    # Add warning message to conversation as user message
-                    warning_msg = {"role": "user", "content": event.get("message", event.get("warning", ""))}
+                    # Add warning message to conversation as system message
+                    warning_msg = {"role": "system", "content": event.get("message", event.get("warning", ""))}
                     self._add_to_conversation(warning_msg)
                     # Update token count for warning message
                     warning_tokens = self._estimate_tokens(warning_msg)
@@ -901,7 +893,7 @@ class Agent:
             if request_tokens > model_context_window:
                 # Cannot proceed - request exceeds model context window
                 error = f"[SYSTEM] Request token count ({request_tokens}) exceeds model context window ({model_context_window}). Cannot make API call. Please use SummarizeTool to reduce context size."
-                error_msg = {"role": "user", "content": error}
+                error_msg = {"role": "system", "content": error}
                 self._add_to_conversation(error_msg)
                 error_tokens = self._estimate_tokens(error_msg)
                 self.state.current_conversation_tokens += error_tokens
@@ -929,7 +921,7 @@ class Agent:
             elif request_tokens > critical_threshold:
                 # Critical warning - near context limit
                 warning = f"[SYSTEM] Request token count ({request_tokens}) is near model context window limit ({model_context_window}). Please use SummarizeTool immediately to reduce context size."
-                warning_msg = {"role": "user", "content": warning}
+                warning_msg = {"role": "system", "content": warning}
                 self._add_to_conversation(warning_msg)
                 warning_tokens = self._estimate_tokens(warning_msg)
                 self.state.current_conversation_tokens += warning_tokens
@@ -956,7 +948,7 @@ class Agent:
             elif request_tokens > warning_threshold:
                 # Warning - approaching context limit
                 warning = f"[SYSTEM] Request token count ({request_tokens}) is approaching model context window ({model_context_window}). Consider using SummarizeTool soon."
-                warning_msg = {"role": "user", "content": warning}
+                warning_msg = {"role": "system", "content": warning}
                 self._add_to_conversation(warning_msg)
                 warning_tokens = self._estimate_tokens(warning_msg)
                 self.state.current_conversation_tokens += warning_tokens

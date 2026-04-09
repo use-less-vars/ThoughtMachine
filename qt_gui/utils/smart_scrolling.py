@@ -73,16 +73,26 @@ class SmartScroller(QObject):
         
     def scroll_to_bottom(self):
         """Scroll to bottom if auto-scroll is enabled."""
+        # Skip if tracking is paused
+        if self._pause_count > 0:
+            debug_log(f"[SmartScroller] scroll_to_bottom skipped because tracking paused (pause_count={self._pause_count})")
+            return
+            
         debug_log(f"[SmartScroller] scroll_to_bottom called, auto_scroll_enabled={self._auto_scroll_enabled}, user_scrolled_away={self._user_scrolled_away}")
         if self._auto_scroll_enabled:
             self._do_scroll_to_bottom()
     
     def deferred_scroll_to_bottom(self, delay_ms=100):
         """Schedule a scroll to bottom after a short delay.
-        
+
         Useful when content is being added and the scrollbar maximum
         may not be updated immediately.
         """
+        # Skip if tracking is paused (e.g., during document rebuild)
+        if self._pause_count > 0:
+            debug_log(f"[SmartScroller] deferred_scroll_to_bottom skipped because tracking paused (pause_count={self._pause_count})")
+            return
+            
         debug_log(f"[SmartScroller] deferred_scroll_to_bottom scheduled with delay {delay_ms}ms")
         # Cancel any pending deferred scroll and clean up previous timer
         if self._deferred_scroll_timer:
@@ -95,8 +105,7 @@ class SmartScroller(QObject):
         self._deferred_scroll_timer = QTimer(self)
         self._deferred_scroll_timer.setSingleShot(True)
         self._deferred_scroll_timer.timeout.connect(self._on_deferred_scroll_timeout)
-        self._deferred_scroll_timer.start(delay_ms)
-    
+        self._deferred_scroll_timer.start(delay_ms)    
     def _on_deferred_scroll_timeout(self):
         """Handle deferred scroll timeout."""
         debug_log(f"[SmartScroller] _on_deferred_scroll_timeout called, auto_scroll_enabled={self._auto_scroll_enabled}")
@@ -167,6 +176,14 @@ class SmartScroller(QObject):
     
     def pause_tracking(self):
         """Temporarily ignore scrollbar changes (e.g., during document rebuild)."""
+        # Cancel any pending deferred scroll timer
+        if self._deferred_scroll_timer:
+            self._deferred_scroll_timer.stop()
+            self._deferred_scroll_timer.timeout.disconnect()
+            self._deferred_scroll_timer.deleteLater()
+            self._deferred_scroll_timer = None
+            debug_log(f"[SmartScroller] Cancelled pending deferred scroll timer due to pause")
+        
         # Save state on first pause
         if self._pause_count == 0:
             self._pre_pause_user_scrolled_away = self._user_scrolled_away

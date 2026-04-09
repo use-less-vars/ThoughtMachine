@@ -56,12 +56,7 @@ class SessionLifecycle:
         """Register callbacks on a session for change tracking."""
         debug_log(f"Registering callbacks for session {session.session_id}", level="DEBUG", component="SessionLifecycle")
         debug_log(f"Registering callbacks: user_history id={id(session.user_history)}", level="DEBUG", component="SessionLifecycle")
-        # Register conversation change callback if set
-        if self._conversation_callback:
-            session.connect_conversation_changed(self._conversation_callback)
-            debug_log(f"Registered conversation callback, callbacks count: {len(session._conversation_changed_callbacks)}", level="DEBUG", component="SessionLifecycle")
-        else:
-            debug_log(f"No conversation callback set", level="DEBUG", component="SessionLifecycle")
+        # Conversation updates are now handled via controller signals, not session callbacks
         # Note: dirty tracking removed, but ObservableList callbacks still needed for UI refresh
     # State management
     @property
@@ -358,16 +353,17 @@ class SessionLifecycle:
         except Exception as e:
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                 import traceback
-                debug_log(f"Error saving session: {e}", level="ERROR", component="SessionLifecycle")
-                traceback.print_exc()
+                debug_log(f"Error saving session: {e}\n{traceback.format_exc()}", level="ERROR", component="SessionLifecycle")
             return False
 
     
-    def load_session(self, filepath: str) -> bool:
+    def load_session(self, filepath: str, target_session: Optional[Session] = None) -> bool:
         """Load a session from a JSON file.
 
         Args:
             filepath: Path to the session file
+            target_session: Optional existing session to update in-place. If None,
+                creates a new session object.
 
         Returns:
             True if loaded successfully, False otherwise
@@ -389,14 +385,21 @@ class SessionLifecycle:
                 debug_log(f"Warning: Session version {version} is not current (1). Attempting to load anyway.", level="DEBUG", component="SessionLifecycle")
 
             # Reconstruct Session object
-            session = Session.from_persistable_dict(session_dict)
-            
-            # Ensure session has a name
-            session.ensure_name()
+            if target_session is not None:
+                # Update existing session in place
+                target_session.update_from_persistable_dict(session_dict)
+                session = target_session
+                session.ensure_name()
+                # Callbacks already registered, no need to re-register
+            else:
+                # Old behavior: create new session
+                session = Session.from_persistable_dict(session_dict)
+                # Ensure session has a name
+                session.ensure_name()
+                # Register callback for conversation changes
+                self._register_session_callbacks(session)
             
             self.state_bridge.bind_session(session)
-            # Register callback for conversation changes
-            self._register_session_callbacks(session)
             self.state_bridge.update_external_file_path(filepath)
 
             # If session name was not set by binding (i.e., metadata lacks name), use fallback
@@ -406,27 +409,42 @@ class SessionLifecycle:
             debug_log(f"Session loaded from {filepath}: {len(session.user_history)} messages", level="DEBUG", component="SessionLifecycle")
             return True
         except Exception as e:
-            debug_log(f"Error loading session: {e}", level="DEBUG", component="SessionLifecycle")
             import traceback
-            traceback.print_exc()
+            debug_log(f"Error loading session: {e}\n{traceback.format_exc()}", level="DEBUG", component="SessionLifecycle")
             return False
 
-    def load_session_by_id(self, session_id: str) -> bool:
-        """Load a session by ID from the session store."""
+    def load_session_by_id(self, session_id: str, target_session: Optional[Session] = None) -> bool:
+        """Load a session by ID from the session store.
+
+        Args:
+            session_id: ID of session to load
+            target_session: Optional existing session to update in-place. If None,
+                creates a new session object.
+        """
         debug_log(f"Loading session {session_id} from store", level="DEBUG", component="SessionLifecycle")
-        session = self.session_store.load_session(session_id)
-        if session is None:
+        loaded_session = self.session_store.load_session(session_id)
+        if loaded_session is None:
             debug_log(f"Session {session_id} not found", level="DEBUG", component="SessionLifecycle")
             return False
+
+        if target_session is not None:
+            # Update existing session in place
+            data = loaded_session.to_persistable_dict()
+            target_session.update_from_persistable_dict(data)
+            session = target_session
+            session.ensure_name()
+            # Callbacks already registered, no need to re-register
+        else:
+            session = loaded_session
+            # Ensure session has a name
+            session.ensure_name()
+            # Register callback for conversation changes
+            self._register_session_callbacks(session)
 
         # Set as current session
         self.state_bridge.current_session = session
         self.state_bridge.current_session_id = str(session.session_id)
-        # Ensure session has a name
-        session.ensure_name()
         self.state_bridge.bind_session(session)
-        # Register callback for conversation changes
-        self._register_session_callbacks(session)
         # Restore external file path from metadata if present
         external_file_path = session.metadata.get('external_file_path')
         if external_file_path:
@@ -485,9 +503,8 @@ class SessionLifecycle:
             # Note: we do NOT clear dirty flag because export does not affect session store
             return True
         except Exception as e:
-            debug_log(f"Error exporting session: {e}", level="DEBUG", component="SessionLifecycle")
             import traceback
-            traceback.print_exc()
+            debug_log(f"Error exporting session: {e}\n{traceback.format_exc()}", level="DEBUG", component="SessionLifecycle")
             return False
 
     def list_sessions(self) -> List[Dict[str, Any]]:

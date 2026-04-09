@@ -59,9 +59,6 @@ class RefactoredAgentPresenter(QObject):
         self.session_lifecycle = SessionLifecycle(self.state_bridge, self.controller)
         # Set up state change callback
         self.session_lifecycle._session_callback = self._on_session_state_change
-        # Set up conversation change callback - DISABLED for Phase 6 (direct session callback used instead)
-        # Note: SessionTab will register its own callback via _setup_session_callback()
-        debug_log(f"Not setting conversation callback - GUI will register its own", level="DEBUG", component="AgentPresenter")
 
         self.event_processor = EventProcessor(
             self.state_bridge, 
@@ -89,6 +86,7 @@ class RefactoredAgentPresenter(QObject):
         self.gui_integration.conversation_changed.connect(self.conversation_changed)
         # Connect controller events
         self.controller.event_occurred.connect(self._handle_controller_event)
+        self.controller.conversation_updated.connect(self._on_conversation_change)
         
         # Connect session lifecycle state changes
         # (StateBridge manages session state internally)
@@ -103,6 +101,10 @@ class RefactoredAgentPresenter(QObject):
         # Update GUI integration state to emit signal
         if self.gui_integration.state != new_state:
             self.gui_integration.state = new_state
+
+    def _on_conversation_change(self, *args):
+        """Callback when conversation changes."""
+        self.gui_integration.emit_conversation_changed()
 
     def _handle_controller_event(self, event: Dict[str, Any]):
         """Forward controller events to event processor."""
@@ -163,20 +165,28 @@ class RefactoredAgentPresenter(QObject):
         """Save current session to the session store."""
         return self.session_lifecycle.save_session()
     
-    def load_session(self, filepath: str) -> bool:
+    def load_session(self, filepath: str, target_session: Optional['Session'] = None) -> bool:
         """Load a session from a JSON file.
 
         Args:
             filepath: Path to the session file
+            target_session: Optional existing session to update in-place. If None,
+                creates a new session object.
 
         Returns:
             True if loaded successfully, False otherwise
         """
-        return self.session_lifecycle.load_session(filepath)
+        return self.session_lifecycle.load_session(filepath, target_session)
     
-    def load_session_by_id(self, session_id: str) -> bool:
-        """Load a session by ID from the session store."""
-        return self.session_lifecycle.load_session_by_id(session_id)
+    def load_session_by_id(self, session_id: str, target_session: Optional['Session'] = None) -> bool:
+        """Load a session by ID from the session store.
+
+        Args:
+            session_id: ID of session to load
+            target_session: Optional existing session to update in-place. If None,
+                creates a new session object.
+        """
+        return self.session_lifecycle.load_session_by_id(session_id, target_session)
     
     def load_current_session(self) -> bool:
         """Load the session marked as current from the store."""

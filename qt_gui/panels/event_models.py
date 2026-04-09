@@ -575,9 +575,13 @@ class EventDelegate(QStyledItemDelegate):
                 add_line("Agent requests interaction", style="color: #006699; background-color: #f0faff; padding: 12px; margin: 0; border: none;", use_markdown=True)
             lines.append('</div>')
         elif etype == "token_warning":
-            add_line(event.get("message", ""), style="color: #FFA500; font-weight: bold;")
+            # Skip displaying token warnings in event list - they appear as system messages in conversation
+            # add_line(event.get("message", ""), style="color: #FFA500; font-weight: bold;")
+            pass
         elif etype == "turn_warning":
-            add_line(event.get("message", ""), style="color: #FFA500; font-weight: bold;")
+            # Skip displaying turn warnings in event list - they appear as system messages in conversation
+            # add_line(event.get("message", ""), style="color: #FFA500; font-weight: bold;")
+            pass
         elif etype == "rate_limit_warning":
             add_line(event.get("message", ""), style="color: #FF8C00; font-weight: bold;")
         elif etype == "paused":
@@ -756,8 +760,9 @@ class EventDelegate(QStyledItemDelegate):
             
             if etype == 'system':
                 html_content += f'<div style="color: #808080; font-style: italic; margin-top: 8px;">System: {html.escape(content)}</div>'
-            elif etype in ['token_warning', 'turn_warning', 'rate_limit_warning']:
+            elif etype == 'rate_limit_warning':
                 html_content += f'<div style="color: #FFA500; font-weight: bold; margin-top: 8px;">⚠️ {html.escape(content)}</div>'
+            # Skip token_warning and turn_warning - they appear as system messages in conversation
             elif etype == 'error':
                 html_content += f'<div style="color: #FF0000; font-weight: bold; margin-top: 8px;">❌ {html.escape(content)}</div>'
             elif etype == 'user_interaction_requested':
@@ -891,9 +896,13 @@ class EventDelegate(QStyledItemDelegate):
             else:
                 add_line("Agent requests interaction")
         elif etype == "token_warning":
-            add_line(event.get("message", ""))
+            # Skip displaying token warnings in event list - they appear as system messages in conversation
+            # add_line(event.get("message", ""))
+            pass
         elif etype == "turn_warning":
-            add_line(event.get("message", ""))
+            # Skip displaying turn warnings in event list - they appear as system messages in conversation
+            # add_line(event.get("message", ""))
+            pass
         elif etype == "rate_limit_warning":
             add_line(event.get("message", ""))
         elif etype == "paused":

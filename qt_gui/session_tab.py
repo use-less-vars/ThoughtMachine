@@ -68,8 +68,6 @@ class SessionTab(QWidget):
         self._display_retry_count = 0  # Counter for deferred display retries
         self._last_conversation_version = 0  # Track session conversation version for change detection
         self._displayed_message_count = 0  # Number of messages already displayed from current session
-        self._session_callback_registered = False  # Whether callback is registered with current session
-        self._registered_session_id = None  # Which session ID we have registered for
 
         self._loading_config = False  # Flag to prevent save during load
         self._closing = False  # Flag to prevent reentrant close
@@ -120,25 +118,7 @@ class SessionTab(QWidget):
     def session(self, value):
         if hasattr(self, '_session') and self._session is value:
             return
-        # Clean up old session callback if any
-        self._cleanup_session_callback()
-        self._session = value
-        # Register callback on new session
-        if self._session is not None:
-            self._setup_session_callback()
 
-    def _cleanup_session_callback(self):
-        """Clean up callback from current session if registered."""
-        from .debug_log import debug_log
-        debug_log(f"[CALLBACK] _cleanup_session_callback called, session={self.session}, registered={self._session_callback_registered}", level="DEBUG")
-        if self.session is not None and self._session_callback_registered:
-            debug_log(f"_cleanup_session_callback: disconnecting callback from session {self.session.session_id}", level="DEBUG")
-            try:
-                self.session.disconnect_conversation_changed(self._on_session_conversation_changed)
-            except Exception as e:
-                debug_log(f"Error disconnecting callback: {e}", level="WARNING")
-        self._session_callback_registered = False
-        self._registered_session_id = None
 
     def create_new_session(self):
         """Create fresh session with auto-generated name."""
@@ -153,6 +133,8 @@ class SessionTab(QWidget):
         session_config = self.presenter._build_session_config(agent_config)
         
         # Create session with auto-generated name (ensure_name will set it)
+        old_session_id = self.session.session_id if self.session else None
+        debug_log(f"[CALLBACK] create_new_session: replacing session {old_session_id} with new session", level="DEBUG")
         self.session = Session(
             session_id=str(uuid.uuid4()),
             config=session_config,
@@ -177,9 +159,9 @@ class SessionTab(QWidget):
         from .debug_log import debug_log
         debug_log(f"load_session_by_id called with session_id: {session_id}", level="DEBUG")
         try:
-            # Load session via presenter
-            debug_log(f"Calling presenter.load_session_by_id({session_id})", level="DEBUG")
-            success = self.presenter.load_session_by_id(session_id)
+            # Load session via presenter, passing current session to update in place
+            debug_log(f"Calling presenter.load_session_by_id({session_id}, target_session=self.session)", level="DEBUG")
+            success = self.presenter.load_session_by_id(session_id, target_session=self.session)
         except Exception as e:
             debug_log(f"Error loading session {session_id}: {e}", level="ERROR")
             self.create_new_session()
@@ -187,12 +169,12 @@ class SessionTab(QWidget):
         
         if success:
             debug_log(f"presenter.load_session_by_id returned success", level="DEBUG")
-            # Get the loaded session from presenter
-            # The session is stored in state_bridge.current_session
+            # No need to reassign self.session; it's the same object
+            debug_log(f"Session updated in place, id: {self.session.session_id if self.session else 'None'}", level="DEBUG")
             
-            
-            self.session = self.presenter.state_bridge.current_session
-            debug_log(f"Session loaded, id: {self.session.session_id if self.session else 'None'}", level="DEBUG")
+            # Reset display counters for fresh session
+            self._displayed_message_count = 0
+            self._last_conversation_version = 0
             
             # Try to display, but don't fail if UI not ready
             # display_conversation_from_history will handle deferred display
@@ -248,13 +230,50 @@ class SessionTab(QWidget):
         user_history = target_session.user_history
         debug_log(f"Displaying {len(user_history)} messages from user_history", level="DEBUG")
         
-        # Clear output panel before adding messages
-        self.output_panel.clear_output()
+        # Check if conversation version changed
+        # Only skip if version unchanged AND we've already displayed messages
+        if target_session.conversation_version == self._last_conversation_version and self._displayed_message_count > 0:
+            debug_log(f"Conversation version unchanged ({self._last_conversation_version}) and messages already displayed, skipping display", level="DEBUG")
+            return
+            
+        debug_log(f"Conversation version changed: {self._last_conversation_version} -> {target_session.conversation_version}", level="DEBUG")
         
-        # Add each message to output panel
-        for message in user_history:
+        # Calculate new messages to append
+        new_message_count = len(user_history)
+        needs_full_rebuild = False
+        messages_to_append = []
+        
+        if new_message_count > self._displayed_message_count:
+            # Only append new messages (conversation history is append-only)
+            messages_to_append = user_history[self._displayed_message_count:]
+            debug_log(f"Appending {len(messages_to_append)} new messages (had {self._displayed_message_count}, now {new_message_count})", level="DEBUG")
+        elif new_message_count < self._displayed_message_count:
+            # History shrank (shouldn't happen, but handle by full rebuild)
+            debug_log(f"History shrank from {self._displayed_message_count} to {new_message_count}, doing full rebuild", level="WARNING")
+            needs_full_rebuild = True
+        else:
+            # Same count but version changed - might be modifications
+            debug_log(f"Same message count but version changed, doing full rebuild", level="DEBUG")
+            needs_full_rebuild = True
+        
+        # Pause smart scrolling during updates to prevent jumping
+        self.output_panel.smart_scroller.pause_tracking()
+        
+        if needs_full_rebuild:
+            self.output_panel.clear_output()
+            messages_to_append = user_history
+        
+        # Append messages
+        for message in messages_to_append:
             self.output_panel.display_message(message)
         
+        # Update tracking variables
+        self._last_conversation_version = target_session.conversation_version
+        self._displayed_message_count = new_message_count
+        
+        # Resume smart scrolling and scroll to bottom if auto-scroll enabled
+        self.output_panel.smart_scroller.resume_tracking()
+        self.output_panel.smart_scroller.scroll_to_bottom()        
         # Update status panel with current token totals and context length from presenter
         self.total_input = self.presenter.total_input
         self.total_output = self.presenter.total_output
@@ -536,10 +555,11 @@ class SessionTab(QWidget):
             # Token updates are handled by tokens_updated signal, skip display
             return
         
-        # Skip content events - they are handled via session callbacks
-        content_event_types = {"user_query", "turn", "tool_call", "tool_result", "final"}
+        # Handle content events by refreshing from session history
+        content_event_types = {"user_query", "turn", "tool_call", "tool_result", "final", "llm_request", "llm_response", "raw_response"}
         if etype in content_event_types:
-            debug_log(f"display_event: skipping content event type {etype}", level="DEBUG")
+            debug_log(f"display_event: content event type {etype}, refreshing from session history", level="DEBUG")
+            self.display_conversation_from_history()
             return
         
         # Debug logging for user_query events
@@ -653,59 +673,8 @@ class SessionTab(QWidget):
         # Refresh conversation display
         self.display_conversation_from_history()
     
-    def _setup_session_callback(self):
-        """Set up callback for session conversation changes."""
-        import sys
-        sys.stderr.write(f'[SessionTab._setup_session_callback] ALWAYS: called, session={self.session}\n')
-        from .debug_log import debug_log
-        debug_log(f"[CALLBACK] _setup_session_callback called, session={self.session}, registered={self._session_callback_registered}, reg_id={self._registered_session_id}", level="DEBUG")
-        if self.session is None:
-            debug_log("_setup_session_callback: session is None", level="DEBUG")
-            return
-        
-        # Check if we're already registered for this exact session
-        if self._registered_session_id == self.session.session_id and self._session_callback_registered:
-            debug_log(f"_setup_session_callback: already registered for session {self.session.session_id}, skipping", level="DEBUG")
-            return
-        
-        # If we have a callback registered for a different session, disconnect it first
-        if self._session_callback_registered and self._registered_session_id is not None:
-            debug_log(f"_setup_session_callback: disconnecting callback from previous session {self._registered_session_id}", level="DEBUG")
-            # We need to find the old session to disconnect from
-            # This should rarely happen as sessions are replaced via load_session_by_id or create_new_session
-            # which would have already handled this
-            pass  # The old session should already have been cleaned up
-        
-        # Disconnect any previous callback for this session (in case of duplicate calls)
-        if self._session_callback_registered:
-            debug_log(f"_setup_session_callback: disconnecting previous callback for session {self.session.session_id}", level="DEBUG")
-            self.session.disconnect_conversation_changed(self._on_session_conversation_changed)
-        
-        # Connect new callback
-        debug_log(f"_setup_session_callback: connecting callback for session {self.session.session_id}, callbacks before: {len(self.session._conversation_changed_callbacks)}", level="DEBUG")
-        self.session.connect_conversation_changed(self._on_session_conversation_changed)
-        sys.stderr.write(f'[SessionTab._setup_session_callback] ALWAYS: after connect, callbacks={len(self.session._conversation_changed_callbacks)}\n')
-        debug_log(f"_setup_session_callback: callbacks after: {len(self.session._conversation_changed_callbacks)}", level="DEBUG")
-        debug_log(f"_setup_session_callback: user_history id: {id(self.session.user_history)}")
-        debug_log(f"[CALLBACK] Registered callback. Total callbacks now: {len(self.session._conversation_changed_callbacks)}")
-        
-        self._session_callback_registered = True
-        self._registered_session_id = self.session.session_id
-        
-        # Reset tracking variables
-        self._last_conversation_version = self.session.conversation_version
-        self._displayed_message_count = len(self.session.user_history)
-        debug_log(f"_setup_session_callback: registered, version={self._last_conversation_version}, messages={self._displayed_message_count}", level="DEBUG")
 
-    def _on_session_conversation_changed(self):
-        """Called when session's user_history changes."""
-        from .debug_log import debug_log
-        debug_log("[CALLBACK] _on_session_conversation_changed triggered")
-        debug_log(f"Session conversation changed callback triggered. Session exists: {self.session is not None}", level="DEBUG")
-        if self.session:
-            debug_log(f"  Current version: {self.session.conversation_version}, history length: {len(self.session.user_history)}", level="DEBUG")
-        # Schedule GUI update in main thread using queued invocation
-        QMetaObject.invokeMethod(self, "_update_gui_from_history", Qt.ConnectionType.QueuedConnection)
+
     
     @pyqtSlot()
     def _update_gui_from_history(self):
@@ -1728,8 +1697,6 @@ class SessionTab(QWidget):
         except Exception as e:
             debug_log(f"closeEvent: error disconnecting signals: {e}", level="WARNING")
         
-        # Clean up session callback using our dedicated method
-        self._cleanup_session_callback()
         from PyQt6.QtWidgets import QInputDialog
         # Stop auto-save timer to prevent interference during close
         self._auto_save_timer.stop()

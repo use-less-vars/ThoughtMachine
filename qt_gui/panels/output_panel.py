@@ -296,6 +296,15 @@ class OutputPanel(QWidget):
         """Display a message from user_history (role-based routing)."""
         role = message.get('role')
         debug_log(f"display_message: role={role}, content preview={str(message.get('content', ''))[:50]}", level="DEBUG")
+        
+        # Add visual separation between messages
+        # Check if we're not at the beginning of the document
+        cursor = self.output_textedit.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        if cursor.position() > 0:
+            # Add a spacer between messages
+            self._append_html('<div style="height: 8px;"></div>')
+        
         if role == 'user':
             self.display_user_message(message)
         elif role == 'assistant':
@@ -311,9 +320,23 @@ class OutputPanel(QWidget):
         """Display a user message."""
         content = message.get('content', '')
         created_at = message.get('created_at', '')
+        
+        # Detect system messages (token warnings, etc.)
+        is_system = content.startswith('[SYSTEM]')
+        if is_system:
+            # Strip the prefix for cleaner display
+            content = content[8:].lstrip()
+            header = 'System'
+            border_color = '#ff9999'
+            bg_color = '#ffe6e6'
+        else:
+            header = 'User'
+            border_color = '#cc99ff'
+            bg_color = '#f0e6ff'
+            
         self._append_html(
-            f'<div style="border: 1px solid #cc99ff; border-radius: 5px; margin-bottom: 8px; overflow: hidden;">'
-            f'<div style="background-color: #f0e6ff; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid #cc99ff;">User</div>'
+            f'<div style="border: 1px solid {border_color}; border-radius: 5px; margin-bottom: 8px; overflow: hidden;">'
+            f'<div style="background-color: {bg_color}; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {border_color};">{header}</div>'
             f'<div style="padding: 10px;">'
             f'{self._render_content(content)}'
             f'</div>'
@@ -324,6 +347,7 @@ class OutputPanel(QWidget):
         """Display an assistant message with optional tool calls."""
         content = message.get('content', '')
         tool_calls = message.get('tool_calls', [])
+        reasoning_content = message.get('reasoning_content', '')
         
         debug_log(f"display_assistant_message: content length={len(content)}, tool_calls count={len(tool_calls)}", level="DEBUG")
         
@@ -331,12 +355,29 @@ class OutputPanel(QWidget):
             f'<div style="border: 1px solid #99ccff; border-radius: 5px; margin-bottom: 8px; overflow: hidden;">'
             f'<div style="background-color: #e6f3ff; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid #99ccff;">Assistant</div>'
             f'<div style="padding: 10px;">'
-            f'{self._render_content(content)}'
-            f'</div>'
-            f'</div>'
         )
         
+        # Display reasoning content if present
+        if reasoning_content:
+            self._append_html(
+                f'<div style="background-color: #f5f5f5; border-left: 4px solid #ccc; padding: 8px; margin-bottom: 12px; font-style: italic;">'
+                f'{self._render_content(reasoning_content)}'
+                f'</div>'
+            )
+            # Add separation between reasoning and main content
+            self._append_html('<div style="height: 4px;"></div>')
+        
+        # Display main content
+        if content:
+            self._append_html(f'{self._render_content(content)}')
+        
+        self._append_html(f'</div></div>')
+
         # Display tool calls if present
+        if tool_calls:
+            # Add visual separator before tool calls
+            self._append_html('<div style="height: 12px; border-top: 1px solid #ddd; margin: 8px 0;"></div>')
+        
         for i, tool_call in enumerate(tool_calls):
             debug_log(f"display_assistant_message: calling display_tool_call {i}", level="DEBUG")
             self.display_tool_call(tool_call)
@@ -412,9 +453,18 @@ class OutputPanel(QWidget):
         """Display a system message."""
         content = message.get('content', '')
         
+        # Detect system messages that already have [SYSTEM] prefix (from token warnings)
+        is_system_prefixed = content.startswith('[SYSTEM]')
+        if is_system_prefixed:
+            # Strip the prefix for cleaner display
+            content = content[8:].lstrip()
+        
         self._append_html(
-            f'<div style="color: #808080; font-style: italic; margin-bottom: 8px;">'
-            f'System: {self._render_content(content)}'
+            f'<div style="border: 1px solid #ff9999; border-radius: 5px; margin-bottom: 8px; overflow: hidden;">'
+            f'<div style="background-color: #ffe6e6; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid #ff9999;">System</div>'
+            f'<div style="padding: 10px;">'
+            f'{self._render_content(content)}'
+            f'</div>'
             f'</div>'
         )
     

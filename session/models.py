@@ -19,21 +19,20 @@ class ObservableList(list):
     """A list that notifies a callback when mutated."""
     def __init__(self, iterable=(), callback=None):
         import sys
-        sys.stderr.write(f'[ObservableList.__init__] ALWAYS: Creating ObservableList id={id(self)}, input type={type(iterable)}, len={len(iterable) if hasattr(iterable, "__len__") else "N/A"}, callback={callback}\n')
+        debug_log(f'[ObservableList.__init__] Creating ObservableList id={id(self)}, input type={type(iterable)}, len={len(iterable) if hasattr(iterable, "__len__") else "N/A"}, callback={callback}', level='DEBUG')
         try:
             super().__init__(iterable)
-            sys.stderr.write(f'[ObservableList.__init__] ALWAYS: Success, list length={len(self)}, id={id(self)}\n')
+            debug_log(f'[ObservableList.__init__] Success, list length={len(self)}, id={id(self)}', level='DEBUG')
         except Exception as e:
-            sys.stderr.write(f'[ObservableList.__init__] ALWAYS: ERROR during initialization: {e}\n')
+            debug_log(f'[ObservableList.__init__] ERROR during initialization: {e}', level='ERROR')
             # Re-raise the exception after logging
             raise
         self.callback = callback
 
     def _notify(self):
-        import sys
         # Always log
         callback_str = str(self.callback)
-        sys.stderr.write(f'[ObservableList._notify] ALWAYS: called on id={id(self)}, callback={callback_str}\n')
+        debug_log(f'[ObservableList._notify] called on id={id(self)}, callback={callback_str}', level='DEBUG')
         if self.callback:
             self.callback()
 
@@ -50,13 +49,12 @@ class ObservableList(list):
         self._notify()
 
     def extend(self, iterable):
-        import sys
         # Always log this - critical for debugging
         try:
             length = len(iterable) if hasattr(iterable, '__len__') else 'unknown'
         except:
             length = 'unknown'
-        sys.stderr.write(f'[ObservableList.extend] ALWAYS LOG: called on id={id(self)} with iterable length={length}\n')
+        debug_log(f'[ObservableList.extend] called on id={id(self)} with iterable length={length}', level='DEBUG')
         super().extend(iterable)
         self._notify()
 
@@ -269,12 +267,16 @@ class Session:
         return normalize(conversation)
     def _on_conversation_changed(self):
         """Called when user_history is mutated."""
-        import sys
-        sys.stderr.write(f'[Session._on_conversation_changed] ALWAYS: called, session_id={self.session_id}, callbacks={len(self._conversation_changed_callbacks)}\n')
+        import os
+        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+            import sys
+            sys.stderr.write(f'[Session._on_conversation_changed] ALWAYS: called, session_id={self.session_id}, callbacks={len(self._conversation_changed_callbacks)}\n')
         debug_log(f"[SESSION] _on_conversation_changed: {len(self._conversation_changed_callbacks)} callbacks", level="DEBUG", component="Session")
         # Log callback details
         for i, cb in enumerate(self._conversation_changed_callbacks):
-            sys.stderr.write(f'  Callback {i}: {cb}\n')
+            import os
+            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+                sys.stderr.write(f'  Callback {i}: {cb}\n')
         self.updated_at = datetime.now()
         self._conversation_version += 1
         # Update conversation hash
@@ -285,13 +287,17 @@ class Session:
             self.conversation_hash = ""
         for callback in self._conversation_changed_callbacks:
             try:
-                sys.stderr.write(f'[Session._on_conversation_changed] ALWAYS: invoking callback {callback}\n')
+                import os
+                if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+                    sys.stderr.write(f'[Session._on_conversation_changed] ALWAYS: invoking callback {callback}\n')
                 callback()
             except Exception as e:
                 # Log but don't break
                 import traceback
-                sys.stderr.write(f'[Session._on_conversation_changed] ALWAYS: callback error: {e}\n')
-                traceback.print_exc()
+                import os
+                if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+                    sys.stderr.write(f'[Session._on_conversation_changed] ALWAYS: callback error: {e}\n')
+                debug_log(f"[SESSION] _on_conversation_changed callback error", level="ERROR", component="Session")
 
     def connect_conversation_changed(self, callback):
         """Register a callback to be invoked when user_history changes."""
@@ -300,6 +306,7 @@ class Session:
 
     def disconnect_conversation_changed(self, callback):
         """Remove a previously registered callback."""
+        debug_log(f"[SESSION] disconnect_conversation_changed: looking for callback {callback}, total callbacks {len(self._conversation_changed_callbacks)}", level="DEBUG", component="Session")
         if callback in self._conversation_changed_callbacks:
             debug_log(f"[SESSION] disconnect_conversation_changed: removing callback, remaining {len(self._conversation_changed_callbacks)-1}", level="DEBUG", component="Session")
             self._conversation_changed_callbacks.remove(callback)
@@ -414,6 +421,78 @@ class Session:
         )
         # agent_context will be built later by ContextBuilder
         return session
+
+    def update_from_persistable_dict(self, data: Dict[str, Any]) -> None:
+        """Update this session's data from a persistable dict (in-place, preserves callbacks)."""
+        # Keep track of old user_history instance to reuse
+        old_history = self.user_history
+
+        # Parse timestamps
+        created_at = datetime.fromisoformat(data.get('created_at', '')) if data.get('created_at') else datetime.now()
+        updated_at = datetime.fromisoformat(data.get('updated_at', '')) if data.get('updated_at') else datetime.now()
+
+        # Build nested objects
+        config_data = data.get('config', {})
+        config = SessionConfig.from_dict(config_data) if config_data else SessionConfig()
+
+        runtime_params_data = data.get('runtime_params', {})
+        runtime_params = RuntimeParams.from_dict(runtime_params_data) if runtime_params_data else RuntimeParams()
+
+        user_history = data.get('user_history', [])
+        # Ensure each message has a created_at timestamp and sequence number
+        max_seq = 0
+        for i, msg in enumerate(user_history):
+            if isinstance(msg, dict):
+                if "created_at" not in msg:
+                    # Use session's updated_at as default (approximate)
+                    msg["created_at"] = updated_at.isoformat()
+                # Assign seq if missing, preserving existing seq if present
+                if "seq" not in msg:
+                    msg["seq"] = i  # fallback: use index order
+                else:
+                    # Keep existing seq, but track maximum
+                    try:
+                        max_seq = max(max_seq, int(msg["seq"]))
+                    except (ValueError, TypeError):
+                        msg["seq"] = i
+                        max_seq = max(max_seq, i)
+        # Compute next sequence number
+        next_seq_value = max(data.get('next_seq', 0), max_seq + 1)
+        containers_data = data.get('containers', [])
+        containers = [ContainerMetadata.from_dict(c) for c in containers_data]
+
+        metadata = data.get('metadata', {})
+        security_config_data = data.get('security_config', {})
+        security_config = merge_security_config(security_config_data)
+        version = data.get('version', 1)
+
+        # Update fields
+        self.session_id = str(data.get('session_id', str(uuid.uuid4())))
+        self.created_at = created_at
+        self.updated_at = updated_at
+        self.config = config
+        self.runtime_params = runtime_params
+        # Update user_history: clear old and extend with new messages
+        # Keep the same ObservableList instance to preserve callbacks
+        old_history.clear()
+        old_history.extend(user_history)
+        # No need to reassign self.user_history; keep the existing ObservableList
+        self.containers = containers
+        self.preset_name = data.get('preset_name')
+        self.metadata = metadata
+        self.security_config = security_config
+        self.version = version
+        self.summary = data.get('summary')
+        self.total_input_tokens = data.get('total_input_tokens', 0)
+        self.total_output_tokens = data.get('total_output_tokens', 0)
+        self.next_seq = next_seq_value
+        self.context_length = data.get('context_length', 0)
+        # agent_context will be rebuilt later by ContextBuilder
+        self.agent_context = []
+        # conversation_hash will be recomputed on next change
+        # _conversation_changed_callbacks and _conversation_version remain unchanged
+        # agent_instance remains unchanged
+
 
     def add_message(self, role: str, content: str, **kwargs) -> None:
         """

@@ -16,6 +16,7 @@ class AgentController(QObject):
     """
     # Signals
     event_occurred = pyqtSignal(dict)
+    conversation_updated = pyqtSignal(str)  # session_id when conversation changes
 
     def __init__(self):
         super().__init__()
@@ -287,6 +288,14 @@ class AgentController(QObject):
         # Emit signal for presenter
         debug_log(f"Emitting event_occurred: {event.get('type')}", level="DEBUG", component="Controller")
         self.event_occurred.emit(event)
+        
+        # Emit conversation_updated signal for conversation-changing events
+        content_event_types = {"user_query", "turn", "tool_call", "tool_result", "final", 
+                              "llm_request", "llm_response", "raw_response"}
+        if event.get("type") in content_event_types:
+            debug_log(f"Emitting conversation_updated for event type {event.get('type')}", 
+                     level="DEBUG", component="Controller")
+            self.conversation_updated.emit(self.current_session_id if self.current_session_id else "")
 
     def _run(self):
         """Internal method that runs in the background thread."""

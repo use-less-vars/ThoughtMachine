@@ -89,8 +89,10 @@ class ToolBase(BaseModel):
         if self._logger:
             self._logger.warning(message)
         else:
-            import sys
-            print(f"WARNING: {message}", file=sys.stderr)
+            import os
+            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+                import sys
+                print(f"WARNING: {message}", file=sys.stderr)
     
     def _log_tool_error(self, message: str, data: Optional[Dict[str, Any]] = None, tool_call_id: Optional[str] = None):
         """Log tool error using structured logging or fallback."""
@@ -105,8 +107,10 @@ class ToolBase(BaseModel):
         if self._logger:
             self._logger.error(message)
         else:
-            import sys
-            print(f"ERROR: {message}", file=sys.stderr)
+            import os
+            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+                import sys
+                print(f"ERROR: {message}", file=sys.stderr)
     
     def _log_tool_internal(self, message: str, data: Optional[Dict[str, Any]] = None, tool_call_id: Optional[str] = None):
         """Log tool internal event using structured logging or fallback."""
@@ -121,8 +125,10 @@ class ToolBase(BaseModel):
         if self._logger:
             self._logger.info(f"Internal: {message}")
         else:
-            import sys
-            print(f"INTERNAL: {message}", file=sys.stderr)
+            import os
+            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+                import sys
+                print(f"INTERNAL: {message}", file=sys.stderr)
     
     def _log_tool_performance(self, message: str, metrics: Dict[str, Any], tool_call_id: Optional[str] = None):
         """Log tool performance metrics using structured logging or fallback."""
@@ -137,8 +143,10 @@ class ToolBase(BaseModel):
         if self._logger:
             self._logger.info(f"Performance: {message} - {metrics}")
         else:
-            import sys
-            print(f"PERFORMANCE: {message} - {metrics}", file=sys.stderr)
+            import os
+            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+                import sys
+                print(f"PERFORMANCE: {message} - {metrics}", file=sys.stderr)
     
     def _log_tool_event(self, event_type: Any, level: Any, message: str, data: Optional[Dict[str, Any]] = None, tool_call_id: Optional[str] = None):
         """Generic tool event logging using structured logging or fallback."""
@@ -162,8 +170,10 @@ class ToolBase(BaseModel):
             else:
                 self._logger.info(message)
         else:
-            import sys
-            print(f"TOOL [{level}]: {message}", file=sys.stderr)
+            import os
+            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
+                import sys
+                print(f"TOOL [{level}]: {message}", file=sys.stderr)
     
     def execute(self) -> str:
         raise NotImplementedError
