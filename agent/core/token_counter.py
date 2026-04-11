@@ -44,6 +44,12 @@ class TokenCounter:
         Returns:
             Estimated token count.
         """
+        # DEBUG: Add logging for token counting
+        debug_log('token_counter', f"estimate_tokens called with type: {type(text_or_message)}")
+        if isinstance(text_or_message, dict):
+            content_preview = str(text_or_message.get('content', ''))[:100].replace('\n', ' ') if 'content' in text_or_message else 'no content'
+            debug_log('token_counter', f"  role: {text_or_message.get('role', 'unknown')}, content preview: {content_preview}")
+        
         encoder = self._get_encoder()
         
         if isinstance(text_or_message, dict):
@@ -70,6 +76,13 @@ class TokenCounter:
         Returns:
             Estimated total tokens for the request.
         """
+        # DEBUG: Add logging for request token counting
+        debug_log('token_counter', f"estimate_request_tokens called with {len(messages)} messages")
+        if messages:
+            first_msg = messages[0]
+            last_msg = messages[-1]
+            debug_log('token_counter', f"  first msg role: {first_msg.get('role', 'unknown')}, last msg role: {last_msg.get('role', 'unknown')}")
+        
         # Note: This method may be called with a provider that has count_tokens method.
         # The actual implementation in Agent class checks for provider.count_tokens.
         # For now, we implement fallback logic.
@@ -143,47 +156,11 @@ class TokenCounter:
         return 128000
     
     def format_tokens(self, tokens: int) -> str:
-        """
-        Format token count in thousands with 'k' suffix.
+        """Format token count in thousands with 'k' suffix.
         
         Args:
             tokens: Token count.
-            
-        Returns:
-            Formatted token string.
         """
-        if tokens >= 1000:
-            return f"{tokens // 1000}k"
-        return str(tokens)
-    
-    def estimate_request_tokens(self, messages, tool_definitions=None):
-        """
-        Estimate tokens for an API request including messages and tool definitions.
-        
-        Args:
-            messages: List of message dictionaries.
-            tool_definitions: Optional tool definitions.
-            
-        Returns:
-            Estimated token count.
-        """
-        import json
-        
-        # Use provider's count_tokens method if available
-        # Note: This would need provider reference, but for now use fallback
-        # In actual implementation, the Agent would pass provider to TokenCounter
-        # or LLMClient would handle this
-        
-        # Fallback: estimate ourselves
-        total_tokens = 0
-        for msg in messages:
-            total_tokens += self.estimate_tokens(msg)
-        
-        # Add tool definition tokens (crude estimate)
-        if tool_definitions:
-            # JSON stringify and estimate
-            tools_json = json.dumps(tool_definitions)
-            total_tokens += len(tools_json) // 4
         
         # Add some overhead for JSON structure, field names, etc.
         # OpenAI's actual token count includes JSON structure, field names, etc.

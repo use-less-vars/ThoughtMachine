@@ -19,7 +19,7 @@ from agent.controller import AgentController
 from agent.core.state import ExecutionState
 from session.models import Session, SessionConfig
 from session.store import FileSystemSessionStore
-from session.context_builder import LastNBuilder
+from session.context_builder import SummaryBuilder
 
 from .state_bridge import StateBridge
 
@@ -33,10 +33,7 @@ class SessionLifecycle:
         
         # Session store and context builder
         self.session_store = FileSystemSessionStore()
-        self.context_builder = LastNBuilder(
-            keep_last_messages=100000, 
-            keep_system_prompt=True
-        )
+        self.context_builder = SummaryBuilder()
         
         # State tracking
         self._state = ExecutionState.IDLE

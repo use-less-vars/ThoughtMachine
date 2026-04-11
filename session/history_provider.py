@@ -219,7 +219,7 @@ class HistoryProvider:
             surrounding_end = history_len  # Up to current length (before new message)
             surrounding = self.session.user_history[surrounding_start:surrounding_end]
             
-            log_message_insertion(message, history_len, surrounding)
+            log_message_insertion(self.session.session_id, message, history_len)
             
             # Also show updated session history
             log_session_history(self.session.user_history, 'After adding message')
@@ -253,8 +253,7 @@ class HistoryProvider:
         
         # Log token count with our clean debug logging
         if DEBUG_PRUNING_AVAILABLE:
-            log_token_count('HistoryProvider.check_token_limit', token_count, 
-                          f'{token_count}/{self.token_limit} ({token_count/self.token_limit*100:.1f}%)')
+            log_token_count('HistoryProvider.check_token_limit', token_count, self.token_limit)
         
         # Simple heuristic: warn at 80% of limit, prune at 95%
         warning_threshold = self.token_limit * 0.8

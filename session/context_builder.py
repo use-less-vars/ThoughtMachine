@@ -46,6 +46,11 @@ class ContextBuilder(ABC):
 
     def _estimate_tokens(self, message: Dict[str, Any], encoder: Optional[tiktoken.Encoding] = None) -> int:
         """Estimate token count for a message."""
+        # DEBUG: Log token estimation
+        debug_log('context_builder', f"_estimate_tokens called, message role: {message.get('role', 'unknown')}")
+        content_preview = str(message.get('content', ''))[:100].replace('\n', ' ') if 'content' in message else 'no content'
+        debug_log('context_builder', f"  content preview: {content_preview}")
+        
         import json
         if encoder is None:
             try:
@@ -57,7 +62,9 @@ class ContextBuilder(ABC):
         # Tokenize the entire message as JSON to include all fields (role, content, tool_calls, etc.)
         # This matches how the OpenAI API counts tokens for the message object
         message_json = json.dumps(message)
-        return len(encoder.encode(message_json))
+        token_count = len(encoder.encode(message_json))
+        debug_log('context_builder', f"  estimated tokens: {token_count}")
+        return token_count
 
     @staticmethod
     def _cleanup_orphaned_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -183,86 +190,6 @@ class ContextBuilder(ABC):
         return result
 
 
-class LastNBuilder(ContextBuilder):
-    """Simple strategy: keep the last N messages (or last N turns)."""
-
-    def __init__(self, keep_last_messages: int = 10, keep_system_prompt: bool = True):
-        """
-        Initialize.
-
-        Args:
-            keep_last_messages: Number of recent messages to retain
-            keep_system_prompt: If True, always include the system message(s) at the start
-        """
-        self.keep_last_messages = keep_last_messages
-        self.keep_system_prompt = keep_system_prompt
-
-    def build(self, user_history: List[Dict[str, Any]], max_tokens: Optional[int] = None) -> List[Dict[str, Any]]:
-        """
-        Build context by taking the last N messages, optionally preserving system messages.
-        If max_tokens is provided and the context exceeds it, further truncation may occur.
-        """
-        if not user_history:
-            return []
-
-        # Separate system messages and other messages
-        system_messages = [msg for msg in user_history if msg.get("role") == "system"]
-        other_messages = [msg for msg in user_history if msg.get("role") != "system"]
-
-        # Keep the most recent messages from other_messages
-        recent_others = other_messages[-self.keep_last_messages:] if other_messages else []
-
-        # Combine system messages (if keep_system_prompt) with recent others
-        if self.keep_system_prompt:
-            context = system_messages + recent_others
-        else:
-            context = recent_others
-
-        # If max_tokens is provided, attempt to honor it by further truncating
-        if max_tokens is not None:
-            context = self._truncate_to_max_tokens(context, max_tokens)
-
-        # Clean up any orphaned tool messages that may have been created by truncation
-        context = self._cleanup_orphaned_tool_messages(context)
-
-        # Debug output
-        if DEBUG_CONTEXT:
-            logger.debug(f'[DEBUG_CONTEXT] SummaryBuilder.build returning {len(context)} context messages')
-            # Show token estimate
-            try:
-                encoder = tiktoken.get_encoding("cl100k_base")
-                total_tokens = sum(self._estimate_tokens(msg, encoder) for msg in context)
-                logger.debug(f'[DEBUG_CONTEXT] Estimated token count for context: {total_tokens}')
-            except Exception:
-                pass
-        
-        return context
-
-    def _truncate_to_max_tokens(self, messages: List[Dict[str, Any]], max_tokens: int) -> List[Dict[str, Any]]:
-        """Truncate messages until under max_tokens.
-        
-        By default removes from beginning (oldest). If remove_from_end=True,
-        removes from end (newest) instead.
-        """
-        try:
-            encoder = tiktoken.get_encoding("cl100k_base")
-        except Exception:
-            encoder = None
-
-        total = sum(self._estimate_tokens(msg, encoder) for msg in messages)
-        while total > max_tokens and len(messages) > 0:
-            # Remove the oldest non-system message (system messages we keep at the front)
-            # We'll be careful: if the first message is system, skip it.
-            idx_to_remove = 0
-            while idx_to_remove < len(messages) and messages[idx_to_remove].get("role") == "system":
-                idx_to_remove += 1
-            if idx_to_remove >= len(messages):
-                break  # Can't truncate further
-            removed_msg = messages.pop(idx_to_remove)
-            total -= self._estimate_tokens(removed_msg, encoder)
-        return messages
-
-
 class SummaryBuilder(ContextBuilder):
     """
     Advanced strategy: keep recent messages + a summary of earlier conversation.
@@ -286,7 +213,11 @@ class SummaryBuilder(ContextBuilder):
         """
         Build context from full history, respecting summaries.
         
-        If no summary found, falls back to LastNBuilder with default_keep_turns.
+        When a summary exists: includes all messages after the summary, with token
+        truncation removing newest messages first (to preserve originally-kept turns).
+        
+        When no summary exists: includes all messages, with token truncation
+        removing oldest messages first.
         """
         # Debug context building
         if os.environ.get('DEBUG_CONTEXT'):
@@ -327,37 +258,34 @@ class SummaryBuilder(ContextBuilder):
         else:
             post_summary = user_history
 
-        # Filter out system messages from post-summary (except we'll add main_prompt and summary)
-        non_system = [msg for msg in post_summary if msg.get('role') != 'system']
+        # Separate system warnings and non-system messages
+        system_warnings = []
+        non_system = []
+        for msg in post_summary:
+            if msg.get('role') == 'system':
+                # Exclude main_prompt if it appears in post_summary (should not happen)
+                if main_prompt is not None and msg == main_prompt:
+                    continue
+                # Keep all other system messages (including warnings)
+                system_warnings.append(msg)
+            else:
+                non_system.append(msg)
 
         # Group into turns
         turns = self._group_messages_into_turns(non_system)
         debug_log('summary_builder', f"SummaryBuilder.build: grouped {len(non_system)} non-system messages into {len(turns)} turns")
 
         # Determine which turns to keep
-        if summary_msg is not None and keep_turns > 0:
-            # We have a summary: keep_turns refers to turns from BEFORE the summary that were kept
-            # These are the first `keep_turns` turns after the summary.
-            # We MUST keep all of these originally-kept turns.
-            # All newer turns (after the kept turns) are also included, subject to token limits.
-            
-            # Always keep the originally-kept turns
-            if len(turns) >= keep_turns:
-                kept_turns = turns[:keep_turns]
-                newer_turns = turns[keep_turns:]
-                
-                # Start with kept turns + ALL newer turns
-                # Token limits will trim from newest first if needed (remove_from_end=True)
-                selected_turns = kept_turns + newer_turns
-                
-                turns = selected_turns
-            else:
-                # Fewer turns than keep_turns (shouldn't happen but handle gracefully)
-                turns = turns
+        if summary_msg is not None:
+            # We have a summary: keep all turns after summary
+            # Token limits will trim from newest first (remove_from_end=True)
+            # This preserves older turns (including originally-kept turns) while
+            # removing newer turns first when token limits require truncation
+            pass  # turns already contains all turns after summary
         else:
-            # No summary or keep_turns == 0: keep only most recent keep_turns turns
-            if keep_turns < len(turns):
-                turns = turns[-keep_turns:]        
+            # No summary: keep all turns
+            # Token limits will trim from oldest first (remove_from_end=False)
+            pass  # turns already contains all turns
         debug_log('summary_builder', f"SummaryBuilder.build: after selection, keeping {len(turns)} turns")
         # Assemble context
         context = []
@@ -365,6 +293,10 @@ class SummaryBuilder(ContextBuilder):
             context.append(main_prompt)
         if summary_msg is not None:
             context.append(summary_msg)
+        
+        # Add system warnings after summary/main_prompt but before turns
+        # These include token warnings, turn warnings, etc.
+        context.extend(system_warnings)
         
         # Flatten kept turns
         for turn in turns:
@@ -449,35 +381,104 @@ class SummaryBuilder(ContextBuilder):
         return main_prompt, summary_idx, summary_msg
     
     def _group_messages_into_turns(self, messages: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
-        """Group messages into conversation turns (user + assistant + tool responses)."""
+        """Group messages into conversation turns (user + assistant + tool responses).
+        
+        Rules:
+        - User messages always start a new turn
+        - Assistant messages with tool_calls can also start a turn (after pruning)
+        - All messages after a turn start belong to that turn until next user message
+        - System messages should be filtered out before calling this method
+        - Turns that don't start with user or assistant-with-tools are discarded
+        
+        This ensures tool call sequences stay together, even when they start with
+        an assistant (due to pruning cutting off the user part of the turn).
+        """
         turns = []
         current_turn = []
         
+        # Debug logging
+        import os
+        debug = os.environ.get('DEBUG_CONTEXT')
+        if debug:
+            logger.debug(f'[DEBUG_CONTEXT] Grouping {len(messages)} messages')
+            max_to_show = 10
+            for i, msg in enumerate(messages[:max_to_show]):
+                role = msg.get("role")
+                content_preview = str(msg.get("content", ""))[:50]
+                has_tool_calls = "tool_calls" in msg and msg["tool_calls"]
+                logger.debug(f'  [{i}] {role}: {content_preview}... tool_calls={has_tool_calls}')
+            if len(messages) > max_to_show:
+                logger.debug(f'  ... and {len(messages) - max_to_show} more messages')
+        
         for msg in messages:
-            role = msg.get('role')
-            if role == 'user':
+            role = msg.get("role")
+            
+            # Skip system messages (should have been filtered out)
+            if role == "system":
+                continue
+                
+            if role == "user":
+                # User always starts a new turn
                 if current_turn:
                     turns.append(current_turn)
-                    current_turn = []
-                current_turn.append(msg)
-            elif role == 'assistant':
-                current_turn.append(msg)
-            elif role == 'tool':
-                # Validate that previous message in current_turn is assistant with tool_calls
-                if current_turn and current_turn[-1].get('role') == 'assistant' and current_turn[-1].get('tool_calls'):
-                    current_turn.append(msg)
+                current_turn = [msg]
+            elif role == "assistant" and msg.get("tool_calls"):
+                # Assistant with tool_calls starts a new turn
+                if current_turn:
+                    turns.append(current_turn)
+                current_turn = [msg]
+            else:
+                # Other messages (assistant without tools, tool) - add to current turn with validation
+                if current_turn:
+                    # For tool messages, validate they follow an assistant with tool_calls
+                    if role == 'tool':
+                        if current_turn and current_turn[-1].get('role') == 'assistant' and current_turn[-1].get('tool_calls'):
+                            current_turn.append(msg)
+                        else:
+                            # Orphaned tool message - skip it
+                            if debug:
+                                tool_call_id = msg.get('tool_call_id', 'unknown')
+                                logger.debug(f'[DEBUG_CONTEXT] Discarding orphaned tool message: {tool_call_id}')
+                            continue
+                    else:
+                        # assistant without tools - add to current turn
+                        current_turn.append(msg)
                 else:
-                    # Orphaned tool message - log warning and skip it (cannot be used without assistant)
-                    tool_call_id = msg.get('tool_call_id', 'unknown')
-                    logger.warning(f'[DEBUG_CONTEXT] Orphaned tool message skipped: {tool_call_id}. Previous message in turn: {current_turn[-1] if current_turn else "none"}')
-                    # Skip orphaned tool message to avoid API errors
+                    # Orphaned message without user or assistant-with-tools
+                    # Discard it
+                    if debug:
+                        logger.debug(f'[DEBUG_CONTEXT] Discarding orphaned {role} message')
                     continue
-            # system messages already filtered out
         
         if current_turn:
             turns.append(current_turn)
+        
+        # Filter to keep only valid turns
+        valid_turns = []
+        for turn in turns:
+            if not turn:
+                continue
+            first_msg = turn[0]
+            first_role = first_msg.get("role")
             
-        return turns
+            if first_role == "user":
+                valid_turns.append(turn)
+            elif first_role == "assistant" and first_msg.get("tool_calls"):
+                # Turn starts with assistant that made tool calls
+                # This is valid (e.g., after pruning cut off the user)
+                valid_turns.append(turn)
+            elif debug:
+                logger.debug(f'[DEBUG_CONTEXT] Discarding turn starting with {first_role}')
+        
+        if debug:
+            logger.debug(f'[DEBUG_CONTEXT] Returned {len(valid_turns)} valid turns')
+            max_to_show = 10
+            for i, turn in enumerate(valid_turns[:max_to_show]):
+                logger.debug(f'  Turn {i}: {[msg.get("role") for msg in turn]}')
+            if len(valid_turns) > max_to_show:
+                logger.debug(f'  ... and {len(valid_turns) - max_to_show} more turns')
+        
+        return valid_turns
     
     def _truncate_to_max_tokens(self, messages: List[Dict[str, Any]], max_tokens: int, 
                                preserve_system: bool = True, remove_from_end: bool = False) -> List[Dict[str, Any]]:

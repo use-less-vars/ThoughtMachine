@@ -1785,12 +1785,7 @@ class SessionTab(QWidget):
         self._auto_save_timer.stop()
 
         # Always attempt to save session before closing
-        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            trunc_limit = int(os.environ.get('THOUGHTMACHINE_DEBUG_TRUNCATION', 100))
-            msg = f'[SessionTab] closeEvent: attempting to save session, user_history length={len(self.presenter.user_history) if self.presenter.user_history else 0}, current_session_id={self.presenter.current_session_id}'
-            if trunc_limit > 0 and len(msg) > trunc_limit:
-                msg = msg[:trunc_limit] + "..."
-            sys.stderr.write(msg)
+        debug_log(f'closeEvent: attempting to save session, user_history length={len(self.presenter.user_history) if self.presenter.user_history else 0}, current_session_id={self.presenter.current_session_id}', level='DEBUG')
 
         debug_log("closeEvent: proceeding with closing", level="DEBUG")
         # Proceed with closing

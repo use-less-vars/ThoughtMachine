@@ -20,7 +20,7 @@ from tools import SIMPLIFIED_TOOL_CLASSES
 from agent.core.state import ExecutionState
 from session.models import Session, SessionConfig, RuntimeParams
 from session.store import FileSystemSessionStore
-from session.context_builder import LastNBuilder
+
 
 from .state_bridge import StateBridge
 from .gui_integration import GUIIntegration

@@ -543,14 +543,7 @@ class EventBus:
 def _map_legacy_event_type(event_type_str: str) -> EventType:
     """Map legacy event type strings to standardized EventType."""
     import os
-    import sys
-    if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-        import os
-        trunc_limit = int(os.environ.get('THOUGHTMACHINE_DEBUG_TRUNCATION', 100))
-        msg = f"[events] _map_legacy_event_type: '{event_type_str}'"
-        if trunc_limit > 0 and len(msg) > trunc_limit:
-            msg = msg[:trunc_limit] + "..."
-        sys.stderr.write(msg + '\n')
+    debug_log(f"_map_legacy_event_type: '{event_type_str}'", level='DEBUG', component='events')
     mapping = {
         "tool_call": EventType.TOOL_CALL,
         "tool_result": EventType.TOOL_RESULT,
@@ -572,13 +565,7 @@ def _map_legacy_event_type(event_type_str: str) -> EventType:
     }
     result = mapping.get(event_type_str)
     if result is None:
-        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            import os
-            trunc_limit = int(os.environ.get('THOUGHTMACHINE_DEBUG_TRUNCATION', 100))
-            msg = f"[events] No mapping for '{event_type_str}', attempting direct EventType creation"
-            if trunc_limit > 0 and len(msg) > trunc_limit:
-                msg = msg[:trunc_limit] + "..."
-            sys.stderr.write(msg + '\n')
+        debug_log(f"No mapping for '{event_type_str}', attempting direct EventType creation", level='DEBUG', component='events')
         result = EventType(event_type_str)
     return result
 

@@ -428,7 +428,7 @@ class Agent:
             print(f"[DEBUG_TOKEN_ESTIMATE] context_builder.token_limit: {self.context_builder.token_limit}")
 
         if DEBUG_PRUNING_AVAILABLE:
-            log_token_count("Runtime context token estimate", estimated_tokens, f"from {len(runtime_context)}/{len(self.conversation)} messages")
+            log_token_count(f"Runtime context token estimate (from {len(runtime_context)}/{len(self.conversation)} messages)", estimated_tokens)
         if self.logger and hasattr(self.logger, 'py_logger'):
             self.logger.py_logger.info(
                 f"[TOKEN_ESTIMATE] Updated runtime context token estimate: {estimated_tokens} tokens (from {len(runtime_context)}/{len(self.conversation)} messages)"
@@ -1470,7 +1470,7 @@ class Agent:
             old_token_count = self.state.current_conversation_tokens
             self._update_conversation_token_estimate()
             if DEBUG_PRUNING_AVAILABLE:
-                log_pruning_operation("Fallback pruning", old_token_count, self.state.current_conversation_tokens)
+                log_pruning_operation("Fallback pruning", f"{old_token_count} -> {self.state.current_conversation_tokens}")
             if self.logger and hasattr(self.logger, 'py_logger'):
                 self.logger.py_logger.info(
                     f"[PRUNING] Updated token estimate after fallback: {self.state.current_conversation_tokens} tokens (was {old_token_count})"
@@ -1528,6 +1528,17 @@ class Agent:
             user_history.insert(insertion_idx, summary_msg)
             debug_log('message_insertion', f"Inserted summary at index {insertion_idx}")
         
+        # Add context cleared notification AFTER summary in the history
+        # This will be included in context for the LLM to know restrictions are lifted
+        context_cleared_msg = {
+            "role": "system",
+            "content": "[SYSTEM] Context has been summarized. You now have a fresh context window and full access to tools."
+        }
+        # Insert right after the summary
+        summary_position = insertion_idx if insertion_idx < len(user_history) else len(user_history) - 1
+        user_history.insert(summary_position + 1, context_cleared_msg)
+        debug_log('message_insertion', f"Added context cleared message at index {summary_position + 1}")
+        
         # Update session.summary field
         self.session.summary = summary_msg
         self.session.updated_at = datetime.now()
@@ -1569,7 +1580,7 @@ class Agent:
         # The caller will yield the event.
         # Instead, we'll rely on process_query to emit after summary
         if DEBUG_PRUNING_AVAILABLE:
-            log_pruning_operation("Summary pruning", old_token_count, self.state.current_conversation_tokens, summary_idx=insertion_idx, kept_turns=kept_turns_count)
+            log_pruning_operation("Summary pruning", f"tokens: {old_token_count} -> {self.state.current_conversation_tokens}, summary_idx={insertion_idx}, kept_turns={kept_turns_count}")
         if self.logger and hasattr(self.logger, 'py_logger'):
             self.logger.py_logger.info(
                 f"[PRUNING] Updated token estimate: {self.state.current_conversation_tokens} tokens (was {old_token_count})"
@@ -1666,21 +1677,11 @@ class Agent:
                 current_turn = [msg]
                 turn_start_indices.append(i)  # Record start index of this new turn
             elif role == "assistant" and msg.get("tool_calls"):
-                # Assistant with tool_calls can start a turn (after pruning)
-                # However, if current turn already starts with a user, this assistant belongs to that turn
+                # Assistant with tool_calls starts a new turn
                 if current_turn:
-                    if current_turn[0].get("role") == "user":
-                        # Continue current turn (user -> assistant with tools)
-                        current_turn.append(msg)
-                    else:
-                        # Start new turn
-                        turns.append(current_turn)
-                        current_turn = [msg]
-                        turn_start_indices.append(i)  # Record start index of this new turn
-                else:
-                    # Start new turn
-                    current_turn = [msg]
-                    turn_start_indices.append(i)  # Record start index of this new turn
+                    turns.append(current_turn)
+                current_turn = [msg]
+                turn_start_indices.append(i)  # Record start index of this new turn
             else:
                 # Other messages (assistant without tools, tool) - add to current turn if we have one
                 if current_turn:
@@ -1774,19 +1775,10 @@ class Agent:
                     turns.append(current_turn)
                 current_turn = [msg]
             elif role == "assistant" and msg.get("tool_calls"):
-                # Assistant with tool_calls can start a turn (after pruning)
-                # However, if current turn already starts with a user, this assistant belongs to that turn
+                # Assistant with tool_calls starts a new turn
                 if current_turn:
-                    if current_turn[0].get("role") == "user":
-                        # Continue current turn (user -> assistant with tools)
-                        current_turn.append(msg)
-                    else:
-                        # Start new turn
-                        turns.append(current_turn)
-                        current_turn = [msg]
-                else:
-                    # Start new turn
-                    current_turn = [msg]
+                    turns.append(current_turn)
+                current_turn = [msg]
             else:
                 # Other messages (assistant without tools, tool) - add to current turn with validation
                 if current_turn:

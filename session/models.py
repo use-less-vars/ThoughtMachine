@@ -19,7 +19,7 @@ class ObservableList(list):
     """A list that notifies a callback when mutated."""
     def __init__(self, iterable=(), callback=None):
         import sys
-        debug_log(f'[ObservableList.__init__] Creating ObservableList id={id(self)}, input type={type(iterable)}, len={len(iterable) if hasattr(iterable, "__len__") else "N/A"}, callback={callback}', level='DEBUG')
+        debug_log(f'[ObservableList.__init__] Creating ObservableList id={id(self)}, input type={type(iterable)}, len={len(iterable) if hasattr(iterable, "__len__") else "N/A"}, callback={callback.__qualname__ if callback else None}', level='DEBUG')
         try:
             super().__init__(iterable)
             debug_log(f'[ObservableList.__init__] Success, list length={len(self)}, id={id(self)}', level='DEBUG')
@@ -31,8 +31,8 @@ class ObservableList(list):
 
     def _notify(self):
         # Always log
-        callback_str = str(self.callback)
-        debug_log(f'[ObservableList._notify] called on id={id(self)}, callback={callback_str}', level='DEBUG')
+        callback_repr = self.callback.__qualname__ if self.callback else None
+        debug_log(f'[ObservableList._notify] called on id={id(self)}, callback={callback_repr}', level='DEBUG')
         if self.callback:
             self.callback()
 
@@ -215,26 +215,27 @@ class Session:
         """Wrap user_history with ObservableList if not already wrapped."""
         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
             import sys
-            sys.stderr.write(f'[Session] _wrap_user_history called, session_id={self.session_id}, is_ObservableList={isinstance(self.user_history, ObservableList)}, type={type(self.user_history)}, len={len(self.user_history) if hasattr(self.user_history, "__len__") else "N/A"}\n')
+            debug_log(f'[Session] _wrap_user_history called, session_id={self.session_id}, is_ObservableList={isinstance(self.user_history, ObservableList)}, type={type(self.user_history)}, len={len(self.user_history) if hasattr(self.user_history, "__len__") else "N/A"}', level='DEBUG')
         
         if not isinstance(self.user_history, ObservableList):
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                 import sys
-                sys.stderr.write(f'[Session] _wrap_user_history: Creating ObservableList from current user_history\n')
+                debug_log(f'[Session] _wrap_user_history: Creating ObservableList from current user_history', level='DEBUG')
             new_list = ObservableList(self.user_history, callback=self._on_conversation_changed)
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                 import sys
-                sys.stderr.write(f'[Session] _wrap_user_history: Created ObservableList, id={id(new_list)}, len={len(new_list)}\n')
+                debug_log(f'[Session] _wrap_user_history: Created ObservableList, id={id(new_list)}, len={len(new_list)}', level='DEBUG')
             self.user_history = new_list
         else:
             # Always ensure callback is set to session callback
             self.user_history.callback = self._on_conversation_changed
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                 import sys
-                sys.stderr.write(f'[Session] _wrap_user_history: Already ObservableList, ensuring session callback, id={id(self.user_history)}, len={len(self.user_history)}\n')
+                debug_log(f'[Session] _wrap_user_history: Already ObservableList, ensuring session callback, id={id(self.user_history)}, len={len(self.user_history)}', level='DEBUG')
         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
             import sys
-            sys.stderr.write(f'[Session] _wrap_user_history: after, len={len(self.user_history)}, id={id(self.user_history)}, callback={self.user_history.callback}\n')
+            callback_repr = self.user_history.callback.__qualname__ if self.user_history.callback else None
+            debug_log(f'[Session] _wrap_user_history: after, len={len(self.user_history)}, id={id(self.user_history)}, callback={callback_repr}', level='DEBUG')
 
     def _get_next_seq(self) -> int:
         """Return the next sequence number and increment the counter."""
@@ -268,15 +269,12 @@ class Session:
     def _on_conversation_changed(self):
         """Called when user_history is mutated."""
         import os
-        if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            import sys
-            sys.stderr.write(f'[Session._on_conversation_changed] ALWAYS: called, session_id={self.session_id}, callbacks={len(self._conversation_changed_callbacks)}\n')
+        debug_log(f'_on_conversation_changed called, session_id={self.session_id}, callbacks={len(self._conversation_changed_callbacks)}', level='DEBUG', component='SESSION')
         debug_log(f"[SESSION] _on_conversation_changed: {len(self._conversation_changed_callbacks)} callbacks", level="DEBUG", component="Session")
         # Log callback details
         for i, cb in enumerate(self._conversation_changed_callbacks):
-            import os
-            if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                sys.stderr.write(f'  Callback {i}: {cb}\n')
+            cb_repr = cb.__qualname__ if hasattr(cb, '__qualname__') else repr(cb)
+            debug_log(f'  Callback {i}: {cb_repr}', level='DEBUG', component='SESSION')
         self.updated_at = datetime.now()
         self._conversation_version += 1
         # Update conversation hash
@@ -287,16 +285,13 @@ class Session:
             self.conversation_hash = ""
         for callback in self._conversation_changed_callbacks:
             try:
-                import os
-                if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                    sys.stderr.write(f'[Session._on_conversation_changed] ALWAYS: invoking callback {callback}\n')
+                callback_repr = callback.__qualname__ if hasattr(callback, '__qualname__') else repr(callback)
+                debug_log(f'invoking callback {callback_repr}', level='DEBUG', component='SESSION')
                 callback()
             except Exception as e:
                 # Log but don't break
                 import traceback
-                import os
-                if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                    sys.stderr.write(f'[Session._on_conversation_changed] ALWAYS: callback error: {e}\n')
+                debug_log(f'callback error: {e}', level='ERROR', component='SESSION')
                 debug_log(f"[SESSION] _on_conversation_changed callback error", level="ERROR", component="Session")
 
     def connect_conversation_changed(self, callback):
@@ -522,13 +517,4 @@ class Session:
         self.agent_instance = agent
         return agent
 
-    def get_history_subset(self, max_tokens: Optional[int] = None) -> List[Dict[str, Any]]:
-        """
-        Build a context subset from the user_history using the configured ContextBuilder.
-        Returns a list of messages suitable for sending to the LLM.
-        """
-        from session.context_builder import LastNBuilder
-        # For now, use LastNBuilder with effectively unlimited keep_last_messages
-        # to preserve full session history during processing (pruning only by max_tokens)
-        builder = LastNBuilder(keep_last_messages=100000, keep_system_prompt=True)
-        return builder.build(self.user_history, max_tokens=max_tokens)
+
