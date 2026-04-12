@@ -12,6 +12,7 @@ import os
 import json
 from datetime import datetime
 from typing import Optional, Dict, Any, List
+from pathlib import Path
 from agent.logging.debug_log import debug_log
 
 from agent.config import AgentConfig, load_default_config, load_config, save_config, update_config
@@ -24,6 +25,7 @@ class StateBridge:
     
     def __init__(self, config_path: str = "agent_config.json"):
         self.config_path = config_path
+        self.user_config_path = str(Path.home() / '.thoughtmachine' / 'config.json')
         self._config = load_default_config()
         
         # Token tracking
@@ -38,8 +40,11 @@ class StateBridge:
         self._external_file_path: Optional[str] = None
         self._pending_user_history: List[Dict[str, Any]] = []
         
-        # Load saved configuration if available
-        self._config = load_config(self.config_path)
+        # Load saved configuration if available - try user config first, then project config
+        if os.path.exists(self.user_config_path):
+            self._config = load_config(self.user_config_path)
+        else:
+            self._config = load_config(self.config_path)
     
     # Configuration methods
     def get_config(self) -> dict:
@@ -51,14 +56,26 @@ class StateBridge:
         self._config = update_config(self._config, config_updates)
         return self._config
     
-    def save_config(self, config: Optional[dict] = None) -> bool:
+    def save_config(self, config: Optional[dict] = None, path: Optional[str] = None) -> bool:
         """Save configuration to file."""
         config_to_save = config or self._config
-        return save_config(config_to_save, self.config_path)
+        save_path = path or self.config_path
+        return save_config(config_to_save, save_path)
+
+    def save_user_config(self, config: Optional[dict] = None) -> bool:
+        """Save configuration to user config file."""
+        config_to_save = config or self._config
+        return save_config(config_to_save, self.user_config_path)
     
-    def load_config(self) -> dict:
+    def load_config(self, path: Optional[str] = None) -> dict:
         """Load configuration from file."""
-        self._config = load_config(self.config_path)
+        load_path = path or self.config_path
+        self._config = load_config(load_path)
+        return self._config
+
+    def load_user_config(self) -> dict:
+        """Load configuration from user config file."""
+        self._config = load_config(self.user_config_path)
         return self._config
     
     # AgentConfig creation

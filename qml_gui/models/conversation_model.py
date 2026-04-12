@@ -9,7 +9,22 @@ from enum import IntEnum
 from PyQt6.QtCore import QAbstractListModel, QModelIndex, Qt, pyqtSlot, pyqtSignal
 from PyQt6.QtGui import QGuiApplication
 
-from qt_gui.panels.markdown_renderer import MarkdownRenderer
+# Try to import markdown renderer from Qt GUI, fallback to simple renderer
+try:
+    from qt_gui.panels.markdown_renderer import MarkdownRenderer
+    HAS_MARKDOWN_RENDERER = True
+except ImportError:
+    HAS_MARKDOWN_RENDERER = False
+    class SimpleMarkdownRenderer:
+        """Simple fallback that converts markdown to basic HTML."""
+        def markdown_to_html(self, markdown_text: str) -> str:
+            # Very basic conversion: just escape HTML and wrap in <pre>
+            import html
+            escaped = html.escape(markdown_text)
+            # Replace simple markdown patterns if needed
+            # For now, just wrap in <pre> for monospace
+            return f"<pre>{escaped}</pre>"
+    MarkdownRenderer = SimpleMarkdownRenderer
 
 
 class ConversationRole(IntEnum):
@@ -43,13 +58,19 @@ class ConversationModel(QAbstractListModel):
     
     def _connect_presenter(self):
         """Connect to presenter signals."""
+        print(f"DEBUG _connect_presenter: presenter={self.presenter}")
         if hasattr(self.presenter, 'conversation_changed'):
+            print(f"DEBUG _connect_presenter: connecting to conversation_changed")
             self.presenter.conversation_changed.connect(self._on_conversation_changed)
+            print(f"DEBUG _connect_presenter: connected to conversation_changed")
+        else:
+            print(f"DEBUG _connect_presenter: presenter has no conversation_changed attribute")
         # TODO: maybe also connect to session lifecycle signals
     
     @pyqtSlot()
     def _on_conversation_changed(self):
         """Called when conversation changes; trigger model reset."""
+        print(f"DEBUG: _on_conversation_changed, history length: {len(self._user_history) if self._user_history else 0}")
         self.beginResetModel()
         self._refresh_history()
         self.endResetModel()
@@ -57,24 +78,29 @@ class ConversationModel(QAbstractListModel):
     
     def _refresh_history(self):
         """Refresh internal copy of user_history from presenter."""
+        print("DEBUG: _refresh_history called")
         if not self.presenter:
             self._user_history = []
+            print(f"DEBUG _refresh_history: no presenter, history cleared")
             return
-        
+
         # Access user_history via presenter.state_bridge.user_history
         try:
             if hasattr(self.presenter, 'state_bridge') and self.presenter.state_bridge:
                 history = self.presenter.state_bridge.user_history
+                print(f"DEBUG _refresh_history: raw history from state_bridge: {history}")
                 if history is not None:
                     self._user_history = list(history)  # copy
+                    print(f"DEBUG _refresh_history: copied history, length: {len(self._user_history)}")
                 else:
                     self._user_history = []
+                    print(f"DEBUG _refresh_history: history is None")
             else:
                 self._user_history = []
+                print(f"DEBUG _refresh_history: no state_bridge attribute")
         except Exception as e:
             print(f"Error refreshing history: {e}")
-            self._user_history = []
-    
+            self._user_history = []    
     def rowCount(self, parent=QModelIndex()):
         return len(self._user_history)
     

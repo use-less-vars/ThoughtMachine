@@ -16,12 +16,25 @@ Window {
             anchors.fill: parent
             spacing: 5
             
-            Text {
-                Layout.alignment: Qt.AlignHCenter
-                text: "Conversation History"
-                font.bold: true
-                font.pixelSize: 20
-                padding: 10
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 5
+                
+                Text {
+                    Layout.alignment: Qt.AlignHCenter
+                    Layout.fillWidth: true
+                    text: "Conversation History"
+                    font.bold: true
+                    font.pixelSize: 20
+                    padding: 10
+                }
+                
+                Button {
+                    text: "Settings"
+                    onClicked: {
+                        configDialog.open()
+                    }
+                }
             }
             
             Rectangle {
@@ -38,7 +51,7 @@ Window {
                         id: conversationView
                         model: conversationModel
                         spacing: 10
-                        delegate: conversationDelegate
+                        delegate: MessageDelegate {}
                         onCountChanged: {
                             // Auto-scroll to bottom when new messages added
                             positionViewAtEnd()
@@ -109,71 +122,10 @@ Window {
             }
         }
     }
-    
-    Component {
-        id: conversationDelegate
-        
-        Rectangle {
-            width: conversationView.width
-            height: contentColumn.implicitHeight + 20
-            color: {
-                if (model.role === "user") return "#e6f3ff"
-                else if (model.role === "assistant") return "#f0fff0"
-                else return "#fff0f0"
-            }
-            border.color: "lightgray"
-            border.width: 1
-            radius: 5
-            
-            Column {
-                id: contentColumn
-                anchors.fill: parent
-                anchors.margins: 10
-                spacing: 5
-                
-                RowLayout {
-                    width: parent.width
-                    
-                    Text {
-                        text: "<b>" + (model.role || "unknown") + "</b>"
-                        font.pixelSize: 14
-                        color: "darkblue"
-                    }
-                    
-                    Text {
-                        Layout.fillWidth: true
-                        horizontalAlignment: Text.AlignRight
-                        text: model.createdAt ? new Date(model.createdAt).toLocaleString() : ""
-                        font.pixelSize: 10
-                        color: "gray"
-                    }
-                }
-                
-                Text {
-                    width: parent.width
-                    text: model.htmlContent || model.content || ""
-                    textFormat: Text.RichText
-                    wrapMode: Text.WordWrap
-                    font.pixelSize: 12
-                    onLinkActivated: Qt.openUrlExternally(link)
-                }
-                
-                // Show tool info if present
-                Text {
-                    visible: model.toolName
-                    text: "Tool: " + model.toolName
-                    font.pixelSize: 11
-                    color: "darkgreen"
-                }
-                
-                Text {
-                    visible: model.isFinal
-                    text: "Final Answer"
-                    font.pixelSize: 11
-                    color: "red"
-                    font.bold: true
-                }
-            }
-        }
+
+    ConfigDialog {
+        id: configDialog
     }
+
+    // Component replaced by MessageDelegate.qml
 }

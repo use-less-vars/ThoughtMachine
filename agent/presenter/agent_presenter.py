@@ -13,7 +13,7 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 from agent.logging.debug_log import debug_log
 
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 from agent.controller import AgentController
 from agent.config import AgentConfig, load_default_config
 from tools import SIMPLIFIED_TOOL_CLASSES
@@ -104,6 +104,7 @@ class RefactoredAgentPresenter(QObject):
 
     def _on_conversation_change(self, *args):
         """Callback when conversation changes."""
+        print(f"DEBUG _on_conversation_change: emitting conversation_changed signal")
         self.gui_integration.emit_conversation_changed()
 
     def _handle_controller_event(self, event: Dict[str, Any]):
@@ -113,16 +114,35 @@ class RefactoredAgentPresenter(QObject):
     # ----- Public API (delegates to modules) -----
     
     # Configuration methods
-    def load_config(self, path: str) -> Optional[Dict[str, Any]]:
+    @pyqtSlot(str, result="QVariant")
+    def load_config(self, path: str = "") -> Optional[Dict[str, Any]]:
         """Load configuration from file path."""
-        return self.state_bridge.load_config(path)
+        if path:
+            return self.state_bridge.load_config(path)
+        else:
+            return self.state_bridge.get_config()
     
-    def save_config(self, path: str, config: Dict[str, Any]) -> bool:
+    @pyqtSlot(dict, str, result=bool)
+    def save_config(self, config: Dict[str, Any], path: str = "") -> bool:
         """Save configuration to file path."""
-        return self.state_bridge.save_config(path, config)
+        if path:
+            return self.state_bridge.save_config(config, path)
+        else:
+            return self.state_bridge.save_config(config)
+
+    @pyqtSlot(dict, result=bool)
+    def save_user_config(self, config: Optional[Dict[str, Any]] = None) -> bool:
+        """Save configuration to user config file."""
+        return self.state_bridge.save_user_config(config)
+
+    @pyqtSlot(result="QVariant")
+    def load_user_config(self) -> Optional[Dict[str, Any]]:
+        """Load configuration from user config file."""
+        return self.state_bridge.load_user_config()
     
 
     
+    @pyqtSlot(dict)
     def update_config_from_gui(self, config_dict: Dict[str, Any]):
         """Update configuration from GUI dictionary."""
         updated_config = self.state_bridge.update_config(config_dict)
@@ -143,6 +163,7 @@ class RefactoredAgentPresenter(QObject):
     # Session management
     def start_session(self, query: str, config: Optional[dict] = None, preset_name: str = None):
         """Start a new agent session."""
+        print(f"DEBUG start_session: query={query}, config={config is not None}, preset={preset_name}")
         self.session_lifecycle.start_session(query, config, preset_name)
     
     def new_session(self, name: str = None):
@@ -151,8 +172,78 @@ class RefactoredAgentPresenter(QObject):
     
     def continue_session(self, query: str):
         """Continue an existing session with a new query."""
+        print(f"DEBUG continue_session: query={query}")
         self.session_lifecycle.continue_session(query)
-    
+
+    @pyqtSlot(str)
+    def on_user_input(self, text: str):
+        """
+        Handle user input from GUI (QML interface).
+
+        Mimics the logic from Qt GUI's run_agent() method.
+        """
+        from agent.core.state import ExecutionState
+        from datetime import datetime
+        print(f"DEBUG on_user_input called: {text}")
+        print(f"DEBUG current_state: {self.state}")
+
+        current_state = self.state
+
+        # Add user message to history immediately for visual feedback
+        user_message = {
+            'role': 'user',
+            'content': text,
+            'created_at': datetime.now().isoformat(),
+            'seq': len(self.user_history)  # Simple sequence number
+        }
+        
+        # Append to pending history if no session, otherwise to session history
+        if self.state_bridge.current_session:
+            self.state_bridge.current_session.user_history.append(user_message)
+        else:
+            self.state_bridge._pending_user_history.append(user_message)
+        
+        # Emit conversation changed signal to update UI
+        print(f"DEBUG on_user_input: emitting conversation_changed after adding user message")
+        self.gui_integration.emit_conversation_changed()
+
+        if current_state == ExecutionState.IDLE:
+            # Start new session with current configuration
+            config = self.config
+            print(f"DEBUG on_user_input: config keys: {list(config.keys()) if config else 'None'}")
+            debug_log(f"on_user_input: Starting new session with query: {text}", 
+                     level="DEBUG", component="AgentPresenter")
+            try:
+                self.start_session(text, config=config)
+            except Exception as e:
+                error_msg = f"Failed to start session: {str(e)}"
+                print(f"ERROR: {error_msg}")
+                debug_log(error_msg, level="ERROR", component="AgentPresenter")
+                if hasattr(self.gui_integration, 'emit_status_message'):
+                    self.gui_integration.emit_status_message(error_msg)
+                if hasattr(self.gui_integration, 'emit_error_occurred'):
+                    self.gui_integration.emit_error_occurred("Session Error", error_msg)
+
+        elif current_state in (ExecutionState.PAUSED, ExecutionState.WAITING_FOR_USER,
+                               ExecutionState.FINALIZED, ExecutionState.MAX_TURNS_REACHED):
+            # Continue existing session
+            debug_log(f"on_user_input: Continuing session with query: {text}", 
+                     level="DEBUG", component="AgentPresenter")
+            self.continue_session(text)
+
+        elif current_state == ExecutionState.RUNNING:
+            # Agent is busy, ignore input
+            debug_log(f"on_user_input: Ignoring input, agent is RUNNING", 
+                     level="WARNING", component="AgentPresenter")
+            if hasattr(self.gui_integration, 'emit_status_message'):
+                self.gui_integration.emit_status_message("Agent is busy, please wait")
+        else:
+            # Other states (STOPPED, PAUSING)
+            debug_log(f"on_user_input: Unhandled state {current_state} for query: {text}", 
+                     level="WARNING", component="AgentPresenter")
+            if hasattr(self.gui_integration, 'emit_status_message'):
+                self.gui_integration.emit_status_message(f"Cannot accept input in state: {current_state}")
+
     def pause_session(self):
         """Request pause of current session."""
         self.session_lifecycle.pause_session()
