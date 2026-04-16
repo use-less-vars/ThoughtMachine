@@ -4,326 +4,287 @@ Summarization Protocol: Keep the document as single source of truth and when sum
 All provided code snippets are examples, not mandatory code pieces. They serve as hints and are only examplatory in nature
 Remember to write progress reports (there is a tool, just dump what you have there) after a chunk of work is done.
 
-Here is a **fine‑grained journey document** for the agent. It assumes the agent has access to the existing ThoughtMachine backend (`agent/`, `RefactoredAgentPresenter`, etc.) and will create a new folder `qml_gui/` from scratch. The document avoids large code blocks, only gives hints and constraints (e.g., use PyQt6, not Qt5). The agent should execute tasks in order, reporting after each, and you will test.
-
----
-
-# Journey: Standalone QML GUI for ThoughtMachine
-
-## Ground Rules
-- **Qt version:** PyQt6 (≥6.5.0). Never use Qt5 imports or syntax.
-- **No mixing with old GUI:** `qml_gui/` is independent. Do not touch `qt_gui/`.
-- **Backend reuse:** Import `RefactoredAgentPresenter`, `ExecutionState`, etc. from existing modules.
-- **Testing after each task:** The engineer will run the GUI and confirm before moving to next task.
+Full Task List: RAG System Implementation (Tool‑Internal Availability Checks)
 
----
+This list assumes the agent is building within the ThoughtMachine architecture, but the principles apply broadly. Each task is self-contained and includes clear acceptance criteria.
+Phase 1: Foundation – Abstract Interface and Configuration
 
-## Phase 0 – Project Skeleton
+Task 1.1: Create a Base Knowledge Base Abstract Class
 
-### [x] Task 0.1: Create folder structure
-Create:
-```
-qml_gui/
-├── __init__.py
-├── main.py
-├── qml/
-│   └── MainWindow.qml
-├── models/
-│   └── __init__.py
-└── resources/          (empty for now)
-```
+    File: agent/knowledge/base.py
 
-### [x] Task 0.2: Minimal main.py
-- Use `QGuiApplication` and `QQmlApplicationEngine`.
-- Load `qml/MainWindow.qml`.
-- Set application name and organization if desired.
-- No backend yet – just a blank window.
+    Acceptance Criteria:
 
-**Hint:** `engine.load(QUrl.fromLocalFile(os.path.join(os.path.dirname(__file__), "qml", "MainWindow.qml")))`
+        Define an abstract base class BaseKnowledgeBase with the following methods:
 
-### [x] Task 0.3: Minimal MainWindow.qml
-- `import QtQuick 6.0`
-- `import QtQuick.Window 2.15`
-- A `Window` with `width: 800`, `height: 600`, `title: "ThoughtMachine QML"`, `visible: true`.
-- Inside, a `Text { text: "Hello QML" }`.
+            search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]
 
-**Test:** Run `python -m qml_gui.main`. A window with “Hello QML” appears.
+            add(self, content: str, metadata: Optional[Dict] = None) -> None
 
----
+        The add method may raise NotImplementedError if the knowledge base is read-only.
 
-## Phase 1 – Backend Integration & Conversation Model
+        Provide a docstring explaining the expected dictionary format for search results (keys: content, metadata, score).
 
-### [x] Task 1.1: Create ConversationModel (Python)
-File: `qml_gui/models/conversation_model.py`
+    DONE BY AGENT - BaseKnowledgeBase abstract class implemented in agent/knowledge/base.py
+Task 1.2: Extend AgentConfig with RAG Settings
 
-- Subclass `QAbstractListModel`.
-- In `__init__(self, presenter)`, store presenter and connect to `presenter.conversation_changed`. On signal, call `self.beginResetModel()` / `endResetModel()` (simplest).
-- Define roles as enum: `RoleRole`, `RoleContent`, `RoleToolName`, `RoleIsFinal`, `RoleReasoning`, `RoleToolCalls`, `RoleToolCallId`, `RoleHtmlContent`.
-- `rowCount()` returns `len(presenter.session.user_history)`.
-- `data(index, role)` returns appropriate field from the message dict. For `RoleHtmlContent`, use `MarkdownRenderer` from old GUI (import `qt_gui.panels.markdown_renderer.MarkdownRenderer`). Instantiate once and convert `content` to HTML.
+    File: agent/core/config.py (or wherever AgentConfig is defined)
 
-**Hint:** Use `self._presenter.session.user_history` to access messages.
+    Acceptance Criteria:
 
-### [x] Task 1.2: Expose model to QML
-In `main.py`:
-- Create a `RefactoredAgentPresenter` (same as old GUI does – it needs a session store, etc. Use default `FileSystemSessionStore`).
-- Create `ConversationModel(presenter)`.
-- Set context property: `engine.rootContext().setContextProperty("conversationModel", model)`.
-- Also set `engine.rootContext().setContextProperty("presenter", presenter)` (needed later for sending queries).
+        Add the following fields to AgentConfig:
 
-**Test:** Print model row count from QML (temporarily add a `Component.onCompleted` script that logs `conversationModel.rowCount`). No visual yet.
+            rag_enabled: bool = False # Whether to expose RAG tools (always True in our design, but kept for preset control)
 
-### [x] Task 1.3: Basic QML ListView
-In `MainWindow.qml`:
-- Replace the `Text` with a `ListView`.
-- Set `model: conversationModel`.
-- Delegate: a simple `Text { text: model.content }`.
-- Add `anchors.fill: parent`.
+            rag_embedding_model: str = "jinaai/jina-code-embeddings-0.5b"
 
-**Test:** Run – you see the conversation history as plain text. If no session loaded, create a default session or load an existing one. The list updates when new messages arrive (auto-refresh).
+            rag_vector_store_path: Optional[str] = None # Defaults to .thoughtmachine/rag/ under workspace
 
----
+        Ensure these fields are serialized/deserialized correctly for preset YAML files.
 
-## Phase 2 – Differentiated Message Delegate
+    DONE BY AGENT - AgentConfig extended with RAG fields in agent/config/models.py
+Task 1.3: Create a RAG Dependency Check Helper
 
-[x] Task 2.1: Create MessageDelegate.qml
-File: `qml_gui/qml/MessageDelegate.qml`
+    File: agent/knowledge/dependencies.py
 
-- Use `Rectangle` as root.
-- Bind `width` to parent or use `ListView.view.width`.
-- Define properties: `role`, `content`, `htmlContent`, `toolName`, `isFinal`, `reasoning`, `toolCalls`, etc. – read from `model`.
-- Use a `Column` or `Row` layout.
-- **Conditional styling** via `Loader` or `states`/`state` based on `role` and `toolName`.
-- Colors:
-  - User: border `#FF69B4`, background `#FFF0F5`
-  - Assistant: border `#99ccff`, background `#e6f3ff`
-  - Tool (role="tool"): border `#00aa00`, background `#e6ffe6`
-  - System: border `#ffcc00`, background `#fff9e6`
-  - Final (toolName in ["Final","FinalReport"]): border `#1e3a8a`, background `#dbeafe`
-  - RequestUserInteraction (toolName == "RequestUserInteraction"): border `#00bcd4`, background `#e0f7fa`
-- For assistant messages, if `reasoning` exists, show a grey box with non‑italic text.
-- For tool calls (role="assistant" with `toolCalls` list), iterate and display each tool call name/arguments.
-- For tool results (role="tool"), display tool name and result content.
+    Acceptance Criteria:
 
-**Hint:** Use `Text { text: htmlContent; textFormat: Text.RichText }` for markdown.
+        A function check_rag_dependencies() -> Tuple[bool, Optional[str]] that attempts to import chromadb, sentence_transformers, and tree_sitter.
 
-[x] Task 2.2: Use delegate in ListView
-In `MainWindow.qml`, set `delegate: MessageDelegate { }`.
+        Returns (True, None) if all are available.
 
-**Test:** Messages appear with correct colors. Finals and RequestUserInteraction stand out. Reasoning is normal font.
+        Returns (False, error_message) if any are missing, with a user‑friendly message listing missing packages.
 
----
+        Do not set any global flag; this function will be called at tool execution time.
 
-Phase 2.5 – Configuration & Error Handling (Minimal)
-[x] Task 2.5.1: Load configuration from environment / file
+Phase 2: Codebase RAG – Indexing and Search
 
-    In qml_gui/main.py, after creating the presenter, attempt to load a config from:
+    DONE BY AGENT - check_rag_dependencies() function implemented in agent/knowledge/dependencies.py
+    DONE BY AGENT - codebase_indexer.py implemented with tree-sitter semantic chunking, .gitignore parsing, and vector storage
+Task 2.1: Create the Codebase Indexer (Offline Script)
 
-        Environment variables: OPENAI_API_KEY, DEEPSEEK_API_KEY, MODEL, BASE_URL
+    File: agent/knowledge/codebase_indexer.py
 
-        A JSON file (e.g., ~/.thoughtmachine/config.json)
+    Acceptance Criteria:
 
-    Create a config dict with keys: api_key, model, base_url, provider_type (e.g., "openai" or "deepseek").
+        Function index_codebase(workspace_path: str, config: AgentConfig) -> Tuple[bool, str]:
 
-    If no config found, leave empty – the error will be shown later.
+            Accepts a workspace path and the agent configuration.
 
-    Apply config to presenter: presenter.update_config(config).
+            Returns success status and a message (e.g., "Indexed 342 chunks successfully").
 
-Hint: Use os.getenv() and json.load if file exists.
-[x] Task 2.5.2: Add user message to history immediately
+        Chunking Logic:
 
-    In presenter.on_user_input(), before calling start_session, manually append the user message to the conversation history.
+            Use tree-sitter to parse files with extensions: .py, .js, .ts, .java, .go, .rs (extensible list).
 
-    Use self.state_bridge.user_history.append({...}) with role='user', content=text, timestamp, etc.
+            For each file, split into semantic units (functions, classes, methods) using AST traversal.
 
-    Emit self.conversation_changed.emit() so the QML view updates instantly.
+            Respect .gitignore patterns (use pathspec library) to skip irrelevant files.
 
-    This gives immediate feedback even if the agent fails to start.
+            Each chunk should include metadata: file_path, start_line, end_line, language.
 
-[x] Task 2.5.3: Display errors as system messages
+        Embedding & Storage:
 
-    In presenter.start_session(), wrap the call to session_lifecycle.start_session in try/except.
+            Use sentence-transformers to load the model specified in config.rag_embedding_model.
 
-    On exception, append a system message to user_history with the error text (e.g., "Missing API key").
+            Compute embeddings for each chunk.
 
-    Emit conversation_changed to show the error in the conversation.
+            Store in a ChromaDB collection named codebase_{workspace_hash} under rag_vector_store_path (default: .thoughtmachine/rag/codebase/).
 
-    Also emit gui_integration.emit_status_message(error).
+            If a collection already exists, overwrite it or offer an --incremental flag (start with overwrite for simplicity).
 
-[x] Task 2.5.4: Minimal config dialog (QML)
+        Error Handling:
 
-    In MainWindow.qml, add a button (e.g., "⚙️" or a gear icon) in the top bar.
+            If dependencies are missing, return a clear error message.
 
-    On click, open a Dialog with TextField for api_key, model, base_url, and a ComboBox for provider_type ("openai" / "deepseek").
+            Log progress using the existing logging system.
 
-    Add a "Save" button that calls a new Python method presenter.update_config_from_qml(config_dict) (exposed via @pyqtSlot(dict) or as separate properties).
+    DONE BY AGENT - LocalCodebaseKB class implemented in agent/knowledge/codebase_kb.py
+Task 2.2: Create the Codebase Knowledge Base Class
 
-    After saving, store the config to the JSON file.
+    File: agent/knowledge/codebase_kb.py
 
-Hint: For the dialog, use import QtQuick.Dialogs 1.3 or a simple Rectangle with visible toggled.
-[x] Task 2.5.5: Persist configuration
+    Acceptance Criteria:
 
-    In Python, after update_config_from_qml, write the config dict to ~/.thoughtmachine/config.json.
+        Class LocalCodebaseKB inheriting BaseKnowledgeBase.
 
-    On next startup, load it (Task 2.5.1).
+        Constructor: __init__(self, workspace_path: str, config: AgentConfig).
 
-Test: Run QML GUI, open config dialog, enter a valid API key, save. Then send a query – agent should run and conversation updates.
-DONE BY AGENT - Configuration system fully implemented with user config file at ~/.thoughtmachine/config.json, QML dialog, and presenter integration. Modules: agent/presenter/state_bridge.py, agent/presenter/agent_presenter.py, qml_gui/qml/ConfigDialog.qml, qml_gui/qml/MainWindow.qml, qml_gui/main.py
+        Method search(self, query: str, top_k: int = 5) -> List[Dict]:
 
-## Phase 3 – User Input Panel
+            Call check_rag_dependencies(); if missing, raise a custom exception (or return empty list with a flag – decide on consistent error handling).
 
-### [x] Task 3.1: Add input area
-In `MainWindow.qml`, below the `ListView`, add a `Rectangle` with a `TextField` and a `Button`.
+            Lazy‑load the ChromaDB collection for the workspace.
 
-- Layout: `Column` with `ListView` (stretch) + input row (fixed height).
-- Input row: `RowLayout` with `TextField` (fill width) and `Button { text: "Send" }`.
+            If the collection does not exist, return an empty list (tool will handle messaging).
 
-### [x] Task 3.2: Connect send action
-- On button click, call `presenter.send_query(textField.text)`.
-- Clear text field.
-- Connect `TextField`’s `onAccepted` signal to same action.
+            Embed the query using the same model.
 
-**Note:** `presenter.send_query` is not `Q_INVOKABLE` by default. The agent must create a small wrapper class in `main.py` (e.g., `PresenterBridge` that inherits `QObject` and has `@pyqtSlot(str)` method calling `presenter.send_query`). Then expose that bridge to QML instead of the raw presenter.
+            Perform similarity search and return top results with content, metadata (file, lines), and score.
 
-**Test:** Type a message, send – agent processes and conversation updates.
+        Method add should raise NotImplementedError.
 
-DONE BY AGENT - Input panel already implemented in MainWindow.qml with TextField, Send button, and connection to presenter.on_user_input(). Layout uses ColumnLayout with ListView (stretch) + input row. Enter key handling included.
----
+        Optional: Provide a is_indexed() method that checks if a collection exists for the workspace.
 
-## Phase 4 – Smart Scrolling
+    DONE BY AGENT - SearchCodebaseTool implemented in tools/search_codebase.py
+Task 2.3: Create the SearchCodebaseTool
 
-### [x] Task 4.1: Implement auto‑scroll logic
-In `MainWindow.qml`:
-- Wrap `ListView` in a `ScrollView` or use `ListView`’s own properties.
-- Add a property `autoScroll` (default true).
-- On new content (e.g., on `model.dataChanged` or `count` change), check if `listView.contentY + listView.height >= listView.contentHeight - threshold` (near bottom). If yes, call `listView.positionViewAtEnd()`.
-- Provide a `CheckBox` to toggle auto‑scroll.
+    File: agent/tools/search_codebase.py
 
-**Hint:** Use `onCountChanged` on `ListView` to detect new messages.
+    Acceptance Criteria:
 
-**Test:** Scroll up – new messages do not move view. Scroll down – new messages keep you at bottom.
+        Class SearchCodebaseTool inheriting ToolBase.
 
-DONE BY AGENT - Implemented smart scrolling with autoScroll property, scrollThreshold, CheckBox toggle, and near‑bottom detection in onCountChanged. Added RowLayout with CheckBox in MainWindow.qml.
+        Pydantic fields:
 
----
+            query: str = Field(..., description="Natural language query about the codebase.")
 
-## Phase 5 – Status Bar & Token Display
+            top_k: int = Field(5, description="Number of results to return.")
 
-### Task 5.1: Create StatusBridge (Python)
-In `main.py`, create a class `StatusBridge(QObject)` with:
-- Signals: `tokensUpdated(int, int)`, `contextUpdated(int)`, `stateChanged(str)`.
-- Connect to `presenter.tokens_updated`, `presenter.context_updated`, `presenter.state_changed`.
-- Expose properties or methods to QML.
+        tool: Literal["SearchCodebase"] = "SearchCodebase"
 
-### Task 5.2: Show status in QML
-In `MainWindow.qml`, add a top bar (e.g., `Rectangle` with `RowLayout`) showing:
-- Input tokens, output tokens, context length.
-- State as colored dot + text.
-- Use `Text` with bindings to `statusBridge` properties.
+        Method execute(self) -> str:
 
-**Test:** When agent runs, numbers update and state changes.
+            Retrieve current workspace path from self.context.workspace_path (or similar mechanism).
 
----
+            Call check_rag_dependencies(). If missing, return "RAG dependencies not installed. Run pip install chromadb sentence-transformers tree-sitter."
 
-## Phase 6 – Session Tabs
+            Instantiate LocalCodebaseKB(workspace_path, self.context.config).
 
-### Task 6.1: Create SessionTab component
-File: `qml_gui/qml/SessionTab.qml`
+            Check if index exists (via is_indexed()). If not, return "No codebase index found. Run thoughtmachine index-codebase first."
 
-- Encapsulates `ListView` (conversation), input panel, status bar.
-- Takes a `model` and `presenterBridge` as properties.
-- Internally uses the same layout as `MainWindow` but without outer tabs.
+            Call kb.search(query, top_k).
 
-### Task 6.2: Tab management in MainWindow
-- Replace the single view with a `TabBar` + `StackLayout` (or `SwipeView`).
-- Maintain a list of session models and bridges.
-- Provide a “New Session” button that:
-  - Creates a new `RefactoredAgentPresenter` (in Python, via a method exposed to QML).
-  - Creates a new `ConversationModel` for it.
-  - Creates a new `PresenterBridge`.
-  - Adds a new tab with `SessionTab` and appropriate properties.
-- Allow closing tabs.
+            Format results as a Markdown table or bullet list with file paths and snippet previews.
 
-**Hint:** In Python, create a `SessionManager` class that holds list of presenters/models and can create new ones. Expose it to QML.
+            If no results, return "No relevant code found."
 
-**Test:** Multiple tabs, independent conversations, switch, close.
+        Registration: Add the tool class to TOOL_CLASSES in agent/tools/__init__.py unconditionally.
 
----
+Task 2.4: Provide a CLI Command for Indexing
 
-## Phase 7 – Sidebar with Icon Buttons (VSCode style)
+    File: Extend existing CLI (e.g., cli.py or create agent/cli/rag_commands.py)
 
-### Task 7.1: Create sidebar layout
-In `MainWindow.qml`, change to `RowLayout`:
-- Left: `Column` of `Button` with icons (use `Image` from `resources/` or `FontAwesome` via `Text`).
-- Center: the tab container (conversation + input).
-- Right: a `StackLayout` for configuration panels (initially empty or hidden).
+    Acceptance Criteria:
 
-### Task 7.2: Icon actions
-- On icon click, set the right stack’s current index to the corresponding panel.
-- Panels: “Agent Config”, “Tools”, etc. (initially placeholder rectangles).
+        Command: thoughtmachine index-codebase [--workspace PATH] [--force]
 
-### Task 7.3: Expose configuration settings
-- Create Python `ConfigBridge` that reads/writes agent configuration (e.g., model, temperature, etc.) using `presenter.config` or `presenter.update_config`.
-- Expose to QML and bind to form elements in the config panel.
+        If --workspace not provided, use the current directory or the configured workspace from a local preset.
 
-**Test:** Click icons, panels appear. Change a setting, agent uses new value.
+        Call index_codebase() from Task 2.1.
 
----
+        Print progress and final status message.
 
-## Phase 8 – Save Session
+        Exit with appropriate code (0 on success, 1 on failure).
 
-### Task 8.1: Save button
-Add a `Button` in the top bar or tab header: “Save”.
-On click, open a QML `Dialog` with a `TextField` for session name.
-Call `presenter.save_session(name)` (expose via `PresenterBridge`).
-Show a temporary notification on success.
+Phase 3: Project Notebook RAG – Dynamic Agent Memory
 
-**Test:** Save a session, close tab, reopen – session loads correctly.
+Task 3.1: Create the Notebook Knowledge Base Class
 
----
+    File: agent/knowledge/notebook_kb.py
 
-## Phase 9 – Performance Optimisation
+    Acceptance Criteria:
 
-### Task 9.1: Incremental model updates
-Modify `ConversationModel` to listen to `ObservableList` callbacks instead of full resets.
-- Implement `beginInsertRows` / `endInsertRows` when a new message is appended.
-- Use `dataChanged` for modifications.
-- Keep track of previous message count.
+        Class NotebookKB inheriting BaseKnowledgeBase.
 
-### Task 9.2: Delegate recycling
-Ensure `ListView` uses `cacheBuffer` to keep delegates alive for smooth scrolling.
-- Set `cacheBuffer: 500` or appropriate.
+        Uses a ChromaDB collection named notebook_{workspace_hash} under the same rag_vector_store_path.
 
-**Test:** Load a conversation with 1000+ messages, scroll – no lag.
+        Method add(self, content: str, metadata: Optional[Dict] = None) -> None:
 
----
+            Check dependencies; if missing, fall back to writing to a plain Markdown file (e.g., .thoughtmachine/notebook/entries.md).
 
-## Phase 10 – Polish & Theming
+            Embed content using the configured model.
 
-### Task 10.1: Dark/light theme toggle
-- Create a `Settings` singleton in QML that holds `theme`.
-- Use `Loader` to load different style files or bind colors to theme property.
-- Add a button to toggle.
+            Store in ChromaDB with metadata that includes timestamp, tags (if provided), and any other user‑supplied metadata.
 
-### Task 10.2: Animations
-- Add smooth transitions for new messages (fade‑in).
-- Animate sidebar panel sliding.
+        Method search(self, query: str, top_k: int = 5) -> List[Dict]:
 
-### Task 10.3: Error handling
-- Show error dialog when presenter fails.
-- Display loading indicator while agent is thinking.
+            Perform semantic search over the notebook collection.
 
-**Final Test:** Full workflow – new session, send messages, scroll, change settings, save, reload, switch tabs, use dark mode – everything works.
+            If ChromaDB is unavailable but fallback file exists, perform simple text search and return snippets (with lower accuracy).
 
----
+        Provide a is_available() method that returns True if ChromaDB is usable.
 
-## Agent Instructions
-- Execute tasks **in order**, one at a time.
-- After each task, report what was done and provide the exact command to run (e.g., `python -m qml_gui.main`).
-- If a task requires code, write the code with proper PyQt6 imports. Avoid large blocks unless necessary; reuse existing backend modules.
-- When in doubt, ask the engineer for clarification before proceeding.
-- Keep a checklist (copy of this document) and mark each subtask as `[x]` when completed.
+Task 3.2: Create AddToNotebookTool
 
----
+    File: agent/tools/add_to_notebook.py
 
-The engineer will now hand this document to the agent and let it begin from **Phase 0, Task 0.1**.
+    Acceptance Criteria:
+
+        Class AddToNotebookTool inheriting ToolBase.
+
+        Pydantic fields:
+
+            content: str = Field(..., description="The note to add to the project notebook.")
+
+            tags: Optional[List[str]] = Field(None, description="Optional tags for categorization.")
+
+        tool: Literal["AddToNotebook"] = "AddToNotebook"
+
+        Method execute(self) -> str:
+
+            Check RAG dependencies. If missing, fall back to appending the note to a plain text file (.thoughtmachine/notebook/entries.md) and return "RAG not available. Note saved to plain text file."
+
+            Otherwise, instantiate NotebookKB and call add(content, metadata={"tags": tags, "timestamp": datetime.now().isoformat()}).
+
+            Return "Note added to project notebook."
+
+        Register tool unconditionally in TOOL_CLASSES.
+
+Task 3.3: Create SearchNotebookTool
+
+    File: agent/tools/search_notebook.py
+
+    Acceptance Criteria:
+
+        Class SearchNotebookTool inheriting ToolBase.
+
+        Pydantic fields:
+
+            query: str
+
+            top_k: int = 5
+
+        tool: Literal["SearchNotebook"] = "SearchNotebook"
+
+        Method execute(self) -> str:
+
+            Check dependencies. If missing, perform a simple file‑grep on the fallback markdown file (if it exists) and return matches.
+
+            Otherwise, use NotebookKB.search().
+
+            Format results in Markdown.
+
+            If no results, return "No matching notes found."
+
+        Register tool unconditionally.
+
+Phase 4: Integration – Presets and System Prompt (Optional)
+
+Task 4.1: Create a RAG Preset File
+
+    File: presets/rag.yaml
+
+    Acceptance Criteria:
+
+        YAML configuration that sets:
+
+            rag_enabled: true
+
+            rag_embedding_model: "jinaai/jina-code-embeddings-0.5b"
+
+            Optionally, include a system_prompt addition that reminds the agent about the RAG tools (but this is not required for functionality).
+
+        Ensure the preset loads correctly via the existing preset system.
+
+Task 4.2: (Optional) System Prompt Enhancement
+
+    File: Wherever the system prompt is assembled (e.g., agent/core/prompts.py or preset YAML).
+
+    Acceptance Criteria:
+
+        If rag_enabled is true, append a brief paragraph:
+
+            "You have access to the SearchCodebaseTool to semantically search the current project's codebase. Use it when you need to understand existing functions or locate implementations. You can also use AddToNotebookTool and SearchNotebookTool to maintain a persistent project memory."
+
+        This is purely informational; the agent will still see the tools in its function definitions.

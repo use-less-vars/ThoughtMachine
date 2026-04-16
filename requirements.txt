@@ -17,4 +17,6 @@ lxml
 sentence-transformers 
 chromadb 
 langchain 
-langchain-community 
+langchain-community
+pathspec
+tree-sitter 

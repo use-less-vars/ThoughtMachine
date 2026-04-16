@@ -7,7 +7,14 @@ from typing import Optional, Callable, List, Any, Dict, Literal
 from pydantic import BaseModel, Field
 from agent.logging.debug_log import debug_log
 
-from tools import SIMPLIFIED_TOOL_CLASSES
+
+def _get_default_enabled_tools() -> list[str]:
+    """Get default list of enabled tool names.
+    
+    Returns empty list to avoid circular imports during initialization.
+    The actual default will be set elsewhere when needed.
+    """
+    return []
 
 
 class AgentConfig(BaseModel):
@@ -57,6 +64,13 @@ class AgentConfig(BaseModel):
     # Workspace configuration for file system access restrictions
     workspace_path: Optional[str] = Field(default=None, description="Root directory for file operations (None = unrestricted)")
 
+    # RAG configuration
+    rag_enabled: bool = Field(default=False, description="Enable RAG functionality (codebase search and notebook)")
+    rag_embedding_model: str = Field(default="BAAI/bge-small-en-v1.5", description="Sentence-transformers model for embedding code and notes. Fast CPU-friendly model with good code understanding.")
+    rag_vector_store_path: Optional[str] = Field(default=None, description="Path to store vector databases (default: .thoughtmachine/rag/ under workspace)")
+    rag_chunk_size: int = Field(default=1500, description="Maximum characters per code chunk (default 1500). Larger chunks = fewer embeddings but less granularity.")
+    rag_chunk_overlap: int = Field(default=200, description="Overlap between chunks in characters (default 200). Helps maintain context across chunk boundaries.")
+
     # Tool output limit configuration
     tool_output_token_limit: int = Field(default=10000, description="Maximum token limit for tool outputs (default 10,000 tokens)")
     # UI detail level configuration
@@ -64,7 +78,7 @@ class AgentConfig(BaseModel):
 
     # Enabled tools configuration
     enabled_tools: List[str] = Field(
-        default_factory=lambda: [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES], 
+        default_factory=lambda: _get_default_enabled_tools(), 
         description="List of enabled tool class names"
     )
 

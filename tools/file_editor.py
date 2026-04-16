@@ -65,8 +65,15 @@ class FileEditor(ToolBase):
             if self.content is None:
                 raise ValueError("content required for append")
         elif op == "replace":
+            # For replace operation, we accept either:
+            # 1. replacements dict (original behavior)
+            # 2. content + line_numbers (for replacing range/list with same content)
+            # 3. content + line_number (backward compatibility for single line)
             if self.replacements is None:
-                raise ValueError("replacements required for replace")
+                if self.content is None:
+                    raise ValueError("For replace operation, either replacements dict or content is required")
+                if self.line_numbers is None and self.line_number is None:
+                    raise ValueError("For replace operation with content, line_numbers or line_number is required")
         elif op == "delete":
             if self.line_numbers is None:
                 raise ValueError("line_numbers required for delete")
@@ -305,13 +312,72 @@ class FileEditor(ToolBase):
             lines = f.readlines()
 
         total_lines = len(lines)
-        replacements = self.replacements
-
-        # Validate line numbers
-        for line_num in replacements.keys():
-            if line_num < 1 or line_num > total_lines:
-                return f"Error: Line number {line_num} is out of range (file has {total_lines} lines)"
-
+        
+        # Build replacements dict from either self.replacements or content + line_numbers/line_number
+        replacements = {}
+        
+        if self.replacements is not None:
+            # Original behavior: use replacements dict
+            replacements = self.replacements
+        else:
+            # New behavior: use content + line_numbers/line_number
+            # Normalize line_numbers
+            line_numbers = self.line_numbers
+            if line_numbers is None and self.line_number is not None:
+                line_numbers = self.line_number
+            
+            if line_numbers is None:
+                return "Error: No line numbers specified for replace operation"
+            
+            # Parse line_numbers into list of line numbers
+            line_nums = []
+            
+            if line_numbers == 'all':
+                line_nums = list(range(1, total_lines + 1))
+            elif isinstance(line_numbers, int):
+                line_nums = [line_numbers]
+            elif isinstance(line_numbers, list):
+                # Special case: 2-element list treated as range [start, end]
+                if len(line_numbers) == 2:
+                    start, end = line_numbers[0], line_numbers[1]
+                    if start < 1 or end > total_lines or start > end:
+                        return f"Error: Invalid range {start}-{end} (file has {total_lines} lines)"
+                    line_nums = list(range(start, end + 1))
+                else:
+                    line_nums = line_numbers
+            elif isinstance(line_numbers, str) and '-' in line_numbers:
+                try:
+                    start_str, end_str = line_numbers.split('-')
+                    start = int(start_str.strip())
+                    end = int(end_str.strip())
+                    if start < 1 or end > total_lines or start > end:
+                        return f"Error: Invalid range {start}-{end} (file has {total_lines} lines)"
+                    line_nums = list(range(start, end + 1))
+                except ValueError:
+                    return f"Error: Invalid range format '{line_numbers}'. Use format like '1-10'"
+            else:
+                return f"Error: Invalid line_numbers parameter: {line_numbers}"
+            
+            # Validate all line numbers are in range
+            for line_num in line_nums:
+                if line_num < 1 or line_num > total_lines:
+                    return f"Error: Line number {line_num} is out of range (file has {total_lines} lines)"
+            
+            # Create replacements dict from content
+            content = self.content
+            if isinstance(content, str):
+                # Single content for all lines
+                for line_num in line_nums:
+                    replacements[line_num] = content
+            elif isinstance(content, list):
+                # List of content - should match number of lines
+                if len(content) != len(line_nums):
+                    return f"Error: Content list length ({len(content)}) doesn't match number of lines to replace ({len(line_nums)})"
+                for line_num, content_item in zip(line_nums, content):
+                    replacements[line_num] = content_item
+            else:
+                return f"Error: Invalid content type: {type(content)}"
+        
         # Apply replacements
         for line_num, new_content in replacements.items():
             lines[line_num - 1] = new_content + "\n"
