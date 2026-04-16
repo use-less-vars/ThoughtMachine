@@ -408,3 +408,4 @@ chmod +x "{script_path}"
             return image
         except DockerException as e:
             raise RuntimeError(f"Failed to build Docker image: {e}")
+
