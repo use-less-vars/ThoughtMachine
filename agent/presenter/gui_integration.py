@@ -18,7 +18,7 @@ class GUIIntegration(QObject):
     
     Signals:
         state_changed(state: ExecutionState): Emitted when agent state changes
-        event_received(event: dict): Emitted when a new event arrives from controller
+
         tokens_updated(total_input: int, total_output: int): Emitted when token counts update
         status_message(message: str): Emitted for status updates
         context_updated(context_length: int): Emitted when context token count updates
@@ -29,7 +29,7 @@ class GUIIntegration(QObject):
     
     # Signals
     state_changed = pyqtSignal(ExecutionState)
-    event_received = pyqtSignal(dict)
+
     tokens_updated = pyqtSignal(int, int)
     context_updated = pyqtSignal(int)
     status_message = pyqtSignal(str)
@@ -55,9 +55,7 @@ class GUIIntegration(QObject):
             self.state_changed.emit(new_state)
     
     # Signal emission methods
-    def emit_event_received(self, event: Dict[str, Any]) -> None:
-        """Emit event_received signal."""
-        self.event_received.emit(event)
+
     
     def emit_tokens_updated(self, total_input: int, total_output: int) -> None:
         """Emit tokens_updated signal."""

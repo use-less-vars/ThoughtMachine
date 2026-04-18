@@ -136,7 +136,7 @@ class AgentState:
             if new_state == TokenState.WARNING:
                 formatted = self._format_tokens(total_tokens)
                 warning = (
-                    f"[SYSTEM NOTIFICATION] **Token usage warning: Conversation is nearing context window limits** ({formatted} tokens). "
+                    f"**Token usage warning: Conversation is nearing context window limits** ({formatted} tokens). "
                     f"Consider pruning soon. If tokens reach CRITICAL threshold, you will have {self.CRITICAL_COUNTDOWN_TURNS} turns before tool restrictions apply."
                 )
             else:  # CRITICAL
@@ -146,7 +146,7 @@ class AgentState:
                 # Use gentler message
                 formatted = self._format_tokens(total_tokens)
                 warning = (
-                    f"[SYSTEM NOTIFICATION] Token usage is at the critical threshold ({formatted} tokens). "
+                    f"Token usage is at the critical threshold ({formatted} tokens). "
                     f"You have {self.CRITICAL_COUNTDOWN_TURNS} turns to work normally before tool restrictions apply. "
                     f"Please consider summarizing to reduce context size. After summarizing, you may continue working. "
                     f"After the countdown ends, only SummarizeTool, Final, and FinalReport will be available."
@@ -214,14 +214,14 @@ class AgentState:
 
             # Create warning message
             if new_state == TurnState.WARNING:
-                warning = f"[SYSTEM NOTIFICATION] **Turn limit warning**: Agent is nearing maximum turn limit ({current_turn}/{max_turns} turns). Please consider wrapping up soon. If turns reach CRITICAL threshold, you will have {self.CRITICAL_COUNTDOWN_TURNS} turns before tool restrictions apply."
+                warning = f"**Turn limit warning**: Agent is nearing maximum turn limit ({current_turn}/{max_turns} turns). Please consider wrapping up soon. If turns reach CRITICAL threshold, you will have {self.CRITICAL_COUNTDOWN_TURNS} turns before tool restrictions apply."
             else:  # CRITICAL
                 # Start the countdown for gradual restrictions
                 countdown_events = self.start_critical_countdown("turn")
                 events.extend(countdown_events)
                 # Use gentler message
                 warning = (
-                    f"[SYSTEM NOTIFICATION] Turn usage is at the critical threshold ({current_turn}/{max_turns} turns). "
+                    f"Turn usage is at the critical threshold ({current_turn}/{max_turns} turns). "
                     f"You have {self.CRITICAL_COUNTDOWN_TURNS} turns to work normally before tool restrictions apply. "
                     f"Please consider completing your work or summarizing. After summarizing, you may continue working. "
                     f"After the countdown ends, only SummarizeTool, Final, and FinalReport will be available."
@@ -337,7 +337,7 @@ class AgentState:
             raise ValueError(f"Unknown resource: {resource}")
 
         warning = (
-            f"[SYSTEM] {resource.upper()} usage is CRITICAL. "
+            f"{resource.upper()} usage is CRITICAL. "
             f"You have {countdown} turns to work normally before tool restrictions apply. "
             f"Use SummarizeTool to reduce context or Final/FinalReport to complete work. After summarizing, you may continue working. "
             f"After countdown: only summary/final tools allowed."
@@ -372,7 +372,7 @@ class AgentState:
             if self.token_critical_countdown == 0:
                 # Create typed event
                 token_critical_data = {
-                    "message": "[SYSTEM] Token countdown expired. Tool restrictions now active: only SummarizeTool, Final, FinalReport allowed.",
+                    "message": "Token countdown expired. Tool restrictions now active: only SummarizeTool, Final, FinalReport allowed.",
                     "resource": "token"
                 }
                 events.append(self._create_event("token_critical_countdown_expired", token_critical_data))
@@ -383,7 +383,7 @@ class AgentState:
             if self.turn_critical_countdown == 0:
                 # Create typed event
                 turn_critical_data = {
-                    "message": "[SYSTEM] Turn countdown expired. Tool restrictions now active: only SummarizeTool, Final, FinalReport allowed.",
+                    "message": "Turn countdown expired. Tool restrictions now active: only SummarizeTool, Final, FinalReport allowed.",
                     "resource": "turn"
                 }
                 events.append(self._create_event("turn_critical_countdown_expired", turn_critical_data))

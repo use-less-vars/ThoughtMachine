@@ -38,7 +38,7 @@ class RefactoredAgentPresenter(QObject):
     
     # Signals (same as original)
     state_changed = pyqtSignal(ExecutionState)
-    event_received = pyqtSignal(dict)
+
     tokens_updated = pyqtSignal(int, int)
     context_updated = pyqtSignal(int)
     status_message = pyqtSignal(str)
@@ -77,7 +77,7 @@ class RefactoredAgentPresenter(QObject):
         """Connect module signals to presenter signals."""
         # Connect GUIIntegration signals to our signals
         self.gui_integration.state_changed.connect(self.state_changed)
-        self.gui_integration.event_received.connect(self.event_received)
+
         self.gui_integration.tokens_updated.connect(self.tokens_updated)
         self.gui_integration.context_updated.connect(self.context_updated)
         self.gui_integration.status_message.connect(self.status_message)
@@ -561,7 +561,7 @@ class RefactoredAgentPresenter(QObject):
         # Disconnect signals to prevent memory leaks
         try:
             self.gui_integration.state_changed.disconnect()
-            self.gui_integration.event_received.disconnect()
+
             self.gui_integration.tokens_updated.disconnect()
             self.gui_integration.context_updated.disconnect()
             self.gui_integration.status_message.disconnect()
