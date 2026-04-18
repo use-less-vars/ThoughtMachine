@@ -69,6 +69,29 @@ class MarkdownRenderer:
         # Escape HTML special characters
         escaped = html_module.escape(text)
 
+        # Process code blocks (triple backticks) before line processing
+        code_blocks = []
+        import re
+        
+        def replace_code_block(match):
+            # Extract language (optional) and code content
+            # match groups: group(1) = language (optional), group(2) = code content
+            language = match.group(1) or ''
+            code_content = match.group(2)
+            # Store the code block with placeholder
+            placeholder = f"@@@CB{len(code_blocks)}@@@"
+            # Create HTML for code block
+            if language:
+                code_blocks.append(f'<pre style="background-color: #f5f5f5; border: 1px solid #ddd; border-radius: 3px; padding: 8px; overflow: auto; white-space: pre-wrap;"><code class="language-{language}" style="font-family: monospace, monospace;">{code_content}</code></pre>')
+            else:
+                code_blocks.append(f'<pre style="background-color: #f5f5f5; border: 1px solid #ddd; border-radius: 3px; padding: 8px; overflow: auto; white-space: pre-wrap;"><code style="font-family: monospace, monospace;">{code_content}</code></pre>')
+            return placeholder
+        
+        # Regex for code blocks: ```language?\n?content\n``` (non-greedy, DOTALL)
+        # Note: language cannot contain spaces, only word characters
+        code_block_pattern = re.compile(r'```(\w*)\n?(.*?)```', re.DOTALL)
+        escaped = code_block_pattern.sub(replace_code_block, escaped)
+
         # Process line by line for block elements
         lines = escaped.split('\n')
         result_lines = []
@@ -184,7 +207,7 @@ class MarkdownRenderer:
 
         # Now apply inline formatting
         # Process code blocks first to protect them from other markdown
-        escaped = re.sub(r'`(.+?)`', r'<code>\1</code>', escaped)
+        escaped = re.sub(r'`(.+?)`', r'<code style="font-family: monospace, monospace; background-color: #f0f0f0; padding: 2px 4px; border-radius: 3px;">\1</code>', escaped)
         # Handle triple asterisks/underscores (bold+italic)
         escaped = re.sub(r'\*\*\*(.+?)\*\*\*', r'<b><i>\1</i></b>', escaped)
         escaped = re.sub(r'___(.+?)___', r'<b><i>\1</i></b>', escaped)
@@ -198,6 +221,11 @@ class MarkdownRenderer:
         escaped = re.sub(r'~~(.+?)~~', r'<s>\1</s>', escaped)
         # Links: [text](url)
         escaped = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', escaped)
+
+        # Replace code block placeholders with actual HTML
+        for i, code_block_html in enumerate(code_blocks):
+            placeholder = f"@@@CB{i}@@@"
+            escaped = escaped.replace(placeholder, code_block_html)
 
         # Apply style if provided
         if style:

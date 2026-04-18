@@ -557,7 +557,7 @@ class SessionTab(QWidget):
         """Connect presenter signals to GUI slots."""
         # Connect presenter signals
         self.presenter.state_changed.connect(self.on_state_changed)
-        # self.presenter.event_received.connect(self.display_event)  # REMOVED: GUI now updates only via ObservableList callbacks
+
         self.presenter.tokens_updated.connect(self.on_tokens_updated)
         self.presenter.context_updated.connect(self.on_context_updated)
         self.presenter.status_message.connect(self.on_status_message)
@@ -1693,7 +1693,7 @@ class SessionTab(QWidget):
         # Disconnect all presenter signals to prevent signal-driven re-entrance
         try:
             self.presenter.state_changed.disconnect(self.on_state_changed)
-            # self.presenter.event_received.disconnect(self.display_event)  # No longer connected due to ObservableList transition
+
             self.presenter.tokens_updated.disconnect(self.on_tokens_updated)
             self.presenter.context_updated.disconnect(self.on_context_updated)
             self.presenter.status_message.disconnect(self.on_status_message)

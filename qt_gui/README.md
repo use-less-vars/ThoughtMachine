@@ -15,7 +15,7 @@ The GUI is organized into separate components for maintainability and testabilit
   - `status_panel.py` - Token usage and context length display.
   - `tool_loader.py` - Tool enable/disable checkboxes.
   - `markdown_renderer.py` - Markdown to HTML rendering.
-  - `event_models.py` - Model, proxy, and delegate for event list.
+
   - `mcp_config.py` - MCP server configuration dialog.
 - **config/**: Configuration management:
   - `config_bridge.py` - `GUIConfigBridge` adapter between GUI and ConfigService, providing debounced saving.

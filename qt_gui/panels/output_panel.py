@@ -9,12 +9,32 @@ from PyQt6.QtGui import QTextCursor
 
 from ..debug_log import debug_log
 from .markdown_renderer import MarkdownRenderer
+from ..utils.constants import MAX_RESULT_LENGTH, MAX_TOOL_RESULTS_PER_TURN, MAX_LINES_PER_RESULT, ENABLE_RESULT_TRUNCATION, INTERNAL_EVENT_TYPES
 
 
 class OutputPanel(QWidget):
     """Panel containing event display, filtering, and query controls."""
-    # Special tools that should have blue styling, no truncation, full markdown
+    # Special tools that should have special styling, no truncation, full markdown
     SPECIAL_TOOLS = ["Final", "FinalReport", "RequestUserInteraction"]
+    # Color constants
+    COLOR_USER_QUERY = "#BD0567"  # New dark pink for actual user queries
+    COLOR_SYSTEM_USER = "#DB7093"  # Original pale violet red for system messages with role user
+    COLOR_REASONING_BG = "#f8f8f8"  # Grey
+    COLOR_REASONING_BORDER = "#888"  # Dark grey
+    COLOR_FINAL = "#3498db"  # Blue
+    COLOR_REQUEST_USER = "#40E0D0"  # Turquoise
+    COLOR_REGULAR_TOOL = "#006400"  # Dark green (kept for compatibility)
+    COLOR_TOOL_CALL = "#00008B"  # Dark blue for tool call headers
+    COLOR_TOOL_RESULT = "#87CEEB"  # Light blue for tool result headers
+    COLOR_SYSTEM = "#ff9999"  # Light red
+    COLOR_ASSISTANT = "#99ccff"  # Light blue
+
+    def _is_system_message(self, content: str) -> bool:
+        """Check if content appears to be a system notification (token warning, etc.)"""
+        if not content:
+            return False
+        # System notifications start with [SYSTEM NOTIFICATION] or [SYSTEM]
+        return content.startswith("[SYSTEM NOTIFICATION]") or content.startswith("[SYSTEM]")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -126,6 +146,44 @@ class OutputPanel(QWidget):
         reasoning_content = event.get("reasoning_content", "")
         tool_call_id = event.get("tool_call_id", "")
         
+        # Process tool calls for mapping and HTML generation
+        tool_calls_html = ""
+        if tool_calls:
+            for tool_call in tool_calls:
+                tool_id = tool_call.get("id", "")
+                tool_func = tool_call.get("function", {})
+                tool_name = tool_func.get("name", "unknown")
+                arguments = tool_func.get("arguments", "{}")
+                # Store mapping for tool result styling
+                if tool_id:
+                    self._tool_call_map[tool_id] = tool_name
+                # Build tool call HTML block
+                if tool_name in self.SPECIAL_TOOLS:
+                    if tool_name == "RequestUserInteraction":
+                        border_color = self.COLOR_REQUEST_USER
+                    else:
+                        border_color = self.COLOR_FINAL
+                    bg_color = "#eef4ff"
+                else:
+                    border_color = self.COLOR_TOOL_CALL
+                    bg_color = "#f0f8f0"
+                if tool_name in self.SPECIAL_TOOLS:
+                    header = f"Tool: <span style='color: #001f3f;'>{tool_name}</span>"
+                else:
+                    header = f"Tool: {tool_name}"
+                # Truncate arguments
+                args_str = str(arguments)
+                if len(args_str) > 200:
+                    args_str = args_str[:200] + '...'
+                escaped_args = html.escape(args_str)
+                # Add background to content area for special tools
+                inner_bg = f"background-color: {bg_color};" if tool_name in self.SPECIAL_TOOLS else ""
+                tool_block = f'''<div style="border: 1px solid {border_color}; border-radius: 5px; margin-top: 8px; margin-bottom: 8px; overflow: hidden;"><div style="background-color: {bg_color} !important; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {border_color}; display: block; width: 100%; box-sizing: border-box;">{header}</div><div style="padding: 10px; {inner_bg}">'''
+                if tool_name not in self.SPECIAL_TOOLS:
+                    tool_block += f'''<div style="color: #666666; font-size: 0.9em; font-family: monospace, monospace;">Arguments: {escaped_args}</div>'''
+                tool_block += '''</div></div>'''
+                tool_calls_html += tool_block
+        
         # Store tool call mapping for special styling
         if event_type == "tool_call":
             tool_name = event.get("function", {}).get("name", "unknown")
@@ -135,36 +193,48 @@ class OutputPanel(QWidget):
         
         # Determine styling based on type
         if event_type == "user_query":
-            border_color = "#FF69B4"
+            content = event.get("content", "")
+            if self._is_system_message(content):
+                border_color = self.COLOR_SYSTEM_USER
+            else:
+                border_color = self.COLOR_USER_QUERY
             bg_color = "#FFF0F5"
             header = "User"
         elif event_type == "turn":  # assistant message
-            border_color = "#99ccff"
+            border_color = self.COLOR_ASSISTANT
             bg_color = "#e6f3ff"
             header = "Assistant"
         elif event_type == "tool_call":
             tool_name = event.get("function", {}).get("name", "unknown")
             if tool_name in self.SPECIAL_TOOLS:
-                border_color = "#3498db"
+                # Special handling for RequestUserInteraction
+                if tool_name == "RequestUserInteraction":
+                    border_color = self.COLOR_REQUEST_USER
+                else:
+                    border_color = self.COLOR_FINAL
                 bg_color = "#eef4ff"
                 header = f"Tool: {tool_name}"
             else:
-                border_color = "#006400"
+                border_color = self.COLOR_TOOL_CALL
                 bg_color = "#f0f8f0"
                 header = f"Tool: {tool_name}"
         elif event_type == "tool_result":
             # Look up tool name for special styling
             tool_name = self._tool_call_map.get(tool_call_id, "")
             if tool_name in self.SPECIAL_TOOLS:
-                border_color = "#3498db"
+                # Special handling for RequestUserInteraction
+                if tool_name == "RequestUserInteraction":
+                    border_color = self.COLOR_REQUEST_USER
+                else:
+                    border_color = self.COLOR_FINAL
                 bg_color = "#eef4ff"
                 header = f"Tool Result ({tool_name})"
             else:
-                border_color = "#006400"
+                border_color = self.COLOR_TOOL_RESULT
                 bg_color = "#f0f8f0"
                 header = "Tool Result"
         elif event_type in ("system", "token_warning", "turn_warning"):
-            border_color = "#ff9999"
+            border_color = self.COLOR_SYSTEM
             bg_color = "#ffe6e6"
             header = "System"
         elif event_type == "final":
@@ -176,16 +246,29 @@ class OutputPanel(QWidget):
             bg_color = "#f8f8f8"
             header = event_type.replace('_', ' ').title()
         
-        # Render content with markdown
-        rendered_content = self._render_content(content)
+        # Get tool_name for tool_result events
+        current_tool_name = ""
+        if event_type == "tool_result":
+            current_tool_name = self._tool_call_map.get(tool_call_id, "")
+        elif event_type == "tool_call":
+            current_tool_name = event.get("function", {}).get("name", "unknown")
         
+        # Render content based on event type and tool
+        rendered_content = self._render_event_content(event_type, content, current_tool_name, tool_call_id)
+
         # Handle reasoning content for assistant messages
         reasoning_html = ""
         if reasoning_content:
-            reasoning_html = f'''<div style="background-color: #f8f8f8; border-left: 4px solid #888; padding: 8px; margin-bottom: 12px;"><div style="color: #333; font-weight: bold;">Reasoning:</div>{self._render_content(reasoning_content)}</div>'''
+            reasoning_html = f'''<div style="background-color: {self.COLOR_REASONING_BG}; border-left: 4px solid {self.COLOR_REASONING_BORDER}; padding: 8px; margin-bottom: 12px;"><div style="color: #333; font-weight: bold;">Reasoning:</div>{self._render_content(reasoning_content)}</div>'''        
+        # Determine if this is a special tool for content background
+        content_background = ""
+        if event_type == "tool_result" and current_tool_name in self.SPECIAL_TOOLS:
+            content_background = f"background-color: {bg_color};"
+        elif event_type == "tool_call" and current_tool_name in self.SPECIAL_TOOLS:
+            content_background = f"background-color: {bg_color};"
         
         # Build HTML
-        html_block = f'''<div style="border: 1px solid {border_color}; border-radius: 5px; margin-bottom: 12px; overflow: hidden;"><div style="background-color: {bg_color}; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {border_color};">{header}</div><div style="padding: 10px;">{reasoning_html}{rendered_content}</div></div>'''
+        html_block = f'''<div style="border: 1px solid {border_color}; border-radius: 5px; margin-bottom: 12px; overflow: hidden;"><div style="background-color: {bg_color} !important; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {border_color}; display: block; width: 100%; box-sizing: border-box;">{header}</div><div style="padding: 10px; {content_background}">{reasoning_html}{tool_calls_html}{rendered_content}</div></div>'''
         
         # For tool calls, optionally show arguments
         if event_type == "tool_call":
@@ -201,6 +284,42 @@ class OutputPanel(QWidget):
         
         return html_block
     
+    def _render_event_content(self, event_type: str, content: str, tool_name: str = '', tool_call_id: str = '') -> str:
+        """Render event content based on event type and tool."""
+        if event_type == "tool_result":
+            # Look up tool name if not provided
+            if not tool_name and tool_call_id:
+                tool_name = self._tool_call_map.get(tool_call_id, "")
+            
+            if tool_name in self.SPECIAL_TOOLS:
+                # Special tools: full markdown rendering
+                rendered = self._render_content(content)
+                # Apply dark blue font for Final/FinalReport
+                if tool_name in ["Final", "FinalReport"]:
+                    return f'<div style="color: #001f3f;">{rendered}</div>'
+                else:
+                    return rendered
+            else:
+                # Regular tools: truncate plain text, no markdown
+                truncated = self._truncate_plain_text(content, tool_name)
+                full_content_escaped = html.escape(content, quote=True)
+                return f'<div style="font-family: monospace, monospace; white-space: pre-wrap;" data-full-content="{full_content_escaped}">{html.escape(truncated)}</div>'
+        elif event_type == "user_query":
+            # Check if this is a system notification in user clothing
+            if self._is_system_message(content):
+                color = self.COLOR_SYSTEM_USER
+            else:
+                color = self.COLOR_USER_QUERY
+            return f'<div style="color: {color};">{self._render_content(content)}</div>'
+        else:
+            # For all other events, use markdown rendering
+            rendered = self._render_content(content)
+            # Apply dark blue font for Final/FinalReport tool calls
+            if tool_name in ["Final", "FinalReport"]:
+                return f'<div style="color: {self.COLOR_TOOL_CALL};">{rendered}</div>'
+            else:
+                return rendered
+
     def _render_content(self, content: str) -> str:
         """Render message content to HTML (handles markdown)."""
         if not content:
@@ -209,6 +328,43 @@ class OutputPanel(QWidget):
         return self.markdown_renderer.markdown_to_html(content)
 
 
+    def _truncate_plain_text(self, content: str, tool_name: str = '') -> str:
+        """Truncate plain text content for regular tool results."""
+        if not content:
+            return ''
+
+        # Don't truncate special tools
+        if tool_name in self.SPECIAL_TOOLS:
+            return content
+
+        # Check if truncation is enabled
+        if not ENABLE_RESULT_TRUNCATION:
+            return content
+
+        lines = content.split('\n')
+
+        # Limit number of lines
+        if len(lines) > MAX_LINES_PER_RESULT:
+            lines = lines[:MAX_LINES_PER_RESULT]
+            lines.append('...')
+
+        # Process each line
+        truncated_lines = []
+        total_chars = 0
+        for line in lines:
+            # Check total character limit
+            if total_chars + len(line) > MAX_RESULT_LENGTH:
+                truncated_lines.append('...')
+                break
+
+            # Limit line length
+            if len(line) > 100:
+                line = line[:100] + '...'
+
+            truncated_lines.append(line)
+            total_chars += len(line)
+
+        return '\n'.join(truncated_lines)
 
     def _append_html(self, html: str) -> None:
         cursor = self.output_textedit.textCursor()
@@ -356,22 +512,3 @@ class OutputPanel(QWidget):
             def scroll_to_bottom(self): pass
         return DummySmartScroller()
     
-    # Event model compatibility (was removed in Phase 4)
-    @property
-    def event_model(self):
-        """Dummy event model for compatibility during transition."""
-        class DummyEventModel:
-            def __init__(self):
-                self.events = []
-            def rowCount(self):
-                return len(self.events)
-            def index(self, i, col):
-                return None
-            def data(self, index, role):
-                return None
-        return DummyEventModel()
-    
-    @property
-    def filter_proxy_model(self):
-        """Dummy filter proxy model for compatibility during transition."""
-        return self.event_model  # Return same dummy object
