@@ -4,326 +4,153 @@ Summarization Protocol: Keep the document as single source of truth and when sum
 All provided code snippets are examples, not mandatory code pieces. They serve as hints and are only examplatory in nature
 Remember to write progress reports (there is a tool, just dump what you have there) after a chunk of work is done.
 
-Here is a **fine‑grained journey document** for the agent. It assumes the agent has access to the existing ThoughtMachine backend (`agent/`, `RefactoredAgentPresenter`, etc.) and will create a new folder `qml_gui/` from scratch. The document avoids large code blocks, only gives hints and constraints (e.g., use PyQt6, not Qt5). The agent should execute tasks in order, reporting after each, and you will test.
-
----
-
-# Journey: Standalone QML GUI for ThoughtMachine
-
-## Ground Rules
-- **Qt version:** PyQt6 (≥6.5.0). Never use Qt5 imports or syntax.
-- **No mixing with old GUI:** `qml_gui/` is independent. Do not touch `qt_gui/`.
-- **Backend reuse:** Import `RefactoredAgentPresenter`, `ExecutionState`, etc. from existing modules.
-- **Testing after each task:** The engineer will run the GUI and confirm before moving to next task.
+ Immediate Tasks for the Agent
 
----
+I'll give you three self-contained tasks that the agent can execute sequentially. Each is small, testable, and builds toward full integration.
+Task 1: Fix Indexing Process Hanging (Prevent Ghost Daemons)
 
-## Phase 0 – Project Skeleton
+File: agent/knowledge/codebase_indexer.py
 
-### [x] Task 0.1: Create folder structure
-Create:
-```
-qml_gui/
-├── __init__.py
-├── main.py
-├── qml/
-│   └── MainWindow.qml
-├── models/
-│   └── __init__.py
-└── resources/          (empty for now)
-```
+What to change:
 
-### [x] Task 0.2: Minimal main.py
-- Use `QGuiApplication` and `QQmlApplicationEngine`.
-- Load `qml/MainWindow.qml`.
-- Set application name and organization if desired.
-- No backend yet – just a blank window.
+    In the embed_chunks_batched() function (or wherever the ChromaDB client is created), add explicit cleanup registration.
 
-**Hint:** `engine.load(QUrl.fromLocalFile(os.path.join(os.path.dirname(__file__), "qml", "MainWindow.qml")))`
+    Mark any custom threads as daemons.
 
-### [x] Task 0.3: Minimal MainWindow.qml
-- `import QtQuick 6.0`
-- `import QtQuick.Window 2.15`
-- A `Window` with `width: 800`, `height: 600`, `title: "ThoughtMachine QML"`, `visible: true`.
-- Inside, a `Text { text: "Hello QML" }`.
+Precise instructions for agent:
 
-**Test:** Run `python -m qml_gui.main`. A window with “Hello QML” appears.
+    Add at the top of the file: import atexit, signal, sys
 
----
+    Locate the ChromaDB client instantiation (likely chromadb.PersistentClient(...)). Assign it to a variable that persists, e.g., _chroma_client.
 
-## Phase 1 – Backend Integration & Conversation Model
+    Define a cleanup function:
 
-### [x] Task 1.1: Create ConversationModel (Python)
-File: `qml_gui/models/conversation_model.py`
+python
 
-- Subclass `QAbstractListModel`.
-- In `__init__(self, presenter)`, store presenter and connect to `presenter.conversation_changed`. On signal, call `self.beginResetModel()` / `endResetModel()` (simplest).
-- Define roles as enum: `RoleRole`, `RoleContent`, `RoleToolName`, `RoleIsFinal`, `RoleReasoning`, `RoleToolCalls`, `RoleToolCallId`, `RoleHtmlContent`.
-- `rowCount()` returns `len(presenter.session.user_history)`.
-- `data(index, role)` returns appropriate field from the message dict. For `RoleHtmlContent`, use `MarkdownRenderer` from old GUI (import `qt_gui.panels.markdown_renderer.MarkdownRenderer`). Instantiate once and convert `content` to HTML.
+def _cleanup():
+    if '_chroma_client' in globals() and _chroma_client:
+        _chroma_client._system.stop()
+    sys.exit(0)
 
-**Hint:** Use `self._presenter.session.user_history` to access messages.
+    Register it: atexit.register(_cleanup)
 
-### [x] Task 1.2: Expose model to QML
-In `main.py`:
-- Create a `RefactoredAgentPresenter` (same as old GUI does – it needs a session store, etc. Use default `FileSystemSessionStore`).
-- Create `ConversationModel(presenter)`.
-- Set context property: `engine.rootContext().setContextProperty("conversationModel", model)`.
-- Also set `engine.rootContext().setContextProperty("presenter", presenter)` (needed later for sending queries).
+    Also set signal handlers for SIGINT and SIGTERM:
 
-**Test:** Print model row count from QML (temporarily add a `Component.onCompleted` script that logs `conversationModel.rowCount`). No visual yet.
+python
 
-### [x] Task 1.3: Basic QML ListView
-In `MainWindow.qml`:
-- Replace the `Text` with a `ListView`.
-- Set `model: conversationModel`.
-- Delegate: a simple `Text { text: model.content }`.
-- Add `anchors.fill: parent`.
+signal.signal(signal.SIGINT, lambda sig, frame: _cleanup())
+signal.signal(signal.SIGTERM, lambda sig, frame: _cleanup())
 
-**Test:** Run – you see the conversation history as plain text. If no session loaded, create a default session or load an existing one. The list updates when new messages arrive (auto-refresh).
+    Ensure any threading.Thread calls have daemon=True.
 
----
+Verification: Run indexing and press Ctrl+C midway; check with pgrep -f indexer that no process remains.
 
-## Phase 2 – Differentiated Message Delegate
+DONE BY AGENT: Added atexit, signal handlers, and global client cleanup to codebase_indexer.py. Cleanup function stops ChromaDB system on exit.
+Task 2: Update SearchCodebaseTool to Use Configurable Lightweight Model and Add Intent Parameter
 
-[x] Task 2.1: Create MessageDelegate.qml
-File: `qml_gui/qml/MessageDelegate.qml`
+Files: tools/search_codebase.py and agent_config.json
 
-- Use `Rectangle` as root.
-- Bind `width` to parent or use `ListView.view.width`.
-- Define properties: `role`, `content`, `htmlContent`, `toolName`, `isFinal`, `reasoning`, `toolCalls`, etc. – read from `model`.
-- Use a `Column` or `Row` layout.
-- **Conditional styling** via `Loader` or `states`/`state` based on `role` and `toolName`.
-- Colors:
-  - User: border `#FF69B4`, background `#FFF0F5`
-  - Assistant: border `#99ccff`, background `#e6f3ff`
-  - Tool (role="tool"): border `#00aa00`, background `#e6ffe6`
-  - System: border `#ffcc00`, background `#fff9e6`
-  - Final (toolName in ["Final","FinalReport"]): border `#1e3a8a`, background `#dbeafe`
-  - RequestUserInteraction (toolName == "RequestUserInteraction"): border `#00bcd4`, background `#e0f7fa`
-- For assistant messages, if `reasoning` exists, show a grey box with non‑italic text.
-- For tool calls (role="assistant" with `toolCalls` list), iterate and display each tool call name/arguments.
-- For tool results (role="tool"), display tool name and result content.
+What to change:
 
-**Hint:** Use `Text { text: htmlContent; textFormat: Text.RichText }` for markdown.
+    Switch the default embedding model to "BAAI/bge-small-en-v1.5".
 
-[x] Task 2.2: Use delegate in ListView
-In `MainWindow.qml`, set `delegate: MessageDelegate { }`.
+    Add optional parameters intent and restrict_to_path to the tool's argument schema.
 
-**Test:** Messages appear with correct colors. Finals and RequestUserInteraction stand out. Reasoning is normal font.
+    Pass these to the underlying CodebaseKB.search() method (which may need corresponding updates—delegate that to agent's judgment).
 
----
+Precise instructions for agent:
 
-Phase 2.5 – Configuration & Error Handling (Minimal)
-[x] Task 2.5.1: Load configuration from environment / file
+    Config file (agent_config.json): Change "rag_embedding_model" value to "BAAI/bge-small-en-v1.5".
 
-    In qml_gui/main.py, after creating the presenter, attempt to load a config from:
+    Tool arguments schema (in tools/search_codebase.py): Update the Pydantic model (SearchCodebaseToolArgs) to include:
+    python
 
-        Environment variables: OPENAI_API_KEY, DEEPSEEK_API_KEY, MODEL, BASE_URL
+    intent: Optional[Literal["exact", "broad", "file"]] = "broad"
+    restrict_to_path: Optional[str] = None
 
-        A JSON file (e.g., ~/.thoughtmachine/config.json)
+    Tool run method: In SearchCodebaseTool.run(), map intent to appropriate limit and min_score:
 
-    Create a config dict with keys: api_key, model, base_url, provider_type (e.g., "openai" or "deepseek").
+        "exact": limit=3, min_score=0.5
 
-    If no config found, leave empty – the error will be shown later.
+        "broad": limit=10, min_score=0.0
 
-    Apply config to presenter: presenter.update_config(config).
+        "file": Use existing logic to aggregate chunks from a file (or simply return file paths).
 
-Hint: Use os.getenv() and json.load if file exists.
-[x] Task 2.5.2: Add user message to history immediately
+    Filtering by restrict_to_path: If provided, add a metadata filter to the ChromaDB query. The exact syntax depends on CodebaseKB.search() implementation; if it doesn't support filters yet, add a where parameter to that method.
 
-    In presenter.on_user_input(), before calling start_session, manually append the user message to the conversation history.
+Verification: In the REPL, call search_codebase with intent="exact" and confirm it returns fewer, higher-confidence results.
+Task 3: Make Chunk Size and Model Choice Configurable via agent_config.json
 
-    Use self.state_bridge.user_history.append({...}) with role='user', content=text, timestamp, etc.
+File: agent/config/models.py and agent_config.json
 
-    Emit self.conversation_changed.emit() so the QML view updates instantly.
+What to change:
 
-    This gives immediate feedback even if the agent fails to start.
+    Add two new fields to AgentConfig:
+    python
 
-[x] Task 2.5.3: Display errors as system messages
+    rag_batch_size: int = Field(default=16, description="Batch size for embedding generation")
+    rag_truncate_dim: Optional[int] = Field(default=None, description="Truncate embeddings to this dimension")
 
-    In presenter.start_session(), wrap the call to session_lifecycle.start_session in try/except.
+    Update agent_config.json with default values.
 
-    On exception, append a system message to user_history with the error text (e.g., "Missing API key").
+    Modify codebase_indexer.py to read these values from the config and pass them to embed_chunks_batched().
 
-    Emit conversation_changed to show the error in the conversation.
+Verification: After changes, indexing should respect the new batch size and truncation dimension from the config file.
 
-    Also emit gui_integration.emit_status_message(error).
 
-[x] Task 2.5.4: Minimal config dialog (QML)
+The next step is to avoid re-indexing the entire codebase every time. This will make the system feel snappy and usable during development.
 
-    In MainWindow.qml, add a button (e.g., "⚙️" or a gear icon) in the top bar.
+Task 4: Create an Incremental Re-indexing Tool
 
-    On click, open a Dialog with TextField for api_key, model, base_url, and a ComboBox for provider_type ("openai" / "deepseek").
+Goal: Add a new CLI command (or tool) that updates the vector store only for files that have changed since the last index.
 
-    Add a "Save" button that calls a new Python method presenter.update_config_from_qml(config_dict) (exposed via @pyqtSlot(dict) or as separate properties).
+Precise instructions for the agent:
 
-    After saving, store the config to the JSON file.
+    Add a new CLI command in agent/cli/rag_commands.py:
 
-Hint: For the dialog, use import QtQuick.Dialogs 1.3 or a simple Rectangle with visible toggled.
-[x] Task 2.5.5: Persist configuration
+        Command name: update-index
 
-    In Python, after update_config_from_qml, write the config dict to ~/.thoughtmachine/config.json.
+        Should call a new function in codebase_indexer.py, e.g., incremental_index(workspace_path, config)
 
-    On next startup, load it (Task 2.5.1).
+    In codebase_indexer.py, implement incremental_index():
 
-Test: Run QML GUI, open config dialog, enter a valid API key, save. Then send a query – agent should run and conversation updates.
-DONE BY AGENT - Configuration system fully implemented with user config file at ~/.thoughtmachine/config.json, QML dialog, and presenter integration. Modules: agent/presenter/state_bridge.py, agent/presenter/agent_presenter.py, qml_gui/qml/ConfigDialog.qml, qml_gui/qml/MainWindow.qml, qml_gui/main.py
+        Maintain a metadata file (e.g., chroma_data/.index_state.json) that stores for each file: file_path, last_modified timestamp, and a file_hash (optional).
 
-## Phase 3 – User Input Panel
+        During incremental indexing:
 
-### [x] Task 3.1: Add input area
-In `MainWindow.qml`, below the `ListView`, add a `Rectangle` with a `TextField` and a `Button`.
+            Scan workspace for all code files (using same extensions filter).
 
-- Layout: `Column` with `ListView` (stretch) + input row (fixed height).
-- Input row: `RowLayout` with `TextField` (fill width) and `Button { text: "Send" }`.
+            Compare current last_modified with stored value.
 
-### [x] Task 3.2: Connect send action
-- On button click, call `presenter.send_query(textField.text)`.
-- Clear text field.
-- Connect `TextField`’s `onAccepted` signal to same action.
+            For new or modified files: chunk, embed, and upsert into ChromaDB (overwriting any existing chunks for that file).
 
-**Note:** `presenter.send_query` is not `Q_INVOKABLE` by default. The agent must create a small wrapper class in `main.py` (e.g., `PresenterBridge` that inherits `QObject` and has `@pyqtSlot(str)` method calling `presenter.send_query`). Then expose that bridge to QML instead of the raw presenter.
+            For deleted files: remove their chunks from ChromaDB using a metadata filter on file_path.
 
-**Test:** Type a message, send – agent processes and conversation updates.
+        Update the state file after completion.
 
-DONE BY AGENT - Input panel already implemented in MainWindow.qml with TextField, Send button, and connection to presenter.on_user_input(). Layout uses ColumnLayout with ListView (stretch) + input row. Enter key handling included.
----
+    Modify full index command to also write the initial state file.
 
-## Phase 4 – Smart Scrolling
+    Expose as an optional agent tool? Later, but for now just the CLI is fine. The agent can call the CLI via subprocess when needed.
 
-### [x] Task 4.1: Implement auto‑scroll logic
-In `MainWindow.qml`:
-- Wrap `ListView` in a `ScrollView` or use `ListView`’s own properties.
-- Add a property `autoScroll` (default true).
-- On new content (e.g., on `model.dataChanged` or `count` change), check if `listView.contentY + listView.height >= listView.contentHeight - threshold` (near bottom). If yes, call `listView.positionViewAtEnd()`.
-- Provide a `CheckBox` to toggle auto‑scroll.
+Why this matters: It turns a 2-minute full index into a 5-second update after editing a few files.
+📋 Task 5 (Optional but Recommended): Staleness Detection in Agent Startup
 
-**Hint:** Use `onCountChanged` on `ListView` to detect new messages.
+Once incremental indexing exists, the agent can be made aware of codebase changes.
 
-**Test:** Scroll up – new messages do not move view. Scroll down – new messages keep you at bottom.
+Instructions for agent:
 
-DONE BY AGENT - Implemented smart scrolling with autoScroll property, scrollThreshold, CheckBox toggle, and near‑bottom detection in onCountChanged. Added RowLayout with CheckBox in MainWindow.qml.
+    In agent/core/agent.py (or wherever initialization happens), after loading the CodebaseKB, compare the stored index hash with the current workspace hash.
 
----
+    If different, add a system message to the agent's initial prompt: "The codebase has changed since the last index. You may want to suggest running update-index for accurate search results."
 
-## Phase 5 – Status Bar & Token Display
+    The agent can then, when appropriate, inform the user or call the update tool itself.
 
-### Task 5.1: Create StatusBridge (Python)
-In `main.py`, create a class `StatusBridge(QObject)` with:
-- Signals: `tokensUpdated(int, int)`, `contextUpdated(int)`, `stateChanged(str)`.
-- Connect to `presenter.tokens_updated`, `presenter.context_updated`, `presenter.state_changed`.
-- Expose properties or methods to QML.
+✅ Summary for the Agent's Next Sprint
 
-### Task 5.2: Show status in QML
-In `MainWindow.qml`, add a top bar (e.g., `Rectangle` with `RowLayout`) showing:
-- Input tokens, output tokens, context length.
-- State as colored dot + text.
-- Use `Text` with bindings to `statusBridge` properties.
+    Task 4: Incremental re-indexing – Implement update-index CLI command and incremental_index() function.
 
-**Test:** When agent runs, numbers update and state changes.
+    Task 5: Staleness awareness – Add hash check at startup with a system message.
 
----
+    Task 6 (later): GUI integration – Add a button and notification area.
 
-## Phase 6 – Session Tabs
-
-### Task 6.1: Create SessionTab component
-File: `qml_gui/qml/SessionTab.qml`
-
-- Encapsulates `ListView` (conversation), input panel, status bar.
-- Takes a `model` and `presenterBridge` as properties.
-- Internally uses the same layout as `MainWindow` but without outer tabs.
-
-### Task 6.2: Tab management in MainWindow
-- Replace the single view with a `TabBar` + `StackLayout` (or `SwipeView`).
-- Maintain a list of session models and bridges.
-- Provide a “New Session” button that:
-  - Creates a new `RefactoredAgentPresenter` (in Python, via a method exposed to QML).
-  - Creates a new `ConversationModel` for it.
-  - Creates a new `PresenterBridge`.
-  - Adds a new tab with `SessionTab` and appropriate properties.
-- Allow closing tabs.
-
-**Hint:** In Python, create a `SessionManager` class that holds list of presenters/models and can create new ones. Expose it to QML.
-
-**Test:** Multiple tabs, independent conversations, switch, close.
-
----
-
-## Phase 7 – Sidebar with Icon Buttons (VSCode style)
-
-### Task 7.1: Create sidebar layout
-In `MainWindow.qml`, change to `RowLayout`:
-- Left: `Column` of `Button` with icons (use `Image` from `resources/` or `FontAwesome` via `Text`).
-- Center: the tab container (conversation + input).
-- Right: a `StackLayout` for configuration panels (initially empty or hidden).
-
-### Task 7.2: Icon actions
-- On icon click, set the right stack’s current index to the corresponding panel.
-- Panels: “Agent Config”, “Tools”, etc. (initially placeholder rectangles).
-
-### Task 7.3: Expose configuration settings
-- Create Python `ConfigBridge` that reads/writes agent configuration (e.g., model, temperature, etc.) using `presenter.config` or `presenter.update_config`.
-- Expose to QML and bind to form elements in the config panel.
-
-**Test:** Click icons, panels appear. Change a setting, agent uses new value.
-
----
-
-## Phase 8 – Save Session
-
-### Task 8.1: Save button
-Add a `Button` in the top bar or tab header: “Save”.
-On click, open a QML `Dialog` with a `TextField` for session name.
-Call `presenter.save_session(name)` (expose via `PresenterBridge`).
-Show a temporary notification on success.
-
-**Test:** Save a session, close tab, reopen – session loads correctly.
-
----
-
-## Phase 9 – Performance Optimisation
-
-### Task 9.1: Incremental model updates
-Modify `ConversationModel` to listen to `ObservableList` callbacks instead of full resets.
-- Implement `beginInsertRows` / `endInsertRows` when a new message is appended.
-- Use `dataChanged` for modifications.
-- Keep track of previous message count.
-
-### Task 9.2: Delegate recycling
-Ensure `ListView` uses `cacheBuffer` to keep delegates alive for smooth scrolling.
-- Set `cacheBuffer: 500` or appropriate.
-
-**Test:** Load a conversation with 1000+ messages, scroll – no lag.
-
----
-
-## Phase 10 – Polish & Theming
-
-### Task 10.1: Dark/light theme toggle
-- Create a `Settings` singleton in QML that holds `theme`.
-- Use `Loader` to load different style files or bind colors to theme property.
-- Add a button to toggle.
-
-### Task 10.2: Animations
-- Add smooth transitions for new messages (fade‑in).
-- Animate sidebar panel sliding.
-
-### Task 10.3: Error handling
-- Show error dialog when presenter fails.
-- Display loading indicator while agent is thinking.
-
-**Final Test:** Full workflow – new session, send messages, scroll, change settings, save, reload, switch tabs, use dark mode – everything works.
-
----
-
-## Agent Instructions
-- Execute tasks **in order**, one at a time.
-- After each task, report what was done and provide the exact command to run (e.g., `python -m qml_gui.main`).
-- If a task requires code, write the code with proper PyQt6 imports. Avoid large blocks unless necessary; reuse existing backend modules.
-- When in doubt, ask the engineer for clarification before proceeding.
-- Keep a checklist (copy of this document) and mark each subtask as `[x]` when completed.
-
----
-
-The engineer will now hand this document to the agent and let it begin from **Phase 0, Task 0.1**.
+Each task is self-contained and builds on the previous work.

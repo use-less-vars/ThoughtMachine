@@ -20,7 +20,7 @@ from agent.core.state import ExecutionState
 from agent.config.service import create_agent_config_service
 from qt_gui.config.config_bridge import GUIConfigBridge
 from session.store import FileSystemSessionStore
-from tools import TOOL_CLASSES, SIMPLIFIED_TOOL_CLASSES
+from tools import SIMPLIFIED_TOOL_CLASSES
 from pathlib import Path
 
 load_dotenv()
@@ -379,7 +379,13 @@ class SessionTab(QWidget):
         self.right_layout = right_layout
 
         # Agent Controls Panel
-        self.agent_controls_panel = AgentControlsPanel(SIMPLIFIED_TOOL_CLASSES)
+        # Filter out SearchCodebaseTool if rag_enabled is False
+        rag_enabled = self.config_bridge.config_service.get('rag_enabled', False)
+        if not rag_enabled:
+            filtered_tool_classes = [cls for cls in SIMPLIFIED_TOOL_CLASSES if cls.__name__ != 'SearchCodebaseTool']
+        else:
+            filtered_tool_classes = SIMPLIFIED_TOOL_CLASSES
+        self.agent_controls_panel = AgentControlsPanel(filtered_tool_classes)
         right_layout.addWidget(self.agent_controls_panel)
 
         # Set callback for MCP config changes to refresh tools
@@ -867,25 +873,27 @@ class SessionTab(QWidget):
     def load_config(self):
         """Load configuration from file and update controls."""
         self._loading_config = True
-        
+
         try:
             # Load config from bridge
             config = self.config_bridge.get_config()
-            
+
+            # Refresh tools list based on rag_enabled
+            self._refresh_tools()
+
             # Update controls
             self.agent_controls_panel.set_config_dict(config)
-            
+
             # Update presenter configuration
             self.presenter.update_config(config)
-            
 
-            # print("[GUI] Configuration loaded")            
+
+            # print("[GUI] Configuration loaded")
         except Exception as e:
             # print(f"[GUI] Error loading config: {e}")
             pass
         finally:
-            self._loading_config = False
-    
+            self._loading_config = False    
     def _on_config_changed(self, config):
         """Handle configuration changes from bridge (e.g., file changed)."""
         # Update UI with new config
@@ -940,11 +948,17 @@ class SessionTab(QWidget):
         try:
             import tools
             importlib.reload(tools)
-            from tools import TOOL_CLASSES
-            self.tool_classes = TOOL_CLASSES
-            self.agent_controls_panel.tool_classes = TOOL_CLASSES
+            from tools import SIMPLIFIED_TOOL_CLASSES
+            # Filter out SearchCodebaseTool if rag_enabled is False
+            rag_enabled = self.config_bridge.config_service.get('rag_enabled', False)
+            if not rag_enabled:
+                filtered_tool_classes = [cls for cls in SIMPLIFIED_TOOL_CLASSES if cls.__name__ != 'SearchCodebaseTool']
+            else:
+                filtered_tool_classes = SIMPLIFIED_TOOL_CLASSES
+            self.tool_classes = filtered_tool_classes
+            self.agent_controls_panel.tool_classes = filtered_tool_classes
             self.agent_controls_panel._rebuild_tool_checkboxes()
-            # print(f"[GUI] Refreshed tools: {len(TOOL_CLASSES)} tools loaded")
+            # print(f"[GUI] Refreshed tools: {len(filtered_tool_classes)} tools loaded")
         except Exception as e:
             # print(f"[GUI] Error refreshing tools: {e}")
             pass

@@ -4,7 +4,7 @@ Configuration models for the ThoughtMachine agent.
 """
 
 from typing import Optional, Callable, List, Any, Dict, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from agent.logging.debug_log import debug_log
 
 from tools import SIMPLIFIED_TOOL_CLASSES
@@ -57,6 +57,14 @@ class AgentConfig(BaseModel):
     # Workspace configuration for file system access restrictions
     workspace_path: Optional[str] = Field(default=None, description="Root directory for file operations (None = unrestricted)")
 
+    # RAG configuration
+    use_qml_ui: bool = Field(default=False, description="Use QML-based UI instead of Qt Widgets")
+    rag_enabled: bool = Field(default=False, description="Enable RAG functionality")
+    rag_embedding_model: str = Field(default="BAAI/bge-small-en-v1.5", description="Model name for sentence-transformers embeddings")
+    rag_vector_store_path: Optional[str] = Field(default=None, description="Path to vector store database (None = default .thoughtmachine/rag/)")
+    rag_chunk_size: int = Field(default=1500, description="Size of text chunks for RAG indexing (characters)")
+    rag_chunk_overlap: int = Field(default=200, description="Overlap between chunks for RAG indexing (characters)")
+
     # Tool output limit configuration
     tool_output_token_limit: int = Field(default=10000, description="Maximum token limit for tool outputs (default 10,000 tokens)")
     # UI detail level configuration
@@ -64,9 +72,54 @@ class AgentConfig(BaseModel):
 
     # Enabled tools configuration
     enabled_tools: List[str] = Field(
-        default_factory=lambda: [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES], 
+        default_factory=lambda: [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES],
         description="List of enabled tool class names"
     )
 
-    class Config:
-        extra = "ignore"  # Allow backward compatibility with older configs
+    @field_validator('enabled_tools')
+    def filter_search_codebase_tool(cls, v, info):
+        """Ensure SearchCodebaseTool is only available when rag_enabled is True."""
+        rag_enabled = info.data.get('rag_enabled', False)
+        if not rag_enabled:
+            # Remove SearchCodebaseTool from enabled_tools
+            filtered = [tool for tool in v if tool != 'SearchCodebaseTool']
+            # Only return filtered if different from original (avoid infinite recursion)
+            if filtered != v:
+                return filtered
+        return v
+    
+    @model_validator(mode='after')
+    def filter_default_enabled_tools(self):
+        """Filter SearchCodebaseTool from default enabled_tools when rag_enabled=False."""
+        if not self.rag_enabled and self.enabled_tools:
+            # Remove SearchCodebaseTool from enabled_tools
+            filtered = [tool for tool in self.enabled_tools if tool != 'SearchCodebaseTool']
+            # Create a new instance with updated enabled_tools
+            # Since Pydantic models are immutable, we return a dict with changes
+            # Actually we can't mutate self; we need to return a new model.
+            # However, model_validator after mode can return the model itself.
+            # We'll set the attribute directly (allowed in after mode).
+            # But we must be careful not to trigger infinite recursion.
+            # Use object.__setattr__ to bypass Pydantic's validation.
+            if filtered != self.enabled_tools:
+                object.__setattr__(self, 'enabled_tools', filtered)
+        return self
+    
+    def get_filtered_tool_classes(self):
+        """Get tool classes filtered based on rag_enabled and enabled_tools."""
+        from tools import SIMPLIFIED_TOOL_CLASSES
+        
+        # Start with SIMPLIFIED_TOOL_CLASSES
+        tool_classes = list(SIMPLIFIED_TOOL_CLASSES)
+        
+        # Filter out SearchCodebaseTool if rag_enabled is False
+        if not self.rag_enabled:
+            tool_classes = [cls for cls in tool_classes if cls.__name__ != 'SearchCodebaseTool']
+        
+        # Also filter based on enabled_tools if specified
+        if self.enabled_tools:
+            tool_classes = [cls for cls in tool_classes if cls.__name__ in self.enabled_tools]
+        
+        return tool_classes
+
+    class Config:        extra = "ignore"  # Allow backward compatibility with older configs

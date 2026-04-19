@@ -15,7 +15,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from agent.config.models import AgentConfig
-from agent.knowledge.codebase_indexer import index_codebase
+from agent.knowledge.codebase_indexer import index_codebase, incremental_index
 from agent.knowledge.dependencies import check_rag_dependencies
 
 
@@ -106,6 +106,72 @@ def add_index_codebase_subparser(subparsers):
     return parser
 
 
+def update_index_command(args) -> int:
+    """
+    Execute the update-index command for incremental re-indexing.
+    
+    Args:
+        args: argparse namespace with workspace flag
+    
+    Returns:
+        Exit code (0 for success, 1 for failure)
+    """
+    workspace_path = args.workspace
+    if workspace_path is None:
+        # Try to get workspace from environment or current directory
+        workspace_path = os.getcwd()
+        print(f"Using current directory as workspace: {workspace_path}")
+
+    workspace_path = os.path.abspath(workspace_path)
+
+    if not os.path.exists(workspace_path):
+        print(f"Error: Workspace path does not exist: {workspace_path}")
+        return 1
+
+    if not os.path.isdir(workspace_path):
+        print(f"Error: Workspace path is not a directory: {workspace_path}")
+        return 1
+
+    # Check RAG dependencies
+    rag_available, missing_msg = check_rag_dependencies()
+    if not rag_available:
+        print(f"Error: {missing_msg}", file=sys.stderr)
+        print("Please install required packages: pip install chromadb sentence-transformers tree-sitter pathspec")
+        return 1
+
+    # Create a minimal AgentConfig with default RAG settings
+    config = AgentConfig()
+
+    print(f"Performing incremental update of codebase index at: {workspace_path}")
+
+    success, message = incremental_index(workspace_path, config)
+
+    if success:
+        print(f"Success: {message}")
+        return 0
+    else:
+        print(f"Failed: {message}")
+        return 1
+
+
+def add_update_index_subparser(subparsers):
+    """
+    Add the update-index subcommand to argparse subparsers.
+    """
+    parser = subparsers.add_parser(
+        "update-index",
+        help="Incrementally update an existing codebase index (only changed files)"
+    )
+    parser.add_argument(
+        "--workspace",
+        "-w",
+        type=str,
+        help="Path to workspace directory (default: current directory)"
+    )
+    parser.set_defaults(func=update_index_command)
+    return parser
+
+
 def main():
     """Main entry point for the RAG CLI."""
     parser = argparse.ArgumentParser(
@@ -119,6 +185,7 @@ def main():
     
     # Add subcommands
     add_index_codebase_subparser(subparsers)
+    add_update_index_subparser(subparsers)
     
     args = parser.parse_args()
     

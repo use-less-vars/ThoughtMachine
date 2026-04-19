@@ -16,7 +16,28 @@ import time
 
 from agent.config.models import AgentConfig
 import agent.knowledge.dependencies as deps
+import atexit
+import signal
+import sys
 
+# Global client for cleanup
+_chroma_client = None
+
+
+def _cleanup_client():
+    if '_chroma_client' in globals() and _chroma_client:
+        try:
+            _chroma_client._system.stop()
+        except Exception:
+            pass
+
+def _signal_handler(sig, frame):
+    _cleanup_client()
+    sys.exit(0)
+
+atexit.register(_cleanup_client)
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
 logger = logging.getLogger(__name__)
 
 
@@ -895,6 +916,8 @@ def create_or_get_chroma_collection(workspace_hash: str, config: AgentConfig, fo
         path=str(vector_store_path),
         settings=Settings(anonymized_telemetry=False)
     )
+    global _chroma_client
+    _chroma_client = client
     
     collection_name = f"codebase_{workspace_hash}"
     
@@ -990,6 +1013,7 @@ def embed_chunks_batched(chunks: List[Dict[str, Any]], config: AgentConfig, coll
     return processed
 
 def index_codebase(workspace_path: str, config: AgentConfig, force: bool = False) -> Tuple[bool, str]:
+
     """
     Main entry point: index a codebase for semantic search.
     
@@ -1054,5 +1078,205 @@ def index_codebase(workspace_path: str, config: AgentConfig, force: bool = False
         
     except Exception as e:
         msg = f"Indexing failed: {e}"
+        logger.exception(msg)
+        return False, msg
+
+
+def incremental_index(workspace_path: str, config: AgentConfig) -> Tuple[bool, str]:
+    """
+    Incrementally update an existing codebase index.
+    
+    This function tracks file modifications since the last indexing run and
+    only processes files that have changed or been added.
+    
+    Args:
+        workspace_path: Path to the workspace directory
+        config: AgentConfig with RAG settings
+        
+    Returns:
+        Tuple of (success, message)
+        - success: True if incremental indexing succeeded, False otherwise
+        - message: Descriptive message about the result
+    """
+    if not deps.RAG_AVAILABLE:
+        msg = "RAG dependencies not available. Cannot perform incremental indexing."
+        logger.error(msg)
+        return False, msg
+    
+    workspace_path = Path(workspace_path)
+    if not workspace_path.exists():
+        msg = f"Workspace path does not exist: {workspace_path}"
+        logger.error(msg)
+        return False, msg
+    if not workspace_path.is_dir():
+        msg = f"Workspace path is not a directory: {workspace_path}"
+        logger.error(msg)
+        return False, msg
+    
+    logger.info(f"Starting incremental indexing for: {workspace_path}")
+    
+    try:
+        # Compute workspace hash
+        workspace_hash = compute_workspace_hash(str(workspace_path))
+        logger.info(f"Workspace hash: {workspace_hash}")
+        
+        # Load or create index state file
+        state_file = Path(config.vector_store_path) / f"index_state_{workspace_hash}.json"
+        index_state = {}
+        if state_file.exists():
+            try:
+                import json
+                with open(state_file, 'r', encoding='utf-8') as f:
+                    index_state = json.load(f)
+                logger.info(f"Loaded existing index state from: {state_file}")
+            except Exception as e:
+                logger.warning(f"Failed to load index state: {e}. Creating new state.")
+        
+        # Get collection to check existing documents
+        collection = create_or_get_chroma_collection(workspace_hash, config, force=False)
+        existing_count = collection.count()
+        logger.info(f"Collection currently contains {existing_count} documents")
+        
+        # Scan for modified files
+        logger.info("Scanning for modified files...")
+        modified_files = []
+        deleted_files = []
+        
+        # Track current file modifications
+        for file_path in workspace_path.rglob("*"):
+            if should_skip_file(file_path, workspace_path):
+                continue
+            
+            if not file_path.is_file():
+                continue
+            
+            # Get file stats
+            try:
+                mtime = file_path.stat().st_mtime
+                file_size = file_path.stat().st_size
+                file_info = {
+                    "path": str(file_path.relative_to(workspace_path)),
+                    "mtime": mtime,
+                    "size": file_size
+                }
+                
+                # Check if file has changed
+                file_key = str(file_path.relative_to(workspace_path))
+                if file_key in index_state:
+                    old_info = index_state[file_key]
+                    if old_info["mtime"] == mtime and old_info["size"] == file_size:
+                        # File unchanged, skip
+                        continue
+                
+                # File is new or modified
+                modified_files.append(file_path)
+                # Update state
+                index_state[file_key] = {"mtime": mtime, "size": file_size}
+                
+            except Exception as e:
+                logger.warning(f"Could not stat file {file_path}: {e}")
+                continue
+        
+        # Identify deleted files (present in state but not on disk)
+        for file_key in list(index_state.keys()):
+            full_path = workspace_path / file_key
+            if not full_path.exists():
+                deleted_files.append(file_key)
+                # Remove from state
+                del index_state[file_key]
+        
+        logger.info(f"Found {len(modified_files)} modified/new files and {len(deleted_files)} deleted files")
+        
+        if not modified_files and not deleted_files:
+            msg = "No changes detected. Index is up to date."
+            logger.info(msg)
+            return True, msg
+        
+        # Delete documents for removed files
+        if deleted_files:
+            logger.info(f"Removing {len(deleted_files)} deleted files from index...")
+            deleted_ids = []
+            for file_key in deleted_files:
+                # Query for documents from this file
+                try:
+                    results = collection.get(
+                        where={"file_path": {"$contains": file_key}}
+                    )
+                    if results and results.get("ids"):
+                        deleted_ids.extend(results["ids"])
+                except Exception as e:
+                    logger.warning(f"Failed to query documents for deleted file {file_key}: {e}")
+            
+            if deleted_ids:
+                collection.delete(ids=deleted_ids)
+                logger.info(f"Removed {len(deleted_ids)} documents for deleted files")
+        
+        # Process modified/new files
+        total_chunks = 0
+        for file_path in modified_files:
+            try:
+                # Determine language from extension
+                ext = file_path.suffix.lower()
+                supported_extensions = {
+                    '.py': 'python', '.js': 'javascript', '.jsx': 'javascript',
+                    '.ts': 'typescript', '.tsx': 'typescript', '.java': 'java',
+                    '.c': 'c', '.cpp': 'cpp', '.h': 'c', '.hpp': 'cpp',
+                    '.go': 'go', '.rs': 'rust', '.rb': 'ruby', '.php': 'php',
+                    '.swift': 'swift', '.kt': 'kotlin', '.scala': 'scala',
+                    '.cs': 'csharp', '.fs': 'fsharp', '.vb': 'vb', '.sql': 'sql',
+                    '.html': 'html', '.css': 'css', '.json': 'json',
+                    '.yaml': 'yaml', '.yml': 'yaml', '.toml': 'toml', '.xml': 'xml',
+                    '.sh': 'bash', '.bash': 'bash', '.md': 'markdown', '.txt': 'text'
+                }
+                
+                if ext not in supported_extensions:
+                    continue
+                
+                language = supported_extensions[ext]
+                
+                # First, remove existing chunks for this file (if any)
+                file_key = str(file_path.relative_to(workspace_path))
+                existing_results = collection.get(
+                    where={"file_path": {"$contains": file_key}}
+                )
+                if existing_results and existing_results.get("ids"):
+                    collection.delete(ids=existing_results["ids"])
+                    logger.debug(f"Removed {len(existing_results['ids'])} existing chunks for {file_key}")
+                
+                # Parse and create new chunks
+                file_chunks = parse_file_with_tree_sitter(file_path, language, config)
+                if not file_chunks:
+                    continue
+                
+                # Add new chunks to collection
+                processed = embed_chunks_batched(
+                    file_chunks, config, collection, workspace_hash, batch_size=16
+                )
+                total_chunks += processed
+                logger.debug(f"Added {processed} chunks for {file_key}")
+                
+            except Exception as e:
+                logger.warning(f"Failed to process file {file_path}: {e}")
+                continue
+        
+        # Save updated state
+        try:
+            import json
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(state_file, 'w', encoding='utf-8') as f:
+                json.dump(index_state, f, indent=2)
+            logger.info(f"Saved index state to: {state_file}")
+        except Exception as e:
+            logger.warning(f"Failed to save index state: {e}")
+        
+        # Count total documents
+        final_count = collection.count()
+        msg = f"Incremental indexing completed. Added {total_chunks} chunks, removed {len(deleted_files)} files. Collection now contains {final_count} documents."
+        logger.info(msg)
+        
+        return True, msg
+        
+    except Exception as e:
+        msg = f"Incremental indexing failed: {e}"
         logger.exception(msg)
         return False, msg

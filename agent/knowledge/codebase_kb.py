@@ -221,20 +221,22 @@ class LocalCodebaseKB(BaseKnowledgeBase):
         """
         return self.is_indexed()
     
-    def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def search(self, query: str, top_k: int = 5, min_score: Optional[float] = None, where: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """
         Search the indexed codebase for relevant code snippets.
-        
+
         Args:
             query: Natural language query
             top_k: Maximum number of results to return
-        
+            min_score: Minimum similarity score (0-1) to filter results. If None, all results returned.
+            where: Optional filter dictionary for metadata fields (ChromaDB where clause).
+
         Returns:
             List of result dictionaries with keys:
                 - content: str - The code snippet text
                 - metadata: Dict[str, Any] - File path, line numbers, language
                 - score: float - Similarity score (0-1, higher is more relevant)
-        
+
         Returns empty list if:
             - RAG dependencies are missing
             - Collection does not exist (index not created)
@@ -273,11 +275,16 @@ class LocalCodebaseKB(BaseKnowledgeBase):
         # Perform search
         try:
             import chromadb
-            results = collection.query(
-                query_embeddings=[query_embedding],
-                n_results=top_k,
-                include=["metadatas", "documents", "distances"]
-            )
+            # Build query parameters
+            query_params = {
+                "query_embeddings": [query_embedding],
+                "n_results": top_k,
+                "include": ["metadatas", "documents", "distances"]
+            }
+            if where is not None:
+                query_params["where"] = where
+            
+            results = collection.query(**query_params)
         except chromadb.errors.InvalidArgumentError as e:
             # Dimension mismatch - suggest re-indexing
             logger.error(
@@ -319,7 +326,15 @@ class LocalCodebaseKB(BaseKnowledgeBase):
                 "score": score
             })
         
-        logger.debug(f"Codebase search returned {len(formatted_results)} results")
+        # Filter by minimum score if specified
+        if min_score is not None:
+            filtered_results = []
+            for result in formatted_results:
+                if result["score"] >= min_score:
+                    filtered_results.append(result)
+            formatted_results = filtered_results
+            
+        logger.debug(f"Codebase search returned {len(formatted_results)} results (after min_score filter)")
         return formatted_results    
     def add(self, content: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """

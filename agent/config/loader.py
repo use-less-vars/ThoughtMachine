@@ -33,10 +33,24 @@ def _map_legacy_fields(config_dict: Dict[str, Any]) -> Dict[str, Any]:
         mapped["tool_output_token_limit"] = mapped["tool_output_limit"]
         del mapped["tool_output_limit"]
     
+    # Map old RAG configuration fields
+    if "chunk_size" in mapped:
+        mapped["rag_chunk_size"] = mapped["chunk_size"]
+        del mapped["chunk_size"]
+    if "chunk_overlap" in mapped:
+        mapped["rag_chunk_overlap"] = mapped["chunk_overlap"]
+        del mapped["chunk_overlap"]
+    if "embedding_model" in mapped:
+        mapped["rag_embedding_model"] = mapped["embedding_model"]
+        del mapped["embedding_model"]
+    
     # Note: token_monitor_enabled already same name
     # Note: workspace_path already same name
     # Note: enabled_tools already same name
     # Note: detail already same name
+    # Note: use_qml_ui already same name
+    # Note: rag_enabled already same name
+    # Note: rag_vector_store_path already same name
     
     return mapped
 

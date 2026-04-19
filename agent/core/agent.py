@@ -147,7 +147,7 @@ class Agent:
         self.debug_context = DebugContext(self.logger)
         
         # Tool setup
-        self.tool_classes = config.tool_classes if config.tool_classes is not None else SIMPLIFIED_TOOL_CLASSES
+        self.tool_classes = config.tool_classes if config.tool_classes is not None else config.get_filtered_tool_classes()
         self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
         
         # Initialize tool executor with security availability
@@ -629,7 +629,7 @@ class Agent:
         )
         
         # Update tool classes
-        self.tool_classes = new_config.tool_classes if new_config.tool_classes is not None else SIMPLIFIED_TOOL_CLASSES
+        self.tool_classes = new_config.tool_classes if new_config.tool_classes is not None else new_config.get_filtered_tool_classes()
         self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
         
         # Recreate tool executor

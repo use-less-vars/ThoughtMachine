@@ -6,7 +6,7 @@ Provides semantic search over an indexed codebase using RAG.
 
 import logging
 from pathlib import Path
-from typing import Literal, ClassVar, List, Dict, Any
+from typing import Literal, ClassVar, List, Dict, Any, Optional
 
 from pydantic import Field
 
@@ -42,6 +42,8 @@ class SearchCodebaseTool(ToolBase):
     
     query: str = Field(..., description="Natural language query about the codebase.")
     top_k: int = Field(5, description="Number of results to return.")
+    intent: Literal["exact", "broad", "file"] = Field("broad", description="Search intent: 'exact' for high precision, 'broad' for more results, 'file' for file-level results.")
+    restrict_to_path: Optional[str] = Field(None, description="Optional path to restrict search to (e.g., 'src/utils/')")
     
     def execute(self) -> str:
         """
@@ -95,18 +97,59 @@ class SearchCodebaseTool(ToolBase):
         if not kb.is_indexed():
             return "No codebase index found. Run `thoughtmachine index-codebase` first to create an index."
         
+        # Determine search parameters based on intent
+        min_score = None
+        where = None
+        
+        # Map intent to minimum score threshold
+        if self.intent == "exact":
+            min_score = 0.5
+        elif self.intent == "broad":
+            min_score = None  # No threshold
+        elif self.intent == "file":
+            # File-level search (not yet fully implemented - treats as broad)
+            min_score = None
+            self._log_debug("File-level search intent selected - will group results by file")
+        
+        # Add path restriction if specified
+        if self.restrict_to_path:
+            # ChromaDB $contains operator for substring match in file_path metadata
+            where = {"file_path": {"$contains": self.restrict_to_path}}
+            self._log_debug(f"Restricting search to path: {self.restrict_to_path}")
+        
         # Perform search
         try:
-            results = kb.search(self.query, top_k=self.top_k)
+            results = kb.search(
+                query=self.query,
+                top_k=self.top_k,
+                min_score=min_score,
+                where=where
+            )
         except Exception as e:
             return f"Error searching codebase: {e}"
         
+        # For file-level intent, group results by file
+        if self.intent == "file" and results:
+            # Group results by file_path, keep highest scoring result per file
+            file_groups = {}
+            for result in results:
+                metadata = result.get("metadata", {})
+                file_path = metadata.get("file_path", "")
+                if file_path not in file_groups:
+                    file_groups[file_path] = result
+                else:
+                    # Keep the result with higher score
+                    if result.get("score", 0) > file_groups[file_path].get("score", 0):
+                        file_groups[file_path] = result
+            # Convert back to list
+            results = list(file_groups.values())
+            self._log_debug(f"File-level grouping: {len(results)} unique files")
+
         # Format results
         if not results:
             return "No relevant code found."
-        
-        return self._format_results(results)
-    
+
+        return self._format_results(results)    
     def _format_results(self, results: List[Dict[str, Any]]) -> str:
         """
         Format search results as Markdown.

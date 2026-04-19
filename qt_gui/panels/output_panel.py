@@ -125,7 +125,10 @@ class OutputPanel(QWidget):
     def display_event(self, event: dict) -> None:
         """Single entry point for all events from the presenter."""
         debug_log(f"DEBUG display_event keys: {list(event.keys())}", level="DEBUG", component="OutputPanel")
+        debug_log(f"DEBUG display_event type: {event.get('type')}", level="DEBUG", component="OutputPanel")
         debug_log(f"DEBUG display_event content sample: {str(event)[:200]}", level="DEBUG", component="OutputPanel")
+        if event.get('type') == 'system':
+            debug_log(f"DEBUG system event: content={event.get('content', '')[:100]}", level="DEBUG", component="OutputPanel")
         if not self._should_display(event):
             return
         html = self._render_event(event)
@@ -136,6 +139,7 @@ class OutputPanel(QWidget):
         Later this can be made configurable via user settings.
         For now, always return True."""
         # TODO: Integrate with filter UI in Phase 5
+        debug_log(f"DEBUG _should_display: type={event.get('type')}, role={event.get('role')}", level="DEBUG", component="OutputPanel")
         return True
 
     def _render_event(self, event) -> str:
@@ -178,7 +182,7 @@ class OutputPanel(QWidget):
                 escaped_args = html.escape(args_str)
                 # Add background to content area for special tools
                 inner_bg = f"background-color: {bg_color};" if tool_name in self.SPECIAL_TOOLS else ""
-                tool_block = f'''<div style="border: 1px solid {border_color}; border-radius: 5px; margin-top: 8px; margin-bottom: 8px; overflow: hidden;"><div style="background-color: {bg_color} !important; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {border_color}; display: block; width: 100%; box-sizing: border-box;">{header}</div><div style="padding: 10px; {inner_bg}">'''
+                tool_block = f'''<div style="border: 1px solid {border_color}; border-radius: 5px; margin-top: 8px; margin-bottom: 8px; overflow: hidden; width: 100%;"><div style="background-color: {bg_color} !important; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {border_color}; margin: 0 !important; display: inline-block !important; vertical-align: top; width: 100% !important; box-sizing: border-box; min-width: 100% !important; position: relative;">{header}</div><div style="padding: 10px; {inner_bg} width: 100%; box-sizing: border-box;">'''
                 if tool_name not in self.SPECIAL_TOOLS:
                     tool_block += f'''<div style="color: #666666; font-size: 0.9em; font-family: monospace, monospace;">Arguments: {escaped_args}</div>'''
                 tool_block += '''</div></div>'''
@@ -268,7 +272,7 @@ class OutputPanel(QWidget):
             content_background = f"background-color: {bg_color};"
         
         # Build HTML
-        html_block = f'''<div style="border: 1px solid {border_color}; border-radius: 5px; margin-bottom: 12px; overflow: hidden;"><div style="background-color: {bg_color} !important; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {border_color}; display: block; width: 100%; box-sizing: border-box;">{header}</div><div style="padding: 10px; {content_background}">{reasoning_html}{tool_calls_html}{rendered_content}</div></div>'''
+        html_block = f'''<div style="border: 1px solid {border_color}; border-radius: 5px; margin-bottom: 12px; overflow: hidden; width: 100%;"><div style="background-color: {bg_color} !important; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {border_color}; margin: 0 !important; display: inline-block !important; vertical-align: top; width: 100% !important; box-sizing: border-box; min-width: 100% !important; position: relative;">{header}</div><div style="padding: 10px; {content_background} width: 100%; box-sizing: border-box;">{reasoning_html}{tool_calls_html}{rendered_content}</div></div>'''
         
         # For tool calls, optionally show arguments
         if event_type == "tool_call":
