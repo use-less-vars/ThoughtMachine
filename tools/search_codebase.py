@@ -111,23 +111,55 @@ class SearchCodebaseTool(ToolBase):
             min_score = None
             self._log_debug("File-level search intent selected - will group results by file")
         
-        # Add path restriction if specified
-        if self.restrict_to_path:
-            # ChromaDB $contains operator for substring match in file_path metadata
-            where = {"file_path": {"$contains": self.restrict_to_path}}
-            self._log_debug(f"Restricting search to path: {self.restrict_to_path}")
-        
-        # Perform search
+        # Perform search without where filter initially
+        # ChromaDB's $contains filter is broken in version 1.5.7, so we'll filter client-side
         try:
-            results = kb.search(
+            # Get more results than needed because we'll filter client-side
+            search_top_k = min(self.top_k * 3, 50)  # Get up to 50 results for filtering
+            raw_results = kb.search(
                 query=self.query,
-                top_k=self.top_k,
+                top_k=search_top_k,
                 min_score=min_score,
-                where=where
+                where=None  # Don't use broken $contains filter
             )
+            
+            # Filter results by restrict_to_path if specified
+            results = []
+            if self.restrict_to_path:
+                # Normalize the path restriction
+                restrict_path = self.restrict_to_path
+                if not restrict_path.endswith('/') and not restrict_path.endswith('\\'):
+                    # For better matching, ensure path separator for directory matching
+                    restrict_path = restrict_path + '/'
+                
+                self._log_debug(f"Filtering results by path: {restrict_path}")
+                filtered_count = 0
+                for result in raw_results:
+                    metadata = result.get("metadata", {})
+                    file_path = metadata.get("file_path", "")
+                    
+                    # Check if restrict_path appears in file_path
+                    # Works for both absolute and relative paths
+                    if restrict_path in file_path:
+                        results.append(result)
+                        filtered_count += 1
+                    else:
+                        # Try without the trailing slash too
+                        if self.restrict_to_path in file_path:
+                            results.append(result)
+                            filtered_count += 1
+                        else:
+                            self._log_debug(f"Skipping file (does not match {restrict_path}): {file_path[:80]}...")
+                
+                self._log_debug(f"Path filtering: {len(raw_results)} raw results -> {filtered_count} matched {self.restrict_to_path}")
+            else:
+                results = raw_results
+                
+            # Trim to requested top_k
+            results = results[:self.top_k]
+            
         except Exception as e:
-            return f"Error searching codebase: {e}"
-        
+            return f"Error searching codebase: {e}"        
         # For file-level intent, group results by file
         if self.intent == "file" and results:
             # Group results by file_path, keep highest scoring result per file
