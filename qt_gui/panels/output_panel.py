@@ -160,6 +160,7 @@ class OutputPanel(QWidget):
                 arguments = tool_func.get("arguments", "{}")
                 # Store mapping for tool result styling
                 if tool_id:
+                    debug_log(f"DEBUG _render_event assistant tool_call mapping: id={tool_id}, name={tool_name}", level="DEBUG", component="OutputPanel")
                     self._tool_call_map[tool_id] = tool_name
                 # Build tool call HTML block
                 if tool_name in self.SPECIAL_TOOLS:
@@ -193,6 +194,7 @@ class OutputPanel(QWidget):
             tool_name = event.get("function", {}).get("name", "unknown")
             tool_call_id = event.get("id", "")
             if tool_call_id:
+                debug_log(f"DEBUG _render_event tool_call mapping: id={tool_call_id}, name={tool_name}", level="DEBUG", component="OutputPanel")
                 self._tool_call_map[tool_call_id] = tool_name
         
         # Determine styling based on type
@@ -224,7 +226,9 @@ class OutputPanel(QWidget):
                 header = f"Tool: {tool_name}"
         elif event_type == "tool_result":
             # Look up tool name for special styling
+            debug_log(f"DEBUG _render_event tool_result: tool_call_id={tool_call_id}, map keys={list(self._tool_call_map.keys())}", level="DEBUG", component="OutputPanel")
             tool_name = self._tool_call_map.get(tool_call_id, "")
+            debug_log(f"DEBUG _render_event tool_result found: '{tool_name}' for id {tool_call_id}", level="DEBUG", component="OutputPanel")
             if tool_name in self.SPECIAL_TOOLS:
                 # Special handling for RequestUserInteraction
                 if tool_name == "RequestUserInteraction":
@@ -246,6 +250,7 @@ class OutputPanel(QWidget):
             bg_color = "#FFF5E6"
             header = "Final"
         else:
+            debug_log(f"DEBUG _render_event unknown event_type: {event_type}, keys: {list(event.keys())}", level="DEBUG", component="OutputPanel")
             border_color = "#cccccc"
             bg_color = "#f8f8f8"
             header = event_type.replace('_', ' ').title()
@@ -390,22 +395,68 @@ class OutputPanel(QWidget):
     
     def load_session_history(self, history, suppress_scroll: bool = True) -> None:
         """Bulk load session history without jumping.
-        
+
         Args:
             history: List of event dicts from session.user_history
             suppress_scroll: If True, disable auto-scroll during bulk load
         """
+        from ..debug_log import debug_log
+        debug_log(f"DEBUG load_session_history: processing {len(history)} messages", level="DEBUG", component="OutputPanel")
+        for i, msg in enumerate(history):
+            debug_log(f"DEBUG load_session_history message {i}: role={msg.get('role')}, keys={list(msg.keys())}", level="DEBUG", component="OutputPanel")
+            if msg.get('role') == 'assistant':
+                tool_calls = msg.get('tool_calls', [])
+                debug_log(f"DEBUG load_session_history assistant tool_calls count: {len(tool_calls)}", level="DEBUG", component="OutputPanel")
+                for tc in tool_calls:
+                    tool_id = tc.get('id', '')
+                    tool_name = tc.get('function', {}).get('name', 'unknown')
+                    debug_log(f"DEBUG load_session_history tool_call mapping: id={tool_id}, name={tool_name}", level="DEBUG", component="OutputPanel")
+            elif msg.get('role') == 'tool' and 'tool_call_id' in msg:
+                tool_call_id = msg.get('tool_call_id', '')
+                debug_log(f"DEBUG load_session_history tool_result: tool_call_id={tool_call_id}", level="DEBUG", component="OutputPanel")
+        
         if suppress_scroll:
             self.set_updates_enabled(False)
-        
+
         self.clear_output()
-        for event in history:
-            self.display_event(event)
         
+        # First pass: populate tool_call_map from assistant messages and standalone tool_call messages
+        # This ensures mapping exists before any tool_result messages are rendered, regardless of order.
+        debug_log(f"DEBUG load_session_history first pass: building tool_call_map", level="DEBUG", component="OutputPanel")
+        for msg in history:
+            role = msg.get('role')
+            debug_log(f"DEBUG load_session_history first pass message role: {role}, keys: {list(msg.keys())}", level="DEBUG", component="OutputPanel")
+            if role == 'assistant':
+                tool_calls = msg.get('tool_calls', [])
+                debug_log(f"DEBUG load_session_history assistant tool_calls count: {len(tool_calls)}", level="DEBUG", component="OutputPanel")
+                for tc in tool_calls:
+                    tool_id = tc.get('id', '')
+                    tool_name = tc.get('function', {}).get('name', 'unknown')
+                    debug_log(f"DEBUG load_session_history tool_call mapping: id={tool_id}, name={tool_name}", level="DEBUG", component="OutputPanel")
+                    if tool_id:
+                        debug_log(f"DEBUG load_session_history mapping: id={tool_id}, name={tool_name}", level="DEBUG", component="OutputPanel")
+                        self._tool_call_map[tool_id] = tool_name
+            elif role == 'tool':
+                if 'tool_call_id' in msg:
+                    tool_call_id = msg.get('tool_call_id', '')
+                    debug_log(f"DEBUG load_session_history tool_result in first pass: tool_call_id={tool_call_id}", level="DEBUG", component="OutputPanel")
+                else:
+                    # Standalone tool_call message (has id and function fields)
+                    tool_id = msg.get('id', '')
+                    tool_name = msg.get('function', {}).get('name', 'unknown')
+                    debug_log(f"DEBUG load_session_history standalone tool_call: id={tool_id}, name={tool_name}", level="DEBUG", component="OutputPanel")
+                    if tool_id:
+                        debug_log(f"DEBUG load_session_history standalone tool_call mapping: id={tool_id}, name={tool_name}", level="DEBUG", component="OutputPanel")
+                        self._tool_call_map[tool_id] = tool_name
+        
+        # Second pass: display messages
+        debug_log(f"DEBUG load_session_history second pass: displaying {len(history)} messages", level="DEBUG", component="OutputPanel")
+        for message in history:
+            self.display_message(message)
+
         if suppress_scroll:
             self.set_updates_enabled(True)
-            self._auto_scroll_if_bottom()
-    
+            self._auto_scroll_if_bottom()    
     def show_processing_indicator(self, query, turn_number):
         """Show a temporary 'Processing...' indicator for a user query."""
         from datetime import datetime
@@ -462,10 +513,13 @@ class OutputPanel(QWidget):
     def clear_output(self):
         """Clear the output text edit."""
         self.output_textedit.clear()
+        self._tool_call_map.clear()
     
     def _role_to_event_type(self, message):
         """Convert a message with 'role' to appropriate event type."""
+        debug_log(f"DEBUG _role_to_event_type keys: {list(message.keys())}", level="DEBUG", component="OutputPanel")
         role = message.get('role')
+        debug_log(f"DEBUG _role_to_event_type role: {role}", level="DEBUG", component="OutputPanel")
         
         if role == 'user':
             return 'user_query'
@@ -481,6 +535,7 @@ class OutputPanel(QWidget):
             return 'system'
         else:
             # Fallback to unknown, will be displayed with role as header
+            debug_log(f"DEBUG _role_to_event_type unknown role: {role}, message keys: {list(message.keys())}", level="DEBUG", component="OutputPanel")
             return 'unknown'
     
     def display_message(self, message):

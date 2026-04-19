@@ -29,21 +29,40 @@ logger = logging.getLogger(__name__)
 
 class SearchCodebaseTool(ToolBase):
     """
-    Search the indexed codebase using natural language queries.
+    SEMANTIC CODEBASE SEARCH - Understands natural language queries about your code.
     
-    Requires RAG dependencies (chromadb, sentence-transformers, tree-sitter, pathspec).
-    Requires an existing codebase index (created via index-codebase command).
-    """
+    Use this tool when you need to:
+    - Find where specific classes/functions are defined
+    - Understand how a feature is implemented
+    - Discover configuration loading patterns
+    - Locate MCP client implementations or other architectural components
+    - Search within specific directories (e.g., 'qt_gui/')
     
+    ADVANTAGES over FileSearchTool:
+    - Understands natural language meaning, not just keywords
+    - Returns semantically relevant code snippets with relevance scores
+    - Can restrict search to specific paths
+    - Three search intents: 'exact' (high precision), 'broad' (more results), 'file' (file-level overview)
+    
+    Examples:
+    - "Find the AgentControlsPanel class definition"
+    - "How does configuration loading work?"
+    - "Show me MCP client implementation"
+    - "Search for token_monitor in qt_gui directory"
+    
+    Requirements:
+    - RAG dependencies (chromadb, sentence-transformers, tree-sitter, pathspec)
+    - Existing codebase index (run `thoughtmachine index-codebase` first)
+    """    
     tool: Literal["SearchCodebase"] = "SearchCodebase"
     
     # Security capabilities required by this tool
     requires_capabilities: ClassVar[List[str]] = ["read_files"]
     
-    query: str = Field(..., description="Natural language query about the codebase.")
-    top_k: int = Field(5, description="Number of results to return.")
-    intent: Literal["exact", "broad", "file"] = Field("broad", description="Search intent: 'exact' for high precision, 'broad' for more results, 'file' for file-level results.")
-    restrict_to_path: Optional[str] = Field(None, description="Optional path to restrict search to (e.g., 'src/utils/')")
+    query: str = Field(..., description="Natural language query about the codebase. Examples: 'Find the AgentControlsPanel class', 'How does configuration loading work?', 'Show MCP client implementation'.")
+    top_k: int = Field(5, description="Number of results to return. Default 5, increase for broader searches, decrease for precision.")
+    intent: Literal["exact", "broad", "file"] = Field("broad", description="Search intent: 'exact' (high precision, min score 0.5), 'broad' (more results), 'file' (file-level overview, one result per file).")
+    restrict_to_path: Optional[str] = Field(None, description="Optional path to restrict search to (e.g., 'qt_gui/', 'tools/'). Only returns results from files under this path.")
     
     def execute(self) -> str:
         """
@@ -179,7 +198,7 @@ class SearchCodebaseTool(ToolBase):
 
         # Format results
         if not results:
-            return "No relevant code found."
+            return "No relevant code found.\n\n💡 **Search Tips**:\n- Try rephrasing your query in natural language (e.g., 'Find class definitions' instead of 'class')\n- Use `intent='broad'` for more results\n- Remove `restrict_to_path` if set\n- Increase `top_k` value\n- The index may not contain the specific code you're looking for"
 
         return self._format_results(results)    
     def _format_results(self, results: List[Dict[str, Any]]) -> str:
@@ -240,5 +259,14 @@ class SearchCodebaseTool(ToolBase):
             output_lines.append(content)
             output_lines.append("```")
             output_lines.append("")  # Empty line between results
+        
+        # Add helpful tip about tool usage
+        output_lines.append("---")
+        output_lines.append("**💡 Semantic Search Tip**: This tool understands natural language queries about code structure. Try queries like:")
+        output_lines.append("- \"Find where [class/function] is defined\"")
+        output_lines.append("- \"How does [feature] work in this project?\"")
+        output_lines.append("- \"Show me the implementation of [component]\"")
+        output_lines.append("- \"Search for [term] in [directory]/\" (use restrict_to_path parameter)")
+        output_lines.append("Use `intent='exact'` for high precision, `intent='broad'` for more results, or `intent='file'` for file-level overview.")
         
         return "\n".join(output_lines)

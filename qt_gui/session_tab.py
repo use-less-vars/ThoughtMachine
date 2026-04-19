@@ -328,16 +328,12 @@ class SessionTab(QWidget):
             # Use new bulk load method with scroll suppression
             self.output_panel.load_session_history(user_history, suppress_scroll=True)
         else:
-            # Pause smart scrolling during incremental updates
-            self.output_panel.smart_scroller.pause_tracking()
-            
             # Append messages incrementally
             for message in messages_to_append:
                 self.output_panel.display_message(message)
             
-            # Resume smart scrolling and scroll to bottom
-            self.output_panel.smart_scroller.resume_tracking()
-            self.output_panel.smart_scroller.scroll_to_bottom()
+            # Auto-scroll only if already at bottom
+            self.output_panel._auto_scroll_if_bottom()
         
         # Update tracking variables
         self._last_conversation_version = target_session.conversation_version

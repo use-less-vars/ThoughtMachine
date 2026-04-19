@@ -64,6 +64,8 @@ class AgentConfig(BaseModel):
     rag_vector_store_path: Optional[str] = Field(default=None, description="Path to vector store database (None = default .thoughtmachine/rag/)")
     rag_chunk_size: int = Field(default=1500, description="Size of text chunks for RAG indexing (characters)")
     rag_chunk_overlap: int = Field(default=200, description="Overlap between chunks for RAG indexing (characters)")
+    rag_batch_size: int = Field(default=16, description="Batch size for embedding generation in RAG indexing")
+    rag_truncate_dim: int = Field(default=256, description="Dimension to truncate embeddings to for memory efficiency")
 
     # Tool output limit configuration
     tool_output_token_limit: int = Field(default=10000, description="Maximum token limit for tool outputs (default 10,000 tokens)")

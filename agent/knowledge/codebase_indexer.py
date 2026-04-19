@@ -1064,7 +1064,7 @@ def index_codebase(workspace_path: str, config: AgentConfig, force: bool = False
         
         # Generate embeddings and add to collection in batches
         logger.info("Generating embeddings and adding to vector store in batches...")
-        processed_count = embed_chunks_batched(chunks, config, collection, workspace_hash, batch_size=16)
+        processed_count = embed_chunks_batched(chunks, config, collection, workspace_hash, batch_size=config.rag_batch_size, truncate_dim=config.rag_truncate_dim)
         
         if processed_count != len(chunks):
             logger.warning(f"Processed {processed_count} chunks but expected {len(chunks)}")
@@ -1249,9 +1249,7 @@ def incremental_index(workspace_path: str, config: AgentConfig) -> Tuple[bool, s
                     continue
                 
                 # Add new chunks to collection
-                processed = embed_chunks_batched(
-                    file_chunks, config, collection, workspace_hash, batch_size=16
-                )
+                processed = embed_chunks_batched(file_chunks, config, collection, workspace_hash, batch_size=config.rag_batch_size, truncate_dim=config.rag_truncate_dim)
                 total_chunks += processed
                 logger.debug(f"Added {processed} chunks for {file_key}")
                 
