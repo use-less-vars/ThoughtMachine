@@ -70,7 +70,7 @@ class ToolBase(BaseModel):
             import os
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                 import sys
-                trunc_limit = int(os.environ.get('THOUGHTMACHINE_DEBUG_TRUNCATION', 100))
+                trunc_limit = int(os.environ.get('TM_DEBUG_TRUNCATE_LENGTH', 100))
                 msg = f"DEBUG: {message}"
                 if trunc_limit > 0 and len(msg) > trunc_limit:
                     msg = msg[:trunc_limit] + "..."

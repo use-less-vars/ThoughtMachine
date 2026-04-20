@@ -2,11 +2,8 @@
 FROM python:3.11-slim
 
 # Copy requirements first (for better layer caching)
-COPY requirements.txt /tmp/requirements.txt
+COPY docker/requirements-docker.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
-
-# Install git and GL libraries for Qt GUI
-RUN apt-get update && apt-get install -y git libgl1-mesa-glx && apt-get clean
 
 # Create a non-root user (UID 1000, can be changed)
 RUN useradd -m -u 1000 agent && \

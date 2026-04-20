@@ -1,4 +1,3 @@
-# agent_controller.py
 import threading
 import os
 import queue
@@ -7,35 +6,28 @@ from agent.config import AgentConfig
 from agent import Agent
 from typing import Optional, List, Dict, Any
 from PyQt6.QtCore import QObject, pyqtSignal
-from agent.logging.debug_log import debug_log
+from agent.logging import log
 
 class AgentController(QObject):
     """
     Runs the agent in a background thread and provides thread‑safe control
     via start/stop/pause/resume and a queue for receiving events.
     """
-    # Signals
     event_occurred = pyqtSignal(dict)
-    conversation_updated = pyqtSignal(str)  # session_id when conversation changes
+    conversation_updated = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
-        # Thread‑safe queue for passing events from agent thread to main thread
         self.event_queue = queue.Queue()
-
-        # Events for controlling the agent thread
-        self.stop_event = threading.Event()   # when set, agent should stop
-        self.pause_event = threading.Event()  # when set, agent can run (otherwise paused)
-        self.pause_event.set()                 # start unpaused
-
-        # Thread handle and running flag
+        self.stop_event = threading.Event()
+        self.pause_event = threading.Event()
+        self.pause_event.set()
         self.thread = None
         self._running = False
         self._initial_conversation = None
         self._agent_override = None
         self.agent = None
-        self.current_session_id = None  # For event filtering
-        # Query queue for keep-alive mode
+        self.current_session_id = None
         self.query_queue = queue.Queue()
         self._keep_alive = True
         self._pause_requested = False
@@ -43,38 +35,31 @@ class AgentController(QObject):
 
     def _cleanup_if_thread_dead(self):
         """Check if background thread is dead and reset state if needed."""
-        debug_log(f"_cleanup_if_thread_dead called, thread={'alive' if self.thread and self.thread.is_alive() else 'dead/None'}", level="DEBUG", component="Controller")
-        if self.thread is not None and not self.thread.is_alive():
-            # Thread has finished but state wasn't cleaned up
-            debug_log(f"Thread dead, cleaning up state", level="DEBUG", component="Controller")
+        log('DEBUG', 'core.controller', f"_cleanup_if_thread_dead called, thread={('alive' if self.thread and self.thread.is_alive() else 'dead/None')}")
+        if self.thread is not None and (not self.thread.is_alive()):
+            log('DEBUG', 'core.controller', f'Thread dead, cleaning up state')
             self._running = False
             self.thread = None
-            self.agent = None  # Clear old agent reference
+            self.agent = None
             self._keep_alive = True
             self._pause_requested = False
             self._processing_query = False
-            debug_log(f"Cleaned up dead thread, _running={self._running}", level="DEBUG", component="Controller")
+            log('DEBUG', 'core.controller', f'Cleaned up dead thread, _running={self._running}')
+
     def reset(self):
         """Reset controller to initial state, clearing all queues and events."""
-        # Clear event queue
         while True:
             try:
                 self.event_queue.get_nowait()
             except queue.Empty:
                 break
-
-        # Clear query queue  
         while True:
             try:
                 self.query_queue.get_nowait()
             except queue.Empty:
                 break
-
-        # Reset events
         self.stop_event.clear()
-        self.pause_event.set()  # start unpaused
-
-        # Reset state
+        self.pause_event.set()
         self.thread = None
         self._running = False
         self._initial_conversation = None
@@ -83,32 +68,28 @@ class AgentController(QObject):
         self._pause_requested = False
         self._processing_query = False
         self.current_session_id = None
-
         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            debug_log(f"Reset to initial state", level="DEBUG", component="Controller")
+            log('DEBUG', 'core.controller', f'Reset to initial state')
 
     @property
     def is_running(self):
         """Return True if the agent thread is alive and not shutting down."""
-        # If _running is False, agent is definitely not running
         if not self._running:
-            debug_log(f"is_running: _running=False, returning False (thread alive={self.thread.is_alive() if self.thread else False})", level="DEBUG", component="Controller")
+            log('DEBUG', 'core.controller', f'is_running: _running=False, returning False (thread alive={(self.thread.is_alive() if self.thread else False)})')
             return False
-        # Check thread status
         if self.thread is not None and self.thread.is_alive():
-            debug_log(f"is_running: thread alive, returning True (_running={self._running}, pause_event.is_set={self.pause_event.is_set()}, _pause_requested={self._pause_requested})", level="DEBUG", component="Controller")
+            log('DEBUG', 'core.controller', f'is_running: thread alive, returning True (_running={self._running}, pause_event.is_set={self.pause_event.is_set()}, _pause_requested={self._pause_requested})')
             return True
-        # Thread is dead or doesn't exist, ensure state is cleaned up
-        debug_log(f"is_running: thread dead or None, cleaning up (thread={self.thread})", level="DEBUG", component="Controller")
+        log('DEBUG', 'core.controller', f'is_running: thread dead or None, cleaning up (thread={self.thread})')
         self._cleanup_if_thread_dead()
-        debug_log(f"is_running: after cleanup, _running={self._running}", level="DEBUG", component="Controller")
+        log('DEBUG', 'core.controller', f'is_running: after cleanup, _running={self._running}')
         return self._running
-    
+
     def get_config(self):
         """Return the current AgentConfig being used."""
         return self._config
 
-    def start(self, query: str, config: AgentConfig = None, session=None, preset_name: str = None, **overrides):
+    def start(self, query: str, config: AgentConfig=None, session=None, preset_name: str=None, **overrides):
         """
         Start the agent with the given query and configuration.
 
@@ -119,112 +100,90 @@ class AgentController(QObject):
             preset_name: Name of a preset to use instead of config. If provided, config is ignored.
             **overrides: Additional config overrides when using preset_name.
         """
-        debug_log(f"start called with query: {query[:50]}...", level="DEBUG", component="Controller")
-        # Clean up any dead thread state
+        log('DEBUG', 'core.controller', f'start called with query: {query[:50]}...')
         self._cleanup_if_thread_dead()
         if self._running:
-            raise RuntimeError("Agent is already running. Stop it first.")
-
-        # Reset control events
+            raise RuntimeError('Agent is already running. Stop it first.')
         self.stop_event.clear()
-        self.pause_event.set()   # ensure we start unpaused
-        # Reset internal state flags
+        self.pause_event.set()
         self._keep_alive = True
         self._pause_requested = False
         self._processing_query = False
-
-        # Resolve configuration: if preset_name provided, use Agent.from_preset
         if preset_name is not None:
             if config is not None:
-                raise ValueError("Cannot specify both config and preset_name")
+                raise ValueError('Cannot specify both config and preset_name')
             from agent import Agent
             agent = Agent.from_preset(preset_name, session=session, **overrides)
-            # Extract the config from the created agent
             resolved_config = agent.config
-            # Store the agent directly (no need to create a new one in _run)
             self._agent_override = agent
         else:
             if config is None:
-                raise ValueError("Must provide either config or preset_name")
+                raise ValueError('Must provide either config or preset_name')
             resolved_config = config
             self._agent_override = None
-
-        # Store query and config for the background thread
         self._query = query
         self._config = resolved_config
         self._session = session
-        # Set session ID for event filtering (use session.session_id if available)
         self.current_session_id = session.session_id if session is not None else None
-        # Enqueue the initial query
         self.query_queue.put(query)
-
-        # Create and start the daemon thread
         self.thread = threading.Thread(target=self._run, daemon=True)
         self._running = True
         self.thread.start()
 
     def stop(self):
         """Request the agent to pause after the current turn/tool."""
-        self.pause()   # treat stop as pause
+        self.pause()
 
     def continue_session(self, query: str):
         """Submit a new query to the already running agent."""
-        debug_log(f"continue_session called: query='{query[:50]}...' is_running={self.is_running} pause_event.is_set={self.pause_event.is_set()}", level="DEBUG", component="Controller")
+        log('DEBUG', 'core.controller', f"continue_session called: query='{query[:50]}...' is_running={self.is_running} pause_event.is_set={self.pause_event.is_set()}")
         if os.environ.get('PAUSE_DEBUG'):
-            debug_log(f"Controller.continue_session: query='{query[:50]}...', is_running={self.is_running}, pause_event.is_set={self.pause_event.is_set()}, _pause_requested={self._pause_requested}", level="WARNING", component="PAUSE_FLOW")
+            log('WARNING', 'presenter.pause_flow', f"Controller.continue_session: query='{query[:50]}...', is_running={self.is_running}, pause_event.is_set={self.pause_event.is_set()}, _pause_requested={self._pause_requested}")
         if not self.is_running:
-            # Agent is not running, cannot continue
-            debug_msg = f"[Controller] Agent not running, cannot continue. _running={self._running}, thread alive={self.thread.is_alive() if self.thread else False}"
+            debug_msg = f'[Controller] Agent not running, cannot continue. _running={self._running}, thread alive={(self.thread.is_alive() if self.thread else False)}'
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                debug_log(debug_msg, level="DEBUG", component="Controller")
+                log('DEBUG', 'core.controller', debug_msg)
             if os.environ.get('PAUSE_DEBUG'):
-                debug_log(f"Controller.continue_session: {debug_msg}", level="WARNING", component="PAUSE_FLOW")
-            raise RuntimeError(f"Agent controller not running: {debug_msg}")
+                log('WARNING', 'presenter.pause_flow', f'Controller.continue_session: {debug_msg}')
+            raise RuntimeError(f'Agent controller not running: {debug_msg}')
         if os.environ.get('PAUSE_DEBUG'):
-            debug_log(f"Controller.continue_session: calling resume() and queuing query", level="WARNING", component="PAUSE_FLOW")
+            log('WARNING', 'presenter.pause_flow', f'Controller.continue_session: calling resume() and queuing query')
         self.resume()
         self.query_queue.put(query)
-        debug_log(f"Query queued, queue size approx {self.query_queue.qsize()}", level="DEBUG", component="Controller")
+        log('DEBUG', 'core.controller', f'Query queued, queue size approx {self.query_queue.qsize()}')
         if os.environ.get('PAUSE_DEBUG'):
-            debug_log(f"Controller.continue_session: query queued, queue size={self.query_queue.qsize()}", level="WARNING", component="PAUSE_FLOW")
+            log('WARNING', 'presenter.pause_flow', f'Controller.continue_session: query queued, queue size={self.query_queue.qsize()}')
 
     def request_pause(self):
         """Request agent to pause after current turn."""
-        debug_log(f"request_pause called: is_running={self.is_running} _processing_query={self._processing_query} pause_event.is_set={self.pause_event.is_set()}", level="DEBUG", component="Controller")
+        log('DEBUG', 'core.controller', f'request_pause called: is_running={self.is_running} _processing_query={self._processing_query} pause_event.is_set={self.pause_event.is_set()}')
         if not self.is_running:
-            # Agent is not running, nothing to pause
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                debug_log(f"Agent not running, nothing to pause", level="DEBUG", component="Controller")
+                log('DEBUG', 'core.controller', f'Agent not running, nothing to pause')
             return
         if self._processing_query:
-            # Agent is currently processing a query, set pause flag
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                debug_log(f"Agent processing query, calling pause()", level="DEBUG", component="Controller")
+                log('DEBUG', 'core.controller', f'Agent processing query, calling pause()')
             self.pause()
         else:
-            # Agent is idle, send paused event directly
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                debug_log(f"Agent idle, sending paused event directly", level="DEBUG", component="Controller")
-            # Clear pause_event to prevent processing and mark as paused
+                log('DEBUG', 'core.controller', f'Agent idle, sending paused event directly')
             self.pause_event.clear()
             self._pause_requested = True
-            # Signal agent to pause after current turn
             if hasattr(self, 'agent') and self.agent is not None and hasattr(self.agent, 'request_pause'):
                 self.agent.request_pause()
-            self._emit_event({"type": "paused"})
-            # Clean up orphaned tool sequences
+            self._emit_event({'type': 'paused'})
             if hasattr(self, 'agent') and self.agent is not None:
                 from session.context_builder import ContextBuilder
                 if hasattr(self.agent, 'conversation'):
                     original_len = len(self.agent.conversation)
                     self.agent.conversation = ContextBuilder._cleanup_orphaned_tool_messages(self.agent.conversation)
                     if original_len != len(self.agent.conversation) and os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                        debug_log(f"Cleaned {original_len - len(self.agent.conversation)} orphaned tool messages on idle pause", level="WARNING", component="Controller")
+                        log('WARNING', 'core.controller', f'Cleaned {original_len - len(self.agent.conversation)} orphaned tool messages on idle pause')
 
     def get_conversation(self) -> Optional[List[Dict[str, Any]]]:
         """Return the current conversation from the agent, if available."""
         if self.agent:
-            # If using a session, the conversation is the session's user_history
             return self.agent.conversation.copy() if self.agent.conversation is not None else None
         return None
 
@@ -236,97 +195,73 @@ class AgentController(QObject):
     def restart_session(self):
         """Restart agent with cleared history."""
         if not self.is_running:
-            # Agent is not running, cannot restart
             return
         if self.agent:
             self.agent.request_reset()
-        # Also submit a sentinel to trigger reset in queue
-        self.query_queue.put("[RESET]")
+        self.query_queue.put('[RESET]')
 
     def pause(self):
         """Pause the agent before the next turn (finishes current turn first)."""
-        debug_log(f"pause() called, clearing pause_event, setting _pause_requested=True", level="DEBUG", component="Controller")
+        log('DEBUG', 'core.controller', f'pause() called, clearing pause_event, setting _pause_requested=True')
         self.pause_event.clear()
         self._pause_requested = True
-        # Signal agent to pause after current turn
         if hasattr(self, 'agent') and self.agent is not None and hasattr(self.agent, 'request_pause'):
             self.agent.request_pause()
-        # Clean up any orphaned tool sequences in the agent
         if hasattr(self, 'agent') and self.agent is not None:
-            # Import the cleanup method
             from session.context_builder import ContextBuilder
-            # Clean up conversation in agent
             if hasattr(self.agent, 'conversation'):
                 original_len = len(self.agent.conversation)
                 self.agent.conversation = ContextBuilder._cleanup_orphaned_tool_messages(self.agent.conversation)
                 if original_len != len(self.agent.conversation) and os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                    debug_log(f"Cleaned {original_len - len(self.agent.conversation)} orphaned tool messages on pause", level="WARNING", component="Controller")
+                    log('WARNING', 'core.controller', f'Cleaned {original_len - len(self.agent.conversation)} orphaned tool messages on pause')
 
     def resume(self):
         """Resume a paused agent."""
-        debug_log(f"resume() called, setting pause_event, clearing _pause_requested", level="DEBUG", component="Controller")
+        log('DEBUG', 'core.controller', f'resume() called, setting pause_event, clearing _pause_requested')
         if os.environ.get('PAUSE_DEBUG'):
-            debug_log(f"Controller.resume: setting pause_event, clearing _pause_requested", level="WARNING", component="PAUSE_FLOW")
+            log('WARNING', 'presenter.pause_flow', f'Controller.resume: setting pause_event, clearing _pause_requested')
         self.pause_event.set()
         self._pause_requested = False
-        # Also clear pause request flag in agent if it exists
         if hasattr(self, 'agent') and self.agent is not None:
             if hasattr(self.agent, '_pause_requested'):
-                debug_log(f"Clearing agent._pause_requested (was {self.agent._pause_requested})", level="DEBUG", component="Controller")
+                log('DEBUG', 'core.controller', f'Clearing agent._pause_requested (was {self.agent._pause_requested})')
                 if os.environ.get('PAUSE_DEBUG'):
-                    debug_log(f"Controller.resume: clearing agent._pause_requested", level="WARNING", component="PAUSE_FLOW")
+                    log('WARNING', 'presenter.pause_flow', f'Controller.resume: clearing agent._pause_requested')
                 self.agent._pause_requested = False
-
-
 
     def _emit_event(self, event):
         """Emit event both to queue and signal."""
-        # Attach session ID for event filtering
         event['session_id'] = self.current_session_id
-        # Put into queue for compatibility
         self.event_queue.put(event)
-        # Emit signal for presenter
-        debug_log(f"Emitting event_occurred: {event.get('type')}", level="DEBUG", component="Controller")
+        log('DEBUG', 'core.controller', f"Emitting event_occurred: {event.get('type')}")
         self.event_occurred.emit(event)
-        
-        # Emit conversation_updated signal for conversation-changing events
-        content_event_types = {"user_query", "turn", "tool_call", "tool_result", "final", 
-                              "llm_request", "llm_response", "raw_response"}
-        if event.get("type") in content_event_types:
-            debug_log(f"Emitting conversation_updated for event type {event.get('type')}", 
-                     level="DEBUG", component="Controller")
-            self.conversation_updated.emit(self.current_session_id if self.current_session_id else "")
+        content_event_types = {'user_query', 'turn', 'tool_call', 'tool_result', 'final', 'llm_request', 'llm_response', 'raw_response'}
+        if event.get('type') in content_event_types:
+            log('DEBUG', 'core.controller', f"Emitting conversation_updated for event type {event.get('type')}")
+            self.conversation_updated.emit(self.current_session_id if self.current_session_id else '')
 
     def _run(self):
         """Internal method that runs in the background thread."""
         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            debug_log(f"_run started", level="DEBUG", component="Controller")
+            log('DEBUG', 'core.controller', f'_run started')
         try:
-            # Define the stop_check function that the agent will call before each turn
+
             def should_stop():
-                # Check if we should stop
-                debug_log(f"should_stop called, pause_event.is_set={self.pause_event.is_set()}, stop_event.is_set={self.stop_event.is_set()}, _pause_requested={self._pause_requested}", level="DEBUG", component="Controller")
-                # If stop event is set, return True immediately
+                log('DEBUG', 'core.controller', f'should_stop called, pause_event.is_set={self.pause_event.is_set()}, stop_event.is_set={self.stop_event.is_set()}, _pause_requested={self._pause_requested}')
                 if self.stop_event.is_set():
                     if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                        debug_log(f"should_stop: stop_event is set, returning True", level="DEBUG", component="Controller")
+                        log('DEBUG', 'core.controller', f'should_stop: stop_event is set, returning True')
                     return True
-                # If paused (pause_event cleared), return "PAUSED" instead of blocking
                 if not self.pause_event.is_set():
                     if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                        debug_log(f"should_stop: pause_event not set, returning PAUSED", level="DEBUG", component="Controller")
-                    return "PAUSED"
-                # Not paused and not stopped
+                        log('DEBUG', 'core.controller', f'should_stop: pause_event not set, returning PAUSED')
+                    return 'PAUSED'
                 if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                    debug_log(f"should_stop: not paused, returning False", level="DEBUG", component="Controller")
+                    log('DEBUG', 'core.controller', f'should_stop: not paused, returning False')
                 return False
-
-            # If an agent was pre-created (from preset), use it directly
             if hasattr(self, '_agent_override') and self._agent_override is not None:
                 agent = self._agent_override
-                # Inject stop_check into the agent's config
                 agent.config.stop_check = should_stop
-                # If we have a session, ensure agent is linked to it
                 if hasattr(self, '_session') and self._session is not None:
                     agent.session = self._session
                     agent.conversation = self._session.user_history
@@ -337,107 +272,71 @@ class AgentController(QObject):
                             agent._handle_state_event(event)
                 self.agent = agent
             else:
-                # Inject the stop_check into a copy of the config to avoid mutating the original
                 run_config = self._config.model_copy() if hasattr(self._config, 'model_copy') else self._config
                 run_config.stop_check = should_stop
-                # Create Agent instance with session if available
                 agent = Agent(run_config, session=self._session if hasattr(self, '_session') else None)
-                self.agent = agent  # store for potential reuse
-
-            # Main loop: process queries from queue
+                self.agent = agent
             while self._keep_alive:
-                # Check if we should stop (paused or stopped)
                 stop_result = should_stop()
                 if stop_result:
-                    if stop_result == "PAUSED":
-                        # Paused, block here until resumed
+                    if stop_result == 'PAUSED':
                         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                            debug_log(f"PAUSED returned, waiting on pause_event", level="DEBUG", component="Controller")
+                            log('DEBUG', 'core.controller', f'PAUSED returned, waiting on pause_event')
                         self.pause_event.wait()
                         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                            debug_log(f"Resumed from pause_event.wait()", level="DEBUG", component="Controller")
+                            log('DEBUG', 'core.controller', f'Resumed from pause_event.wait()')
                         continue
-                    # Otherwise stopped (True)
-                    # Agent is stopped, continue loop
                     continue
-                
-                # Wait for next query (only if not paused)
-                debug_log(f"Before query_queue.get, queue size: {self.query_queue.qsize()}", level="DEBUG", component="Controller")
+                log('DEBUG', 'core.controller', f'Before query_queue.get, queue size: {self.query_queue.qsize()}')
                 try:
                     query = self.query_queue.get(timeout=1.0)
-                    debug_log(f"Got query from queue: '{query[:50]}...'", level="DEBUG", component="Controller")
+                    log('DEBUG', 'core.controller', f"Got query from queue: '{query[:50]}...'")
                 except queue.Empty:
-                    # Queue empty, continue loop
-                    debug_log(f"Queue empty after timeout", level="DEBUG", component="Controller")
+                    log('DEBUG', 'core.controller', f'Queue empty after timeout')
                     continue
-
-                if query == "[RESET]":
+                if query == '[RESET]':
                     agent.reset()
                     continue
-                if query == "[PAUSE]":
+                if query == '[PAUSE]':
                     if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                        debug_log(f"Pause requested", level="DEBUG", component="Controller")
-                    self._emit_event({"type": "paused"})
+                        log('DEBUG', 'core.controller', f'Pause requested')
+                    self._emit_event({'type': 'paused'})
                     continue
-
-                debug_log(f"Processing query: {query[:50]}...", level="DEBUG", component="Controller")
+                log('DEBUG', 'core.controller', f'Processing query: {query[:50]}...')
                 self._processing_query = True
-                # Run the agent for this query
                 for event in agent.process_query(query):
-                    debug_log(f"Event: {event['type']}", level="DEBUG", component="Controller")
-                    # Put each event into the queue for the GUI to pick up
+                    log('DEBUG', 'core.controller', f"Event: {event['type']}")
                     self._emit_event(event)
-                    if event["type"] == "paused":
+                    if event['type'] == 'paused':
                         self._pause_requested = False
-                        # Agent has paused, break out of event loop to allow new queries
                         break
-
-                    # If this is a terminal event, decide what to do
-                    if event["type"] in ("stopped", "error", "max_turns"):
-                        # Treat as pause, keep thread alive
-                        debug_log(f"Terminal event {event['type']} detected, treating as pause", level="DEBUG", component="Controller")
-                        # Clear pause request flag
+                    if event['type'] in ('stopped', 'error', 'max_turns'):
+                        log('DEBUG', 'core.controller', f"Terminal event {event['type']} detected, treating as pause")
                         self._pause_requested = False
-                        # Send paused event to inform GUI
-                        self._emit_event({"type": "paused"})
+                        self._emit_event({'type': 'paused'})
                         break
-                    elif event["type"] in ("final", "user_interaction_requested"):
-                        # Agent has completed this query, pause and wait for next query
-                        # Yield a paused event to inform GUI
+                    elif event['type'] in ('final', 'user_interaction_requested'):
                         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                            debug_log(f"Sending paused event", level="DEBUG", component="Controller")
-                        self._emit_event({"type": "paused"})
+                            log('DEBUG', 'core.controller', f'Sending paused event')
+                        self._emit_event({'type': 'paused'})
                         break
-                    # For other events (turn), continue processing
-                    # Check if we're paused between events
                     if not self.pause_event.is_set():
-                        # We're paused, break out of loop
                         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                            debug_log(f"pause_event not set between events, breaking loop", level="DEBUG", component="Controller")
+                            log('DEBUG', 'core.controller', f'pause_event not set between events, breaking loop')
                         self._pause_requested = False
-                        self._emit_event({"type": "paused"})
+                        self._emit_event({'type': 'paused'})
                         break
-
                 self._processing_query = False
-                # If _keep_alive becomes False, break outer loop
                 if not self._keep_alive:
-                    debug_log(f"_keep_alive=False, breaking outer loop", level="DEBUG", component="Controller")
+                    log('DEBUG', 'core.controller', f'_keep_alive=False, breaking outer loop')
                     break
-
         except Exception as e:
-            # Catch any unexpected exception and send an error event
-            debug_log(f"Exception in _run: {e}", level="ERROR", component="Controller")
+            log('ERROR', 'core.controller', f'Exception in _run: {e}')
             traceback.print_exc()
-            self._running = False  # Mark as not running before sending error
-            self._emit_event({
-                "type": "error",
-                "error_type": "CONTROLLER_ERROR",
-                "message": str(e),
-                "traceback": traceback.format_exc()   # helpful for debugging
-            })
+            self._running = False
+            self._emit_event({'type': 'error', 'error_type': 'CONTROLLER_ERROR', 'message': str(e), 'traceback': traceback.format_exc()})
         finally:
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                debug_log(f"Finally block: thread finishing", level="DEBUG", component="Controller")
-            # Signal that the thread is finishing
-            self._emit_event({"type": "thread_finished"})
+                log('DEBUG', 'core.controller', f'Finally block: thread finishing')
+            self._emit_event({'type': 'thread_finished'})
             self._running = False

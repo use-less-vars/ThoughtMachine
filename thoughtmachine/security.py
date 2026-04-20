@@ -16,13 +16,13 @@ import threading
 import queue
 import uuid
 
-# Try to import the AgentLogger for structured logging
+# Try to import the logging facade and types
 try:
-    from agent.logging import AgentLogger, LogEventType, LogLevel
+    from agent.logging import log, LogEventType, LogLevel
     LOGGING_AVAILABLE = True
 except ImportError:
     LOGGING_AVAILABLE = False
-    AgentLogger = None
+    log = None
     LogEventType = None
     LogLevel = None
 
@@ -37,7 +37,7 @@ except ImportError:
     create_event = None
 
 # Global logger instance (set by agent at startup)
-_logger: Optional[AgentLogger] = None
+_logger: Optional[Any] = None
 
 # Security prompt management
 _pending_security_requests: Dict[str, queue.Queue] = {}
@@ -61,7 +61,7 @@ class CapabilityDeniedError(SecurityError):
     pass
 
 
-def set_logger(logger: Optional[AgentLogger]) -> None:
+def set_logger(logger: Optional[Any]) -> None:
     """Set the global logger for security module."""
     global _logger
     _logger = logger
@@ -271,7 +271,7 @@ def _log_security_event(
     Log a security-related event using the global logger if available.
     Redacts sensitive data before logging.
     """
-    if _logger is None or not LOGGING_AVAILABLE:
+    if log is None or not LOGGING_AVAILABLE:
         # Fallback to standard logging
         # Convert level to integer logging level
         if hasattr(level, 'value'):
@@ -293,14 +293,23 @@ def _log_security_event(
     
     # Redact sensitive data
     redacted_data = _redact_sensitive_data(data)
-    
+
     try:
-        _logger._log_event(
-            event_type=event_type,
-            level=level,
-            message=message,
-            data=redacted_data
-        )
+        # Use unified logging facade
+        if log is not None:
+            # Convert level to string if needed
+            level_str = level.value if hasattr(level, 'value') else str(level)
+            # Map to appropriate tag
+            tag = "security.operation"
+            log(level_str, tag, message, redacted_data, event_type)
+        elif _logger is not None and hasattr(_logger, '_log_event'):
+            # Fallback to old logger if available
+            _logger._log_event(
+                event_type=event_type,
+                level=level,
+                message=message,
+                data=redacted_data
+            )
     except Exception as e:
         # Don't let logging failures break security operations
         logging.getLogger(__name__).error(f"Failed to log security event: {e}")

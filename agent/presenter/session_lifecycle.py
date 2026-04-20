@@ -7,80 +7,64 @@ Handles:
 - Session listing, deletion, renaming
 - Auto-save and dirty state tracking
 """
-
 import json
 import uuid
 import os
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Callable
-from agent.logging.debug_log import debug_log
-
+from agent.logging import log
 from agent.controller import AgentController
 from agent.core.state import ExecutionState
 from session.models import Session, SessionConfig
 from session.store import FileSystemSessionStore
 from session.context_builder import SummaryBuilder
-
 from .state_bridge import StateBridge
-
 
 class SessionLifecycle:
     """Manages session lifecycle operations."""
-    
+
     def __init__(self, state_bridge: StateBridge, controller: AgentController):
         self.state_bridge = state_bridge
         self.controller = controller
-        
-        # Session store and context builder
         self.session_store = FileSystemSessionStore()
         self.context_builder = SummaryBuilder()
-        
-        # State tracking
         self._state = ExecutionState.IDLE
         self._restarting = False
-
         self._initial_conversation: Optional[List[Dict[str, Any]]] = None
         self._session_callback: Optional[Callable] = None
         self._conversation_callback: Optional[Callable] = None
-        
-        # Cached configuration for restart
         self._cached_config = None
         self._cached_preset_name = None
-        
-        debug_log(f"Initialized", level="DEBUG", component="SessionLifecycle")
-    
+        log('DEBUG', 'presenter.lifecycle', f'Initialized')
+
     def _register_session_callbacks(self, session):
         """Register callbacks on a session for change tracking."""
-        debug_log(f"Registering callbacks for session {session.session_id}", level="DEBUG", component="SessionLifecycle")
-        debug_log(f"Registering callbacks: user_history id={id(session.user_history)}", level="DEBUG", component="SessionLifecycle")
-        # Conversation updates are now handled via controller signals, not session callbacks
-        # Note: dirty tracking removed, but ObservableList callbacks still needed for UI refresh
-    # State management
+        log('DEBUG', 'presenter.lifecycle', f'Registering callbacks for session {session.session_id}')
+        log('DEBUG', 'presenter.lifecycle', f'Registering callbacks: user_history id={id(session.user_history)}')
+
     @property
     def state(self) -> ExecutionState:
         """Current execution state."""
         return self._state
-    
+
     @state.setter
     def state(self, new_state: ExecutionState):
         """Update execution state."""
         if self._state != new_state:
             old_state = self._state
             self._state = new_state
-            debug_log(f"state changed: {old_state} -> {new_state}", level="DEBUG", component="SessionLifecycle")
-            # Notify callback if set
+            log('DEBUG', 'presenter.lifecycle', f'state changed: {old_state} -> {new_state}')
             if self._session_callback:
                 try:
                     self._session_callback(old_state, new_state)
                 except Exception as e:
-                    debug_log(f"Error in state callback: {e}", level="DEBUG", component="SessionLifecycle")
-    
+                    log('DEBUG', 'presenter.lifecycle', f'Error in state callback: {e}')
 
     def mark_clean(self) -> None:
         """Mark session as clean (no unsaved changes). Dummy method after removing dirty tracking."""
         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            debug_log(f'mark_clean called (dummy method - dirty tracking removed)', level="DEBUG", component="SessionLifecycle")
-    
+            log('DEBUG', 'presenter.lifecycle', f'mark_clean called (dummy method - dirty tracking removed)')
+
     def has_unsaved_changes(self) -> bool:
         """Check if current session has unsaved changes.
         
@@ -88,8 +72,8 @@ class SessionLifecycle:
             Always returns False (dirty tracking removed).
         """
         return False
-    # Session operations
-    def start_session(self, query: str, config: Optional[dict] = None, preset_name: str = None):
+
+    def start_session(self, query: str, config: Optional[dict]=None, preset_name: str=None):
         """
         Start a new agent session.
 
@@ -98,21 +82,16 @@ class SessionLifecycle:
             config: Optional configuration overrides
             preset_name: Optional preset name to use instead of config
         """
-        debug_log(f"start_session called, state={self.state}, current_session exists={self.state_bridge.current_session is not None}", level="DEBUG", component="SessionLifecycle")
+        log('DEBUG', 'presenter.lifecycle', f'start_session called, state={self.state}, current_session exists={self.state_bridge.current_session is not None}')
         if self.state != ExecutionState.IDLE:
-            debug_log(f"Cannot start session in state {self.state}", level="DEBUG", component="SessionLifecycle")
+            log('DEBUG', 'presenter.lifecycle', f'Cannot start session in state {self.state}')
             return
-
-        # Clear session name only for a brand new session (no existing session ID)
         if self.state_bridge.current_session_id is None:
             self.state_bridge.session_name = None
-
         try:
-            # Resolve configuration and cache for restart
             if preset_name is not None:
                 from agent import Agent
                 overrides = config if config is not None else {}
-                # Ensure agent carries over current session's token totals as initial values
                 overrides['initial_input_tokens'] = self.state_bridge.total_input
                 overrides['initial_output_tokens'] = self.state_bridge.total_output
                 temp_agent = Agent.from_preset(preset_name, session=None, **overrides)
@@ -120,89 +99,46 @@ class SessionLifecycle:
                 self._cached_config = agent_config
                 self._cached_preset_name = preset_name
             else:
-                agent_config = self.state_bridge.create_agent_config(
-                    config,
-                    total_input=self.state_bridge.total_input,
-                    total_output=self.state_bridge.total_output
-                )
+                agent_config = self.state_bridge.create_agent_config(config, total_input=self.state_bridge.total_input, total_output=self.state_bridge.total_output)
                 self._cached_config = agent_config
                 self._cached_preset_name = None
-
-            # Ensure we have a bound session (should be bound via new_session or load_session)
             if self.state_bridge.current_session is None:
                 session_config = self.state_bridge.build_session_config(agent_config)
-                new_session = Session(
-                    session_id=str(uuid.uuid4()),
-                    config=session_config,
-                    user_history=[],
-                    metadata={}
-                )
-                # Ensure session has a name
+                new_session = Session(session_id=str(uuid.uuid4()), config=session_config, user_history=[], metadata={})
                 new_session.ensure_name()
                 self.state_bridge.bind_session(new_session)
-                # Register callback for conversation changes
                 self._register_session_callbacks(new_session)
-
-            # Clear any initial conversation flag
             self._initial_conversation = None
-
-            # Start the agent with the bound session
             if preset_name is not None:
-                self.controller.start(
-                    query,
-                    session=self.state_bridge.current_session,
-                    preset_name=preset_name,
-                    **overrides
-                )
+                self.controller.start(query, session=self.state_bridge.current_session, preset_name=preset_name, **overrides)
             else:
-                self.controller.start(
-                    query,
-                    config=agent_config,
-                    session=self.state_bridge.current_session
-                )
+                self.controller.start(query, config=agent_config, session=self.state_bridge.current_session)
             self.state = ExecutionState.RUNNING
-            # Status message will be emitted through event processing
-
         except Exception as e:
             self.state = ExecutionState.PAUSED
-            # Error will be emitted through event processing
-            debug_log(f"Error starting session: {e}", level="DEBUG", component="SessionLifecycle")
+            log('DEBUG', 'presenter.lifecycle', f'Error starting session: {e}')
             raise
 
-    def new_session(self, name: str = None):
+    def new_session(self, name: str=None):
         """Start a brand new session.
         
         Args:
             name: Optional name for the new session. If None, session will be unnamed.
         """
-        # Always auto-save current session before starting new session
         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            debug_log(f'Auto-saving current session before starting new session', level="DEBUG", component="SessionLifecycle")
+            log('DEBUG', 'presenter.lifecycle', f'Auto-saving current session before starting new session')
         self.auto_save_current_session()
-        
-        # If agent is running, stop it first (best effort)
         if self.controller.is_running:
             self.controller.stop()
-        # Create a fresh Session with a generated UUID and default config
         agent_config = self.state_bridge.create_agent_config()
         session_config = self.state_bridge.build_session_config(agent_config)
-        session = Session(
-            session_id=str(uuid.uuid4()),
-            config=session_config,
-            user_history=[],
-            metadata={'name': name} if name else {}
-        )
-        # Ensure session has a name
+        session = Session(session_id=str(uuid.uuid4()), config=session_config, user_history=[], metadata={'name': name} if name else {})
         session.ensure_name()
         self.state_bridge.bind_session(session)
-        # Register callback for conversation changes
         self._register_session_callbacks(session)
         self.state_bridge.update_external_file_path(None)
-
-        # Ensure state is IDLE
         self.state = ExecutionState.IDLE
-        # Status message will be emitted through event processing
-        debug_log(f"Started new session{' named ' + name if name else ''}", level="DEBUG", component="SessionLifecycle")
+        log('DEBUG', 'presenter.lifecycle', f"Started new session{(' named ' + name if name else '')}")
 
     def continue_session(self, query: str):
         """
@@ -211,24 +147,15 @@ class SessionLifecycle:
         Args:
             query: User query string
         """
-        # States that accept new queries: IDLE, PAUSED, WAITING_FOR_USER, FINALIZED, MAX_TURNS_REACHED
-        # But for continue_session (existing session), IDLE might mean session was never started
-        # Actually, let controller handle whether it can accept queries
-        # The controller checks is_running and other internal state
-        debug_log(f"continue_session called in state {self.state}", level="DEBUG", component="SessionLifecycle")
-        # We'll let controller decide; just pass query through
+        log('DEBUG', 'presenter.lifecycle', f'continue_session called in state {self.state}')
         try:
             self.controller.continue_session(query)
             self.state = ExecutionState.RUNNING
-            debug_log(f"continue_session successful, state set to RUNNING", level="DEBUG", component="SessionLifecycle")
-            # Status message will be emitted through event processing
+            log('DEBUG', 'presenter.lifecycle', f'continue_session successful, state set to RUNNING')
         except Exception as e:
-            # Error will be emitted through event processing
-            debug_log(f"Error in continue_session: {e}", level="DEBUG", component="SessionLifecycle")
+            log('DEBUG', 'presenter.lifecycle', f'Error in continue_session: {e}')
             if os.environ.get('PAUSE_DEBUG'):
-                debug_log(f"SessionLifecycle.continue_session: controller rejected query: {e}", level="WARNING", component="PAUSE_FLOW")
-            # Don't set state to RUNNING since controller failed to accept query
-            # Re-raise the exception so presenter can handle it
+                log('WARNING', 'presenter.pause_flow', f'SessionLifecycle.continue_session: controller rejected query: {e}')
             raise
 
     def pause_session(self):
@@ -237,72 +164,51 @@ class SessionLifecycle:
             self.controller.request_pause()
             self.state = ExecutionState.PAUSING
         else:
-            debug_log(f"Cannot pause in state {self.state}", level="DEBUG", component="SessionLifecycle")
+            log('DEBUG', 'presenter.lifecycle', f'Cannot pause in state {self.state}')
 
     def _finalize_restart(self):
         """Common restart cleanup: reset controller and state."""
-        # Reset rate limiting on current agent if it exists
         if hasattr(self.controller, 'agent') and self.controller.agent is not None:
             agent = self.controller.agent
             if hasattr(agent, 'reset_rate_limiting'):
                 try:
                     agent.reset_rate_limiting()
-                    debug_log(f"Reset rate limiting on agent before restart", level="DEBUG", component="SessionLifecycle")
+                    log('DEBUG', 'presenter.lifecycle', f'Reset rate limiting on agent before restart')
                 except Exception as e:
-                    debug_log(f"Failed to reset rate limiting: {e}", level="DEBUG", component="SessionLifecycle")
+                    log('DEBUG', 'presenter.lifecycle', f'Failed to reset rate limiting: {e}')
         self.controller.reset()
         self.state = ExecutionState.IDLE
         self._restarting = False
-        # Rebuild initial conversation from user_history for continuation
         if self.state_bridge.current_session and self.state_bridge.current_session.user_history:
-            self._initial_conversation = self.context_builder.build(
-                self.state_bridge.current_session.user_history
-            )
+            self._initial_conversation = self.context_builder.build(self.state_bridge.current_session.user_history)
         else:
             self._initial_conversation = None
-        # Status message will be emitted through event processing
 
-    def restart_session(self, query: str = None):
+    def restart_session(self, query: str=None):
         """
         Restart a fresh session with current configuration.
         Does NOT automatically start a new session. After restart, state is IDLE.
         """
-        # Refresh config from current GUI
         try:
             self._cached_config = self.state_bridge.create_agent_config()
         except Exception as e:
-            # Error will be emitted through event processing
-            debug_log(f"Error creating agent config for restart: {e}", level="DEBUG", component="SessionLifecycle")
+            log('DEBUG', 'presenter.lifecycle', f'Error creating agent config for restart: {e}')
             raise
-
-        # Auto-save current session if exists (silent)
         if self.state_bridge.current_session_id:
             try:
-                # Save will be implemented when save_session is added
                 pass
             except Exception as e:
-                debug_log(f"Auto-save before restart failed: {e}", level="DEBUG", component="SessionLifecycle")
-                # Continue anyway
-
-        # If already IDLE, finalize immediately
+                log('DEBUG', 'presenter.lifecycle', f'Auto-save before restart failed: {e}')
         if self.state == ExecutionState.IDLE:
             self._finalize_restart()
             return
-
-        # Avoid re-entrancy
         if self._restarting:
             return
         self._restarting = True
-
-        # Request stop
         self.controller.stop()
-
-        # If controller already stopped (thread dead), finalize now
         if not self.controller.is_running:
             self._finalize_restart()
             return
-
-        # Otherwise, wait for terminal event; state = PAUSING
 
     def save_session(self) -> bool:
         """Save current session to the session store.
@@ -310,53 +216,36 @@ class SessionLifecycle:
         Returns:
             True if saved successfully, False otherwise
         """
-        debug_log(f"save_session called, current_session_id={self.state_bridge.current_session_id}", level="DEBUG", component="SessionLifecycle")
+        log('DEBUG', 'presenter.lifecycle', f'save_session called, current_session_id={self.state_bridge.current_session_id}')
         try:
-            # Build session from current state
             session = self._build_session_from_current_state()
             if session is None:
-                debug_log(f"No session to save", level="DEBUG", component="SessionLifecycle")
+                log('DEBUG', 'presenter.lifecycle', f'No session to save')
                 return False
-
-            # Ensure we have a session_id (new session if None)
             if not self.state_bridge.current_session_id:
                 self.state_bridge.current_session_id = str(session.session_id)
             else:
-                # Preserve the existing session_id
                 session.session_id = str(self.state_bridge.current_session_id)
-
-            # Set current_session reference
             self.state_bridge.current_session = session
-
-            # Ensure session has a name for listing
             session.ensure_name()
-
-            # Save via session store (writes to store directory)
-            debug_log(f"About to save session {session.session_id} to store", level="WARNING", component="SessionLifecycle")
+            log('WARNING', 'presenter.lifecycle', f'About to save session {session.session_id} to store')
             self.session_store.save_session(session)
-
-            # Update session name from metadata
             self.state_bridge.session_name = session.metadata.get('name')
-
-            # Update current session marker to point to this session
             self.session_store.set_current_session_id(self.state_bridge.current_session_id)
-            debug_log(f"Session saved to store: {self.session_store.get_session_path(session.session_id)}", level="DEBUG", component="SessionLifecycle")
-            # Also export to external file if set
+            log('DEBUG', 'presenter.lifecycle', f'Session saved to store: {self.session_store.get_session_path(session.session_id)}')
             if self.state_bridge._external_file_path:
                 try:
-                    # Export will be implemented when export_session is added
                     pass
                 except Exception as e:
-                    debug_log(f"Failed to export to external file: {e}", level="DEBUG", component="SessionLifecycle")
+                    log('DEBUG', 'presenter.lifecycle', f'Failed to export to external file: {e}')
             return True
         except Exception as e:
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                 import traceback
-                debug_log(f"Error saving session: {e}\n{traceback.format_exc()}", level="ERROR", component="SessionLifecycle")
+                log('ERROR', 'presenter.lifecycle', f'Error saving session: {e}\n{traceback.format_exc()}')
             return False
 
-    
-    def load_session(self, filepath: str, target_session: Optional[Session] = None) -> bool:
+    def load_session(self, filepath: str, target_session: Optional[Session]=None) -> bool:
         """Load a session from a JSON file.
 
         Args:
@@ -367,52 +256,36 @@ class SessionLifecycle:
         Returns:
             True if loaded successfully, False otherwise
         """
-        # Always auto-save current session before loading new one
         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            debug_log(f'Auto-saving current session before loading new session', level="DEBUG", component="SessionLifecycle")
+            log('DEBUG', 'presenter.lifecycle', f'Auto-saving current session before loading new session')
         self.auto_save_current_session()
-
         try:
-            # Convert to absolute path for consistency
             filepath = os.path.abspath(filepath)
             with open(filepath, 'r') as f:
                 session_dict = json.load(f)
-
-            # Check session version
             version = session_dict.get('version', 0)
             if version != 1:
-                debug_log(f"Warning: Session version {version} is not current (1). Attempting to load anyway.", level="DEBUG", component="SessionLifecycle")
-
-            # Reconstruct Session object
+                log('DEBUG', 'presenter.lifecycle', f'Warning: Session version {version} is not current (1). Attempting to load anyway.')
             if target_session is not None:
-                # Update existing session in place
                 target_session.update_from_persistable_dict(session_dict)
                 session = target_session
                 session.ensure_name()
-                # Callbacks already registered, no need to re-register
             else:
-                # Old behavior: create new session
                 session = Session.from_persistable_dict(session_dict)
-                # Ensure session has a name
                 session.ensure_name()
-                # Register callback for conversation changes
                 self._register_session_callbacks(session)
-            
             self.state_bridge.bind_session(session)
             self.state_bridge.update_external_file_path(filepath)
-
-            # If session name was not set by binding (i.e., metadata lacks name), use fallback
             if not self.state_bridge.session_name:
                 self.state_bridge.session_name = os.path.basename(filepath)
-
-            debug_log(f"Session loaded from {filepath}: {len(session.user_history)} messages", level="DEBUG", component="SessionLifecycle")
+            log('DEBUG', 'presenter.lifecycle', f'Session loaded from {filepath}: {len(session.user_history)} messages')
             return True
         except Exception as e:
             import traceback
-            debug_log(f"Error loading session: {e}\n{traceback.format_exc()}", level="DEBUG", component="SessionLifecycle")
+            log('DEBUG', 'presenter.lifecycle', f'Error loading session: {e}\n{traceback.format_exc()}')
             return False
 
-    def load_session_by_id(self, session_id: str, target_session: Optional[Session] = None) -> bool:
+    def load_session_by_id(self, session_id: str, target_session: Optional[Session]=None) -> bool:
         """Load a session by ID from the session store.
 
         Args:
@@ -420,46 +293,36 @@ class SessionLifecycle:
             target_session: Optional existing session to update in-place. If None,
                 creates a new session object.
         """
-        debug_log(f"Loading session {session_id} from store", level="DEBUG", component="SessionLifecycle")
+        log('DEBUG', 'presenter.lifecycle', f'Loading session {session_id} from store')
         loaded_session = self.session_store.load_session(session_id)
         if loaded_session is None:
-            debug_log(f"Session {session_id} not found", level="DEBUG", component="SessionLifecycle")
+            log('DEBUG', 'presenter.lifecycle', f'Session {session_id} not found')
             return False
-
         if target_session is not None:
-            # Update existing session in place
             data = loaded_session.to_persistable_dict()
             target_session.update_from_persistable_dict(data)
             session = target_session
             session.ensure_name()
-            # Callbacks already registered, no need to re-register
         else:
             session = loaded_session
-            # Ensure session has a name
             session.ensure_name()
-            # Register callback for conversation changes
             self._register_session_callbacks(session)
-
-        # Set as current session
         self.state_bridge.current_session = session
         self.state_bridge.current_session_id = str(session.session_id)
         self.state_bridge.bind_session(session)
-        # Restore external file path from metadata if present
         external_file_path = session.metadata.get('external_file_path')
         if external_file_path:
-            # Convert to absolute path for consistency
             external_file_path = os.path.abspath(external_file_path)
             self.state_bridge.update_external_file_path(external_file_path)
-        # If session name was not set by binding, format a fallback
         if not self.state_bridge.session_name:
             if isinstance(session.created_at, datetime):
-                self.state_bridge.session_name = f"Session {session.created_at:%Y-%m-%d %H:%M}"
+                self.state_bridge.session_name = f'Session {session.created_at:%Y-%m-%d %H:%M}'
             else:
-                self.state_bridge.session_name = "Untitled Session"
-        debug_log(f"Session loaded from store: {session_id} ({self.state_bridge.session_name})", level="DEBUG", component="SessionLifecycle")
+                self.state_bridge.session_name = 'Untitled Session'
+        log('DEBUG', 'presenter.lifecycle', f'Session loaded from store: {session_id} ({self.state_bridge.session_name})')
         return True
 
-    def export_session(self, filepath: str, set_as_external: bool = False) -> bool:
+    def export_session(self, filepath: str, set_as_external: bool=False) -> bool:
         """Export current session to a specified file path (for backup/transfer).
 
         Args:
@@ -471,39 +334,28 @@ class SessionLifecycle:
             True if exported successfully, False otherwise
         """
         try:
-            # Convert to absolute path for consistency
             filepath = os.path.abspath(filepath)
             session = self._build_session_from_current_state()
             if session is None:
-                debug_log(f"No session to export", level="DEBUG", component="SessionLifecycle")
+                log('DEBUG', 'presenter.lifecycle', f'No session to export')
                 return False
-
-            # Use the session's ID if available, otherwise generate a temporary one for export
             if not session.session_id:
                 session.session_id = str(uuid.uuid4())
-
-            # Serialize to JSON (version already included by to_persistable_dict)
             session_dict = session.to_persistable_dict()
-            # Ensure datetime objects are serialized
             if isinstance(session_dict.get('created_at'), datetime):
                 session_dict['created_at'] = session_dict['created_at'].isoformat()
             if isinstance(session_dict.get('updated_at'), datetime):
                 session_dict['updated_at'] = session_dict['updated_at'].isoformat()
-
-            # Ensure directory exists
             os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else '.', exist_ok=True)
-
             with open(filepath, 'w') as f:
                 json.dump(session_dict, f, indent=2)
-
-            debug_log(f"Session exported to {filepath}", level="DEBUG", component="SessionLifecycle")
+            log('DEBUG', 'presenter.lifecycle', f'Session exported to {filepath}')
             if set_as_external:
                 self.state_bridge.update_external_file_path(filepath)
-            # Note: we do NOT clear dirty flag because export does not affect session store
             return True
         except Exception as e:
             import traceback
-            debug_log(f"Error exporting session: {e}\n{traceback.format_exc()}", level="DEBUG", component="SessionLifecycle")
+            log('DEBUG', 'presenter.lifecycle', f'Error exporting session: {e}\n{traceback.format_exc()}')
             return False
 
     def list_sessions(self) -> List[Dict[str, Any]]:
@@ -514,10 +366,10 @@ class SessionLifecycle:
         """
         try:
             sessions = self.session_store.list_sessions()
-            debug_log(f"Listed {len(sessions)} sessions", level="DEBUG", component="SessionLifecycle")
+            log('DEBUG', 'presenter.lifecycle', f'Listed {len(sessions)} sessions')
             return sessions
         except Exception as e:
-            debug_log(f"Error listing sessions: {e}", level="DEBUG", component="SessionLifecycle")
+            log('DEBUG', 'presenter.lifecycle', f'Error listing sessions: {e}')
             return []
 
     def delete_session(self, session_id: str) -> bool:
@@ -529,12 +381,12 @@ class SessionLifecycle:
         try:
             success = self.session_store.delete_session(session_id)
             if success:
-                debug_log(f"Deleted session {session_id}", level="DEBUG", component="SessionLifecycle")
+                log('DEBUG', 'presenter.lifecycle', f'Deleted session {session_id}')
             else:
-                debug_log(f"Session {session_id} not found for deletion", level="DEBUG", component="SessionLifecycle")
+                log('DEBUG', 'presenter.lifecycle', f'Session {session_id} not found for deletion')
             return success
         except Exception as e:
-            debug_log(f"Error deleting session: {e}", level="DEBUG", component="SessionLifecycle")
+            log('DEBUG', 'presenter.lifecycle', f'Error deleting session: {e}')
             return False
 
     def rename_session(self, session_id: str, new_name: str) -> bool:
@@ -547,76 +399,50 @@ class SessionLifecycle:
         try:
             session = self.session_store.load_session(session_id)
             if session is None:
-                debug_log(f"Session {session_id} not found for rename", level="DEBUG", component="SessionLifecycle")
+                log('DEBUG', 'presenter.lifecycle', f'Session {session_id} not found for rename')
                 return False
-
-            # Update name in metadata
             session.metadata['name'] = new_name
-            # Save back to store
             self.session_store.save_session(session)
-            # If this is the current session, update our session_name
             if self.state_bridge.current_session_id == session_id:
                 self.state_bridge.session_name = new_name
-
-            debug_log(f"Renamed session {session_id} to {new_name}", level="DEBUG", component="SessionLifecycle")
+            log('DEBUG', 'presenter.lifecycle', f'Renamed session {session_id} to {new_name}')
             return True
         except Exception as e:
-            debug_log(f"Error renaming session: {e}", level="DEBUG", component="SessionLifecycle")
+            log('DEBUG', 'presenter.lifecycle', f'Error renaming session: {e}')
             return False
 
     def _build_session_from_current_state(self):
         """Construct a Session object from current presenter state."""
-        debug_log(f"_build_session_from_current_state: user_history length={len(self.state_bridge.user_history) if self.state_bridge.user_history else 0}, current_session_id={self.state_bridge.current_session_id}, current_session exists={self.state_bridge.current_session is not None}", level="DEBUG", component="SessionLifecycle")
-        # Get the full conversation from the current session
+        log('DEBUG', 'presenter.lifecycle', f'_build_session_from_current_state: user_history length={(len(self.state_bridge.user_history) if self.state_bridge.user_history else 0)}, current_session_id={self.state_bridge.current_session_id}, current_session exists={self.state_bridge.current_session is not None}')
         conversation = None
         if self.state_bridge.user_history is not None:
             conversation = self.state_bridge.user_history
         else:
-            # Try to get conversation from controller
             conversation = self.controller.get_conversation() if hasattr(self.controller, 'get_conversation') else None
             if conversation is None:
                 conversation = self._initial_conversation
-
-        # If conversation is still None, check if we have a current session
         if conversation is None:
             if self.state_bridge.current_session is not None:
-                # We have a session but no conversation (empty session)
                 conversation = []
             else:
-                debug_log(f"_build_session_from_current_state: No conversation found and no current session", level="DEBUG", component="SessionLifecycle")
+                log('DEBUG', 'presenter.lifecycle', f'_build_session_from_current_state: No conversation found and no current session')
                 return None
-
-        # Build session config from current agent config
         try:
             agent_config = self.state_bridge.create_agent_config()
             session_config = self.state_bridge.build_session_config(agent_config)
         except Exception as e:
-            debug_log(f"Error building session config: {e}", level="DEBUG", component="SessionLifecycle")
+            log('DEBUG', 'presenter.lifecycle', f'Error building session config: {e}')
             return None
-
-        # Create session with current state
-        session = Session(
-            session_id=self.state_bridge.current_session_id or str(uuid.uuid4()),
-            config=session_config,
-            user_history=conversation,
-            metadata={'name': self.state_bridge.session_name} if self.state_bridge.session_name else {}
-        )
-        # Ensure session has a name
+        session = Session(session_id=self.state_bridge.current_session_id or str(uuid.uuid4()), config=session_config, user_history=conversation, metadata={'name': self.state_bridge.session_name} if self.state_bridge.session_name else {})
         session.ensure_name()
-        
-        # Copy token totals and context length if available
         if self.state_bridge.total_input > 0:
             session.total_input_tokens = self.state_bridge.total_input
         if self.state_bridge.total_output > 0:
             session.total_output_tokens = self.state_bridge.total_output
         if self.state_bridge.context_length > 0:
             session.context_length = self.state_bridge.context_length
-        
-        
-        # Add external file path to metadata if set
         if self.state_bridge._external_file_path:
             session.metadata['external_file_path'] = self.state_bridge._external_file_path
-        
         return session
 
     def auto_save_current_session(self) -> bool:
@@ -625,28 +451,24 @@ class SessionLifecycle:
         Returns:
             True if saved successfully, False on error.
         """
-        debug_log(f"auto_save_current_session called, current_session_id={self.state_bridge.current_session_id}, current_session exists={self.state_bridge.current_session is not None}", level="DEBUG", component="SessionLifecycle")        # Event-driven auto-save: always attempt to save on terminal events
-        # The save_session() method will handle cases where there's nothing to save
+        log('DEBUG', 'presenter.lifecycle', f'auto_save_current_session called, current_session_id={self.state_bridge.current_session_id}, current_session exists={self.state_bridge.current_session is not None}')
         if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-            debug_log(f'Attempting auto-save (event-driven)', level="DEBUG", component="SessionLifecycle")
-
+            log('DEBUG', 'presenter.lifecycle', f'Attempting auto-save (event-driven)')
         try:
             success = self.save_session()
             if success:
                 if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                    debug_log(f'Auto-saved session successfully', level="DEBUG", component="SessionLifecycle")
-                # Also export to external file if set
+                    log('DEBUG', 'presenter.lifecycle', f'Auto-saved session successfully')
                 if self.state_bridge._external_file_path:
                     try:
                         self.export_session(self.state_bridge._external_file_path, set_as_external=False)
                     except Exception as e:
-                        debug_log(f"Failed to export to external file: {e}", level="DEBUG", component="SessionLifecycle")
+                        log('DEBUG', 'presenter.lifecycle', f'Failed to export to external file: {e}')
                 return True
             else:
                 if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
-                    debug_log(f'Auto-save failed', level="DEBUG", component="SessionLifecycle")
+                    log('DEBUG', 'presenter.lifecycle', f'Auto-save failed')
                 return False
         except Exception as e:
-            debug_log(f"Error in auto-save: {e}", level="DEBUG", component="SessionLifecycle")
+            log('DEBUG', 'presenter.lifecycle', f'Error in auto-save: {e}')
             return False
-
