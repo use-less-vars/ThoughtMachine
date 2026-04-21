@@ -5,28 +5,32 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QTextCursor
 from agent.logging import log
 from .markdown_renderer import MarkdownRenderer
+from .message_renderer import MessageRenderer, MessageType
 from ..utils.constants import MAX_RESULT_LENGTH, MAX_TOOL_RESULTS_PER_TURN, MAX_LINES_PER_RESULT, ENABLE_RESULT_TRUNCATION, INTERNAL_EVENT_TYPES
 
 class OutputPanel(QWidget):
     """Panel containing event display, filtering, and query controls."""
-    SPECIAL_TOOLS = ['Final', 'FinalReport', 'RequestUserInteraction']
-    COLOR_USER_QUERY = '#BD0567'
-    COLOR_SYSTEM_USER = '#DB7093'
-    COLOR_REASONING_BG = '#f8f8f8'
-    COLOR_REASONING_BORDER = '#888'
-    COLOR_FINAL = '#3498db'
-    COLOR_REQUEST_USER = '#40E0D0'
-    COLOR_REGULAR_TOOL = '#006400'
-    COLOR_TOOL_CALL = '#00008B'
-    COLOR_TOOL_RESULT = '#87CEEB'
-    COLOR_SYSTEM = '#ff9999'
-    COLOR_ASSISTANT = '#99ccff'
+    SPECIAL_TOOLS = {'Final', 'FinalReport', 'RequestUserInteraction', 'ProgressReport'}
+    COLOR_USER_QUERY = MessageRenderer.STYLES[MessageType.USER].border_color
+    COLOR_SYSTEM_USER = MessageRenderer.STYLES[MessageType.USER_SYSTEM].border_color
+    COLOR_REASONING_BG = MessageRenderer.STYLES[MessageType.REASONING].background_color
+    COLOR_REASONING_BORDER = MessageRenderer.STYLES[MessageType.REASONING].border_color
+    COLOR_FINAL = MessageRenderer.STYLES[MessageType.TOOL_CALL].border_color
+    COLOR_REQUEST_USER = MessageRenderer.STYLES[MessageType.TOOL_CALL].border_color
+    COLOR_REGULAR_TOOL = MessageRenderer.STYLES[MessageType.TOOL_RESULT].border_color
+    COLOR_TOOL_CALL = MessageRenderer.STYLES[MessageType.TOOL_CALL].border_color
+    COLOR_TOOL_RESULT = MessageRenderer.STYLES[MessageType.TOOL_RESULT].border_color
+    COLOR_SYSTEM = MessageRenderer.STYLES[MessageType.SYSTEM].border_color
+    COLOR_ASSISTANT = MessageRenderer.STYLES[MessageType.ASSISTANT].border_color
 
     def _is_system_message(self, content: str) -> bool:
         """Check if content appears to be a system notification (token warning, etc.)"""
         if not content:
             return False
-        return content.startswith('[SYSTEM NOTIFICATION]') or content.startswith('[SYSTEM]')
+        # Accept both formats: with or without asterisks
+        return (content.startswith('[SYSTEM NOTIFICATION]') or 
+                content.startswith('[**SYSTEM NOTIFICATION**]') or 
+                content.startswith('[SYSTEM]'))
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -38,6 +42,7 @@ class OutputPanel(QWidget):
         self._tool_call_map = {}
         self.init_ui()
         self.markdown_renderer = MarkdownRenderer()
+        self.message_renderer = MessageRenderer(self.markdown_renderer)
         self.setup_signal_connections()
 
     def init_ui(self):
@@ -122,10 +127,10 @@ class OutputPanel(QWidget):
                         border_color = self.COLOR_REQUEST_USER
                     else:
                         border_color = self.COLOR_FINAL
-                    bg_color = '#eef4ff'
+                    bg_color = MessageRenderer.STYLES[MessageType.TOOL_CALL].background_color
                 else:
                     border_color = self.COLOR_TOOL_CALL
-                    bg_color = '#f0f8f0'
+                    bg_color = MessageRenderer.STYLES[MessageType.TOOL_RESULT].background_color
                 if tool_name in self.SPECIAL_TOOLS:
                     header = f"Tool: <span style='color: #001f3f;'>{tool_name}</span>"
                 else:
@@ -148,15 +153,18 @@ class OutputPanel(QWidget):
                 self._tool_call_map[tool_call_id] = tool_name
         if event_type == 'user_query':
             content = event.get('content', '')
-            if self._is_system_message(content):
+            is_system_notification = self._is_system_message(content)
+            if is_system_notification:
                 border_color = self.COLOR_SYSTEM_USER
+                bg_color = MessageRenderer.STYLES[MessageType.USER_SYSTEM].background_color
+                header = 'System'
             else:
                 border_color = self.COLOR_USER_QUERY
-            bg_color = '#FFF0F5'
-            header = 'User'
+                bg_color = MessageRenderer.STYLES[MessageType.USER].background_color
+                header = 'User'
         elif event_type == 'turn':
             border_color = self.COLOR_ASSISTANT
-            bg_color = '#e6f3ff'
+            bg_color = MessageRenderer.STYLES[MessageType.ASSISTANT].background_color
             header = 'Assistant'
         elif event_type == 'tool_call':
             tool_name = event.get('function', {}).get('name', 'unknown')
@@ -165,11 +173,11 @@ class OutputPanel(QWidget):
                     border_color = self.COLOR_REQUEST_USER
                 else:
                     border_color = self.COLOR_FINAL
-                bg_color = '#eef4ff'
+                bg_color = MessageRenderer.STYLES[MessageType.TOOL_CALL].background_color
                 header = f'Tool: {tool_name}'
             else:
                 border_color = self.COLOR_TOOL_CALL
-                bg_color = '#f0f8f0'
+                bg_color = MessageRenderer.STYLES[MessageType.TOOL_RESULT].background_color
                 header = f'Tool: {tool_name}'
         elif event_type == 'tool_result':
             log('DEBUG', 'ui.output_panel', f'DEBUG _render_event tool_result: tool_call_id={tool_call_id}, map keys={list(self._tool_call_map.keys())}')
@@ -180,24 +188,24 @@ class OutputPanel(QWidget):
                     border_color = self.COLOR_REQUEST_USER
                 else:
                     border_color = self.COLOR_FINAL
-                bg_color = '#eef4ff'
+                bg_color = MessageRenderer.STYLES[MessageType.TOOL_CALL].background_color
                 header = f'Tool Result ({tool_name})'
             else:
                 border_color = self.COLOR_TOOL_RESULT
-                bg_color = '#f0f8f0'
+                bg_color = MessageRenderer.STYLES[MessageType.TOOL_RESULT].background_color
                 header = 'Tool Result'
         elif event_type in ('system', 'token_warning', 'turn_warning'):
             border_color = self.COLOR_SYSTEM
-            bg_color = '#ffe6e6'
+            bg_color = MessageRenderer.STYLES[MessageType.SYSTEM].background_color
             header = 'System'
         elif event_type == 'final':
             border_color = '#FFA500'
-            bg_color = '#FFF5E6'
+            bg_color = '#FFF5E6'  # Final event not in MessageRenderer, keep original
             header = 'Final'
         else:
             log('DEBUG', 'ui.output_panel', f'DEBUG _render_event unknown event_type: {event_type}, keys: {list(event.keys())}')
             border_color = '#cccccc'
-            bg_color = '#f8f8f8'
+            bg_color = MessageRenderer.STYLES[MessageType.REASONING].background_color
             header = event_type.replace('_', ' ').title()
         current_tool_name = ''
         if event_type == 'tool_result':

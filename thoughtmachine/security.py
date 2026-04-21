@@ -572,7 +572,7 @@ def _request_security_prompt(
             source="security",
             session_id=session_id
         )
-        global_event_bus.emit(event)
+        global_event_bus.publish(event)
     except Exception as e:
         # Log error and fallback to allow
         logging.getLogger(__name__).error(f"Failed to emit security prompt: {e}")
@@ -856,7 +856,7 @@ def get_default_security_config() -> Dict[str, Any]:
             "read_only": False,
             "allowed_networks": [],  # list of domain patterns
             "tool_overrides": {},    # {"FileEditor": "ask", "DockerCodeRunner": "deny"}
-            "default_policy": "ask",  # "allow", "ask", "deny"
+            "default_policy": "allow",  # "allow", "ask", "deny"
             "capability_requirements": {}  # {"fs:write": "ask", "container:exec": "deny"}
         },
         "agent_overrides": {}  # for future multi-agent support

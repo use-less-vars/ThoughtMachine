@@ -13,12 +13,7 @@ import logging
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + '/../')
-try:
-    from debug_pruning import debug_log
-    DEBUG_PRUNING_AVAILABLE = True
-except ImportError:
-    DEBUG_PRUNING_AVAILABLE = False
-    debug_log = lambda *args, **kwargs: None
+
 logger = logging.getLogger(__name__)
 # Lazy import to avoid circular dependency
 _log_real = None

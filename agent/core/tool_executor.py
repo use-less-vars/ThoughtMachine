@@ -14,12 +14,6 @@ from tools.final_report import FinalReport
 from agent.core.turn_transaction import TurnTransaction
 from tools.request_user_interaction import RequestUserInteraction
 from tools.summarize_tool import SummarizeTool
-try:
-    from agent.logging import log
-    DEBUG_PRUNING_AVAILABLE = True
-except ImportError:
-    DEBUG_PRUNING_AVAILABLE = False
-    log = lambda *args, **kwargs: None
 
 class ToolExecutor:
     """Handles tool execution, JSON repair, and tool result processing."""
@@ -124,8 +118,7 @@ class ToolExecutor:
                     summary_requested = True
                     summary_text = tool_execution_result.get('summary_text')
                     summary_keep_recent_turns = tool_execution_result.get('summary_keep_recent_turns')
-                    if DEBUG_PRUNING_AVAILABLE:
-                        log_summary_operation(f'SummarizeTool executed: summary length={len(summary_text)}, keep_recent_turns={summary_keep_recent_turns}')
+                    log('DEBUG', 'core.summary', f'SummarizeTool executed: summary length={len(summary_text)}, keep_recent_turns={summary_keep_recent_turns}')
             if self.logger:
                 self.logger.log_tool_result(tool_name, tool_result, tool_call['id'])
             add_tool_result({'role': 'tool', 'tool_call_id': tool_call['id'], 'content': tool_result})

@@ -39,12 +39,6 @@ from .conversation_manager import ConversationManager
 from .tool_executor import ToolExecutor
 from .turn_transaction import TurnTransaction
 from .debug_context import DebugContext
-try:
-    from agent.logging import log
-    DEBUG_PRUNING_AVAILABLE = True
-except ImportError:
-    DEBUG_PRUNING_AVAILABLE = False
-    log = lambda *args, **kwargs: None
 if TYPE_CHECKING:
     from agent.config import AgentConfig
     from session.models import Session
@@ -853,8 +847,7 @@ class Agent:
             self._apply_summary_pruning_fallback(summary, keep_recent_turns)
             old_token_count = self.state.current_conversation_tokens
             self._update_conversation_token_estimate()
-            if DEBUG_PRUNING_AVAILABLE:
-                log_pruning_operation('Fallback pruning', f'{old_token_count} -> {self.state.current_conversation_tokens}')
+            log('DEBUG', 'core.pruning', f'Fallback pruning token change: {old_token_count} -> {self.state.current_conversation_tokens}')
             if self.logger and hasattr(self.logger, 'py_logger'):
                 self.logger.py_logger.info(f'[PRUNING] Updated token estimate after fallback: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
             return
@@ -903,14 +896,12 @@ class Agent:
             log('DEBUG', 'core.context_builder', f'_apply_summary_pruning: cleared _cached_context')
         if self.logger:
             self.logger.log_conversation_prune(len(user_history) - 1, len(user_history), 'summary_pruning_append_only')
-        if DEBUG_PRUNING_AVAILABLE:
-            log_summary_operation(f'Added summary to append-only history: kept {kept_turns_count} turns, inserted at index {insertion_idx}')
+        log('DEBUG', 'core.summary', f'Added summary to append-only history: kept {kept_turns_count} turns, inserted at index {insertion_idx}')
         if self.logger and hasattr(self.logger, 'py_logger'):
             self.logger.py_logger.info(f'[PRUNING] Added summary to append-only history: kept {kept_turns_count} turns, inserted summary at index {insertion_idx}, history length: {len(user_history)} messages')
         old_token_count = self.state.current_conversation_tokens
         self._update_conversation_token_estimate()
-        if DEBUG_PRUNING_AVAILABLE:
-            log_pruning_operation('Summary pruning', f'tokens: {old_token_count} -> {self.state.current_conversation_tokens}, summary_idx={insertion_idx}, kept_turns={kept_turns_count}')
+        log('DEBUG', 'core.pruning', f'Summary pruning token change: {old_token_count} -> {self.state.current_conversation_tokens}, summary_idx={insertion_idx}, kept_turns={kept_turns_count}')
         if self.logger and hasattr(self.logger, 'py_logger'):
             self.logger.py_logger.info(f'[PRUNING] Updated token estimate: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
         log('DEBUG', 'core.pruning', f'_apply_summary_pruning completed. History length: {len(user_history)} messages')

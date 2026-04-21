@@ -50,8 +50,8 @@ class MessageRenderer:
     # CSS style definitions
     STYLES = {
         MessageType.USER: MessageStyle(
-            border_color="#FF69B4",
-            background_color="#FFF0F5",
+            border_color="#440424",
+            background_color="#F0AFC5",
             header_text_color="#000000"
         ),
         MessageType.USER_SYSTEM: MessageStyle(

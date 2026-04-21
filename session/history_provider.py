@@ -13,19 +13,7 @@ import logging
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + '/../')
-try:
-    from debug_pruning import debug_log, log_session_history, log_history_provider_reconstruction, log_message_insertion, log_pruning_operation, log_token_count, log_summary_operation, truncate_message
-    DEBUG_PRUNING_AVAILABLE = True
-except ImportError:
-    DEBUG_PRUNING_AVAILABLE = False
-    debug_log = lambda *args, **kwargs: None
-    log_session_history = lambda *args, **kwargs: None
-    log_history_provider_reconstruction = lambda *args, **kwargs: None
-    log_message_insertion = lambda *args, **kwargs: None
-    log_pruning_operation = lambda *args, **kwargs: None
-    log_token_count = lambda *args, **kwargs: None
-    log_summary_operation = lambda *args, **kwargs: None
-    truncate_message = lambda entry, max_len: str(entry)[:max_len]
+
 from .models import Session
 from .context_builder import ContextBuilder, SummaryBuilder
 from agent.logging import log
@@ -91,12 +79,10 @@ class HistoryProvider:
         if self._cached_context is not None:
             return self._cached_context
         context = self.context_builder.build(self.session.user_history, max_tokens=self.token_limit)
-        if DEBUG_CONTEXT and DEBUG_PRUNING_AVAILABLE:
+        if DEBUG_CONTEXT:
             log('DEBUG', 'session.history_provider', f'get_context_for_llm: {len(self.session.user_history)} history → {len(context)} context')
             if self.token_limit:
                 log('DEBUG', 'session.history_provider', f'Token limit: {self.token_limit}')
-            log_session_history(self.session.user_history, 'Session history')
-            log_history_provider_reconstruction('HistoryProvider', self.session.user_history, context)
         elif DEBUG_CONTEXT:
             logger.debug(f'[DEBUG_CONTEXT] HistoryProvider.get_context_for_llm: full history={len(self.session.user_history)} messages, context={len(context)} messages')
             if self.token_limit:
@@ -177,14 +163,7 @@ class HistoryProvider:
         self.session.user_history.append(message)
         self.session.updated_at = datetime.now()
         self._cached_context = None
-        if DEBUG_CONTEXT and DEBUG_PRUNING_AVAILABLE:
-            history_len = len(self.session.user_history)
-            surrounding_start = max(0, history_len - 3)
-            surrounding_end = history_len
-            surrounding = self.session.user_history[surrounding_start:surrounding_end]
-            log_message_insertion(self.session.session_id, message, history_len)
-            log_session_history(self.session.user_history, 'After adding message')
-        elif DEBUG_CONTEXT:
+        if DEBUG_CONTEXT:
             logger.debug(f"[DEBUG_CONTEXT] HistoryProvider.add_message: role={message.get('role')}, type={message.get('type', 'N/A')}, tool_calls={message.get('tool_calls', 'N/A')}")
         role = message.get('role', 'unknown')
         content_preview = str(message.get('content', ''))[:100]
@@ -207,8 +186,7 @@ class HistoryProvider:
             return (False, None)
         context = self.get_context_for_llm()
         token_count = self._estimate_context_tokens(context)
-        if DEBUG_PRUNING_AVAILABLE:
-            log_token_count('HistoryProvider.check_token_limit', token_count, self.token_limit)
+        log('DEBUG', 'core.pruning', f'Token count: {token_count}/{self.token_limit}')
         warning_threshold = self.token_limit * 0.8
         prune_threshold = self.token_limit * 0.95
         if token_count >= prune_threshold:
@@ -234,10 +212,8 @@ class HistoryProvider:
         summary_msg = {'role': 'system', 'content': f'Summary of previous conversation: {summary_text}', 'pruning_keep_recent_turns': keep_recent_turns, 'pruning_insertion_idx': len(self.session.user_history), 'timestamp': datetime.now().isoformat()}
         self.add_message(summary_msg)
         self.session.summary = summary_msg
-        if DEBUG_PRUNING_AVAILABLE:
-            log_summary_operation('Created summary', summary_msg)
-            log('DEBUG', 'core.pruning', f'Keeping {keep_recent_turns} recent turns after summary')
-            log_session_history(self.session.user_history, 'After adding summary')
+        log('DEBUG', 'core.summary', f'Created summary: {summary_text[:200]}...')
+        log('DEBUG', 'core.pruning', f'Keeping {keep_recent_turns} recent turns after summary')
         logger.info(f'Created summary: {summary_text[:100]}... (keeping {keep_recent_turns} recent turns)')
         return summary_msg
 

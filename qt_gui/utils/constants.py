@@ -3,6 +3,7 @@
 MAX_RESULT_LENGTH = 10000
 MAX_TOOL_RESULTS_PER_TURN = 10
 MAX_LINES_PER_RESULT = 5
+MAX_CHARS_PER_LINE = 200
 ENABLE_RESULT_TRUNCATION = True
 
 # Internal event types that should be hidden from output even with "all" filter
