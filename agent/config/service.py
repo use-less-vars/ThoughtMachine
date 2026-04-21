@@ -51,11 +51,11 @@ class ConfigService:
                 with self._lock:
                     self._config = self.default_config.copy()
                     self._config.update(loaded)
-                log('WARNING', 'config.service', f'Loaded config from {self.config_path}')
+                log('INFO', 'config.service', f'Loaded config from {self.config_path}')
                 self._notify_listeners()
                 return True
             else:
-                log('WARNING', 'config.service', f'Config file not found, using defaults')
+                log('INFO', 'config.service', f'Config file not found, using defaults')
                 with self._lock:
                     self._config = self.default_config.copy()
                 return False
@@ -75,14 +75,14 @@ class ConfigService:
         Returns:
             True if saved (or scheduled), False on error
         """
-        log('WARNING', 'config.service_debug', f'save called: immediate={immediate}, thread={threading.get_ident()}')
+        log('DEBUG', 'config.service_debug', f'save called: immediate={immediate}, thread={threading.get_ident()}')
         if immediate:
             result = self._do_save()
-            log('WARNING', 'config.service_debug', f'save immediate result: {result}')
+            log('DEBUG', 'config.service_debug', f'save immediate result: {result}')
             return result
         else:
             self._schedule_save()
-            log('WARNING', 'config.service_debug', f'save scheduled, thread={threading.get_ident()}')
+            log('DEBUG', 'config.service_debug', f'save scheduled, thread={threading.get_ident()}')
             return True
 
     def _do_save(self) -> bool:
@@ -90,19 +90,19 @@ class ConfigService:
         import threading
         import time
         thread_id = threading.get_ident()
-        log('WARNING', 'config.service_debug', f'_do_save start, thread {thread_id}, lock={self._lock}')
+        log('DEBUG', 'config.service_debug', f'_do_save start, thread {thread_id}, lock={self._lock}')
         try:
-            log('WARNING', 'config.service_debug', f'_do_save acquiring lock, thread {thread_id}')
+            log('DEBUG', 'config.service_debug', f'_do_save acquiring lock, thread {thread_id}')
             with self._lock:
-                log('WARNING', 'config.service_debug', f'_do_save lock acquired, thread {thread_id}')
+                log('DEBUG', 'config.service_debug', f'_do_save lock acquired, thread {thread_id}')
                 config_to_save = self._config.copy()
-                log('WARNING', 'config.service_debug', f'_do_save config copied, thread {thread_id}')
-            log('WARNING', 'config.service_debug', f'_do_save lock released, thread {thread_id}')
+                log('DEBUG', 'config.service_debug', f'_do_save config copied, thread {thread_id}')
+            log('DEBUG', 'config.service_debug', f'_do_save lock released, thread {thread_id}')
             os.makedirs(os.path.dirname(os.path.abspath(self.config_path)), exist_ok=True)
             with open(self.config_path, 'w') as f:
                 json.dump(config_to_save, f, indent=2)
-            log('WARNING', 'config.service', f'Saved config to {self.config_path}')
-            log('WARNING', 'config.service_debug', f'_do_save completed, thread {thread_id}')
+            log('INFO', 'config.service', f'Saved config to {self.config_path}')
+            log('DEBUG', 'config.service_debug', f'_do_save completed, thread {thread_id}')
             return True
         except Exception as e:
             log('ERROR', 'config.service', f'Error saving config: {e}')

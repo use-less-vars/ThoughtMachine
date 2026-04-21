@@ -1,7 +1,7 @@
 """Output Panel - Event display and output area for the agent."""
 import html
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox, QTextEdit, QFrame, QScrollArea
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QTextCursor
 from agent.logging import log
 from .markdown_renderer import MarkdownRenderer
@@ -284,18 +284,24 @@ class OutputPanel(QWidget):
         return '\n'.join(truncated_lines)
 
     def _append_html(self, html: str) -> None:
+        # Check if user is near bottom before inserting new content
+        scrollbar = self.output_textedit.verticalScrollBar()
+        was_near_bottom = scrollbar.value() >= scrollbar.maximum() - 5
+        
         cursor = self.output_textedit.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         cursor.insertBlock()
         cursor.insertHtml(html)
         cursor.insertBlock()
-        self.output_textedit.setTextCursor(cursor)
-        self._auto_scroll_if_bottom()
+        
+        # If user was near bottom before new content, scroll to new bottom
+        if was_near_bottom:
+            QTimer.singleShot(0, lambda: scrollbar.setValue(scrollbar.maximum()))
 
     def _auto_scroll_if_bottom(self) -> None:
         scrollbar = self.output_textedit.verticalScrollBar()
         if scrollbar.value() >= scrollbar.maximum() - 5:
-            self.output_textedit.ensureCursorVisible()
+            QTimer.singleShot(0, lambda: scrollbar.setValue(scrollbar.maximum()))
 
     def set_updates_enabled(self, enabled: bool) -> None:
         """Enable or disable widget updates for bulk operations."""
@@ -310,6 +316,18 @@ class OutputPanel(QWidget):
         """
         from agent.logging import log
         log('DEBUG', 'ui.output_panel', f'DEBUG load_session_history: processing {len(history)} messages')
+        
+        # Save scroll state before clearing if suppressing scroll
+        old_scroll_value = 0
+        old_scroll_max = 0
+        scroll_percentage = 0.0
+        if suppress_scroll:
+            scrollbar = self.output_textedit.verticalScrollBar()
+            old_scroll_value = scrollbar.value()
+            old_scroll_max = scrollbar.maximum()
+            if old_scroll_max > 0:
+                scroll_percentage = old_scroll_value / old_scroll_max
+            
         for i, msg in enumerate(history):
             log('DEBUG', 'ui.output_panel', f"DEBUG load_session_history message {i}: role={msg.get('role')}, keys={list(msg.keys())}")
             if msg.get('role') == 'assistant':
@@ -355,7 +373,15 @@ class OutputPanel(QWidget):
             self.display_message(message)
         if suppress_scroll:
             self.set_updates_enabled(True)
-            self._auto_scroll_if_bottom()
+            # Restore scroll position
+            scrollbar = self.output_textedit.verticalScrollBar()
+            new_max = scrollbar.maximum()
+            if scroll_percentage > 0.95:  # Was near bottom
+                QTimer.singleShot(0, lambda: scrollbar.setValue(new_max))  # Scroll to new bottom
+            elif scroll_percentage > 0 and new_max > 0:
+                # Restore relative position
+                new_value = int(scroll_percentage * new_max)
+                QTimer.singleShot(0, lambda: scrollbar.setValue(new_value))
 
     def show_processing_indicator(self, query, turn_number):
         """Show a temporary 'Processing...' indicator for a user query."""

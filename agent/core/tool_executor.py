@@ -15,20 +15,11 @@ from agent.core.turn_transaction import TurnTransaction
 from tools.request_user_interaction import RequestUserInteraction
 from tools.summarize_tool import SummarizeTool
 try:
-    import sys
-    import os
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + '/../../')
-    from debug_pruning import debug_log, log_session_history, log_history_provider_reconstruction, log_message_insertion, log_pruning_operation, log_token_count, log_summary_operation, truncate_message
+    from agent.logging import log
     DEBUG_PRUNING_AVAILABLE = True
 except ImportError:
     DEBUG_PRUNING_AVAILABLE = False
-    debug_log = lambda *args, **kwargs: None
-    log_session_history = lambda *args, **kwargs: None
-    log_history_provider_reconstruction = lambda *args, **kwargs: None
-    log_message_insertion = lambda *args, **kwargs: None
-    log_pruning_operation = lambda *args, **kwargs: None
-    log_token_count = lambda *args, **kwargs: None
-    log_summary_operation = lambda *args, **kwargs: None
+    log = lambda *args, **kwargs: None
 
 class ToolExecutor:
     """Handles tool execution, JSON repair, and tool result processing."""

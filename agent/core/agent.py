@@ -40,21 +40,11 @@ from .tool_executor import ToolExecutor
 from .turn_transaction import TurnTransaction
 from .debug_context import DebugContext
 try:
-    import sys
-    import os
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + '/../../')
-    from debug_pruning import debug_log, log_session_history, log_history_provider_reconstruction, log_message_insertion, log_pruning_operation, log_token_count, log_summary_operation, truncate_message
+    from agent.logging import log
     DEBUG_PRUNING_AVAILABLE = True
 except ImportError:
     DEBUG_PRUNING_AVAILABLE = False
-    debug_log = lambda *args, **kwargs: None
-    log_session_history = lambda *args, **kwargs: None
-    log_history_provider_reconstruction = lambda *args, **kwargs: None
-    log_message_insertion = lambda *args, **kwargs: None
-    log_pruning_operation = lambda *args, **kwargs: None
-    log_token_count = lambda *args, **kwargs: None
-    log_summary_operation = lambda *args, **kwargs: None
-    truncate_message = lambda *args, **kwargs: None
+    log = lambda *args, **kwargs: None
 if TYPE_CHECKING:
     from agent.config import AgentConfig
     from session.models import Session
@@ -299,8 +289,7 @@ class Agent:
         log('DEBUG', 'core.token_estimate', f'Estimated tokens: {estimated_tokens}, runtime_context length: {len(runtime_context)}, conversation length: {len(self.conversation)}')
         if hasattr(self, 'context_builder') and self.context_builder is not None and hasattr(self.context_builder, 'token_limit'):
             log('DEBUG', 'core.token_estimate', f'context_builder.token_limit: {self.context_builder.token_limit}')
-        if DEBUG_PRUNING_AVAILABLE:
-            log_token_count(f'Runtime context token estimate (from {len(runtime_context)}/{len(self.conversation)} messages)', estimated_tokens)
+        log('DEBUG', 'core.pruning', f'Runtime context token estimate (from {len(runtime_context)}/{len(self.conversation)} messages)', {'tokens': estimated_tokens})
         if self.logger and hasattr(self.logger, 'py_logger'):
             self.logger.py_logger.info(f'[TOKEN_ESTIMATE] Updated runtime context token estimate: {estimated_tokens} tokens (from {len(runtime_context)}/{len(self.conversation)} messages)')
 
@@ -795,8 +784,7 @@ class Agent:
                         self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
                     return
                 if summary_text is not None:
-                    if DEBUG_PRUNING_AVAILABLE:
-                        log_summary_operation(f'Processing summary request: summary length={len(summary_text)}, keep_recent_turns={summary_keep_recent_turns}')
+                    log('DEBUG', 'core.summary', f'Processing summary request: summary length={len(summary_text)}, keep_recent_turns={summary_keep_recent_turns}')
                     self._apply_summary_pruning(summary_text, summary_keep_recent_turns)
                     for event in self._update_tokens_and_yield():
                         yield event
