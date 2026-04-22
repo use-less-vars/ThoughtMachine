@@ -266,7 +266,7 @@ class EventDelegate(QStyledItemDelegate):
             lines.append('<div style="background-color: #e6f7ff; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid #99ccff;">FINAL ANSWER</div>')
             add_line(f"{event['content']}", style='font-weight: bold; color: #000080; background-color: #f0f8ff; padding: 12px;', use_markdown=True)
             if 'reasoning' in event and event['reasoning']:
-                add_line(f"{event['reasoning']}", style='color: #666666; font-style: italic; margin-top: 8px; margin-left: 10px;', use_markdown=True)
+                add_line(f"{event['reasoning']}", style='color: #666666; font-style: italic; margin-top: 8px; padding-left: 10px !important;', use_markdown=True)
             lines.append('</div>')
         elif etype == 'user_query':
             lines.append('<div style="border: 1px solid #FF69B4; border-radius: 5px; margin-bottom: 8px; overflow: hidden;">')
@@ -390,7 +390,7 @@ class EventDelegate(QStyledItemDelegate):
             reasoning = final.get('reasoning')
             if reasoning:
                 rendered_reasoning = MarkdownRenderer.markdown_to_html(reasoning)
-                html_content += f'<div style="color: #666666; font-style: italic; margin-top: 8px; margin-left: 10px;">{rendered_reasoning}</div>'
+                html_content += f'<div style="color: #666666; font-style: italic; margin-top: 8px; padding-left: 10px !important;">{rendered_reasoning}</div>'
             html_content += '</div>'
         other_events = turn_data.get('other_events', [])
         for event in other_events:

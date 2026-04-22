@@ -50,9 +50,10 @@ class MessageRenderer:
     # CSS style definitions
     STYLES = {
         MessageType.USER: MessageStyle(
-            border_color="#440424",
-            background_color="#F0AFC5",
-            header_text_color="#000000"
+            border_color="#4B0082",
+            background_color="#F3E8FF",
+            text_color="#4B0082",
+            header_text_color="#4B0082",
         ),
         MessageType.USER_SYSTEM: MessageStyle(
             border_color="#ff9999",
@@ -71,14 +72,14 @@ class MessageRenderer:
         ),
         MessageType.TOOL_CALL: MessageStyle(
             border_color="#3498db",
-            background_color="#eef4ff",
+            background_color="#a0f1a0",
             text_color="#0000FF",
             special_tool=False
         ),
         MessageType.TOOL_RESULT: MessageStyle(
-            border_color="#006400",
-            background_color="#f0fff0",
-            text_color="#006400",
+            border_color="#3498db",
+            background_color="#a0f1a0",
+            text_color="#0000FF",
             special_tool=False
         ),
         MessageType.REASONING: MessageStyle(
@@ -101,29 +102,26 @@ class MessageRenderer:
     def render_user_message(self, content: str, created_at: str = "", is_system_notification: bool = False) -> str:
         """
         Render a user message.
-        
+
         Args:
             content: Message content
             created_at: Timestamp (optional)
             is_system_notification: Whether this is a system notification
-            
+
         Returns:
             HTML string
         """
-        msg_type = MessageType.USER_SYSTEM if is_system_notification else MessageType.USER
-        style = self.STYLES[msg_type]
-        header = "System" if is_system_notification else "User"
-        
+        style = self.STYLES[MessageType.USER]
+        header = "User" if not is_system_notification else "System Notification"
         rendered_content = self._render_content(content)
         
         html = (f'<div style="border: 1px solid {style.border_color}; border-radius: 5px; margin-bottom: 12px; overflow: hidden;">'
-                f'<div style="background-color: {style.background_color}; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {style.border_color};">{header}</div>'
-                f'<div style="padding: 10px;">'
+                f'<div style="background-color: {style.background_color}; color: {style.header_text_color or style.border_color}; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {style.border_color};">{header}</div>'
+                f'<div style="padding: 10px; color: {style.text_color or style.border_color}; background-color: {style.background_color};">'
                 f'{rendered_content}'
                 f'</div>'
                 f'</div>')
-        return html
-    
+        return html    
     def render_assistant_message(self, content: str = "", tool_calls: List[Dict] = None, 
                                 reasoning_content: str = "", created_at: str = "") -> str:
         """
@@ -146,8 +144,8 @@ class MessageRenderer:
         # Main message container
         html_parts.append(
             f'<div style="border: 1px solid {style.border_color}; border-radius: 5px; margin-bottom: 12px; overflow: hidden;">'
-            f'<div style="background-color: {style.background_color}; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {style.border_color};">Assistant</div>'
-            f'<div style="padding: 10px;">'
+            f'<div style="background-color: {style.background_color}; color: {style.header_text_color}; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {style.border_color};">Assistant</div>'
+            f'<div style="padding: 10px; color: {style.text_color}; background-color: {style.background_color};">'
         )
         
         # Display reasoning content if present
@@ -197,20 +195,21 @@ class MessageRenderer:
         if is_special:
             # Special tool: blue styling, no truncation, full markdown
             return (
-                f'<div style="margin-left: 20px; margin-top: 8px; margin-bottom: 8px; border-left: 4px solid #3498db; background-color: #eef4ff; padding: 8px; border-radius: 4px; display: block; clear: both;">'
+                f'<div style="padding-left: 20px !important; margin-top: 8px; margin-bottom: 8px; border-left: 4px solid #3498db; background-color: #eef4ff; padding: 8px; border-radius: 4px; display: block; clear: both;">'
                 f'<div style="color: #0000FF; font-weight: bold; display: block; clear: both;">Tool: {html.escape(tool_name)}</div>'
                 f'<div style="color: #666666; font-size: 0.9em;">Arguments: {html.escape(arguments)}</div>'
                 f'</div>'
             )
         else:
-            # Regular tool: truncate arguments, monospace font
+            # Regular tool: use TOOL_CALL styling
+            style = self.STYLES[MessageType.TOOL_CALL]
             args_str = str(arguments)
             if len(args_str) > 200:
                 args_str = args_str[:200] + '...'
             escaped_args = html.escape(args_str)
             return (
-                f'<div style="margin-left: 20px; margin-top: 5px; margin-bottom: 5px; display: block; clear: both;">'
-                f'<div style="color: #006400; font-weight: bold; display: block; clear: both;">Tool: {html.escape(tool_name)}</div>'
+                f'<div style="padding-left: 20px !important; margin-top: 5px; margin-bottom: 5px; border-left: 4px solid {style.border_color}; background-color: {style.background_color}; padding: 8px; border-radius: 4px; display: block; clear: both;">'
+                f'<div style="color: {style.text_color}; font-weight: bold; display: block; clear: both;">Tool: {html.escape(tool_name)}</div>'
                 f'<div style="color: #666666; font-size: 0.9em; font-family: monospace, monospace;">Arguments: {escaped_args}</div>'
                 f'</div>'
             )
@@ -241,13 +240,14 @@ class MessageRenderer:
             # Special tool: blue styling, full markdown rendering
             display_name = f" ({tool_name})" if tool_name else ""
             return (
-                f'<div style="margin-left: 20px; margin-top: 8px; margin-bottom: 10px; border-left: 4px solid #3498db; background-color: #eef4ff; padding: 8px; border-radius: 4px; display: block; clear: both;">'
+                f'<div style="padding-left: 20px !important; margin-top: 8px; margin-bottom: 10px; border-left: 4px solid #3498db; background-color: #eef4ff; padding: 8px; border-radius: 4px; display: block; clear: both;">'
                 f'<div style="color: #0000FF; font-weight: bold; margin-bottom: 4px;">Tool Result{display_name}</div><br>'
-                f'<div style="color: #0000FF; margin-left: 10px;">{self._render_content(content)}</div>'
+                f'<div style="color: #0000FF; padding-left: 10px !important;">{self._render_content(content)}</div>'
                 f'</div>'
             )
         else:
             # Regular tool: truncate plain text, HTML escape, monospace font
+            style = self.STYLES[MessageType.TOOL_RESULT]
             if enable_truncation:
                 truncated_content = self._truncate_plain_text(content, tool_name)
             else:
@@ -259,28 +259,28 @@ class MessageRenderer:
                 # print(f"[DEBUG] render_tool_result error: {error}")
                 # Error styling
                 return (
-                    f'<div style="margin-left: 20px; margin-top: 5px; margin-bottom: 10px; display: block; clear: both;">'
+                    f'<div style="padding-left: 20px !important; margin-top: 5px; margin-bottom: 10px; border-left: 4px solid #FF0000; background-color: #ffe6e6; padding: 8px; border-radius: 4px; display: block; clear: both;">'
                     f'<div style="color: #FF0000; font-weight: bold; margin-bottom: 4px; clear: both;">Error:</div><br>'
-                    f'<div style="color: #FF0000; font-family: monospace, monospace; white-space: pre-wrap; margin-left: 10px;">{html.escape(error)}</div>'
+                    f'<div style="color: #FF0000; font-family: monospace, monospace; white-space: pre-wrap; padding-left: 10px !important;">{html.escape(error)}</div>'
                     f'</div>'
                 )
             elif not success:
                 # print(f"[DEBUG] render_tool_result warning: success={success}")
                 # Warning styling
                 return (
-                    f'<div style="margin-left: 20px; margin-top: 5px; margin-bottom: 10px; display: block; clear: both;">'
+                    f'<div style="padding-left: 20px !important; margin-top: 5px; margin-bottom: 10px; border-left: 4px solid #FFA500; background-color: #fff3e6; padding: 8px; border-radius: 4px; display: block; clear: both;">'
                     f'<div style="color: #FFA500; font-weight: bold; margin-bottom: 4px; clear: both;">Warning:</div><br>'
-                    f'<div style="color: #FFA500; font-family: monospace, monospace; white-space: pre-wrap; margin-left: 10px;">{escaped_content}</div>'
+                    f'<div style="color: #FFA500; font-family: monospace, monospace; white-space: pre-wrap; padding-left: 10px !important;">{escaped_content}</div>'
                     f'</div>'
                 )
             else:
                 # Success styling
                 # Build the result HTML with explicit line break
                 result_html = f'''
-<div style="margin-top: 8px; margin-bottom: 8px;">
-    <div style="font-weight: bold;">Result:</div>
+<div style="padding-left: 20px !important; margin-top: 5px; margin-bottom: 10px; border-left: 4px solid {style.border_color}; background-color: {style.background_color}; padding: 8px; border-radius: 4px; display: block; clear: both;">
+    <div style="font-weight: bold; color: {style.text_color};">Result:</div>
     <br>
-    <div style="color: #006400; font-family: monospace; white-space: pre-wrap; margin-left: 10px;">{escaped_content}</div>
+    <div style="color: {style.text_color}; font-family: monospace; white-space: pre-wrap; padding-left: 10px !important;">{escaped_content}</div>
 </div>
 '''
                 # print(f"[DEBUG] render_tool_result success HTML: {result_html}")
@@ -306,8 +306,8 @@ class MessageRenderer:
         rendered_content = self._render_content(content)
         
         html = (f'<div style="border: 1px solid {style.border_color}; border-radius: 5px; margin-bottom: 8px; overflow: hidden;">'
-                f'<div style="background-color: {style.background_color}; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {style.border_color};">System</div>'
-                f'<div style="padding: 10px;">'
+                f'<div style="background-color: {style.background_color}; color: {style.header_text_color}; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {style.border_color};">System</div>'
+                f'<div style="padding: 10px; color: {style.text_color}; background-color: {style.background_color};">'
                 f'{rendered_content}'
                 f'</div>'
                 f'</div>')
@@ -380,16 +380,17 @@ class MessageRenderer:
         if event_type in ('system', 'token_warning', 'turn_warning'):
             return self.render_system_message(content, '')
         
-        # Special handling for final events (orange styling)
+        # Special handling for final events (blue styling for special tools)
         if event_type == 'final':
-            # Final events not in MessageRenderer, keep original orange styling
-            border_color = '#FFA500'
-            bg_color = '#FFF5E6'
+            # Final is a special tool, use blue styling
+            border_color = '#3498db'
+            bg_color = '#eef4ff'
+            text_color = '#0000FF'
             header = 'Final'
-            rendered_content = self._render_content(content)
+            rendered_content = f'<div style="color: #0000FF;">{self._render_content(content)}</div>'
             html_block = f'''<div style="border: 1px solid {border_color}; border-radius: 5px; margin-bottom: 12px; overflow: hidden; width: 100%;">
-                <div style="background-color: {bg_color} !important; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {border_color}; margin: 0 !important; display: inline-block !important; vertical-align: top; width: 100% !important; box-sizing: border-box; min-width: 100% !important; position: relative;">{header}</div>
-                <div style="padding: 10px; width: 100%; box-sizing: border-box;">
+                <div style="background-color: {bg_color} !important; color: {text_color}; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {border_color}; margin: 0 !important; display: inline-block !important; vertical-align: top; width: 100% !important; box-sizing: border-box; min-width: 100% !important; position: relative;">{header}</div>
+                <div style="padding: 10px; background-color: {bg_color}; width: 100%; box-sizing: border-box;">
                     {rendered_content}
                 </div>
             </div>'''
@@ -400,11 +401,12 @@ class MessageRenderer:
         # print(f'DEBUG render_event unknown event_type: {event_type}')
         border_color = '#cccccc'
         bg_color = self.STYLES[MessageType.REASONING].background_color
+        text_color = '#333333'
         header = event_type.replace('_', ' ').title()
         rendered_content = self._render_content(content)
         html_block = f'''<div style="border: 1px solid {border_color}; border-radius: 5px; margin-bottom: 12px; overflow: hidden; width: 100%;">
-            <div style="background-color: {bg_color} !important; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {border_color}; margin: 0 !important; display: inline-block !important; vertical-align: top; width: 100% !important; box-sizing: border-box; min-width: 100% !important; position: relative;">{header}</div>
-            <div style="padding: 10px; width: 100%; box-sizing: border-box;">
+            <div style="background-color: {bg_color} !important; color: {text_color}; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {border_color}; margin: 0 !important; display: inline-block !important; vertical-align: top; width: 100% !important; box-sizing: border-box; min-width: 100% !important; position: relative;">{header}</div>
+            <div style="padding: 10px; background-color: {bg_color}; width: 100%; box-sizing: border-box;">
                 {rendered_content}
             </div>
         </div>'''
@@ -520,11 +522,14 @@ class MessageRenderer:
             # Special tool: blue styling
             border_color = self.STYLES[MessageType.TOOL_CALL].border_color
             bg_color = self.STYLES[MessageType.TOOL_CALL].background_color
+            text_color = '#0000FF'
             header = f'Tool: {tool_name}'
         else:
             # Regular tool: green styling
-            border_color = self.STYLES[MessageType.TOOL_RESULT].border_color
-            bg_color = self.STYLES[MessageType.TOOL_RESULT].background_color
+            style = self.STYLES[MessageType.TOOL_CALL]
+            border_color = style.border_color
+            bg_color = style.background_color
+            text_color = style.text_color
             header = f'Tool: {tool_name}'
         
         # Prepare arguments display
@@ -533,12 +538,12 @@ class MessageRenderer:
             args_str = args_str[:200] + '...'
         escaped_args = html.escape(args_str)
         
-        # Content background for special tools
-        content_background = f'background-color: {bg_color};' if is_special else ''
+        # Content background - apply to both regular and special tools
+        content_background = f'background-color: {bg_color};'
         
         html_block = f'''<div style="border: 1px solid {border_color}; border-radius: 5px; margin-bottom: 12px; overflow: hidden; width: 100%;">
-            <div style="background-color: {bg_color} !important; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {border_color}; margin: 0 !important; display: inline-block !important; vertical-align: top; width: 100% !important; box-sizing: border-box; min-width: 100% !important; position: relative;">{header}</div>
-            <div style="padding: 10px; {content_background} width: 100%; box-sizing: border-box;">'''
+            <div style="background-color: {bg_color} !important; color: {text_color}; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {border_color}; margin: 0 !important; display: inline-block !important; vertical-align: top; width: 100% !important; box-sizing: border-box; min-width: 100% !important; position: relative;">{header}</div>
+            <div style="padding: 10px 10px 10px 20px; {content_background} width: 100%; box-sizing: border-box;">'''
         
         if not is_special:
             html_block += f'<div style="color: #666666; font-size: 0.9em; font-family: monospace, monospace;">Arguments: {escaped_args}</div>'
@@ -570,15 +575,18 @@ class MessageRenderer:
             # Special tool: blue styling
             border_color = self.STYLES[MessageType.TOOL_CALL].border_color
             bg_color = self.STYLES[MessageType.TOOL_CALL].background_color
+            text_color = '#0000FF'
             header = f'Tool Result ({tool_name})' if tool_name else 'Tool Result'
         else:
             # Regular tool: green styling
-            border_color = self.STYLES[MessageType.TOOL_RESULT].border_color
-            bg_color = self.STYLES[MessageType.TOOL_RESULT].background_color
+            style = self.STYLES[MessageType.TOOL_RESULT]
+            border_color = style.border_color
+            bg_color = style.background_color
+            text_color = style.text_color
             header = 'Tool Result'
         
-        # Content background for special tools
-        content_background = f'background-color: {bg_color};' if is_special else ''
+        # Content background - apply to both regular and special tools
+        content_background = f'background-color: {bg_color};'
         
         # Render content based on tool type and success status
         if error:
@@ -587,8 +595,8 @@ class MessageRenderer:
             rendered_content = f'<div style="color: #FFA500; font-family: monospace, monospace; white-space: pre-wrap;">{html.escape(content)}</div>'
         else:
             if is_special:
-                # Special tool: full markdown rendering
-                rendered_content = self._render_content(content)
+                # Special tool: full markdown rendering with blue text
+                rendered_content = f'<div style="color: #0000FF;">{self._render_content(content)}</div>'
             else:
                 # Regular tool: truncate plain text, HTML escape, monospace font
                 if enable_truncation:
@@ -596,11 +604,11 @@ class MessageRenderer:
                 else:
                     truncated_content = content
                 escaped_content = html.escape(truncated_content)
-                rendered_content = f'<div style="font-family: monospace, monospace; white-space: pre-wrap;">{escaped_content}</div>'
+                rendered_content = f'<div style="color: {style.text_color}; font-family: monospace, monospace; white-space: pre-wrap;">{escaped_content}</div>'
         
         html_block = f'''<div style="border: 1px solid {border_color}; border-radius: 5px; margin-bottom: 12px; overflow: hidden; width: 100%;">
-            <div style="background-color: {bg_color} !important; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {border_color}; margin: 0 !important; display: inline-block !important; vertical-align: top; width: 100% !important; box-sizing: border-box; min-width: 100% !important; position: relative;">{header}</div>
-            <div style="padding: 10px; {content_background} width: 100%; box-sizing: border-box;">
+            <div style="background-color: {bg_color} !important; color: {text_color}; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {border_color}; margin: 0 !important; display: inline-block !important; vertical-align: top; width: 100% !important; box-sizing: border-box; min-width: 100% !important; position: relative;">{header}</div>
+            <div style="padding: 10px 10px 10px 20px; {content_background} width: 100%; box-sizing: border-box;">
                 {rendered_content}
             </div>
         </div>'''
@@ -612,28 +620,28 @@ class MessageRenderer:
         if is_special:
             return "border-left: 4px solid #3498db; background-color: #eef4ff; padding: 8px; margin: 8px 0; border-radius: 4px; display: block; clear: both;"
         else:
-            return "margin-left: 20px; margin-top: 5px; margin-bottom: 5px; display: block; clear: both;"
+            return "padding-left: 20px !important; margin-top: 5px; margin-bottom: 5px; display: block; clear: both;"
     
     def get_tool_call_header_style(self, is_special: bool = False) -> str:
         """Get CSS style for tool call header."""
         if is_special:
             return "color: #0000FF; font-weight: bold; display: block; clear: both;"
         else:
-            return "color: #006400; font-weight: bold; display: block; clear: both;"
+            return "color: #0000FF; font-weight: bold; display: block; clear: both;"
     
     def get_tool_result_container_style(self, is_special: bool = False) -> str:
         """Get CSS style for tool result container."""
         if is_special:
             return "border-left: 4px solid #3498db; background-color: #eef4ff; padding: 8px; margin: 8px 0; border-radius: 4px; display: block; clear: both;"
         else:
-            return "margin-left: 20px; margin-top: 5px; margin-bottom: 10px; display: block; clear: both;"
+            return "padding-left: 20px !important; margin-top: 5px; margin-bottom: 10px; display: block; clear: both;"
     
     def get_tool_result_header_style(self, is_special: bool = False) -> str:
         """Get CSS style for tool result header."""
         if is_special:
             return "color: #0000FF; font-weight: bold; display: block; clear: both;"
         else:
-            return "color: #006400; font-weight: bold; display: block; clear: both;"
+            return "color: #0000FF; font-weight: bold; display: block; clear: both;"
     
     def get_event_title_style(self) -> str:
         """Get CSS style for event title bar."""
