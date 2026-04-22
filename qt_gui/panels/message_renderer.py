@@ -328,7 +328,97 @@ class MessageRenderer:
             return ""
         
         return f'<div style="font-weight: bold; background-color: #e0e0e0; padding: 3px; display: block; clear: both;">{html.escape(event_type.upper())}</div>'
-    
+
+    def render_event(self, event: Dict) -> str:
+        """
+        Render any event type as a self-contained HTML block.
+        
+        This is a unified method to handle all event types, eliminating duplicate
+        styling code in OutputPanel.
+        
+        Args:
+            event: Event dictionary with at least a 'type' key
+            
+        Returns:
+            HTML string
+        """
+        event_type = event.get('type', 'unknown')
+        content = event.get('content', '')
+        tool_calls = event.get('tool_calls', [])
+        reasoning_content = event.get('reasoning_content', '')
+        tool_call_id = event.get('tool_call_id', '')
+        
+        # Handle standalone tool calls and results using existing methods
+        if event_type == 'tool_call':
+            tool_name = event.get('function', {}).get('name', 'unknown')
+            arguments = event.get('function', {}).get('arguments', '{}')
+            call_id = event.get('id', '')
+            created_at = event.get('created_at', '')
+            return self.render_standalone_tool_call(tool_name, arguments, call_id, created_at)
+        
+        if event_type == 'tool_result':
+            tool_name = event.get('tool_name', '')  # Note: OutputPanel uses tool_call_map, but we can't access it here
+            success = event.get('success', True)
+            error = event.get('error', '')
+            created_at = event.get('created_at', '')
+            # Note: We need to pass tool_name from event or tool_call_map
+            # For now, use empty string; OutputPanel will need to provide tool_name
+            return self.render_standalone_tool_result(
+                content, tool_name, tool_call_id, success, error,
+                ENABLE_RESULT_TRUNCATION, created_at
+            )
+        
+        # Map event types to existing render methods
+        if event_type == 'user_query':
+            is_system_notification = self._is_system_message(content)
+            return self.render_user_message(content, '', is_system_notification)
+        
+        if event_type == 'turn':
+            # For assistant messages with tool calls and reasoning
+            return self.render_assistant_message(content, tool_calls, reasoning_content, '')
+        
+        if event_type in ('system', 'token_warning', 'turn_warning'):
+            return self.render_system_message(content, '')
+        
+        # Special handling for final events (orange styling)
+        if event_type == 'final':
+            # Final events not in MessageRenderer, keep original orange styling
+            border_color = '#FFA500'
+            bg_color = '#FFF5E6'
+            header = 'Final'
+            rendered_content = self._render_content(content)
+            html_block = f'''<div style="border: 1px solid {border_color}; border-radius: 5px; margin-bottom: 12px; overflow: hidden; width: 100%;">
+                <div style="background-color: {bg_color} !important; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {border_color}; margin: 0 !important; display: inline-block !important; vertical-align: top; width: 100% !important; box-sizing: border-box; min-width: 100% !important; position: relative;">{header}</div>
+                <div style="padding: 10px; width: 100%; box-sizing: border-box;">
+                    {rendered_content}
+                </div>
+            </div>'''
+            return html_block
+        
+        # Generic fallback for unknown event types
+        # Note: log function not available here; could use print for debugging
+        # print(f'DEBUG render_event unknown event_type: {event_type}')
+        border_color = '#cccccc'
+        bg_color = self.STYLES[MessageType.REASONING].background_color
+        header = event_type.replace('_', ' ').title()
+        rendered_content = self._render_content(content)
+        html_block = f'''<div style="border: 1px solid {border_color}; border-radius: 5px; margin-bottom: 12px; overflow: hidden; width: 100%;">
+            <div style="background-color: {bg_color} !important; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {border_color}; margin: 0 !important; display: inline-block !important; vertical-align: top; width: 100% !important; box-sizing: border-box; min-width: 100% !important; position: relative;">{header}</div>
+            <div style="padding: 10px; width: 100%; box-sizing: border-box;">
+                {rendered_content}
+            </div>
+        </div>'''
+        return html_block
+
+    def _is_system_message(self, content: str) -> bool:
+        """Check if content appears to be a system notification (token warning, etc.)"""
+        if not content:
+            return False
+        # Accept both formats: with or without asterisks
+        return (content.startswith('[SYSTEM NOTIFICATION]') or
+                content.startswith('[**SYSTEM NOTIFICATION**]') or
+                content.startswith('[SYSTEM]'))
+
     def _render_content(self, content: str) -> str:
         """
         Render message content to HTML (handles markdown).
@@ -410,6 +500,112 @@ class MessageRenderer:
             return content[:max_length] + '...'
         
         return content
+
+    def render_standalone_tool_call(self, tool_name: str, arguments: str, tool_call_id: str = "", created_at: str = "") -> str:
+        """
+        Render a standalone tool call as a card layout.
+
+        Args:
+            tool_name: Name of the tool
+            arguments: JSON string of arguments
+            tool_call_id: Tool call ID (optional)
+            created_at: Timestamp (optional)
+
+        Returns:
+            HTML string with card layout
+        """
+        is_special = tool_name in self.SPECIAL_TOOLS
+        
+        if is_special:
+            # Special tool: blue styling
+            border_color = self.STYLES[MessageType.TOOL_CALL].border_color
+            bg_color = self.STYLES[MessageType.TOOL_CALL].background_color
+            header = f'Tool: {tool_name}'
+        else:
+            # Regular tool: green styling
+            border_color = self.STYLES[MessageType.TOOL_RESULT].border_color
+            bg_color = self.STYLES[MessageType.TOOL_RESULT].background_color
+            header = f'Tool: {tool_name}'
+        
+        # Prepare arguments display
+        args_str = str(arguments)
+        if len(args_str) > 200 and not is_special:
+            args_str = args_str[:200] + '...'
+        escaped_args = html.escape(args_str)
+        
+        # Content background for special tools
+        content_background = f'background-color: {bg_color};' if is_special else ''
+        
+        html_block = f'''<div style="border: 1px solid {border_color}; border-radius: 5px; margin-bottom: 12px; overflow: hidden; width: 100%;">
+            <div style="background-color: {bg_color} !important; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {border_color}; margin: 0 !important; display: inline-block !important; vertical-align: top; width: 100% !important; box-sizing: border-box; min-width: 100% !important; position: relative;">{header}</div>
+            <div style="padding: 10px; {content_background} width: 100%; box-sizing: border-box;">'''
+        
+        if not is_special:
+            html_block += f'<div style="color: #666666; font-size: 0.9em; font-family: monospace, monospace;">Arguments: {escaped_args}</div>'
+        
+        html_block += '</div></div>'
+        return html_block
+
+    def render_standalone_tool_result(self, content: str, tool_name: str = "", tool_call_id: str = "", 
+                                     success: bool = True, error: str = "", enable_truncation: bool = True,
+                                     created_at: str = "") -> str:
+        """
+        Render a standalone tool result as a card layout.
+
+        Args:
+            content: Result content
+            tool_name: Tool name (optional)
+            tool_call_id: Tool call ID (optional)
+            success: Whether the tool succeeded
+            error: Error message (if any)
+            enable_truncation: Whether to truncate long results
+            created_at: Timestamp (optional)
+
+        Returns:
+            HTML string with card layout
+        """
+        is_special = tool_name in self.SPECIAL_TOOLS
+        
+        if is_special:
+            # Special tool: blue styling
+            border_color = self.STYLES[MessageType.TOOL_CALL].border_color
+            bg_color = self.STYLES[MessageType.TOOL_CALL].background_color
+            header = f'Tool Result ({tool_name})' if tool_name else 'Tool Result'
+        else:
+            # Regular tool: green styling
+            border_color = self.STYLES[MessageType.TOOL_RESULT].border_color
+            bg_color = self.STYLES[MessageType.TOOL_RESULT].background_color
+            header = 'Tool Result'
+        
+        # Content background for special tools
+        content_background = f'background-color: {bg_color};' if is_special else ''
+        
+        # Render content based on tool type and success status
+        if error:
+            rendered_content = f'<div style="color: #FF0000; font-family: monospace, monospace; white-space: pre-wrap;">{html.escape(error)}</div>'
+        elif not success:
+            rendered_content = f'<div style="color: #FFA500; font-family: monospace, monospace; white-space: pre-wrap;">{html.escape(content)}</div>'
+        else:
+            if is_special:
+                # Special tool: full markdown rendering
+                rendered_content = self._render_content(content)
+            else:
+                # Regular tool: truncate plain text, HTML escape, monospace font
+                if enable_truncation:
+                    truncated_content = self._truncate_plain_text(content, tool_name)
+                else:
+                    truncated_content = content
+                escaped_content = html.escape(truncated_content)
+                rendered_content = f'<div style="font-family: monospace, monospace; white-space: pre-wrap;">{escaped_content}</div>'
+        
+        html_block = f'''<div style="border: 1px solid {border_color}; border-radius: 5px; margin-bottom: 12px; overflow: hidden; width: 100%;">
+            <div style="background-color: {bg_color} !important; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid {border_color}; margin: 0 !important; display: inline-block !important; vertical-align: top; width: 100% !important; box-sizing: border-box; min-width: 100% !important; position: relative;">{header}</div>
+            <div style="padding: 10px; {content_background} width: 100%; box-sizing: border-box;">
+                {rendered_content}
+            </div>
+        </div>'''
+        return html_block
+
     # Helper methods for event_models.py to centralize CSS
     def get_tool_call_container_style(self, is_special: bool = False) -> str:
         """Get CSS style for tool call container."""

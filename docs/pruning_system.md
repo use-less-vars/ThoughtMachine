@@ -109,6 +109,24 @@ They are appended to user_history at the moment they are triggered.
     If it appears after the summary, it is included (current).
 
 Bug fixed earlier: The context builder originally filtered all warnings from post_summary (including current ones). That was corrected by removing the warning‑filtering block in SummaryBuilder.build(). Now only the insertion index decides inclusion.
+
+4.4 System Notification Metadata Flag
+
+All system notifications (token warnings, turn warnings, countdown expiry, context cleared / unwarning) now carry a metadata flag:
+
+{
+"role": "user",
+"content": "[...]",
+"is_system_notification": true
+}
+
+This flag is used only in turn counting and summary insertion logic: in _find_summary_insertion_index and _group_messages_into_turns. Notifications with this flag are skipped when determining turn boundaries, ensuring that they never affect where a summary is inserted. However, they are not excluded from the LLM context; they appear in the context as normal user messages, preserving chronological order.
+
+Old sessions (without the flag) are still supported via fallback content-based checks for [SYSTEM NOTIFICATION] and [SYSTEM NOTIFICATION] patterns. The previously missing four-asterisk pattern [SYSTEM NOTIFICATION] has also been added to the fallback.
+
+Because the flag prevents notifications from shifting the insertion index, they stay in their original chronological order relative to user and assistant messages. The LLM sees them in the correct sequence, and summarisation no longer causes expired warnings or other system notifications to appear out of place.
+
+
 5. The Unwarning Placement Fix (Critical)
 5.1 The Problem
 

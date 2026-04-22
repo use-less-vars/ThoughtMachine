@@ -216,7 +216,7 @@ class Agent:
         elif event.get('type') in ('token_critical_countdown_start', 'turn_critical_countdown_start', 'token_critical_countdown_expired', 'turn_critical_countdown_expired'):
             message = event.get('message', '')
             sender = event.get('sender', 'system')
-            warning_msg = {'role': sender, 'content': '[SYSTEM NOTIFICATION] ' + message}
+            warning_msg = {'role': sender, 'content': '[**SYSTEM NOTIFICATION**] ' + message, 'is_system_notification': True}
             self._add_to_conversation(warning_msg)
             warning_tokens = self._estimate_tokens(warning_msg)
             self.state.current_conversation_tokens += warning_tokens
@@ -520,7 +520,7 @@ class Agent:
             turn_events = self.state.update_turn_state(turn)
             for event in turn_events:
                 if event['type'] == 'turn_warning':
-                    warning_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + event.get('message', event.get('warning', ''))}
+                    warning_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + event.get('message', event.get('warning', '')), 'is_system_notification': True}
                     self._add_to_conversation(warning_msg)
                     warning_tokens = self._estimate_tokens(warning_msg)
                     self.state.current_conversation_tokens += warning_tokens
@@ -533,7 +533,7 @@ class Agent:
             token_events = self.state.update_token_state(self.state.current_conversation_tokens)
             for event in token_events:
                 if event['type'] == 'token_warning':
-                    warning_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + event.get('message', event.get('warning', ''))}
+                    warning_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + event.get('message', event.get('warning', '')), 'is_system_notification': True}
                     self._add_to_conversation(warning_msg)
                     warning_tokens = self._estimate_tokens(warning_msg)
                     self.state.current_conversation_tokens += warning_tokens
@@ -589,7 +589,7 @@ class Agent:
             warning_threshold = int(model_context_window * 0.85)
             if request_tokens > model_context_window:
                 error = f'Request token count ({request_tokens}) exceeds model context window ({model_context_window}). Cannot make API call. Please use SummarizeTool to reduce context size.'
-                error_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + error}
+                error_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + error, 'is_system_notification': True}
                 self._add_to_conversation(error_msg)
                 error_tokens = self._estimate_tokens(error_msg)
                 self.state.current_conversation_tokens += error_tokens
@@ -601,7 +601,7 @@ class Agent:
                     self.logger.log_token_warning('low', 'critical', request_tokens, f'Request tokens {request_tokens} exceed model context window {model_context_window}')
             elif request_tokens > critical_threshold:
                 warning = f'Request token count ({request_tokens}) is near model context window limit ({model_context_window}). Please use SummarizeTool immediately to reduce context size.'
-                warning_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + warning}
+                warning_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + warning, 'is_system_notification': True}
                 self._add_to_conversation(warning_msg)
                 warning_tokens = self._estimate_tokens(warning_msg)
                 self.state.current_conversation_tokens += warning_tokens
@@ -613,7 +613,7 @@ class Agent:
                     self.logger.log_token_warning('low', 'critical', request_tokens, f'Request tokens {request_tokens} near model context window {model_context_window}')
             elif request_tokens > warning_threshold:
                 warning = f'Request token count ({request_tokens}) is approaching model context window ({model_context_window}). Consider using SummarizeTool soon.'
-                warning_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + warning}
+                warning_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + warning, 'is_system_notification': True}
                 self._add_to_conversation(warning_msg)
                 warning_tokens = self._estimate_tokens(warning_msg)
                 self.state.current_conversation_tokens += warning_tokens
@@ -878,7 +878,7 @@ class Agent:
         else:
             user_history.insert(insertion_idx, summary_msg)
             log('DEBUG', 'core.message_insertion', f'Inserted summary at index {insertion_idx}')
-        context_cleared_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] Context has been summarized. You now have a fresh context window and full access to tools.'}
+        context_cleared_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] Context has been summarized. You now have a fresh context window and full access to tools.', 'is_system_notification': True}
         # Append unwarning after the tool result (at the end of user_history)
         user_history.append(context_cleared_msg)
         log('DEBUG', 'core.message_insertion', f'Appended context cleared message at end (history length: {len(user_history)})')
@@ -937,7 +937,7 @@ class Agent:
         for turn in kept_turns:
             pruned_other.extend(turn)
         new_conversation = cleaned_system_messages + [summary_msg] + pruned_other
-        context_cleared_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] Context has been summarized. You now have a fresh context window and full access to tools.'}
+        context_cleared_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] Context has been summarized. You now have a fresh context window and full access to tools.', 'is_system_notification': True}
         # Append unwarning after the tool result (at the end of new_conversation)
         new_conversation.append(context_cleared_msg)
         self.conversation = new_conversation
@@ -956,7 +956,9 @@ class Agent:
         turn_start_indices = []
         for i, msg in enumerate(user_history):
             role = msg.get('role')
-            if role == 'system':
+            content = msg.get('content', '')
+            # Skip system messages and system notifications
+            if role == 'system' or msg.get('is_system_notification') is True or '[SYSTEM NOTIFICATION]' in content or '[**SYSTEM NOTIFICATION**]' in content:
                 continue
             if role == 'user':
                 if current_turn:
@@ -1028,7 +1030,8 @@ class Agent:
                 logger.debug(f'  ... and {len(messages) - max_to_show} more messages')
         for msg in messages:
             role = msg.get('role')
-            if role == 'system':
+            content = msg.get('content', '')
+            if role == 'system' or msg.get('is_system_notification') is True or '[SYSTEM NOTIFICATION]' in content or '[**SYSTEM NOTIFICATION**]' in content:
                 continue
             if role == 'user':
                 if current_turn:
