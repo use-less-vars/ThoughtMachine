@@ -262,12 +262,8 @@ class EventDelegate(QStyledItemDelegate):
         elif etype == 'final':
             if event.get('content', '').startswith('## ✅ **All GUI Display Issues Fixed**'):
                 return ''
-            lines.append('<div style="border: 1px solid #99ccff; border-radius: 5px; margin-bottom: 8px; overflow: hidden;">')
-            lines.append('<div style="background-color: #e6f7ff; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid #99ccff;">FINAL ANSWER</div>')
-            add_line(f"{event['content']}", style='font-weight: bold; color: #000080; background-color: #f0f8ff; padding: 12px;', use_markdown=True)
-            if 'reasoning' in event and event['reasoning']:
-                add_line(f"{event['reasoning']}", style='color: #666666; font-style: italic; margin-top: 8px; padding-left: 10px !important;', use_markdown=True)
-            lines.append('</div>')
+            rendered = self.message_renderer.render_event(event)
+            lines.append(rendered)
         elif etype == 'user_query':
             lines.append('<div style="border: 1px solid #FF69B4; border-radius: 5px; margin-bottom: 8px; overflow: hidden;">')
             lines.append('<div style="background-color: #FFE6F2; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid #FF69B4;">USER QUERY</div>')
@@ -381,17 +377,7 @@ class EventDelegate(QStyledItemDelegate):
         if final and final.get('content', '').startswith('## ✅ **All GUI Display Issues Fixed**'):
             final = None
         if final:
-            content = final.get('content', '')
-            if content:
-                html_content += '<div style="border: 1px solid #99ccff; border-radius: 5px; margin-bottom: 8px; overflow: hidden;">'
-                html_content += '<div style="background-color: #e6f7ff; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid #99ccff;">FINAL ANSWER</div>'
-                rendered_content = MarkdownRenderer.markdown_to_html(content)
-                html_content += f'<div style="color: #000080; font-weight: bold; background-color: #f0f8ff; padding: 12px;">{rendered_content}</div>'
-            reasoning = final.get('reasoning')
-            if reasoning:
-                rendered_reasoning = MarkdownRenderer.markdown_to_html(reasoning)
-                html_content += f'<div style="color: #666666; font-style: italic; margin-top: 8px; padding-left: 10px !important;">{rendered_reasoning}</div>'
-            html_content += '</div>'
+            html_content += self.message_renderer.render_event(final)
         other_events = turn_data.get('other_events', [])
         for event in other_events:
             etype = event.get('type', 'unknown')

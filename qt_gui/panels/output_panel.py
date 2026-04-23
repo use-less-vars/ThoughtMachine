@@ -79,6 +79,11 @@ class OutputPanel(QWidget):
         if not self._should_display(event):
             return
         html = self._render_event(event)
+        log('DEBUG', 'ui.output_panel', 'Rendered HTML for event', {
+            'event_type': event.get('type', 'unknown'),
+            'html_length': len(html),
+            'html_preview': html[:500]
+        })
         self._append_html(html)
 
     def _should_display(self, event) -> bool:
@@ -127,16 +132,21 @@ class OutputPanel(QWidget):
 
 
     def _append_html(self, html: str) -> None:
+        # Log the full HTML being inserted into the QTextEdit for debugging
+        log('DEBUG', 'ui.output_panel', 'Full HTML inserted into QTextEdit', {
+            'html_length': len(html),
+            'html_full': html
+        })
+
         # Check if user is near bottom before inserting new content
         scrollbar = self.output_textedit.verticalScrollBar()
         was_near_bottom = scrollbar.value() >= scrollbar.maximum() - 5
-        
+
         cursor = self.output_textedit.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         cursor.insertBlock()
         cursor.insertHtml(html)
-        cursor.insertBlock()
-        
+        cursor.insertBlock()        
         # If user was near bottom before new content, scroll to new bottom
         if was_near_bottom:
             QTimer.singleShot(0, lambda: scrollbar.setValue(scrollbar.maximum()))
