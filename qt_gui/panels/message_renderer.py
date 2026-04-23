@@ -16,6 +16,7 @@ from ..utils.constants import ENABLE_RESULT_TRUNCATION, MAX_LINES_PER_RESULT, MA
 from agent.logging import log
 
 
+
 class MessageType(Enum):
     """Message type enumeration."""
     USER = "user"
@@ -77,63 +78,63 @@ class MessageRenderer:
     # CSS style definitions
     STYLES = {
         MessageType.USER: MessageStyle(
-            border_color="#4B0082",
+            border_color="#ffffff",
             background_color="#F3E8FF",
             text_color="#4B0082",
             header_text_color="#4B0082",
         ),
         MessageType.USER_SYSTEM: MessageStyle(
-            border_color="#ff9999",
+            border_color="#ffffff",
             background_color="#ffe6e6",
             header_text_color="#000000"
         ),
         MessageType.ASSISTANT: MessageStyle(
-            border_color="#99ccff",
+            border_color="#ffffff",
             background_color="#e6f3ff",
             header_text_color="#000000"
         ),
         MessageType.SYSTEM: MessageStyle(
-            border_color="#ff9999",
+            border_color="#ffffff",
             background_color="#ffe6e6",
             header_text_color="#000000"
         ),
         MessageType.TOOL_CALL: MessageStyle(
-            border_color="#3498db",
-            background_color="#a0f1a0",
-            text_color="#0000FF",
+            border_color="#ffffff",
+            background_color="#eef9ee",
+            text_color="#000000",
             special_tool=False
         ),
         MessageType.TOOL_RESULT: MessageStyle(
-            border_color="#3498db",
-            background_color="#a0f1a0",
-            text_color="#0000FF",
+            border_color="#ffffff",
+            background_color="#eef9ee",
+            text_color="#000000",
             special_tool=False
         ),
         MessageType.REASONING: MessageStyle(
-            border_color="#888888",
+            border_color="#ffffff",
             background_color="#f8f8f8",
             text_color="#333333"
         ),
         MessageType.SPECIAL: MessageStyle(
-            border_color="#3498db",
-            background_color="#eef4ff",
+            border_color="#ffffff",
+            background_color="#c9daf8",
             text_color="#0000FF",
             special_tool=True
         ),
         MessageType.ERROR: MessageStyle(
-            border_color="#FF0000",
+            border_color="#ffffff",
             background_color="#ffe6e6",
             text_color="#FF0000",
             special_tool=False
         ),
         MessageType.WARNING: MessageStyle(
-            border_color="#FFA500",
+            border_color="#ffffff",
             background_color="#fff3e6",
             text_color="#FFA500",
             special_tool=False
         ),
         MessageType.SUMMARY: MessageStyle(
-            border_color="#888888",
+            border_color="#ffffff",
             background_color="#f8f8f8",
             text_color="#666666",
             special_tool=False
@@ -195,31 +196,23 @@ class MessageRenderer:
         tool_calls = tool_calls or []
         html_parts = []
 
-        # Build content HTML for the main assistant card
-        content_html_parts = []
-        
-        # Display reasoning content if present
+        # Display reasoning content if present (standalone sibling card)
         if reasoning_content:
-            # Use unified card layout for reasoning (nested within assistant card)
             reasoning_html = self._render_card(
                 title="Reasoning:",
                 style_key=MessageType.REASONING,
-                indent_level=1,
+                indent_level=0,
                 content_html=self._render_content(reasoning_content),
-                extra_html=""
             )
-            content_html_parts.append(reasoning_html)
-            # Add separation between reasoning and main content
-            content_html_parts.append('<div style="height: 4px;"></div>')
+            html_parts.append(reasoning_html)
 
-        # Display main content
+        # Build content HTML for the main assistant card
+        content_html_parts = []
         if content:
             content_html_parts.append(self._render_content(content))
-        
-        # Combine content HTML
         content_html = ''.join(content_html_parts)
         
-        # Main assistant card using unified layout
+        # Main assistant card (title + content, unified blue background)
         html_parts.append(self._render_card(
             title="Assistant",
             style_key=MessageType.ASSISTANT,
@@ -670,16 +663,17 @@ class MessageRenderer:
         
         # Build the card HTML
         card_html = f'''
-<div style="margin-left: {indent_px}px !important; margin-top: 5px; margin-bottom: 10px; border-left: 4px solid {style.border_color}; background-color: {style.background_color}; padding: 8px; border-radius: 4px; display: block; clear: both;">
-    <div style="font-weight: bold; color: {style.text_color};">{html.escape(title)}</div>
+<div style="margin-left: {indent_px}px !important; margin-top: 5px; margin-bottom: 10px; border-left: 4px solid {style.border_color}; background-color: {style.background_color}; padding: 8px; border-radius: 4px; display: block; clear: both; list-style: none;">
 '''
+        if title:
+            card_html += f'    <div style="font-weight: bold; color: {style.text_color};">{html.escape(title)}</div>\n'
         
         if extra_html:
             card_html += f'    <div style="color: #666666; font-size: 0.9em; font-family: monospace, monospace;">{extra_html}</div>\n'
         
         if content_html:
             # Add line break between title/extra and content if we have content
-            if extra_html or title:
+            if extra_html:
                 card_html += '    <br>\n'
             card_html += f'    <div style="color: {style.text_color}; font-family: monospace; white-space: pre-wrap; padding-left: 10px !important;">{content_html}</div>\n'
         

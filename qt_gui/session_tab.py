@@ -512,7 +512,7 @@ class SessionTab(QWidget):
                 QMessageBox.warning(self, 'No Query', 'Please enter a query first.')
                 return
             self._display_turn += 1
-            self.output_panel.show_processing_indicator(query, self._display_turn)
+            #self.output_panel.show_processing_indicator(query, self._display_turn)
             try:
                 self.presenter.start_session(query, config_dict, preset_name=preset_name)
             except Exception as e:
@@ -522,7 +522,7 @@ class SessionTab(QWidget):
         elif current_state in [ExecutionState.PAUSED, ExecutionState.WAITING_FOR_USER]:
             if query:
                 self._display_turn += 1
-                self.output_panel.show_processing_indicator(query, self._display_turn)
+                #self.output_panel.show_processing_indicator(query, self._display_turn)
             else:
                 pass
             try:

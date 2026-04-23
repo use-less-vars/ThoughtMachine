@@ -2,7 +2,7 @@
 import html
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox, QTextEdit, QFrame, QScrollArea
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QTextCursor
+from PyQt6.QtGui import QTextCursor, QTextCharFormat
 from agent.logging import log
 from .markdown_renderer import MarkdownRenderer
 from .message_renderer import MessageRenderer, MessageType
@@ -144,9 +144,19 @@ class OutputPanel(QWidget):
 
         cursor = self.output_textedit.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertBlock()
         cursor.insertHtml(html)
-        cursor.insertBlock()        
+
+        # --- List context reset ---
+        # Insert an empty paragraph with default block format
+        cursor.insertBlock()
+        # Reset the character format to plain (no list attributes)
+        fmt = QTextCharFormat()
+        cursor.setCharFormat(fmt)
+        cursor.insertText('')  # ensure an empty block
+        # Move cursor to end again
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.output_textedit.setTextCursor(cursor)
+
         # If user was near bottom before new content, scroll to new bottom
         if was_near_bottom:
             QTimer.singleShot(0, lambda: scrollbar.setValue(scrollbar.maximum()))

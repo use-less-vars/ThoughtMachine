@@ -35,19 +35,30 @@ from enum import Enum
 from typing import Optional, Dict, Any, List, Union
 import json
 
-# Import AgentLogger - we'll handle config dependency gracefully
-try:
-    from agent.logging import AgentLogger, LogLevel as AgentLogLevel, LogCategory, LogEventType
-    from agent.config import AgentConfig
-    AGENT_LOGGER_AVAILABLE = True
-except ImportError:
-    # For GUI compatibility when agent dependencies aren't available
-    AGENT_LOGGER_AVAILABLE = False
-    AgentLogger = None
-    AgentLogLevel = None
-    LogCategory = None
-    LogEventType = None
-    AgentConfig = None
+# AgentLogger imports are done lazily in _get_logger() to avoid circular imports
+# with agent/logging/__init__.py which imports from this module.
+_agent_logger_classes = None
+
+
+def _get_agent_logger_classes():
+    """Lazily import agent logging classes to avoid circular imports."""
+    global _agent_logger_classes
+    if _agent_logger_classes is not None:
+        return _agent_logger_classes if _agent_logger_classes else None
+    try:
+        from agent.logging import AgentLogger, LogLevel as AgentLogLevel, LogCategory, LogEventType
+        from agent.config import AgentConfig
+        _agent_logger_classes = {
+            'AgentLogger': AgentLogger,
+            'AgentLogLevel': AgentLogLevel,
+            'LogCategory': LogCategory,
+            'LogEventType': LogEventType,
+            'AgentConfig': AgentConfig,
+        }
+        return _agent_logger_classes
+    except ImportError:
+        _agent_logger_classes = False
+        return None
 
 
 class LogLevel(Enum):
@@ -337,15 +348,17 @@ def _truncate_data(data: Any, truncate_hint: Optional[str] = None) -> Any:
 _logger_instance = None
 
 
-def _get_logger() -> Optional[AgentLogger]:
+def _get_logger() -> Optional[object]:
     """Get or create singleton AgentLogger instance."""
     global _logger_instance
     if _logger_instance is not None:
         return _logger_instance
     
-    if not AGENT_LOGGER_AVAILABLE:
+    # Lazy import to avoid circular import with agent/logging/__init__.py
+    classes = _get_agent_logger_classes()
+    if not classes:
         return None
-    
+    AgentLogger = classes['AgentLogger']    
     # Create minimal config for AgentLogger
     # This is a temporary solution until Phase 2 refactoring
     class MinimalConfig:
@@ -435,13 +448,18 @@ def log(
             console_msg += f" | {data_str}"
         
         print(console_msg, file=sys.stderr)
-    
+
     # Forward to AgentLogger (if available)
     logger = _get_logger()
     if logger is not None:
         # Map to AgentLogger's internal methods
         # This is a simplified forwarding - will be improved in Phase 2
         try:
+            # Lazily import AgentLogLevel and LogEventType
+            classes = _get_agent_logger_classes()
+            AgentLogLevel = classes.get('AgentLogLevel') if classes else None
+            LogEventType = classes.get('LogEventType') if classes else None
+
             # Convert our LogLevel to AgentLogger's LogLevel if available
             if AgentLogLevel is not None:
                 try:
@@ -450,12 +468,12 @@ def log(
                     agent_level = AgentLogLevel.INFO
             else:
                 agent_level = level_enum
-            
+
             # Use appropriate LogEventType if available
             log_event_type = event_type
             if log_event_type is None:
                 log_event_type = LogEventType.TOOL_DEBUG if LogEventType else None
-            
+
             logger._log_event(
                 event_type=log_event_type,
                 level=agent_level,
@@ -465,6 +483,7 @@ def log(
             )
         except Exception as e:
             print(f"[LOGGING ERROR] Failed to forward to AgentLogger: {e}", file=sys.stderr)
+
 
 # Convenience functions
 def debug(tag: str, message: str, data: Optional[Dict[str, Any]] = None, event_type: Optional[Any] = None, truncate_hint: Optional[str] = None) -> None:
