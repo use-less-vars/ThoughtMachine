@@ -30,6 +30,7 @@ class MessageType(Enum):
     ERROR = "error"
     WARNING = "warning"
     SUMMARY = "summary"
+    SUMMARY_TOOL = "summary_tool"
 
 
 @dataclass
@@ -73,7 +74,7 @@ class MessageRenderer:
         "FinalReport": {"show_arguments": False, "truncate_content": True, "style_key": MessageType.SPECIAL},
         "RequestUserInteraction": {"show_arguments": False, "truncate_content": False, "style_key": MessageType.SPECIAL},
         "ProgressReport": {"show_arguments": False, "truncate_content": False, "style_key": MessageType.SPECIAL},
-        "SummarizeTool": {"show_arguments": False, "truncate_content": False, "style_key": MessageType.SPECIAL},
+        "SummarizeTool": {"show_arguments": False, "truncate_content": False, "style_key": MessageType.SUMMARY_TOOL},
     }
 
     # CSS style definitions
@@ -130,8 +131,8 @@ class MessageRenderer:
         ),
         MessageType.WARNING: MessageStyle(
             border_color="#ffd9b3",
-            background_color="#fdf6ef",
-            text_color="#FFA500",
+            background_color="#fefbf8",
+            text_color="#9D6600",
             special_tool=False
         ),
         MessageType.SUMMARY: MessageStyle(
@@ -139,6 +140,12 @@ class MessageRenderer:
             background_color="#f8f8f8",
             text_color="#666666",
             special_tool=False
+        ),
+        MessageType.SUMMARY_TOOL: MessageStyle(
+            border_color="#fdcc5a",
+            background_color="#fdf9ee",
+            text_color="#89714e",
+            special_tool=True
         )
     }
     
@@ -251,6 +258,11 @@ class MessageRenderer:
         )
         return container_html
 
+    def _get_tool_style_key(self, tool_name: str) -> MessageType:
+        """Get the style key for a tool from TOOL_OVERRIDES, defaults to SPECIAL."""
+        config = self.TOOL_OVERRIDES.get(tool_name, {})
+        return config.get('style_key', MessageType.SPECIAL)
+
     def render_tool_call(self, tool_call: Dict, verbose: bool = False) -> str:
         """
         Render a tool call.
@@ -276,10 +288,10 @@ class MessageRenderer:
         extra_html = f"Arguments: {escaped_args}"        
         # Use unified card layout
         if is_special:
-            # Special tool: blue styling (SPECIAL type)
+            # Special tool: use per-tool styling from TOOL_OVERRIDES
             return self._render_card(
                 title=f"Tool: {tool_name}",
-                style_key=MessageType.SPECIAL,
+                style_key=self._get_tool_style_key(tool_name),
                 indent_level=0,
                 content_html="",
                 extra_html=extra_html
@@ -315,15 +327,15 @@ class MessageRenderer:
         
         if is_special:
             log("DEBUG", "ui.message_renderer", "render_tool_result special branch")
-            # Special tool: blue styling, full markdown rendering
+            # Special tool: per-tool styling from TOOL_OVERRIDES
             title = "Tool Result"
             if tool_name:
                 title = f"Tool Result ({tool_name})"
             
-            # Use unified card layout with SPECIAL type
+            # Use unified card layout with per-tool style
             return self._render_card(
                 title=title,
-                style_key=MessageType.SPECIAL,
+                style_key=self._get_tool_style_key(tool_name),
                 indent_level=0,
                 content_html=self._render_content(content),
                 extra_html=""
@@ -809,10 +821,10 @@ class MessageRenderer:
         
         # Use unified card layout
         if is_special:
-            # Special tool: blue styling (SPECIAL type)
+            # Special tool: per-tool styling from TOOL_OVERRIDES
             return self._render_card(
                 title=f"Tool: {tool_name}",
-                style_key=MessageType.SPECIAL,
+                style_key=self._get_tool_style_key(tool_name),
                 indent_level=0,  # Standalone tool calls have no indentation
                 content_html="",
                 extra_html=extra_html
@@ -873,10 +885,10 @@ class MessageRenderer:
         else:
             # Success case
             if is_special:
-                # Special tool: blue styling, full markdown rendering
+                # Special tool: per-tool styling from TOOL_OVERRIDES
                 return self._render_card(
                     title=title,
-                    style_key=MessageType.SPECIAL,
+                    style_key=self._get_tool_style_key(tool_name),
                     indent_level=0,
                     content_html=self._render_content(content),
                     extra_html=""

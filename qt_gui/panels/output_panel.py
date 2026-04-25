@@ -10,7 +10,7 @@ from ..utils.constants import MAX_RESULT_LENGTH, MAX_TOOL_RESULTS_PER_TURN, MAX_
 
 class OutputPanel(QWidget):
     """Panel containing event display, filtering, and query controls."""
-    SPECIAL_TOOLS = {'Final', 'FinalReport', 'RequestUserInteraction', 'ProgressReport'}
+    SPECIAL_TOOLS = {'Final', 'FinalReport', 'RequestUserInteraction', 'ProgressReport', 'SummarizeTool'}
 
 
 
