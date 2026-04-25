@@ -856,7 +856,7 @@ class Agent:
             for i in range(insertion_idx):
                 if user_history[i].get('role') != 'system':
                     discarded_msg_count += 1
-        MAX_SUMMARY_LENGTH = 4000
+        MAX_SUMMARY_LENGTH = 20000
         truncated_summary = summary
         if len(truncated_summary) > MAX_SUMMARY_LENGTH:
             truncated_summary = truncated_summary[:MAX_SUMMARY_LENGTH] + '... (truncated)'

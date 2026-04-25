@@ -65,7 +65,7 @@ class MessageRenderer:
     """
     
     # Special tools that get blue styling
-    SPECIAL_TOOLS = {"Final", "FinalReport", "RequestUserInteraction", "ProgressReport"}
+    SPECIAL_TOOLS = {"Final", "FinalReport", "RequestUserInteraction", "ProgressReport", "SummarizeTool"}
 
     # Tool configuration overrides
     TOOL_OVERRIDES = {
@@ -73,6 +73,7 @@ class MessageRenderer:
         "FinalReport": {"show_arguments": False, "truncate_content": True, "style_key": MessageType.SPECIAL},
         "RequestUserInteraction": {"show_arguments": False, "truncate_content": False, "style_key": MessageType.SPECIAL},
         "ProgressReport": {"show_arguments": False, "truncate_content": False, "style_key": MessageType.SPECIAL},
+        "SummarizeTool": {"show_arguments": False, "truncate_content": False, "style_key": MessageType.SPECIAL},
     }
 
     # CSS style definitions
