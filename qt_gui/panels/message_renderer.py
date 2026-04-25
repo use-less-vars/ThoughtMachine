@@ -69,8 +69,8 @@ class MessageRenderer:
 
     # Tool configuration overrides
     TOOL_OVERRIDES = {
-        "Final": {"show_arguments": False, "truncate_content": False, "style_key": MessageType.SPECIAL},
-        "FinalReport": {"show_arguments": False, "truncate_content": False, "style_key": MessageType.SPECIAL},
+        "Final": {"show_arguments": False, "truncate_content": True, "style_key": MessageType.SPECIAL},
+        "FinalReport": {"show_arguments": False, "truncate_content": True, "style_key": MessageType.SPECIAL},
         "RequestUserInteraction": {"show_arguments": False, "truncate_content": False, "style_key": MessageType.SPECIAL},
         "ProgressReport": {"show_arguments": False, "truncate_content": False, "style_key": MessageType.SPECIAL},
     }
@@ -78,79 +78,89 @@ class MessageRenderer:
     # CSS style definitions
     STYLES = {
         MessageType.USER: MessageStyle(
-            border_color="#ffffff",
+            border_color="#D9B8FF",
             background_color="#F3E8FF",
             text_color="#4B0082",
             header_text_color="#4B0082",
         ),
         MessageType.USER_SYSTEM: MessageStyle(
-            border_color="#ffffff",
-            background_color="#ffe6e6",
+            border_color="#cda2a2",
+            background_color="#f9ebeb",
             header_text_color="#000000"
         ),
         MessageType.ASSISTANT: MessageStyle(
-            border_color="#ffffff",
-            background_color="#e6f3ff",
+            border_color="#ecf5ff",
+            background_color="#f3f7fb",
             header_text_color="#000000"
         ),
         MessageType.SYSTEM: MessageStyle(
-            border_color="#ffffff",
+            border_color="#ffcccc",
             background_color="#ffe6e6",
             header_text_color="#000000"
         ),
         MessageType.TOOL_CALL: MessageStyle(
-            border_color="#ffffff",
+            border_color="#99cc99",
             background_color="#eef9ee",
             text_color="#000000",
             special_tool=False
         ),
         MessageType.TOOL_RESULT: MessageStyle(
-            border_color="#ffffff",
+            border_color="#99cc99",
             background_color="#eef9ee",
             text_color="#000000",
             special_tool=False
         ),
         MessageType.REASONING: MessageStyle(
-            border_color="#ffffff",
+            border_color="#cccccc",
             background_color="#f8f8f8",
             text_color="#333333"
         ),
         MessageType.SPECIAL: MessageStyle(
-            border_color="#ffffff",
-            background_color="#c9daf8",
-            text_color="#0000FF",
+            border_color="#a8c4e8",
+            background_color="#e3eefe",
+            text_color="#000030",
             special_tool=True
         ),
         MessageType.ERROR: MessageStyle(
-            border_color="#ffffff",
-            background_color="#ffe6e6",
+            border_color="#ff9999",
+            background_color="#f9f1f1",
             text_color="#FF0000",
             special_tool=False
         ),
         MessageType.WARNING: MessageStyle(
-            border_color="#ffffff",
-            background_color="#fff3e6",
+            border_color="#ffd9b3",
+            background_color="#fdf6ef",
             text_color="#FFA500",
             special_tool=False
         ),
         MessageType.SUMMARY: MessageStyle(
-            border_color="#ffffff",
+            border_color="#cccccc",
             background_color="#f8f8f8",
             text_color="#666666",
             special_tool=False
         )
     }
     
-    def __init__(self, markdown_renderer=None):
+    def __init__(self, markdown_renderer=None, detail_level: str = "normal"):
         """
         Initialize the message renderer.
-        
+
         Args:
             markdown_renderer: Optional markdown renderer for converting
                 markdown content to HTML.
+            detail_level: Detail level for rendering ('minimal', 'normal', 'verbose').
+                - minimal: Only show assistant text, hide reasoning/tool calls
+                - normal: Show reasoning, assistant, and tool calls (compact)
+                - verbose: Show everything including full JSON arguments
         """
         self.markdown_renderer = markdown_renderer
-    
+        self.detail_level = detail_level  # 'minimal', 'normal', 'verbose'
+
+    def set_detail_level(self, level: str) -> None:
+        """Set the rendering detail level: 'minimal', 'normal', or 'verbose'."""
+        if level in ('minimal', 'normal', 'verbose'):
+            self.detail_level = level
+
     def render_user_message(self, content: str, created_at: str = "", is_system_notification: bool = False) -> str:
         """
         Render a user message.
@@ -183,6 +193,9 @@ class MessageRenderer:
                                 reasoning_content: str = "", created_at: str = "") -> str:
         """
         Render an assistant message with optional tool calls and reasoning.
+        
+        All cards belonging to this turn are wrapped in a container div
+        with a subtle left-border to visually group them as one unit.
 
         Args:
             content: Main content
@@ -194,26 +207,28 @@ class MessageRenderer:
             HTML string
         """
         tool_calls = tool_calls or []
-        html_parts = []
+        inner_parts = []
 
-        # Display reasoning content if present (standalone sibling card)
-        if reasoning_content:
-            reasoning_html = self._render_card(
+        is_minimal = self.detail_level == 'minimal'
+        is_verbose = self.detail_level == 'verbose'
+
+        # Display reasoning content if present and not minimal mode
+        if reasoning_content and not is_minimal:
+            inner_parts.append(self._render_card(
                 title="Reasoning:",
                 style_key=MessageType.REASONING,
                 indent_level=0,
                 content_html=self._render_content(reasoning_content),
-            )
-            html_parts.append(reasoning_html)
+            ))
 
         # Build content HTML for the main assistant card
         content_html_parts = []
         if content:
             content_html_parts.append(self._render_content(content))
         content_html = ''.join(content_html_parts)
-        
-        # Main assistant card (title + content, unified blue background)
-        html_parts.append(self._render_card(
+
+        # Main assistant card
+        inner_parts.append(self._render_card(
             title="Assistant",
             style_key=MessageType.ASSISTANT,
             indent_level=0,
@@ -221,21 +236,27 @@ class MessageRenderer:
             extra_html=""
         ))
 
-        # Display tool calls if present
-        if tool_calls:
-            # Add visual separator before tool calls
-            html_parts.append('<div style="height: 12px; border-top: 1px solid #ddd; margin: 8px 0;"></div>')
-
+        # Display tool calls if present and not minimal mode
+        if tool_calls and not is_minimal:
             for tool_call in tool_calls:
-                html_parts.append(self.render_tool_call(tool_call))
+                inner_parts.append(self.render_tool_call(tool_call, verbose=is_verbose))
 
-        return ''.join(html_parts)
-    def render_tool_call(self, tool_call: Dict) -> str:
+        # Wrap all cards in a container that visually groups the turn
+        container_html = (
+            '<div style="border-left: 3px solid #90a4ae; margin-bottom: 14px; padding-left: 6px;'
+            ' margin-top: 2px; background: #fafafa; border-radius: 0 4px 4px 0;">'
+            + ''.join(inner_parts) +
+            '</div>'
+        )
+        return container_html
+
+    def render_tool_call(self, tool_call: Dict, verbose: bool = False) -> str:
         """
         Render a tool call.
 
         Args:
             tool_call: Tool call dictionary
+            verbose: If True, show full arguments without truncation
 
         Returns:
             HTML string
@@ -243,23 +264,22 @@ class MessageRenderer:
         tool_name = tool_call.get('function', {}).get('name', 'unknown')
         arguments = tool_call.get('function', {}).get('arguments', '{}')
         tool_call_id = tool_call.get('id', '')
-        
+
         is_special = tool_name in self.SPECIAL_TOOLS
-        
+
         # Prepare arguments display
         args_str = str(arguments)
-        if len(args_str) > 200 and not is_special:
-            args_str = args_str[:200] + '...'
+        if not verbose and len(args_str) > 80:
+            args_str = args_str[:80] + '...'
         escaped_args = html.escape(args_str)
-        extra_html = f"Arguments: {escaped_args}"
-        
+        extra_html = f"Arguments: {escaped_args}"        
         # Use unified card layout
         if is_special:
             # Special tool: blue styling (SPECIAL type)
             return self._render_card(
                 title=f"Tool: {tool_name}",
                 style_key=MessageType.SPECIAL,
-                indent_level=1,
+                indent_level=0,
                 content_html="",
                 extra_html=extra_html
             )
@@ -268,7 +288,7 @@ class MessageRenderer:
             return self._render_card(
                 title=f"Tool: {tool_name}",
                 style_key=MessageType.TOOL_CALL,
-                indent_level=1,
+                indent_level=0,
                 content_html="",
                 extra_html=extra_html
             )    
@@ -303,7 +323,7 @@ class MessageRenderer:
             return self._render_card(
                 title=title,
                 style_key=MessageType.SPECIAL,
-                indent_level=1,
+                indent_level=0,
                 content_html=self._render_content(content),
                 extra_html=""
             )
@@ -316,14 +336,15 @@ class MessageRenderer:
                 truncated_content = content
             
             escaped_content = html.escape(truncated_content)
-            
+            escaped_content = escaped_content.replace('\n', '<br>')
+
             if error:
                 log("DEBUG", "ui.message_renderer", "render_tool_result error", {"error": error})
                 # Error styling
                 return self._render_card(
                     title="Error:",
                     style_key=MessageType.ERROR,
-                    indent_level=1,
+                    indent_level=0,
                     content_html=html.escape(error),
                     extra_html=""
                 )
@@ -333,7 +354,7 @@ class MessageRenderer:
                 return self._render_card(
                     title="Warning:",
                     style_key=MessageType.WARNING,
-                    indent_level=1,
+                    indent_level=0,
                     content_html=escaped_content,
                     extra_html=""
                 )
@@ -346,7 +367,7 @@ class MessageRenderer:
                 result_html = self._render_card(
                     title=title,
                     style_key=MessageType.TOOL_RESULT,
-                    indent_level=1,
+                    indent_level=0,
                     content_html=escaped_content,
                     extra_html=""
                 )
@@ -454,7 +475,7 @@ class MessageRenderer:
         result_html = self._render_card(
             title=recipe.title,
             style_key=recipe.style_key,
-            indent_level=recipe.indent_level,
+            indent_level=0,#recipe.indent_level,
             content_html=content_html,
             extra_html=""
         )
@@ -477,22 +498,49 @@ class MessageRenderer:
     def _render_content(self, content: str) -> str:
         """
         Render message content to HTML (handles markdown).
-        
+
         Args:
             content: Content string
-            
+
         Returns:
             HTML string
         """
         if not content:
             return ''
-        
+
         if self.markdown_renderer:
-            return self.markdown_renderer.markdown_to_html(content)
+            html_content = self.markdown_renderer.markdown_to_html(content)
+            # Strip margins from block-level elements so backgrounds
+            # in the card div are continuous (Qt QTextDocument renders
+            # each block with its own frame, and margins create gaps).
+            html_content = re.sub(
+                r'<(h[1-6]|p|ul|ol|li|blockquote|pre|hr|div)([^>]*)>',
+                self._add_margin_zero,
+                html_content,
+                flags=re.IGNORECASE
+            )
+            return html_content
         else:
             # Fallback: simple HTML escaping
             return html.escape(content).replace('\n', '<br>')
-    
+
+    @staticmethod
+    def _add_margin_zero(match: re.Match) -> str:
+        """Callback for re.sub: adds margin:0 to block elements."""
+        tag = match.group(1)
+        attrs = match.group(2) or ''
+        if 'style=' in attrs.lower():
+            # Append margin:0 to existing style attribute
+            attrs = re.sub(
+                r'(style\s*=\s*["\'])',
+                r'\1margin:0; ',
+                attrs,
+                count=1,
+                flags=re.IGNORECASE
+            )
+        else:
+            attrs += ' style="margin:0;"'
+        return f'<{tag}{attrs}>'    
     def _get_recipe(self, event: Dict) -> Recipe:
         """
         Get rendering recipe for an event.
@@ -517,7 +565,7 @@ class MessageRenderer:
                     indent_level=0,
                     show_arguments=False,
                     truncate_content=False,
-                    max_chars=2000
+                    max_chars=200
                 )
             else:
                 return Recipe(
@@ -550,7 +598,7 @@ class MessageRenderer:
                 indent_level=1 if event_type == 'tool_call' else 0,
                 show_arguments=event_type == 'tool_call',
                 truncate_content=True,
-                max_chars=2000
+                max_chars=200
             )
         
         # Map event types to recipes
@@ -643,43 +691,67 @@ class MessageRenderer:
 
         return '\n'.join(lines)
     
-    def _render_card(self, title: str, style_key: MessageType, indent_level: int = 1, 
+    def _render_card(self, title: str, style_key: MessageType, indent_level: int = 1,
                     content_html: str = "", extra_html: str = "") -> str:
         """
         Render a unified card layout for messages.
-        
+
         Args:
             title: Card title (e.g., "Tool: name", "Result:")
             style_key: MessageType for styling
             indent_level: Indentation level (0 = no indent, 1 = 20px, etc.)
             content_html: Main content HTML
             extra_html: Optional extra HTML (e.g., arguments display)
-            
+
         Returns:
             HTML string for the card
         """
         style = self.STYLES[style_key]
         indent_px = indent_level * 20
-        
-        # Build the card HTML
+
+        # Build the card HTML.
+        # Qt QTextDocument "flattens" nested <div> elements and discards their
+        # background-color. To get continuous backgrounds, inject the card's
+        # background color directly into each markdown block element.
+        if content_html:
+            # Add background-color and margin:0 to all block-level elements
+            # in the content so Qt renders each block with the card's color.
+            bg_style = f'background-color:{style.background_color};margin:0;'
+            def _inject_bg(match):
+                tag = match.group(1)
+                attrs = match.group(2) or ''
+                if 'style=' in attrs.lower():
+                    attrs = re.sub(
+                        r'(style\s*=\s*["\'])',
+                        f'\\1{bg_style} ',
+                        attrs,
+                        count=1,
+                        flags=re.IGNORECASE
+                    )
+                else:
+                    attrs += f' style="{bg_style}"'
+                return f'<{tag}{attrs}>'
+            content_html = re.sub(
+                r'<(h[1-6]|p|ul|ol|li|blockquote|pre|hr|div)([^>]*)>',
+                _inject_bg,
+                content_html,
+                flags=re.IGNORECASE
+            )
+
         card_html = f'''
-<div style="margin-left: {indent_px}px !important; margin-top: 5px; margin-bottom: 10px; border-left: 4px solid {style.border_color}; background-color: {style.background_color}; padding: 8px; border-radius: 4px; display: block; clear: both; list-style: none;">
+<div style="margin-left: {indent_px}px; margin-top: 5px; margin-bottom: 10px; border-left: 4px solid {style.border_color}; background-color: {style.background_color}; padding: 8px; border-radius: 4px; display: block; clear: both;">
 '''
         if title:
-            card_html += f'    <div style="font-weight: bold; color: {style.text_color};">{html.escape(title)}</div>\n'
-        
+            card_html += f'    <div style="font-weight: bold; color: {style.header_text_color};">{html.escape(title)}</div>\n'
+
         if extra_html:
             card_html += f'    <div style="color: #666666; font-size: 0.9em; font-family: monospace, monospace;">{extra_html}</div>\n'
-        
+
         if content_html:
-            # Add line break between title/extra and content if we have content
-            if extra_html:
-                card_html += '    <br>\n'
-            card_html += f'    <div style="color: {style.text_color}; font-family: monospace; white-space: pre-wrap; padding-left: 10px !important;">{content_html}</div>\n'
-        
+            card_html += f'    <div style="color: {style.text_color}; font-family: monospace; white-space: pre-wrap; padding-left: 10px;">{content_html}</div>\n'
+
         card_html += '</div>'
-        return card_html
-    
+        return card_html    
     def format_result_plain(self, content: str, tool_name: str = "", 
                             enable_truncation: bool = True, 
                             max_length: int = MAX_RESULT_LENGTH) -> str:
@@ -725,11 +797,12 @@ class MessageRenderer:
             HTML string with card layout
         """
         is_special = tool_name in self.SPECIAL_TOOLS
-        
+        is_verbose = self.detail_level == 'verbose'
+
         # Prepare arguments display
         args_str = str(arguments)
-        if len(args_str) > 200 and not is_special:
-            args_str = args_str[:200] + '...'
+        if not is_verbose and len(args_str) > 80:
+            args_str = args_str[:80] + '...'
         escaped_args = html.escape(args_str)
         extra_html = f"Arguments: {escaped_args}"
         
@@ -814,11 +887,12 @@ class MessageRenderer:
                 else:
                     truncated_content = content
                 escaped_content = html.escape(truncated_content)
-                
+                escaped_content = escaped_content.replace('\n', '<br>')
+
                 return self._render_card(
                     title=title,
                     style_key=MessageType.TOOL_RESULT,
-                    indent_level=1,
+                    indent_level=0,
                     content_html=escaped_content,
                     extra_html=""
                 )

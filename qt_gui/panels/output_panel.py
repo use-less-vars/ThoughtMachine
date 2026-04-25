@@ -2,7 +2,7 @@
 import html
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox, QTextEdit, QFrame, QScrollArea
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QTextCursor, QTextCharFormat
+from PyQt6.QtGui import QTextCursor, QTextCharFormat, QTextBlockFormat
 from agent.logging import log
 from .markdown_renderer import MarkdownRenderer
 from .message_renderer import MessageRenderer, MessageType
@@ -43,6 +43,12 @@ class OutputPanel(QWidget):
         self.filter_type_combo = QComboBox()
         self.filter_type_combo.addItems(['all', 'turn', 'final', 'user_query', 'processing', 'stopped', 'system', 'user_interaction_requested', 'token_warning', 'turn_warning', 'paused', 'max_turns', 'error', 'thread_finished'])
         filter_layout.addWidget(self.filter_type_combo)
+        # Detail level selector
+        filter_layout.addWidget(QLabel('Detail:'))
+        self.detail_level_combo = QComboBox()
+        self.detail_level_combo.addItems(['normal', 'minimal', 'verbose'])
+        self.detail_level_combo.setToolTip('minimal: just responses\nnormal: responses + tool calls\nverbose: everything + full arguments')
+        filter_layout.addWidget(self.detail_level_combo)
         layout.addWidget(filter_widget)
         self.output_textedit = QTextEdit()
         self.output_textedit.setReadOnly(True)
@@ -57,6 +63,7 @@ class OutputPanel(QWidget):
         """Connect filter signals."""
         self.filter_lineedit.textChanged.connect(self._apply_filter)
         self.filter_type_combo.currentTextChanged.connect(self._apply_filter)
+        self.detail_level_combo.currentTextChanged.connect(self._on_detail_level_changed)
 
     def _apply_filter(self):
         """Apply current filter settings and rebuild output.
@@ -68,6 +75,11 @@ class OutputPanel(QWidget):
         self._last_filter_text = filter_text
         self._last_filter_type = filter_type
         log('DEBUG', 'debug.unknown', f"[OutputPanel] _apply_filter: text='{filter_text}', type='{filter_type}'")
+
+    def _on_detail_level_changed(self, level: str) -> None:
+        """Update the message renderer's detail level when user changes it."""
+        self.message_renderer.set_detail_level(level)
+        log('DEBUG', 'ui.output_panel', f'Detail level changed to: {level}')
 
     def display_event(self, event: dict) -> None:
         """Single entry point for all events from the presenter."""
@@ -146,19 +158,24 @@ class OutputPanel(QWidget):
         cursor.movePosition(QTextCursor.MoveOperation.End)
         cursor.insertHtml(html)
 
-        # --- List context reset ---
-        # Insert an empty paragraph with default block format
+        # --- Block format reset ---
+        # QTextEdit insertBlock() inherits formatting from the preceding block,
+        # which can cause list-style or other properties to leak into subsequent
+        # blocks. Explicitly reset both character and block formats.
         cursor.insertBlock()
-        # Reset the character format to plain (no list attributes)
+        # Reset character format to plain
         fmt = QTextCharFormat()
         cursor.setCharFormat(fmt)
+        # Reset block format to plain (clear any inherited list properties)
+        block_fmt = QTextBlockFormat()
+        cursor.setBlockFormat(block_fmt)
         cursor.insertText('')  # ensure an empty block
         # Move cursor to end again
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        self.output_textedit.setTextCursor(cursor)
 
         # If user was near bottom before new content, scroll to new bottom
         if was_near_bottom:
+            self.output_textedit.setTextCursor(cursor)
             QTimer.singleShot(0, lambda: scrollbar.setValue(scrollbar.maximum()))
 
     def _auto_scroll_if_bottom(self) -> None:

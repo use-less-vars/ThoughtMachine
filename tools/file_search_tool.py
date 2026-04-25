@@ -134,9 +134,11 @@ class FileSearchTool(ToolBase):
             matches = []
             file_lines_cache = {}
             file_line_offsets_cache = {}
+            nonexistent_files = []
             
             for file_path in files_to_search:
                 if not os.path.isfile(file_path):
+                    nonexistent_files.append(file_path)
                     continue
                 try:
                     file_size = os.path.getsize(file_path)
@@ -177,7 +179,20 @@ class FileSearchTool(ToolBase):
                 if len(matches) >= max_results:
                     break            
             if not matches:
-                return "No matches found."
+                msg = "No matches found."
+                if nonexistent_files:
+                    # Check if the issue might be that all specified files don't exist
+                    if self.filenames and len(nonexistent_files) == len(files_to_search):
+                        msg = f"None of the specified files exist: {', '.join(self.filenames)}"
+                    elif nonexistent_files:
+                        rel_nonexistent = []
+                        for f in nonexistent_files:
+                            try:
+                                rel_nonexistent.append(os.path.relpath(f))
+                            except ValueError:
+                                rel_nonexistent.append(f)
+                        msg = f"No matches found ({len(nonexistent_files)} specified files do not exist: {', '.join(rel_nonexistent)})"
+                return msg
             
             # Now build output with context lines and highlighting
             output_lines = []
