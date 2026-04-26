@@ -34,11 +34,9 @@ class MarkdownRenderer:
             body_match = re.search(r'<body[^>]*>(.*?)</body>', html_result, re.IGNORECASE | re.DOTALL)
             if body_match:
                 body_content = body_match.group(1).strip()
-                # Qt's QTextDocument HTML parser does not respect inline font-size
-                # on <p> elements (they inherit Qt's internal paragraph default which
-                # can be ~13pt). Replace <p> with <div> so font-size inheritance works.
-                import re
-                body_content = re.sub(r'<(/?)p\b', r'<\1div', body_content)
+                # Keep <p> elements as-is. Qt DOES support font-size on <p> elements
+                # when set via inline style, but NOT on nested <div> elements.
+                # The previous <p>-><div> conversion broke font-size propagation.
                 html_result = body_content
             else:
                 # If no body tag found, strip any DOCTYPE, html, head tags
