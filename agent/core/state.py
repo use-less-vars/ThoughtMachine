@@ -90,6 +90,8 @@ class AgentState:
         self.token_state = new_state
         events = []
         state_order = {TokenState.LOW: 0, TokenState.WARNING: 1, TokenState.CRITICAL: 2}
+        # Save pre-warning pending state so we can defer promotion to next turn
+        old_restrictions_pending = self.restrictions_pending
         if state_order[new_state] > state_order[old_state] and self.last_token_warning_state != new_state and (new_state in (TokenState.WARNING, TokenState.CRITICAL)):
             if new_state == TokenState.WARNING:
                 formatted = self._format_tokens(total_tokens)
@@ -113,7 +115,9 @@ class AgentState:
             token_warning_data = {'old_state': old_state.value, 'new_state': new_state.value, 'token_count': total_tokens, 'warning_message': warning, 'state': new_state.value}
             events.append(self._create_event('token_warning', token_warning_data))
         # Transition block: promote pending to active, or clear when no longer critical
-        if self.restrictions_pending and self.token_state == TokenState.CRITICAL:
+        # Deferred promotion: only promote if restrictions_pending was set in a PREVIOUS call
+        # (not just set by the warning block above), giving the agent one turn to summarise
+        if old_restrictions_pending and self.token_state == TokenState.CRITICAL:
             self.restrictions_active = True
             self.restrictions_pending = False
         elif self.token_state != TokenState.CRITICAL and self.turn_state != TurnState.CRITICAL:
@@ -146,6 +150,8 @@ class AgentState:
         self.turn_state = new_state
         events = []
         state_order = {TurnState.LOW: 0, TurnState.WARNING: 1, TurnState.CRITICAL: 2}
+        # Save pre-warning pending state so we can defer promotion to next turn
+        old_restrictions_pending = self.restrictions_pending
         if state_order[new_state] > state_order[old_state] and self.last_turn_warning_state != new_state and (new_state in (TurnState.WARNING, TurnState.CRITICAL)):
             if new_state == TurnState.WARNING:
                 warning = f'**Turn limit warning**: Agent is nearing maximum turn limit ({current_turn}/{max_turns} turns). Please consider wrapping up soon.'
@@ -161,7 +167,8 @@ class AgentState:
             turn_warning_data = {'old_state': old_state.value, 'new_state': new_state.value, 'turn_count': current_turn, 'warning_message': warning, 'state': new_state.value}
             events.append(self._create_event('turn_warning', turn_warning_data))
         # Transition block: promote pending to active, or clear when no longer critical
-        if self.restrictions_pending and self.turn_state == TurnState.CRITICAL:
+        # Deferred promotion: only promote if restrictions_pending was set in a PREVIOUS call
+        if old_restrictions_pending and self.turn_state == TurnState.CRITICAL:
             self.restrictions_active = True
             self.restrictions_pending = False
         elif self.turn_state != TurnState.CRITICAL and self.token_state != TokenState.CRITICAL:
