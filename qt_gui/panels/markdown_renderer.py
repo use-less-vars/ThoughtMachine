@@ -34,8 +34,11 @@ class MarkdownRenderer:
             body_match = re.search(r'<body[^>]*>(.*?)</body>', html_result, re.IGNORECASE | re.DOTALL)
             if body_match:
                 body_content = body_match.group(1).strip()
-                # Also need to include any styles in the head
-                # For simplicity, we'll just use the body content
+                # Qt's QTextDocument HTML parser does not respect inline font-size
+                # on <p> elements (they inherit Qt's internal paragraph default which
+                # can be ~13pt). Replace <p> with <div> so font-size inheritance works.
+                import re
+                body_content = re.sub(r'<(/?)p\b', r'<\1div', body_content)
                 html_result = body_content
             else:
                 # If no body tag found, strip any DOCTYPE, html, head tags

@@ -521,6 +521,10 @@ class MessageRenderer:
         if not content:
             return ''
 
+        # DIRTY HACK: collapse double newlines to single newlines to avoid
+        # Qt HTML renderer font-size inheritance issues with paragraph blocks.
+        content = content.replace('\n\n', '\n')
+
         if self.markdown_renderer:
             html_content = self.markdown_renderer.markdown_to_html(content)
             # Strip margins from block-level elements so backgrounds
@@ -748,8 +752,9 @@ class MessageRenderer:
             def _inject_bg(match):
                 tag = match.group(1)
                 attrs = match.group(2) or ''
-                # Use the style variant that includes font-size only for <p> tags
-                use_bg = p_style if tag == 'p' else bg_style
+                # Use font-size on ALL block elements since Qt doesn't
+                # reliably inherit font-size from parent divs
+                use_bg = p_style
                 if 'style=' in attrs.lower():
                     attrs = re.sub(
                         r'(style\s*=\s*["\'])',
