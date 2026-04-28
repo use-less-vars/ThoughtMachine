@@ -192,14 +192,16 @@ class MarkdownRenderer:
                     list_type = None
                 continue
 
-            # Regular text line
+            # Regular text line — MUST wrap in <p> so _inject_bg can add font-size
             if not in_paragraph:
                 in_paragraph = True
-            result_lines.append(line)
+                result_lines.append(f'<p>{line}')
+            else:
+                result_lines.append(f'<br/>{line}')
 
         # Close any open structures
         if in_paragraph:
-            result_lines.append('<br/>')
+            result_lines.append('</p>')
         if in_list:
             result_lines.append(f'</{list_type}>')
 

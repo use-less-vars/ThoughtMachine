@@ -534,8 +534,9 @@ class MessageRenderer:
             )
             return html_content
         else:
-            # Fallback: simple HTML escaping
-            return html.escape(content).replace('\n', '<br>')
+            # Fallback: simple HTML escaping — wrap in <p> so _inject_bg can add font-size
+            escaped = html.escape(content).replace('\n', '<br>')
+            return f'<p>{escaped}</p>' if escaped else ''
 
     @staticmethod
     def _add_margin_zero(match: re.Match) -> str:
