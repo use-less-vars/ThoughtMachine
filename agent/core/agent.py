@@ -150,7 +150,7 @@ class Agent:
 
     def _apply_pending_config(self):
         """Apply pending configuration update if one exists.
-        
+
         Called at the start of process_query(). Determines whether
         the change can be hot-swapped (simple parameter changes like
         temperature, max_tokens, top_p, enabled_tools) or requires
@@ -158,13 +158,21 @@ class Agent:
         """
         if self._pending_config is None:
             return
-        
+
         new_config = self._pending_config
         self._pending_config = None
-        
+
         if self._can_hot_swap(new_config):
             self._hot_swap(new_config)
         else:
+            # Validate that the new config has an API key available before attempting restart
+            if not self._has_api_key(new_config):
+                logger.error(
+                    f'Cannot restart with provider {new_config.provider_type}: '
+                    f'no API key available. Set {new_config.provider_type.upper()}_API_KEY '
+                    f'environment variable or provide api_key in config.'
+                )
+                return
             self._restart_with_config(new_config)
 
     def _can_hot_swap(self, new_config: AgentConfig) -> bool:
@@ -187,6 +195,9 @@ class Agent:
             return False
         if new_config.tool_classes != self.config.tool_classes:
             return False
+        # Workspace path changes require a full restart
+        if new_config.workspace_path != self.config.workspace_path:
+            return False
         return True
 
     def _hot_swap(self, new_config: AgentConfig):
@@ -208,7 +219,10 @@ class Agent:
         # Update config reference
         old_config = self.config
         self.config = new_config
-        
+        # Also update the ToolExecutor's config reference so it picks up
+        # workspace_path and other non-hot-swappable-but-config fields
+        self.tool_executor.config = new_config
+
         # Rebuild tools if enabled_tools changed
         if new_config.enabled_tools != old_config.enabled_tools:
             self.tool_classes = new_config.get_filtered_tool_classes()
@@ -227,11 +241,35 @@ class Agent:
 
     def _restart_with_config(self, new_config: AgentConfig):
         """Perform a full agent restart with new configuration.
-        
+
         Closes old LLM client and tool executor, then re-initialises
         everything from the new config while preserving conversation history.
         """
-        self.restart(new_config)
+        success = self.restart(new_config)
+        if not success:
+            logger.error(f'Agent restart with provider={new_config.provider_type} failed')
+
+    @staticmethod
+    def _has_api_key(config: AgentConfig) -> bool:
+        """Check if the config has an API key available (either directly or via env var).
+
+        Args:
+            config: The AgentConfig to check.
+
+        Returns:
+            True if an API key is available, False otherwise.
+        """
+        if config.api_key:
+            return True
+        # Check provider-specific environment variable
+        env_var = f"{config.provider_type.upper()}_API_KEY"
+        if os.getenv(env_var):
+            return True
+        # For openai/openai_compatible, also check OPENAI_API_KEY
+        if config.provider_type in ("openai", "openai_compatible"):
+            if os.getenv("OPENAI_API_KEY"):
+                return True
+        return False
 
     def restart(self, new_config: AgentConfig) -> bool:
         """
@@ -247,19 +285,23 @@ class Agent:
         Returns:
             True on success, False on error.
         """
-        try:
-            old_logger = self.logger
-            old_system_event_logger = getattr(self, 'system_event_logger', None)
+        # Save old references BEFORE closing, so we can restore on failure
+        old_logger = self.logger
+        old_system_event_logger = getattr(self, 'system_event_logger', None)
+        old_config = getattr(self, 'config', None)
+        old_llm_client = getattr(self, 'llm_client', None)
+        old_tool_executor = getattr(self, 'tool_executor', None)
 
+        try:
             # Preserve conversation and token state BEFORE closing
             current_conversation = self.conversation.copy()
             token_counts = self._token_counts.copy()
 
             # Close old resources
-            if hasattr(self, 'llm_client') and self.llm_client is not None:
-                self.llm_client.close()
-            if hasattr(self, 'tool_executor') and self.tool_executor is not None:
-                self.tool_executor.close()
+            if old_llm_client is not None:
+                old_llm_client.close()
+            if old_tool_executor is not None:
+                old_tool_executor.close()
 
             # Reset execution state
             self.state.set_execution_state(ExecutionState.IDLE)
@@ -311,9 +353,25 @@ class Agent:
                 self.logger.log_info('AGENT_RESTART', f'Configuration reloaded, provider: {self.provider}')
             return True
         except Exception as e:
-            logger.error(f'Failed to restart agent: {e}')
-            traceback.print_exc()
+            logger.error(f'Failed to restart agent: {e}', exc_info=True)
+            # Restore old LLM client so agent isn't left in a broken state
+            if old_config is not None and old_logger is not None:
+                try:
+                    self.llm_client = LLMClient(old_config, self._session, old_logger)
+                    self.provider = self.llm_client.provider
+                except Exception as restore_error:
+                    logger.critical(f'Failed to restore old LLM client after restart failure: {restore_error}')
+            else:
+                self.llm_client = None
+                self.provider = None
+            # Restore config to previous value
+            self.config = old_config
             return False
+
+    @property
+    def session(self):
+        """Return the session object."""
+        return self._session
 
     @session.setter
     def session(self, value):
@@ -581,6 +639,25 @@ class Agent:
         Yields events as dicts."""
         # Apply any pending configuration update before processing
         self._apply_pending_config()
+
+        # Safety check: ensure LLM client is in a valid state after config update
+        llm_client = getattr(self, 'llm_client', None)
+        if llm_client is None or getattr(llm_client, 'provider', None) is None:
+            logger.error('LLM client is unavailable or in invalid state after config update')
+            events = self.state.set_execution_state(ExecutionState.WAITING_FOR_USER)
+            for event in events:
+                for yielded_event in self._handle_state_event(event):
+                    yield yielded_event
+            event_dict = {
+                'type': 'error',
+                'error_type': 'invalid_config',
+                'message': 'LLM client unavailable after configuration update. The new configuration may be invalid.',
+                'turn': self._display_turn,
+            }
+            self._add_conversation_data_to_event(event_dict)
+            yield event_dict
+            return
+
         pause_debug(f"process_query called with query: '{query[:50]}...'")
         pause_debug(f'Current execution state: {self.state.execution_state}')
         pause_debug(f'Conversation length before adding query: {len(self.conversation)}')
@@ -729,6 +806,8 @@ class Agent:
                 warning = f'Request token count ({request_tokens}) is near model context window limit ({model_context_window}). Please use SummarizeTool immediately to reduce context size.'
                 warning_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + warning, 'is_system_notification': True}
                 self._add_to_conversation(warning_msg)
+                # Also add to messages so the LLM sees the warning in this turn
+                messages.append(warning_msg)
                 warning_tokens = self._estimate_tokens(warning_msg)
                 self.state.current_conversation_tokens += warning_tokens
                 yield self._create_token_update_event()
@@ -741,6 +820,8 @@ class Agent:
                 warning = f'Request token count ({request_tokens}) is approaching model context window ({model_context_window}). Consider using SummarizeTool soon.'
                 warning_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + warning, 'is_system_notification': True}
                 self._add_to_conversation(warning_msg)
+                # Also add to messages so the LLM sees the warning in this turn
+                messages.append(warning_msg)
                 warning_tokens = self._estimate_tokens(warning_msg)
                 self.state.current_conversation_tokens += warning_tokens
                 yield self._create_token_update_event()
