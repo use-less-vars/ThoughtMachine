@@ -155,24 +155,33 @@ class Agent:
         the change can be hot-swapped (simple parameter changes like
         temperature, max_tokens, top_p, enabled_tools) or requires
         a full agent restart.
+
+        Preserves _pending_config on failure so the change can be
+        retried on the next process_query() call.
         """
         if self._pending_config is None:
             return
 
         new_config = self._pending_config
-        self._pending_config = None
+        log('DEBUG', 'core.config', f'[CONFIG_TRACE] _apply_pending_config incoming workspace_path={new_config.workspace_path}')
 
         if self._can_hot_swap(new_config):
             self._hot_swap(new_config)
+            self._pending_config = None
+            log('DEBUG', 'core.config', '[CONFIG_TRACE] Pending config cleared after successful hot-swap')
         else:
             # Validate that the new config has an API key available before attempting restart
             if not self._has_api_key(new_config):
-                logger.error(
+                logger.warning(
                     f'Cannot restart with provider {new_config.provider_type}: '
                     f'no API key available. Set {new_config.provider_type.upper()}_API_KEY '
                     f'environment variable or provide api_key in config.'
                 )
+                log('WARNING', 'core.config',
+                    '[CONFIG_TRACE] Pending config PRESERVED for retry on next turn '
+                    f'(no API key for provider={new_config.provider_type})')
                 return
+            self._pending_config = None
             self._restart_with_config(new_config)
 
     def _can_hot_swap(self, new_config: AgentConfig) -> bool:
@@ -321,6 +330,7 @@ class Agent:
             # Rebuild tool_classes and tool_definitions
             self.tool_classes = new_config.tool_classes if new_config.tool_classes is not None else new_config.get_filtered_tool_classes()
             self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
+            log('DEBUG', 'core.config', f'[CONFIG_TRACE] restart: creating executors with workspace={new_config.workspace_path}')
             self.tool_executor = ToolExecutor(self.tool_classes, new_config, self.state, old_logger, self.security_available, agent=self)
 
             # Rebuild context builder

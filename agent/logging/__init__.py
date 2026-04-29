@@ -268,14 +268,15 @@ class _AgentLogger:
         event = {'type': event_type.value, 'level': level.value, 'message': message, 'data': data or {}, 'turn': turn if turn is not None else self.current_turn, 'total_input_tokens': self.total_input_tokens, 'total_output_tokens': self.total_output_tokens}
         if self.enable_file_logging and self.jsonl_format and self._should_log_to_file(level):
             self._write_jsonl(event)
-        log_method = getattr(self.py_logger, level.value.lower())
-        log_msg = f'[{event_type.value}] {message}'
-        if data:
-            data_str = self._truncate_string(str(data), self.console_data_truncate)
-            if '... [truncated]' in data_str:
-                data_str = data_str.replace('... [truncated]', '...')
-            log_msg += f' | Data: {data_str}'
-        log_method(log_msg)
+        if self.enable_console_logging:
+            log_method = getattr(self.py_logger, level.value.lower())
+            log_msg = f'[{event_type.value}] {message}'
+            if data:
+                data_str = self._truncate_string(str(data), self.console_data_truncate)
+                if '... [truncated]' in data_str:
+                    data_str = data_str.replace('... [truncated]', '...')
+                log_msg += f' | Data: {data_str}'
+            log_method(log_msg)
 
     def log_agent_start(self, query: str, config_data: Dict[str, Any]):
         """Log agent startup."""

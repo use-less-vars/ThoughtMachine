@@ -609,37 +609,46 @@ class SessionTab(QWidget):
     def load_config(self):
         """Load configuration from file and update controls.
 
-        Priority:
-        1. session.config (primary per-session storage)
-        2. session.metadata['working_config'] (backward compatibility, deprecated)
-        3. Global config file (StateBridge)
+        Layered merge (not exclusive priority):
+        1. Start with empty config
+        2. Layer in global config (file) — provides workspace_path and all persisted fields
+        3. Layer in session.config (SessionConfig dataclass) — overwrites limited basic fields
+        4. Layer in session.metadata['working_config'] (full config dict) — highest priority
+
+        Each layer fills in fields the previous layer doesn't have, so fields like
+        workspace_path from global config survive unless explicitly overridden.
         """
         self._loading_config = True
         try:
-            config = None
+            config = {}
             session = getattr(self.presenter, 'current_session', None)
 
-            # Priority 1: session.config
+            # Layer 3 (base): Global config file — contains workspace_path and all persisted fields
+            global_config = self.config_bridge.get_config()
+            config.update(global_config)
+            log('DEBUG', 'session_tab', f'Layer global config ({len(global_config)} keys): workspace_path={global_config.get("workspace_path", "NOT_IN_DICT")}')
+            log('DEBUG', 'core.config', f'[CONFIG_TRACE] load_config layer global: workspace_path={config.get("workspace_path", "NOT_IN_DICT")}')
+
+            # Layer 2: session.config (limited to SessionConfig fields)
             if session is not None and hasattr(session, 'config') and session.config:
                 if isinstance(session.config, dict):
-                    config = session.config
+                    session_config = session.config
                 else:
                     try:
-                        config = session.config.model_dump()
+                        session_config = session.config.model_dump()
                     except Exception:
-                        config = session.config.__dict__ if hasattr(session.config, '__dict__') else None
-                if config:
-                    log('DEBUG', 'session_tab', f'Using session.config ({len(config)} keys)')
+                        session_config = session.config.__dict__ if hasattr(session.config, '__dict__') else {}
+                if session_config:
+                    config.update(session_config)
+                    log('DEBUG', 'session_tab', f'Layer session.config ({len(session_config)} keys): workspace_path={config.get("workspace_path", "NOT_IN_DICT")}')
+                    log('DEBUG', 'core.config', f'[CONFIG_TRACE] load_config layer session.config: workspace_path={config.get("workspace_path", "NOT_IN_DICT")}')
 
-            # Priority 2: session.metadata['working_config'] (deprecated)
-            if config is None and session is not None and 'working_config' in session.metadata:
-                config = session.metadata['working_config']
-                log('DEBUG', 'session_tab', f'Using session.metadata working_config ({len(config)} keys)')
-
-            # Priority 3: Global config
-            if config is None:
-                config = self.config_bridge.get_config()
-                log('DEBUG', 'session_tab', 'Using global config file')
+            # Layer 1 (top): session.metadata['working_config'] — highest priority
+            if session is not None and 'working_config' in session.metadata:
+                metadata_config = session.metadata['working_config']
+                config.update(metadata_config)
+                log('DEBUG', 'session_tab', f'Layer session.metadata working_config ({len(metadata_config)} keys): workspace_path={config.get("workspace_path", "NOT_IN_DICT")}')
+                log('DEBUG', 'core.config', f'[CONFIG_TRACE] load_config layer metadata: workspace_path={config.get("workspace_path", "NOT_IN_DICT")}')
 
             self.working_config = config.copy()
             self._refresh_tools()
@@ -691,6 +700,7 @@ class SessionTab(QWidget):
         the mailbox pattern. The agent decides internally whether to
         hot-swap or restart at the next process_query() boundary.
         """
+        log('DEBUG', 'core.config', f'[CONFIG_TRACE] _on_apply_runtime_params start: workspace_path={config.get("workspace_path", "NOT_IN_DICT")}')
         from agent.config import AgentConfig
         # Validate the full config
         try:
@@ -707,6 +717,14 @@ class SessionTab(QWidget):
         if self.presenter.controller is not None:
             self.presenter.controller.request_config_update(validated_config)
             log('INFO', 'session_tab', f'Configuration update queued: provider={validated_config.provider_type}, model={validated_config.model}')
+            # Persist the updated config (including workspace_path) to session metadata immediately
+            # so that the new workspace survives agent restart and session reload.
+            self.working_config.update(config)
+            # Sync state_bridge._config so auto-save picks up the new workspace_path
+            self.presenter.update_config(config)
+            log('DEBUG', 'core.config', '[CONFIG_TRACE] after presenter.update_config')
+            self._save_config_to_session()
+            log('DEBUG', 'core.config', '[CONFIG_TRACE] after _save_config_to_session')
 
     def _handle_config_change(self):
         """Handle configuration change from UI controls."""
@@ -715,16 +733,20 @@ class SessionTab(QWidget):
         config = self.agent_controls_panel.get_config_dict()
         self.working_config = config.copy()
         self.presenter.update_config(config)
+        # Set flag before scheduling save to prevent _on_config_changed from
+        # reloading the global config file (which would overwrite workspace_path).
+        # Reset after the 1000ms debounced save completes.
+        self._saving_config = True
         self._schedule_config_save()
         # Save config to session metadata for per-session persistence
         self._save_config_to_session()
+        # Reset flag after bridge's 1000ms debounce timer + buffer
+        QTimer.singleShot(1500, lambda: setattr(self, '_saving_config', False))
 
     def _save_config_to_session(self):
-        """Save working_config to current session for per-session persistence.
+        """Save working_config to current session metadata for per-session persistence.
 
-        Uses session.config (a dict or Pydantic model) as the primary storage.
-        Also updates session.metadata['working_config'] for backward compatibility
-        (deprecated — will be removed in a future version).
+        Uses session.metadata['working_config'] as the single source of truth.
         """
         if not hasattr(self.presenter, 'current_session') or self.presenter.current_session is None:
             log('DEBUG', 'session_tab', '_save_config_to_session: no current session, skipping')
@@ -733,23 +755,15 @@ class SessionTab(QWidget):
             from datetime import datetime
             session = self.presenter.current_session
             config_copy = self.working_config.copy()
-            # Primary: save to session.config (dict field)
-            if hasattr(session, 'config'):
-                if isinstance(session.config, dict):
-                    session.config.update(config_copy)
-                else:
-                    # Pydantic model — create or update from dict
-                    try:
-                        from agent.config import AgentConfig
-                        session.config = AgentConfig(**config_copy)
-                    except Exception:
-                        session.config = config_copy
-            else:
-                session.config = config_copy
-            # Backward compatibility (deprecated)
             session.metadata['working_config'] = config_copy
             session.updated_at = datetime.now()
-            log('DEBUG', 'session_tab', f'Saved working_config to session.config ({len(config_copy)} keys)')
+            log('DEBUG', 'session_tab', f'Saved working_config to session.metadata ({len(config_copy)} keys)')
+            log('DEBUG', 'core.config', f'[CONFIG_TRACE] saving to session metadata: workspace_path={config_copy.get("workspace_path", "NOT_IN_DICT")}')
+            # Persist to disk immediately so per-session config survives restart
+            if hasattr(self.presenter, 'session_store') and self.presenter.session_store is not None:
+                self.presenter.session_store.save_session(session)
+                log('DEBUG', 'session_tab', 'Flushed working_config to disk')
+                log('DEBUG', 'core.config', '[CONFIG_TRACE] session save complete')
         except Exception as e:
             log('DEBUG', 'session_tab', f'Failed to save config to session: {e}')
 
@@ -775,6 +789,7 @@ class SessionTab(QWidget):
         """Schedule a debounced configuration save."""
         if not self._loading_config:
             config = self.agent_controls_panel.get_config_dict()
+            log('DEBUG', 'core.config', f'[CONFIG_TRACE] auto-save triggered; current state_bridge._config workspace={config.get("workspace_path", "NOT_IN_DICT")} and working_config workspace={getattr(self, "working_config", {}).get("workspace_path", "NOT_IN_DICT")}')
             self.config_bridge.save_config(config, immediate=False)
 
     def set_workspace(self):

@@ -1,14 +1,14 @@
 """
 StateBridge: Configuration management, session binding, and token tracking.
 
-Handles:
 - Configuration loading/saving/updating
-- AgentConfig creation from configuration dictionaries  
+- AgentConfig creation from configuration dictionaries
 - Session binding and external file path management
 - Token total tracking (input, output, context)
 """
 import os
 import json
+import traceback
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from pathlib import Path
@@ -43,7 +43,14 @@ class StateBridge:
 
     def update_config(self, config_updates: dict) -> dict:
         """Update configuration with partial updates."""
+        # Capture caller info
+        caller_frame = traceback.extract_stack()[-3]  # 0=this, 1=update_config, 2=our caller
+        caller_info = f'{caller_frame.filename}:{caller_frame.lineno} in {caller_frame.name}'
+        log('DEBUG', 'core.config', f'[CONFIG_TRACE] state_bridge update_config CALLER={caller_info}')
+        log('DEBUG', 'core.config', f'[CONFIG_TRACE] state_bridge update_config before: workspace_path={self._config.get("workspace_path", "NOT_IN_DICT")}')
+        log('DEBUG', 'core.config', f'[CONFIG_TRACE] state_bridge update_config incoming: workspace_path={config_updates.get("workspace_path", "KEY_MISSING")}')
         self._config = update_config(self._config, config_updates)
+        log('DEBUG', 'core.config', f'[CONFIG_TRACE] state_bridge update_config after: workspace_path={self._config.get("workspace_path", "NOT_IN_DICT")}')
         return self._config
 
     def save_config(self, config: Optional[dict]=None, path: Optional[str]=None) -> bool:
@@ -136,6 +143,10 @@ class StateBridge:
         self.total_input = session.total_input_tokens
         self.total_output = session.total_output_tokens
         self.context_length = session.context_length
+        # Restore workspace_path from session metadata into the active config
+        ws = session.metadata.get('workspace_path')
+        if ws:
+            self._config['workspace_path'] = ws
         external_file_path = session.metadata.get('external_file_path')
         if external_file_path:
             self._external_file_path = os.path.abspath(external_file_path)

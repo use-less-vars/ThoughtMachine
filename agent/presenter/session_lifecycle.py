@@ -1,7 +1,6 @@
 """
 SessionLifecycle: Session start/stop/pause/save/load operations.
 
-Handles:
 - Session creation, starting, pausing, restarting
 - Session loading, saving, exporting
 - Session listing, deletion, renaming
@@ -104,7 +103,11 @@ class SessionLifecycle:
                 self._cached_preset_name = None
             if self.state_bridge.current_session is None:
                 session_config = self.state_bridge.build_session_config(agent_config)
-                new_session = Session(session_id=str(uuid.uuid4()), config=session_config, user_history=[], metadata={})
+                ws_path = self.state_bridge._config.get('workspace_path')
+                metadata = {}
+                if ws_path:
+                    metadata['workspace_path'] = ws_path
+                new_session = Session(session_id=str(uuid.uuid4()), config=session_config, user_history=[], metadata=metadata)
                 new_session.ensure_name()
                 self.state_bridge.bind_session(new_session)
                 self._register_session_callbacks(new_session)
@@ -132,7 +135,13 @@ class SessionLifecycle:
             self.controller.stop()
         agent_config = self.state_bridge.create_agent_config()
         session_config = self.state_bridge.build_session_config(agent_config)
-        session = Session(session_id=str(uuid.uuid4()), config=session_config, user_history=[], metadata={'name': name} if name else {})
+        ws_path = self.state_bridge._config.get('workspace_path')
+        metadata = {}
+        if name:
+            metadata['name'] = name
+        if ws_path:
+            metadata['workspace_path'] = ws_path
+        session = Session(session_id=str(uuid.uuid4()), config=session_config, user_history=[], metadata=metadata)
         session.ensure_name()
         self.state_bridge.bind_session(session)
         self._register_session_callbacks(session)
@@ -412,6 +421,7 @@ class SessionLifecycle:
             return False
 
     def _build_session_from_current_state(self):
+        log('DEBUG', 'core.config', f'[CONFIG_TRACE] _build_session_from_current_state: workspace_path={self.state_bridge._config.get("workspace_path", "NOT_IN_DICT")}')
         """Construct a Session object from current presenter state."""
         log('DEBUG', 'presenter.lifecycle', f'_build_session_from_current_state: user_history length={(len(self.state_bridge.user_history) if self.state_bridge.user_history else 0)}, current_session_id={self.state_bridge.current_session_id}, current_session exists={self.state_bridge.current_session is not None}')
         conversation = None
@@ -443,6 +453,9 @@ class SessionLifecycle:
             session.context_length = self.state_bridge.context_length
         if self.state_bridge._external_file_path:
             session.metadata['external_file_path'] = self.state_bridge._external_file_path
+        # Store workspace_path in session metadata for persistence
+        workspace_path = self.state_bridge._config.get('workspace_path')
+        session.metadata['workspace_path'] = workspace_path  # always set, even if None
         return session
 
     def auto_save_current_session(self) -> bool:

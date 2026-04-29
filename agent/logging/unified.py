@@ -47,13 +47,11 @@ def _get_agent_logger_classes():
         return _agent_logger_classes if _agent_logger_classes else None
     try:
         from agent.logging import AgentLogger, LogLevel as AgentLogLevel, LogCategory, LogEventType
-        from agent.config import AgentConfig
         _agent_logger_classes = {
             'AgentLogger': AgentLogger,
             'AgentLogLevel': AgentLogLevel,
             'LogCategory': LogCategory,
             'LogEventType': LogEventType,
-            'AgentConfig': AgentConfig,
         }
         return _agent_logger_classes
     except ImportError:
@@ -372,13 +370,24 @@ def _get_logger() -> Optional[object]:
         max_file_size_mb = 10
         max_backup_files = 5
         session_id = None
+        file_log_level = "DEBUG"
     
     try:
         config = MinimalConfig()
+        # Determine file_log_level from environment variable TM_LOG_FILE_LEVEL
+        env_level = os.environ.get('TM_LOG_FILE_LEVEL')
+        if env_level:
+            from agent.logging import LogLevel as AgentLogLevel
+            try:
+                config.file_log_level = AgentLogLevel(env_level.upper())
+            except ValueError:
+                pass
+
         _logger_instance = AgentLogger(
             config=config,
             log_dir=config.log_dir,
             log_level=config.log_level,
+            file_log_level=config.file_log_level,
             enable_file_logging=config.enable_file_logging,
             enable_console_logging=config.enable_console_logging,
             jsonl_format=config.jsonl_format,

@@ -118,6 +118,10 @@ def update_config(current_config: Dict[str, Any], updates: Dict[str, Any]) -> Di
     Returns:
         Updated configuration dictionary
     """
+    old_ws = current_config.get('workspace_path', 'KEY_MISSING')
+    new_ws = updates.get('workspace_path', 'KEY_MISSING')
+    has_ws_key = 'workspace_path' in updates
+    logger.debug(f'[CONFIG_TRACE] loader.update_config: old_workspace_path={old_ws!r}, new_workspace_path={new_ws!r}, has_workspace_path_key={has_ws_key}, update_keys={list(updates.keys())}')
     updated = current_config.copy()
     updated.update(updates)
     return updated
