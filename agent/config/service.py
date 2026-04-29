@@ -29,7 +29,6 @@ class ConfigService:
         """
         self.config_path = config_path
         self.default_config = default_config or {}
-        self.schema = {}
         self._config = self.default_config.copy()
         self._listeners = []
         self._save_timer = None
@@ -230,67 +229,6 @@ class ConfigService:
         Returns:
             Always True
         """
-        return True
-
-    def _validate_config(self, config: Dict[str, Any], context: str='configuration', schema: Optional[Dict[str, Any]]=None, strict: bool=True) -> bool:
-        """
-        Validate configuration against schema.
-
-        Args:
-            config: Configuration dictionary to validate
-            context: Description of what's being validated (for error messages)
-            schema: Validation schema (ignored - validation handled by AgentConfig)
-            strict: If True, unknown keys cause validation failure; if False, unknown keys are ignored
-
-        Returns:
-            True if valid, False otherwise
-        """
-        validation_schema = schema or self.schema
-        if not validation_schema or validation_schema == {}:
-            return True
-        errors = []
-        for key, rules in validation_schema.items():
-            if key not in config:
-                if not rules.get('optional', False):
-                    errors.append(f"Required key '{key}' missing")
-                continue
-            value = config[key]
-            if rules.get('nullable', False) and value is None:
-                continue
-            if 'type' in rules:
-                expected_type = rules['type']
-                if expected_type == 'int':
-                    if not isinstance(value, int):
-                        errors.append(f"Key '{key}' must be int, got {type(value).__name__}")
-                elif expected_type == 'float':
-                    if not isinstance(value, (int, float)):
-                        errors.append(f"Key '{key}' must be float, got {type(value).__name__}")
-                elif expected_type == 'str':
-                    if not isinstance(value, str):
-                        errors.append(f"Key '{key}' must be str, got {type(value).__name__}")
-                elif expected_type == 'bool':
-                    if not isinstance(value, bool):
-                        errors.append(f"Key '{key}' must be bool, got {type(value).__name__}")
-                elif expected_type == 'list':
-                    if not isinstance(value, list):
-                        errors.append(f"Key '{key}' must be list, got {type(value).__name__}")
-                elif expected_type == 'none':
-                    if value is not None:
-                        errors.append(f"Key '{key}' must be None, got {type(value).__name__}")
-            if isinstance(value, (int, float)):
-                if 'min' in rules and value < rules['min']:
-                    errors.append(f"Key '{key}' must be >= {rules['min']}, got {value}")
-                if 'max' in rules and value > rules['max']:
-                    errors.append(f"Key '{key}' must be <= {rules['max']}, got {value}")
-            if 'choices' in rules and value not in rules['choices']:
-                errors.append(f"Key '{key}' must be one of {rules['choices']}, got {value}")
-        if strict:
-            for key in config.keys():
-                if key not in validation_schema:
-                    errors.append(f"Unknown configuration key '{key}'")
-        if errors:
-            log('WARNING', 'config.service', f'Validation errors in {context}:\n' + '\n'.join(errors))
-            return False
         return True
 
     def reset_to_defaults(self) -> None:

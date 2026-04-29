@@ -2,7 +2,7 @@
 Configuration models for the ThoughtMachine agent.
 """
 from typing import Optional, Callable, List, Any, Dict, Literal
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
 from agent.logging import log
 from tools import SIMPLIFIED_TOOL_CLASSES
 
@@ -73,15 +73,23 @@ class AgentConfig(BaseModel):
                 object.__setattr__(self, 'enabled_tools', filtered)
         return self
 
-    def get_filtered_tool_classes(self):
-        """Get tool classes filtered based on rag_enabled and enabled_tools."""
+    def get_filtered_tool_classes(self, enabled_tools=None):
+        """Get tool classes filtered based on rag_enabled and enabled_tools.
+
+        Args:
+            enabled_tools: Optional override list of enabled tool names.
+                          If None, uses self.enabled_tools.
+
+        Returns:
+            List of tool class objects.
+        """
         from tools import SIMPLIFIED_TOOL_CLASSES
         tool_classes = list(SIMPLIFIED_TOOL_CLASSES)
         if not self.rag_enabled:
             tool_classes = [cls for cls in tool_classes if cls.__name__ != 'SearchCodebaseTool']
-        if self.enabled_tools:
-            tool_classes = [cls for cls in tool_classes if cls.__name__ in self.enabled_tools]
+        active_tools = enabled_tools if enabled_tools is not None else self.enabled_tools
+        if active_tools:
+            tool_classes = [cls for cls in tool_classes if cls.__name__ in active_tools]
         return tool_classes
 
-    class Config:
-        extra = 'ignore'
+    model_config = ConfigDict(extra='ignore')

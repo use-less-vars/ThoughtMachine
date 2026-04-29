@@ -190,6 +190,12 @@ class ToolExecutor:
         except Exception as e:
             return {'result': f'Error executing tool: {e}', 'tool_type': 'normal'}
 
+    def close(self):
+        """Close and release any resources held by this executor."""
+        self.tool_classes = []
+        self.agent = None
+        self.state = None
+
     def _create_tool_rejection_message(self, tool_name: str) -> str:
         """Create rejection message for disallowed tool calls."""
         allowed_tools = self.state.get_allowed_tools()

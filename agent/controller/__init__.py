@@ -187,10 +187,56 @@ class AgentController(QObject):
             return self.agent.conversation.copy() if self.agent.conversation is not None else None
         return None
 
-    def update_runtime_params(self, **kwargs):
-        """Forward runtime parameter updates to the agent if available."""
+    def request_config_update(self, config: AgentConfig):
+        """Request a configuration update via the mailbox pattern.
+        
+        The agent will apply the update at the next process_query() boundary,
+        deciding internally whether to hot-swap or restart.
+        """
         if self.agent is not None:
-            self.agent.update_runtime_params(**kwargs)
+            self.agent.request_config_update(config)
+
+    def restart_agent(self, new_config: AgentConfig) -> bool:
+        """
+        Restart the agent with a new configuration while preserving conversation history.
+
+        This pauses the agent, applies the new config via Agent.restart(),
+        and resumes execution. Safe to call from the main/GUI thread.
+
+        Args:
+            new_config: New AgentConfig to apply
+
+        Returns:
+            True if restart was successful, False otherwise
+        """
+        if not self.is_running or self.agent is None:
+            log('DEBUG', 'core.controller', 'Cannot restart agent: not running or no agent')
+            return False
+
+        # Request pause and wait for any in-flight processing to finish
+        self.request_pause()
+
+        import time
+        timeout = 5.0
+        start = time.time()
+        while self._processing_query and time.time() - start < timeout:
+            time.sleep(0.1)
+
+        if self._processing_query:
+            log('ERROR', 'core.controller', 'Timed out waiting for agent to pause for restart')
+            return False
+
+        try:
+            # Apply new config to agent (safe since agent is paused)
+            self.agent.restart(new_config)
+            self._config = new_config
+            log('INFO', 'core.controller', f'Agent restarted with new config: provider={new_config.provider_type}, model={new_config.model}')
+            return True
+        except Exception as e:
+            log('ERROR', 'core.controller', f'Failed to restart agent: {e}')
+            return False
+        finally:
+            self.resume()
 
     def restart_session(self):
         """Restart agent with cleared history."""

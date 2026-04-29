@@ -123,6 +123,32 @@ class LLMClient:
                     break
             raise LLMError(error_type=error_type, message=str(e), original_exception=e)
 
+    def close(self):
+        """Close and release provider resources."""
+        provider = getattr(self, 'provider', None)
+        if provider is not None:
+            if hasattr(provider, 'close'):
+                try:
+                    provider.close()
+                except Exception as e:
+                    log('DEBUG', 'core.llm_client', f'Error closing provider: {e}')
+            elif hasattr(provider, 'aclose'):
+                try:
+                    import asyncio
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            loop.create_task(provider.aclose())
+                        else:
+                            loop.run_until_complete(provider.aclose())
+                    except RuntimeError:
+                        pass
+                    except Exception as e:
+                        log('DEBUG', 'core.llm_client', f'Error closing async provider: {e}')
+                except Exception as e:
+                    log('DEBUG', 'core.llm_client', f'Error closing provider: {e}')
+        self.provider = None
+
     def format_tools(self, tool_definitions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Format tool definitions for the provider.

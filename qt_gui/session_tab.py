@@ -40,11 +40,13 @@ class SessionTab(QWidget):
         self.current_theme = None
         self.last_history = None
         self._cached_config = None
+        self.working_config = {}
         self._display_turn = 0
         self._display_retry_count = 0
         self._last_conversation_version = 0
         self._displayed_message_count = 0
         self._loading_config = False
+        self._saving_config = False
         self._closing = False
         self._auto_save_timer = QTimer(self)
         self._auto_save_timer.setInterval(120000)
@@ -254,6 +256,7 @@ class SessionTab(QWidget):
             filtered_tool_classes = SIMPLIFIED_TOOL_CLASSES
         self.agent_controls_panel = AgentControlsPanel(filtered_tool_classes)
         right_layout.addWidget(self.agent_controls_panel)
+        self.agent_controls_panel.apply_to_agent_requested.connect(self._on_apply_runtime_params)
         self.agent_controls_panel.on_mcp_config_changed = self._refresh_tools
         self.agent_controls_panel.set_workspace_btn.clicked.connect(self.set_workspace)
         self.agent_controls_panel.clear_workspace_btn.clicked.connect(self.clear_workspace)
@@ -604,20 +607,55 @@ class SessionTab(QWidget):
             self.status_panel.update_status('Ready')
 
     def load_config(self):
-        """Load configuration from file and update controls."""
+        """Load configuration from file and update controls.
+
+        Priority:
+        1. session.config (primary per-session storage)
+        2. session.metadata['working_config'] (backward compatibility, deprecated)
+        3. Global config file (StateBridge)
+        """
         self._loading_config = True
         try:
-            config = self.config_bridge.get_config()
+            config = None
+            session = getattr(self.presenter, 'current_session', None)
+
+            # Priority 1: session.config
+            if session is not None and hasattr(session, 'config') and session.config:
+                if isinstance(session.config, dict):
+                    config = session.config
+                else:
+                    try:
+                        config = session.config.model_dump()
+                    except Exception:
+                        config = session.config.__dict__ if hasattr(session.config, '__dict__') else None
+                if config:
+                    log('DEBUG', 'session_tab', f'Using session.config ({len(config)} keys)')
+
+            # Priority 2: session.metadata['working_config'] (deprecated)
+            if config is None and session is not None and 'working_config' in session.metadata:
+                config = session.metadata['working_config']
+                log('DEBUG', 'session_tab', f'Using session.metadata working_config ({len(config)} keys)')
+
+            # Priority 3: Global config
+            if config is None:
+                config = self.config_bridge.get_config()
+                log('DEBUG', 'session_tab', 'Using global config file')
+
+            self.working_config = config.copy()
             self._refresh_tools()
             self.agent_controls_panel.set_config_dict(config)
             self.presenter.update_config(config)
         except Exception as e:
-            pass
+            log('ERROR', 'session_tab', f'load_config error: {e}')
         finally:
             self._loading_config = False
 
     def _on_config_changed(self, config):
-        """Handle configuration changes from bridge (e.g., file changed)."""
+        """Handle configuration changes from bridge (e.g., file changed).
+        Skips reload if this tab itself saved the change (prevents crosstalk).
+        """
+        if self._saving_config:
+            return
         self.load_config()
 
     def save_config(self, immediate=False):
@@ -630,25 +668,90 @@ class SessionTab(QWidget):
         if self._loading_config:
             return
         try:
+            self._saving_config = True
             config = self.agent_controls_panel.get_config_dict()
+            self.working_config = config.copy()
             log('DEBUG', 'debug.unknown', f'save_config: config keys: {list(config.keys())}')
             self.config_bridge.save_config(config, immediate=immediate)
             log('DEBUG', 'debug.unknown', 'save_config: bridge save completed')
         except Exception as e:
             log('ERROR', 'debug.unknown', f'save_config error: {e}')
+        finally:
+            self._saving_config = False
 
     def _update_model_suggestions(self):
         """Update model suggestions based on selected provider."""
         self.agent_controls_panel.update_model_suggestions()
         self._handle_config_change()
 
+    def _on_apply_runtime_params(self, config):
+        """Handle Apply to Agent button press.
+        
+        Builds a full AgentConfig from the config dict and queues it via
+        the mailbox pattern. The agent decides internally whether to
+        hot-swap or restart at the next process_query() boundary.
+        """
+        from agent.config import AgentConfig
+        # Validate the full config
+        try:
+            validated_config = AgentConfig(**config)
+        except Exception as e:
+            QMessageBox.critical(
+                self, 'Invalid Configuration',
+                f'The configuration is invalid and cannot be applied:\n\n{e}'
+            )
+            log('ERROR', 'session_tab', f'Config validation failed: {e}')
+            return
+        
+        # Queue via mailbox pattern — agent decides hot-swap vs restart
+        if self.presenter.controller is not None:
+            self.presenter.controller.request_config_update(validated_config)
+            log('INFO', 'session_tab', f'Configuration update queued: provider={validated_config.provider_type}, model={validated_config.model}')
+
     def _handle_config_change(self):
         """Handle configuration change from UI controls."""
         if self._loading_config:
             return
         config = self.agent_controls_panel.get_config_dict()
+        self.working_config = config.copy()
         self.presenter.update_config(config)
         self._schedule_config_save()
+        # Save config to session metadata for per-session persistence
+        self._save_config_to_session()
+
+    def _save_config_to_session(self):
+        """Save working_config to current session for per-session persistence.
+
+        Uses session.config (a dict or Pydantic model) as the primary storage.
+        Also updates session.metadata['working_config'] for backward compatibility
+        (deprecated — will be removed in a future version).
+        """
+        if not hasattr(self.presenter, 'current_session') or self.presenter.current_session is None:
+            log('DEBUG', 'session_tab', '_save_config_to_session: no current session, skipping')
+            return
+        try:
+            from datetime import datetime
+            session = self.presenter.current_session
+            config_copy = self.working_config.copy()
+            # Primary: save to session.config (dict field)
+            if hasattr(session, 'config'):
+                if isinstance(session.config, dict):
+                    session.config.update(config_copy)
+                else:
+                    # Pydantic model — create or update from dict
+                    try:
+                        from agent.config import AgentConfig
+                        session.config = AgentConfig(**config_copy)
+                    except Exception:
+                        session.config = config_copy
+            else:
+                session.config = config_copy
+            # Backward compatibility (deprecated)
+            session.metadata['working_config'] = config_copy
+            session.updated_at = datetime.now()
+            log('DEBUG', 'session_tab', f'Saved working_config to session.config ({len(config_copy)} keys)')
+        except Exception as e:
+            log('DEBUG', 'session_tab', f'Failed to save config to session: {e}')
 
     def _refresh_tools(self):
         """Refresh the available tools from MCP configuration."""

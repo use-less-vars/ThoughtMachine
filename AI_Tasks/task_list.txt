@@ -4,153 +4,496 @@ Summarization Protocol: Keep the document as single source of truth and when sum
 All provided code snippets are examples, not mandatory code pieces. They serve as hints and are only examplatory in nature
 Remember to write progress reports (there is a tool, just dump what you have there) after a chunk of work is done.
 
- Immediate Tasks for the Agent
+Refinement 3: 
+ What We Need to Audit
+1. The State Machine
 
-I'll give you three self-contained tasks that the agent can execute sequentially. Each is small, testable, and builds toward full integration.
-Task 1: Fix Indexing Process Hanging (Prevent Ghost Daemons)
+The agent has an ExecutionState enum (likely IDLE, THINKING, CALLING_TOOL, etc.). We changed update_runtime_params() and restart() to be callable at any time.
 
-File: agent/knowledge/codebase_indexer.py
+Questions:
 
-What to change:
+    When update_runtime_params() fires while the agent is mid-turn, does the state machine notice? Or does it blindly use the new values halfway through a step?
 
-    In the embed_chunks_batched() function (or wherever the ChromaDB client is created), add explicit cleanup registration.
+    Does the _processing_query flag in the controller actually gate these updates? Or can we update params while a tool is executing?
 
-    Mark any custom threads as daemons.
+    If temperature changes between the initial thought and a tool retry, is that okay or could it cause inconsistent behavior?
 
-Precise instructions for agent:
+2. Token Budget and Context Window
 
-    Add at the top of the file: import atexit, signal, sys
+max_tokens is used to cap the response length. But the agent also has a context window budget (max_context_tokens). Changing max_tokens doesn't change the context window, but the relationship matters.
 
-    Locate the ChromaDB client instantiation (likely chromadb.PersistentClient(...)). Assign it to a variable that persists, e.g., _chroma_client.
+Questions:
 
-    Define a cleanup function:
+    If max_tokens is increased mid-conversation, does the context budget adjust?
 
-python
+    Is there a _get_max_context_tokens() method that depends on model or config? Does restart() recalculate it correctly?
 
-def _cleanup():
-    if '_chroma_client' in globals() and _chroma_client:
-        _chroma_client._system.stop()
-    sys.exit(0)
+    The TokenCounter is reinitialized on restart. Does it reset counts? If so, does that break turn monitoring?
 
-    Register it: atexit.register(_cleanup)
+3. Tool Executor State
 
-    Also set signal handlers for SIGINT and SIGTERM:
+When we toggle tools, we rebuild self.tool_classes and self.tool_executor.
 
-python
+Questions:
 
-signal.signal(signal.SIGINT, lambda sig, frame: _cleanup())
-signal.signal(signal.SIGTERM, lambda sig, frame: _cleanup())
+    Is the tool executor in the middle of a call when we swap it? What happens to in-flight tool executions?
 
-    Ensure any threading.Thread calls have daemon=True.
+    Does the tool executor hold any cached state (e.g., open file handles, Docker containers) that need cleanup before replacement?
 
-Verification: Run indexing and press Ctrl+C midway; check with pgrep -f indexer that no process remains.
+    Are there any queued tool calls that reference the old tool set?
 
-DONE BY AGENT: Added atexit, signal handlers, and global client cleanup to codebase_indexer.py. Cleanup function stops ChromaDB system on exit.
-Task 2: Update SearchCodebaseTool to Use Configurable Lightweight Model and Add Intent Parameter
+4. Conversation History Integrity on Restart
 
-Files: tools/search_codebase.py and agent_config.json
+restart() preserves self.conversation. But the conversation object may contain message objects that reference the old model or tools.
 
-What to change:
+Questions:
 
-    Switch the default embedding model to "BAAI/bge-small-en-v1.5".
+    Does the conversation format include tool definitions that could become stale?
 
-    Add optional parameters intent and restrict_to_path to the tool's argument schema.
+    If the model changes (e.g., GPT-4 to Claude), are there any model-specific fields in the conversation that need migration?
 
-    Pass these to the underlying CodebaseKB.search() method (which may need corresponding updates—delegate that to agent's judgment).
+    Does the LLM client cache anything (auth tokens, connection pools) that needs refreshing?
 
-Precise instructions for agent:
+5. Thread Safety
 
-    Config file (agent_config.json): Change "rag_embedding_model" value to "BAAI/bge-small-en-v1.5".
+The GUI runs in the main thread; the agent may run in a separate thread.
 
-    Tool arguments schema (in tools/search_codebase.py): Update the Pydantic model (SearchCodebaseToolArgs) to include:
+Questions:
+
+    Is update_runtime_params() safe to call from the GUI thread while the agent thread is running?
+
+    Are self.runtime_params and self.tool_classes protected by locks?
+
+    Could a race condition occur where the agent reads temperature halfway through a write?
+
+📋 Investigation Prompt for the Agent
+text
+
+You are to perform a SAFETY AUDIT of the runtime configuration system. Do NOT modify code. Report findings only.
+
+For the following areas, trace the code and answer each question with evidence (file, line numbers, code snippets).
+
+### 1. State Machine Safety
+- What is the state machine definition? (Agent's ExecutionState enum or equivalent)
+- In Agent.update_runtime_params(), is there any check for the current state before modifying parameters?
+- In Controller.update_runtime_params(), is there a gate (e.g., checking _processing_query) before forwarding to the agent?
+- If temperature changes while a tool call is in progress, could that affect retry logic or tool execution?
+
+### 2. Token Budget & Context Window
+- Show _get_max_context_tokens() or equivalent method. Does it depend on model? Does restart() recalculate it?
+- How does TokenCounter work? Does it get reset on restart? If yes, what are the consequences for turn/error monitoring?
+- Is max_tokens used anywhere besides the LLM call? Does changing it mid-turn affect any budget calculations?
+
+### 3. Tool Executor Safety
+- When self.tool_classes and self.tool_executor are replaced in update_runtime_params(), is the old tool executor properly cleaned up? (Look for __del__, close(), or cleanup methods on ToolExecutor.)
+- Is there any in-flight tool execution state that could be orphaned?
+- Does the agent's main loop reference self.tool_executor between tool calls, or is it always fetched fresh?
+
+### 4. Conversation Integrity on Restart
+- Show the Agent.restart() method. Does it keep the same self.conversation object reference?
+- Does the conversation object contain model-specific fields? If so, are they updated on restart?
+- Does the LLM client have any state (connection pool, auth token) that is refreshed when the provider/model changes?
+
+### 5. Thread Safety
+- Is Agent running in a separate thread from the GUI? If so, how is it managed (QThread, threading.Thread)?
+- Are self.runtime_params and self.tool_classes protected by locks or only accessed from the agent's thread?
+- Show Controller.update_runtime_params() — does it use a signal/slot or queue to safely pass data to the agent thread?
+
+### Output Format
+For each question, provide:
+- File path and line numbers
+- Relevant code snippet
+- Concise answer (Yes/No with explanation)
+- Risk assessment: LOW / MEDIUM / HIGH
+
+🎯 What We Do With the Results
+
+Once the agent reports:
+
+    LOW risk items → we accept.
+
+    MEDIUM risk → we add a guard (e.g., state check before modifying params).
+
+    HIGH risk → we redesign that part (e.g., add locks, defer param changes to safe points).
+
+Shall I send this audit prompt to the agent now? I'll hold off until you confirm — this is your core agent logic, and you should be in control.
+
+
+Refinement 2:
+
+Corrective Implementation Prompt for Agent
+
+Apply these changes in order. Show the exact diff for each file modified.
+1. Implement Agent.restart(new_config)
+
+File: agent/core/agent.py
+
+Add a method restart(self, new_config: AgentConfig) -> bool that:
+
+    Re‑initialises the LLM client and provider from new_config (use existing init logic lines 95‑108 as a guide).
+
+    Re‑builds self.tool_classes and self.tool_definitions from new_config.
+
+    Updates self.runtime_params (temperature, max_tokens, top_p).
+
+    Preserves self.conversation (history), self.logger, and self.system_event_logger.
+
+    Updates self.config to the new config.
+
+    Returns True on success, False on error.
+
+2. Update Agent.update_runtime_params() to handle enabled_tools
+
+File: agent/core/agent.py (line 1077‑1096)
+
+    Remove the misleading docstring note about enabled_tools requiring restart.
+
+    Add if 'enabled_tools' in kwargs: block that:
+
+        Rebuilds self.tool_classes using self.config.get_filtered_tool_classes(enabled_tools=kwargs['enabled_tools']).
+
+        Rebuilds self.tool_definitions using model_to_openai_tool.
+
+        Logs the change.
+
+    Also allow rag_enabled to be updated and re‑run filtering (if rag_enabled is passed).
+
+3. Move enabled_tools from restart_keys to hot‑reloadable params
+
+File: qt_gui/session_tab.py _on_apply_runtime_params() (line ~700‑725)
+
+    Remove 'enabled_tools' from the restart_keys set.
+
+    Add enabled_tools to the runtime_params dict that is passed to controller.update_runtime_params().
+
+    Use self.working_config to get the current config for comparison, not self.config_bridge.get_config() (to respect per‑session isolation).
+
+4. Fix global save format to JSON
+
+File: qt_gui/panels/agent_controls.py _on_save_global_default() (lines 535‑554)
+
+    Replace yaml.dump with json.dump(config, f, indent=2).
+
+    Remove the import yaml line.
+
+    Ensure the saved JSON is consistent with existing config files (e.g., indent=2).
+
+5. Save session config to session.config (proper field), not metadata
+
+File: qt_gui/session_tab.py _save_config_to_session() (line 738)
+
+    Instead of session.metadata['working_config'] = ..., update session.config (which is a SessionConfig Pydantic model or dict) directly.
+
+    Use the existing session model's config field. If session.config is a dict, update it; if it's a Pydantic model, create a new one from the working config.
+
+    Keep backward compatibility: also update session.metadata['working_config'] for now if the code elsewhere depends on it, but mark it deprecated with a comment.
+
+    In load_config() (line 609), prefer loading from session.config if available, falling back to metadata and then global config.
+
+6. (Optional but recommended) Migrate AgentConfig to Pydantic v2 style
+
+File: agent/config/models.py (line 86)
+
+    Replace class Config: extra = 'ignore' with model_config = ConfigDict(extra='ignore') (import ConfigDict from pydantic).
+
+    Update any Config references if needed (check for other Pydantic v1 styles).
+
+7. Remove unused imports and dead code
+
+    After the above changes, check if GUIConfigBridge and create_agent_config_service are still needed. If not, remove imports in session_tab.py.
+
+    If ConfigService is now entirely unused, delete the class and its file (only if no references remain).
+
+8. Test Criteria
+
+After applying, manually verify (simulate if no GUI):
+
+    Agent.restart() works, conversation preserved.
+
+    Toggling tool checkbox and clicking “Apply to Agent” updates tools without restart.
+
+    Global save produces valid JSON that can be loaded back.
+
+    Two sessions have independent configs; changing one doesn't affect the other.
+
+Please implement these fixes, showing the diff for each modified file. Start with the critical fix: Agent.restart() implementation.
+
+refinement 1: 
+ Follow-Up Prompt for Agent: Missing Configuration Fixes
+
+The previous changes addressed some structural issues but left important functionality incomplete. Complete the following tasks based on the existing codebase after the recent modifications.
+1. Runtime Tool Toggling (enabled_tools)
+
+Currently Agent.update_runtime_params() only updates temperature, max_tokens, top_p. It needs to support enabled_tools so that toggling tool checkboxes in the GUI takes effect immediately on the running agent.
+
+    File: agent/core/agent.py
+
+    In update_runtime_params():
+
+        Add handling for enabled_tools. If provided, call self.config.get_filtered_tool_classes(enabled_tools=...) to rebuild self.tool_classes.
+
+        Update self.tool_definitions accordingly (using model_to_openai_tool).
+
+        Log the change.
+
+    Ensure get_filtered_tool_classes() correctly respects rag_enabled and the new list.
+
+    In _on_apply_runtime_params() (session_tab.py):
+
+        If enabled_tools has changed, include it when calling controller.update_runtime_params().
+
+2. Full Agent Restart on “Apply” for Restart-Requiring Changes
+
+The current button only shows a message box. We need actual restart with the new config while preserving conversation history.
+
+    File: agent/core/agent.py
+
+        Verify or implement a restart(self, new_config: AgentConfig) method that reinitializes provider, LLM client, tools, and runtime params, but keeps self.conversation intact.
+
+        This method already partially exists? (line 407‑409 check). If it just validates type, extend it.
+
+    File: agent/controller/__init__.py
+
+        Add a method restart_agent(self, config: AgentConfig) that calls self.agent.restart(config) and updates any controller state.
+
+    File: qt_gui/session_tab.py in _on_apply_runtime_params()
+
+        After detecting restart‑required changes, use presenter.state_bridge.create_agent_config() to build a new AgentConfig from self.working_config.
+
+        Call controller.restart_agent(new_config) instead of just prompting.
+
+        Show a confirmation dialog before restarting.
+
+3. Pydantic Validation Before Applying
+
+All changes applied to the agent must first be validated against AgentConfig.
+
+    In _on_apply_runtime_params():
+
+        Before applying, do AgentConfig.model_validate(self.working_config).
+
+        If validation fails, display an error message with details and abort.
+
+    In StateBridge (or wherever global save happens):
+
+        When saving global config, also validate with AgentConfig and log/alert on errors.
+
+4. True Session Isolation – No Shared Global Bridge for Per‑Tab Config
+
+The current working_config is initialized by copying from self.config_bridge. This still relies on a global ConfigBridge that may be shared across tabs. Remove that dependency.
+
+    In SessionTab.__init__:
+
+        Instead of self.config_bridge = GUIConfigBridge(create_agent_config_service()), create a StateBridge instance per tab? Or simpler: load the session‑specific config directly from the session file.
+
+        Use self.working_config = self._load_session_config(session_id) where _load_session_config reads the session JSON and extracts the config field (or returns the global default for a new session).
+
+    Global config should only be used to get defaults for new sessions and as a base when the user explicitly saves “as global default”.
+
+    Remove the _saving_config flag workaround; instead, ensure each tab’s config is completely independent.
+
+5. Save Per‑Session Config to Session File, Not Global Config
+
+The agent must persist the working config into the session’s own JSON file.
+
+    In _schedule_config_save() (SessionTab):
+
+        Write self.working_config into ~/.thoughtmachine/sessions/{session_id}.json under the config key.
+
+        Use the existing session store (FileSystemSessionStore). For an active session, update its Session.config and call store.save(session).
+
+    When a session is loaded later, SessionTab should initialize working_config from that saved config.
+
+6. “Save as Global Default” Button
+
+Provide an explicit way to persist the current session’s config as the new global default.
+
+    Add a button (e.g., “Set as Default”) in agent_controls.py.
+
+    On click:
+
+        Copy working_config to the global config file (~/.thoughtmachine/config.json) using the existing save path.
+
+        Show a confirmation message.
+
+        This replaces the previous automatic global save on every change.
+
+    Remove the old auto‑save timer for global config (or repurpose it to only save session configs periodically).
+
+7. Clean Up Dead Code Completely
+
+    Remove ConfigBridge if it’s no longer used. Update any remaining references (e.g., in SessionTab) to use the new direct session‑config loading.
+
+    Remove _SCHEMA dictionary and any remaining validation boilerplate in ConfigService that was missed earlier.
+
+    Reduce auto‑save interval for session configs to 10 seconds (if still using a timer), or rely on explicit save on changes.
+
+8. Final Testing Instructions
+
+After all changes, verify:
+
+    Two open sessions have independent configs; changing workspace in one does not affect the other.
+
+    Temperature slider moves, “Apply to Agent” updates agent mid‑conversation.
+
+    Tool checkbox toggles take effect on the next agent turn without restart.
+
+    Changing model and clicking “Apply” restarts the agent with the new model and retains conversation history.
+
+    Old config files with unknown keys load without errors (Pydantic extra='ignore').
+
+    Saving “Set as Default” updates the global config and is used as base for new sessions.
+
+Please implement these tasks and report the changes with file paths and line numbers.
+
+ 🛠️ Implementation Prompt for Agent
+📌 Context Summary
+
+    Current config pipeline: GUI → StateBridge (global dict) → disk.
+
+    Agent creation snapshots that dict at session start.
+
+    Runtime changes (temperature, tools) never reach the running agent.
+
+    All sessions share the same global config UI state → crosstalk.
+
+🎯 Goals for This Implementation
+
+    Eliminate session crosstalk – each session tab maintains its own working config.
+
+    Enable runtime updates – temperature, max_tokens, top_p, and tool toggling apply to the running agent without restart.
+
+    Provide “Apply” button for changes that need agent reinitialization (model, provider, API key, base URL, workspace).
+
+    Keep global defaults safe – user can explicitly save a session config as the new global default.
+
+    No dead code – remove unused ConfigService pieces where possible.
+
+🔨 Task 1: Session‑scoped Working Config (Fix Crosstalk)
+1.1 Give SessionTab its own config dict
+
+    File: qt_gui/session_tab.py
+
+    Change: Add self.working_config: dict attribute to SessionTab.__init__.
+
+    Initial value: Deep copy of the global config returned by self.config_bridge.get_full_config() (or directly from StateBridge.load_config() if that's simpler).
+
+    On new session: When new_session() is called, working_config is re‑initialized from the current global config.
+
+1.2 Config changes only affect this session
+
+    File: qt_gui/session_tab.py – in _handle_config_change()
+
+    After getting the dict from get_config_dict(), update self.working_config (using the same loader.update_config() merge) instead of pushing directly to the global StateBridge.
+
+    When the user clicks a new “Apply to Session” button (see Task 3), propagate the changes to the agent/presenter.
+
+    Persist this working config to the session file (~/.thoughtmachine/sessions/{id}.json), not the global config file. Call presenter.update_session_config(working_config) or similar.
+
+    Add a “Save as Global Default” button in the settings panel (optionally, for later) – for now, keep the existing global save mechanism but make it save the current working config as the new global default when explicitly triggered.
+
+1.3 Load session config on session open
+
+    File: agent/presenter/state_bridge.py (or session lifecycle)
+
+    Ensure that when a session is loaded from disk, its saved config becomes the session’s working config (not merged into the global dict).
+
+    The existing Session.config field already holds a snapshot; we just need to use it to initialise SessionTab.working_config.
+
+🔧 Task 2: Implement Runtime Parameter & Tool Updates
+2.1 Agent.update_runtime_params()
+
+    File: agent/core/agent.py (lines 1085‑1087)
+
+    Replace the stub with real logic:
     python
 
-    intent: Optional[Literal["exact", "broad", "file"]] = "broad"
-    restrict_to_path: Optional[str] = None
+    def update_runtime_params(self, **kwargs):
+        # Update RuntimeParams
+        for k in ['temperature', 'max_tokens', 'top_p']:
+            if k in kwargs:
+                setattr(self.runtime_params, k, kwargs[k])
+        # If enabled_tools is provided, rebuild tool classes & definitions
+        if 'enabled_tools' in kwargs:
+            self.tool_classes = self.config.get_filtered_tool_classes(
+                enabled_tools=kwargs['enabled_tools']
+            )
+            self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
+            # Notify tool executor if it caches tools – likely not, but check.
 
-    Tool run method: In SearchCodebaseTool.run(), map intent to appropriate limit and min_score:
+    Note: get_filtered_tool_classes() already handles the rag_enabled logic. Ensure it re‑evaluates correctly.
 
-        "exact": limit=3, min_score=0.5
+2.2 AgentController.update_runtime_params()
 
-        "broad": limit=10, min_score=0.0
+    File: agent/controller/__init__.py (line 190‑194)
 
-        "file": Use existing logic to aggregate chunks from a file (or simply return file paths).
+    Verify it forwards to self.agent.update_runtime_params(**kwargs). It already does, but confirm.
 
-    Filtering by restrict_to_path: If provided, add a metadata filter to the ChromaDB query. The exact syntax depends on CodebaseKB.search() implementation; if it doesn't support filters yet, add a where parameter to that method.
+2.3 Presenter → Controller wiring
 
-Verification: In the REPL, call search_codebase with intent="exact" and confirm it returns fewer, higher-confidence results.
-Task 3: Make Chunk Size and Model Choice Configurable via agent_config.json
+    File: agent/presenter/agent_presenter.py
 
-File: agent/config/models.py and agent_config.json
+    In the method that receives runtime‑only changes (e.g., temperature slider), call self.controller.update_runtime_params(...) with the appropriate kwargs.
 
-What to change:
+    Only for fields classified as hot‑reloadable (Task 3). Others go through the Apply button.
 
-    Add two new fields to AgentConfig:
-    python
+🎛️ Task 3: “Apply to Agent” Button (Restart‑Required Changes)
+3.1 Add UI button
 
-    rag_batch_size: int = Field(default=16, description="Batch size for embedding generation")
-    rag_truncate_dim: Optional[int] = Field(default=None, description="Truncate embeddings to this dimension")
+    File: qt_gui/panels/agent_controls.py (or session_tab.py)
 
-    Update agent_config.json with default values.
+    Add a QPushButton labelled “Apply to Agent”.
 
-    Modify codebase_indexer.py to read these values from the config and pass them to embed_chunks_batched().
+    It should be enabled only when:
 
-Verification: After changes, indexing should respect the new batch size and truncation dimension from the config file.
+        A session is active, and
 
+        The working config differs from the config currently used by the agent (track a hash or timestamp).
 
-The next step is to avoid re-indexing the entire codebase every time. This will make the system feel snappy and usable during development.
+    On click:
 
-Task 4: Create an Incremental Re-indexing Tool
+        Validate the working_config against AgentConfig (Pydantic). If invalid, show error dialog.
 
-Goal: Add a new CLI command (or tool) that updates the vector store only for files that have changed since the last index.
+        If the changed fields are only hot‑reloadable, call controller.update_runtime_params() directly.
 
-Precise instructions for the agent:
+        If they contain any restart‑required field (list below), call controller.restart_agent(new_config).
 
-    Add a new CLI command in agent/cli/rag_commands.py:
+3.2 Classification of fields
+Hot‑reloadable (immediate)	Needs agent restart
+temperature	provider_type
+max_tokens	api_key
+top_p	base_url
+tool_output_limit	model
+detail	workspace_path
+token_monitor_*	
+turn_monitor_*	
+max_turns	
+enabled_tools	
+rag_enabled	
 
-        Command name: update-index
+(You can move max_turns to hot‑reloadable if the agent reads it dynamically.)
+3.3 Agent restart with new config
 
-        Should call a new function in codebase_indexer.py, e.g., incremental_index(workspace_path, config)
+    File: agent/core/agent.py – restart(new_config: AgentConfig) method already exists? (Line 407‑409 validates type). If not, add a method that re‑initialises internal state from the new config.
 
-    In codebase_indexer.py, implement incremental_index():
+    Controller: In controller.restart_agent(), stop current turn (if any), create new agent instance or call agent.restart(config), and preserve conversation history if possible.
 
-        Maintain a metadata file (e.g., chroma_data/.index_state.json) that stores for each file: file_path, last_modified timestamp, and a file_hash (optional).
+🧹 Task 4: Clean Up Dead Code (Optional, Do After Above)
+4.1 Remove _SCHEMA validation
 
-        During incremental indexing:
+    File: agent/config/service.py
 
-            Scan workspace for all code files (using same extensions filter).
+    Delete the _SCHEMA dict and any methods that reference it (_validate_against_schema). Ensure no caller uses them.
 
-            Compare current last_modified with stored value.
+4.2 Remove ConfigBridge if truly unused
 
-            For new or modified files: chunk, embed, and upsert into ChromaDB (overwriting any existing chunks for that file).
+    File: qt_gui/config/config_bridge.py
 
-            For deleted files: remove their chunks from ChromaDB using a metadata filter on file_path.
+    If only instantiated but never called, remove it. Update SessionTab to call StateBridge directly.
 
-        Update the state file after completion.
+4.3 Adjust auto‑save interval
 
-    Modify full index command to also write the initial state file.
+    File: qt_gui/session_tab.py line 50
 
-    Expose as an optional agent tool? Later, but for now just the CLI is fine. The agent can call the CLI via subprocess when needed.
+    Change self._auto_save_timer.setInterval(120000) to 10000 (10 seconds) for global config saves (when user explicitly saves global defaults).
 
-Why this matters: It turns a 2-minute full index into a 5-second update after editing a few files.
-📋 Task 5 (Optional but Recommended): Staleness Detection in Agent Startup
-
-Once incremental indexing exists, the agent can be made aware of codebase changes.
-
-Instructions for agent:
-
-    In agent/core/agent.py (or wherever initialization happens), after loading the CodebaseKB, compare the stored index hash with the current workspace hash.
-
-    If different, add a system message to the agent's initial prompt: "The codebase has changed since the last index. You may want to suggest running update-index for accurate search results."
-
-    The agent can then, when appropriate, inform the user or call the update tool itself.
-
-✅ Summary for the Agent's Next Sprint
-
-    Task 4: Incremental re-indexing – Implement update-index CLI command and incremental_index() function.
-
-    Task 5: Staleness awareness – Add hash check at startup with a system message.
-
-    Task 6 (later): GUI integration – Add a button and notification area.
-
-Each task is self-contained and builds on the previous work.

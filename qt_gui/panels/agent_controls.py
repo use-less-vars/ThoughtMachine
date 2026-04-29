@@ -2,7 +2,7 @@
 import os
 import yaml
 from PyQt6.QtWidgets import QGroupBox, QVBoxLayout, QHBoxLayout, QGridLayout, QWidget, QLabel, QPushButton, QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox, QScrollArea, QStyle, QSizePolicy
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from .mcp_config import MCPConfigDialog
 from .markdown_renderer import MarkdownRenderer
 from ..utils.constants import MAX_RESULT_LENGTH
@@ -10,6 +10,8 @@ from agent.logging import log
 
 class AgentControlsPanel(QGroupBox):
     """Collapsible panel for agent controls."""
+
+    apply_to_agent_requested = pyqtSignal(object)
 
     def __init__(self, tool_classes, config_file=None):
         super().__init__('Agent Controls')
@@ -244,6 +246,21 @@ class AgentControlsPanel(QGroupBox):
         self.right_column.addStretch()
         self.main_layout.addWidget(self.controls_container)
         self.controls_container.setVisible(False)
+        apply_row = QWidget()
+        apply_layout = QHBoxLayout()
+        apply_row.setLayout(apply_layout)
+        self.apply_btn = QPushButton('Apply to Agent')
+        self.apply_btn.setToolTip('Apply runtime changes (temperature, max_tokens, top_p) without restarting the agent.')
+        self.apply_btn.setMaximumWidth(150)
+        self.apply_btn.clicked.connect(self._on_apply_to_agent)
+        apply_layout.addWidget(self.apply_btn)
+        self.save_global_btn = QPushButton('Save as Global Default')
+        self.save_global_btn.setToolTip('Save current configuration as the global default config file.')
+        self.save_global_btn.setMaximumWidth(180)
+        self.save_global_btn.clicked.connect(self._on_save_global_default)
+        apply_layout.addWidget(self.save_global_btn)
+        apply_layout.addStretch()
+        self.main_layout.addWidget(apply_row)
         self._warning_threshold_timer = QTimer()
         self._warning_threshold_timer.setSingleShot(True)
         self._warning_threshold_timer.timeout.connect(self._adjust_warning_threshold)
@@ -509,6 +526,34 @@ class AgentControlsPanel(QGroupBox):
             self.model_combo.setCurrentText(current_model)
         else:
             self.model_combo.setCurrentIndex(0)
+
+    def _on_apply_to_agent(self):
+        """Emit signal with current config when Apply to Agent is clicked."""
+        config = self.get_config_dict()
+        self.apply_to_agent_requested.emit(config)
+
+    def _on_save_global_default(self):
+        """Save current config as global default (user config file)."""
+        config = self.get_config_dict()
+        from PyQt6.QtWidgets import QMessageBox
+        from agent.config import get_config_paths
+        import json
+        paths = get_config_paths()
+        user_config_path = paths.get('user_config')
+        if not user_config_path:
+            QMessageBox.warning(self, 'Error', 'Could not determine user config path.')
+            return
+        if not str(user_config_path).endswith('.json'):
+            user_config_path = str(user_config_path) + '.json'
+        try:
+            with open(user_config_path, 'w') as f:
+                json.dump(config, f, indent=2)
+            QMessageBox.information(
+                self, 'Saved',
+                f'Configuration saved as global default to:\n{user_config_path}'
+            )
+        except Exception as e:
+            QMessageBox.critical(self, 'Save Error', f'Failed to save config:\n{e}')
 
     def get_config_dict(self):
         """Return a dictionary of current control values suitable for JSON serialization."""
