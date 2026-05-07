@@ -203,14 +203,9 @@ try:
 except ImportError as e:
     logger.warning(f"Failed to import Thought: {e}")
 
-try:
-    from .mcp_manager import register_mcp_tools
-    register_mcp_tools()
-    logger.info("MCP tools registered successfully")
-except ImportError as e:
-    logger.debug(f"MCP tools not available: {e}")
-except Exception as e:
-    logger.warning(f"Failed to register MCP tools: {e}")
+# MCP tools are registered lazily via register_mcp_tools() when the agent starts.
+# Do NOT call register_mcp_tools() here - it starts MCP server subprocesses
+# which can hang if servers are unavailable (see bug #BUG001).
 
 # Initialize SIMPLIFIED_TOOL_CLASSES
 _update_simplified_toolset()

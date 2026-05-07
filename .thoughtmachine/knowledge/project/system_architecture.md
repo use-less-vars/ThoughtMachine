@@ -459,3 +459,122 @@ In `AgentConfig` and `agent_config.json`:
 - Phase 5: Integration testing and regression checks
 
 **Status:** Plan received, awaiting implementation go-ahead.
+
+## 2026-05-06 — ## Phase 1: State Simplification Complete
+
+The ExecutionStat...
+
+## Phase 1: State Simplification Complete
+
+The ExecutionState enum has been simplified to just 3 values: RUNNING, PAUSING, READY.
+
+**Files modified across codebase:**
+
+1. **agent/core/state.py** — ExecutionState enum reduced, AgentState default READY
+2. **agent/core/agent.py** — process_query() simplified, all terminal state transitions removed, stop_reason added
+3. **agent/controller/__init__.py** — Event loop simplified, synthetic paused events removed
+4. **agent/presenter/event_processor.py** — All PAUSED/WAITING_FOR_USER → READY
+5. **agent/presenter/session_lifecycle.py** — Default IDLE→READY, guard conditions updated
+6. **agent/presenter/agent_presenter.py** — on_user_input checks for READY, differentiates via current_session
+7. **agent/presenter/gui_integration.py** — Default IDLE→READY
+8. **qt_gui/session_tab.py** — on_state_changed, run_agent, update_buttons all updated for READY-only model
+
+**Key design decisions:**
+- READY is the universal non-running state (replaces IDLE, PAUSED, WAITING_FOR_USER, FINALIZED, STOPPED, MAX_TURNS_REACHED)
+- When user provides input in READY state: checks self.presenter.current_session to decide start vs continue
+- PAUSING and STOPPING retained as transitional states for UI feedback
+
+## 2026-05-06 — ## Turn Limit Simplification Complete (2026-05-06)
+
+### Chan...
+
+## Turn Limit Simplification Complete (2026-05-06)
+
+### Changes Made
+1. **agent/core/state.py**: Simplified `TurnState` enum to only `LOW`/`WARNING` (removed `CRITICAL`). `update_turn_state()` uses fixed `max_turns - 3` warning threshold with immediate `restrictions_active = True`. `get_allowed_tools()` returns only `['Final', 'FinalReport']` when restricted.
+
+2. **agent/config/models.py**: Removed `turn_monitor_warning_threshold` and `turn_monitor_critical_threshold` from FIELD_CATEGORIES and field declarations.
+
+3. **agent/core/agent.py**: Removed turn threshold fields from `config_data` dict in preset creation.
+
+4. **agent/presenter/state_bridge.py**: Removed threshold entries from `direct_mappings`.
+
+5. **qt_gui/panels/agent_controls.py**: Removed turn_monitor_row widget, turn timers, all turn-related signal connections and methods.
+
+6. **qt_gui/session_tab.py**: Removed signal connections for removed turn monitor controls.
+
+7. **agent/core/tool_executor.py**: Updated rejection message to remove SummarizeTool references (only Final/FinalReport available).
+
+8. **agent_config.json**: Removed stale `turn_monitor_warning_threshold` and `turn_monitor_critical_threshold` fields.
+
+### Verification
+- Zero references to removed fields or `TurnState.CRITICAL` remain in agent/*.py or qt_gui/*.py.
+- Config file cleaned of stale fields (safe via `extra='ignore'` but removed for cleanliness).
+
+## 2026-05-07 — Phase 5: Token Counting & Output Truncation Audit completed
+
+## Phase 5 Audit Results — Token Counting & Output Truncation
+
+### Token Counting Architecture
+
+**Three token counters exist, each serving different purposes:**
+
+1. `self.state.current_conversation_tokens` — Running estimate of conversation tokens
+   - Updated by: user message estimates (tiktoken), LLM response.usage.prompt_tokens (ground truth), tool result estimates (`len(str(result)) // 4`), system notification estimates
+   - Overwritten each turn by `response.usage.prompt_tokens` (line 827)
+   
+2. `self.total_input_tokens` / `self.total_output_tokens` — Running totals (persistent across turns)
+   - Property-backed: reads from session.total_input_tokens / _token_counts dict
+   - Accumulated each turn: `self.total_input_tokens += input_tokens`
+   
+3. `token_counter.estimate_tokens()` / `estimate_request_tokens()` — Pure estimation using tiktoken
+   - Used for: warning threshold checks, context calculation
+
+### Key Findings
+
+**A. LLM response.usage.prompt_tokens as ground truth (line 827)**
+- `self.state.current_conversation_tokens = input_tokens` overwrites with actual API-counted tokens
+- This is the correct approach — resets accumulated estimate drift each turn
+- After overwrite, tool results and system notifications are added on top (estimates)
+
+**B. Tool result token estimation**
+- Uses `len(str(tool_result)) // 4` in tool_executor.py (lines 90, 133)
+- This is a rough character-based estimate (~4 chars per token), not tiktoken
+- Results in ~4x overestimation compared to tiktoken for typical results
+- Called via `update_token_func` → resolves to `agent._update_tokens_after_tool`
+
+**C. Warning injection in `_update_tokens_after_tool` (lines 549-573)**
+- After adding tool_tokens, calls `state.update_token_state()` which may return warning events
+- Warning messages are injected as [SYSTEM NOTIFICATION] and their token estimates are also tracked
+- Works correctly but there's a minor style issue: no blank line before @property on line 574
+
+**D. Consistency analysis — three counters compared**
+| Counter | Source | Consistency |
+|---------|--------|-------------|
+| `current_conversation_tokens` | Mix of API ground truth + estimates | Moderate — resets to truth each turn, drifts between turns |
+| `total_input_tokens` | Accumulated from API `prompt_tokens` | High — pure accumulation from API |
+| `token_counter.estimate_tokens()` | Pure tiktoken estimation | High (deterministic) |
+
+**E. Output truncation handling**
+- ContextBuilder's `_truncate_to_max_tokens()` handles input context truncation (two modes)
+- No explicit handling for LLM response exceeding context_window (the API enforces this via max_tokens param)
+- `_get_max_context_tokens()` reserves room for response via `SAFETY_MARGIN` + `max_tokens`/`DEFAULT_RESPONSE_TOKENS`
+
+**F. Flow per turn:**
+1. User message: estimate → add to current_conversation_tokens
+2. Turn warnings: estimate → add to current_conversation_tokens
+3. `_update_conversation_token_estimate()` (line 520) — full re-estimate using context_builder
+4. Token state: `state.update_token_state(current_conversation_tokens)` → inject warnings if needed
+5. Context built: `context_builder.build(conversation, max_tokens=max_context_tokens)`
+6. LLM call: `response = llm_client.chat_completion(messages)`
+7. **Reset**: `current_conversation_tokens = response.usage.prompt_tokens` (ground truth)
+8. Tool execution: each tool result adds `len(str(result)) // 4` via `_update_tokens_after_tool`
+9. Summary pruning: full re-estimate via `_update_conversation_token_estimate()`
+
+### Issues Found
+
+1. **Tool token estimation is rough**: `len(str(result)) // 4` is a crude estimate that overcounts. No tiktoken fallback for tool results.
+2. **Missing blank line before `@property`** in `_update_tokens_after_tool` (line 574). Not a bug but violates PEP 8.
+3. **`_update_tokens_and_yield` removed**: Old code had a generator version that did full re-estimate after each tool. Current code uses `_update_tokens_after_tool` which only does a rough addition. The old version was more accurate but also more expensive.
+4. **No mechanism to handle `TokenLimitExceededError`**: If the LLM response exceeds the context window, the error is caught as `ProviderError` in the provider layer, but there's no retry or context-trimming logic.
+

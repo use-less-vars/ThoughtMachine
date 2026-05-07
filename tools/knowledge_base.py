@@ -571,28 +571,28 @@ class KnowledgeBaseTool(ToolBase):
             self._log_tool_error(f"Error reading {file_path} for update: {e}")
             return f"Error reading '{rel_path}': {e}"
 
-        # Locate the section header: "## <section>" or "## <section>\n"
-        section_header = f"## {self.section}"
+        # Normalize section name: strip leading '#' and whitespace
+        clean_section = self.section.lstrip('#').strip()
+
+        # Locate the section header: "## <section>"
+        section_header = f"## {clean_section}"
         section_start = content.find(section_header)
 
         if section_start == -1:
             # Section not found — append it at the end
             updated_content = content.rstrip() + f"\n\n{section_header}\n{self.new_content}\n"
-            self._log_debug(f"Section '{self.section}' not found, appending to end of {rel_path}")
+            self._log_debug(f"Section '{clean_section}' not found, appending to end of {rel_path}")
             found = False
         else:
-            # Section found — replace everything after it until next "## " or EOF
-            # Find the start of content after the header line
-            after_header = content.index("\n", section_start) + 1
-
-            # Find the next "## " header (if any)
-            next_section = content.find("\n## ", after_header)
+            # Section found — delete from header to next "## " or EOF, then insert new header + content
+            # Find the next "## " header after the current one
+            next_section = content.find("\n## ", section_start + len(section_header))
             if next_section == -1:
-                # No next section, replace until EOF
-                updated_content = content[:after_header] + self.new_content + "\n"
+                # No next section, delete until EOF
+                updated_content = content[:section_start] + f"{section_header}\n{self.new_content}\n"
             else:
-                # Replace until next section
-                updated_content = content[:after_header] + self.new_content + content[next_section:]
+                # Delete until next section
+                updated_content = content[:section_start] + f"{section_header}\n{self.new_content}\n" + content[next_section:]
             found = True
 
         try:

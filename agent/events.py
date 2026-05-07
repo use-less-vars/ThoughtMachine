@@ -46,6 +46,7 @@ class EventType(enum.Enum):
     PAUSED = 'paused'
     STOPPED = 'stopped'
     THREAD_FINISHED = 'thread_finished'
+    SESSION_STOP = 'session_stop'
     ERROR = 'error'
     FILE_ACCESS = 'file_access'
     SECURITY_VIOLATION = 'security_violation'

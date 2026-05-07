@@ -341,8 +341,33 @@ class CodeModifier(ToolBase):
         def parse_body_to_statements(body_str: str) -> list[cst.BaseStatement]:
             if not body_str.strip():
                 return []
-            # Remove common leading whitespace
-            dedented = textwrap.dedent(body_str)
+            # Normalize line endings
+            body_str = body_str.replace('\r\n', '\n').replace('\r', '\n')
+            lines = body_str.split('\n')
+            # Find minimum indentation across non-empty lines
+            non_empty = [(i, l) for i, l in enumerate(lines) if l.strip()]
+            if non_empty:
+                indents = [len(l) - len(l.lstrip()) for _, l in non_empty]
+                unique_indents = sorted(set(indents))
+                # If minimum is 0 but other lines have indent, use second smallest
+                if len(unique_indents) > 1 and unique_indents[0] == 0:
+                    min_indent = unique_indents[1]
+                else:
+                    min_indent = unique_indents[0]
+                # Dedent each line by min_indent, but don't go negative
+                dedented_lines = []
+                for line in lines:
+                    if line.strip():
+                        actual_indent = len(line) - len(line.lstrip())
+                        if actual_indent >= min_indent:
+                            dedented_lines.append(line[min_indent:])
+                        else:
+                            dedented_lines.append(line)
+                    else:
+                        dedented_lines.append(line)
+                dedented = '\n'.join(dedented_lines)
+            else:
+                dedented = body_str
             # Ensure at least one newline at end
             if dedented and not dedented.endswith('\n'):
                 dedented += '\n'
@@ -515,8 +540,33 @@ class CodeModifier(ToolBase):
         def parse_body_to_statements(body_str: str) -> list[cst.BaseStatement]:
             if not body_str.strip():
                 return []
-            # Remove common leading whitespace
-            dedented = textwrap.dedent(body_str)
+            # Normalize line endings
+            body_str = body_str.replace('\r\n', '\n').replace('\r', '\n')
+            lines = body_str.split('\n')
+            # Find minimum indentation across non-empty lines
+            non_empty = [(i, l) for i, l in enumerate(lines) if l.strip()]
+            if non_empty:
+                indents = [len(l) - len(l.lstrip()) for _, l in non_empty]
+                unique_indents = sorted(set(indents))
+                # If minimum is 0 but other lines have indent, use second smallest
+                if len(unique_indents) > 1 and unique_indents[0] == 0:
+                    min_indent = unique_indents[1]
+                else:
+                    min_indent = unique_indents[0]
+                # Dedent each line by min_indent, but don't go negative
+                dedented_lines = []
+                for line in lines:
+                    if line.strip():
+                        actual_indent = len(line) - len(line.lstrip())
+                        if actual_indent >= min_indent:
+                            dedented_lines.append(line[min_indent:])
+                        else:
+                            dedented_lines.append(line)
+                    else:
+                        dedented_lines.append(line)
+                dedented = '\n'.join(dedented_lines)
+            else:
+                dedented = body_str
             # Ensure at least one newline at end
             if dedented and not dedented.endswith('\n'):
                 dedented += '\n'
@@ -730,13 +780,12 @@ class CodeModifier(ToolBase):
             import_node = cst.ImportFrom(
                 module=module_expr,
                 names=names,
-                relative=0
             )
         else:
             # import module [as alias]
             alias_node = cst.ImportAlias(
                 name=cst.Name(self.import_module),
-                asname=cst.Name(self.import_alias) if self.import_alias else None
+                asname=cst.AsName(name=cst.Name(self.import_alias)) if self.import_alias else None
             )
             import_node = cst.Import(names=[alias_node])
         
@@ -781,8 +830,33 @@ class CodeModifier(ToolBase):
         def parse_body_to_statements(body_str: str) -> list[cst.BaseStatement]:
             if not body_str.strip():
                 return []
-            # Remove common leading whitespace
-            dedented = textwrap.dedent(body_str)
+            # Normalize line endings
+            body_str = body_str.replace('\r\n', '\n').replace('\r', '\n')
+            lines = body_str.split('\n')
+            # Find minimum indentation across non-empty lines
+            non_empty = [(i, l) for i, l in enumerate(lines) if l.strip()]
+            if non_empty:
+                indents = [len(l) - len(l.lstrip()) for _, l in non_empty]
+                unique_indents = sorted(set(indents))
+                # If minimum is 0 but other lines have indent, use second smallest
+                if len(unique_indents) > 1 and unique_indents[0] == 0:
+                    min_indent = unique_indents[1]
+                else:
+                    min_indent = unique_indents[0]
+                # Dedent each line by min_indent, but don't go negative
+                dedented_lines = []
+                for line in lines:
+                    if line.strip():
+                        actual_indent = len(line) - len(line.lstrip())
+                        if actual_indent >= min_indent:
+                            dedented_lines.append(line[min_indent:])
+                        else:
+                            dedented_lines.append(line)
+                    else:
+                        dedented_lines.append(line)
+                dedented = '\n'.join(dedented_lines)
+            else:
+                dedented = body_str
             # Ensure at least one newline at end
             if dedented and not dedented.endswith('\n'):
                 dedented += '\n'

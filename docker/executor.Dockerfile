@@ -1,7 +1,8 @@
 FROM python:3.11-slim
 
-# Install pydantic system-wide (into rootfs which has exec permissions)
-RUN pip install --no-cache-dir pydantic
+# Install git and pydantic system-wide
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir pydantic libcst pytest
 
 # Disable user site-packages (writable dirs have noexec, preventing .so loading)
 ENV PYTHONNOUSERSITE=1

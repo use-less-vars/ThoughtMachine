@@ -33,7 +33,7 @@ class GUIIntegration(QObject):
 
     def __init__(self):
         super().__init__()
-        self._state = ExecutionState.IDLE
+        self._state = ExecutionState.READY
 
     @property
     def state(self) -> ExecutionState:

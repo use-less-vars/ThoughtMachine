@@ -200,6 +200,6 @@ class ToolExecutor:
         """Create rejection message for disallowed tool calls."""
         allowed_tools = self.state.get_allowed_tools()
         if allowed_tools:
-            return f"❌ TOOL CALL REJECTED ❌\n\nYou attempted to use '{tool_name}', which is currently FORBIDDEN.\n\nCurrent state: restrictions_active (limit exceeded)\nREQUIRED ACTION: SummarizeTool\nWhy: Token or turn limits exceeded - conversation must be pruned before continuing.\n\nYou may call:\n- SummarizeTool (to prune and continue)\n- Final (to end conversation)\n- FinalReport (to end with report)\n\nCall SummarizeTool NOW to proceed."
+            return f"❌ TOOL CALL REJECTED ❌\n\nYou attempted to use '{tool_name}', which is currently FORBIDDEN.\n\nCurrent state: restrictions_active (limit exceeded)\nWhy: Token or turn limits exceeded.\n\nYou may call:\n- Final (to end conversation)\n- FinalReport (to end with report)\n\nPlease use Final or FinalReport now."
         else:
             return f"❌ TOOL CALL REJECTED ❌\n\nYou attempted to use '{tool_name}', which is currently FORBIDDEN.\n\nCurrent state: token_state={self.state.token_state.value}, turn_state={self.state.turn_state.value}\nPossible reasons: Token or turn limits exceeded with active restrictions.\n\nCheck system warnings for required actions."

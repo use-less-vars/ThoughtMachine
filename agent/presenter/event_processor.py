@@ -66,10 +66,14 @@ class EventProcessor:
             self._process_user_query_event(event)
         elif event_type == 'paused':
             self._process_paused_event(event)
+        elif event_type == 'stop_reason':
+            self._process_stop_reason_event(event)
         elif event_type in ['final', 'stopped', 'max_turns', 'thread_finished']:
             self._process_terminal_event(event, event_type)
         elif event_type == 'error':
             self._process_error_event(event)
+        elif event_type == 'session_stop':
+            self._process_session_stop_event(event)
         elif event_type == 'execution_state_change':
             self._process_execution_state_change_event(event)
         elif event_type == 'session_state_change':
@@ -109,7 +113,7 @@ class EventProcessor:
 
     def _process_user_interaction_event(self, event: Dict[str, Any]) -> None:
         """Process user interaction request event."""
-        self.session_lifecycle.state = ExecutionState.WAITING_FOR_USER
+        self.session_lifecycle.state = ExecutionState.READY
         if self.gui_integration:
             self.gui_integration.emit_status_message('Waiting for user input')
         self.session_lifecycle.auto_save_current_session()
@@ -119,16 +123,32 @@ class EventProcessor:
         log('DEBUG', 'presenter.event_processor', f'Processing user_query event')
 
     def _process_paused_event(self, event: Dict[str, Any]) -> None:
-        """Process paused event."""
-        self.session_lifecycle.state = ExecutionState.PAUSED
+        """Process paused event.
+
+        Note: We do NOT transition PAUSING→READY here because that would
+        prevent the GUI from painting 'Pausing…' before immediately jumping
+        to 'Ready'. The session_stop event (which follows 'paused') handles
+        the PAUSING→READY transition naturally.
+        """
         if self.gui_integration:
             self.gui_integration.emit_status_message('Paused')
-        self.session_lifecycle.auto_save_current_session()
+
+    def _process_stop_reason_event(self, event: Dict[str, Any]) -> None:
+        """Process stop_reason event (max_turns_reached, rate_limit)."""
+        stop_reason = event.get('stop_reason', 'unknown')
+        if stop_reason == 'max_turns_reached':
+            message = 'Max turns reached'
+        elif stop_reason == 'rate_limit':
+            message = 'Rate limit exceeded'
+        else:
+            message = f'Session stopped: {stop_reason}'
+        if self.gui_integration:
+            self.gui_integration.emit_status_message(message)
 
     def _process_terminal_event(self, event: Dict[str, Any], event_type: str) -> None:
         """Process terminal event (final, stopped, max_turns, thread_finished)."""
         if event_type == 'final':
-            self.session_lifecycle.state = ExecutionState.PAUSED
+            self.session_lifecycle.state = ExecutionState.READY
             if self.gui_integration:
                 self.gui_integration.emit_status_message('Completed successfully')
             content = event.get('content')
@@ -147,26 +167,40 @@ class EventProcessor:
                 self.state_bridge.current_session.final_reasoning = reasoning
                 self.state_bridge.current_session.final_timestamp = timestamp
         elif event_type == 'max_turns':
-            self.session_lifecycle.state = ExecutionState.PAUSED
+            self.session_lifecycle.state = ExecutionState.READY
             if self.gui_integration:
                 self.gui_integration.emit_status_message('Max turns reached')
         elif self.session_lifecycle._restarting:
             pass
         else:
-            self.session_lifecycle.state = ExecutionState.PAUSED
+            self.session_lifecycle.state = ExecutionState.READY
             if self.gui_integration:
-                message = 'Paused' if event_type == 'stopped' else 'Thread finished'
+                message = 'Stopped' if event_type == 'stopped' else 'Thread finished'
                 self.gui_integration.emit_status_message(message)
         self.session_lifecycle.auto_save_current_session()
 
     def _process_error_event(self, event: Dict[str, Any]) -> None:
         """Process error event."""
-        self.session_lifecycle.state = ExecutionState.PAUSED
+        self.session_lifecycle.state = ExecutionState.READY
         error_msg = event.get('message', 'Unknown error')
         traceback_text = event.get('traceback', '')
         if self.gui_integration:
             self.gui_integration.emit_error_occurred(error_msg, traceback_text)
             self.gui_integration.emit_status_message(f'Error: {error_msg}')
+        self.session_lifecycle.auto_save_current_session()
+
+    def _process_session_stop_event(self, event: Dict[str, Any]) -> None:
+        """Process session_stop event — transition session to READY state."""
+        self.session_lifecycle.state = ExecutionState.READY
+        stop_reason = event.get('stop_reason', 'unknown')
+        if self.gui_integration:
+            self.gui_integration.emit_status_message(f'Session stopped: {stop_reason}')
+            # Emit conversation_changed to trigger GUI display of any new messages
+            # (e.g., grace turn committed just before pause) since the ObservableList
+            # callback uses QTimer.singleShot from the worker thread, which may not
+            # reliably deliver on all platforms. This runs on the main thread via
+            # the queued signal connection from controller.event_occurred.
+            self.gui_integration.emit_conversation_changed()
         self.session_lifecycle.auto_save_current_session()
 
     def _process_execution_state_change_event(self, event: Dict[str, Any]) -> None:

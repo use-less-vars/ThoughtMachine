@@ -100,34 +100,6 @@ class AgentControlsPanel(QGroupBox):
         max_turns_layout.addWidget(self.max_turns_spinbox)
         max_turns_layout.addWidget(QLabel('turns'))
         self.left_column.addWidget(max_turns_row)
-        turn_monitor_row = QWidget()
-        turn_monitor_layout = QHBoxLayout()
-        turn_monitor_row.setLayout(turn_monitor_layout)
-        turn_monitor_layout.setSpacing(5)
-        self.turn_monitor_checkbox = QCheckBox('Turn warnings')
-        self.turn_monitor_checkbox.setChecked(True)
-        turn_monitor_layout.addWidget(self.turn_monitor_checkbox)
-        turn_monitor_layout.addWidget(QLabel('Warning:'))
-        self.turn_warning_threshold_spinbox = QDoubleSpinBox()
-        self.turn_warning_threshold_spinbox.setRange(0.0, 1.0)
-        self.turn_warning_threshold_spinbox.setValue(0.8)
-        self.turn_warning_threshold_spinbox.setSingleStep(0.05)
-        self.turn_warning_threshold_spinbox.setDecimals(2)
-        turn_monitor_layout.addWidget(self.turn_warning_threshold_spinbox)
-        self.turn_warning_formatted_label = QLabel('(80)')
-        turn_monitor_layout.addWidget(self.turn_warning_formatted_label)
-        turn_monitor_layout.addWidget(QLabel('turns'))
-        turn_monitor_layout.addWidget(QLabel('Critical:'))
-        self.turn_critical_threshold_spinbox = QDoubleSpinBox()
-        self.turn_critical_threshold_spinbox.setRange(0.0, 1.0)
-        self.turn_critical_threshold_spinbox.setValue(0.95)
-        self.turn_critical_threshold_spinbox.setSingleStep(0.05)
-        self.turn_critical_threshold_spinbox.setDecimals(2)
-        turn_monitor_layout.addWidget(self.turn_critical_threshold_spinbox)
-        self.turn_critical_formatted_label = QLabel('(95)')
-        turn_monitor_layout.addWidget(self.turn_critical_formatted_label)
-        turn_monitor_layout.addWidget(QLabel('turns'))
-        self.left_column.addWidget(turn_monitor_row)
         temperature_row = QWidget()
         temperature_layout = QHBoxLayout()
         temperature_row.setLayout(temperature_layout)
@@ -225,22 +197,13 @@ class AgentControlsPanel(QGroupBox):
         self._critical_threshold_timer = QTimer()
         self._critical_threshold_timer.setSingleShot(True)
         self._critical_threshold_timer.timeout.connect(self._adjust_critical_threshold)
-        self._turn_warning_threshold_timer = QTimer()
-        self._turn_warning_threshold_timer.setSingleShot(True)
-        self._turn_warning_threshold_timer.timeout.connect(self._adjust_turn_warning_threshold)
-        self._turn_critical_threshold_timer = QTimer()
-        self._turn_critical_threshold_timer.setSingleShot(True)
-        self._turn_critical_threshold_timer.timeout.connect(self._adjust_turn_critical_threshold)
+
         self.warning_threshold_spinbox.valueChanged.connect(self._on_warning_threshold_changed)
         self.critical_threshold_spinbox.valueChanged.connect(self._on_critical_threshold_changed)
         self.token_monitor_checkbox.stateChanged.connect(self.update_token_monitor_controls)
-        self.turn_monitor_checkbox.stateChanged.connect(self.update_turn_monitor_controls)
-        self.turn_warning_threshold_spinbox.valueChanged.connect(self._on_turn_warning_threshold_changed)
-        self.turn_critical_threshold_spinbox.valueChanged.connect(self._on_turn_critical_threshold_changed)
+
         self.mcp_config_btn.clicked.connect(self._open_mcp_config)
         self._update_token_threshold_labels()
-        self.update_turn_monitor_controls()
-        self._update_turn_threshold_labels()
 
     def _load_presets(self):
         """Load available presets from the presets directory into the combo box."""
@@ -406,58 +369,6 @@ class AgentControlsPanel(QGroupBox):
             critical_text = f'({critical_value})'
         self.critical_formatted_label.setText(critical_text)
 
-    def update_turn_monitor_controls(self):
-        """Enable/disable turn monitor threshold controls based on checkbox."""
-        enabled = self.turn_monitor_checkbox.isChecked()
-        self.turn_warning_threshold_spinbox.setEnabled(enabled)
-        self.turn_critical_threshold_spinbox.setEnabled(enabled)
-
-    def _on_turn_warning_threshold_changed(self, value):
-        """Start debounced adjustment of turn warning threshold."""
-        self._turn_warning_threshold_timer.start(500)
-
-    def _adjust_turn_warning_threshold(self):
-        """Ensure turn warning threshold is always lower than critical threshold."""
-        value = self.turn_warning_threshold_spinbox.value()
-        critical = self.turn_critical_threshold_spinbox.value()
-        step = self.turn_warning_threshold_spinbox.singleStep()
-        if value >= critical:
-            clamped_value = critical - step
-            if clamped_value < 0.0:
-                clamped_value = 0.0
-            self.turn_warning_threshold_spinbox.blockSignals(True)
-            self.turn_warning_threshold_spinbox.setValue(clamped_value)
-            self.turn_warning_threshold_spinbox.blockSignals(False)
-        self._update_turn_threshold_labels()
-
-    def _on_turn_critical_threshold_changed(self, value):
-        """Start debounced adjustment of turn critical threshold."""
-        self._turn_critical_threshold_timer.start(500)
-
-    def _adjust_turn_critical_threshold(self):
-        """Ensure turn critical threshold is always higher than warning threshold."""
-        value = self.turn_critical_threshold_spinbox.value()
-        warning = self.turn_warning_threshold_spinbox.value()
-        step = self.turn_critical_threshold_spinbox.singleStep()
-        if value <= warning:
-            clamped_value = warning + step
-            max_val = self.turn_critical_threshold_spinbox.maximum()
-            if clamped_value > max_val:
-                clamped_value = max_val
-            self.turn_critical_threshold_spinbox.blockSignals(True)
-            self.turn_critical_threshold_spinbox.setValue(clamped_value)
-            self.turn_critical_threshold_spinbox.blockSignals(False)
-        self._update_turn_threshold_labels()
-
-    def _update_turn_threshold_labels(self):
-        """Update formatted labels for turn thresholds."""
-        warning_value = self.turn_warning_threshold_spinbox.value()
-        warning_text = f'({int(warning_value * 100)})'
-        self.turn_warning_formatted_label.setText(warning_text)
-        critical_value = self.turn_critical_threshold_spinbox.value()
-        critical_text = f'({int(critical_value * 100)})'
-        self.turn_critical_formatted_label.setText(critical_text)
-
     def _on_manage_profiles(self):
         """Open the Provider Profiles management dialog.
 
@@ -534,9 +445,7 @@ class AgentControlsPanel(QGroupBox):
         config['token_monitor_enabled'] = self.token_monitor_checkbox.isChecked()
         config['token_monitor_warning_threshold'] = self.warning_threshold_spinbox.value() * 1000
         config['token_monitor_critical_threshold'] = self.critical_threshold_spinbox.value() * 1000
-        config['turn_monitor_enabled'] = self.turn_monitor_checkbox.isChecked()
-        config['turn_monitor_warning_threshold'] = self.turn_warning_threshold_spinbox.value()
-        config['turn_monitor_critical_threshold'] = self.turn_critical_threshold_spinbox.value()
+
 
         workspace_display = self.workspace_display.text()
         workspace_path = None if workspace_display == 'None (unrestricted)' else workspace_display
@@ -588,15 +497,7 @@ class AgentControlsPanel(QGroupBox):
         if token_monitor_critical is not None:
             self.critical_threshold_spinbox.setValue(token_monitor_critical // 1000)
         log('DEBUG', 'core.config', f'[CONFIG_TRACE] AgentControlsPanel.set_config spinbox values AFTER set: warning_spinbox_raw={self.warning_threshold_spinbox.value()}, critical_spinbox_raw={self.critical_threshold_spinbox.value()}, token_monitor_warning_threshold_derived={self.warning_threshold_spinbox.value() * 1000}, token_monitor_critical_threshold_derived={self.critical_threshold_spinbox.value() * 1000}')
-        turn_monitor_enabled = set_val('turn_monitor_enabled')
-        if turn_monitor_enabled is not None:
-            self.turn_monitor_checkbox.setChecked(turn_monitor_enabled)
-        turn_warning = set_val('turn_monitor_warning_threshold')
-        if turn_warning is not None:
-            self.turn_warning_threshold_spinbox.setValue(turn_warning)
-        turn_critical = set_val('turn_monitor_critical_threshold')
-        if turn_critical is not None:
-            self.turn_critical_threshold_spinbox.setValue(turn_critical)
+
         tool_output_limit = set_val('tool_output_token_limit')
         if tool_output_limit is not None:
             self.tool_output_limit_spinbox.setValue(tool_output_limit)

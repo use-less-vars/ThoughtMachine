@@ -27,7 +27,7 @@ class SessionLifecycle:
         self.controller = controller
         self.session_store = FileSystemSessionStore()
         self.context_builder = SummaryBuilder()
-        self._state = ExecutionState.IDLE
+        self._state = ExecutionState.READY
         self._restarting = False
 
         self._session_callback: Optional[Callable] = None
@@ -81,7 +81,7 @@ class SessionLifecycle:
             preset_name: Optional preset name to use instead of config
         """
         log('DEBUG', 'presenter.lifecycle', f'start_session called, state={self.state}, current_session exists={self.state_bridge.current_session is not None}')
-        if self.state != ExecutionState.IDLE:
+        if self.state != ExecutionState.READY:
             log('DEBUG', 'presenter.lifecycle', f'Cannot start session in state {self.state}')
             return
         if self.state_bridge.current_session_id is None:
@@ -115,7 +115,7 @@ class SessionLifecycle:
                 self.controller.start(query, config=agent_config, session=self.state_bridge.current_session)
             self.state = ExecutionState.RUNNING
         except Exception as e:
-            self.state = ExecutionState.PAUSED
+            self.state = ExecutionState.READY
             log('DEBUG', 'presenter.lifecycle', f'Error starting session: {e}')
             raise
 
@@ -142,7 +142,7 @@ class SessionLifecycle:
         self.state_bridge.bind_session(session)
         self._register_session_callbacks(session)
         self.state_bridge.update_external_file_path(None)
-        self.state = ExecutionState.IDLE
+        self.state = ExecutionState.READY
         log('DEBUG', 'presenter.lifecycle', f"Started new session{(' named ' + name if name else '')}")
 
     def continue_session(self, query: str):
@@ -182,7 +182,7 @@ class SessionLifecycle:
                 except Exception as e:
                     log('DEBUG', 'presenter.lifecycle', f'Failed to reset rate limiting: {e}')
         self.controller.reset()
-        self.state = ExecutionState.IDLE
+        self.state = ExecutionState.READY
         self._restarting = False
 
 
@@ -201,7 +201,7 @@ class SessionLifecycle:
                 pass
             except Exception as e:
                 log('DEBUG', 'presenter.lifecycle', f'Auto-save before restart failed: {e}')
-        if self.state == ExecutionState.IDLE:
+        if self.state == ExecutionState.READY:
             self._finalize_restart()
             return
         if self._restarting:

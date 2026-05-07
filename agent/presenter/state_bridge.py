@@ -139,7 +139,7 @@ class StateBridge:
                 tool_classes.append(tool_cls)
         agent_kwargs = {}
         agent_kwargs['api_key'] = api_key
-        direct_mappings = [('model', 'model'), ('provider_type', 'provider_type'), ('provider_config', 'provider_config'), ('temperature', 'temperature'), ('max_turns', 'max_turns'), ('workspace_path', 'workspace_path'), ('detail', 'detail'), ('token_monitor_enabled', 'token_monitor_enabled'), ('enabled_tools', 'enabled_tools'), ('turn_monitor_enabled', 'turn_monitor_enabled'), ('turn_monitor_warning_threshold', 'turn_monitor_warning_threshold'), ('turn_monitor_critical_threshold', 'turn_monitor_critical_threshold'), ('system_prompt', 'system_prompt')]
+        direct_mappings = [('model', 'model'), ('provider_type', 'provider_type'), ('provider_config', 'provider_config'), ('temperature', 'temperature'), ('max_turns', 'max_turns'), ('workspace_path', 'workspace_path'), ('detail', 'detail'), ('token_monitor_enabled', 'token_monitor_enabled'), ('enabled_tools', 'enabled_tools'), ('turn_monitor_enabled', 'turn_monitor_enabled'), ('system_prompt', 'system_prompt')]
         for config_key, agent_key in direct_mappings:
             if config_key in config:
                 agent_kwargs[agent_key] = config[config_key]
