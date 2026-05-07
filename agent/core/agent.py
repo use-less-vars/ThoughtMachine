@@ -842,7 +842,7 @@ class Agent:
                 yield event_dict
                 time.sleep(wait_time)
                 if self.session is not None:
-                    self.session.add_message('system', f'Error: RATE_LIMIT_EXCEEDED: rate limit exceeded after {self.rate_limit_count} attempts')
+                    self.session.add_message('user', '[SYSTEM NOTIFICATION] Error: RATE_LIMIT_EXCEEDED: rate limit exceeded after {self.rate_limit_count} attempts', is_system_notification=True)
                 stop_reason_event = {'type': 'stop_reason', 'stop_reason': 'rate_limit', 'message': f'Rate limit exceeded after {self.rate_limit_count} attempts', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                 self._add_conversation_data_to_event(stop_reason_event)
                 yield stop_reason_event
@@ -857,7 +857,7 @@ class Agent:
                     self.logger.log_agent_end('provider_error', f'Provider error: {e}')
                     self.logger.close()
                 if self.session is not None:
-                    self.session.add_message('system', f'Error: {error_type}: {e}')
+                    self.session.add_message('user', '[SYSTEM NOTIFICATION] Error: {error_type}: {e}', is_system_notification=True)
                 event_dict = {'type': 'error', 'error_type': error_type, 'message': str(e), 'stop_reason': 'error', 'traceback': traceback.format_exc(), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                 self._add_conversation_data_to_event(event_dict)
                 yield event_dict
@@ -870,7 +870,7 @@ class Agent:
                     self.logger.log_agent_end('unexpected_error', f'Unexpected error: {e}')
                     self.logger.close()
                 if self.session is not None:
-                    self.session.add_message('system', f'Error: UNEXPECTED_ERROR: {e}')
+                    self.session.add_message('user', '[SYSTEM NOTIFICATION] Error: UNEXPECTED_ERROR: {e}', is_system_notification=True)
                 event_dict = {'type': 'error', 'error_type': 'UNEXPECTED_ERROR', 'message': str(e), 'stop_reason': 'error', 'traceback': traceback.format_exc(), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                 self._add_conversation_data_to_event(event_dict)
                 yield event_dict

@@ -349,7 +349,7 @@ class SummaryBuilder(ContextBuilder):
                 logger.debug(f'  ... and {len(messages) - max_to_show} more messages')
         for msg in messages:
             role = msg.get('role')
-            if role == 'system':
+            if role == 'system' or msg.get('is_system_notification') is True or '[SYSTEM NOTIFICATION]' in str(msg.get('content', '')):
                 continue
             if role == 'user':
                 if current_turn:

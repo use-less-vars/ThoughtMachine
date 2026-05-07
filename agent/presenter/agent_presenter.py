@@ -133,7 +133,7 @@ class RefactoredAgentPresenter(QObject):
         except Exception as e:
             error_msg = f'Failed to start session: {str(e)}'
             log('ERROR', 'ui.presenter', error_msg)
-            system_message = {'role': 'system', 'content': error_msg, 'created_at': datetime.now().isoformat(), 'seq': len(self.user_history)}
+            system_message = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + error_msg, 'is_system_notification': True, 'created_at': datetime.now().isoformat(), 'seq': len(self.user_history)}
             if self.state_bridge.current_session:
                 self.state_bridge.current_session.user_history.append(system_message)
             else:
@@ -151,7 +151,7 @@ class RefactoredAgentPresenter(QObject):
         except Exception as e:
             error_msg = f'Failed to create new session: {str(e)}'
             log('ERROR', 'ui.presenter', error_msg)
-            system_message = {'role': 'system', 'content': error_msg, 'created_at': datetime.now().isoformat(), 'seq': len(self.user_history)}
+            system_message = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + error_msg, 'is_system_notification': True, 'created_at': datetime.now().isoformat(), 'seq': len(self.user_history)}
             if self.state_bridge.current_session:
                 self.state_bridge.current_session.user_history.append(system_message)
             else:
@@ -170,7 +170,7 @@ class RefactoredAgentPresenter(QObject):
         except Exception as e:
             error_msg = f'Failed to continue session: {str(e)}'
             log('ERROR', 'ui.presenter', error_msg)
-            system_message = {'role': 'system', 'content': error_msg, 'created_at': datetime.now().isoformat(), 'seq': len(self.user_history)}
+            system_message = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + error_msg, 'is_system_notification': True, 'created_at': datetime.now().isoformat(), 'seq': len(self.user_history)}
             if self.state_bridge.current_session:
                 self.state_bridge.current_session.user_history.append(system_message)
             else:
@@ -208,7 +208,7 @@ class RefactoredAgentPresenter(QObject):
                 except Exception as e:
                     error_msg = f'Failed to continue session: {str(e)}'
                     log('ERROR', 'ui.presenter', error_msg)
-                    system_message = {'role': 'system', 'content': error_msg, 'created_at': datetime.now().isoformat(), 'seq': len(self.user_history)}
+                    system_message = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + error_msg, 'is_system_notification': True, 'created_at': datetime.now().isoformat(), 'seq': len(self.user_history)}
                     if self.state_bridge.current_session:
                         self.state_bridge.current_session.user_history.append(system_message)
                     else:
@@ -227,7 +227,7 @@ class RefactoredAgentPresenter(QObject):
                 except Exception as e:
                     error_msg = f'Failed to start session: {str(e)}'
                     log('ERROR', 'ui.presenter', error_msg)
-                    system_message = {'role': 'system', 'content': error_msg, 'created_at': datetime.now().isoformat(), 'seq': len(self.user_history)}
+                    system_message = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + error_msg, 'is_system_notification': True, 'created_at': datetime.now().isoformat(), 'seq': len(self.user_history)}
                     if self.state_bridge.current_session:
                         self.state_bridge.current_session.user_history.append(system_message)
                     else:
@@ -257,7 +257,7 @@ class RefactoredAgentPresenter(QObject):
         except Exception as e:
             error_msg = f'Failed to restart session: {str(e)}'
             log('ERROR', 'ui.presenter', error_msg)
-            system_message = {'role': 'system', 'content': error_msg, 'created_at': datetime.now().isoformat(), 'seq': len(self.user_history)}
+            system_message = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + error_msg, 'is_system_notification': True, 'created_at': datetime.now().isoformat(), 'seq': len(self.user_history)}
             if self.state_bridge.current_session:
                 self.state_bridge.current_session.user_history.append(system_message)
             else:

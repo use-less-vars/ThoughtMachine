@@ -178,3 +178,96 @@ JSON-formatted string with: `success`, `exit_code`, `stdout`, `stderr`, `command
 | pip cannot reach PyPI | `docker_network_allowed` not true |
 | Package disappears between calls | Idle timeout exceeded, or policy mismatch |
 | Container name changes between calls | Workspace path not normalized (absolute, no trailing slash) |
+
+## 2026-05-07 — ## Phase 1 Complete: Branch Creation & Switching
+
+### New Me...
+
+## Phase 1 Complete: Branch Creation & Switching
+
+### New Methods Added (3 methods, ~220 lines)
+1. **`_create_agent_branch(repo_root)`** — Creates `agent_{base}_{suffix}` branch from base, validates suffix format, checks for duplicates
+2. **`_switch_branch(repo_root)`** — Switches to existing branch (agent branches + readonly branches allowed)
+3. **`_cleanup_agent_branch(repo_root)`** — Stashes changes, switches to merge target, safe-deletes branch
+
+### New Fields (3 Pydantic fields)
+- `branch_suffix: Optional[str]` — Suffix for new branch names
+- `base_branch: str = "dev"` — Source branch for branching
+- `branch_name: Optional[str]` — Target for switch/cleanup
+
+### New Literal Operations
+- `"create_agent_branch"`, `"switch_branch"`, `"cleanup_agent_branch"`
+
+### Config Used
+- `.thoughtmachine/git_config.json`: `agent_branch_prefix`, `readonly_branches`, `allowed_merge_targets`
+
+### Protection
+- All writes blocked on `dev`/`main`/`master` via `_assert_not_readonly_branch()`
+- `_switch_branch` only allows agent/readonly branches
+- `_cleanup_agent_branch` only operates on agent-prefixed branches
+- Safe delete (`-d` flag) — only if fully merged
+
+## 2026-05-07 — ## Phase 2 Complete: Commit on Agent Branches
+
+**New Pydanti...
+
+## Phase 2 Complete: Commit on Agent Branches
+
+**New Pydantic fields added:**
+- `commit_message: Optional[str]` — commit message (required, validates format)
+- `file_paths: Optional[List[str]]` — list of files to `git add`
+- `add_all: bool = False` — if True, runs `git add -A` instead
+
+**New operation:** `"commit_on_agent_branch"`
+
+**Method `_commit_on_agent_branch()` validates:**
+1. `commit_message` is non-empty
+2. Current branch is an agent branch (starts with `agent_` prefix from config)
+3. Message matches `<type>: <description>` format where type is one of `allowed_commit_types` (configurable, defaults: fix, feat, refactor, chore, docs, test, perf, ci)
+4. If `add_all=False`, `file_paths` must be provided
+5. If `add_all=True`, runs `git add -A` ignoring file_paths
+
+**Staging flow:**
+- `add_all=True` → single `git add -A`
+- `add_all=False` → iterative `git add <path>` for each path in file_paths
+
+**Commit:** `git commit -m "<message>"` via `_run_git_write`
+
+**Safety:** Blocked on non-agent branches, protected by `_assert_not_readonly_branch()`. All writes through `_run_git_write` with error_context.
+
+**Cleanup:** Moved `import re` from local scope in `_create_agent_branch` to module-level import.
+
+## 2026-05-07 — ## Phase 3 Complete: Sync and Merge
+
+**New Pydantic fields:*...
+
+## Phase 3 Complete: Sync and Merge
+
+**New Pydantic fields:**
+- `prose_message: Optional[str]` — merge commit message (200 char max, required for merge_agent_to_dev)
+
+**New operation Literal values:**
+- `"sync_agent_with_dev"`
+- `"merge_agent_to_dev"`
+
+**Readonly guard integration:**
+- Added `readonly_guarded_ops` set in `execute()` — calls `_assert_not_readonly_branch()` for Phase 1/2 ops but NOT for sync/merge (which legitimately write to dev)
+
+### `_sync_agent_with_dev(repo_root)`
+1. Validates on agent branch (not detached HEAD, starts with prefix)
+2. Checks no uncommitted changes (`git status --porcelain`)
+3. `git fetch origin dev`
+4. `git merge origin/dev --no-edit`
+5. On `GitWriteError`: `git merge --abort`, then `git diff --name-only --diff-filter=U` to list conflicted files
+6. Returns success or conflict report (never auto-resolves)
+
+### `_merge_agent_to_dev(repo_root)`
+1. Validates on agent branch
+2. Validates `prose_message` is non-empty and ≤200 chars
+3. Checks no uncommitted changes
+4. `git checkout dev`, `git pull origin dev`
+5. `git merge --no-ff <agent_branch> -m "<prose_message>"`
+6. On conflict: abort, list conflicted files
+7. Post-merge: checks `delete_agent_after_merge` config flag (default `False`), safe-deletes branch if True
+
+**Phase 1-3 complete.** Full write operations: create branch, switch, cleanup, commit, sync with dev, merge to dev.
