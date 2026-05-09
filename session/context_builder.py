@@ -190,6 +190,11 @@ class SummaryBuilder(ContextBuilder):
                     logger.debug(f'  [{i}] role={role}, content: {content_preview}')
                 if len(user_history) > max_to_show:
                     logger.debug(f'  ... and {len(user_history) - max_to_show} more messages')
+        # [CTXBUILD] ENTER
+        log('DEBUG', 'ctxbuild', f"ENTER: received {len(user_history)} messages")
+        for i, m in enumerate(user_history):
+            log('DEBUG', 'ctxbuild', f"  INPUT[{i}] role={m.get('role')} preview={str(m.get('content',''))[:100]}")
+        
         if not user_history:
             return []
         main_prompt, summary_idx, summary_msg = self._find_main_prompt_and_summary(user_history)
@@ -207,6 +212,10 @@ class SummaryBuilder(ContextBuilder):
             post_summary = user_history[summary_idx + 1:]
         else:
             post_summary = user_history
+        
+        # [CTXBUILD] AFTER SPLIT
+        log('DEBUG', 'ctxbuild', f"AFTER SPLIT: summary_idx={summary_idx}, post_summary has {len(post_summary)} msgs")
+        
         system_warnings = []
         non_system = []
         for msg in post_summary:
@@ -216,7 +225,10 @@ class SummaryBuilder(ContextBuilder):
                 system_warnings.append(msg)
             else:
                 non_system.append(msg)
-
+        
+        # [CTXBUILD] AFTER FILTER
+        log('DEBUG', 'ctxbuild', f"AFTER FILTER: non_system={len(non_system)} msgs, system_warnings={len(system_warnings)} msgs")
+        
         if os.environ.get('DEBUG_CONTEXT'):
             logger.debug(f'[DEBUG_CONTEXT] Collected {len(system_warnings)} system warnings:')
             for i, warn in enumerate(system_warnings):
@@ -224,6 +236,10 @@ class SummaryBuilder(ContextBuilder):
                 logger.debug(f'  [{i}] {content_preview}')
         turns = self._group_messages_into_turns(non_system)
         log('DEBUG', 'session.summary_builder', f'SummaryBuilder.build: grouped {len(non_system)} non-system messages into {len(turns)} turns')
+        # [CTXBUILD] AFTER GROUP
+        log('DEBUG', 'ctxbuild', f"AFTER GROUP: {len(turns)} turns")
+        for ti, turn in enumerate(turns):
+            log('DEBUG', 'ctxbuild', f"  TURN[{ti}] {len(turn)} msgs, starts with role={turn[0].get('role')}")
         if summary_msg is not None:
             pass
         else:
@@ -279,6 +295,18 @@ class SummaryBuilder(ContextBuilder):
                 content = msg.get('content', '')
                 if '[SYSTEM]' in content:
                     logger.info(f'[WARNING_IN_CONTEXT] {content[:100]}')
+        # [CTXBUILD] EXIT
+        log('DEBUG', 'ctxbuild', f"EXIT: returning {len(context)} messages")
+        for i, m in enumerate(context):
+            log('DEBUG', 'ctxbuild', f"  OUTPUT[{i}] role={m.get('role')} preview={str(m.get('content',''))[:100]}")
+        
+        # EMERGENCY TRACE: log context summary before return
+        log('DEBUG', 'debug.emergency', f'====== EMERGENCY TRACE: context_builder.build() returning {len(context)} msgs ======')
+        for i, msg in enumerate(context):
+            role = msg.get('role', 'unknown')
+            content = msg.get('content', '')
+            preview = content[:80].replace('\n', '\\n')
+            log('DEBUG', 'debug.emergency', f'  CTX[{i}] role={role}: {preview}')
         return context
 
     def _find_main_prompt_and_summary(self, user_history: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], int, Optional[Dict[str, Any]]]:
@@ -347,9 +375,12 @@ class SummaryBuilder(ContextBuilder):
                 logger.debug(f'  [{i}] {role}: {content_preview}... tool_calls={has_tool_calls}')
             if len(messages) > max_to_show:
                 logger.debug(f'  ... and {len(messages) - max_to_show} more messages')
-        for msg in messages:
+        for idx, msg in enumerate(messages):
             role = msg.get('role')
-            if role == 'system' or msg.get('is_system_notification') is True or '[SYSTEM NOTIFICATION]' in str(msg.get('content', '')):
+            skip = role == 'system' or msg.get('is_system_notification') is True
+            starts_new_turn = (role == 'user') or (role == 'assistant' and msg.get('tool_calls'))
+            log('DEBUG', 'ctxbuild', f"GROUP_MSG idx={idx} role={role} skip={skip} turn_start={starts_new_turn}")
+            if skip:
                 continue
             if role == 'user':
                 if current_turn:
@@ -395,6 +426,9 @@ class SummaryBuilder(ContextBuilder):
                 valid_turns.append(turn)
             elif debug:
                 logger.debug(f'[DEBUG_CONTEXT] Discarding turn starting with {first_role}')
+            # [CTXBUILD] TURN VALIDITY
+            keep = (first_role in ('user', 'assistant') and not (first_role == 'assistant' and not first_msg.get('tool_calls')))
+            log('DEBUG', 'ctxbuild', f"  TURN VALIDITY: keep={keep}, first_role={first_role}, len={len(turn)}")
         if debug:
             logger.debug(f'[DEBUG_CONTEXT] Returned {len(valid_turns)} valid turns')
             max_to_show = 10
@@ -415,6 +449,9 @@ class SummaryBuilder(ContextBuilder):
         except Exception:
             encoder = None
         total = sum((self._estimate_tokens(msg, encoder) for msg in messages))
+        removed_count = 0
+        if total > max_tokens:
+            log('DEBUG', 'session.context_builder', f'Truncating: {len(messages)} messages, removing 0 initially, need to reduce from ~{total} to {max_tokens} tokens')
         if remove_from_end:
             while total > max_tokens and len(messages) > 0:
                 if preserve_system and messages[-1].get('role') == 'system':
@@ -424,6 +461,7 @@ class SummaryBuilder(ContextBuilder):
                         if not (preserve_system and messages[-i].get('role') == 'system'):
                             removed_msg = messages.pop(-i)
                             total -= self._estimate_tokens(removed_msg, encoder)
+                            removed_count += 1
                             if os.environ.get('DEBUG_CONTEXT'):
                                 role = removed_msg.get('role', 'unknown')
                                 content_preview = str(removed_msg.get('content', ''))[:100].replace('\\n', ' ')
@@ -434,6 +472,7 @@ class SummaryBuilder(ContextBuilder):
                 else:
                     removed_msg = messages.pop()
                     total -= self._estimate_tokens(removed_msg, encoder)
+                    removed_count += 1
                     if os.environ.get('DEBUG_CONTEXT'):
                         role = removed_msg.get('role', 'unknown')
                         content_preview = str(removed_msg.get('content', ''))[:100].replace('\\n', ' ')
@@ -446,4 +485,8 @@ class SummaryBuilder(ContextBuilder):
                     continue
                 removed_msg = messages.pop(idx_to_remove)
                 total -= self._estimate_tokens(removed_msg, encoder)
+                removed_count += 1
+        if removed_count > 0:
+            log('DEBUG', 'session.context_builder', f'Truncating: {len(messages)} messages, removing {removed_count} to stay under {max_tokens} tokens')
+            log('DEBUG', 'session.context_builder', f'Truncated: removed {removed_count} messages, now {len(messages)} messages at ~{total} tokens')
         return messages

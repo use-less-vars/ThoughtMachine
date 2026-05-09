@@ -558,6 +558,7 @@ class Agent:
         """
         if tool_tokens is not None:
             self.state.current_conversation_tokens += tool_tokens
+            log('DEBUG', 'core.agent.token', f'Tool result added {tool_tokens}, current_tokens now: {self.state.current_conversation_tokens}')
 
         # Process any warnings or state changes from the token update
         for event in self.state.update_token_state(self.state.current_conversation_tokens):
@@ -810,6 +811,19 @@ class Agent:
                         self.logger.py_logger.info(f'[RATE_LIMIT] Applying rate limit delay: {delay}s between turns')
                     time.sleep(delay)
             tools = self.llm_client.format_tools(self.tool_definitions)
+            # EMERGENCY TRACE: dump conversation and messages before LLM call
+            log('DEBUG', 'debug.emergency', f'====== EMERGENCY TRACE: self.conversation ({len(self.conversation)} msgs) ======')
+            for i, msg in enumerate(self.conversation):
+                role = msg.get('role', 'unknown')
+                content = msg.get('content', '')
+                preview = content[:80].replace('\n', '\\n')
+                log('DEBUG', 'debug.emergency', f'  CONV[{i}] role={role}: {preview}')
+            log('DEBUG', 'debug.emergency', f'====== EMERGENCY TRACE: messages from build() ({len(messages)} msgs) ======')
+            for i, msg in enumerate(messages):
+                role = msg.get('role', 'unknown')
+                content = msg.get('content', '')
+                preview = content[:80].replace('\n', '\\n')
+                log('DEBUG', 'debug.emergency', f'  MSG[{i}] role={role}: {preview}')
             try:
                 chat_kwargs = {'temperature': self.runtime_params.temperature}
                 if self.runtime_params.max_tokens is not None:
@@ -824,7 +838,9 @@ class Agent:
                 input_tokens = response.usage.get('prompt_tokens', 0) if response.usage else 0
                 output_tokens = response.usage.get('completion_tokens', 0) if response.usage else 0
                 # Use LLM-reported prompt_tokens as ground truth for conversation token count
+                previous_tokens = self.state.current_conversation_tokens
                 self.state.current_conversation_tokens = input_tokens
+                log('DEBUG', 'core.agent.token', f'LLM prompt_tokens={input_tokens}, overwriting current_tokens (was {previous_tokens})')
                 last_input_tokens = input_tokens
                 last_output_tokens = output_tokens
                 self.total_input_tokens += input_tokens
@@ -1152,7 +1168,7 @@ class Agent:
             role = msg.get('role')
             content = msg.get('content', '')
             # Skip system messages and system notifications
-            if role == 'system' or msg.get('is_system_notification') is True or '[SYSTEM NOTIFICATION]' in content or '[**SYSTEM NOTIFICATION**]' in content:
+            if role == 'system' or msg.get('is_system_notification') is True:
                 continue
             if role == 'user':
                 if current_turn:
@@ -1225,7 +1241,7 @@ class Agent:
         for msg in messages:
             role = msg.get('role')
             content = msg.get('content', '')
-            if role == 'system' or msg.get('is_system_notification') is True or '[SYSTEM NOTIFICATION]' in content or '[**SYSTEM NOTIFICATION**]' in content:
+            if role == 'system' or msg.get('is_system_notification') is True:
                 continue
             if role == 'user':
                 if current_turn:
