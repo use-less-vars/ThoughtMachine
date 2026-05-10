@@ -578,3 +578,33 @@ The ExecutionState enum has been simplified to just 3 values: RUNNING, PAUSING, 
 3. **`_update_tokens_and_yield` removed**: Old code had a generator version that did full re-estimate after each tool. Current code uses `_update_tokens_after_tool` which only does a rough addition. The old version was more accurate but also more expensive.
 4. **No mechanism to handle `TokenLimitExceededError`**: If the LLM response exceeds the context window, the error is caught as `ProviderError` in the provider layer, but there's no retry or context-trimming logic.
 
+
+## 2026-05-09 — ## Summarization and Pruning System — Deep Audit (2025-01)
+
+...
+
+## Summarization and Pruning System — Deep Audit (2025-01)
+
+### Architecture: Append-Only History + On-Demand Context Assembly
+The system maintains a purely append-only `session.user_history` (all messages ever exchanged). When the LLM context is needed, `SummaryBuilder.build()` assembles a **derived view**: main system prompt + latest summary + recent turns (after summary) + system warnings. This avoids destructive edits to the canonical history.
+
+### Key Components
+- **SummaryBuilder** (session/context_builder.py:194-350): Assembles LLM context from user_history. Finds main prompt, latest summary, groups non-system messages into turns, selects turns to keep (post-summary content), truncates by max_tokens, cleans orphaned tool messages.
+- **HistoryProvider** (session/history_provider.py:46-280): Orchestrates caching (_cached_context), token-limit checking (80% warning / 95% prune), and summary creation. Cache cleared by add_message(), clear_cache(), session setter, TurnTransaction.commit(), and _apply_summary_pruning().
+- **_apply_summary_pruning()** (agent/core/agent.py:1037-1119): The main pruning action — computes insertion index via _find_summary_insertion_index(), creates summary_msg with metadata (pruning_keep_recent_turns, pruning_insertion_idx, pruning_discarded_msg_count), inserts it and a [SYSTEM NOTIFICATION] message, clears cache, updates tokens. Falls back to _apply_summary_pruning_fallback() if session is None.
+- **ObservableList** (session/models.py:18-90): Wraps session.user_history, notifies _on_conversation_changed on any mutation.
+- **Turn Grouping** (agent/core/message_utils.py): Shared utility for turn grouping. Rules: user msg starts turn, assistant-with-tool_calls starts turn, tool results attach if assistant-with-tool_calls anywhere in turn.
+- **_cleanup_orphaned_tool_messages()** (session/context_builder.py:108-192): Called twice (SummaryBuilder.build + get_context_for_llm). Handles orphaned tools, non-matching IDs, incomplete sequences, duplicates.
+
+### Token Limits
+- `_get_max_context_tokens()`: context_window - 1000 (SAFETY_MARGIN) - config.max_tokens (default 4096)
+- Default 8000 if no token_limit specified (LLMClient.create_context_builder)
+- Default keep_turns = 5 (DEFAULT_KEEP_TURNS in history_provider.py)
+
+### Edge Cases Noted
+1. Fallback path (no session) uses MAX_SUMMARY_LENGTH=4000 vs main path 20000
+2. Fallback path does NOT clear _cached_context explicitly
+3. _cleanup_orphaned_tool_messages runs twice (redundant but safe)
+4. Multiple summaries: only the latest (rightmost) is used; older summaries remain in history as dead metadata
+5. Token truncation with summary: remove_from_end=True (newest messages removed first) — preserves original kept turns but may truncate beyond what's expected
+6. Pause/error interrupts summarization flow — summary_text is only set if SummarizeTool completed successfully

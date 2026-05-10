@@ -344,8 +344,25 @@ def _compact_turn(
                 break
         if last_plain_assistant is not None:
             result.append(last_plain_assistant)
-        # else: no plain assistant found — drop all assistant messages
-        # (tool-calling intermediaries are not meaningful without their results)
+        else:
+            # Fallback: no plain assistant found (all had tool_calls).
+            # Keep the last assistant with any content (content or tool_calls).
+            last_content_assistant: Optional[Dict[str, Any]] = None
+            for asst in reversed(assistant_msgs):
+                content = asst.get('content', '')
+                if content and isinstance(content, str) and content.strip():
+                    last_content_assistant = asst
+                    break
+
+                # Also check tool_calls — an assistant without content
+                # but with tool_calls is meaningful
+                tool_calls = asst.get('tool_calls', [])
+                if tool_calls:
+                    last_content_assistant = asst
+                    break
+
+            if last_content_assistant is not None:
+                result.append(last_content_assistant)
     else:
         # Legacy behavior: keep last assistant with content
         last_content_assistant: Optional[Dict[str, Any]] = None

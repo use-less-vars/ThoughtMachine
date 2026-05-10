@@ -271,3 +271,25 @@ JSON-formatted string with: `success`, `exit_code`, `stdout`, `stderr`, `command
 7. Post-merge: checks `delete_agent_after_merge` config flag (default `False`), safe-deletes branch if True
 
 **Phase 1-3 complete.** Full write operations: create branch, switch, cleanup, commit, sync with dev, merge to dev.
+
+## 2026-05-09 — ## FileEditor `line_number` vs `line_numbers` — subtle disti...
+
+## FileEditor `line_number` vs `line_numbers` — subtle distinction
+
+**Problem**: Agents get confused and use `line_numbers` (plural) expecting context lines around the result.
+
+**The rules**:
+- `line_number` (singular, int) + `context_lines` (int) → shows the line WITH surrounding context. Best for reading a specific area.
+- `line_numbers` (plural, int) → shows ONLY that single line (no context). Use for targeted reads.
+- `line_numbers` (plural, string like `"420-451"`) → shows a range of lines. Use `context_lines` for surrounding context.
+
+**Recommended pattern for reading code with context**:
+```json
+FileEditor(operation="read", filename="path/to/file.py", 
+           line_number=440, context_lines=10)
+```
+
+**Avoid** `line_numbers: 440` (plural with int) — it gives no context.
+**Avoid** `line_numbers: [440]` (plural with list) — same issue.
+
+**For reading a full block/range**, use `line_numbers: "420-451"` (range string) to get all lines.
