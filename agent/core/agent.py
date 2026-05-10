@@ -39,6 +39,7 @@ from .conversation_manager import ConversationManager
 from .tool_executor import ToolExecutor
 from .turn_transaction import TurnTransaction
 from .debug_context import DebugContext
+from .message_utils import group_messages_into_turns, group_messages_into_turns_with_indices
 if TYPE_CHECKING:
     from agent.config import AgentConfig
     from session.models import Session
@@ -104,6 +105,7 @@ class Agent:
         self.llm_client = LLMClient(config, session, self.logger)
         self.conversation_manager = ConversationManager(session, None, self.logger)
         self.debug_context = DebugContext(self.logger)
+        self._pending_warnings = []  # Buffer for token warnings, flushed after turn commit
         self.tool_classes = config.get_filtered_tool_classes()
         # Register MCP tools lazily (not during import to avoid hangs)
         try:
@@ -563,13 +565,14 @@ class Agent:
         # Process any warnings or state changes from the token update
         for event in self.state.update_token_state(self.state.current_conversation_tokens):
             if event['type'] == 'token_warning':
-                # Inject the warning as a user-visible message so the agent can react
+                # Buffer the warning instead of injecting immediately — it will be flushed
+                # after turn_transaction.commit() so it lands in correct chronological order.
                 warning_msg = {
                     'role': 'user',
                     'content': f'[SYSTEM NOTIFICATION] {event.get("message", event.get("warning", ""))}',
                     'is_system_notification': True
                 }
-                self._add_to_conversation(warning_msg)
+                self._pending_warnings.append(warning_msg)
                 warning_tokens = self._estimate_tokens(warning_msg)
                 self.state.current_conversation_tokens += warning_tokens
     @property
@@ -858,7 +861,7 @@ class Agent:
                 yield event_dict
                 time.sleep(wait_time)
                 if self.session is not None:
-                    self.session.add_message('user', '[SYSTEM NOTIFICATION] Error: RATE_LIMIT_EXCEEDED: rate limit exceeded after {self.rate_limit_count} attempts', is_system_notification=True)
+                    self._add_to_conversation({'role': 'user', 'content': f'[SYSTEM NOTIFICATION] Error: RATE_LIMIT_EXCEEDED: rate limit exceeded after {self.rate_limit_count} attempts', 'is_system_notification': True})
                 stop_reason_event = {'type': 'stop_reason', 'stop_reason': 'rate_limit', 'message': f'Rate limit exceeded after {self.rate_limit_count} attempts', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                 self._add_conversation_data_to_event(stop_reason_event)
                 yield stop_reason_event
@@ -873,7 +876,7 @@ class Agent:
                     self.logger.log_agent_end('provider_error', f'Provider error: {e}')
                     self.logger.close()
                 if self.session is not None:
-                    self.session.add_message('user', '[SYSTEM NOTIFICATION] Error: {error_type}: {e}', is_system_notification=True)
+                    self._add_to_conversation({'role': 'user', 'content': f'[SYSTEM NOTIFICATION] Error: {error_type}: {e}', 'is_system_notification': True})
                 event_dict = {'type': 'error', 'error_type': error_type, 'message': str(e), 'stop_reason': 'error', 'traceback': traceback.format_exc(), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                 self._add_conversation_data_to_event(event_dict)
                 yield event_dict
@@ -886,7 +889,7 @@ class Agent:
                     self.logger.log_agent_end('unexpected_error', f'Unexpected error: {e}')
                     self.logger.close()
                 if self.session is not None:
-                    self.session.add_message('user', '[SYSTEM NOTIFICATION] Error: UNEXPECTED_ERROR: {e}', is_system_notification=True)
+                    self._add_to_conversation({'role': 'user', 'content': f'[SYSTEM NOTIFICATION] Error: UNEXPECTED_ERROR: {e}', 'is_system_notification': True})
                 event_dict = {'type': 'error', 'error_type': 'UNEXPECTED_ERROR', 'message': str(e), 'stop_reason': 'error', 'traceback': traceback.format_exc(), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                 self._add_conversation_data_to_event(event_dict)
                 yield event_dict
@@ -961,6 +964,11 @@ class Agent:
                     yield event_dict
                 if turn_transaction:
                     turn_transaction.commit()
+                # Flush any buffered token warnings after the turn is committed
+                # so they land chronologically after tool results in user_history
+                for warning in self._pending_warnings:
+                    self._add_to_conversation(warning)
+                self._pending_warnings.clear()
                 if final_detected:
                     final_event = {'type': 'final', 'stop_reason': 'final', 'content': final_content if final_content is not None else content, 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                     if reasoning is not None:
@@ -1004,6 +1012,10 @@ class Agent:
             if not tool_calls:
                 if turn_transaction and turn_transaction.has_assistant_message():
                     turn_transaction.commit()
+                # Flush any buffered token warnings (unlikely here, but be safe)
+                for warning in self._pending_warnings:
+                    self._add_to_conversation(warning)
+                self._pending_warnings.clear()
                 if self.logger:
                     self.logger.log_system_resources()
                     self.logger.log_agent_end('completed', 'Assistant provided direct answer with no tool calls')
@@ -1118,176 +1130,64 @@ class Agent:
         log('DEBUG', 'core.session_history', f'session.summary exists: {self.session.summary is not None}')
 
     def _apply_summary_pruning_fallback(self, summary: str, keep_recent_turns: int):
-        """Fallback pruning for when no session is available (legacy behavior)."""
+        """Fallback pruning for when no session is available (legacy behavior).
+
+        This mirrors the main _apply_summary_pruning path: it mutates the existing
+        conversation list via insert/append rather than replacing it entirely.
+        """
         logger.warning('[DEBUG_PRUNING] Using fallback pruning (no session)')
-        system_messages = [msg for msg in self.conversation if msg.get('role') == 'system']
-        other_messages = [msg for msg in self.conversation if msg.get('role') != 'system']
-        if not other_messages:
+        if not self.conversation:
             return
-        turns = self._group_messages_into_turns(other_messages)
-        if keep_recent_turns <= 0:
-            kept_turns = []
-        else:
-            kept_turns = turns[-keep_recent_turns:] if keep_recent_turns <= len(turns) else turns
-        MAX_SUMMARY_LENGTH = 4000
+        # Use _find_summary_insertion_index (which uses the shared turn-grouping utility)
+        # to find the correct insertion point
+        insertion_idx = self._find_summary_insertion_index(self.conversation, keep_recent_turns)
+        MAX_SUMMARY_LENGTH = 20000
         truncated_summary = summary
         if len(truncated_summary) > MAX_SUMMARY_LENGTH:
             truncated_summary = truncated_summary[:MAX_SUMMARY_LENGTH] + '... (truncated)'
-        if kept_turns:
-            first_kept_turn_idx = len(turns) - len(kept_turns)
-            discarded_msg_count = sum((len(turns[i]) for i in range(first_kept_turn_idx)))
-        else:
-            discarded_msg_count = len(other_messages)
-        insertion_idx = discarded_msg_count + len(system_messages)
-        summary_msg = {'role': 'system', 'content': f'Summary of previous conversation: {truncated_summary}', 'summary': True, 'pruning_keep_recent_turns': keep_recent_turns, 'pruning_discarded_msg_count': discarded_msg_count, 'pruning_insertion_idx': insertion_idx}
-        cleaned_system_messages = []
-        if system_messages:
-            cleaned_system_messages.append(system_messages[0])
-        pruned_other = []
-        for turn in kept_turns:
-            pruned_other.extend(turn)
-        new_conversation = cleaned_system_messages + [summary_msg] + pruned_other
+        summary_msg = {'role': 'system', 'content': f'Summary of previous conversation: {truncated_summary}', 'summary': True, 'pruning_keep_recent_turns': keep_recent_turns, 'pruning_insertion_idx': insertion_idx}
         context_cleared_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] Context has been summarized. You now have a fresh context window and full access to tools.', 'is_system_notification': True}
-        # Append unwarning after the tool result (at the end of new_conversation)
-        new_conversation.append(context_cleared_msg)
-        self.conversation = new_conversation
-        logger.debug(f'[DEBUG_PRUNING] Fallback pruning: new conversation length {len(self.conversation)}')
+        # Insert summary at the computed position (mutating the existing list)
+        self.conversation.insert(insertion_idx, summary_msg)
+        log('DEBUG', 'core.message_insertion', f'Fallback: inserted summary at index {insertion_idx}')
+        # Append context-cleared notification at the end
+        self.conversation.append(context_cleared_msg)
+        log('DEBUG', 'core.message_insertion', f'Fallback: appended context cleared message (history length: {len(self.conversation)})')
+        # Invalidate context_builder cache to pick up the new summary
+        if hasattr(self, 'context_builder') and self.context_builder is not None and hasattr(self.context_builder, '_cached_context'):
+            self.context_builder._cached_context = None
+            log('DEBUG', 'core.context_builder', 'Fallback pruning: cleared _cached_context')
+        logger.debug(f'[DEBUG_PRUNING] Fallback pruning: conversation length {len(self.conversation)}')
 
     def _find_summary_insertion_index(self, user_history: List[Dict[str, Any]], keep_recent_turns: int) -> int:
         """Find index in user_history where summary should be inserted.
-        
+
+        Uses the shared group_messages_into_turns_with_indices utility which
+        supports multi-tool-call scenarios (checking ANY message in the turn
+        for assistant with tool_calls, not just the last message).
+
         Returns the index of the first message of the first kept turn.
         If keep_recent_turns is 0 or no turns to keep, returns len(user_history).
         """
         if keep_recent_turns <= 0:
             return len(user_history)
-        turns = []
-        current_turn = []
-        turn_start_indices = []
-        for i, msg in enumerate(user_history):
-            role = msg.get('role')
-            content = msg.get('content', '')
-            # Skip system messages and system notifications
-            if role == 'system' or msg.get('is_system_notification') is True:
-                continue
-            if role == 'user':
-                if current_turn:
-                    turns.append(current_turn)
-                current_turn = [msg]
-                turn_start_indices.append(i)
-            elif role == 'assistant' and msg.get('tool_calls'):
-                if current_turn:
-                    turns.append(current_turn)
-                current_turn = [msg]
-                turn_start_indices.append(i)
-            elif current_turn:
-                if role == 'tool':
-                    if current_turn and current_turn[-1].get('role') == 'assistant' and current_turn[-1].get('tool_calls'):
-                        current_turn.append(msg)
-                    else:
-                        continue
-                else:
-                    current_turn.append(msg)
-            else:
-                continue
-        if current_turn:
-            turns.append(current_turn)
-        valid_turn_indices = []
-        for idx, turn in enumerate(turns):
-            if not turn:
-                continue
-            first_msg = turn[0]
-            first_role = first_msg.get('role')
-            if first_role == 'user' or (first_role == 'assistant' and first_msg.get('tool_calls')):
-                valid_turn_indices.append(idx)
-        if not valid_turn_indices:
+        turns, turn_start_indices = group_messages_into_turns_with_indices(user_history)
+        if not turns:
             return len(user_history)
-        if keep_recent_turns > len(valid_turn_indices):
-            keep_recent_turns = len(valid_turn_indices)
-        first_kept_valid_idx = len(valid_turn_indices) - keep_recent_turns
-        first_kept_turn_idx = valid_turn_indices[first_kept_valid_idx]
-        if first_kept_turn_idx < len(turn_start_indices):
-            return turn_start_indices[first_kept_turn_idx]
-        else:
-            return len(user_history)
+        if keep_recent_turns > len(turns):
+            keep_recent_turns = len(turns)
+        first_kept_idx = len(turns) - keep_recent_turns
+        return turn_start_indices[first_kept_idx]
 
     def _group_messages_into_turns(self, messages: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
         """Group non-system messages into turns.
-        
-        Rules:
-        - User messages always start a new turn
-        - Assistant messages with tool_calls can also start a turn (after pruning)
-        - All messages after a turn start belong to that turn until next user message
-        - System messages should be filtered out before calling this method
-        - Turns that don't start with user or assistant-with-tools are discarded
-        
-        This ensures tool call sequences stay together, even when they start with
-        an assistant (due to pruning cutting off the user part of the turn).
+
+        Delegates to the shared group_messages_into_turns utility which provides
+        a single source of truth for turn-grouping logic. The shared version
+        uses the more robust multi-tool-call approach (checking ANY message in
+        the turn for assistant with tool_calls, not just the last message).
         """
-        turns = []
-        current_turn = []
-        import os
-        debug = os.environ.get('DEBUG_TURN_GROUPING')
-        if debug:
-            logger.debug(f'[DEBUG_TURN_GROUPING] Grouping {len(messages)} messages')
-            max_to_show = 10
-            for i, msg in enumerate(messages[:max_to_show]):
-                role = msg.get('role')
-                content_preview = str(msg.get('content', ''))[:50]
-                has_tool_calls = 'tool_calls' in msg and msg['tool_calls']
-                logger.debug(f'  [{i}] {role}: {content_preview}... tool_calls={has_tool_calls}')
-            if len(messages) > max_to_show:
-                logger.debug(f'  ... and {len(messages) - max_to_show} more messages')
-        for msg in messages:
-            role = msg.get('role')
-            content = msg.get('content', '')
-            if role == 'system' or msg.get('is_system_notification') is True:
-                continue
-            if role == 'user':
-                if current_turn:
-                    turns.append(current_turn)
-                current_turn = [msg]
-            elif role == 'assistant' and msg.get('tool_calls'):
-                if current_turn:
-                    turns.append(current_turn)
-                current_turn = [msg]
-            elif current_turn:
-                if role == 'tool':
-                    if current_turn and current_turn[-1].get('role') == 'assistant' and current_turn[-1].get('tool_calls'):
-                        current_turn.append(msg)
-                    else:
-                        if debug:
-                            tool_call_id = msg.get('tool_call_id', 'unknown')
-                            logger.debug(f'[DEBUG_TURN_GROUPING] Discarding orphaned tool message: {tool_call_id}')
-                        continue
-                else:
-                    current_turn.append(msg)
-            else:
-                if debug:
-                    logger.debug(f'[DEBUG_TURN_GROUPING] Discarding orphaned {role} message')
-                continue
-        if current_turn:
-            turns.append(current_turn)
-        valid_turns = []
-        for turn in turns:
-            if not turn:
-                continue
-            first_msg = turn[0]
-            first_role = first_msg.get('role')
-            if first_role == 'user':
-                valid_turns.append(turn)
-            elif first_role == 'assistant' and first_msg.get('tool_calls'):
-                valid_turns.append(turn)
-            elif debug:
-                logger.debug(f'[DEBUG_TURN_GROUPING] Discarding turn starting with {first_role}')
-        if debug:
-            logger.debug(f'[DEBUG_TURN_GROUPING] Returned {len(valid_turns)} valid turns')
-            max_to_show = 10
-            for i, turn in enumerate(valid_turns[:max_to_show]):
-                logger.debug(f"  Turn {i}: {[msg.get('role') for msg in turn]}")
-            if len(valid_turns) > max_to_show:
-                logger.debug(f'  ... and {len(valid_turns) - max_to_show} more turns')
-        return valid_turns
+        return group_messages_into_turns(messages)
 
     def reset(self):
         """Reset agent state."""

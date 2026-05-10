@@ -6,6 +6,7 @@ Extracted from agent.py to separate tool execution concerns.
 import json
 from typing import List, Dict, Any, Optional, Tuple
 import logging
+import tiktoken
 from pydantic import ValidationError
 from agent.logging import log
 from fast_json_repair import loads as repair_loads
@@ -87,7 +88,7 @@ class ToolExecutor:
             if not self.state.is_tool_allowed(tool_name):
                 tool_result = self._create_tool_rejection_message(tool_name)
                 add_tool_result({'role': 'tool', 'tool_call_id': tool_call['id'], 'content': tool_result})
-                tool_tokens = len(str(tool_result)) // 4
+                tool_tokens = self.agent.token_counter.estimate_tokens(tool_result) if self.agent is not None else self._estimate_tokens_fallback(tool_result)
                 update_token_func(tool_tokens)
                 executed_tools.append({'name': tool_name, 'arguments': {}, 'result': tool_result})
                 continue
@@ -130,7 +131,7 @@ class ToolExecutor:
             if self.logger:
                 self.logger.log_tool_result(tool_name, tool_result, tool_call['id'])
             add_tool_result({'role': 'tool', 'tool_call_id': tool_call['id'], 'content': tool_result})
-            tool_tokens = len(str(tool_result)) // 4
+            tool_tokens = self.agent.token_counter.estimate_tokens(tool_result) if self.agent is not None else self._estimate_tokens_fallback(tool_result)
             update_token_func(tool_tokens)
             if self.logger:
                 pass
@@ -196,10 +197,28 @@ class ToolExecutor:
         self.agent = None
         self.state = None
 
+    @staticmethod
+    def _estimate_tokens_fallback(text: str) -> int:
+        """Fallback token estimation using tiktoken when agent is unavailable."""
+        try:
+            encoder = tiktoken.get_encoding('cl100k_base')
+            return len(encoder.encode(str(text)))
+        except Exception:
+            return len(str(text)) // 4
+
     def _create_tool_rejection_message(self, tool_name: str) -> str:
         """Create rejection message for disallowed tool calls."""
         allowed_tools = self.state.get_allowed_tools()
         if allowed_tools:
-            return f"❌ TOOL CALL REJECTED ❌\n\nYou attempted to use '{tool_name}', which is currently FORBIDDEN.\n\nCurrent state: restrictions_active (limit exceeded)\nWhy: Token or turn limits exceeded.\n\nYou may call:\n- Final (to end conversation)\n- FinalReport (to end with report)\n\nPlease use Final or FinalReport now."
+            # Dynamically list all allowed tools
+            allowed_list = '\n'.join(f'- {t}' for t in allowed_tools)
+            return (
+                f"❌ TOOL CALL REJECTED ❌"
+                f"\n\nYou attempted to use '{tool_name}', which is currently FORBIDDEN."
+                f"\n\nCurrent state: restrictions_active (limit exceeded)"
+                f"\nWhy: Token or turn limits exceeded."
+                f"\n\nYou may call:\n{allowed_list}"
+                f"\n\nPlease use one of the allowed tools now."
+            )
         else:
             return f"❌ TOOL CALL REJECTED ❌\n\nYou attempted to use '{tool_name}', which is currently FORBIDDEN.\n\nCurrent state: token_state={self.state.token_state.value}, turn_state={self.state.turn_state.value}\nPossible reasons: Token or turn limits exceeded with active restrictions.\n\nCheck system warnings for required actions."
