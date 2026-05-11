@@ -903,31 +903,37 @@ class Agent:
             user_interaction_message = None
             pause_debug(f'Checking pause request before turn: _pause_requested={self._pause_requested}')
             if self._pause_requested:
-                pause_debug(f'Pause detected! Transitioning to PAUSING')
-                # Save grace turn: commit LLM response to user_history BEFORE yielding pause
-                assistant_msg = {'role': 'assistant', 'content': content}
-                if reasoning is not None:
-                    assistant_msg['reasoning_content'] = reasoning
-                elif tool_calls:
-                    assistant_msg['reasoning_content'] = ''
-                # Don't include tool_calls — they weren't executed
-                grace_tx = TurnTransaction(self.session, self.context_builder)
-                grace_tx.add_assistant_message(assistant_msg)
-                grace_tx.commit()
-                events = self.state.set_execution_state(ExecutionState.PAUSING)
-                for event in events:
-                    for yielded_event in self._handle_state_event(event):
-                        yield yielded_event
-                pause_debug(f'Clearing _pause_requested after pause')
-                self._pause_requested = False
-                pause_event = {'type': 'paused', 'stop_reason': 'paused', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens}
-                self._add_conversation_data_to_event(pause_event)
-                yield pause_event
-                turn_duration = time.time() - turn_start_time
-                if self.logger:
-                    self.logger.log_system_resources()
-                    self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
-                return
+                if tool_calls:
+                    # Defer pause: tools need to execute first.
+                    # _pause_requested stays True -> checkpoint 2 (line ~998) will catch it
+                    # after tools have run and turn_transaction has been committed.
+                    pause_debug(f'Pause requested but tool_calls present, deferring to after tool execution')
+                else:
+                    pause_debug(f'Pause detected! Transitioning to PAUSING')
+                    # Save grace turn: commit LLM response to user_history BEFORE yielding pause
+                    assistant_msg = {'role': 'assistant', 'content': content}
+                    if reasoning is not None:
+                        assistant_msg['reasoning_content'] = reasoning
+                    elif tool_calls:
+                        assistant_msg['reasoning_content'] = ''
+                    # Don't include tool_calls — they weren't executed
+                    grace_tx = TurnTransaction(self.session, self.context_builder)
+                    grace_tx.add_assistant_message(assistant_msg)
+                    grace_tx.commit()
+                    events = self.state.set_execution_state(ExecutionState.PAUSING)
+                    for event in events:
+                        for yielded_event in self._handle_state_event(event):
+                            yield yielded_event
+                    pause_debug(f'Clearing _pause_requested after pause')
+                    self._pause_requested = False
+                    pause_event = {'type': 'paused', 'stop_reason': 'paused', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens}
+                    self._add_conversation_data_to_event(pause_event)
+                    yield pause_event
+                    turn_duration = time.time() - turn_start_time
+                    if self.logger:
+                        self.logger.log_system_resources()
+                        self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
+                    return
             turn_transaction = TurnTransaction(self.session, self.context_builder)
             assistant_msg = {'role': 'assistant', 'content': content}
             if reasoning is not None:
