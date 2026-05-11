@@ -2,17 +2,16 @@
  * ConfigPanel.jsx
  *
  * Sidebar panel — each control sends update_config immediately.
- * The store is updated only when config_changed arrives from the backend,
- * so the controls are *driven* by store values (controlled components).
+ * The component is driven by the `config` prop (controlled component).
  *
- * Props: sendCommand(command, payload)
+ * Props:
+ *   sendCommand(command, payload)
+ *   config — { temperature, max_turns, provider, tools }
  */
 
 import React from 'react'
-import useStore from '../store/useStore'
 
-export default function ConfigPanel({ sendCommand }) {
-  const config = useStore((s) => s.config)
+export default function ConfigPanel({ sendCommand, config }) {
 
   const updateField = (field, value) => {
     sendCommand('update_config', { field, value })

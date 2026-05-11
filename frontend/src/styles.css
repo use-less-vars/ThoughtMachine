@@ -323,6 +323,162 @@ body {
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
+   SessionList (right sidebar)
+   ────────────────────────────────────────────────────────────────────────── */
+.app-center {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.session-list-panel {
+  width: 280px;
+  min-width: 280px;
+  padding: 1rem;
+  background: var(--bg-secondary);
+  border-left: 1px solid var(--border);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.session-list-header h3 {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.session-list-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.btn-save {
+  background: var(--success);
+  color: var(--bg-primary);
+}
+.btn-save:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+
+.btn-new {
+  background: var(--accent);
+  color: var(--bg-primary);
+}
+.btn-new:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.btn-sm {
+  padding: 0.25rem 0.5rem;
+  font-size: 0.75rem;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.btn-sm:hover {
+  background: var(--border);
+}
+
+.btn-icon {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0.2rem;
+  opacity: 0.6;
+  transition: opacity 0.15s;
+}
+.btn-icon:hover {
+  opacity: 1;
+}
+
+.session-list-items {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.session-list-empty {
+  color: var(--text-secondary);
+  font-style: italic;
+  font-size: 0.85rem;
+  text-align: center;
+  padding: 1rem 0;
+}
+
+.session-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 0.5rem;
+  background: var(--bg-surface);
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  cursor: default;
+  transition: border-color 0.15s;
+}
+
+.session-item:hover {
+  border-color: var(--border);
+}
+
+.session-item-active {
+  border-color: var(--accent) !important;
+}
+
+.session-item-info {
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.session-item-name {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-item-meta {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-item-actions {
+  display: flex;
+  gap: 0.2rem;
+  flex-shrink: 0;
+  margin-left: 0.5rem;
+}
+
+.session-rename-form {
+  display: flex;
+  gap: 0.3rem;
+  align-items: center;
+  width: 100%;
+}
+
+.session-rename-input {
+  flex: 1;
+  padding: 0.3rem 0.4rem;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  font-size: 0.85rem;
+  outline: none;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
    Scrollbar (Webkit)
    ────────────────────────────────────────────────────────────────────────── */
 ::-webkit-scrollbar {
@@ -338,3 +494,143 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--text-secondary);
 }
+
+/* ──────────────────────────────────────────────────────────────────────────
+   TabBar (open sessions)
+   ────────────────────────────────────────────────────────────────────────── */
+.tab-bar {
+  display: flex;
+  align-items: center;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  padding: 0 0.5rem;
+  min-height: 36px;
+}
+
+.tab-list {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  overflow-x: auto;
+  flex: 1;
+}
+
+.tab-item {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.6rem 0.35rem 0.8rem;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s;
+  user-select: none;
+  min-width: 0;
+  margin-top: 4px;
+}
+
+.tab-item:hover {
+  background: var(--border);
+  color: var(--text-primary);
+}
+
+.tab-active {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-color: var(--border);
+  border-bottom-color: var(--bg-primary);
+  font-weight: 600;
+}
+
+.tab-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 120px;
+}
+
+.tab-close-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  padding: 0.15rem 0.2rem;
+  border-radius: 3px;
+  line-height: 1;
+  transition: background 0.15s, color 0.15s;
+  flex-shrink: 0;
+}
+
+.tab-close-btn:hover {
+  background: var(--danger);
+  color: #fff;
+}
+
+.tab-new-btn {
+  background: none;
+  border: 1px dashed var(--border);
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  cursor: pointer;
+  font-size: 1rem;
+  color: var(--text-secondary);
+  padding: 0.35rem 0.7rem;
+  margin-top: 4px;
+  transition: background 0.15s, color 0.15s;
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+.tab-new-btn:hover {
+  background: var(--accent);
+  color: var(--bg-primary);
+  border-color: var(--accent);
+}
+
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Multi-tab additions
+   ────────────────────────────────────────────────────────────────────────── */
+
+.tab-content-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+}
+
+.tab-wrapper {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;  /* allow flex child to shrink below content height */
+}
+
+.session-tab-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.empty-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.empty-state p {
+  max-width: 300px;
+  text-align: center;
+  line-height: 1.6;
+}
+

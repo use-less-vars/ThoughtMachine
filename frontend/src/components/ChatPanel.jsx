@@ -1,13 +1,14 @@
 /*
  * ChatPanel.jsx
  *
- * Renders session.history as message bubbles.
+ * Renders a list of message bubbles.
  * Supports roles: user, assistant, tool_call, tool_result, system.
  * Each role gets a distinct CSS class and alignment.
+ *
+ * Props: history — array of { role, content } objects
  */
 
 import React, { useEffect, useRef } from 'react'
-import useStore from '../store/useStore'
 
 const ROLE_STYLE = {
   user:        { className: 'message-user',     label: 'You' },
@@ -27,8 +28,7 @@ function MessageBubble({ msg, index }) {
   )
 }
 
-export default function ChatPanel() {
-  const history = useStore((s) => s.session.history)
+export default function ChatPanel({ history }) {
   const bottomRef = useRef(null)
 
   useEffect(() => {

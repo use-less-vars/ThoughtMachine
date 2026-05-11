@@ -12,17 +12,15 @@
  *   PAUSED         |       | ✓     | ✓          continue_session(query) / stop_session
  *   WAITING... ✓   |       |        | ✓          continue_session(query)
  *
- * Props: sendCommand(command, payload)
+ * Props:
+ *   sendCommand(command, payload)
+ *   status, isRunning, config
  */
 
 import React, { useState } from 'react'
-import useStore from '../store/useStore'
 
-export default function QueryBar({ sendCommand }) {
+export default function QueryBar({ sendCommand, status, isRunning, config }) {
   const [query, setQuery] = useState('')
-  const status = useStore((s) => s.session.status)
-  const isRunning = useStore((s) => s.session.isRunning)
-  const config = useStore((s) => s.config)
 
   const isIdle = status === 'IDLE'
   const isBusy = status === 'RUNNING'

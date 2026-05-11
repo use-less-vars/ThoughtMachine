@@ -1,11 +1,12 @@
 /*
  * StatusBar.jsx
  *
- * Shows session.status (coloured dot + label), tokensIn/Out, contextLength.
+ * Shows session status (coloured dot + label), tokensIn/Out, contextLength.
+ *
+ * Props: status, tokensIn, tokensOut, contextLength
  */
 
 import React from 'react'
-import useStore from '../store/useStore'
 
 function statusDisplay(status) {
   switch (status) {
@@ -22,17 +23,16 @@ function statusDisplay(status) {
   }
 }
 
-export default function StatusBar() {
-  const session = useStore((s) => s.session)
-  const { className, label } = statusDisplay(session.status)
+export default function StatusBar({ status, tokensIn, tokensOut, contextLength }) {
+  const { className, label } = statusDisplay(status)
 
   return (
     <div className="status-bar">
       <span className={`status-indicator ${className}`}>{label}</span>
       <span className="status-sep">|</span>
-      <span>Tokens: In={session.tokensIn} / Out={session.tokensOut}</span>
+      <span>Tokens: In={tokensIn} / Out={tokensOut}</span>
       <span className="status-sep">|</span>
-      <span>Context: {session.contextLength}</span>
+      <span>Context: {contextLength}</span>
     </div>
   )
 }

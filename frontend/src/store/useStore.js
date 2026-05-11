@@ -1,71 +1,23 @@
 /*
- * Zustand store — the single source of truth for all UI state.
+ * useStore.js — Zustand store
  *
- * State shape:
- *   session   { status, history, tokensIn, tokensOut, contextLength }
- *   config    { temperature, max_turns, provider, tools }
- *   securityQueue  (placeholder)
+ * After the multi-tab refactoring, the store only holds data that is
+ * shared across all tabs: the sessions list.
  *
- * All actions are thin wrappers around set().
- * The WebSocket handler in App.jsx calls these actions when events arrive.
+ * Each SessionTab manages its own local state (status, history, tokens,
+ * config, etc.) via useState, since those are per-tab concerns.
  */
 
 import { create } from 'zustand'
 
-// ────────────────────────────────────────────────────────────────────────────
-// Initial state
-// ────────────────────────────────────────────────────────────────────────────
 const initialState = {
-  session: {
-    status: 'IDLE',           // IDLE | RUNNING | PAUSED | WAITING_FOR_USER
-    history: [],              // messages: { role, content }
-    tokensIn: 0,
-    tokensOut: 0,
-    contextLength: 0,
-    isRunning: false,         // true = agent thread alive, can continue_session
-  },
-  config: {
-    temperature: 0.7,
-    max_turns: 20,
-    provider: 'openai',
-    tools: [
-      { name: 'bash', enabled: true },
-      { name: 'file_read', enabled: false },
-    ],
-  },
-  securityQueue: [],
+  sessions: [],  // list of { session_id, name, created_at, updated_at, preview }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Store creation
-// ────────────────────────────────────────────────────────────────────────────
 const useStore = create((set) => ({
   ...initialState,
 
-  setStatus: (status) =>
-    set((s) => ({ session: { ...s.session, status } })),
-
-  setRunning: (isRunning) =>
-    set((s) => ({ session: { ...s.session, isRunning } })),
-
-  setHistory: (history) =>
-    set((s) => ({ session: { ...s.session, history } })),
-
-  setTokens: (tokensIn, tokensOut) =>
-    set((s) => ({ session: { ...s.session, tokensIn, tokensOut } })),
-
-  setContextLength: (contextLength) =>
-    set((s) => ({ session: { ...s.session, contextLength } })),
-
-  setConfig: (config) => set({ config }),
-
-  addStatusMessage: (text) =>
-    set((s) => ({
-      session: {
-        ...s.session,
-        history: [...s.session.history, { role: 'system', content: text }],
-      },
-    })),
+  setSessions: (sessions) => set({ sessions }),
 
   reset: () => set({ ...initialState }),
 }))

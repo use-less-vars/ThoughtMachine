@@ -1,120 +1,247 @@
 /*
  * App.jsx
  *
- * Root component — layout + WebSocket lifecycle + event → store routing.
+ * Root component — hub WebSocket for sessions list + tab management.
  *
- * Layout:
- *   ┌──────────────────────────────────────┐
- *   │            StatusBar                  │
- *   ├──────────────┬───────────────────────┤
- *   │  ConfigPanel │      ChatPanel         │
- *   │  (sidebar)   │    (conversation)      │
- *   ├──────────────┴───────────────────────┤
- *   │            QueryBar                   │
- *   └──────────────────────────────────────┘
+ * Architecture (multi-tab):
+ *   ┌──────────────────────────────────────────────────┐
+ *   │                   TabBar                          │
+ *   ├──────────────────────────────────────────────────┤
+ *   │  ┌─ Tab 1 ──┐  ┌─ Tab 2 ──┐  ┌─ Tab 3 ──┐      │
+ *   │  │ SessionTab │  │ SessionTab │  │ SessionTab │  │
+ *   │  │ (own WS)  │  │ (own WS)  │  │ (own WS)  │  │
+ *   │  └───────────┘  └───────────┘  └───────────┘      │
+ *   ├──────────────────────────────────────────────────┤
+ *   │              SessionList (sidebar)                │
+ *   └──────────────────────────────────────────────────┘
  *
- * WebSocket events (mapped to store actions):
- *   state_changed         →  setStatus(msg.state) + setRunning(msg.is_running)
- *   tokens_updated        →  setTokens(msg.input, msg.output)
- *   context_updated       →  setContextLength(msg.context_length)
- *   conversation_changed  →  setHistory(msg.messages)
- *   config_changed        →  setConfig(msg.config)
- *   status_message        →  addStatusMessage(msg.text)
+ * App maintains one "hub" WebSocket that only handles:
+ *   - list_sessions → sessions_list
+ *   - session_saved
+ *   - session_deleted
+ *   - session_renamed
+ *
+ * Each SessionTab creates its OWN WebSocket for session interaction.
+ * App manages a tabs array: [ { tabId, sessionId }, ... ]
  */
 
-import React, { useEffect, useRef, useCallback } from 'react'
+import React, { useEffect, useRef, useCallback, useState } from 'react'
 import useStore from './store/useStore'
-import ChatPanel from './components/ChatPanel'
-import QueryBar from './components/QueryBar'
-import StatusBar from './components/StatusBar'
-import ConfigPanel from './components/ConfigPanel'
+import SessionTab from './components/SessionTab'
+import SessionList from './components/SessionList'
+import TabBar from './components/TabBar'
 import './styles.css'
 
 const WS_URL = `ws://${window.location.hostname}:8000/ws`
 
-export default function App() {
-  const wsRef = useRef(null)
+let nextTabId = 1
 
-  // ── Socket lifecycle ──────────────────────────────────────────────────
+export default function App() {
+  const [tabs, setTabs] = useState([])           // { tabId, sessionId }
+  const [activeTabId, setActiveTabId] = useState(null)
+  const wsRef = useRef(null)
+  const tabActionsRef = useRef({})   // tabId -> { sendCommand }
+
+  // ── Hub WebSocket (sessions list only) ─────────────────────────────────
   useEffect(() => {
     const ws = new WebSocket(WS_URL)
     wsRef.current = ws
 
-    ws.onopen = () => console.log("✅ WS onopen")
+    ws.onopen = () => {
+      console.log("✅ [Hub WS] onopen")
+      ws.send(JSON.stringify({ command: 'list_sessions' }))
+    }
 
     ws.onmessage = (event) => {
-      console.log("📨 WS message:", event.data)
       try {
         const msg = JSON.parse(event.data)
-        handleEvent(msg)
+        handleHubEvent(msg)
       } catch (err) {
-        console.error('Failed to parse message:', event.data, err)
+        console.error('[Hub WS] Failed to parse message:', event.data, err)
       }
     }
 
     ws.onclose = (e) => {
-      console.log("❌ WS onclose code:", e.code, "reason:", e.reason, "wasClean:", e.wasClean)
-      useStore.getState().addStatusMessage('Disconnected from agent server.')
-      useStore.getState().setStatus('IDLE')
+      console.log("❌ [Hub WS] onclose", e.code, e.reason)
     }
 
     ws.onerror = (e) => {
-      console.error("🔥 WS onerror", e)
-      useStore.getState().addStatusMessage('WebSocket error — see console.')
+      console.error("🔥 [Hub WS] error", e)
     }
 
     return () => ws.close()
   }, [])
 
-  // ── Event router (calls store actions directly) ───────────────────────
-  function handleEvent(msg) {
+  // ── Hub event router ────────────────────────────────────────────────────
+  function handleHubEvent(msg) {
     const store = useStore.getState()
     switch (msg.type) {
-      case 'state_changed':
-        store.setStatus(msg.state)
-        store.setRunning(msg.is_running !== false)
+      case 'sessions_list':
+        store.setSessions(msg.sessions ?? [])
         break
-      case 'tokens_updated':
-        store.setTokens(msg.input ?? 0, msg.output ?? 0)
+      case 'session_saved':
+        wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
         break
-      case 'context_updated':
-        store.setContextLength(msg.context_length ?? 0)
+      case 'session_deleted':
+        wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
         break
-      case 'conversation_changed':
-        console.log("📨 Store before update:", useStore.getState().session.history)
-        store.setHistory(msg.messages ?? [])
-        console.log("📨 Store after update:", useStore.getState().session.history)
-        break
-      case 'config_changed':
-        store.setConfig(msg.config)
-        break
-      case 'status_message':
-        store.addStatusMessage(msg.text ?? '')
+      case 'session_renamed':
+        wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
         break
       default:
-        console.warn('Unknown event type:', msg.type)
+        // Other events (state_changed, conversation_changed, etc.)
+        // are handled by individual SessionTab WebSockets.
+        break
     }
   }
 
-  // ── sendCommand helper ────────────────────────────────────────────────
-  const sendCommand = useCallback((command, payload = {}) => {
+  // ── Hub sendCommand (only for sessions-list operations) ─────────────────
+  const hubSend = useCallback((command, payload = {}) => {
     const ws = wsRef.current
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      useStore.getState().addStatusMessage('Cannot send — not connected.')
-      return
-    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
     ws.send(JSON.stringify({ command, ...payload }))
   }, [])
 
-  // ── Render ────────────────────────────────────────────────────────────
+  // ── Tab management ──────────────────────────────────────────────────────
+  const addTab = useCallback((sessionId = null) => {
+    const tabId = `tab-${nextTabId++}`
+    setTabs((prev) => [...prev, { tabId, sessionId }])
+    setActiveTabId(tabId)
+  }, [])
+
+  // Initiate close: send close_session over the tab's own WS.
+  // Do NOT remove from DOM yet — wait for server acknowledgement.
+  const initiateCloseTab = useCallback((tabId) => {
+    const actions = tabActionsRef.current[tabId]
+    if (actions?.sendCommand) {
+      actions.sendCommand('close_session')
+    } else {
+      // No WS connected — remove immediately
+      removeTab(tabId)
+    }
+  }, [])
+
+  // Actually remove the tab from DOM (called when server acknowledges close
+  // via session_closed event, or on unexpected WS close).
+  const removeTab = useCallback((tabId) => {
+    setTabs((prev) => {
+      const idx = prev.findIndex((t) => t.tabId === tabId)
+      if (idx === -1) return prev  // already removed
+      const next = prev.filter((t) => t.tabId !== tabId)
+      if (tabId === activeTabId) {
+        const newIdx = Math.min(idx, next.length - 1)
+        setActiveTabId(next.length > 0 ? next[newIdx >= 0 ? newIdx : 0].tabId : null)
+      }
+      return next
+    })
+    delete tabActionsRef.current[tabId]
+  }, [activeTabId])
+
+  const handleNewTab = useCallback(() => {
+    addTab(null) // null sessionId = fresh session
+  }, [addTab])
+
+  const handleOpenTab = useCallback((sessionId) => {
+    setTabs((prev) => {
+      const existing = prev.find((t) => t.sessionId === sessionId)
+      if (existing) {
+        setActiveTabId(existing.tabId)
+        return prev
+      }
+      const tabId = `tab-${nextTabId++}`
+      setActiveTabId(tabId)
+      return [...prev, { tabId, sessionId }]
+    })
+  }, [])
+
+  const handleSessionSaved = useCallback((sessionId) => {
+    // Refresh sessions list
+    hubSend('list_sessions')
+  }, [hubSend])
+
+  const handleNewSessionCreated = useCallback((sessionId) => {
+    // Update the tab that created this session with its new sessionId
+    setTabs((prev) =>
+      prev.map((t) => (t.sessionId === null ? { ...t, sessionId } : t))
+    )
+  }, [])
+
+  // ── Tab action registry (for save from SessionList) ───────────────────
+  const handleRegisterTab = useCallback((tabId, actions) => {
+    tabActionsRef.current[tabId] = actions
+  }, [])
+
+  const handleSaveActiveTab = useCallback(() => {
+    const actions = tabActionsRef.current[activeTabId]
+    if (actions?.sendCommand) {
+      actions.sendCommand('save_session')
+    }
+  }, [activeTabId])
+
+  // ── Derive tab names from sessions list ─────────────────────────────────
+  const sessions = useStore((s) => s.sessions)
+  const sessionMap = {}
+  for (const s of sessions) {
+    sessionMap[s.session_id] = s.name || 'Untitled'
+  }
+
+  const tabItems = tabs.map((t) => ({
+    id: t.tabId,
+    name: t.sessionId ? (sessionMap[t.sessionId] || t.sessionId.slice(0, 8)) : 'New Session',
+  }))
+
+  const activeTab = tabs.find((t) => t.tabId === activeTabId)
+
+  // ── Render ──────────────────────────────────────────────────────────────
   return (
     <div className="app-container">
-      <StatusBar />
+      <TabBar
+        tabs={tabItems}
+        activeTabId={activeTabId}
+        onSelectTab={setActiveTabId}
+        onCloseTab={initiateCloseTab}
+        onNewTab={handleNewTab}
+      />
+
       <div className="app-main">
-        <ConfigPanel sendCommand={sendCommand} />
-        <ChatPanel />
+        {/* All tabs stay mounted; inactive ones hidden with display:none */}
+        <div className="app-center tab-content-area">
+          {tabs.length === 0 ? (
+            <div className="empty-state">
+              <p>Open a session or create a new one to get started.</p>
+            </div>
+          ) : (
+            tabs.map((tab) => (
+              <div
+                key={tab.tabId}
+                className="tab-wrapper"
+                style={{ display: tab.tabId === activeTabId ? '' : 'none' }}
+              >
+                <SessionTab
+                  sessionId={tab.sessionId}
+                  onClose={() => removeTab(tab.tabId)}
+                  onNewSession={handleNewSessionCreated}
+                  onSessionSaved={handleSessionSaved}
+                  onRegister={(actions) => handleRegisterTab(tab.tabId, actions)}
+                />
+              </div>
+            ))
+          )}
+        </div>
+
+        {/* Sessions sidebar */}
+        <SessionList
+          sessions={sessions}
+          onSave={handleSaveActiveTab}
+          saveEnabled={activeTabId != null}
+          onNew={handleNewTab}
+          onOpenTab={handleOpenTab}
+          onDelete={(sessionId) => hubSend('delete_session', { session_id: sessionId })}
+          onRename={(sessionId, newName) =>
+            hubSend('rename_session', { session_id: sessionId, new_name: newName })
+          }
+        />
       </div>
-      <QueryBar sendCommand={sendCommand} />
     </div>
   )
 }
