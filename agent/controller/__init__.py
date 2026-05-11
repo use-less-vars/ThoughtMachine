@@ -5,8 +5,31 @@ import queue
 import traceback
 from agent.config import AgentConfig
 from agent import Agent
-from typing import Optional, List, Dict, Any
-from PyQt6.QtCore import QObject, pyqtSignal
+from typing import Optional, Callable, List, Dict, Any
+try:
+    from PyQt6.QtCore import QObject, pyqtSignal
+    _HAS_QT = True
+except ImportError:
+    _HAS_QT = False
+    # Dummy QObject for non-Qt environments
+    class QObject:
+        """Stand-in when PyQt6 is not installed."""
+        pass
+
+    class _DummySignal:
+        """Stand-in for pyqtSignal when PyQt6 is not installed."""
+        def __init__(self, *args, **kwargs):
+            pass
+        def emit(self, *args, **kwargs):
+            pass
+        def connect(self, *args, **kwargs):
+            pass
+        def disconnect(self, *args, **kwargs):
+            pass
+
+    def pyqtSignal(*args, **kwargs):
+        """Return a dummy signal object when PyQt6 is not available."""
+        return _DummySignal()
 from agent.logging import log
 
 class AgentController(QObject):
@@ -32,6 +55,16 @@ class AgentController(QObject):
         self._keep_alive = True
         self._pause_requested = False
         self._processing_query = False
+        # Plain Python callbacks (non-Qt consumers like Web UI)
+        self._event_callbacks: List[Callable[[Dict[str, Any]], None]] = []
+
+    def set_event_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """
+        Register a plain Python callback for events.
+        Unlike the pyqtSignal, this works without a Qt event loop.
+        """
+        if callback not in self._event_callbacks:
+            self._event_callbacks.append(callback)
 
     def _cleanup_if_thread_dead(self):
         """Check if background thread is dead and reset state if needed."""
@@ -282,15 +315,29 @@ class AgentController(QObject):
                 self.agent._pause_requested = False
 
     def _emit_event(self, event):
-        """Emit event both to queue and signal."""
+        """Emit event to queue, signal, and plain callbacks."""
         event['session_id'] = self.current_session_id
         self.event_queue.put(event)
         log('DEBUG', 'core.controller', f"Emitting event_occurred: {event.get('type')}")
-        self.event_occurred.emit(event)
+        # Qt signal path (requires QApplication running)
+        try:
+            self.event_occurred.emit(event)
+        except RuntimeError:
+            pass  # No QApplication – safe to ignore
+        # Plain callback path (works without Qt — used by Web UI)
+        for cb in self._event_callbacks:
+            try:
+                cb(event)
+            except Exception:
+                import traceback as _tb
+                _tb.print_exc()
         content_event_types = {'user_query', 'turn', 'tool_call', 'tool_result', 'final', 'llm_request', 'llm_response', 'raw_response'}
         if event.get('type') in content_event_types:
             log('DEBUG', 'core.controller', f"Emitting conversation_updated for event type {event.get('type')}")
-            self.conversation_updated.emit(self.current_session_id if self.current_session_id else '')
+            try:
+                self.conversation_updated.emit(self.current_session_id if self.current_session_id else '')
+            except RuntimeError:
+                pass
 
     def _run(self):
         """Internal method that runs in the background thread."""

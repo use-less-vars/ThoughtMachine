@@ -11,7 +11,34 @@ import os
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 from agent.logging import log
-from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+try:
+    from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+except ImportError:
+    # Dummy Qt objects for non-Qt environments
+    class QObject:
+        """Stand-in when PyQt6 is not installed."""
+        pass
+
+    class _DummySignal:
+        """Stand-in for pyqtSignal when PyQt6 is not installed."""
+        def __init__(self, *args, **kwargs):
+            pass
+        def emit(self, *args, **kwargs):
+            pass
+        def connect(self, *args, **kwargs):
+            pass
+        def disconnect(self, *args, **kwargs):
+            pass
+
+    def pyqtSignal(*args, **kwargs):
+        """Return a dummy signal object when PyQt6 is not available."""
+        return _DummySignal()
+
+    def pyqtSlot(*args, **kwargs):
+        """No-op decorator when PyQt6 is not available."""
+        def decorator(func):
+            return func
+        return decorator
 from agent.controller import AgentController
 from agent.config import AgentConfig, load_default_config
 from tools import SIMPLIFIED_TOOL_CLASSES

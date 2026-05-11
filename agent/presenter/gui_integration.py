@@ -6,7 +6,30 @@ Separates Qt dependencies from business logic.
 """
 from typing import Optional, Dict, Any
 from agent.logging import log
-from PyQt6.QtCore import QObject, pyqtSignal
+try:
+    from PyQt6.QtCore import QObject, pyqtSignal
+    _HAS_QT = True
+except ImportError:
+    _HAS_QT = False
+    # Dummy QObject for non-Qt environments
+    class QObject:
+        """Stand-in when PyQt6 is not installed."""
+        pass
+
+    class _DummySignal:
+        """Stand-in for pyqtSignal when PyQt6 is not installed."""
+        def __init__(self, *args, **kwargs):
+            pass
+        def emit(self, *args, **kwargs):
+            pass
+        def connect(self, *args, **kwargs):
+            pass
+        def disconnect(self, *args, **kwargs):
+            pass
+
+    def pyqtSignal(*args, **kwargs):
+        """Return a dummy signal object when PyQt6 is not available."""
+        return _DummySignal()
 from agent.core.state import ExecutionState
 
 class GUIIntegration(QObject):
