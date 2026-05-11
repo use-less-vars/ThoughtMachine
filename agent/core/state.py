@@ -97,10 +97,9 @@ class AgentState:
             else:
                 formatted = self._format_tokens(total_tokens)
                 warning = f'Token usage is at the critical threshold ({formatted} tokens). Please summarize to reduce context size or complete work. Only SummarizeTool, Final, and FinalReport will be available.'
-            if new_state != TokenState.CRITICAL:
-                self.last_token_warning = warning
-                self.last_token_warning_count = total_tokens
-                self.last_token_warning_state = new_state
+            self.last_token_warning = warning
+            self.last_token_warning_count = total_tokens
+            self.last_token_warning_state = new_state
             if self.logger:
                 self.logger.log_token_warning(old_state.value, new_state.value, total_tokens, warning)
             token_warning_data = {'old_state': old_state.value, 'new_state': new_state.value, 'token_count': total_tokens, 'warning_message': warning, 'state': new_state.value}
