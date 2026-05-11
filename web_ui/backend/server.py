@@ -40,7 +40,7 @@ Client → Server (JSON):
     { "command": "update_config",     "field": "...", "value": ... }
 
 Server → Client (JSON):
-    state_changed       { "type": "state_changed",       "state": "IDLE|RUNNING|PAUSED|WAITING_FOR_USER" }
+    state_changed       { "type": "state_changed",       "state": "IDLE|RUNNING|PAUSED|WAITING_FOR_USER", "is_running": bool }
     tokens_updated      { "type": "tokens_updated",      "input": int, "output": int }
     context_updated     { "type": "context_updated",     "context_length": int }
     conversation_changed { "type": "conversation_changed", "messages": [...] }
@@ -172,12 +172,11 @@ async def websocket_endpoint(ws: WebSocket):
                             "text": f"⚠ Failed to start: {exc}",
                         })
                         continue
-                    await ws.send_json({"type": "state_changed", "state": "RUNNING"})
-                    await ws.send_json({"type": "status_message", "text": f"Session started."})
+                    await ws.send_json({"type": "status_message", "text": "Session started."})
 
                 elif command == "continue_session":
                     if bridge is None or not bridge.is_running:
-                        await ws.send_json({"type": "status_message", "text": "⚠ No active session."})
+                        await ws.send_json({"type": "status_message", "text": "No active session — start a new one."})
                         continue
                     query = msg.get("query", "")
                     if not query.strip():
@@ -185,7 +184,6 @@ async def websocket_endpoint(ws: WebSocket):
                         continue
                     try:
                         bridge.continue_session(query)
-                        await ws.send_json({"type": "state_changed", "state": "RUNNING"})
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
@@ -195,19 +193,16 @@ async def websocket_endpoint(ws: WebSocket):
                 elif command == "pause_session":
                     if bridge is not None:
                         bridge.pause()
-                        await ws.send_json({"type": "state_changed", "state": "PAUSED"})
                         await ws.send_json({"type": "status_message", "text": "⏸ Paused."})
 
                 elif command == "resume_session":
                     if bridge is not None:
                         bridge.resume()
-                        await ws.send_json({"type": "state_changed", "state": "RUNNING"})
                         await ws.send_json({"type": "status_message", "text": "▶ Resumed."})
 
                 elif command == "stop_session":
                     if bridge is not None:
                         bridge.stop()
-                        await ws.send_json({"type": "state_changed", "state": "IDLE"})
                         await ws.send_json({"type": "status_message", "text": "⏹ Stopped."})
 
                 elif command == "get_config":

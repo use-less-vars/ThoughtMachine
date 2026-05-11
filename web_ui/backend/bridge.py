@@ -95,7 +95,11 @@ class WebAgentBridge:
 
     @property
     def is_running(self) -> bool:
-        return self._running and (self._thread is not None and self._thread.is_alive())
+        """
+        Whether the agent thread (standalone) or controller thread (controller mode)
+        is still alive and can accept follow-up queries.
+        """
+        return self._get_is_running()
 
     @property
     def is_paused(self) -> bool:
@@ -353,11 +357,11 @@ class WebAgentBridge:
             msg = self._event_to_message(raw_event)
             if msg is not None:
                 self.history.append(msg)
-            # Send full conversation snapshot
-            results.append({
-                "type": "conversation_changed",
-                "messages": list(self.history),
-            })
+                # Send full conversation snapshot — only when history actually changed
+                results.append({
+                    "type": "conversation_changed",
+                    "messages": list(self.history),
+                })
             if event_type == "final":
                 results.append({
                     "type": "state_changed",
