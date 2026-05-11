@@ -84,7 +84,7 @@ class _AgentLogger:
     Thread-safe for use in the agent's background thread.
     """
 
-    def __init__(self, config: 'AgentConfig', log_dir: str='./logs', log_level: Union[str, LogLevel]=LogLevel.INFO, file_log_level: Union[str, LogLevel]=LogLevel.DEBUG, enable_file_logging: bool=True, enable_console_logging: bool=False, jsonl_format: bool=True, max_file_size_mb: int=10, max_backup_files: int=5, session_id: Optional[str]=None):
+    def __init__(self, config: 'AgentConfig', log_dir: str='./logs', log_level: Union[str, LogLevel]=LogLevel.INFO, file_log_level: Union[str, LogLevel]=LogLevel.DEBUG, enable_file_logging: bool=True, enable_console_logging: bool=False, jsonl_format: bool=True, max_file_size_mb: int=10, session_id: Optional[str]=None):
         """
         Initialize the logger.
         
@@ -97,7 +97,6 @@ class _AgentLogger:
             enable_console_logging: Whether to print logs to console
             jsonl_format: Whether to use JSONL format for file logging
             max_file_size_mb: Maximum log file size in MB before rotation
-            max_backup_files: Maximum number of backup files to keep
             session_id: Unique identifier for this agent session (auto-generated if None)
         """
         self.config = config
@@ -118,7 +117,6 @@ class _AgentLogger:
         self.enable_console_logging = enable_console_logging
         self.jsonl_format = jsonl_format
         self.max_file_size_bytes = max_file_size_mb * 1024 * 1024
-        self.max_backup_files = max_backup_files
         debug_length = os.getenv('DEBUG_TRUNCATE_LENGTH')
         tool_result_env = os.getenv('TOOL_RESULT_TRUNCATE_LENGTH', debug_length)
         self.tool_result_truncate = int(tool_result_env) if tool_result_env else 100
@@ -138,6 +136,7 @@ class _AgentLogger:
         self._current_file_size = 0
         os.makedirs(self.log_dir, exist_ok=True)
         _cleanup_old_logs(self.log_dir)
+        _prune_logs_by_size(self.log_dir)
         self.log_file_path = os.path.join(self.log_dir, f"agent_{self.session_id}.{('jsonl' if jsonl_format else 'log')}")
         self.py_logger = python_logging.getLogger(f'agent_{self.session_id}')
         self.py_logger.setLevel(self._to_python_log_level(self.log_level))
@@ -212,7 +211,24 @@ class _AgentLogger:
                 self._file_handle.flush()
                 self._current_file_size += len(json_line.encode('utf-8'))
                 if self._current_file_size >= self.max_file_size_bytes:
-                    self._rotate_log_file()
+                    # Archive current log file with timestamp
+                    try:
+                        self._file_handle.close()
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        archived_path = f'{self.log_file_path}.{timestamp}'
+                        if os.path.exists(self.log_file_path):
+                            os.replace(self.log_file_path, archived_path)
+                        self._file_handle = open(self.log_file_path, 'a', encoding='utf-8')
+                        self._current_file_size = 0
+                        _prune_logs_by_size(self.log_dir)
+                    except Exception as rotate_e:
+                        print(f"[LOGGING ERROR] Failed to archive log file: {rotate_e}", file=__import__('sys').stderr)
+                        self._file_handle = None
+                        try:
+                            self._file_handle = open(self.log_file_path, 'a', encoding='utf-8')
+                        except:
+                            self._file_handle = None
+                            self.enable_file_logging = False
             except Exception as e:
                 print(f"[LOGGING ERROR] Failed to write log entry: {e}", file=__import__('sys').stderr)
                 # Attempt fallback write to agent_fallback.jsonl
@@ -232,36 +248,6 @@ class _AgentLogger:
                     pass
                 self._file_handle = None
 
-    def _rotate_log_file(self):
-        """Rotate log file when it reaches maximum size."""
-        if not self.enable_file_logging or not self._file_handle or self._file_handle.closed:
-            return
-        with self._lock:
-            try:
-                self._file_handle.close()
-                # Clean up the oldest backup file if it exists (beyond max_backup_files)
-                oldest_file = f'{self.log_file_path}.{self.max_backup_files + 1}'
-                if os.path.exists(oldest_file):
-                    os.remove(oldest_file)
-                # Rotate: shift .i → .i+1 for i from max_backup_files-1 down to 1
-                for i in range(self.max_backup_files - 1, 0, -1):
-                    old_file = f'{self.log_file_path}.{i}'
-                    new_file = f'{self.log_file_path}.{i + 1}'
-                    if os.path.exists(old_file):
-                        os.replace(old_file, new_file)
-                # Move current log to .1 (overwrites if exists)
-                if os.path.exists(self.log_file_path):
-                    os.replace(self.log_file_path, f'{self.log_file_path}.1')
-                self._file_handle = open(self.log_file_path, 'a', encoding='utf-8')
-                self._current_file_size = 0
-            except Exception as e:
-                print(f"[LOGGING ERROR] Failed to rotate log file: {e}", file=__import__('sys').stderr)
-                self._file_handle = None
-                try:
-                    self._file_handle = open(self.log_file_path, 'a', encoding='utf-8')
-                except:
-                    self._file_handle = None
-                    self.enable_file_logging = False
 
     def _log_event(self, event_type: LogEventType, level: LogLevel, message: str='', data: Optional[Dict[str, Any]]=None, turn: Optional[int]=None):
         """
@@ -640,6 +626,61 @@ def _cleanup_old_logs(log_dir: str) -> None:
         pass  # Best-effort cleanup
 
 
+def _prune_logs_by_size(log_dir: str) -> None:
+    """
+    Hard-prune old log files when total directory size exceeds a limit.
+
+    Reads TM_LOG_DIR_MAX_MB env var (default: 50, 0 = unlimited).
+    When total size exceeds the limit, the oldest files (by mtime) are
+    deleted until total size is back within bounds.
+
+    Only targets files matching the agent log pattern:
+      agent_*.jsonl, agent_*.jsonl.*, agent_*.log, agent_*.log.*
+    """
+    import fnmatch
+    try:
+        max_mb = int(os.environ.get('TM_LOG_DIR_MAX_MB', '50'))
+        if max_mb <= 0:
+            return
+        max_bytes = max_mb * 1024 * 1024
+        if not os.path.isdir(log_dir):
+            return
+
+        # Collect all agent log files with their sizes and mtimes
+        log_patterns = ('agent_*.jsonl', 'agent_*.jsonl.*', 'agent_*.log', 'agent_*.log.*')
+        files = []
+        total_size = 0
+        for fname in os.listdir(log_dir):
+            if not any(fnmatch.fnmatch(fname, pat) for pat in log_patterns):
+                continue
+            fpath = os.path.join(log_dir, fname)
+            if not os.path.isfile(fpath):
+                continue
+            try:
+                size = os.path.getsize(fpath)
+                mtime = os.path.getmtime(fpath)
+                files.append((mtime, fpath, size))
+                total_size += size
+            except OSError:
+                continue
+
+        if total_size <= max_bytes:
+            return
+
+        # Sort by mtime (oldest first) and delete until under limit
+        files.sort(key=lambda x: x[0])  # ascending mtime = oldest first
+        for mtime, fpath, size in files:
+            if total_size <= max_bytes:
+                break
+            try:
+                os.remove(fpath)
+                total_size -= size
+            except OSError:
+                continue
+    except Exception:
+        pass  # Best-effort cleanup
+
+
 def create_logger(config: 'AgentConfig') -> Optional[_AgentLogger]:
     """Create a logger based on config settings."""
     if not getattr(config, 'enable_logging', False):
@@ -666,7 +707,6 @@ def create_logger(config: 'AgentConfig') -> Optional[_AgentLogger]:
             enable_console_logging=getattr(config, 'enable_console_logging', False),
             jsonl_format=getattr(config, 'jsonl_format', True),
             max_file_size_mb=getattr(config, 'max_file_size_mb', 10),
-            max_backup_files=getattr(config, 'max_backup_files', 5),
             session_id=getattr(config, 'session_id', None)
         )
         return logger

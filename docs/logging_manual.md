@@ -54,8 +54,12 @@ unset TM_LOG_LEVEL TM_LOG_TAGS DEBUG_EVENTBUS
 File Logging (JSONL) Control
 Variable	Effect	Default
 TM_LOG_FILE_LEVEL	Minimum level written to JSONL file	DEBUG
+TM_LOG_DIR_MAX_MB	Hard limit on total log directory size (0 = unlimited)	50
 
 All logs are written to logs/agent_<session_id>.jsonl. Rotation: 10 MB, 5 backups.
+Total directory size is capped at TM_LOG_DIR_MAX_MB (default 50 MB).
+When exceeded, the oldest files (by modification time) are deleted until
+under the limit. Set to 0 to disable size-based pruning.
 Truncation (Prevents Bloat)
 Variable	Default	Applies To
 TM_DEBUG_TRUNCATE_LENGTH	100	Generic debug messages, dump_messages preview
