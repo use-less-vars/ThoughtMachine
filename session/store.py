@@ -294,9 +294,63 @@ class FileSystemSessionStore(SessionStore):
         # Session not saved yet, return the default path (for compatibility)
         return self._get_session_path(session_id)
 
+    # ── Open sessions management ────────────────────────────────────────────
+
     def get_open_sessions_path(self) -> Path:
         """Get the path for the open_sessions.json state file."""
         return self.state_dir / 'open_sessions.json'
+
+    def get_open_sessions(self) -> List[str]:
+        """
+        Read the list of open session IDs from open_sessions.json.
+        Returns an empty list if the file does not exist or is corrupt.
+        """
+        path = self.get_open_sessions_path()
+        if not path.exists():
+            return []
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return [str(sid) for sid in data]
+            logger.warning(f"[SessionStore] open_sessions.json content is not a list: {type(data)}")
+            return []
+        except Exception as e:
+            logger.error(f"[SessionStore] Error reading open_sessions.json: {e}")
+            return []
+
+    def save_open_sessions(self, session_ids: List[str]) -> None:
+        """
+        Write the list of open session IDs to open_sessions.json.
+        """
+        path = self.get_open_sessions_path()
+        try:
+            # Atomic write via temp file
+            temp_path = path.with_suffix('.tmp')
+            with open(temp_path, 'w') as f:
+                json.dump(session_ids, f)
+            temp_path.replace(path)
+            logger.debug(f"[SessionStore] Saved {len(session_ids)} open sessions to {path}")
+        except Exception as e:
+            logger.error(f"[SessionStore] Error saving open_sessions.json: {e}")
+
+    def add_open_session(self, session_id: str) -> None:
+        """
+        Add a session ID to the open sessions list (idempotent).
+        """
+        ids = self.get_open_sessions()
+        if session_id not in ids:
+            ids.append(session_id)
+            self.save_open_sessions(ids)
+
+    def remove_open_session(self, session_id: str) -> None:
+        """
+        Remove a session ID from the open sessions list.
+        """
+        ids = self.get_open_sessions()
+        if session_id in ids:
+            ids.remove(session_id)
+            self.save_open_sessions(ids)
 
     def get_current_session_id(self) -> Optional[str]:
         """
