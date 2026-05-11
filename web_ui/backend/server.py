@@ -38,6 +38,14 @@ Client → Server (JSON):
     { "command": "get_config" }
     { "command": "get_conversation" }
     { "command": "update_config",     "field": "...", "value": ... }
+    { "command": "list_sessions" }
+    { "command": "save_session",          "name": "..." (optional) }
+    { "command": "load_session",          "session_id": "..." }
+    { "command": "delete_session",        "session_id": "..." }
+    { "command": "rename_session",        "session_id": "...", "new_name": "..." }
+    { "command": "get_open_sessions" }
+    { "command": "close_session",          "session_id": "..." (optional) }
+    { "command": "new_session" }
 
 Server → Client (JSON):
     state_changed       { "type": "state_changed",       "state": "IDLE|RUNNING|PAUSED|WAITING_FOR_USER", "is_running": bool }
@@ -46,6 +54,14 @@ Server → Client (JSON):
     conversation_changed { "type": "conversation_changed", "messages": [...] }
     config_changed      { "type": "config_changed",      "config": {...} }
     status_message      { "type": "status_message",      "text": "..." }
+    sessions_list       { "type": "sessions_list",       "sessions": [...] }
+    session_saved       { "type": "session_saved",       "session": {...} }
+    session_loaded      { "type": "session_loaded",      "session_id": "...", "session_name": "...", "message_count": int }
+    session_deleted     { "type": "session_deleted",     "session_id": "..." }
+    session_renamed     { "type": "session_renamed",     "session_id": "...", "new_name": "..." }
+    open_sessions_list  { "type": "open_sessions_list",  "session_ids": ["..."] }
+    session_closed      { "type": "session_closed",      "session_id": "..." }
+    session_cleared     { "type": "session_cleared" }
 """
 
 from __future__ import annotations
@@ -257,6 +273,172 @@ async def websocket_endpoint(ws: WebSocket):
                         "config": _frontend_config_from_bridge(bridge) if bridge else _default_frontend_config(),
                     })
 
+                elif command == "list_sessions":
+                    if bridge is None:
+                        await ws.send_json({"type": "status_message", "text": "⚠ No bridge available."})
+                        continue
+                    try:
+                        sessions = bridge.list_sessions()
+                        await ws.send_json({
+                            "type": "sessions_list",
+                            "sessions": sessions,
+                        })
+                    except Exception as exc:
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": f"⚠ Failed to list sessions: {exc}",
+                        })
+
+                elif command == "save_session":
+                    if bridge is None or not bridge.is_running:
+                        await ws.send_json({"type": "status_message", "text": "⚠ No active session to save."})
+                        continue
+                    name = msg.get("name", "")
+                    try:
+                        session = bridge.save_session(name=name if name else None)
+                        await ws.send_json({
+                            "type": "session_saved",
+                            "session": {
+                                "id": session.session_id,
+                                "name": session.metadata.get('name', 'Untitled'),
+                                "created_at": session.created_at.isoformat() if hasattr(session.created_at, 'isoformat') else str(session.created_at),
+                                "updated_at": session.updated_at.isoformat() if hasattr(session.updated_at, 'isoformat') else str(session.updated_at),
+                                "message_count": len(session.user_history) if session.user_history else 0,
+                            },
+                        })
+                    except Exception as exc:
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": f"⚠ Failed to save session: {exc}",
+                        })
+
+                elif command == "load_session":
+                    session_id = msg.get("session_id", "")
+                    if not session_id:
+                        await ws.send_json({"type": "status_message", "text": "⚠ session_id is required."})
+                        continue
+                    # If a bridge/session is running, stop it first
+                    if bridge is not None:
+                        bridge.stop()
+                    try:
+                        # Create fresh controller and bridge
+                        from agent.controller import AgentController
+                        controller = AgentController()
+                        bridge = WebAgentBridge(event_callback=event_callback)
+                        bridge.set_controller(controller)
+                        bridge.load_session(session_id)
+                        await ws.send_json({
+                            "type": "session_loaded",
+                            "session_id": session_id,
+                        })
+                        await ws.send_json({
+                            "type": "state_changed",
+                            "state": "IDLE",
+                            "is_running": bridge.is_running,
+                        })
+                        await ws.send_json({"type": "status_message", "text": f"Session {session_id} loaded. Click Run to continue."})
+                    except Exception as exc:
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": f"⚠ Failed to load session: {exc}",
+                        })
+
+                elif command == "delete_session":
+                    session_id = msg.get("session_id", "")
+                    if not session_id:
+                        await ws.send_json({"type": "status_message", "text": "⚠ session_id is required."})
+                        continue
+                    if bridge is None:
+                        await ws.send_json({"type": "status_message", "text": "⚠ No bridge available."})
+                        continue
+                    try:
+                        bridge.delete_session(session_id)
+                        await ws.send_json({
+                            "type": "session_deleted",
+                            "session_id": session_id,
+                        })
+                    except Exception as exc:
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": f"⚠ Failed to delete session: {exc}",
+                        })
+
+                elif command == "rename_session":
+                    session_id = msg.get("session_id", "")
+                    new_name = msg.get("new_name", "")
+                    if not session_id:
+                        await ws.send_json({"type": "status_message", "text": "⚠ session_id is required."})
+                        continue
+                    if bridge is None:
+                        await ws.send_json({"type": "status_message", "text": "⚠ No bridge available."})
+                        continue
+                    try:
+                        bridge.rename_session(session_id, new_name)
+                        await ws.send_json({
+                            "type": "session_renamed",
+                            "session_id": session_id,
+                            "new_name": new_name,
+                        })
+                    except Exception as exc:
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": f"⚠ Failed to rename session: {exc}",
+                        })
+
+                elif command == "get_open_sessions":
+                    if bridge is None:
+                        await ws.send_json({"type": "status_message", "text": "⚠ No bridge available."})
+                        continue
+                    try:
+                        session_ids = bridge.get_open_sessions()
+                        await ws.send_json({
+                            "type": "open_sessions_list",
+                            "session_ids": session_ids,
+                        })
+                    except Exception as exc:
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": f"⚠ Failed to get open sessions: {exc}",
+                        })
+
+                elif command == "close_session":
+                    session_id = msg.get("session_id", "")
+                    try:
+                        if bridge is not None:
+                            bridge.close_session(session_id if session_id else None)
+                        else:
+                            # No bridge active — just acknowledge
+                            await ws.send_json({"type": "status_message", "text": "Session closed."})
+                        await ws.send_json({
+                            "type": "session_closed",
+                            "session_id": session_id,
+                        })
+                        await ws.send_json({
+                            "type": "state_changed",
+                            "state": "IDLE",
+                            "is_running": False,
+                        })
+                    except Exception as exc:
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": f"⚠ Failed to close session: {exc}",
+                        })
+
+                elif command == "new_session":
+                    # Clear any loaded session and stop current bridge
+                    if bridge is not None:
+                        bridge.stop()
+                        await ws.send_json({
+                            "type": "state_changed",
+                            "state": "IDLE",
+                            "is_running": False,
+                        })
+                    bridge = None
+                    await ws.send_json({
+                        "type": "session_cleared",
+                    })
+                    await ws.send_json({"type": "status_message", "text": "Ready for a new session."})
+
                 else:
                     await ws.send_json({
                         "type": "status_message",
@@ -277,8 +459,12 @@ async def websocket_endpoint(ws: WebSocket):
         print(f"⚠ WebSocket error: {exc}")
         traceback.print_exc()
     finally:
-        # Cleanup: stop the bridge if it exists
+        # Cleanup: auto-save open session + stop bridge
         if bridge is not None:
+            try:
+                bridge.save_open_session()
+            except Exception:
+                pass
             bridge.stop()
 
 

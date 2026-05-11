@@ -40,11 +40,14 @@ from __future__ import annotations
 import threading
 import queue
 import traceback
+import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from agent import Agent
 from agent.config import AgentConfig
 from agent.controller import AgentController
+from session.models import Session
+from session.store import FileSystemSessionStore
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -91,6 +94,11 @@ class WebAgentBridge:
         # reuse the existing AgentController instead of creating an Agent directly)
         self._controller: Optional[AgentController] = None
 
+        # Session persistence
+        self._session_store = FileSystemSessionStore()
+        self._loaded_session: Optional[Session] = None
+        self._loaded_config_overrides: Optional[Dict[str, Any]] = None
+
     # ── Public API ──────────────────────────────────────────────────────────
 
     @property
@@ -134,26 +142,50 @@ class WebAgentBridge:
         """
         Start a new agent session.
 
+        If a session was previously loaded via load_session(), the loaded
+        session's conversation is passed to the controller so the agent
+        can continue from that context.  After starting, the loaded-session
+        reference is cleared (the new run owns its own session).
+
+        If ``self._loaded_config_overrides`` is set (from load_session),
+        those values are merged into the config_dict so the saved config
+        (system prompt, tools, etc.) is restored.
+
         Args:
             query: Initial user query string.
             config_dict: Configuration dictionary (see AgentConfig fields).
+                         Values from loaded session metadata override these.
             preset_name: Named preset to load instead of config_dict.
                          If both are given, config_dict values override the preset.
         """
+        # ── Merge loaded config overrides ──────────────────────────────────
+        merged_config = dict(config_dict or {})
+        if self._loaded_config_overrides:
+            # Loaded config overrides take priority (they were the saved config)
+            for k, v in self._loaded_config_overrides.items():
+                if k not in ('session_id', 'created_at', 'updated_at'):
+                    merged_config.setdefault(k, v)
+            print(f"🔧 Merged {len(self._loaded_config_overrides)} config overrides from loaded session")
+
         if self._controller is not None:
             # ── Delegate to controller ──────────────────────────────────
+            # Pass loaded session so the controller continues from its history
+            session_arg = self._loaded_session
             if preset_name:
                 self._running = True
                 self._session_id = None
-                overrides = config_dict or {}
-                self._controller.start(query, preset_name=preset_name, **overrides)
+                overrides = merged_config
+                self._controller.start(query, preset_name=preset_name,
+                                       session=session_arg, **overrides)
                 self._config = self._controller.get_config()
             else:
-                config = AgentConfig(**config_dict)
+                config = AgentConfig(**merged_config)
                 self._config = config
                 self._running = True
                 self._session_id = None
-                self._controller.start(query, config)
+                self._controller.start(query, config, session=session_arg)
+            self._loaded_session = None  # consumed
+            self._loaded_config_overrides = None  # consumed
             return
 
         if self.is_running:
@@ -165,8 +197,8 @@ class WebAgentBridge:
         self._running = True
         self._processing = False
 
-        # Build AgentConfig from the dict
-        config = AgentConfig(**config_dict)
+        # Build AgentConfig from the merged dict
+        config = AgentConfig(**merged_config)
         self._config = config
 
         # Create agent (no Qt dependency, pure Python)
@@ -238,6 +270,233 @@ class WebAgentBridge:
         if self._controller is not None:
             return self._controller.get_config()
         return self._config
+
+    # ── Session persistence ──────────────────────────────────────────────────
+
+    def list_sessions(self) -> List[Dict[str, Any]]:
+        """List all saved sessions from the session store."""
+        try:
+            return self._session_store.list_sessions()
+        except Exception as e:
+            print(f"⚠ list_sessions error: {e}")
+            return []
+
+    def save_session(self, name: Optional[str] = None) -> Optional[Session]:
+        """
+        Save current conversation as a session to the store.
+
+        Args:
+            name: Optional display name for the session.
+
+        Returns:
+            The saved Session object, or None on failure.
+        """
+        try:
+            session_id = self._loaded_session.session_id if self._loaded_session else str(uuid.uuid4())
+            session = Session(
+                session_id=session_id,
+                user_history=list(self.history),
+                metadata={
+                    'agent_config': self._config.model_dump() if self._config else {},
+                    'source': 'web_ui',
+                }
+            )
+            # Apply name: explicit arg > existing loaded session name > generated
+            if name:
+                session.metadata['name'] = name
+            elif self._loaded_session and self._loaded_session.metadata.get('name'):
+                session.metadata['name'] = self._loaded_session.metadata['name']
+            session.ensure_name()
+            self._session_store.save_session(session)
+            self._loaded_session = session
+            print(f"✅ Session saved: {session.session_id} ({session.metadata.get('name')})")
+            return session
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"⚠ save_session error: {e}")
+            return None
+
+    def load_session(self, session_id: str) -> bool:
+        """Load a session from the store, replacing current conversation.
+
+        Also extracts ``session.metadata['agent_config']`` and stores it as
+        ``self._loaded_config_overrides`` so that the next ``start()`` call
+        applies the saved configuration (system prompt, tools, etc.).
+
+        Emits ``config_changed`` with the restored config so the frontend
+        updates its controls.
+        """
+        try:
+            session = self._session_store.load_session(session_id)
+            if session is None:
+                print(f"⚠ Session not found: {session_id}")
+                return False
+            self.history = list(session.user_history)
+            self._loaded_session = session
+
+            # ── Extract agent_config from session metadata ────────────────
+            agent_config_raw = session.metadata.get('agent_config', {})
+            if agent_config_raw and isinstance(agent_config_raw, dict):
+                self._loaded_config_overrides = dict(agent_config_raw)
+                print(f"🔧 Loaded agent_config overrides from session metadata: {len(agent_config_raw)} keys")
+            else:
+                self._loaded_config_overrides = None
+                print(f"ℹ️ No agent_config in session metadata")
+
+            # Emit conversation_changed so the frontend updates
+            self._emit({
+                "type": "conversation_changed",
+                "messages": list(self.history),
+            })
+            # Emit session_loaded for metadata
+            self._emit({
+                "type": "session_loaded",
+                "session_id": session_id,
+                "session_name": session.metadata.get('name', 'Untitled Session'),
+                "message_count": len(self.history),
+            })
+            # Emit config_changed with the restored config so frontend controls update
+            if self._loaded_config_overrides:
+                self._emit({
+                    "type": "config_changed",
+                    "config": self._loaded_config_overrides,
+                })
+            print(f"✅ Session loaded: {session_id} ({session.metadata.get('name')}) — {len(self.history)} messages")
+            return True
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"⚠ load_session error: {e}")
+            return False
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete a session from the store."""
+        try:
+            result = self._session_store.delete_session(session_id)
+            if result:
+                print(f"🗑️ Session deleted: {session_id}")
+            else:
+                print(f"⚠ Session not found for deletion: {session_id}")
+            return result
+        except Exception as e:
+            print(f"⚠ delete_session error: {e}")
+            return False
+
+    def rename_session(self, session_id: str, new_name: str) -> bool:
+        """Rename a session in the store."""
+        try:
+            session = self._session_store.load_session(session_id)
+            if session is None:
+                print(f"⚠ Session not found for rename: {session_id}")
+                return False
+            session.metadata['name'] = new_name
+            self._session_store.save_session(session)
+            # Update loaded session name if it's the one being renamed
+            if self._loaded_session and self._loaded_session.session_id == session_id:
+                self._loaded_session.metadata['name'] = new_name
+            print(f"✏️ Session renamed: {session_id} → {new_name}")
+            return True
+        except Exception as e:
+            print(f"⚠ rename_session error: {e}")
+            return False
+
+    # ── Open sessions management ────────────────────────────────────────────
+
+    def get_open_sessions(self) -> List[str]:
+        """
+        Return the list of open session IDs from open_sessions.json.
+        Delegates to FileSystemSessionStore.
+        """
+        try:
+            return self._session_store.get_open_sessions()
+        except Exception as e:
+            print(f"⚠ get_open_sessions error: {e}")
+            return []
+
+    def save_open_session(self, session_id: Optional[str] = None) -> None:
+        """
+        Save the current session and add it to the open sessions list.
+        If session_id is provided, that ID is added; otherwise uses the
+        bridge's current session ID.
+        """
+        sid = session_id or self._session_id or (
+            self._loaded_session.session_id if self._loaded_session else None
+        )
+        if sid is None:
+            print("⚠ save_open_session: no session ID available")
+            return
+        # Save the session first (so it exists on disk)
+        self.save_session()
+        # Then add to open list
+        try:
+            self._session_store.add_open_session(sid)
+            print(f"📋 Session {sid} added to open sessions")
+        except Exception as e:
+            print(f"⚠ save_open_session error: {e}")
+
+    def remove_open_session(self, session_id: Optional[str] = None) -> None:
+        """
+        Remove a session from the open sessions list.
+        If session_id is provided, that ID is removed; otherwise uses the
+        bridge's current session ID.
+        """
+        sid = session_id or self._session_id or (
+            self._loaded_session.session_id if self._loaded_session else None
+        )
+        if sid is None:
+            print("⚠ remove_open_session: no session ID available")
+            return
+        try:
+            self._session_store.remove_open_session(sid)
+            print(f"📋 Session {sid} removed from open sessions")
+        except Exception as e:
+            print(f"⚠ remove_open_session error: {e}")
+
+    def close_session(self, session_id: Optional[str] = None) -> None:
+        """
+        Save session, remove from open sessions list, and stop the bridge.
+        This is the complete "close tab" sequence.
+
+        Args:
+            session_id: Session to close. If None, uses the bridge's current
+                        session or loaded session.
+        """
+        sid = session_id or self._session_id or (
+            self._loaded_session.session_id if self._loaded_session else None
+        )
+        print(f"🚪 Closing session: {sid or '(no id)'}")
+        # Save current state
+        if sid:
+            self.save_session()
+            self.remove_open_session(sid)
+        # Stop the bridge
+        self.stop()
+        # Reset state
+        self._loaded_session = None
+        self._loaded_config_overrides = None
+        self.history = []
+        self._session_id = None
+        self._emit({
+            "type": "session_cleared",
+        })
+        self._emit({
+            "type": "state_changed",
+            "state": "IDLE",
+            "is_running": False,
+        })
+        print(f"🚪 Session closed: {sid or '(no id)'}")
+
+    def clear_loaded_session(self) -> None:
+        """Clear the loaded session reference for a fresh start."""
+        self._loaded_session = None
+        self._loaded_config_overrides = None
+        self.history = []
+        self._emit({
+            "type": "conversation_changed",
+            "messages": [],
+        })
+        print("🆕 Session cleared for fresh start")
 
     # ── Internal: event emission ────────────────────────────────────────────
 
