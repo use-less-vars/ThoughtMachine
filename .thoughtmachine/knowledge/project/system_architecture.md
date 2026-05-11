@@ -608,3 +608,151 @@ The system maintains a purely append-only `session.user_history` (all messages e
 4. Multiple summaries: only the latest (rightmost) is used; older summaries remain in history as dead metadata
 5. Token truncation with summary: remove_from_end=True (newest messages removed first) — preserves original kept turns but may truncate beyond what's expected
 6. Pause/error interrupts summarization flow — summary_text is only set if SummarizeTool completed successfully
+
+## 2026-05-10 — ## Docker Executor — User Site-Packages Fix (2026-05-10)
+
+**...
+
+## Docker Executor — User Site-Packages Fix (2026-05-10)
+
+**Problem**: `pip install --user` installed packages to `/home/agent/.local/lib/python3.11/site-packages/` but `ENV PYTHONNOUSERSITE=1` in `docker/executor.Dockerfile` disabled user site-packages, making imports fail silently.
+
+**Fix**: Commented out `ENV PYTHONNOUSERSITE=1` and rebuilt the Docker image with `build=True`. Now `pip install --user <package>` works seamlessly without needing `PYTHONPATH` workarounds.
+
+**Files changed**:
+- `docker/executor.Dockerfile` — removed `ENV PYTHONNOUSERSITE=1`
+
+## 2026-05-11 — ## Web UI Backend — Added (2025-07-16)
+
+**Files created:**
+-...
+
+## Web UI Backend — Added (2025-07-16)
+
+**Files created:**
+- `web_ui/backend/bridge.py` — `WebAgentBridge`: Pure-Python thread-safe wrapper around Agent with start/pause/resume/stop lifecycle. Maps Agent events to frontend protocol (state_changed, tokens_updated, context_updated, conversation_changed, status_message). No Qt dependencies.
+- `web_ui/backend/server.py` — FastAPI WebSocket server with `/ws` endpoint supporting commands: start_session, continue_session, pause_session, resume_session, stop_session, get_config, get_conversation, update_config. Health check at `/health`.
+
+**Config translation:**
+- Frontend sends `provider: 'openai'|'anthropic'|'local'` → translated to `provider_type: 'openai_compatible'|'anthropic'|'openai'`
+- Frontend sends `tools: [{name, enabled}]` → translated to `enabled_tools: ['name1', ...]`
+- Reverse translation exists for sending config back to frontend
+
+**Protocol:** Client sends JSON commands, server streams JSON events (state_changed, tokens_updated, context_updated, conversation_changed, config_changed, status_message).
+
+**Startup:** `python -m web_ui.backend.server` (uvicorn on :8000)
+
+## 2026-05-11 — ## Controller-Bridge Integration (2025-07-16)
+
+**Problem:** ...
+
+## Controller-Bridge Integration (2025-07-16)
+
+**Problem:** `AgentController` uses `pyqtSignal(dict)` for `event_occurred` — requires a running Qt event loop to deliver signals from the agent thread. The Web UI backend has no QApplication.
+
+**Solution:** Added a plain-Python callback path to `AgentController`:
+- `agent/controller/__init__.py`:
+  - New `_event_callbacks: List[Callable]` attribute in `__init__`
+  - New `set_event_callback(callback)` method to register non-Qt consumers
+  - Modified `_emit_event()` to also iterate and call all registered callbacks (wrapped in try/except)
+  - Qt signal emission wrapped in try/except RuntimeError for graceful fallback when no QApplication exists
+
+- `web_ui/backend/bridge.py`:
+  - New `set_controller(controller)` method — attaches an `AgentController`, registers `_on_controller_event` as the callback
+  - All lifecycle methods (`start`, `pause`, `resume`, `stop`, `continue_session`, `get_config`, `get_conversation`) delegate to controller when set
+  - `_on_controller_event` feeds controller events into existing `_map_and_emit` pipeline
+
+- `web_ui/backend/server.py`:
+  - Creates an `AgentController` per WebSocket connection
+  - Passes it to the bridge via `bridge.set_controller(controller)`
+
+## 2026-05-11 — ## Logging — Size-based hard pruning (2026-05-11)
+
+Log direc...
+
+## Logging — Size-based hard pruning (2026-05-11)
+
+Log directory growth is now bounded by two mechanisms:
+1. **Age-based**: `_cleanup_old_logs()` — removes files older than `TM_LOG_MAX_AGE_DAYS` (default 7 days)
+2. **Size-based**: `_prune_logs_by_size()` — deletes oldest log files when total directory size exceeds `TM_LOG_DIR_MAX_MB` (default 50 MB)
+
+Size pruning is invoked on logger initialization and after each file rotation. It only targets agent log files (`agent_*.jsonl*`, `agent_*.log*`), leaving non-log files untouched.
+
+## 2026-05-11 — ## Log Rotation Refactored — Timestamp-Based Archiving
+
+Repl...
+
+## Log Rotation Refactored — Timestamp-Based Archiving
+
+Replaced the old numbered-backup rotation scheme (`_rotate_log_file()`) with inline timestamp-based archiving:
+
+- **Before**: `_rotate_log_file()` used numbered backups (`.1`, `.2`, ...`.N`) with `max_backup_files` config. Renamed files with shifting indices.
+- **After**: When `_current_file_size >= max_file_size_bytes`, the current file is closed, renamed with a timestamp (`agent_<session>.jsonl.<YYYYMMDD_HHMMSS>`), and a fresh file is opened. `_prune_logs_by_size()` handles cleanup by deleting old archived files when total exceeds `MAX_LOG_DIR_SIZE_MB`.
+- **Removed**: `max_backup_files` from AgentConfig model, `_AgentLogger.__init__`, `create_logger()`, agent.py config_data, and service.py fields_to_remove.
+- **Removed**: Entire `_rotate_log_file()` method.
+- **Kept**: `_cleanup_old_logs()` (cleans stale session dirs) and `_prune_logs_by_size()` (size-based pruning).
+
+## 2026-05-11 — ## Web UI Config — aligned with old GUI pattern (2025-07-16)...
+
+## Web UI Config — aligned with old GUI pattern (2025-07-16)
+
+`web_ui/backend/server.py` now mirrors the `qt_gui/session_tab.py` `run_agent()` logic:
+
+**Before**: Had `_default_config()` with hardcoded `system_prompt`, `enabled_tools: []`, env-var-based api_key/base_url/model. Then translated frontend format.
+
+**After**: Removed `_default_config()`. Frontend config fields are translated (provider→provider_type, tools→enabled_tools) and passed as overrides on top of `preset_name="Default"`. The preset system handles all defaults (api_key, model, system_prompt, etc.).
+
+**start_session vs continue_session**: Frontend's `QueryBar.jsx` already handles the distinction (IDLE/WAITING → start_session, PAUSED → continue_session), matching the old GUI's state-check logic.
+
+## 2026-05-11 — ## ConfigPanel Engineer Reference (2025-07-16)
+
+**Summary**:...
+
+## ConfigPanel Engineer Reference (2025-07-16)
+
+**Summary**: Comprehensive reference documenting AgentConfig fields, widget mappings, session store API, preset handling, and bridge gaps for rebuilding the frontend ConfigPanel.
+
+See full report in conversation history.
+
+## 2026-05-11 — ## Old PyQt6 GUI — Session Run Action & State Tracking
+
+### ...
+
+## Old PyQt6 GUI — Session Run Action & State Tracking
+
+### 1. Run Button Handler (`run_agent()` at session_tab.py:474)
+- Bound at line 270: `self.query_panel.run_btn.clicked.connect(self.run_agent)`
+- Conditional logic:
+  1. Checks `self.presenter.state == ExecutionState.READY`
+  2. If READY **and** `self.presenter.controller.is_running` (thread alive): calls `self.presenter.continue_session(query)` — meaning an agent thread is alive after completing a prior turn
+  3. If READY **and** NOT `controller.is_running` (thread dead): calls `self.presenter.start_session(query, config_dict, preset_name=preset_name)` — first run or after manual stop
+- If NOT READY state: shows warning dialog "Cannot run agent in current state: {state}"
+
+### 2. Session-Active Tracking
+- **No** `_session_active` boolean exists in the GUI
+- Uses two signals to derive active state:
+  - `presenter.state` (ExecutionState enum: READY/RUNNING/PAUSING) — from session_lifecycle._state
+  - `presenter.controller.is_running` (property at controller/__init__.py:105) — checks `_running` flag AND thread alive/dead
+- `current_session_id` (Optional[str]) is also available but not used for active/inactive decisions
+
+### 3. After-Turn State
+- When agent finishes a turn: `_process_terminal_event()` in event_processor.py sets `self.session_lifecycle.state = ExecutionState.READY` (lines 148-180)
+- `on_state_changed()` fires with READY → calls `update_buttons(running=False)`
+- `update_buttons()` (line 534): enables Run button (`setEnabled(True)`), disables Pause button (`setEnabled(False)`)
+- **Button text never changes** — always shows "RUN" (set in query_panel.py:38). No "Continue" or "New Session" text swapping.
+- After manual stop (`new_session()` at line 510): same behavior — calls `update_buttons(running=False)`, Run enabled, Pause disabled
+- After `stop`/`request_stop`: event_processor sets state back to READY, same button result
+
+### 4. Session Persistence Hooks (main_window.py + session_tab.py)
+- **File > Save Session As...** (line 206-208): calls `self.current_tab().save_session_as()` → session_tab.py:875
+- **File > Open Session...** (line 209-211): calls `self.current_tab().open_session()` → session_tab.py:967
+- **Tab close** (session_tab.py:1138 closeEvent): calls `self.presenter.save_session()` on tab close
+- **Window close** (main_window.py:242 closeEvent): calls `self.save_open_sessions()` then triggers all tab closeEvents
+- **Presenter methods used**:
+  - `presenter.save_session()` → session_lifecycle.save_session() → session_store.save_session(session)
+  - `presenter.load_session_by_id(id)` → session_lifecycle.load_session_by_id()
+  - `presenter.export_session(filepath)` → session_lifecycle.export_session()
+  - `presenter.list_sessions()` → session_lifecycle.list_sessions()
+  - `presenter.rename_session(id, name)` → session_lifecycle.rename_session()
+  - `presenter.delete_session(id)` → session_lifecycle.delete_session()
+- **Auto-save**: event_processor calls `auto_save_current_session()` after every terminal event (final/stopped/max_turns/error)

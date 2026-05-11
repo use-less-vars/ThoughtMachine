@@ -1,2 +1,0 @@
-# Test file for git commit test
-This is a test to verify the GitInfoTool commit operation.
