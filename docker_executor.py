@@ -156,6 +156,41 @@ class DockerExecutor:
                     existing = None
 
                 if existing is not None:
+                    # Check if the container's image matches the currently tagged image.
+                    # After a Dockerfile rebuild, the image ID changes even if the tag
+                    # stays the same, and container pooling would otherwise reuse the
+                    # stale container with the old image.
+                    try:
+                        # Container's Image attribute stores the SHA256 of the image
+                        # used at creation time.
+                        container_image_id = existing.attrs.get('Image', '')
+                        current_image = self.client.images.get(self.image)
+                        current_image_id = current_image.id
+                        if container_image_id and current_image_id and container_image_id != current_image_id:
+                            log("INFO", "tools.docker_executor.container",
+                                "Container built from stale image, recreating",
+                                {"container_id": existing.id,
+                                 "container_image": container_image_id[:19] + "...",
+                                 "current_image": current_image_id[:19] + "..."})
+                            try:
+                                existing.stop()
+                                existing.remove()
+                            except docker.errors.NotFound:
+                                pass
+                            existing = None
+                    except docker.errors.ImageNotFound:
+                        # If the image can't be found for comparison, recreate to be safe
+                        log("WARNING", "tools.docker_executor.container",
+                            "Could not compare image IDs (image not found), recreating container",
+                            {"container_id": existing.id})
+                        try:
+                            existing.stop()
+                            existing.remove()
+                        except docker.errors.NotFound:
+                            pass
+                        existing = None
+
+                if existing is not None:
                     self.container = existing
                     # Handle non-running container states
                     if self.container.status == "dead":
@@ -180,7 +215,7 @@ class DockerExecutor:
         network_mode = "bridge" if policy.get("docker_network_allowed", False) else "none"
         tmpfs = {"/tmp": "rw,noexec,nosuid,size=64m"}
         if policy.get("writable_home", False):
-            tmpfs["/home/agent"] = "rw,size=256M,uid=1000,gid=1000"
+            tmpfs["/home/agent"] = "rw,exec,size=256M,uid=1000,gid=1000"
 
         log('DEBUG', 'tools.docker_executor.container',
             f"Creating container with network={network_mode}, tmpfs={tmpfs}")
