@@ -3,9 +3,11 @@
 Project milestones, planned features, and long-term goals.
 
 ## Current Status
+## Current Status
 - **Phase 1 (Core State Machine):** ✅ Complete (1.1–1.14)
 - **Phase 2 (Event Pipeline + Token Restrictions):** ✅ Complete (1.15–1.18, plus event fixes)
-- **Phase 3 (GUI Adaptation & Grace-Turn Preservation):** 🟢 **Now** — task 3.1 first
+- **Phase 2.5 (Multi‑Session Tab Support & Full Session Restore):** 🟢 **Now** — being planned
+- **Phase 3 (GUI Adaptation & Grace-Turn Preservation):** 📋 Queued (after 2.5)
 - **Phase 4 (System Message Injection Audit):** 📋 Planned
 - **Phase 5 (Token Counting & Output Truncation Audit):** 📋 Planned
 - **Phase 6 (Streaming LLM Support):** 📋 Planned
@@ -62,3 +64,35 @@ Project milestones, planned features, and long-term goals.
 | F4 | **Multi‑tool output total‑truncation** — cap sum of tool-result tokens per turn. |
 | F5 | **Config‑change UI feedback** — warn user when a setting requires restart (utilize FIELD_CATEGORIES). |
 | F6 | **Grace‑turn visibility on pause** — ensure the user always sees the last finished turn's content even after pressing pause. (Partially addressed in 3.1 but may need further GUI work.) |
+
+## 2026-05-11 — ## Phase 2.5 — Multi‑Session Tab Support & Full Session Rest...
+
+## Phase 2.5 — Multi‑Session Tab Support & Full Session Restore 🟢 NOW
+
+| Item | Description | Status |
+|------|-------------|--------|
+| 2.5.1a | **Backend: load_session also loads agent_config** — extract `session.metadata['agent_config']` and store as overrides so next `start_session` uses saved config (system prompt, tools, etc.) | Planned |
+| 2.5.1b | **Backend: new `get_open_sessions` command** — returns session IDs from `open_sessions.json` | Planned |
+| 2.5.1c | **Backend: new `close_session` command** — save session, remove from open list, stop bridge | Planned |
+| 2.5.1d | **Backend: WebSocket disconnect handler** — treat unexpected close as tab close (save + remove from open list) | Planned |
+| 2.5.2a | **Frontend: Tab bar component** — replace single-session view with tab manager; each tab has `tabId`, `sessionId`, `ws`, local chat state | Planned |
+| 2.5.2b | **Frontend: Each tab is independent** — refactor `App.jsx` into `SessionTab` component with own WebSocket lifecycle; per-tab Zustand context or local state | Planned |
+| 2.5.2c | **Frontend: Initialisation flow** — on load, send `get_open_sessions`, open tabs for each returned session_id via `load_session` | Planned |
+| 2.5.2d | **Frontend: "+" button** — creates blank tab; on first query sends `start_session` with default config | Planned |
+| 2.5.2e | **Frontend: Tab close** — send `close_session`, close WebSocket, remove tab | Planned |
+| 2.5.2f | **Frontend: Config per session** (deferred to Phase 3) | Deferred |
+
+### Architectural Mapping
+| Old PyQt6 GUI | New Web GUI |
+|---------------|-------------|
+| Each `SessionTab` has its own Presenter + Controller | Each browser tab gets its own WebSocket → backend spawns `WebAgentBridge` + `AgentController` |
+| `QTabWidget` with "+" button | React tab bar component, "+" creates new WebSocket connection |
+| On start, restore open sessions from `open_sessions.json` | Frontend sends `get_open_sessions`, opens tabs for each session_id with `load_session` |
+| Close tab → save session | Frontend sends `close_session`, backend saves + updates open list, client closes WebSocket |
+| Load session from file → `presenter.load_session(filepath)` | WebSocket command `load_session { session_id }` → bridge loads session with full agent_config from metadata |
+
+### Design Notes
+- No agent logic changes — this is a thin-shell reproduction of the old PyQt6 tab system
+- `load_session` must extract `session.metadata['agent_config']` so that system prompt, tools, and settings are restored exactly as saved
+- `close_session` passes through to existing `SessionLifecycle`/`FileSystemSessionStore` methods — no new logic
+- Per-tab WebSocket isolation ensures each tab is an independent "mini-app"

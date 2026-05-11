@@ -756,3 +756,55 @@ See full report in conversation history.
   - `presenter.rename_session(id, name)` → session_lifecycle.rename_session()
   - `presenter.delete_session(id)` → session_lifecycle.delete_session()
 - **Auto-save**: event_processor calls `auto_save_current_session()` after every terminal event (final/stopped/max_turns/error)
+
+## 2026-05-11 — # Multi-Tab Architecture (Refactoring)
+
+**Date**: 2025-01-15...
+
+# Multi-Tab Architecture (Refactoring)
+
+**Date**: 2025-01-15
+
+## Architecture Change
+Replaced single-session architecture with multi-tab support. Each tab creates its own WebSocket connection for truly independent session interaction.
+
+## Component Tree
+```
+App.jsx (hub WS for sessions list)
+├── TabBar (props-driven: tabs, activeTabId, callbacks)
+├── SessionTab (manages own WS + local state)
+│   ├── StatusBar (props: status, tokensIn/Out, contextLength)
+│   ├── ConfigPanel (props: config, sendCommand)
+│   ├── ChatPanel (props: history)
+│   └── QueryBar (props: sendCommand, status, isRunning, config)
+└── SessionList (props: sessions, callbacks for open/delete/rename)
+```
+
+## Key Decisions
+- **Per-tab WebSockets**: Each SessionTab has its own WS connection, enabling simultaneous independent sessions.
+- **Hub WS**: App.jsx maintains a single "hub" WS for session list management (list, save, delete, rename).
+- **Local state per tab**: SessionTab uses useState instead of Zustand for session-specific state.
+- **Zustand store simplified**: Now only holds `sessions` list (shared across tabs).
+- **Save via registry**: App keeps a `tabActionsRef` map (tabId -> `{sendCommand}`) so SessionList's Save button can trigger save on the active tab.
+- **Tab lifecycle**: New tabs start with `sessionId=null`, which gets populated when the backend creates a session (`session_loaded` event).
+
+
+## 2026-05-11 — ## Keep-All-Tabs-Mounted Fix (2025-01-15)
+
+Changed App.jsx t...
+
+## Keep-All-Tabs-Mounted Fix (2025-01-15)
+
+Changed App.jsx to render ALL SessionTab components simultaneously instead of only the active one. Inactive tabs are hidden with `style={{ display: 'none' }}` on a `.tab-wrapper` div.
+
+### Close flow (3-step)
+1. User clicks X → `initiateCloseTab(tabId)` sends `close_session` over that tab's own WS
+2. Backend acknowledges → `session_closed` event → SessionTab calls `onClose()`
+3. App's `removeTab(tabId)` removes from `tabs` array → React unmounts → WS cleanup runs
+
+### Key invariants
+- `display: none` does NOT trigger React unmount — components stay mounted
+- SessionTab's `useEffect([], [])` ties WS to component lifecycle, not visibility
+- `closedRef.current` gate prevents double-close (both `session_closed` handler and WS `onclose`)
+- `tabActionsRef` map survives tab switches (stored in a ref, not state)
+
