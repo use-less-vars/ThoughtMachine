@@ -3,6 +3,7 @@ import os
 import sys
 import queue
 import traceback
+import uuid
 from agent.config import AgentConfig
 from agent import Agent
 from typing import Optional, Callable, List, Dict, Any
@@ -152,6 +153,10 @@ class AgentController(QObject):
                 raise ValueError('Must provide either config or preset_name')
             resolved_config = config
             self._agent_override = None
+        if preset_name is not None:
+            log('DEBUG', 'core.controller', f"[CONTROLLER start] preset agent id={id(agent)}, session={session.session_id if session else 'None'}")
+        else:
+            log('DEBUG', 'core.controller', f"[CONTROLLER start] config mode, _agent_override reset, session={session.session_id if session else 'None'}")
         self._query = query
         self._config = resolved_config
         self._session = session
@@ -169,6 +174,7 @@ class AgentController(QObject):
 
     def continue_session(self, query: str):
         """Submit a new query to the already running agent."""
+        log('DEBUG', 'core.controller', f"[CONTROLLER continue_session] self.agent={'exists' if hasattr(self, 'agent') and self.agent else 'MISSING'}, agent.id={id(self.agent) if hasattr(self, 'agent') and self.agent else 'N/A'}")
         log('DEBUG', 'core.controller', f"continue_session called: query='{query[:50]}...' is_running={self.is_running} pause_event.is_set={self.pause_event.is_set()}")
         if os.environ.get('PAUSE_DEBUG'):
             log('WARNING', 'presenter.pause_flow', f"Controller.continue_session: query='{query[:50]}...', is_running={self.is_running}, pause_event.is_set={self.pause_event.is_set()}, _pause_requested={self._pause_requested}")
@@ -342,6 +348,8 @@ class AgentController(QObject):
     def _run(self):
         """Internal method that runs in the background thread."""
         log('DEBUG', 'core.controller', f'_run started')
+        if hasattr(self, 'agent') and self.agent is not None:
+            log('DEBUG', 'core.controller', f"[CONTROLLER _run] entering with self.agent={id(self.agent)}, agent.conversation len={len(self.agent.conversation)}, first roles={[m.get('role') for m in self.agent.conversation[:3]]}")
 
         def should_stop():
             log('DEBUG', 'core.controller', f'should_stop called, pause_event.is_set={self.pause_event.is_set()}, stop_event.is_set={self.stop_event.is_set()}, _pause_requested={self._pause_requested}')
@@ -372,8 +380,12 @@ class AgentController(QObject):
             else:
                 run_config = self._config.model_copy() if hasattr(self._config, 'model_copy') else self._config
                 run_config.stop_check = should_stop
+                log('DEBUG', 'core.controller', "[CONTROLLER] creating new Agent instance")
                 agent = Agent(run_config, session=self._session if hasattr(self, '_session') else None)
                 self.agent = agent
+            # Propagate agent's session_id so events carry it (needed for Web UI bridge)
+            if self.agent and not self.current_session_id:
+                self.current_session_id = self.agent.session_id or str(uuid.uuid4())
             log('DEBUG', 'core.controller', '_run: Agent created successfully')
         except Exception as e:
             log('ERROR', 'core.controller', f'_run: Agent creation FAILED: {e}')
@@ -419,6 +431,11 @@ class AgentController(QObject):
                 self._processing_query = True
                 stop_reason = None
                 try:
+                    # ── Controller diagnostic ───────────────────────────────────────
+                    if hasattr(agent, 'conversation'):
+                        log('DEBUG', 'core.controller', f"[CONTROLLER _run] passing query to agent. agent.conversation has {len(agent.conversation)} msgs. roles={[m.get('role') for m in agent.conversation]}")
+                    else:
+                        log('DEBUG', 'core.controller', "[CONTROLLER _run] agent has NO conversation attribute")
                     for event in agent.process_query(query):
                         log('DEBUG', 'core.controller', f"Event: {event['type']}")
                         self._emit_event(event)

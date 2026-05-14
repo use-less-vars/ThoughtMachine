@@ -286,7 +286,51 @@ class OpenAICompatibleProvider(LLMProvider):
                 for i, msg in enumerate(completion_kwargs.get('messages', [])):
                     if msg.get('role') == 'assistant' and 'tool_calls' in msg:
                         pass
+            # ── [REQUEST LOG] Diagnostic: dump full request payload ──────────────
+            import json as _json
+            _safe_messages = []
+            for _m in completion_kwargs.get('messages', []):
+                _mc = {k: v for k, v in _m.items() if k != 'id'}
+                if isinstance(_mc.get('content'), str) and len(_mc['content']) > 200:
+                    _mc['content'] = _mc['content'][:200] + f'... [truncated, total {len(_mc["content"])} chars]'
+                _safe_messages.append(_mc)
+            _log_payload = {
+                'model': completion_kwargs.get('model'),
+                'base_url': str(self.client.base_url) if hasattr(self.client, 'base_url') else 'N/A',
+                'api_key_prefix': (self.config.api_key[:8] + '...') if self.config.api_key else 'NONE',
+                'temperature': completion_kwargs.get('temperature'),
+                'max_tokens': completion_kwargs.get('max_tokens'),
+                'tool_choice': completion_kwargs.get('tool_choice'),
+                'tools_count': len(completion_kwargs.get('tools', [])),
+                'tools_names': [t.get('function', {}).get('name', '?') for t in (completion_kwargs.get('tools') or [])],
+                'messages_count': len(_safe_messages),
+                'messages_roles': [m.get('role') for m in _safe_messages],
+                'messages_preview': _safe_messages[:6],  # first 6 messages
+            }
+            log('DEBUG', 'llm.openai', '[REQUEST LOG] FULL REQUEST PAYLOAD:\n' + _json.dumps(_log_payload, indent=2, default=str, ensure_ascii=False))
+            log('DEBUG', 'llm.openai', f"[NEW REQUEST] model={self.config.model}, tools_count={len(tools) if tools else 0}, tool_choice={kwargs.get('tool_choice', 'NOT SET')}, base_url={self.config.base_url}")
+            log('DEBUG', 'llm.openai', f"[MESSAGES] system_prompt={'present' if any(m['role']=='system' for m in messages) else 'MISSING'}, message_count={len(messages)}")
+            if tools:
+                log('DEBUG', 'llm.openai', f"[TOOLS SAMPLE] first_tool={tools[0]['function']['name']}, format={type(tools)}")
             response = self.client.chat.completions.create(**completion_kwargs)
+            # ── [REQUEST LOG] Diagnostic: log response ────────────────────────
+            _response_lines = ['[REQUEST LOG] RAW RESPONSE (first choice):']
+            try:
+                _choice = response.choices[0] if response.choices else None
+                if _choice:
+                    _msg = _choice.message
+                    _response_lines.append(f'  finish_reason: {_choice.finish_reason}')
+                    _response_lines.append(f'  content_preview: {str(_msg.content)[:200] if _msg.content else "(empty)"}')
+                    _response_lines.append(f'  has_tool_calls: {bool(hasattr(_msg, "tool_calls") and _msg.tool_calls)}')
+                    if hasattr(_msg, 'tool_calls') and _msg.tool_calls:
+                        for _tc in _msg.tool_calls[:5]:
+                            _response_lines.append(f'  -> ToolCall: id={getattr(_tc, "id", "?")} name={getattr(_tc.function, "name", "?") if hasattr(_tc, "function") else "?"}')
+                    if hasattr(_msg, 'reasoning_content') and _msg.reasoning_content:
+                        _response_lines.append(f'  reasoning_content: {str(_msg.reasoning_content)[:200]}')
+                _response_lines.append(f'  usage: {response.usage}')
+            except Exception as _e:
+                _response_lines.append(f'  (error parsing response: {_e})')
+            log('DEBUG', 'llm.openai', '\n'.join(_response_lines))
             import os
             if os.environ.get('DEBUG_OPENAI'):
                 raw_str = str(response)
