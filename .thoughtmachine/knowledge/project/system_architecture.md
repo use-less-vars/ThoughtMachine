@@ -1015,3 +1015,24 @@ The WebSocket endpoint (`server.py`) now uses a dual pattern:
 2. **Per-tab commands** (start_session, continue_session, load_session, save_session, etc.) use the `WebAgentBridge` which wraps a controller+agent. These commands still check `bridge is None` and return errors if no session is active.
 
 This separation allows the hub WebSocket (App.jsx) to list sessions and auto-load open tabs without needing an active agent session.
+
+## 2026-05-14 — ## 2026-05-15 — Auto-Load Sessions on Hub WS Connect
+
+**What...
+
+## 2026-05-15 — Auto-Load Sessions on Hub WS Connect
+
+**What changed:**
+- Added `loadTab` function in `App.jsx` — opens a tab for an existing session with de-duplication (reuses already-open tabs). Uses `setTimeout(0)` to avoid calling `setActiveTabId` inside `setTabs` updater.
+- `open_sessions` handler now calls `loadTab(s.session_id)` instead of `handleOpenTab`
+- `handleOpenTab` (called from SessionList sidebar) now delegates to `loadTab`
+- `SessionTab.jsx` now tracks `currentSessionId` state, updated from `session_loaded` event
+- `onRegister` exposes `getSessionId: () => currentSessionId` for parent access
+
+**Flow:**
+1. Hub WS connects → sends `get_open_sessions`
+2. Server responds with `{ type: "open_sessions", sessions: [...] }`
+3. `loadTab()` creates tabs with pre-set `sessionId` → sets `activeTabId`
+4. Each `SessionTab` WS connects → sends `load_session` with the `sessionId`
+5. Backend loads session → emits `session_loaded` with the ID
+6. SessionTab updates `currentSessionId` → ready for `continue_session`

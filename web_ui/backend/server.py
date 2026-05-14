@@ -392,30 +392,26 @@ async def websocket_endpoint(ws: WebSocket):
                         log("ERROR", "server.config", f"rename_session failed: {exc}")
 
                 elif command == "get_open_sessions":
+                    log("INFO", "server.config", "get_open_sessions handler reached")
                     try:
-                        open_session_ids = session_store.get_open_sessions()
+                        open_ids = session_store.get_open_sessions()
+                        log("INFO", "server.config", f"get_open_sessions returned {len(open_ids)} ids: {open_ids}")
                         open_sessions = []
-                        for sid in open_session_ids:
+                        for sid in open_ids:
                             session = session_store.load_session(sid)
                             if session:
                                 open_sessions.append({
                                     "session_id": session.session_id,
-                                    "name": session.name,
-                                    "updated_at": session.updated_at.isoformat() if hasattr(session.updated_at, 'isoformat') else str(session.updated_at),
-                                    "message_count": len(session.user_history) if session.user_history else 0,
-                                    "metadata": session.metadata,
+                                    "name": session.metadata.get('name', 'Untitled'),
+                                    "updated_at": session.updated_at.isoformat(),
+                                    "message_count": len(session.user_history) if session.user_history else 0
                                 })
-                        await ws.send_json({
-                            "type": "open_sessions",
-                            "sessions": open_sessions,
-                        })
-                        log("INFO", "server.config", f"Auto-load: {len(open_sessions)} open sessions")
-                    except Exception as exc:
-                        await ws.send_json({
-                            "type": "status_message",
-                            "text": f"⚠ Failed to get open sessions: {exc}",
-                        })
-                        log("ERROR", "server.config", f"get_open_sessions failed: {exc}")
+                        response = {"type": "open_sessions", "sessions": open_sessions}
+                        await ws.send_json(response)
+                        log("INFO", "server.config", f"Sent open_sessions with {len(open_sessions)} items")
+                    except Exception as e:
+                        log("ERROR", "server.config", f"get_open_sessions failed: {e}")
+                        await ws.send_json({"type": "error", "message": str(e)})
 
                 elif command == "close_session":
                     session_id = msg.get("session_id", "")

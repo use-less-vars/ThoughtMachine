@@ -40,6 +40,7 @@ export default function App() {
   const [tabs, setTabs] = useState([])           // { tabId, sessionId }
   const [activeTabId, setActiveTabId] = useState(null)
   const wsRef = useRef(null)
+  const [hubWs, setHubWs] = useState(null)
   const tabActionsRef = useRef({})   // tabId -> { sendCommand }
 
   // ── Hub WebSocket (sessions list only) ─────────────────────────────────
@@ -49,8 +50,8 @@ export default function App() {
 
     ws.onopen = () => {
       console.log("✅ [Hub WS] onopen")
+      setHubWs(ws)
       ws.send(JSON.stringify({ command: 'list_sessions' }))
-      ws.send(JSON.stringify({ command: 'get_open_sessions' }))
     }
 
     ws.onmessage = (event) => {
@@ -73,6 +74,14 @@ export default function App() {
     return () => ws.close()
   }, [])
 
+  // ── Request open sessions when hub WS connects ──────────────────────────
+  useEffect(() => {
+    if (hubWs && hubWs.readyState === WebSocket.OPEN) {
+      hubWs.send(JSON.stringify({ command: 'get_open_sessions' }))
+      console.log('[Hub WS] Sent get_open_sessions')
+    }
+  }, [hubWs])
+
   // ── Hub event router ────────────────────────────────────────────────────
   function handleHubEvent(msg) {
     const store = useStore.getState()
@@ -90,7 +99,12 @@ export default function App() {
         wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
         break
       case 'open_sessions':
-        msg.sessions.forEach(s => handleOpenTab(s.session_id))
+        console.log('[Hub WS] open_sessions received:', msg.sessions)
+        if (msg.sessions && msg.sessions.length > 0) {
+          msg.sessions.forEach(s => {
+            loadTab(s.session_id)
+          })
+        }
         break
       default:
         // Other events (state_changed, conversation_changed, etc.)
@@ -111,6 +125,22 @@ export default function App() {
     const tabId = `tab-${nextTabId++}`
     setTabs((prev) => [...prev, { tabId, sessionId }])
     setActiveTabId(tabId)
+  }, [])
+
+  // Open a tab for an existing session (auto-load from hub WS or sidebar)
+  const loadTab = useCallback((sessionId) => {
+    // Don't create duplicate tabs for the same session.
+    // Use functional updater to avoid stale closure on `tabs`.
+    setTabs((prev) => {
+      const existing = prev.find((t) => t.sessionId === sessionId)
+      if (existing) {
+        setActiveTabId(existing.tabId)
+        return prev
+      }
+      const tabId = `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      setActiveTabId(tabId)
+      return [...prev, { tabId, sessionId }]
+    })
   }, [])
 
   // Initiate close: send close_session over the tab's own WS.
@@ -145,18 +175,10 @@ export default function App() {
     addTab(null) // null sessionId = fresh session
   }, [addTab])
 
+  // Open an existing session in a tab (called from SessionList sidebar)
   const handleOpenTab = useCallback((sessionId) => {
-    setTabs((prev) => {
-      const existing = prev.find((t) => t.sessionId === sessionId)
-      if (existing) {
-        setActiveTabId(existing.tabId)
-        return prev
-      }
-      const tabId = `tab-${nextTabId++}`
-      setActiveTabId(tabId)
-      return [...prev, { tabId, sessionId }]
-    })
-  }, [])
+    loadTab(sessionId)
+  }, [loadTab])
 
   const handleSessionSaved = useCallback((sessionId) => {
     // Refresh sessions list

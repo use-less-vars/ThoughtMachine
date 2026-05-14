@@ -477,6 +477,11 @@ class WebAgentBridge:
                     "config": self._loaded_config_overrides,
                 })
             print(f"✅ Session loaded: {session_id} ({session.metadata.get('name')}) — {len(self.history)} messages")
+
+            # Register this session as an open session (persists to open_sessions.json)
+            # so it survives server restarts and the hub WS can return it.
+            self.save_open_session(session_id)
+
             return True
         except Exception as e:
             import traceback

@@ -52,6 +52,7 @@ const INITIAL_STATE = {
 // ────────────────────────────────────────────────────────────────────────────
 export default function SessionTab({ sessionId, onClose, onNewSession, onSessionSaved, onRegister }) {
   const [state, setState] = useState(INITIAL_STATE)
+  const [currentSessionId, setCurrentSessionId] = useState(sessionId)
   const wsRef = useRef(null)
   const closedRef = useRef(false)  // prevent double-close
 
@@ -59,6 +60,13 @@ export default function SessionTab({ sessionId, onClose, onNewSession, onSession
   const update = useCallback((patch) => {
     setState((prev) => ({ ...prev, ...patch }))
   }, [])
+
+  // ── Debug: log whenever history changes ─────────────────────────────
+  useEffect(() => {
+    console.log('[SessionTab] history updated, length:', state.history.length,
+      'first role:', state.history[0]?.role,
+      'last role:', state.history[state.history.length - 1]?.role)
+  }, [state.history])
 
   // ── WebSocket lifecycle ─────────────────────────────────────────────────
   useEffect(() => {
@@ -68,12 +76,16 @@ export default function SessionTab({ sessionId, onClose, onNewSession, onSession
     ws.onopen = () => {
       console.log(`[SessionTab ${sessionId || 'new'}] WS onopen`)
 
-      // Register sendCommand with parent (for save, etc.)
-      onRegister?.({ sendCommand })
+      // Register sendCommand + getSessionId with parent
+      onRegister?.({ sendCommand, getSessionId: () => currentSessionId })
 
-      // If we have a sessionId, load it; otherwise create a new session
+      // If we have a sessionId, load it immediately; otherwise create a new session
       if (sessionId) {
-        ws.send(JSON.stringify({ command: 'load_session', session_id: sessionId }))
+        ws.send(JSON.stringify({
+          command: 'load_session',
+          session_id: sessionId
+        }))
+        console.log(`[SessionTab ${sessionId}] Sent load_session`)
       } else {
         ws.send(JSON.stringify({ command: 'new_session' }))
       }
@@ -109,6 +121,14 @@ export default function SessionTab({ sessionId, onClose, onNewSession, onSession
 
   // ── Event router ─────────────────────────────────────────────────────────
   function handleEvent(msg) {
+    // ── Debug: log conversation data ─────────────────────────────────
+    if (msg.type === 'conversation_changed') {
+      console.log('[SessionTab] conversation_changed:', {
+        messagesCount: msg.messages?.length,
+        firstMsg: msg.messages?.[0]?.content?.slice(0, 60),
+        lastMsg: msg.messages?.[msg.messages?.length - 1]?.content?.slice(0, 60),
+      })
+    }
     switch (msg.type) {
       case 'state_changed':
         update({
@@ -150,8 +170,11 @@ export default function SessionTab({ sessionId, onClose, onNewSession, onSession
         break
 
       case 'session_loaded':
-        // Session data will arrive via conversation_changed + config_changed
-        // If this is a new session, notify parent with the session_id
+        // Track the session ID so subsequent continue_session calls use it
+        if (msg.session_id) {
+          setCurrentSessionId(msg.session_id)
+        }
+        // If this is a new session (tab had no sessionId), notify parent
         if (msg.session_id && !sessionId) {
           onNewSession?.(msg.session_id)
         }
