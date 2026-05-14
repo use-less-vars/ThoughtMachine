@@ -75,6 +75,7 @@ from typing import Any, Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from agent.logging import log
 from contextlib import asynccontextmanager
+from session.store import FileSystemSessionStore
 
 # Ensure project root is on sys.path
 _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -125,6 +126,7 @@ async def websocket_endpoint(ws: WebSocket):
     from agent.controller import AgentController
 
     bridge: Optional[WebAgentBridge] = None
+    session_store = FileSystemSessionStore()
 
     # Capture the asyncio event loop HERE (inside the async handler)
     # so we can schedule sends from the agent thread later.
@@ -276,20 +278,19 @@ async def websocket_endpoint(ws: WebSocket):
                     })
 
                 elif command == "list_sessions":
-                    if bridge is None:
-                        await ws.send_json({"type": "status_message", "text": "⚠ No bridge available."})
-                        continue
                     try:
-                        sessions = bridge.list_sessions()
+                        sessions = session_store.list_sessions()
                         await ws.send_json({
                             "type": "sessions_list",
                             "sessions": sessions,
                         })
+                        log("INFO", "server.config", f"Listed {len(sessions)} sessions")
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
                             "text": f"⚠ Failed to list sessions: {exc}",
                         })
+                        log("ERROR", "server.config", f"list_sessions failed: {exc}")
 
                 elif command == "save_session":
                     if bridge is None or not bridge.is_running:
@@ -350,20 +351,19 @@ async def websocket_endpoint(ws: WebSocket):
                     if not session_id:
                         await ws.send_json({"type": "status_message", "text": "⚠ session_id is required."})
                         continue
-                    if bridge is None:
-                        await ws.send_json({"type": "status_message", "text": "⚠ No bridge available."})
-                        continue
                     try:
-                        bridge.delete_session(session_id)
+                        session_store.delete_session(session_id)
                         await ws.send_json({
                             "type": "session_deleted",
                             "session_id": session_id,
                         })
+                        log("INFO", "server.config", f"Deleted session {session_id}")
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
                             "text": f"⚠ Failed to delete session: {exc}",
                         })
+                        log("ERROR", "server.config", f"delete_session failed: {exc}")
 
                 elif command == "rename_session":
                     session_id = msg.get("session_id", "")
@@ -371,37 +371,51 @@ async def websocket_endpoint(ws: WebSocket):
                     if not session_id:
                         await ws.send_json({"type": "status_message", "text": "⚠ session_id is required."})
                         continue
-                    if bridge is None:
-                        await ws.send_json({"type": "status_message", "text": "⚠ No bridge available."})
-                        continue
                     try:
-                        bridge.rename_session(session_id, new_name)
+                        session = session_store.load_session(session_id)
+                        if session is None:
+                            await ws.send_json({"type": "status_message", "text": f"⚠ Session not found: {session_id}"})
+                            continue
+                        session.metadata['name'] = new_name
+                        session_store.save_session(session)
                         await ws.send_json({
                             "type": "session_renamed",
                             "session_id": session_id,
                             "new_name": new_name,
                         })
+                        log("INFO", "server.config", f"Renamed session {session_id} → {new_name}")
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
                             "text": f"⚠ Failed to rename session: {exc}",
                         })
+                        log("ERROR", "server.config", f"rename_session failed: {exc}")
 
                 elif command == "get_open_sessions":
-                    if bridge is None:
-                        await ws.send_json({"type": "status_message", "text": "⚠ No bridge available."})
-                        continue
                     try:
-                        session_ids = bridge.get_open_sessions()
+                        open_session_ids = session_store.get_open_sessions()
+                        open_sessions = []
+                        for sid in open_session_ids:
+                            session = session_store.load_session(sid)
+                            if session:
+                                open_sessions.append({
+                                    "session_id": session.session_id,
+                                    "name": session.name,
+                                    "updated_at": session.updated_at.isoformat() if hasattr(session.updated_at, 'isoformat') else str(session.updated_at),
+                                    "message_count": len(session.user_history) if session.user_history else 0,
+                                    "metadata": session.metadata,
+                                })
                         await ws.send_json({
-                            "type": "open_sessions_list",
-                            "session_ids": session_ids,
+                            "type": "open_sessions",
+                            "sessions": open_sessions,
                         })
+                        log("INFO", "server.config", f"Auto-load: {len(open_sessions)} open sessions")
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
                             "text": f"⚠ Failed to get open sessions: {exc}",
                         })
+                        log("ERROR", "server.config", f"get_open_sessions failed: {exc}")
 
                 elif command == "close_session":
                     session_id = msg.get("session_id", "")
@@ -527,9 +541,12 @@ def _translate_frontend_config(fe_config: Dict[str, Any]) -> Dict[str, Any]:
     cfg = {k: v for k, v in cfg.items() if not k.startswith("_")}
 
     # ── Translate diagnostic log ──────────────────────────────────────
-    log('DEBUG', 'web.server', f"[TRANSLATE] frontend config keys: {list(fe_config.keys())}, "
-        f"tools field: {fe_config.get('tools')}, "
-        f"enabled_tools after translate: {cfg.get('enabled_tools')}")
+    log('INFO', 'server.config',
+        f"[TRANSLATE] frontend config: provider={fe_config.get('provider')}, "
+        f"model={fe_config.get('model')}, keys={list(fe_config.keys())}")
+    log('DEBUG', 'server.config',
+        f"[TRANSLATE] full dump: tools_field={fe_config.get('tools')}, "
+        f"enabled_tools_after={cfg.get('enabled_tools')}")
 
     return cfg
 

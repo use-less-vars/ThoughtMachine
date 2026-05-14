@@ -90,13 +90,13 @@ class TurnTransaction:
                 break
         commit_messages.extend(self._tool_calls_buffer)
         if self.session:
-            log('DEBUG', 'debug.unknown', f'[TurnTransaction] Extending user_history with {len(commit_messages)} messages')
-            log('DEBUG', 'debug.unknown', f'[TurnTransaction] user_history type: {type(self.session.user_history).__name__}, is ObservableList: {isinstance(self.session.user_history, ObservableList)}')
-            log('DEBUG', 'debug.unknown', f'[TurnTransaction] user_history id: {id(self.session.user_history)}')
+            log('DEBUG', 'core.turn_transaction', f'[TurnTransaction] Extending user_history with {len(commit_messages)} messages')
+            log('DEBUG', 'core.turn_transaction', f'[TurnTransaction] user_history type: {type(self.session.user_history).__name__}, is ObservableList: {isinstance(self.session.user_history, ObservableList)}')
+            log('DEBUG', 'core.turn_transaction', f'[TurnTransaction] user_history id: {id(self.session.user_history)}')
             self.session.user_history.extend(commit_messages)
             self.session.updated_at = datetime.now()
         elif self.conversation is not None:
-            log('DEBUG', 'debug.unknown', f'[TurnTransaction] Extending fallback conversation with {len(commit_messages)} messages (session=None)')
+            log('DEBUG', 'core.turn_transaction', f'[TurnTransaction] Extending fallback conversation with {len(commit_messages)} messages (session=None)')
             self.conversation.extend(commit_messages)
         if self.context_builder and hasattr(self.context_builder, 'clear_cache'):
             self.context_builder.clear_cache()

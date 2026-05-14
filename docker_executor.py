@@ -366,13 +366,13 @@ class DockerExecutor:
         if not os.path.exists(dockerfile_path):
             raise RuntimeError(f"Dockerfile not found at {dockerfile_path}")
 
-        log('DEBUG', 'docker.build', f"Building Docker image {self.image} from {dockerfile_path}")
-        log('DEBUG', 'docker.build', f"Build context directory: {dockerfile_dir}")
-        log('DEBUG', 'docker.build', f"Absolute path: {os.path.abspath(dockerfile_dir)}")
-        log('DEBUG', 'docker.build', f"Requirements.txt exists: {os.path.exists(os.path.join(dockerfile_dir, 'requirements.txt'))}")
-        log('DEBUG', 'docker.build', f"Files in build context:")
+        log('DEBUG', 'tools.docker_executor.build', f"Building Docker image {self.image} from {dockerfile_path}")
+        log('DEBUG', 'tools.docker_executor.build', f"Build context directory: {dockerfile_dir}")
+        log('DEBUG', 'tools.docker_executor.build', f"Absolute path: {os.path.abspath(dockerfile_dir)}")
+        log('DEBUG', 'tools.docker_executor.build', f"Requirements.txt exists: {os.path.exists(os.path.join(dockerfile_dir, 'requirements.txt'))}")
+        log('DEBUG', 'tools.docker_executor.build', f"Files in build context:")
         for f in os.listdir(dockerfile_dir):
-            log('DEBUG', 'docker.build', f"  {f}")
+            log('DEBUG', 'tools.docker_executor.build', f"  {f}")
 
         log_lines = []
         try:
@@ -392,7 +392,7 @@ class DockerExecutor:
                     line = chunk["stream"].strip()
                     if line:
                         log_lines.append(line)
-                        log('DEBUG', 'docker.build', f"Build: {line}")
+                        log('DEBUG', 'tools.docker_executor.build', f"Build: {line}")
         except docker.errors.BuildError as e:
             # BuildError already has build_log; include it in the error message
             build_log_str = "\n".join(str(line) for line in (e.build_log or []))
@@ -404,6 +404,6 @@ class DockerExecutor:
             raise RuntimeError(f"Docker build failed: {e}") from e
 
         if verbose_build and log_lines:
-            log('INFO', 'docker.build', f"Build complete for {self.image}:\n" + "\n".join(log_lines))
+            log('INFO', 'tools.docker_executor.build', f"Build complete for {self.image}:\n" + "\n".join(log_lines))
 
         return image, log_lines

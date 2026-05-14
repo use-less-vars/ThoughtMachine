@@ -18,6 +18,7 @@ export default function ConfigPanel({ sendCommand, config }) {
   }
 
   const toggleTool = (index) => {
+    if (!config.tools || !Array.isArray(config.tools)) return
     const tool = config.tools[index]
     if (tool) updateField(`tools.${index}.enabled`, !tool.enabled)
   }
@@ -62,6 +63,7 @@ export default function ConfigPanel({ sendCommand, config }) {
         </select>
       </label>
 
+      {config.tools && Array.isArray(config.tools) && (
       <div className="config-tools">
         <span>Tools:</span>
         {config.tools.map((tool, i) => (
@@ -75,6 +77,7 @@ export default function ConfigPanel({ sendCommand, config }) {
           </label>
         ))}
       </div>
+      )}
     </div>
   )
 }

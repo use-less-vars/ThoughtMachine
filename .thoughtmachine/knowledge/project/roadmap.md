@@ -128,3 +128,18 @@ Project milestones, planned features, and long-term goals.
 - `load_session` must extract `session.metadata['agent_config']` so that system prompt, tools, and settings are restored exactly as saved
 - `close_session` passes through to existing `SessionLifecycle`/`FileSystemSessionStore` methods — no new logic
 - Per-tab WebSocket isolation ensures each tab is an independent "mini-app"
+
+## 2026-05-14 — ## Future Idea: GUI Logging Toggle (Dynamic `TM_LOG_TAGS`)
+
+...
+
+## Future Idea: GUI Logging Toggle (Dynamic `TM_LOG_TAGS`)
+
+**Problem**: `TM_LOG_TAGS` and `TM_LOG_LEVEL` are read at import time — changing them requires restarting the agent. For an active server developer, this is friction.
+
+**Idea**: Add a runtime logging panel / dropdown in the Web UI that:
+- Dynamically adjusts which tags are shown on console
+- Could write to a settings endpoint that the logging system polls
+- Would require modifying `unified.py` to read from a mutable source (settings object or polling env vars) instead of import-time constants
+
+**Why it wasn't done yet**: This is a cross-cutting change to the logging facade itself. The import-time env var approach is simple and works for restart-driven development. A proper GUI toggle needs careful design to avoid perf overhead from polling or callback registration.

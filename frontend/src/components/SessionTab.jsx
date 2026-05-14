@@ -133,7 +133,11 @@ export default function SessionTab({ sessionId, onClose, onNewSession, onSession
         break
 
       case 'config_changed':
-        update({ config: msg.config })
+        // Merge received config with existing defaults so missing fields
+        // (like tools, provider) don't get nuked into undefined
+        update((prev) => ({
+          config: { ...prev.config, ...msg.config }
+        }))
         break
 
       case 'status_message':

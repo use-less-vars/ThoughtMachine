@@ -712,5 +712,5 @@ def create_logger(config: 'AgentConfig') -> Optional[_AgentLogger]:
         return logger
     except Exception as e:
         print(f"[LOGGING ERROR] Failed to create logger: {e}", file=__import__('sys').stderr)
-from .unified import log
-__all__ = ['log', 'LogLevel', 'LogCategory', 'LogEventType', 'create_logger', 'AgentLogger']
+from .unified import log, set_log_level, set_log_tags, show_log_config
+__all__ = ['log', 'set_log_level', 'set_log_tags', 'show_log_config', 'LogLevel', 'LogCategory', 'LogEventType', 'create_logger', 'AgentLogger']

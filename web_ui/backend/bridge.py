@@ -37,6 +37,7 @@ that the React frontend expects (see frontend/src/App.jsx):
 
 from __future__ import annotations
 
+import json
 import threading
 import queue
 import traceback
@@ -240,9 +241,12 @@ class WebAgentBridge:
         self._config = config
 
         # ── Bridge diagnostic log ──────────────────────────────────────
-        log('DEBUG', 'web.bridge', f"[BRIDGE CONFIG] enabled_tools={merged_config.get('enabled_tools')}, "
-            f"loaded_overrides_keys={list(self._loaded_config_overrides.keys()) if self._loaded_config_overrides else None}, "
-            f"frontend_dict_keys={list(config_dict.keys()) if config_dict else None}")
+        log('INFO', 'server.bridge',
+            f"[BRIDGE CONFIG] starting: enabled_tools={merged_config.get('enabled_tools')}, "
+            f"overrides={'yes' if self._loaded_config_overrides else 'no'}")
+        log('DEBUG', 'server.bridge',
+            f"[BRIDGE CONFIG] overrides_keys={list(self._loaded_config_overrides.keys()) if self._loaded_config_overrides else None}, "
+            f"frontend_keys={list(config_dict.keys()) if config_dict else None}")
 
         # Create session for this run (no Qt dependency, pure Python)
         if self._loaded_session is not None:
@@ -406,6 +410,15 @@ class WebAgentBridge:
                 self._loaded_config_overrides = None
                 print(f"ℹ️ No agent_config in session metadata")
 
+            # Ensure enabled_tools is always present — merge from global config if missing
+            if self._loaded_config_overrides and 'enabled_tools' not in self._loaded_config_overrides:
+                try:
+                    global_config = self._build_global_agent_config()
+                    self._loaded_config_overrides['enabled_tools'] = global_config.enabled_tools
+                    print(f"🔧 Merged enabled_tools from global config: {len(global_config.enabled_tools)} tools")
+                except Exception as exc:
+                    print(f"⚠ Could not merge enabled_tools: {exc}")
+
             # Emit conversation_changed so the frontend updates
             self._emit({
                 "type": "conversation_changed",
@@ -567,6 +580,7 @@ class WebAgentBridge:
     def _emit(self, event: Dict[str, Any]) -> None:
         """Thread‑safe event emission via callback."""
         print(f"📤 Sending to frontend: {event}")
+
         if self._event_callback is not None:
             try:
                 self._event_callback(event)
@@ -606,10 +620,12 @@ class WebAgentBridge:
 
         if event_type == "turn":
             content = event.get("content", "")
+            reasoning = event.get("reasoning", "")
             self._last_assistant_content = content
             msg = {
                 "role": "assistant",
                 "content": content,
+                "reasoning_content": reasoning,
             }
             print(f"✅ Converted {event_type} to message: {msg}")
             return msg
@@ -635,21 +651,17 @@ class WebAgentBridge:
             return msg
 
         elif event_type == "tool_call":
-            tool_name = event.get("tool_name", "?")
-            args = event.get("arguments", "")
-            msg = {
-                "role": "assistant",
-                "content": f"[Tool call: {tool_name}({args})]",
-            }
-            print(f"✅ Converted {event_type} to message: {msg}")
+            content = json.dumps({
+                "name": event.get("tool_name", "?"),
+                "arguments": event.get("arguments", {}),
+            })
+            msg = {"role": "tool_call", "content": content}
+            print(f"✅ Converted {event_type} to tool_call message")
             return msg
 
         elif event_type == "tool_result":
-            msg = {
-                "role": "tool",
-                "content": event.get("result", ""),
-            }
-            print(f"✅ Converted {event_type} to message: {msg}")
+            msg = {"role": "tool_result", "content": event.get("result", "")}
+            print(f"✅ Converted {event_type} to tool_result message")
             return msg
 
         return None

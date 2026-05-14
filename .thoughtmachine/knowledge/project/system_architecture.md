@@ -959,3 +959,59 @@ When `_can_hot_swap()` returns `False` (e.g., provider, model, system_prompt, wo
 - `web_ui/backend/bridge.py` — WebAgentBridge.start (line 164), load_session (line 361), controller vs standalone paths
 - `session/store.py` — FileSystemSessionStore for persistence
 - `session/context_builder.py` — SummaryBuilder/ContextBuilder for context window management
+
+## 2026-05-14 — ## 2026-05-15 — Logging tag namespace: server.*
+
+Added `serv...
+
+## 2026-05-15 — Logging tag namespace: server.*
+
+Added `server.*` namespace for web server layer diagnostics:
+
+- `server.config` — config translation in `web_ui/backend/server.py` (INFO: brief summary, DEBUG: full dump)
+- `server.bridge` — bridge config forwarding in `web_ui/backend/bridge.py` (INFO: tools+overrides summary, DEBUG: full keys)
+
+**Design rationale**: Two-level split per module:
+- INFO: one-liner showing *what happened* (always-on under `TM_LOG_TAGS=server.*`)
+- DEBUG: full diagnostics showing *all details* (opt-in with `TM_LOG_LEVEL=DEBUG`)
+
+This lets users see operational status at a glance, then drill into detail when troubleshooting. All other migrated debug prints (controller, agent, llm) remain at DEBUG level under their existing namespaces (`core.*`, `llm.*`).
+
+## 2026-05-14 — ## Logging system v2.2 — Runtime setters + timestamps + name...
+
+## Logging system v2.2 — Runtime setters + timestamps + namespace cleanup
+
+### New runtime API (in `agent/logging/unified.py`)
+- **`set_log_level(level)`**: Change `CURRENT_LOG_LEVEL` at runtime. Accepts `str` or `LogLevel` enum.
+- **`set_log_tags(tags)`**: Change `_LOG_TAGS` filter at runtime. Accepts comma-separated string or list of patterns.
+- **`show_log_config()`**: Returns dict with `log_level`, `log_tags`, `truncation`, `env_vars` for diagnostics.
+
+### Timestamps on console output
+- Every console log line now starts with `[HH:MM:SS]` (e.g., `[14:23:01] DEBUG [core.pruning] ...`).
+- Implemented via `datetime.now().strftime("[%H:%M:%S]")` in the `log()` function.
+
+### Namespace fixes
+- `docker.build` → `tools.docker_executor.build` (in `docker_executor.py`, 8 occurrences)
+- `debug.unknown` → `core.turn_transaction` (in `agent/core/turn_transaction.py`, 5 occurrences)
+- `**debug.unknown**` (old double-asterisk format) was also fixed as it used the same tag value.
+
+### Exports
+- `set_log_level`, `set_log_tags`, `show_log_config` exported from `agent/logging/__init__.py`
+- Updated `__all__` list accordingly.
+
+### Documentation
+- `docs/logging_manual.md` updated to v2.2 with: timestamp format, runtime API docs, corrected tag table, runtime workflow examples.
+
+## 2026-05-14 — **Session Management Architecture Update**
+
+The WebSocket en...
+
+**Session Management Architecture Update**
+
+The WebSocket endpoint (`server.py`) now uses a dual pattern:
+
+1. **Hub commands** (session listing, open sessions, delete, rename) use a standalone `FileSystemSessionStore` instance created at the start of the hub handler. These do NOT require a `WebAgentBridge`.
+
+2. **Per-tab commands** (start_session, continue_session, load_session, save_session, etc.) use the `WebAgentBridge` which wraps a controller+agent. These commands still check `bridge is None` and return errors if no session is active.
+
+This separation allows the hub WebSocket (App.jsx) to list sessions and auto-load open tabs without needing an active agent session.

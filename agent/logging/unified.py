@@ -34,6 +34,7 @@ import sys
 from enum import Enum
 from typing import Optional, Dict, Any, List, Union
 import json
+from datetime import datetime
 
 # AgentLogger imports are done lazily in _get_logger() to avoid circular imports
 # with agent/logging/__init__.py which imports from this module.
@@ -352,6 +353,82 @@ def set_logger(logger):
     _logger = logger
 
 
+def set_log_level(level: Union[str, LogLevel]) -> None:
+    """
+    Change the minimum log level at runtime.
+
+    Accepts either a string ("DEBUG", "INFO", etc.) or a LogLevel enum.
+    Affects console output filtering; JSONL file logging is unaffected.
+
+    Example:
+        set_log_level("DEBUG")
+        set_log_level(LogLevel.WARNING)
+    """
+    global CURRENT_LOG_LEVEL
+    if isinstance(level, str):
+        try:
+            CURRENT_LOG_LEVEL = LogLevel(level.upper())
+        except ValueError:
+            print(f"[LOGGING] Invalid log level: {level}. Keeping {CURRENT_LOG_LEVEL.value}.", file=sys.stderr)
+    else:
+        CURRENT_LOG_LEVEL = level
+
+
+def set_log_tags(tags: Union[str, List[str]]) -> None:
+    """
+    Change the tag filter at runtime.
+
+    Accepts:
+      - A comma-separated string: "core.*,tools.file_editor"
+      - A list of tag patterns: ["core.*", "tools.file_editor"]
+      - An empty string or list to restore default (WARNING+ only)
+      - "*" to show all tags
+
+    Example:
+        set_log_tags("core.*,tools.file_editor")
+        set_log_tags(["core.session", "llm.stepfun"])
+        set_log_tags("*")  # firehose
+        set_log_tags("")   # back to default (WARNING+ only)
+    """
+    global _LOG_TAGS
+    if isinstance(tags, str):
+        if tags.strip():
+            _LOG_TAGS = [t.strip() for t in tags.split(",") if t.strip()]
+        else:
+            _LOG_TAGS = []
+    else:
+        _LOG_TAGS = list(tags)
+
+
+def show_log_config() -> Dict[str, Any]:
+    """
+    Return a snapshot of the current logging configuration as a dict.
+
+    Useful for debugging filters or including in diagnostic output.
+
+    Returns:
+        dict with keys: log_level, log_tags, truncation_settings, env_vars
+    """
+    return {
+        "log_level": CURRENT_LOG_LEVEL.value,
+        "log_tags": list(_LOG_TAGS),
+        "truncation": {
+            "tool_arguments": TM_TOOL_ARGUMENTS_TRUNCATE,
+            "tool_result": TM_TOOL_RESULT_TRUNCATE,
+            "raw_response": TM_RAW_RESPONSE_TRUNCATE,
+            "console_data": TM_CONSOLE_DATA_TRUNCATE,
+            "conversation_content": TM_CONVERSATION_CONTENT_TRUNCATE,
+            "docker_output": TM_DOCKER_OUTPUT_TRUNCATE,
+            "debug_fallback": TM_DEBUG_TRUNCATE_LENGTH,
+        },
+        "env_vars": {
+            "TM_LOG_LEVEL": os.environ.get("TM_LOG_LEVEL", ""),
+            "TM_LOG_TAGS": os.environ.get("TM_LOG_TAGS", ""),
+            "THOUGHTMACHINE_DEBUG": os.environ.get("THOUGHTMACHINE_DEBUG", ""),
+        },
+    }
+
+
 def _get_logger() -> Optional[object]:
     """Get the registered AgentLogger instance (set via set_logger())."""
     return _logger
@@ -400,9 +477,10 @@ def log(
         color = COLORS.get(level_enum, "")
         level_str = level_enum.value
         tag_str = f"[{tag}]" if tag else ""
+        timestamp = datetime.now().strftime("[%H:%M:%S]")
         
-        # Build message
-        console_msg = f"{color}{level_str:8s} {tag_str} {message}{RESET}"
+        # Build message with [HH:MM:SS] timestamp
+        console_msg = f"{color}{timestamp} {level_str:8s} {tag_str} {message}{RESET}"
         if truncated_data:
             # Format data for console (truncate further if needed)
             data_str = str(truncated_data)

@@ -313,3 +313,19 @@ Replaced `ChatPanel.jsx` with a full-featured chat display supporting:
 - `frontend/src/components/ChatPanel.jsx` — full rewrite (51→137 lines)
 - `frontend/src/styles.css` — appended ~200 lines of new CSS
 - `frontend/src/components/SessionTab.jsx` — already updated with `messages={state.history}`
+
+## 2026-05-14 — Bridge debug logging added
+
+## Bridge Debug Logging Added (2025-01-17)
+
+Added debug logging to `web_ui/backend/bridge.py`:
+
+1. **`_emit` method** — Logs structured `conversation_changed` events with:
+   - Message count and roles array
+   - Per-message `reasoning_content` presence flags
+   - A `sample_tool_msg` (first tool_call or tool_result message found) for diagnostic inspection
+
+2. **`_on_controller_event` method** — Logs raw controller events before translation for types: `turn`, `tool_call`, `tool_result`, `user_query`, `final`, `execution_state_change`, `token_update`, `reasoning`
+   - Includes full event dict and keys list
+
+3. **Truncation** — Both `log()` calls use default `truncate_hint=None`, which means `_truncate_data` passes data through unchanged, preserving full diagnostic data in JSONL file logs. Console output may still truncate the display line per `TM_DEBUG_TRUNCATE_LENGTH`.

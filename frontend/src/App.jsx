@@ -50,6 +50,7 @@ export default function App() {
     ws.onopen = () => {
       console.log("✅ [Hub WS] onopen")
       ws.send(JSON.stringify({ command: 'list_sessions' }))
+      ws.send(JSON.stringify({ command: 'get_open_sessions' }))
     }
 
     ws.onmessage = (event) => {
@@ -87,6 +88,9 @@ export default function App() {
         break
       case 'session_renamed':
         wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
+        break
+      case 'open_sessions':
+        msg.sessions.forEach(s => handleOpenTab(s.session_id))
         break
       default:
         // Other events (state_changed, conversation_changed, etc.)
