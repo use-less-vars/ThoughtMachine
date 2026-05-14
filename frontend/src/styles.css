@@ -634,3 +634,238 @@ body {
   line-height: 1.6;
 }
 
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Markdown content inside assistant messages
+   ────────────────────────────────────────────────────────────────────────── */
+
+.assistant-markdown {
+  line-height: 1.6;
+}
+
+.assistant-markdown p {
+  margin: 0.4em 0;
+}
+
+.assistant-markdown p:first-child {
+  margin-top: 0;
+}
+
+.assistant-markdown p:last-child {
+  margin-bottom: 0;
+}
+
+.assistant-markdown ul,
+.assistant-markdown ol {
+  margin: 0.4em 0;
+  padding-left: 1.5rem;
+}
+
+.assistant-markdown li {
+  margin: 0.2em 0;
+}
+
+.assistant-markdown code {
+  background: rgba(255, 255, 255, 0.08);
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  font-family: var(--font-mono, 'SF Mono', 'Fira Code', monospace);
+  font-size: 0.85em;
+}
+
+.assistant-markdown pre {
+  background: rgba(0, 0, 0, 0.3);
+  padding: 0.75rem 1rem;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin: 0.6em 0;
+}
+
+.assistant-markdown pre code {
+  background: none;
+  padding: 0;
+  font-size: 0.85rem;
+}
+
+.assistant-markdown blockquote {
+  border-left: 3px solid var(--accent, #646cff);
+  padding-left: 0.75rem;
+  margin: 0.6em 0;
+  color: var(--text-secondary, #a0a0b0);
+}
+
+.assistant-markdown hr {
+  border: none;
+  border-top: 1px solid var(--border, #333);
+  margin: 1em 0;
+}
+
+.assistant-markdown table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.6em 0;
+}
+
+.assistant-markdown th,
+.assistant-markdown td {
+  border: 1px solid var(--border, #333);
+  padding: 0.4rem 0.6rem;
+  text-align: left;
+}
+
+.assistant-markdown th {
+  background: rgba(255, 255, 255, 0.06);
+  font-weight: 600;
+}
+
+.assistant-markdown a {
+  color: var(--accent, #646cff);
+}
+
+.assistant-markdown a:hover {
+  text-decoration: underline;
+}
+
+.assistant-markdown h1,
+.assistant-markdown h2,
+.assistant-markdown h3,
+.assistant-markdown h4 {
+  margin: 0.8em 0 0.4em;
+  line-height: 1.3;
+}
+
+.assistant-markdown h1 { font-size: 1.4rem; }
+.assistant-markdown h2 { font-size: 1.2rem; }
+.assistant-markdown h3 { font-size: 1.1rem; }
+
+.assistant-markdown img {
+  max-width: 100%;
+  border-radius: 6px;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Reasoning block (collapsible)
+   ────────────────────────────────────────────────────────────────────────── */
+
+.reasoning-block {
+  margin-bottom: 0.6rem;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 6px;
+  border: 1px solid var(--border, #333);
+}
+
+.reasoning-summary {
+  cursor: pointer;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-secondary, #a0a0b0);
+  user-select: none;
+}
+
+.reasoning-summary:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.reasoning-content {
+  padding: 0 0.6rem 0.6rem;
+  font-size: 0.9rem;
+  color: var(--text-secondary, #a0a0b0);
+  line-height: 1.5;
+  border-top: 1px solid var(--border, #333);
+  margin-top: 0.2rem;
+  padding-top: 0.5rem;
+}
+
+.reasoning-content p {
+  margin: 0.3em 0;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Tool call display (expandable)
+   ────────────────────────────────────────────────────────────────────────── */
+
+.tool-call-details {
+  margin: 0;
+}
+
+.tool-call-summary {
+  cursor: pointer;
+  padding: 0.2rem 0;
+  font-size: 0.85rem;
+  user-select: none;
+  color: var(--accent, #646cff);
+}
+
+.tool-call-summary:hover {
+  opacity: 0.8;
+}
+
+.tool-call-body {
+  margin-top: 0.3rem;
+}
+
+.tool-call-args {
+  background: rgba(0, 0, 0, 0.25);
+  padding: 0.5rem 0.75rem;
+  border-radius: 4px;
+  font-family: var(--font-mono, 'SF Mono', 'Fira Code', monospace);
+  font-size: 0.8rem;
+  overflow-x: auto;
+  white-space: pre;
+  border-left: 2px solid var(--accent, #646cff);
+}
+
+.tool-call-raw {
+  font-family: var(--font-mono, 'SF Mono', 'Fira Code', monospace);
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Truncatable content (long tool results)
+   ────────────────────────────────────────────────────────────────────────── */
+
+.truncatable-content {
+  font-family: var(--font-mono, 'SF Mono', 'Fira Code', monospace);
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+}
+
+.truncate-toggle {
+  margin-top: 0.3rem;
+  background: none;
+  border: 1px solid var(--border, #333);
+  color: var(--text-secondary, #a0a0b0);
+  font-size: 0.75rem;
+  padding: 0.2rem 0.6rem;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.truncate-toggle:hover {
+  background: var(--bg-surface, #222);
+  color: var(--text-primary, #e0e0e0);
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   System message text
+   ────────────────────────────────────────────────────────────────────────── */
+
+.system-text {
+  margin: 0;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Tool-result applies monospace to the bubble
+   ────────────────────────────────────────────────────────────────────────── */
+
+.message-tool-result .truncatable-content,
+.message-tool-call .tool-call-raw,
+.message-tool-call .tool-call-args {
+  font-family: var(--font-mono, 'SF Mono', 'Fira Code', monospace);
+}
+

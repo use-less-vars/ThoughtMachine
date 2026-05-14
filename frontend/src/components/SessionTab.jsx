@@ -190,7 +190,7 @@ export default function SessionTab({ sessionId, onClose, onNewSession, onSession
       <div className="app-main">
         <ConfigPanel config={state.config} sendCommand={sendCommand} />
         <div className="app-center">
-          <ChatPanel history={state.history} />
+          <ChatPanel messages={state.history} />
         </div>
         {/* Session list is rendered by App, not per-tab */}
       </div>
