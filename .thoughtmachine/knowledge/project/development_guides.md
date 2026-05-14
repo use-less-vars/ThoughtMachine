@@ -293,3 +293,23 @@ FileEditor(operation="read", filename="path/to/file.py",
 **Avoid** `line_numbers: [440]` (plural with list) — same issue.
 
 **For reading a full block/range**, use `line_numbers: "420-451"` (range string) to get all lines.
+
+## 2026-05-14 — ## Chat Display Overhaul (2025-01-17)
+
+Replaced `ChatPanel.j...
+
+## Chat Display Overhaul (2025-01-17)
+
+Replaced `ChatPanel.jsx` with a full-featured chat display supporting:
+- **Markdown rendering** via `react-markdown` + `remark-gfm` for assistant and reasoning content
+- **Tool calls** displayed as expandable `<details>` with 🛠️ icon and formatted JSON args
+- **Long tool results** truncated at 500 chars with "▼ Show more" toggle
+- **Reasoning blocks** as 💭 Thinking collapsible `<details>` with markdown rendering
+- All roles (user, assistant, tool_call, tool_result, system) get distinct bubbles
+- Prop renamed from `history` to `messages` to match SessionTab usage
+- Added ~200 lines of CSS in `styles.css` for markdown styling, reasoning blocks, tool call details, and truncation toggle
+
+**Files changed:**
+- `frontend/src/components/ChatPanel.jsx` — full rewrite (51→137 lines)
+- `frontend/src/styles.css` — appended ~200 lines of new CSS
+- `frontend/src/components/SessionTab.jsx` — already updated with `messages={state.history}`

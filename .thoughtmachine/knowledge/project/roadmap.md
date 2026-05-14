@@ -54,6 +54,7 @@ Project milestones, planned features, and long-term goals.
 | 7.2 | Remove daemon‑thread dependency; support both blocking and async invocation. | Planned |
 | 7.3 | Provide backward‑compatible wrapper so the current GUI still works. | Planned |
 
+## Future Ideas
 ## Future Ideas (Foggy — No Timeline Yet)
 
 | Item | Description |
@@ -64,6 +65,37 @@ Project milestones, planned features, and long-term goals.
 | F4 | **Multi‑tool output total‑truncation** — cap sum of tool-result tokens per turn. |
 | F5 | **Config‑change UI feedback** — warn user when a setting requires restart (utilize FIELD_CATEGORIES). |
 | F6 | **Grace‑turn visibility on pause** — ensure the user always sees the last finished turn's content even after pressing pause. (Partially addressed in 3.1 but may need further GUI work.) |
+| F7 | **Interchangeable system prompts in GUI** — allow swapping system prompts on the fly per session/tab, possibly from a library/dropdown. Could leverage Phase 4 injection points. |
+| F8 | **Linux analysis tool (privileged read)** — a tool with elevated read access to inspect system state, logs, config files, hardware info, etc. Needs careful security consideration (capability-gated). |
+| F9 | **Web research suite** — download videos (yt-dlp), transcribe them (Whisper/stt), scrape & summarize web pages, fetch RSS, etc. A bundle of web-centric tools working in concert. |
+| F10 | **Evolution log / agent meta-cognition** — a persistent log of the agent's own evolution (config changes, tool additions, lessons learned) that the agent can query to talk about itself. Like an "agent autobiography" stored in the KB or a special session. |
+| F11 | **Multi-agent "circuitry" system** — framework for composing multiple agents with: dedicated tooling per agent, security boundaries, independent sysprompts, and a "circuit" definition (data flow between agents). Think piping agents together like electronic components. |
+| F12 | **Multipurpose viewer (lightweight reader + media)** — a unified viewing component in the GUI that can render: plain text, markdown, code with syntax highlighting, images, audio (waveform), video (embedded player), PDF, data tables. Could show tool outputs, analysis results, or user-provided content in context. |
+| F13 | **Multi-agent async with thread joining** — pattern where multiple agent instances run concurrently (async) and a "join" operation synchronizes their results. Enables parallel research, divide-and-conquer workflows, ensemble reasoning. Think `Promise.all()` for agents. |
+| F14 | **Config change awareness messages** — inject system notifications when the agent's configuration changes mid-session (workspace switched, context window expanded, tools changed). The agent should receive a message like "Your workspace has been changed to X" so it can adapt its behavior accordingly. |
+| F15 | **Unify Final / FinalReport / RequestUserInteraction into one tool** — these three tools serve the same fundamental purpose (returning control to the user) with different flavors. Merge them into a single `Response` tool with parameters for finality, reporting, and user interaction needs. Simplifies the tool surface and reduces cognitive load. |
+| F16 | **Remove the Thought tool** — `ThoughtTool` is a relic from an early architecture where internal reasoning needed to be explicitly exposed. It has proven useless in practice: the agent's chain-of-thought is already captured in its message stream, and the tool adds no value beyond clutter. Remove it to clean up tool definitions and reduce system prompt token waste. |
+
+
+## Future Ideas (Foggy — No Timeline Yet)
+
+| Item | Description |
+|------|-------------|
+| F1 | **KB query enhancement** — inject system hints (e.g., "split tasks") before user query. Needs injection-point spec from Phase 4. |
+| F2 | **Multi‑agent timeouts** — stop agent after time limit using stop_event + stop_reason pattern. |
+| F3 | **RequestUserInteraction mid‑turn resume** — replace current abort‑and‑restart with generator.send() protocol. |
+| F4 | **Multi‑tool output total‑truncation** — cap sum of tool-result tokens per turn. |
+| F5 | **Config‑change UI feedback** — warn user when a setting requires restart (utilize FIELD_CATEGORIES). |
+| F6 | **Grace‑turn visibility on pause** — ensure the user always sees the last finished turn's content even after pressing pause. (Partially addressed in 3.1 but may need further GUI work.) |
+| F7 | **Interchangeable system prompts in GUI** — allow swapping system prompts on the fly per session/tab, possibly from a library/dropdown. Could leverage Phase 4 injection points. |
+| F8 | **Linux analysis tool (privileged read)** — a tool with elevated read access to inspect system state, logs, config files, hardware info, etc. Needs careful security consideration (capability-gated). |
+| F9 | **Web research suite** — download videos (yt-dlp), transcribe them (Whisper/stt), scrape & summarize web pages, fetch RSS, etc. A bundle of web-centric tools working in concert. |
+| F10 | **Evolution log / agent meta-cognition** — a persistent log of the agent's own evolution (config changes, tool additions, lessons learned) that the agent can query to talk about itself. Like an "agent autobiography" stored in the KB or a special session. |
+| F11 | **Multi-agent "circuitry" system** — framework for composing multiple agents with: dedicated tooling per agent, security boundaries, independent sysprompts, and a "circuit" definition (data flow between agents). Think piping agents together like electronic components. |
+| F12 | **Multipurpose viewer (lightweight reader + media)** — a unified viewing component in the GUI that can render: plain text, markdown, code with syntax highlighting, images, audio (waveform), video (embedded player), PDF, data tables. Could show tool outputs, analysis results, or user-provided content in context. |
+| F13 | **Multi-agent async with thread joining** — pattern where multiple agent instances run concurrently (async) and a "join" operation synchronizes their results. Enables parallel research, divide-and-conquer workflows, ensemble reasoning. Think `Promise.all()` for agents. |
+| F14 | **Config change awareness messages** — inject system notifications when the agent's configuration changes mid-session (workspace switched, context window expanded, tools changed). The agent should receive a message like "Your workspace has been changed to X" so it can adapt its behavior accordingly. |
+
 
 ## 2026-05-11 — ## Phase 2.5 — Multi‑Session Tab Support & Full Session Rest...
 

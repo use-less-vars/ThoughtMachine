@@ -808,3 +808,154 @@ Changed App.jsx to render ALL SessionTab components simultaneously instead of on
 - `closedRef.current` gate prevents double-close (both `session_closed` handler and WS `onclose`)
 - `tabActionsRef` map survives tab switches (stored in a ref, not state)
 
+
+## 2026-05-13 — ## Remove preset-based config loading from Web UI backend
+
+T...
+
+## Remove preset-based config loading from Web UI backend
+
+The `WebAgentBridge.start()` method no longer accepts or uses `preset_name`. Configuration is now built from three layers:
+1. **Global config** (from `agent_config.json` via `ConfigService`) — replaces preset-based defaults
+2. **Session config overrides** (from a loaded session's metadata) — restores saved session config
+3. **Frontend config_dict** (from WebSocket message) — runtime overrides from the UI
+
+Provider resolution and API-key env-var fallback happen once, after all three layers are merged. The `_build_global_agent_config()` method was added to build an `AgentConfig` from `agent_config.json`, mirroring what the PyQt GUI's `create_agent_config()` does.
+
+Files changed:
+- `web_ui/backend/bridge.py`: Added `ProviderManager`/`create_agent_config_service` imports, added `_build_global_agent_config()` method, rewrote `start()` to remove `preset_name` param and preset-based system_prompt fallback
+- `web_ui/backend/server.py`: Removed `preset_name="Default"` from both `bridge.start()` calls, updated comment
+
+## 2026-05-13 — ## Config System — Hot-Swap vs Restart (2025-01-16)
+
+### Ove...
+
+## Config System — Hot-Swap vs Restart (2025-01-16)
+
+### Overview
+
+The configuration system uses a **mailbox pattern**: config changes are queued and applied at the next turn boundary (start of `process_query()`). This ensures thread-safe, atomic updates that never interrupt an agent mid-turn.
+
+### The Mailbox Flow
+
+```
+User clicks "Apply" in GUI
+    → session_tab._on_apply_runtime_params(config)
+        → controller.request_config_update(config)          # Qt variant
+        → bridge.send_command("update_config", config_dict)  # Web UI variant
+            → agent.request_config_update(new_config)        # queues in _pending_config
+                → (next turn) _apply_pending_config()
+                    → _can_hot_swap(config)? YES → _hot_swap()
+                                              NO  → _restart_with_config()
+```
+
+### Hot-Swap — What Actually Happens
+
+When `_can_hot_swap()` returns `True` (meaning only HOT_SWAPPABLE fields changed), `_hot_swap()` does:
+
+1. **Updates `runtime_params`**: Sets `self.runtime_params.temperature` and `self.runtime_params.max_tokens` — these are the params passed to the LLM on the *next* API call
+2. **Replaces config reference**: `self.config = new_config` — the config object itself is swapped atomically
+3. **Propagates downstream**: `self.state.config = new_config` and `self.tool_executor.config = new_config` — so token thresholds, workspace_path, etc. take effect immediately
+4. **Rebuilds tools if needed**: If `enabled_tools` changed, the `ToolExecutor` is closed and recreated with the new tool set
+5. **Does NOT** close the LLM client — the connection to the API remains open, the same model/provider continues serving
+
+**Effect**: The agent thread keeps running. The next LLM call uses the new temperature/max_tokens/tool set. You don't lose conversation context, the thread doesn't restart, and you can continue chatting *instantly*.
+
+**Fields that hot-swap**: temperature, max_tokens, max_turns, token/turn monitor settings, detail, tool_output_token_limit, enabled_tools.
+
+### Restart — What Actually Happens
+
+When `_can_hot_swap()` returns `False` (e.g., provider, model, system_prompt, workspace changed), `_restart_with_config()` calls:
+
+1. **`self.restart(new_config)`** — the big restart method:
+   - **Saves old references**: logger, system_event_logger, config, llm_client, tool_executor
+   - **Closes old resources**: `self.llm_client.close()`, `self.tool_executor.close()`
+   - **Re-initialises**: Calls `self.__init__(new_config, ...)` equivalent — creates a fresh LLM client for the new provider/model, creates a new ToolExecutor
+   - **Restores preserved state**: Copies back conversation history (`self.conversation`), token counts (`total_input_tokens`, `total_output_tokens`), session reference, logger, system_event_logger from old references
+   - **On failure**: Restores all old references and returns `False`
+
+2. **Does NOT restart the Python process** — no subprocess, no fork, no reload. The agent thread continues running as the same Python object.
+
+3. **Conversation is preserved** — all messages, token counts, and session state stay intact. The user sees no interruption.
+
+**Fields that require restart**: provider_type, model, api_key, base_url, system_prompt, workspace_path, stop_check, provider_config, tool_classes, ALL RAG settings, ALL logging settings (GLOBAL_STATIC), kb_enabled, kb_path, provider_id, model_override.
+
+### What the Categories Mean
+
+| Category | Meaning | Example Fields |
+|----------|---------|---------------|
+| `HOT_SWAPPABLE` | Can be changed mid-session without disruption | temperature, max_tokens, enabled_tools |
+| `RESTART_REQUIRED` | Needs LLM client re-creation | provider, model, system_prompt, workspace_path |
+| `SESSION_IDENTITY` | Immutable per-session identity (set once at creation) | session_id, initial_conversation |
+| `GLOBAL_STATIC` | Global settings that are read at startup and rarely change | log_dir, log_level, log_categories |
+
+### Important Nuances
+
+1. **API key validation before restart**: Before calling `_restart_with_config()`, the system checks `_has_api_key(new_config)` — if no API key is available (neither in config nor via env var), the restart is **skipped** and `_pending_config` is **preserved** for retry on next turn. This prevents bricking the agent by restarting with no credentials.
+
+2. **Workspace path is special**: Though it's categorized as `RESTART_REQUIRED`, it's propagated to `self.state.config` and `self.tool_executor.config` during hot-swap too — so the **new workspace path is available** to downstream components immediately, even though the agent needed restart to fully switch tool contexts.
+
+3. **`_pending_config` is never lost on error**: If anything fails (no API key, restart failure), `_pending_config` is **not cleared** — it remains for retry on the next `process_query()` turn.
+
+4. **It does NOT restart the Docker container**: The Docker executor container has its own lifecycle (pooled containers with idle timeout). Config changes to the agent don't affect Docker containers directly.
+
+5. **The GUI's "old" restart button was removed**: Originally there was a separate "Restart" button that was redundant — changing provider/model/workspace and clicking Apply already triggers the restart path. The restart button was removed per the config_architecture.txt plan.
+
+## Session Architecture & Data Flow
+## Session Architecture & Data Flow
+
+### Data Model (session/models.py)
+
+**Session**: Core dataclass holding conversation state:
+- `user_history: List[Dict[str,Any]]` — Wrapped in `ObservableList` via `__post_init__()`
+- `session_id`, `created_at`, `updated_at`, `runtime_params`, `metadata`
+- `_conversation_changed_callbacks` — list of callbacks fired on any mutation
+- `total_input_tokens`, `total_output_tokens` — cumulative token tracking
+- `summary` — optional summary of earlier conversation (for pruning)
+- `conversation_version`, `conversation_hash` — auto-updated on changes
+- `create_agent(config)` → `Agent(config, session=self)` — ties agent to session
+
+**ObservableList(list)**: Custom list subclass that calls `callback()` on every mutation (append, extend, __setitem__, pop, remove, clear, etc.)
+- `__post_init__()` wraps `user_history` in ObservableList with `callback=self._on_conversation_changed`
+- `connect_conversation_changed(callback)` registers external callbacks
+- `_on_conversation_changed()` fires all registered callbacks, updates hash/version
+
+### TurnTransaction (agent/core/turn_transaction.py)
+- Atomic turn commit/rollback buffer
+- `__init__(session, context_builder)` — session can be None
+- `commit()` — extends `session.user_history` if session exists, else does NOTHING
+- **BUG**: When session=None, assistant/tool_call/tool_result messages are silently discarded
+
+### Agent.conversation property (agent/core/agent.py)
+- Getter returns `session.user_history` if session exists, else `self._conversation`
+- Setter replaces `session.user_history` in-place if session exists, else assigns to `self._conversation`
+
+### Flow Paths
+
+**Qt GUI Path (works correctly):**
+1. `SessionLifecycle.start_session()` creates Session + calls `controller.start(query, session=session)`
+2. `AgentController._run()` → `Agent(run_config, session=self._session)` — session is NOT None
+3. `TurnTransaction(self.session, ...)` — session exists → commit works
+
+**Web UI Controller Path (works correctly):**
+1. `WebAgentBridge.start()` → `self._controller.start(query, config, session=session_arg)` — session passed
+2. Same as Qt path from step 2
+
+**Web UI Standalone Path (BROKEN):**
+1. `WebAgentBridge.start()` → `self._agent = Agent(config)` — NO session passed
+2. `Agent.__init__()` → `self._session = None`, `self._conversation = []`
+3. `process_query()` → `TurnTransaction(self.session, ...)` — session is None
+4. `TurnTransaction.commit()` → `if self.session:` is False → skips extending anything
+5. `self._conversation` stays as `[system, user]` — no assistant/tool/tool_result messages ever added
+6. Conversation stays stuck at [system, user] every turn
+
+### Key Files:
+- `session/models.py` — Session, ObservableList, RuntimeParams, ContainerMetadata
+- `agent/core/turn_transaction.py` — TurnTransaction with the bug at line 90
+- `agent/core/agent.py` — Agent.__init__ (line 54), conversation property (line 423), process_query (line 663), _add_to_conversation (line 535)
+- `agent/core/conversation_manager.py` — ConversationManager.add_message (line 30) — has fallback when session=None (appends to conversation list directly)
+- `agent/controller/__init__.py` — AgentController.start (line 124), _run (line 348), dual event path
+- `agent/presenter/session_lifecycle.py` — SessionLifecycle.start_session (line 74), load_session (line 248), save/export
+- `web_ui/backend/bridge.py` — WebAgentBridge.start (line 164), load_session (line 361), controller vs standalone paths
+- `session/store.py` — FileSystemSessionStore for persistence
+- `session/context_builder.py` — SummaryBuilder/ContextBuilder for context window management
