@@ -15,11 +15,11 @@ import remarkGfm from 'remark-gfm'
 const TRUNCATE_LENGTH = 500
 
 const ROLE_STYLE = {
-  user:        { className: 'message-user',     label: 'You' },
-  assistant:   { className: 'message-assistant', label: 'Assistant' },
-  tool_call:   { className: 'message-tool-call', label: 'Tool Call' },
-  tool_result: { className: 'message-tool-result', label: 'Tool Result' },
-  system:      { className: 'message-system',    label: 'System' },
+  user:        { className: 'message-user',             label: 'You' },
+  assistant:   { className: 'message-assistant',       label: 'Assistant' },
+  tool_call:   { className: 'message-tool-call',       label: 'Tool Call' },
+  tool_result: { className: 'message-tool-result',     label: 'Tool Result' },
+  system:      { className: 'message-system-as-user',  label: 'System' },
 }
 
 /* ── Truncatable text for long tool results ── */
@@ -100,13 +100,19 @@ function MessageContent({ msg }) {
     case 'system':
       return <p className="system-text">{msg.content}</p>
     default:
+      /* System notification messages with role 'user' render as system style */
+      if (msg.is_system_notification) {
+        return <p className="system-text">{msg.content}</p>
+      }
       return <p className="message-text">{msg.content}</p>
   }
 }
 
 /* ── Single bubble ── */
 function MessageBubble({ msg, index }) {
-  const style = ROLE_STYLE[msg.role] || ROLE_STYLE.system
+  /* ── System notifications are stored as 'user' role with is_system_notification flag ── */
+  const effectiveRole = msg.is_system_notification ? 'system' : msg.role
+  const style = ROLE_STYLE[effectiveRole] || ROLE_STYLE.system
   return (
     <div className={`message ${style.className}`} key={index}>
       <div className="message-sender">{style.label}</div>

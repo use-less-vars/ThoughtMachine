@@ -50,7 +50,7 @@ const INITIAL_STATE = {
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
-export default function SessionTab({ sessionId, onClose, onNewSession, onSessionSaved, onRegister }) {
+export default function SessionTab({ sessionId, tabId, onClose, onNewSession, onSessionSaved, onRegister, onRunningChange }) {
   const [state, setState] = useState(INITIAL_STATE)
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
   const wsRef = useRef(null)
@@ -60,6 +60,11 @@ export default function SessionTab({ sessionId, onClose, onNewSession, onSession
   const update = useCallback((patch) => {
     setState((prev) => ({ ...prev, ...patch }))
   }, [])
+
+  // ── Notify parent when running state changes (for tab color) ────────
+  useEffect(() => {
+    onRunningChange?.(tabId, state.isRunning)
+  }, [state.isRunning, tabId, onRunningChange])
 
   // ── Debug: log whenever history changes ─────────────────────────────
   useEffect(() => {
@@ -218,15 +223,15 @@ export default function SessionTab({ sessionId, onClose, onNewSession, onSession
         <ConfigPanel config={state.config} sendCommand={sendCommand} />
         <div className="app-center">
           <ChatPanel messages={state.history} />
+          <QueryBar
+            sendCommand={sendCommand}
+            status={state.status}
+            isRunning={state.isRunning}
+            config={state.config}
+          />
         </div>
         {/* Session list is rendered by App, not per-tab */}
       </div>
-      <QueryBar
-        sendCommand={sendCommand}
-        status={state.status}
-        isRunning={state.isRunning}
-        config={state.config}
-      />
     </div>
   )
 }

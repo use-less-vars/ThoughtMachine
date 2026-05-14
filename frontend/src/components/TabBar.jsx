@@ -15,7 +15,7 @@
 
 import React from 'react'
 
-export default function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onNewTab }) {
+export default function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onNewTab, runningStates = {} }) {
   if (tabs.length === 0) {
     return null
   }
@@ -26,7 +26,7 @@ export default function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onN
         {tabs.map((tab) => (
           <div
             key={tab.id}
-            className={`tab-item ${activeTabId === tab.id ? 'tab-active' : ''}`}
+            className={`tab-item ${activeTabId === tab.id ? 'tab-active' : ''} ${runningStates[tab.id] ? 'running' : 'idle'}`}
             onClick={() => onSelectTab(tab.id)}
             title={tab.name}
           >

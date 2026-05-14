@@ -39,6 +39,8 @@ let nextTabId = 1
 export default function App() {
   const [tabs, setTabs] = useState([])           // { tabId, sessionId }
   const [activeTabId, setActiveTabId] = useState(null)
+  const [showSessions, setShowSessions] = useState(false)
+  const [tabRunningStates, setTabRunningStates] = useState({})
   const wsRef = useRef(null)
   const [hubWs, setHubWs] = useState(null)
   const tabActionsRef = useRef({})   // tabId -> { sendCommand }
@@ -180,6 +182,10 @@ export default function App() {
     loadTab(sessionId)
   }, [loadTab])
 
+  const handleRunningChange = useCallback((tabId, isRunning) => {
+    setTabRunningStates((prev) => ({ ...prev, [tabId]: isRunning }))
+  }, [])
+
   const handleSessionSaved = useCallback((sessionId) => {
     // Refresh sessions list
     hubSend('list_sessions')
@@ -227,6 +233,7 @@ export default function App() {
         onSelectTab={setActiveTabId}
         onCloseTab={initiateCloseTab}
         onNewTab={handleNewTab}
+        runningStates={tabRunningStates}
       />
 
       <div className="app-main">
@@ -245,28 +252,41 @@ export default function App() {
               >
                 <SessionTab
                   sessionId={tab.sessionId}
+                  tabId={tab.tabId}
                   onClose={() => removeTab(tab.tabId)}
                   onNewSession={handleNewSessionCreated}
                   onSessionSaved={handleSessionSaved}
                   onRegister={(actions) => handleRegisterTab(tab.tabId, actions)}
+                  onRunningChange={handleRunningChange}
                 />
               </div>
             ))
           )}
         </div>
 
-        {/* Sessions sidebar */}
-        <SessionList
-          sessions={sessions}
-          onSave={handleSaveActiveTab}
-          saveEnabled={activeTabId != null}
-          onNew={handleNewTab}
-          onOpenTab={handleOpenTab}
-          onDelete={(sessionId) => hubSend('delete_session', { session_id: sessionId })}
-          onRename={(sessionId, newName) =>
-            hubSend('rename_session', { session_id: sessionId, new_name: newName })
-          }
-        />
+        {/* Sessions sidebar — hidden by default, toggle with ☰ */}
+        <div className={`session-sidebar ${showSessions ? 'open' : ''}`}>
+          <SessionList
+            sessions={sessions}
+            onSave={handleSaveActiveTab}
+            saveEnabled={activeTabId != null}
+            onNew={handleNewTab}
+            onOpenTab={handleOpenTab}
+            onDelete={(sessionId) => hubSend('delete_session', { session_id: sessionId })}
+            onRename={(sessionId, newName) =>
+              hubSend('rename_session', { session_id: sessionId, new_name: newName })
+            }
+          />
+        </div>
+
+        {/* Toggle button for sessions sidebar */}
+        <button
+          className="session-toggle"
+          onClick={() => setShowSessions((s) => !s)}
+          title="Toggle sessions list"
+        >
+          ☰
+        </button>
       </div>
     </div>
   )

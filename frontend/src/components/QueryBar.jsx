@@ -64,14 +64,18 @@ export default function QueryBar({ sendCommand, status, isRunning, config }) {
 
   return (
     <div className="query-bar">
-      <input
+      <textarea
         className="query-input"
-        type="text"
         placeholder="Enter your query…"
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         onKeyDown={handleKeyDown}
+        onInput={(e) => {
+          e.target.style.height = 'auto';
+          e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px';
+        }}
         disabled={isBusy || isPaused}
+        rows={1}
       />
       <div className="query-buttons">
         {/* Run — visible when IDLE or WAITING_FOR_USER */}
