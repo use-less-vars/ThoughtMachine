@@ -45,7 +45,10 @@ from typing import Any, Callable, Dict, List, Optional
 
 from agent import Agent
 from agent.config import AgentConfig
+from agent.config.provider_profile import ProviderManager
+from agent.config.service import create_agent_config_service
 from agent.controller import AgentController
+from agent.logging import log
 from session.models import Session
 from session.store import FileSystemSessionStore
 
@@ -96,6 +99,7 @@ class WebAgentBridge:
 
         # Session persistence
         self._session_store = FileSystemSessionStore()
+        self._session: Optional[Session] = None
         self._loaded_session: Optional[Session] = None
         self._loaded_config_overrides: Optional[Dict[str, Any]] = None
 
@@ -137,53 +141,87 @@ class WebAgentBridge:
 
     # ── Lifecycle ───────────────────────────────────────────────────────────
 
-    def start(self, query: str, config_dict: Optional[Dict[str, Any]] = None,
-              preset_name: Optional[str] = None) -> None:
+    def _build_global_agent_config(self) -> AgentConfig:
+        """
+        Build an AgentConfig from the global config file (agent_config.json)
+        via ConfigService, mirroring what the PyQt GUI does in
+        SessionTab.create_new_session() -> state_bridge.create_agent_config().
+
+        This removes the dependency on presets for config defaults.
+
+        Note: provider resolution and API-key fallback happen *after* all
+        three config layers are merged in start(), so they are not done here.
+        """
+        try:
+            service = create_agent_config_service()
+            raw_config = service.get_all()
+            return AgentConfig(**raw_config)
+        except Exception as e:
+            print(f"⚠ Could not build global agent config: {e}")
+            # Fall back to minimal AgentConfig with env-var key
+            return AgentConfig(
+                api_key=os.getenv('OPENAI_API_KEY') or os.getenv('DEEPSEEK_API_KEY') or ''
+            )
+
+    def start(self, query: str,
+              config_dict: Optional[Dict[str, Any]] = None) -> None:
         """
         Start a new agent session.
+
+        Configuration is built from three layers (each overriding the previous):
+          1. Global config (from agent_config.json via ConfigService)
+          2. Session config overrides (from a loaded session's metadata)
+          3. Frontend config_dict (the caller's runtime overrides)
 
         If a session was previously loaded via load_session(), the loaded
         session's conversation is passed to the controller so the agent
         can continue from that context.  After starting, the loaded-session
         reference is cleared (the new run owns its own session).
 
-        If ``self._loaded_config_overrides`` is set (from load_session),
-        those values are merged into the config_dict so the saved config
-        (system prompt, tools, etc.) is restored.
-
         Args:
             query: Initial user query string.
-            config_dict: Configuration dictionary (see AgentConfig fields).
-                         Values from loaded session metadata override these.
-            preset_name: Named preset to load instead of config_dict.
-                         If both are given, config_dict values override the preset.
+            config_dict: Frontend configuration overrides (see AgentConfig fields).
+                         Applied on top of global config + loaded session config.
         """
-        # ── Merge loaded config overrides ──────────────────────────────────
-        merged_config = dict(config_dict or {})
+        # ── Layer 1: global config from agent_config.json ──────────────────
+        global_config = self._build_global_agent_config()
+        merged_config = global_config.model_dump()
+
+        # ── Layer 2: loaded session config overrides ──────────────────────
         if self._loaded_config_overrides:
-            # Loaded config overrides take priority (they were the saved config)
-            for k, v in self._loaded_config_overrides.items():
-                if k not in ('session_id', 'created_at', 'updated_at'):
-                    merged_config.setdefault(k, v)
+            merged_config.update(self._loaded_config_overrides)
             print(f"🔧 Merged {len(self._loaded_config_overrides)} config overrides from loaded session")
+
+        # ── Layer 3: frontend config_dict ─────────────────────────────────
+        if config_dict:
+            for k, v in config_dict.items():
+                if k not in ('session_id', 'created_at', 'updated_at'):
+                    merged_config[k] = v
+
+        # ── Provider resolution ────────────────────────────────────────────
+        provider_id = merged_config.get('provider_id')
+        if provider_id:
+            try:
+                manager = ProviderManager()
+                merged_config = manager.resolve_config(merged_config)
+            except Exception as e:
+                print(f"⚠ Could not resolve provider profile: {e}")
+
+        # ── API key fallback to env vars ───────────────────────────────────
+        api_key = merged_config.get('api_key') or os.getenv('OPENAI_API_KEY') or os.getenv('DEEPSEEK_API_KEY')
+        if api_key:
+            merged_config['api_key'] = api_key
 
         if self._controller is not None:
             # ── Delegate to controller ──────────────────────────────────
-            # Pass loaded session so the controller continues from its history
+            # Build an AgentConfig from the merged config and pass it.
+            # The controller path always uses config (never preset).
             session_arg = self._loaded_session
-            if preset_name:
-                self._running = True
-                self._session_id = None
-                overrides = merged_config
-                self._controller.start(query, preset_name=preset_name,
-                                       session=session_arg, **overrides)
-                self._config = self._controller.get_config()
-            else:
-                config = AgentConfig(**merged_config)
-                self._config = config
-                self._running = True
-                self._session_id = None
-                self._controller.start(query, config, session=session_arg)
+            config = AgentConfig(**merged_config)
+            self._config = config
+            self._running = True
+            # session_id will be captured from the first controller event
+            self._controller.start(query, config, session=session_arg)
             self._loaded_session = None  # consumed
             self._loaded_config_overrides = None  # consumed
             return
@@ -201,9 +239,21 @@ class WebAgentBridge:
         config = AgentConfig(**merged_config)
         self._config = config
 
-        # Create agent (no Qt dependency, pure Python)
-        self._agent = Agent(config)
-        self._session_id = getattr(self._agent, 'session_id', None)
+        # ── Bridge diagnostic log ──────────────────────────────────────
+        log('DEBUG', 'web.bridge', f"[BRIDGE CONFIG] enabled_tools={merged_config.get('enabled_tools')}, "
+            f"loaded_overrides_keys={list(self._loaded_config_overrides.keys()) if self._loaded_config_overrides else None}, "
+            f"frontend_dict_keys={list(config_dict.keys()) if config_dict else None}")
+
+        # Create session for this run (no Qt dependency, pure Python)
+        if self._loaded_session is not None:
+            session = self._loaded_session
+            self._loaded_session = None  # consumed
+        else:
+            session = Session()
+            session.metadata['source'] = 'web_ui'
+        self._session = session
+        self._agent = Agent(config, session=session)
+        self._session_id = session.session_id
 
         # Queue the initial query
         self._query_queue.put(query)
@@ -292,15 +342,26 @@ class WebAgentBridge:
             The saved Session object, or None on failure.
         """
         try:
-            session_id = self._loaded_session.session_id if self._loaded_session else str(uuid.uuid4())
-            session = Session(
-                session_id=session_id,
-                user_history=list(self.history),
-                metadata={
-                    'agent_config': self._config.model_dump() if self._config else {},
-                    'source': 'web_ui',
-                }
-            )
+            # Use the active session if available (standalone or controller path)
+            session = getattr(self, '_session', None)
+            if session is None:
+                # Fallback when no session is active — build from self.history
+                session_id = self._loaded_session.session_id if self._loaded_session else str(uuid.uuid4())
+                session = Session(
+                    session_id=session_id,
+                    user_history=list(self.history),
+                    metadata={
+                        'agent_config': self._config.model_dump() if self._config else {},
+                        'source': 'web_ui',
+                    }
+                )
+            else:
+                # Update existing session metadata
+                session.metadata.setdefault('agent_config', {})
+                if self._config:
+                    session.metadata['agent_config'] = self._config.model_dump()
+                session.metadata.setdefault('source', 'web_ui')
+
             # Apply name: explicit arg > existing loaded session name > generated
             if name:
                 session.metadata['name'] = name
@@ -333,6 +394,7 @@ class WebAgentBridge:
                 print(f"⚠ Session not found: {session_id}")
                 return False
             self.history = list(session.user_history)
+            self._session = session
             self._loaded_session = session
 
             # ── Extract agent_config from session metadata ────────────────
@@ -473,6 +535,7 @@ class WebAgentBridge:
         # Stop the bridge
         self.stop()
         # Reset state
+        self._session = None
         self._loaded_session = None
         self._loaded_config_overrides = None
         self.history = []
@@ -489,6 +552,7 @@ class WebAgentBridge:
 
     def clear_loaded_session(self) -> None:
         """Clear the loaded session reference for a fresh start."""
+        self._session = None
         self._loaded_session = None
         self._loaded_config_overrides = None
         self.history = []
@@ -515,8 +579,19 @@ class WebAgentBridge:
         Receives raw events from the controller's agent thread and maps
         them to the frontend protocol, exactly like _map_and_emit does
         for the standalone agent loop.
+
+        Also captures the session ID from the first event that carries one
+        and triggers save_open_session() — deferred from start() because
+        the session ID isn't known until the controller has created its agent.
         """
         print(f"🔹 Bridge received event: {event.get('type')} — {str(event)[:200]}")
+        # Capture session ID from first event that has one
+        if self._session_id is None:
+            sid = event.get('session_id')
+            if sid is not None:
+                self._session_id = sid
+                self.save_open_session()
+                print(f"📋 Session ID captured from controller event: {sid}")
         self._map_and_emit(event)
 
     def _event_to_message(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:

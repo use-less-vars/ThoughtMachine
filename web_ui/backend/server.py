@@ -73,6 +73,7 @@ import traceback
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from agent.logging import log
 from contextlib import asynccontextmanager
 
 # Ensure project root is on sys.path
@@ -168,20 +169,21 @@ async def websocket_endpoint(ws: WebSocket):
                         await ws.send_json({"type": "status_message", "text": "⚠ Query cannot be empty."})
                         continue
 
-                    # Translate frontend config format → AgentConfig format
-                    # The preset provides defaults; frontend fields become overrides.
+                    # Translate frontend config format → AgentConfig format.
+                    # Global config from agent_config.json provides defaults;
+                    # frontend fields become overrides.
                     config_dict = _translate_frontend_config(config_dict)
 
                     controller = AgentController()
                     bridge = WebAgentBridge(event_callback=event_callback)
                     bridge.set_controller(controller)
                     try:
-                        bridge.start(query, config_dict, preset_name="Default")
+                        bridge.start(query, config_dict)
                     except RuntimeError as exc:
                         # Controller may be stuck from a prior session; stop and retry
                         await ws.send_json({"type": "status_message", "text": f"⚠ Controller busy — resetting: {exc}"})
                         controller.stop()
-                        bridge.start(query, config_dict, preset_name="Default")
+                        bridge.start(query, config_dict)
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
@@ -518,16 +520,16 @@ def _translate_frontend_config(fe_config: Dict[str, Any]) -> Dict[str, Any]:
     if provider:
         cfg["provider_type"] = provider_map.get(provider, provider)
 
-    # Translate tools list to enabled_tools
-    tools = cfg.pop("tools", None)
-    if isinstance(tools, list):
-        cfg["enabled_tools"] = [
-            t["name"] for t in tools
-            if isinstance(t, dict) and t.get("enabled", False)
-        ]
+    # [REMOVED] tools→enabled_tools translation — frontend placeholder list must not override global config
+    cfg.pop("tools", None)
 
     # Remove any keys that start with _
     cfg = {k: v for k, v in cfg.items() if not k.startswith("_")}
+
+    # ── Translate diagnostic log ──────────────────────────────────────
+    log('DEBUG', 'web.server', f"[TRANSLATE] frontend config keys: {list(fe_config.keys())}, "
+        f"tools field: {fe_config.get('tools')}, "
+        f"enabled_tools after translate: {cfg.get('enabled_tools')}")
 
     return cfg
 
