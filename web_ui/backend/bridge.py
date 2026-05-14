@@ -38,6 +38,7 @@ that the React frontend expects (see frontend/src/App.jsx):
 from __future__ import annotations
 
 import json
+import re
 import threading
 import queue
 import traceback
@@ -398,6 +399,44 @@ class WebAgentBridge:
                 print(f"⚠ Session not found: {session_id}")
                 return False
             self.history = list(session.user_history)
+
+            # ── Normalize old message formats ────────────────────────────────
+            # Convert pre-standardization role names ("tool", assistant with
+            # "[Tool call:") to the canonical "tool_call" / "tool_result" that
+            # the frontend ChatPanel expects.
+            normalized = []
+            for msg in self.history:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+
+                # Convert old tool_call: stored as assistant with "[Tool call: name(args)]"
+                if role == "assistant" and content.startswith("[Tool call:"):
+                    match = re.match(r'^\[Tool call:\s*(\w+)\(([^)]*)\)\]$', content)
+                    if match:
+                        tool_name = match.group(1)
+                        args_str = match.group(2)
+                        try:
+                            args_json = args_str.replace("'", '"')
+                            args = json.loads(args_json)
+                        except Exception:
+                            args = {}
+                        new_content = json.dumps({"name": tool_name, "arguments": args})
+                        normalized.append({"role": "tool_call", "content": new_content})
+                        continue
+
+                # Convert old tool_result: role "tool" -> "tool_result"
+                if role == "tool":
+                    normalized.append({"role": "tool_result", "content": content})
+                    continue
+
+                # Remove empty assistant messages that were placeholders for tool calls
+                if role == "assistant" and content.strip() == "":
+                    continue
+
+                # Keep everything else unchanged
+                normalized.append(msg)
+
+            self.history = normalized
             self._session = session
             self._loaded_session = session
 
