@@ -836,6 +836,10 @@ class Agent:
                     chat_kwargs['max_tokens'] = self.runtime_params.max_tokens
                 if self.runtime_params.top_p is not None:
                     chat_kwargs['top_p'] = self.runtime_params.top_p
+                # ── Agent messages diagnostic ──────────────────────────────────
+                log('DEBUG', 'core.agent', f"[AGENT MESSAGES BEFORE API] turn={turn} len(messages)={len(messages)} "
+                    f"roles={[m.get('role') for m in messages[-5:]]} "
+                    f"last_user={'present' if any(m['role']=='user' for m in messages[-2:]) else 'MISSING'}")
                 llm_start_time = time.time()
                 response = self.llm_client.chat_completion(messages=messages, tools=tools if tools else None, **chat_kwargs)
                 llm_duration_ms = (time.time() - llm_start_time) * 1000
@@ -917,7 +921,7 @@ class Agent:
                     elif tool_calls:
                         assistant_msg['reasoning_content'] = ''
                     # Don't include tool_calls — they weren't executed
-                    grace_tx = TurnTransaction(self.session, self.context_builder)
+                    grace_tx = TurnTransaction(self.session, self.context_builder, conversation=None if self._session is not None else self._conversation)
                     grace_tx.add_assistant_message(assistant_msg)
                     grace_tx.commit()
                     events = self.state.set_execution_state(ExecutionState.PAUSING)
@@ -934,7 +938,7 @@ class Agent:
                         self.logger.log_system_resources()
                         self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
                     return
-            turn_transaction = TurnTransaction(self.session, self.context_builder)
+            turn_transaction = TurnTransaction(self.session, self.context_builder, conversation=None if self._session is not None else self._conversation)
             assistant_msg = {'role': 'assistant', 'content': content}
             if reasoning is not None:
                 assistant_msg['reasoning_content'] = reasoning
@@ -978,6 +982,7 @@ class Agent:
                 for warning in self._pending_warnings:
                     self._add_to_conversation(warning)
                 self._pending_warnings.clear()
+                log('DEBUG', 'core.agent', f"[TOOL LOOP] conversation length now {len(self.conversation)}, last 3 roles: {[m.get('role') for m in self.conversation[-3:]]}")
                 if final_detected:
                     final_event = {'type': 'final', 'stop_reason': 'final', 'content': final_content if final_content is not None else content, 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                     if reasoning is not None:

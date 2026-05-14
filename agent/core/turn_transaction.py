@@ -20,16 +20,18 @@ logger = logging.getLogger(__name__)
 class TurnTransaction:
     """Buffer for atomic turn execution."""
 
-    def __init__(self, session, context_builder=None):
+    def __init__(self, session, context_builder=None, conversation=None):
         """
         Initialize empty transaction.
         
         Args:
             session: Session object with user_history attribute
             context_builder: Optional HistoryProvider for cache invalidation
+            conversation: Fallback conversation list when session is None
         """
         self.session = session
         self.context_builder = context_builder
+        self.conversation = conversation
         self._assistant_message: Optional[Dict[str, Any]] = None
         self._tool_calls_buffer: List[Dict[str, Any]] = []
         self._committed = False
@@ -93,6 +95,9 @@ class TurnTransaction:
             log('DEBUG', 'debug.unknown', f'[TurnTransaction] user_history id: {id(self.session.user_history)}')
             self.session.user_history.extend(commit_messages)
             self.session.updated_at = datetime.now()
+        elif self.conversation is not None:
+            log('DEBUG', 'debug.unknown', f'[TurnTransaction] Extending fallback conversation with {len(commit_messages)} messages (session=None)')
+            self.conversation.extend(commit_messages)
         if self.context_builder and hasattr(self.context_builder, 'clear_cache'):
             self.context_builder.clear_cache()
         self._committed = True

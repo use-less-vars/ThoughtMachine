@@ -152,6 +152,16 @@ class ToolExecutor:
         """
         try:
             tool_args = arguments.copy()
+            # Validate LLM's original arguments BEFORE injecting infrastructure fields.
+            # This ensures that if validation fails, the error message shows the LLM's
+            # own input (e.g., empty {}) rather than the injected fields like
+            # {'workspace_path': '/home/...', 'token_limit': 10000} which makes it
+            # look like a system bug.
+            try:
+                tool_class.model_validate(tool_args)
+            except ValidationError as e:
+                return {'result': f'Invalid arguments: {e}', 'tool_type': 'normal'}
+            # Now inject infrastructure fields (safe because validation passed)
             if self.config.workspace_path is not None:
                 tool_args['workspace_path'] = self.config.workspace_path
             if self.config.tool_output_token_limit is not None:
