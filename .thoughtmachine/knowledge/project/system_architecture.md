@@ -1036,3 +1036,15 @@ This separation allows the hub WebSocket (App.jsx) to list sessions and auto-loa
 4. Each `SessionTab` WS connects → sends `load_session` with the `sessionId`
 5. Backend loads session → emits `session_loaded` with the ID
 6. SessionTab updates `currentSessionId` → ready for `continue_session`
+
+## 2026-05-16 — Dead code removal: orchestrator.py, legacy config/, agent/utils/, qml_gui/, AI_Tasks/
+
+## Dead Code Removal (2026-05-15)
+
+Removed the following dead/orphaned code:
+
+- **`llm_providers/orchestrator.py`** (359 lines) — Old provider fallback/chaining orchestrator. Unused. Only imported from orphaned top-level `config/` package.
+- **Top-level `config/` package** (`__init__.py`, `models.py`, `loader.py`, ~18 KB) — Legacy configuration system (`FallbackConfig`, `BudgetConfig`, `LLMConfig`, `ConfigLoader`). Superseded by `agent/config/models.py` (`AgentConfig`).
+- **`agent/utils/__init__.py`** — Empty package, unused.
+- **`qml_gui/`** (7 files, 52 KB) — QML-based GUI, superseded by `web_ui/` + React frontend.
+- **`AI_Tasks/`** (12 files, 64 KB) — Old task documents migrated to Knowledge Base.
