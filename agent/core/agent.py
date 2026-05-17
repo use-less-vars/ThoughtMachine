@@ -16,7 +16,6 @@ import os
 import queue
 import time
 import traceback
-import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Any, TYPE_CHECKING, Generator
 from agent.logging import log
@@ -43,7 +42,7 @@ from .message_utils import group_messages_into_turns, group_messages_into_turns_
 if TYPE_CHECKING:
     from agent.config import AgentConfig
     from session.models import Session
-logger = logging.getLogger(__name__)
+
 from .debug_context import PAUSE_DEBUG, pause_debug
 
 class Agent:
@@ -117,7 +116,7 @@ class Agent:
             # Recalculate tool_classes to include MCP tools
             self.tool_classes = config.get_filtered_tool_classes()
         except Exception as e:
-            logger.warning(f"Failed to register MCP tools: {e}")
+            log('WARNING', 'core.agent', f"Failed to register MCP tools: {e}")
         self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
         self.tool_executor = ToolExecutor(self.tool_classes, config, None, self.logger, self.security_available, agent=self)
         self.provider = self.llm_client.provider
@@ -164,7 +163,7 @@ class Agent:
             new_config: New AgentConfig to apply.
         """
         self._pending_config = new_config
-        logger.debug(f'Pending config update queued: provider={new_config.provider_type}, model={new_config.model}')
+        log('DEBUG', 'agent.core', f'Pending config update queued: provider={new_config.provider_type}, model={new_config.model}')
 
     def _apply_pending_config(self):
         """Apply pending configuration update if one exists.
@@ -190,11 +189,9 @@ class Agent:
         else:
             # Validate that the new config has an API key available before attempting restart
             if not self._has_api_key(new_config):
-                logger.warning(
-                    f'Cannot restart with provider {new_config.provider_type}: '
+                log('WARNING', 'agent.core', f'Cannot restart with provider {new_config.provider_type}: '
                     f'no API key available. Set {new_config.provider_type.upper()}_API_KEY '
-                    f'environment variable or provide api_key in config.'
-                )
+                    f'environment variable or provide api_key in config.')
                 log('WARNING', 'core.config',
                     '[CONFIG_TRACE] Pending config PRESERVED for retry on next turn '
                     f'(no API key for provider={new_config.provider_type})')
@@ -262,7 +259,7 @@ class Agent:
             changed.append(f'enabled_tools={", ".join(new_config.enabled_tools)}')
         
         if changed:
-            logger.debug(f'Config hot-swapped: {", ".join(changed)}')
+            log('DEBUG', 'agent.core', f'Config hot-swapped: {", ".join(changed)}')
             if self.logger:
                 self.logger.log_system_event(f'Config hot-swapped: {", ".join(changed)}')
 
@@ -274,7 +271,7 @@ class Agent:
         """
         success = self.restart(new_config)
         if not success:
-            logger.error(f'Agent restart with provider={new_config.provider_type} failed')
+            log('ERROR', 'agent.core', f'Agent restart with provider={new_config.provider_type} failed')
 
     @staticmethod
     def _has_api_key(config: AgentConfig) -> bool:
@@ -378,19 +375,19 @@ class Agent:
             # Reset rate limiting
             self.reset_rate_limiting()
 
-            logger.debug(f'Agent restarted with provider={new_config.provider_type}, model={new_config.model}')
+            log('DEBUG', 'agent.core', f'Agent restarted with provider={new_config.provider_type}, model={new_config.model}')
             if self.logger:
                 self.logger.log_info('AGENT_RESTART', f'Configuration reloaded, provider: {self.provider}')
             return True
         except Exception as e:
-            logger.error(f'Failed to restart agent: {e}', exc_info=True)
+            log('ERROR', 'agent.core', f'Failed to restart agent: {e}')
             # Restore old LLM client so agent isn't left in a broken state
             if old_config is not None and old_logger is not None:
                 try:
                     self.llm_client = LLMClient(old_config, self._session, old_logger)
                     self.provider = self.llm_client.provider
                 except Exception as restore_error:
-                    logger.critical(f'Failed to restore old LLM client after restart failure: {restore_error}')
+                    log('CRITICAL', 'agent.core', f'Failed to restore old LLM client after restart failure: {restore_error}')
             else:
                 self.llm_client = None
                 self.provider = None
@@ -476,14 +473,14 @@ class Agent:
             old_state = event.get('old_state')
             new_state = event.get('new_state')
             if self.logger:
-                self.logger.py_logger.debug(f'Execution state change: {old_state} -> {new_state}')
+                log('DEBUG', 'agent.core', f'Execution state change: {old_state} -> {new_state}')
             self._add_conversation_data_to_event(event)
             yield event
         elif event.get('type') == 'session_state_change':
             old_state = event.get('old_state')
             new_state = event.get('new_state')
             if self.logger:
-                self.logger.py_logger.debug(f'Session state change: {old_state} -> {new_state}')
+                log('DEBUG', 'agent.core', f'Session state change: {old_state} -> {new_state}')
             self._add_conversation_data_to_event(event)
             yield event
     def _update_conversation_token_estimate(self):
@@ -520,7 +517,7 @@ class Agent:
         original_len = len(runtime_context)
         runtime_context = ContextBuilder._cleanup_orphaned_tool_messages(runtime_context)
         if original_len != len(runtime_context):
-            logger.debug(f'[DEBUG_CONTEXT] Token estimate: cleaned {original_len - len(runtime_context)} orphaned tool messages')
+            log('DEBUG', 'agent.core', f'[DEBUG_CONTEXT] Token estimate: cleaned {original_len - len(runtime_context)} orphaned tool messages')
         estimated_tokens = 0
         for msg in runtime_context:
             estimated_tokens += self.token_counter.estimate_tokens(msg)
@@ -530,7 +527,7 @@ class Agent:
             log('DEBUG', 'core.token_estimate', f'context_builder.token_limit: {self.context_builder.token_limit}')
         log('DEBUG', 'core.pruning', f'Runtime context token estimate (from {len(runtime_context)}/{len(self.conversation)} messages)', {'tokens': estimated_tokens})
         if self.logger and hasattr(self.logger, 'py_logger'):
-            self.logger.py_logger.info(f'[TOKEN_ESTIMATE] Updated runtime context token estimate: {estimated_tokens} tokens (from {len(runtime_context)}/{len(self.conversation)} messages)')
+            log('INFO', 'agent.core', f'[TOKEN_ESTIMATE] Updated runtime context token estimate: {estimated_tokens} tokens (from {len(runtime_context)}/{len(self.conversation)} messages)')
 
     def _add_to_conversation(self, message):
         """Add a message via conversation_manager (ensures cache invalidation)."""
@@ -669,7 +666,7 @@ class Agent:
         # Safety check: ensure LLM client is in a valid state after config update
         llm_client = getattr(self, 'llm_client', None)
         if llm_client is None or getattr(llm_client, 'provider', None) is None:
-            logger.error('LLM client is unavailable or in invalid state after config update')
+            log('ERROR', 'agent.core', 'LLM client is unavailable or in invalid state after config update')
             event_dict = {
                 'type': 'error',
                 'error_type': 'invalid_config',
@@ -781,10 +778,10 @@ class Agent:
                         msg['reasoning_content'] = ''
             if self.logger and hasattr(self.logger, 'py_logger'):
                 system_msgs = [msg for msg in self.conversation if msg.get('role') == 'system']
-                self.logger.py_logger.info(f'[CONVERSATION] Total messages: {len(self.conversation)}, system messages: {len(system_msgs)}')
+                log('INFO', 'agent.core', f'[CONVERSATION] Total messages: {len(self.conversation)}, system messages: {len(system_msgs)}')
             max_context_tokens = self._get_max_context_tokens()
             if self.logger and hasattr(self.logger, 'py_logger'):
-                self.logger.py_logger.info(f'[CONTEXT] Max context tokens: {max_context_tokens}, model: {self.config.model}')
+                log('INFO', 'agent.core', f'[CONTEXT] Max context tokens: {max_context_tokens}, model: {self.config.model}')
             self.debug_context.debug_context('before_build', context_builder=self.context_builder)
             if hasattr(self, 'context_builder') and self.context_builder is not None:
                 messages = self.context_builder.build(self.conversation, max_tokens=max_context_tokens)
@@ -799,7 +796,7 @@ class Agent:
             original_len = len(messages)
             messages = ContextBuilder._cleanup_orphaned_tool_messages(messages)
             if original_len != len(messages):
-                logger.debug(f'[DEBUG_CONTEXT] Agent: cleaned {original_len - len(messages)} orphaned tool messages from final context')
+                log('DEBUG', 'agent.core', f'[DEBUG_CONTEXT] Agent: cleaned {original_len - len(messages)} orphaned tool messages from final context')
             if self.logger and hasattr(self.logger, 'py_logger'):
                 import tiktoken
                 try:
@@ -807,14 +804,14 @@ class Agent:
                 except Exception:
                     encoder = None
                 total_tokens = sum((self.token_counter.estimate_tokens(msg) for msg in messages))
-                self.logger.py_logger.info(f'[CONTEXT] Built context: {len(messages)} messages, ~{total_tokens} tokens')
+                log('INFO', 'agent.core', f'[CONTEXT] Built context: {len(messages)} messages, ~{total_tokens} tokens')
             if self.logger:
                 self.logger.log_llm_request(messages, self.tool_definitions)
             if self.rate_limit_active:
                 delay = min(self.rate_limit_delay, self.rate_limit_max_wait)
                 if delay > 0:
                     if self.logger and hasattr(self.logger, 'py_logger'):
-                        self.logger.py_logger.info(f'[RATE_LIMIT] Applying rate limit delay: {delay}s between turns')
+                        log('INFO', 'agent.core', f'[RATE_LIMIT] Applying rate limit delay: {delay}s between turns')
                     time.sleep(delay)
             tools = self.llm_client.format_tools(self.tool_definitions)
             # EMERGENCY TRACE: dump conversation and messages before LLM call
@@ -889,7 +886,7 @@ class Agent:
                 yield event_dict
                 return
             except Exception as e:
-                logger.exception(f'[Agent] Unexpected exception in process_query: {e}')
+                log('ERROR', 'agent.core', f'[Agent] Unexpected exception in process_query: {e}')
                 if self.logger:
                     self.logger.log_error('UNEXPECTED_ERROR', str(e))
                     self.logger.log_system_resources()
@@ -1074,8 +1071,7 @@ class Agent:
         if self.conversation:
             dump_messages(self.conversation, "Conversation before summarization")
         if self.session is None:
-            logger.warning('[DEBUG_PRUNING] No session available, using fallback pruning')
-            log('DEBUG', 'core.pruning', 'No session available, using fallback pruning')
+            log('WARNING', 'core.pruning', 'No session available, using fallback pruning')
             self._apply_summary_pruning_fallback(summary, keep_recent_turns)
             old_token_count = self.state.current_conversation_tokens
             self._update_conversation_token_estimate()
@@ -1083,7 +1079,7 @@ class Agent:
             self.state.update_token_state(self.state.current_conversation_tokens)
             log('DEBUG', 'core.pruning', f'Fallback pruning token change: {old_token_count} -> {self.state.current_conversation_tokens}')
             if self.logger and hasattr(self.logger, 'py_logger'):
-                self.logger.py_logger.info(f'[PRUNING] Updated token estimate after fallback: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
+                log('INFO', 'agent.core', f'[PRUNING] Updated token estimate after fallback: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
             return
         user_history = self.session.user_history
         log('DEBUG', 'core.session_history', f'session.user_history length: {len(user_history)}')
@@ -1132,14 +1128,14 @@ class Agent:
             self.logger.log_conversation_prune(len(user_history) - 1, len(user_history), 'summary_pruning_append_only')
         log('DEBUG', 'core.summary', f'Added summary to append-only history: kept {kept_turns_count} turns, inserted at index {insertion_idx}')
         if self.logger and hasattr(self.logger, 'py_logger'):
-            self.logger.py_logger.info(f'[PRUNING] Added summary to append-only history: kept {kept_turns_count} turns, inserted summary at index {insertion_idx}, history length: {len(user_history)} messages')
+            log('INFO', 'agent.core', f'[PRUNING] Added summary to append-only history: kept {kept_turns_count} turns, inserted summary at index {insertion_idx}, history length: {len(user_history)} messages')
         old_token_count = self.state.current_conversation_tokens
         self._update_conversation_token_estimate()
         # Immediately re-evaluate token state to clear restrictions if below critical
         self.state.update_token_state(self.state.current_conversation_tokens)
         log('DEBUG', 'core.pruning', f'Summary pruning token change: {old_token_count} -> {self.state.current_conversation_tokens}, summary_idx={insertion_idx}, kept_turns={kept_turns_count}')
         if self.logger and hasattr(self.logger, 'py_logger'):
-            self.logger.py_logger.info(f'[PRUNING] Updated token estimate: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
+            log('INFO', 'agent.core', f'[PRUNING] Updated token estimate: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
         log('DEBUG', 'core.pruning', f'_apply_summary_pruning completed. History length: {len(user_history)} messages')
         log('DEBUG', 'core.session_history', f'session.summary exists: {self.session.summary is not None}')
 
@@ -1149,7 +1145,7 @@ class Agent:
         This mirrors the main _apply_summary_pruning path: it mutates the existing
         conversation list via insert/append rather than replacing it entirely.
         """
-        logger.warning('[DEBUG_PRUNING] Using fallback pruning (no session)')
+        log('WARNING', 'core.pruning', '[DEBUG_PRUNING] Using fallback pruning (no session)')
         if not self.conversation:
             return
         # Use _find_summary_insertion_index (which uses the shared turn-grouping utility)
@@ -1171,7 +1167,7 @@ class Agent:
         if hasattr(self, 'context_builder') and self.context_builder is not None and hasattr(self.context_builder, '_cached_context'):
             self.context_builder._cached_context = None
             log('DEBUG', 'core.context_builder', 'Fallback pruning: cleared _cached_context')
-        logger.debug(f'[DEBUG_PRUNING] Fallback pruning: conversation length {len(self.conversation)}')
+        log('DEBUG', 'core.pruning', f'[DEBUG_PRUNING] Fallback pruning: conversation length {len(self.conversation)}')
 
     def _find_summary_insertion_index(self, user_history: List[Dict[str, Any]], keep_recent_turns: int) -> int:
         """Find index in user_history where summary should be inserted.

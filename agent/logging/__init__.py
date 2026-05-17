@@ -199,7 +199,12 @@ class _AgentLogger:
 
     def _write_jsonl(self, event: Dict[str, Any]):
         """Write a JSONL entry to the log file."""
-        with self._lock:
+        # Use a timeout to prevent indefinite blocking if lock is contended
+        acquired = self._lock.acquire(timeout=5.0)
+        if not acquired:
+            print(f"[LOGGING WARNING] _write_jsonl: could not acquire lock within 5s, skipping", file=__import__('sys').stderr)
+            return
+        try:
             if not self.enable_file_logging or not self._file_handle or self._file_handle.closed:
                 return
             try:
@@ -247,6 +252,8 @@ class _AgentLogger:
                 except:
                     pass
                 self._file_handle = None
+        finally:
+            self._lock.release()
 
 
     def _log_event(self, event_type: LogEventType, level: LogLevel, message: str='', data: Optional[Dict[str, Any]]=None, turn: Optional[int]=None):

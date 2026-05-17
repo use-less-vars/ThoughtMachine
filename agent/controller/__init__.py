@@ -132,7 +132,8 @@ class AgentController(QObject):
             preset_name: Name of a preset to use instead of config. If provided, config is ignored.
             **overrides: Additional config overrides when using preset_name.
         """
-        log('DEBUG', 'core.controller', f'start called with query: {query[:50]}...')
+        log('INFO', 'core.controller', 'controller.start() ENTERED')
+        log('INFO', 'core.controller', f'start called with query={query[:80]!r}..., config type={type(config).__name__}, session={session.session_id if session else None}, preset_name={preset_name!r}')
         self._cleanup_if_thread_dead()
         if self._running:
             raise RuntimeError('Agent is already running. Stop it first.')
@@ -347,7 +348,8 @@ class AgentController(QObject):
 
     def _run(self):
         """Internal method that runs in the background thread."""
-        log('DEBUG', 'core.controller', f'_run started')
+        log('INFO', 'core.controller', f'_run thread STARTED (threading.get_ident={threading.get_ident()})')
+        log('INFO', 'core.controller', f'_run: self.agent={id(self.agent) if hasattr(self, "agent") and self.agent is not None else None}')
         if hasattr(self, 'agent') and self.agent is not None:
             log('DEBUG', 'core.controller', f"[CONTROLLER _run] entering with self.agent={id(self.agent)}, agent.conversation len={len(self.agent.conversation)}, first roles={[m.get('role') for m in self.agent.conversation[:3]]}")
 
@@ -362,7 +364,7 @@ class AgentController(QObject):
             log('DEBUG', 'core.controller', f'should_stop: not paused, returning False')
             return False
 
-        log('DEBUG', 'core.controller', '_run(): about to create agent')
+        log('INFO', 'core.controller', '_run(): about to create agent')
         # --- Agent creation (separate try/except to keep thread alive on failure) ---
         try:
             if hasattr(self, '_agent_override') and self._agent_override is not None:
@@ -381,12 +383,20 @@ class AgentController(QObject):
                 run_config = self._config.model_copy() if hasattr(self._config, 'model_copy') else self._config
                 run_config.stop_check = should_stop
                 log('DEBUG', 'core.controller', "[CONTROLLER] creating new Agent instance")
+                # Ensure API key is set from env vars if config doesn't have one
+                api_key_val = getattr(run_config, 'api_key', None) or ''
+                if not api_key_val:
+                    import os
+                    api_key_val = os.getenv('OPENAI_API_KEY') or os.getenv('DEEPSEEK_API_KEY') or os.getenv('OPENAI_COMPATIBLE_API_KEY') or ''
+                    if api_key_val:
+                        run_config.api_key = api_key_val
+                        log('INFO', 'core.controller', f"[CONTROLLER] Filled missing api_key from env var")
                 agent = Agent(run_config, session=self._session if hasattr(self, '_session') else None)
                 self.agent = agent
             # Propagate agent's session_id so events carry it (needed for Web UI bridge)
             if self.agent and not self.current_session_id:
                 self.current_session_id = self.agent.session_id or str(uuid.uuid4())
-            log('DEBUG', 'core.controller', '_run: Agent created successfully')
+            log('INFO', 'core.controller', f'_run: Agent created successfully, agent.id={id(self.agent) if self.agent else None}')
         except Exception as e:
             log('ERROR', 'core.controller', f'_run: Agent creation FAILED: {e}')
             traceback.print_exc()
@@ -427,13 +437,14 @@ class AgentController(QObject):
                 if query == '[RESET]':
                     agent.reset()
                     continue
-                log('DEBUG', 'core.controller', f'Processing query: {query[:50]}...')
+                log('INFO', 'core.controller', f'Processing query: {query[:80]!r}...')
                 self._processing_query = True
                 stop_reason = None
                 try:
                     # ── Controller diagnostic ───────────────────────────────────────
                     if hasattr(agent, 'conversation'):
-                        log('DEBUG', 'core.controller', f"[CONTROLLER _run] passing query to agent. agent.conversation has {len(agent.conversation)} msgs. roles={[m.get('role') for m in agent.conversation]}")
+                        log('INFO', 'core.controller', f"[CONTROLLER _run] passing query to agent. agent.conversation has {len(agent.conversation)} msgs. roles={[m.get('role') for m in agent.conversation]}")
+                        log('INFO', 'core.controller', f'[CONTROLLER _run] about to call agent.process_query()')
                     else:
                         log('DEBUG', 'core.controller', "[CONTROLLER _run] agent has NO conversation attribute")
                     for event in agent.process_query(query):

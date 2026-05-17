@@ -5,11 +5,9 @@ This module provides a function to check if required RAG libraries are installed
 If dependencies are missing, RAG tools will gracefully degrade or provide fallback behavior.
 """
 
-import logging
 from typing import Tuple, Optional, Dict
 import sys
-
-logger = logging.getLogger(__name__)
+from agent.logging import log
 
 # Global dependency status
 DEPENDENCIES: Dict[str, bool] = {}
@@ -36,44 +34,44 @@ def check_rag_dependencies() -> Tuple[bool, Optional[str]]:
     try:
         import chromadb
         DEPENDENCIES["chromadb"] = True
-        logger.debug("chromadb imported successfully")
+        log('DEBUG', 'knowledge.deps', 'chromadb imported successfully')
     except ImportError as e:
         DEPENDENCIES["chromadb"] = False
         missing.append("chromadb")
-        logger.debug(f"chromadb import failed: {e}")
+        log('DEBUG', 'knowledge.deps', f'chromadb import failed: {e}')
 
 
     # Try to import sentence_transformers
     try:
         import sentence_transformers
         DEPENDENCIES["sentence_transformers"] = True
-        logger.debug("sentence_transformers imported successfully")
+        log('DEBUG', 'knowledge.deps', 'sentence_transformers imported successfully')
     except ImportError as e:
         DEPENDENCIES["sentence_transformers"] = False
         missing.append("sentence_transformers")
-        logger.debug(f"sentence_transformers import failed: {e}")
+        log('DEBUG', 'knowledge.deps', f'sentence_transformers import failed: {e}')
 
 
     # Try to import tree_sitter
     try:
         import tree_sitter
         DEPENDENCIES["tree_sitter"] = True
-        logger.debug("tree_sitter imported successfully")
+        log('DEBUG', 'knowledge.deps', 'tree_sitter imported successfully')
     except ImportError as e:
         DEPENDENCIES["tree_sitter"] = False
         missing.append("tree_sitter")
-        logger.debug(f"tree_sitter import failed: {e}")
+        log('DEBUG', 'knowledge.deps', f'tree_sitter import failed: {e}')
 
 
     # Try to import pathspec (for .gitignore parsing)
     try:
         import pathspec
         DEPENDENCIES["pathspec"] = True
-        logger.debug("pathspec imported successfully")
+        log('DEBUG', 'knowledge.deps', 'pathspec imported successfully')
     except ImportError as e:
         DEPENDENCIES["pathspec"] = False
         missing.append("pathspec")
-        logger.debug(f"pathspec import failed: {e}")
+        log('DEBUG', 'knowledge.deps', f'pathspec import failed: {e}')
 
 
     # All four are required for full RAG functionality
@@ -85,11 +83,8 @@ def check_rag_dependencies() -> Tuple[bool, Optional[str]]:
 
     if not all_available:
         error_msg = f"Missing RAG dependencies: {', '.join(missing)}. Please install with: pip install {' '.join(missing)}"
-        logger.warning(
-            f"RAG dependencies missing: {missing}. "
-            f"RAG tools will be disabled or use fallback behavior."
-        )
+        log('WARNING', 'knowledge.deps', f'RAG dependencies missing: {missing}. RAG tools will be disabled or use fallback behavior.')
         return False, error_msg
     else:
-        logger.info("All RAG dependencies available")
+        log('INFO', 'knowledge.deps', 'All RAG dependencies available')
         return True, None

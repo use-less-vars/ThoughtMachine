@@ -5,10 +5,7 @@ Provides a single source of truth for turn-grouping logic used by
 both agent.py (summary pruning) and context_builder.py (context assembly).
 """
 
-import logging
 from typing import Any, Dict, List, Optional
-
-logger = logging.getLogger(__name__)
 
 
 def group_messages_into_turns(messages: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
@@ -37,15 +34,15 @@ def group_messages_into_turns(messages: List[Dict[str, Any]]) -> List[List[Dict[
     debug = os.environ.get('DEBUG_CONTEXT') or os.environ.get('DEBUG_TURN_GROUPING')
 
     if debug:
-        logger.debug(f'[DEBUG_TURN_GROUPING] Grouping {len(messages)} messages')
+        log('DEBUG', 'core.message_utils', f'[DEBUG_TURN_GROUPING] Grouping {len(messages)} messages')
         max_to_show = 10
         for i, msg in enumerate(messages[:max_to_show]):
             role = msg.get('role')
             content_preview = str(msg.get('content', ''))[:50]
             has_tool_calls = 'tool_calls' in msg and msg['tool_calls']
-            logger.debug(f'  [{i}] {role}: {content_preview}... tool_calls={has_tool_calls}')
+            log('DEBUG', 'core.message_utils', f'  [{i}] {role}: {content_preview}... tool_calls={has_tool_calls}')
         if len(messages) > max_to_show:
-            logger.debug(f'  ... and {len(messages) - max_to_show} more messages')
+            log('DEBUG', 'core.message_utils', f'  ... and {len(messages) - max_to_show} more messages')
 
     for msg in messages:
         role = msg.get('role')
@@ -84,14 +81,14 @@ def group_messages_into_turns(messages: List[Dict[str, Any]]) -> List[List[Dict[
                 else:
                     if debug:
                         tool_call_id = msg.get('tool_call_id', 'unknown')
-                        logger.debug(f'[DEBUG_TURN_GROUPING] Discarding orphaned tool message: {tool_call_id}')
+                        log('DEBUG', 'core.message_utils', f'[DEBUG_TURN_GROUPING] Discarding orphaned tool message: {tool_call_id}')
                     continue
             else:
                 current_turn.append(msg)
         else:
             # No current turn, discard orphaned message
             if debug:
-                logger.debug(f'[DEBUG_TURN_GROUPING] Discarding orphaned {role} message')
+                log('DEBUG', 'core.message_utils', f'[DEBUG_TURN_GROUPING] Discarding orphaned {role} message')
             continue
 
     if current_turn:
@@ -109,15 +106,15 @@ def group_messages_into_turns(messages: List[Dict[str, Any]]) -> List[List[Dict[
         elif first_role == 'assistant' and first_msg.get('tool_calls'):
             valid_turns.append(turn)
         elif debug:
-            logger.debug(f'[DEBUG_TURN_GROUPING] Discarding turn starting with {first_role}')
+            log('DEBUG', 'core.message_utils', f'[DEBUG_TURN_GROUPING] Discarding turn starting with {first_role}')
 
     if debug:
-        logger.debug(f'[DEBUG_TURN_GROUPING] Returned {len(valid_turns)} valid turns')
+        log('DEBUG', 'core.message_utils', f'[DEBUG_TURN_GROUPING] Returned {len(valid_turns)} valid turns')
         max_to_show = 10
         for i, turn in enumerate(valid_turns[:max_to_show]):
-            logger.debug(f"  Turn {i}: {[msg.get('role') for msg in turn]}")
+            log('DEBUG', 'core.message_utils', f"  Turn {i}: {[msg.get('role') for msg in turn]}")
         if len(valid_turns) > max_to_show:
-            logger.debug(f'  ... and {len(valid_turns) - max_to_show} more turns')
+            log('DEBUG', 'core.message_utils', f'  ... and {len(valid_turns) - max_to_show} more turns')
 
     return valid_turns
 

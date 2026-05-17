@@ -4,7 +4,6 @@ Works with OpenAI, DeepSeek, OpenCode/Big Pickle, and any OpenAI-compatible API.
 """
 from typing import Dict, List, Any, Optional
 import time
-import logging
 import os
 import sys
 from openai import OpenAI, APIError, RateLimitError, APIConnectionError
@@ -12,9 +11,6 @@ import tiktoken
 from .base import LLMProvider, ProviderConfig, LLMResponse
 from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError
 from agent.logging import log
-logger = logging.getLogger(__name__)
-if os.environ.get('DEBUG_OPENAI'):
-    logger.setLevel(logging.DEBUG)
 
 class OpenAICompatibleProvider(LLMProvider):
     """
@@ -26,16 +22,13 @@ class OpenAICompatibleProvider(LLMProvider):
     def __init__(self, config: ProviderConfig):
         super().__init__(config)
         client_kwargs = {'api_key': config.api_key, 'timeout': config.timeout, 'max_retries': config.max_retries}
-        logger.debug(f'OpenAI client config: base_url={config.base_url}, model={config.model}, api_key={config.api_key}, timeout={config.timeout}, max_retries={config.max_retries}, extra_headers={config.extra_headers}')
         log('DEBUG', 'llm.openai', f'client config: base_url={config.base_url}, model={config.model}, api_key={config.api_key}, timeout={config.timeout}, max_retries={config.max_retries}, extra_headers={config.extra_headers}')
         if config.base_url:
             client_kwargs['base_url'] = config.base_url
         if config.extra_headers:
             client_kwargs['default_headers'] = config.extra_headers
-        logger.debug(f"OpenAI client final kwargs: base_url={client_kwargs.get('base_url')}, default_headers={client_kwargs.get('default_headers')}")
         log('DEBUG', 'llm.openai', f"client final kwargs: base_url={client_kwargs.get('base_url')}, default_headers={client_kwargs.get('default_headers')}")
         self.client = OpenAI(**client_kwargs)
-        logger.debug(f"OpenAI client created with base_url={(self.client.base_url if hasattr(self.client, 'base_url') else 'default')}")
         log('DEBUG', 'llm.openai', f"client created with base_url={(self.client.base_url if hasattr(self.client, 'base_url') else 'default')}")
         self.encoding = None
 
@@ -45,7 +38,7 @@ class OpenAICompatibleProvider(LLMProvider):
             return
         try:
             self.encoding = tiktoken.encoding_for_model(self.config.model)
-            logger.debug(f'Loaded tokenizer for model: {self.config.model}')
+            log('DEBUG', 'llm.openai', f'Loaded tokenizer for model: {self.config.model}')
         except KeyError:
             try:
                 model_lower = self.config.model.lower()
@@ -58,10 +51,10 @@ class OpenAICompatibleProvider(LLMProvider):
                 else:
                     self.encoding = tiktoken.get_encoding('cl100k_base')
             except Exception as e:
-                logger.warning(f'Failed to load tokenizer: {e}. Token counting will be approximate.')
+                log('WARNING', 'llm.openai', f'Failed to load tokenizer: {e}. Token counting will be approximate.')
                 self.encoding = None
         except Exception as e:
-            logger.warning(f'Failed to load tokenizer: {e}. Token counting will be approximate.')
+            log('WARNING', 'llm.openai', f'Failed to load tokenizer: {e}. Token counting will be approximate.')
             self.encoding = None
 
     def _normalize_deepseek_tool_calls(self, messages):
@@ -257,7 +250,7 @@ class OpenAICompatibleProvider(LLMProvider):
                     messages_with_ids.append(msg_copy)
                 messages = messages_with_ids
                 messages = self._normalize_deepseek_tool_calls(messages)
-                logger.debug(f'DeepSeek: Added IDs to {len(messages)} messages')
+                log('DEBUG', 'llm.openai', f'DeepSeek: Added IDs to {len(messages)} messages')
                 for i, msg in enumerate(messages):
                     pass
             is_stepfun = 'stepfun' in self.config.model.lower()
@@ -275,7 +268,7 @@ class OpenAICompatibleProvider(LLMProvider):
             if tools:
                 completion_kwargs['tools'] = self.format_tools(tools)
                 completion_kwargs['tool_choice'] = kwargs.get('tool_choice', 'auto')
-            logger.debug(f"OpenAI API call: model={completion_kwargs.get('model')}, temperature={completion_kwargs.get('temperature')}, max_tokens={completion_kwargs.get('max_tokens')}, tools_count={(len(tools) if tools else 0)}, base_url={(self.client.base_url if hasattr(self.client, 'base_url') else 'default')}, api_key={self.config.api_key}")
+            log('DEBUG', 'llm.openai', f"OpenAI API call: model={completion_kwargs.get('model')}, temperature={completion_kwargs.get('temperature')}, max_tokens={completion_kwargs.get('max_tokens')}, tools_count={(len(tools) if tools else 0)}, base_url={(self.client.base_url if hasattr(self.client, 'base_url') else 'default')}, api_key={self.config.api_key}")
             if 'deepseek' in self.config.model.lower() or (self.config.base_url and 'deepseek' in self.config.base_url.lower()):
                 for i, msg in enumerate(completion_kwargs.get('messages', [])):
                     pass
@@ -536,7 +529,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 text += str(tools)
             return len(self.encoding.encode(text))
         except Exception as e:
-            logger.warning(f'Token counting failed: {e}')
+            log('WARNING', 'llm.openai', f'Token counting failed: {e}')
             return 0
 
     def _calculate_cost(self, response: LLMResponse) -> float:

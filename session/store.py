@@ -7,10 +7,11 @@ that stores each session as a JSON file in a configured directory.
 import json
 import os
 import re
+import time
 import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 import logging
 logger = logging.getLogger(__name__)
@@ -106,6 +107,12 @@ class FileSystemSessionStore(SessionStore):
         logger.debug(f"[SessionStore] Session history pruning enabled: {self._enable_session_history_pruning}")
         self._original_sessions_dir = sessions_dir  # Store original parameter
 
+        # In-memory caches to reduce disk I/O
+        self._cached_list: Optional[Tuple[float, List[Dict[str, Any]]]] = None  # (timestamp, list)
+        self._cached_paths: Dict[str, Optional[Path]] = {}  # session_id -> path (None = not found)
+        self._cached_paths_ts: Dict[str, float] = {}  # when each path entry was cached
+        self._cache_ttl = 5.0  # seconds
+
         # Resolve state directory
         if state_dir is None:
             home = os.path.expanduser("~")
@@ -154,15 +161,27 @@ class FileSystemSessionStore(SessionStore):
         return self.sessions_dir / f"{session_id}.json"
 
     def _find_session_path(self, session_id: str) -> Optional[Path]:
-        """Find the actual file path for a session ID by scanning JSON files."""
+        """Find the actual file path for a session ID by scanning JSON files.
+        Uses an in-memory cache (TTL: 5s) that is invalidated on save/delete.
+        """
+        # Check cache first (with TTL)
+        if session_id in self._cached_paths:
+            ts = self._cached_paths_ts.get(session_id, 0)
+            if time.time() - ts < self._cache_ttl:
+                return self._cached_paths[session_id]
+        # Scan files
         for file_path in self.sessions_dir.glob("*.json"):
             try:
                 with open(file_path, 'r') as f:
                     data = json.load(f)
                 if data.get('session_id') == session_id:
+                    self._cached_paths[session_id] = file_path
+                    self._cached_paths_ts[session_id] = time.time()
                     return file_path
             except Exception:
                 continue
+        self._cached_paths[session_id] = None  # cache as not found
+        self._cached_paths_ts[session_id] = time.time()
         return None
 
     def _get_friendly_path(self, session: Session) -> Path:
@@ -173,6 +192,10 @@ class FileSystemSessionStore(SessionStore):
 
     def save_session(self, session: Session) -> None:
         """Save a session to a JSON file."""
+        # Invalidate caches
+        self._cached_paths.pop(session.session_id, None)
+        self._cached_paths_ts.pop(session.session_id, None)
+        self._cached_list = None
         logger.debug(f"[SessionStore] Saving session {session.session_id}")
         # Update the updated_at timestamp
         session.updated_at = datetime.now()
@@ -212,6 +235,9 @@ class FileSystemSessionStore(SessionStore):
                 json.dump(data, f, indent=2, default=str)  # default=str handles datetime
             temp_path.replace(new_path)
             logger.debug(f"[SessionStore] Session {session.session_id} saved to {new_path}")
+            # Invalidate path cache so subsequent _find_session_path re-scans
+            self._cached_paths.pop(session.session_id, None)
+            self._cached_paths_ts.pop(session.session_id, None)
         except Exception:
             # Clean up temp file on failure
             if temp_path.exists():
@@ -238,9 +264,14 @@ class FileSystemSessionStore(SessionStore):
     def list_sessions(self) -> List[Dict[str, Any]]:
         """
         List all saved sessions with basic metadata.
-        Reads each JSON file and extracts a few fields.
+        Uses an in-memory cache (TTL: 5s) to avoid re-reading all files on every call.
         Skips files that are not valid session objects (e.g. open_sessions.json).
         """
+        now = time.time()
+        if self._cached_list is not None:
+            ts, cached = self._cached_list
+            if now - ts < self._cache_ttl:
+                return cached
         sessions = []
         for file_path in self.sessions_dir.glob("*.json"):
             try:
@@ -267,6 +298,7 @@ class FileSystemSessionStore(SessionStore):
                 continue
         # Sort by updated_at descending (most recent first)
         sessions.sort(key=lambda s: s.get('updated_at', ''), reverse=True)
+        self._cached_list = (time.time(), sessions)
         return sessions
 
     def _extract_preview(self, user_history: List[Dict[str, Any]], max_length: int = 100) -> str:
@@ -280,6 +312,10 @@ class FileSystemSessionStore(SessionStore):
 
     def delete_session(self, session_id: str) -> bool:
         """Delete a session file."""
+        # Invalidate caches
+        self._cached_paths.pop(session_id, None)
+        self._cached_paths_ts.pop(session_id, None)
+        self._cached_list = None
         path = self._find_session_path(session_id)
         if path is not None and path.exists():
             path.unlink()

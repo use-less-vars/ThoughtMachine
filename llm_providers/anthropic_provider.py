@@ -5,7 +5,6 @@ Supports Claude models with tool use .
 from typing import Dict, List, Any, Optional
 import time
 import json
-import logging
 import os
 import sys
 import anthropic
@@ -14,9 +13,6 @@ from .base import LLMProvider, ProviderConfig, LLMResponse
 from .tool_converter import ToolFormatConverter
 from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError
 from agent.logging import log
-logger = logging.getLogger(__name__)
-if os.environ.get('DEBUG_ANTHROPIC'):
-    logger.setLevel(logging.DEBUG)
 
 class AnthropicProvider(LLMProvider):
     """
@@ -47,7 +43,6 @@ class AnthropicProvider(LLMProvider):
                 api_kwargs['system'] = system_msg
             if tools:
                 api_kwargs['tools'] = self.converter.to_anthropic(tools)
-            logger.debug(f"Anthropic API call: model={api_kwargs.get('model')}, temperature={api_kwargs.get('temperature')}, max_tokens={api_kwargs.get('max_tokens')}, tools_count={(len(tools) if tools else 0)}, api_key={self.config.api_key}")
             log('DEBUG', 'llm.anthropic', f"[DEBUG_ANTHROPIC] API call: model={api_kwargs.get('model')}, temperature={api_kwargs.get('temperature')}, max_tokens={api_kwargs.get('max_tokens')}, tools_count={(len(tools) if tools else 0)}, api_key={self.config.api_key}")
             response = self.client.messages.create(**api_kwargs)
             if os.environ.get('DEBUG_ANTHROPIC'):
@@ -186,7 +181,7 @@ class AnthropicProvider(LLMProvider):
             response = self.client.beta.messages.count_tokens(model=self.config.model, messages=anthropic_messages)
             return response.input_tokens
         except Exception as e:
-            logger.warning(f'Anthropic token counting failed: {e}')
+            log('WARNING', 'llm.anthropic', f'Anthropic token counting failed: {e}')
             text = ' '.join([m.get('content', '') for m in messages])
             return len(text) // 4
 

@@ -5,7 +5,6 @@ Extracted from agent.py to separate tool execution concerns.
 """
 import json
 from typing import List, Dict, Any, Optional, Tuple
-import logging
 import tiktoken
 from pydantic import ValidationError
 from agent.logging import log
@@ -99,7 +98,7 @@ class ToolExecutor:
                 try:
                     arguments = repair_loads(arguments_str)
                     if self.logger:
-                        self.logger.py_logger.info(f'JSON repaired for {tool_name}')
+                        log('INFO', 'core.tool_executor', f'JSON repaired for {tool_name}')
                 except Exception as e:
                     tool_result = f'Invalid JSON in arguments: {e}. Raw: {arguments_str}'
                     if self.logger:
@@ -183,7 +182,7 @@ class ToolExecutor:
                     tool_instance._set_logger(self.logger.py_logger)
                     if hasattr(tool_instance, '_set_agent_logger'):
                         tool_instance._set_agent_logger(self.logger)
-                elif isinstance(self.logger, logging.Logger):
+                elif hasattr(self.logger, 'log_tool_debug'):
                     tool_instance._set_logger(self.logger)
                     if hasattr(self.logger, 'log_tool_debug') and hasattr(tool_instance, '_set_agent_logger'):
                         tool_instance._set_agent_logger(self.logger)
