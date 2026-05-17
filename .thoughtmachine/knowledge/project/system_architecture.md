@@ -1048,3 +1048,175 @@ Removed the following dead/orphaned code:
 - **`agent/utils/__init__.py`** — Empty package, unused.
 - **`qml_gui/`** (7 files, 52 KB) — QML-based GUI, superseded by `web_ui/` + React frontend.
 - **`AI_Tasks/`** (12 files, 64 KB) — Old task documents migrated to Knowledge Base.
+
+## 2026-05-16 — ## 2026-05-16 — Frontend migrated from top-level `frontend/`...
+
+## 2026-05-16 — Frontend migrated from top-level `frontend/` to `web_ui/frontend/`
+
+The React frontend (previously at `/frontend/`) has been moved to `web_ui/frontend/` to sit alongside the backend at `web_ui/backend/`. This consolidates all web UI code under a single `web_ui/` directory.
+
+Structure:
+```
+web_ui/
+├── backend/          # FastAPI + WebSocket server
+│   ├── __init__.py
+│   ├── bridge.py
+│   └── server.py
+├── frontend/         # Vite + React frontend
+│   ├── public/
+│   ├── src/
+│   │   ├── components/
+│   │   ├── store/
+│   │   ├── App.jsx
+│   │   ├── main.jsx
+│   │   └── styles.css
+│   ├── index.html
+│   ├── package.json
+│   └── vite.config.js
+└── __init__.py
+```
+
+## 2026-05-16 — ## WebSocket Connection Sequencing (2026-05-16)
+
+**Goal**: E...
+
+## WebSocket Connection Sequencing (2026-05-16)
+
+**Goal**: Eliminate connection storm on page load (multiple tabs hammering the server simultaneously)
+
+**Changes**:
+
+### App.jsx — Hub WebSocket
+- Added `hubConnectingRef` (useRef) — guards against duplicate hub WS from StrictMode double-mount
+- Added `hubReady` (useState) — set to `true` only after hub receives `open_sessions` event
+- Hub `onclose` resets `hubReady` to `false`, preventing tab connections while hub is down
+
+### SessionTab.jsx — Per-tab WebSockets  
+- Added `tabConnectingRef` (useRef) — guards against duplicate tab WS from StrictMode
+- Added `hubReady` prop — tab only connects after hub has synced sessions
+- Added `staggerMs` prop — each tab delays its connection by `index * 200ms` (tab 0: 0ms, tab 1: 200ms, tab 2: 400ms...)
+- `useEffect` now depends on `[hubReady, staggerMs, connectSessionWs]` instead of running once
+
+**Result**: StrictMode double-mount only creates one WS per connection. Tabs connect sequentially (0ms, 200ms, 400ms...) only after the hub is ready. Total time from page load to all tabs connected should be under ~1.2s for 6 tabs.
+
+## 2026-05-17 — ## API key resolution flow in Web UI bridge
+
+**Primary**: `P...
+
+## API key resolution flow in Web UI bridge
+
+**Primary**: `ProviderManager().resolve_config(merged_config)` in `bridge.py:start()` looks up the `provider_id` in `~/.thoughtmachine/providers.json` and fills in `api_key`, `provider_type`, `base_url`, and `model` from the stored profile. Uses `setdefault()` so explicit frontend overrides take precedence.
+
+**Secondary** (Agent internal): `Agent._has_api_key(config)` checks `config.api_key`, then `{provider_type}_API_KEY` env var, then `OPENAI_API_KEY` (for openai/openai_compatible).
+
+**The bridge no longer duplicates env var logic** — it relies on `ProviderManager.resolve_config()` for stored keys and the Agent's `_has_api_key()` for env var fallback.
+
+**Config layering** (from bottom to top):
+1. Global config from `agent_config.json` via `ConfigService`
+2. Session config overrides from loaded session metadata
+3. Frontend `config_dict` from `start_session` WebSocket command
+4. Provider profile resolution (fills api_key/base_url from stored profile)
+
+
+## 2026-05-17 — ## Config & Key Handling — Full Reference (2026-05-17)
+
+### ...
+
+## Config & Key Handling — Full Reference (2026-05-17)
+
+### 1. The Two Config Files
+
+| File | Purpose | Contains keys? | Editable by |
+|------|---------|----------------|-------------|
+| `agent_config.json` (project root) | Factory defaults for new sessions. All settings a user might want as a starting point. | **No** — keys are stripped automatically. | User (hand‑edit) or GUI "Save as Global Default" button. |
+| `~/.thoughtmachine/providers.json` (home directory) | Named provider profiles with credentials. | **Yes** — API keys live here exclusively. | GUI "Manage Profiles" dialog or hand‑edit. |
+
+The key principle: **keys never leave `providers.json`**. No other file on disk stores them. No session file, no project file, no log.
+
+### 2. How Keys Move Through the System (Lifecycle)
+
+#### At app startup
+1. `ProviderManager` loads `~/.thoughtmachine/providers.json` into memory.
+2. The GUI populates the profile dropdown.
+3. The last active profile is restored.
+4. If a session is being reloaded, its `provider_id` and `model_override` are read from session metadata. The corresponding profile is loaded, and the flat fields (`provider_type`, `base_url`, `model`, `api_key`) are filled in — **in memory only**. No key is written to the session file during load.
+
+#### When the user clicks Apply
+1. The GUI calls `ProviderManager.resolve_config(profile_id, model_override)`.
+2. This returns a dict: `{provider_type, api_key, base_url, model}`.
+3. Those values are merged into the `AgentConfig` object that's about to be sent.
+4. The `AgentConfig` is persisted to session metadata via `model_dump(exclude={'api_key'})` — so **the key is stripped** before writing to disk.
+5. The `AgentConfig` object (with key still in memory) is sent to the agent mailbox.
+6. The agent creates an `LLMClient` using that key. The key resides in the `LLMClient` instance in RAM, never on disk.
+
+#### When a session is reloaded later
+1. Session metadata contains `provider_id`, `model_override`, `provider_type`, `base_url`, `model` — but **no key**.
+2. The GUI reads `provider_id`, loads the corresponding profile from `providers.json`, and fills the key back into the `AgentConfig` object in memory.
+3. If the profile file is missing (different machine), the key is left empty and the user must reconfigure.
+
+#### When "Save as Global Default" is used
+1. The GUI builds an `AgentConfig` and calls `model_dump(exclude={'api_key'})`.
+2. The resulting dict is written to `agent_config.json`. Keys are never present.
+3. This action **does not** touch `providers.json`.
+
+#### When a tab is closed
+1. Only the session file is saved.
+2. `agent_config.json` is **never** written on tab close.
+3. `providers.json` is **never** written on tab close.
+
+### 3. Responsibility Matrix
+
+| Component | What it owns | What it NEVER does |
+|-----------|-------------|-------------------|
+| **`ProviderManager`** (`agent/config/provider_profile.py`) | Load/save `providers.json`, CRUD profiles, resolve config for a profile. | Never touches session files or global config. |
+| **`AgentConfig` model** (`agent/config/models.py`) | Schema definition. `api_key` field marked `exclude=True`. | Never writes itself to disk; callers use `model_dump(exclude={'api_key'})`. |
+| **`AgentControlsPanel`** (`qt_gui/panels/agent_controls.py`) | `get_config()` — builds `AgentConfig` from UI, resolves profile via `ProviderManager`. `set_config()` — populates UI from `AgentConfig`. "Save as Global Default" button handler. | Never writes `providers.json`. |
+| **`ProviderSelector`** (`qt_gui/panels/provider_selector.py`) | Dropdown widget, communicates with `ProviderManager`. | No persistence. |
+| **`ProviderDialog`** (`qt_gui/panels/provider_dialog.py`) | Table dialog for CRUD operations on profiles. Calls `ProviderManager` methods. | No direct file access. |
+| **`SessionTab`** (`qt_gui/session_tab.py`) | `load_config()` — layered merge (global → session metadata). `_on_apply_runtime_params()` — triggers persistence. `closeEvent()` — saves session only, not global config. | Never writes global config on close. |
+| **`StateBridge`** (`agent/presenter/state_bridge.py`) | Holds `current_config: AgentConfig` in memory. `create_agent_config()` — resolves profiles when building config for agent. | No longer has mutable `_config` dict. |
+| **`Agent`** (`agent/core/agent.py`) | Mailbox pattern (`_pending_config`). `_can_hot_swap()` / `_hot_swap()` / `_restart_with_config()`. | Never sees `providers.json` — receives flat `AgentConfig` with key already resolved. |
+
+### 4. Key Stripping — Where Exactly It Happens
+
+The single mechanism is Pydantic's `Field(exclude=True)` on `AgentConfig.api_key`:
+
+```python
+api_key: str = Field(default='', exclude=True)
+```
+
+Every call to `model_dump()` anywhere in the codebase automatically drops `api_key`. The primary persistence points that use `model_dump()`:
+- `_save_config_to_session()` — writes to `session.metadata['agent_config']`
+- `_on_save_global_default()` — writes to `agent_config.json`
+- `save_config()` (via Ctrl+S) — writes to `agent_config.json`
+
+No special stripping code is needed anywhere. The model enforces it.
+
+### 5. Migration from Old Sessions
+
+Old sessions that had plain‑text `api_key` in metadata:
+- On load, Pydantic will parse the old dict. If `api_key` is present, it will populate the field in memory.
+- On the very next save (Apply or close), `model_dump(exclude={'api_key'})` will drop it.
+- The key is lost from the session file at that point. The user must have a profile configured to supply the key on next reload.
+
+This is by design — old keys in session files are a liability we eliminate on first rewrite.
+
+### 6. Security Boundaries
+
+| Boundary | Protection |
+|----------|-----------|
+| Git repository | `agent_config.json` contains no keys. `providers.json` is in `~/.thoughtmachine/` (outside the project root) and should be in global `.gitignore`. |
+| Session files | No keys — stripped by Pydantic `exclude=True`. |
+| Log files | Logging does not log the full `AgentConfig`; only specific fields are traced. `api_key` is never logged. |
+| Memory | Key is present in `AgentConfig` object during runtime. Standard process memory protections apply. |
+| GUI display | The profile dialog masks the key (`••••••`) with a show/hide toggle. |
+
+### 7. Design Rationale (Why We Did This)
+
+**Before:** API key was a plain text field in the GUI, stored in `agent_config.json` and in session files. Switching providers meant re‑typing the key manually. Keys leaked into git, session shares, and backups.
+
+**After:**
+- **Single storage location** — `~/.thoughtmachine/providers.json`. No duplication.
+- **Automatic exclusion** — Pydantic field attribute ensures keys can't leak through serialization.
+- **Named profiles** — switch providers with a dropdown, no re‑typing.
+- **Minimal complexity** — no encryption, no OS keyring, no background threads. The threat model is accidental leakage, not targeted attack. Encryption can be added later without changing the architecture.
