@@ -43,15 +43,34 @@ export default function App() {
   const [tabRunningStates, setTabRunningStates] = useState({})
   const wsRef = useRef(null)
   const [hubWs, setHubWs] = useState(null)
+  const hubHasConnectedOnceRef = useRef(false)   // persist past StrictMode double-mount
+  const [hubReady, setHubReady] = useState(false)
   const tabActionsRef = useRef({})   // tabId -> { sendCommand }
 
-  // ── Hub WebSocket (sessions list only) ─────────────────────────────────
-  useEffect(() => {
+  // ── Hub WebSocket (sessions list only) with auto-reconnect ────────────
+  const reconnectTimeoutRef = useRef(null)
+  const connectHub = useCallback(() => {
+    // Guard: prevent duplicate connections (StrictMode double-mount)
+    if (hubHasConnectedOnceRef.current) {
+      console.log('[Hub WS] Already connected once, skipping duplicate')
+      return null
+    }
+    // Set immediately — before new WebSocket() — so StrictMode remount sees it
+    hubHasConnectedOnceRef.current = true
+
+    // Clear any pending reconnect
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current)
+      reconnectTimeoutRef.current = null
+    }
+
     const ws = new WebSocket(WS_URL)
     wsRef.current = ws
 
     ws.onopen = () => {
-      console.log("✅ [Hub WS] onopen")
+      console.log("[Hub WS] onopen")
+      // Already set at connectHub entry; this is just a sanity double-set
+      hubHasConnectedOnceRef.current = true
       setHubWs(ws)
       ws.send(JSON.stringify({ command: 'list_sessions' }))
     }
@@ -60,21 +79,44 @@ export default function App() {
       try {
         const msg = JSON.parse(event.data)
         handleHubEvent(msg)
+        // Tabs may connect only after hub has received open_sessions
+        if (msg.type === 'open_sessions') {
+          console.log('[Hub WS] open_sessions processed, tabs may connect now')
+          setHubReady(true)
+        }
       } catch (err) {
         console.error('[Hub WS] Failed to parse message:', event.data, err)
       }
     }
 
     ws.onclose = (e) => {
-      console.log("❌ [Hub WS] onclose", e.code, e.reason)
+      setHubWs(null)
+      setHubReady(false)
+      // 1001 = normal close (component unmounting), keep flag, don't reconnect
+      if (e.code !== 1001) {
+        hubHasConnectedOnceRef.current = false  // allow reconnection on real errors
+        const delay = 1000 + Math.random() * 3000  // 1–4s jitter
+        console.log(`[Hub WS] disconnected, reconnecting in ${Math.round(delay)}ms...`)
+        reconnectTimeoutRef.current = setTimeout(connectHub, delay)
+      }
     }
 
-    ws.onerror = (e) => {
-      console.error("🔥 [Hub WS] error", e)
+    ws.onerror = () => {
+      // onclose fires right after onerror, so we let onclose handle reconnection
     }
 
-    return () => ws.close()
+    return ws
   }, [])
+
+  useEffect(() => {
+    const ws = connectHub()
+    return () => {
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current)
+      }
+      ws?.close()  // may be null if connectHub guard skipped duplicate
+    }
+  }, [connectHub])
 
   // ── Request open sessions when hub WS connects ──────────────────────────
   useEffect(() => {
@@ -107,6 +149,7 @@ export default function App() {
             loadTab(s.session_id)
           })
         }
+        // hubReady is set to true in onmessage after handleHubEvent returns
         break
       default:
         // Other events (state_changed, conversation_changed, etc.)
@@ -244,7 +287,7 @@ export default function App() {
               <p>Open a session or create a new one to get started.</p>
             </div>
           ) : (
-            tabs.map((tab) => (
+            tabs.map((tab, index) => (
               <div
                 key={tab.tabId}
                 className="tab-wrapper"
@@ -253,6 +296,8 @@ export default function App() {
                 <SessionTab
                   sessionId={tab.sessionId}
                   tabId={tab.tabId}
+                  hubReady={hubReady}
+                  staggerMs={index * 200}
                   onClose={() => removeTab(tab.tabId)}
                   onNewSession={handleNewSessionCreated}
                   onSessionSaved={handleSessionSaved}
@@ -282,7 +327,15 @@ export default function App() {
         {/* Toggle button for sessions sidebar */}
         <button
           className="session-toggle"
-          onClick={() => setShowSessions((s) => !s)}
+          onClick={() => {
+            console.time('toggleSessions')
+            setShowSessions((s) => {
+              const next = !s
+              // Profile after state update — timeEnd on next frame
+              requestAnimationFrame(() => console.timeEnd('toggleSessions'))
+              return next
+            })
+          }}
           title="Toggle sessions list"
         >
           ☰

@@ -50,11 +50,12 @@ const INITIAL_STATE = {
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
-export default function SessionTab({ sessionId, tabId, onClose, onNewSession, onSessionSaved, onRegister, onRunningChange }) {
+function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewSession, onSessionSaved, onRegister, onRunningChange }) {
   const [state, setState] = useState(INITIAL_STATE)
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
   const wsRef = useRef(null)
   const closedRef = useRef(false)  // prevent double-close
+  const tabConnectingRef = useRef(false)  // prevent StrictMode duplicate
 
   // ── Derived helpers ─────────────────────────────────────────────────────
   const update = useCallback((patch) => {
@@ -73,16 +74,49 @@ export default function SessionTab({ sessionId, tabId, onClose, onNewSession, on
       'last role:', state.history[state.history.length - 1]?.role)
   }, [state.history])
 
-  // ── WebSocket lifecycle ─────────────────────────────────────────────────
-  useEffect(() => {
+  // ── sendCommand — sends over this tab's WebSocket ──────────────────────
+  const sendCommandRef = useRef(null)
+  const sendCommand = useCallback((command, payload = {}) => {
+    const ws = wsRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      console.warn('[SessionTab] Cannot send — WS not connected')
+      return
+    }
+    console.log(`[SessionTab] Sending command: ${command}`, JSON.stringify({ command, ...payload }))
+    ws.send(JSON.stringify({ command, ...payload }))
+  }, [])
+  sendCommandRef.current = sendCommand
+
+  // ── WebSocket lifecycle with auto-reconnect ────────────────────────────
+  const reconnectTimeoutRef = useRef(null)
+  const connectSessionWs = useCallback(() => {
+    // Guard: prevent duplicate connections from StrictMode double-mount
+    if (tabConnectingRef.current) {
+      console.log(`[SessionTab ${sessionId || 'new'}] Already connecting, skipping duplicate`)
+      return
+    }
+    tabConnectingRef.current = true
+
+    // Reset closed guard — allows StrictMode double-effect and reconnections
+    closedRef.current = false
+
+    // Clear any pending reconnect
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current)
+      reconnectTimeoutRef.current = null
+    }
+
+    if (closedRef.current) return  // component unmounted (may be set during clearTimeout)
+
     const ws = new WebSocket(WS_URL)
     wsRef.current = ws
 
     ws.onopen = () => {
       console.log(`[SessionTab ${sessionId || 'new'}] WS onopen`)
+      tabConnectingRef.current = false
 
-      // Register sendCommand + getSessionId with parent
-      onRegister?.({ sendCommand, getSessionId: () => currentSessionId })
+      // Register sendCommand with parent (use ref to avoid stale closure)
+      onRegister?.({ sendCommand: sendCommandRef.current, getSessionId: () => currentSessionId })
 
       // If we have a sessionId, load it immediately; otherwise create a new session
       if (sessionId) {
@@ -106,23 +140,41 @@ export default function SessionTab({ sessionId, tabId, onClose, onNewSession, on
     }
 
     ws.onclose = (e) => {
-      console.log(`[SessionTab ${sessionId || '?'}] WS closed`, e.code, e.reason)
-      if (!closedRef.current) {
-        // Unexpected close — notify parent
-        onClose?.()
+      tabConnectingRef.current = false
+      // 1001 = normal close (component unmounting), don't reconnect
+      if (e.code !== 1001 && !closedRef.current) {
+        const delay = 1000 + Math.random() * 3000  // 1–4s jitter
+        console.log(`[SessionTab ${sessionId || '?'}] disconnected, reconnecting in ${Math.round(delay)}ms...`)
+        reconnectTimeoutRef.current = setTimeout(connectSessionWs, delay)
       }
     }
 
-    ws.onerror = (e) => {
-      console.error(`[SessionTab ${sessionId || '?'}] WS error`, e)
+    ws.onerror = () => {
+      // onclose fires right after onerror, so we let onclose handle reconnection
     }
+  }, [sessionId, onRegister])  // no sendCommand dep needed — accessed via ref
+
+  // Connect only after hub is ready, with optional stagger delay
+  useEffect(() => {
+    if (!hubReady) return
+
+    const timer = setTimeout(() => {
+      connectSessionWs()
+    }, staggerMs)
 
     return () => {
+      clearTimeout(timer)
       closedRef.current = true
-      ws.close()
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current)
+      }
+      try {
+        wsRef.current?.close()
+      } catch {
+        // ignore — WebSocket may still be in CONNECTING state
+      }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])  // intentionally run once
+  }, [hubReady, staggerMs, connectSessionWs])
 
   // ── Event router ─────────────────────────────────────────────────────────
   function handleEvent(msg) {
@@ -199,15 +251,6 @@ export default function SessionTab({ sessionId, tabId, onClose, onNewSession, on
     }
   }
 
-  // ── sendCommand — sends over this tab's WebSocket ──────────────────────
-  const sendCommand = useCallback((command, payload = {}) => {
-    const ws = wsRef.current
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      console.warn('[SessionTab] Cannot send — WS not connected')
-      return
-    }
-    ws.send(JSON.stringify({ command, ...payload }))
-  }, [])
 
   // ── Render ───────────────────────────────────────────────────────────────
   // Pass per-tab state to children as props
@@ -228,6 +271,7 @@ export default function SessionTab({ sessionId, tabId, onClose, onNewSession, on
             status={state.status}
             isRunning={state.isRunning}
             config={state.config}
+            sessionId={currentSessionId}
           />
         </div>
         {/* Session list is rendered by App, not per-tab */}
@@ -235,3 +279,14 @@ export default function SessionTab({ sessionId, tabId, onClose, onNewSession, on
     </div>
   )
 }
+
+export default React.memo(SessionTab, (prevProps, nextProps) => {
+  // Only re-render if session-specific props change
+  // Ignore changes to callback props (onClose, onRegister, etc.)
+  // which create new references on every parent render
+  return (
+    prevProps.sessionId === nextProps.sessionId &&
+    prevProps.hubReady === nextProps.hubReady &&
+    prevProps.staggerMs === nextProps.staggerMs
+  )
+})

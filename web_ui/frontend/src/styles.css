@@ -353,8 +353,8 @@ body {
 }
 
 .session-list-panel {
-  width: 280px;
-  min-width: 280px;
+  width: 320px;
+  min-width: 260px;
   padding: 1rem;
   background: var(--bg-secondary);
   border-left: 1px solid var(--border);
@@ -503,21 +503,14 @@ body {
    ────────────────────────────────────────────────────────────────────────── */
 
 .session-sidebar {
-  position: fixed;
-  right: 0;
-  top: 0;
-  height: 100vh;
-  width: 280px;
-  transform: translateX(100%);
-  transition: transform 0.2s ease;
-  z-index: 100;
-  background: var(--bg-secondary);
-  box-shadow: -2px 0 10px rgba(0,0,0,0.3);
-  overflow-y: auto;
+  overflow: hidden;
+  width: 0;
+  transition: width 0.2s ease;
+  flex-shrink: 0;
 }
 
 .session-sidebar.open {
-  transform: translateX(0);
+  width: 320px;
 }
 
 .session-toggle {
@@ -532,8 +525,13 @@ body {
   padding: 4px 10px;
   border-radius: var(--radius);
   cursor: pointer;
-  transition: background 0.15s;
+  transition: right 0.2s ease, background 0.15s;
   line-height: 1;
+}
+
+.session-sidebar.open ~ .session-toggle,
+.session-toggle.shifted {
+  right: 330px;
 }
 
 .session-toggle:hover {
@@ -938,4 +936,3 @@ body {
 .message-tool-call .tool-call-args {
   font-family: var(--font-mono, 'SF Mono', 'Fira Code', monospace);
 }
-

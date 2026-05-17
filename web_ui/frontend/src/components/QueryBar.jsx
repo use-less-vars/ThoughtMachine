@@ -19,7 +19,7 @@
 
 import React, { useState } from 'react'
 
-export default function QueryBar({ sendCommand, status, isRunning, config }) {
+export default function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
   const [query, setQuery] = useState('')
 
   const isIdle = status === 'IDLE'
@@ -29,9 +29,9 @@ export default function QueryBar({ sendCommand, status, isRunning, config }) {
 
   const handleRun = () => {
     if (!query.trim()) return
-    if (isIdle && isRunning) {
-      // Agent thread still alive — continue session
-      sendCommand('continue_session', { query: query.trim() })
+    if (sessionId) {
+      // Loaded session — continue with existing context
+      sendCommand('continue_session', { query: query.trim(), session_id: sessionId })
     } else {
       // Fresh start — create new agent session
       sendCommand('start_session', { query: query.trim(), config })
