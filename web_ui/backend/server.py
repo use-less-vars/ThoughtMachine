@@ -90,9 +90,9 @@ if _project_root not in sys.path:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan handler — no global state needed (state is per‑connection)."""
-    print("🧠 ThoughtMachine Web UI server starting ...")
+    log('INFO', 'server', 'ThoughtMachine Web UI server starting ...')
     yield
-    print("🧠 Server shutting down.")
+    log('INFO', 'server', 'Server shutting down.')
 
 app = FastAPI(
     title="ThoughtMachine Web UI",
@@ -119,7 +119,7 @@ app.add_middleware(
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-    print(f"⚡ WebSocket connected: {ws.client}")
+    log('INFO', 'server.ws', f'WebSocket connected: {ws.client}')
 
     # Import bridge here (after project root is on sys.path)
     from web_ui.backend.bridge import WebAgentBridge
@@ -138,7 +138,7 @@ async def websocket_endpoint(ws: WebSocket):
         try:
             await ws.send_json(event)
         except Exception as exc:
-            print(f"⚠ send_event failed: {exc}")
+            log('ERROR', 'server.ws', f'send_event failed: {exc}')
 
     # Callback wrapper — called from the bridge's agent thread
     def event_callback(event: Dict[str, Any]) -> None:
@@ -146,7 +146,7 @@ async def websocket_endpoint(ws: WebSocket):
         try:
             asyncio.run_coroutine_threadsafe(send_event(event), _loop)
         except Exception as exc:
-            print(f"🔥 event_callback error: {exc}")
+            log('ERROR', 'server.ws', f'event_callback error: {exc}')
             import traceback
             traceback.print_exc()
 
@@ -160,7 +160,7 @@ async def websocket_endpoint(ws: WebSocket):
                 continue
 
             command = msg.get("command", "")
-            print(f"  ▶ Command: {command}")
+            log('DEBUG', 'server.ws', f'Command: {command}')
 
             # ── Handle commands ─────────────────────────────────────────────
             try:
@@ -176,15 +176,20 @@ async def websocket_endpoint(ws: WebSocket):
                     # frontend fields become overrides.
                     config_dict = _translate_frontend_config(config_dict)
 
+                    # Always create a fresh bridge + controller for start_session.
+                    # Stop any existing bridge first to prevent resource leaks.
+                    if bridge is not None:
+                        bridge.stop()
                     controller = AgentController()
                     bridge = WebAgentBridge(event_callback=event_callback)
                     bridge.set_controller(controller)
+
                     try:
                         bridge.start(query, config_dict)
                     except RuntimeError as exc:
                         # Controller may be stuck from a prior session; stop and retry
                         await ws.send_json({"type": "status_message", "text": f"⚠ Controller busy — resetting: {exc}"})
-                        controller.stop()
+                        bridge.stop()
                         bridge.start(query, config_dict)
                     except Exception as exc:
                         await ws.send_json({
@@ -195,20 +200,43 @@ async def websocket_endpoint(ws: WebSocket):
                     await ws.send_json({"type": "status_message", "text": "Session started."})
 
                 elif command == "continue_session":
-                    if bridge is None or not bridge.is_running:
-                        await ws.send_json({"type": "status_message", "text": "No active session — start a new one."})
-                        continue
                     query = msg.get("query", "")
                     if not query.strip():
                         await ws.send_json({"type": "status_message", "text": "⚠ Query cannot be empty."})
                         continue
-                    try:
-                        bridge.continue_session(query)
-                    except Exception as exc:
-                        await ws.send_json({
-                            "type": "status_message",
-                            "text": f"⚠ Failed to continue: {exc}",
-                        })
+
+                    # Case 1: Bridge has a loaded session (first query for a new session)
+                    # Only start if the agent is not already running.
+                    if bridge is not None and bridge._loaded_session is not None and not bridge._agent_running:
+                        log('INFO', 'server.ws', f'continue_session: loaded session exists — starting bridge with session {bridge._loaded_session.session_id}')
+                        try:
+                            # Pass the frontend config if available (for first query)
+                            config_dict = msg.get("config", {})
+                            if config_dict:
+                                config_dict = _translate_frontend_config(config_dict)
+                                bridge.start(query, config_dict)
+                            else:
+                                bridge.start(query)
+                        except Exception as exc:
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": f"⚠ Failed to start loaded session: {exc}",
+                            })
+                        continue
+
+                    # Case 2: Agent is already running — continue normally
+                    if bridge is not None and bridge._agent_running:
+                        try:
+                            bridge.continue_session(query)
+                        except Exception as exc:
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": f"⚠ Failed to continue: {exc}",
+                            })
+                        continue
+
+                    # Case 3: Nothing to continue
+                    await ws.send_json({"type": "status_message", "text": "No active session — start a new one."})
 
                 elif command == "pause_session":
                     if bridge is not None:
@@ -437,19 +465,39 @@ async def websocket_endpoint(ws: WebSocket):
                         })
 
                 elif command == "new_session":
-                    # Clear any loaded session and stop current bridge
+                    # Stop any existing bridge
                     if bridge is not None:
                         bridge.stop()
-                        await ws.send_json({
-                            "type": "state_changed",
-                            "state": "IDLE",
-                            "is_running": False,
-                        })
-                    bridge = None
+
+                    # Create fresh bridge + controller with a new Session.
+                    # The bridge sits IDLE with _loaded_session set so that
+                    # the first continue_session triggers Case 1 (loaded session)
+                    # and calls bridge.start(query) to kick off the agent.
+                    from agent.controller import AgentController
+                    controller = AgentController()
+                    bridge = WebAgentBridge(event_callback=event_callback)
+                    bridge.set_controller(controller)
+
+                    # Create a new empty session
+                    from session.models import Session
+                    new_session = Session()
+                    new_session.metadata['source'] = 'web_ui'
+                    new_session.ensure_name()
+
+                    # Store as the loaded session so continue_session picks it up
+                    bridge._loaded_session = new_session
+                    bridge._loaded_config_overrides = None
+
                     await ws.send_json({
-                        "type": "session_cleared",
+                        "type": "session_loaded",
+                        "session_id": new_session.session_id,
                     })
-                    await ws.send_json({"type": "status_message", "text": "Ready for a new session."})
+                    await ws.send_json({
+                        "type": "state_changed",
+                        "state": "IDLE",
+                        "is_running": False,
+                    })
+                    await ws.send_json({"type": "status_message", "text": "Ready. Type a query to start."})
 
                 else:
                     await ws.send_json({
@@ -457,7 +505,7 @@ async def websocket_endpoint(ws: WebSocket):
                         "text": f"⚠ Unknown command: {command}",
                     })
             except Exception as exc:
-                print(f"🔥 FATAL WebSocket error: {exc}")
+                log('ERROR', 'server.ws', f'FATAL WebSocket error: {exc}')
                 import traceback
                 traceback.print_exc()
                 try:
@@ -466,9 +514,9 @@ async def websocket_endpoint(ws: WebSocket):
                     pass
 
     except WebSocketDisconnect:
-        print(f"⚡ WebSocket disconnected: {ws.client}")
+        log('INFO', 'server.ws', f'WebSocket disconnected: {ws.client}')
     except Exception as exc:
-        print(f"⚠ WebSocket error: {exc}")
+        log('ERROR', 'server.ws', f'WebSocket error: {exc}')
         traceback.print_exc()
     finally:
         # Cleanup: auto-save open session + stop bridge
@@ -628,7 +676,7 @@ def main():
     port = int(os.environ.get("PORT", "8000"))
     reload = os.environ.get("RELOAD", "false").lower() == "true"
 
-    print(f"🧠 Starting ThoughtMachine Web UI on {host}:{port}")
+    log('INFO', 'server', f'Starting ThoughtMachine Web UI on {host}:{port}')
     uvicorn.run(
         "web_ui.backend.server:app",
         host=host,

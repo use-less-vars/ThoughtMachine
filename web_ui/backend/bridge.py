@@ -38,6 +38,7 @@ that the React frontend expects (see frontend/src/App.jsx):
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import queue
@@ -105,6 +106,11 @@ class WebAgentBridge:
         self._loaded_session: Optional[Session] = None
         self._loaded_config_overrides: Optional[Dict[str, Any]] = None
 
+        # Agent running flag — set True when controller.start() succeeds,
+        # reset on stop/disconnect.  More reliable than is_running for
+        # routing decisions in the WebSocket handler.
+        self._agent_running: bool = False
+
     # ── Public API ──────────────────────────────────────────────────────────
 
     @property
@@ -159,11 +165,9 @@ class WebAgentBridge:
             raw_config = service.get_all()
             return AgentConfig(**raw_config)
         except Exception as e:
-            print(f"⚠ Could not build global agent config: {e}")
+            log('ERROR', 'server.bridge', f"Could not build global agent config: {e}")
             # Fall back to minimal AgentConfig with env-var key
-            return AgentConfig(
-                api_key=os.getenv('OPENAI_API_KEY') or os.getenv('DEEPSEEK_API_KEY') or ''
-            )
+            return AgentConfig(api_key='')
 
     def start(self, query: str,
               config_dict: Optional[Dict[str, Any]] = None) -> None:
@@ -192,7 +196,6 @@ class WebAgentBridge:
         # ── Layer 2: loaded session config overrides ──────────────────────
         if self._loaded_config_overrides:
             merged_config.update(self._loaded_config_overrides)
-            print(f"🔧 Merged {len(self._loaded_config_overrides)} config overrides from loaded session")
 
         # ── Layer 3: frontend config_dict ─────────────────────────────────
         if config_dict:
@@ -206,26 +209,26 @@ class WebAgentBridge:
             try:
                 manager = ProviderManager()
                 merged_config = manager.resolve_config(merged_config)
-            except Exception as e:
-                print(f"⚠ Could not resolve provider profile: {e}")
+            except Exception:
+                pass
 
-        # ── API key fallback to env vars ───────────────────────────────────
-        api_key = merged_config.get('api_key') or os.getenv('OPENAI_API_KEY') or os.getenv('DEEPSEEK_API_KEY')
-        if api_key:
-            merged_config['api_key'] = api_key
+        # ── API key is resolved by ProviderManager.resolve_config() above ──
+        # The Agent's own _has_api_key() will additionally check
+        # {provider_type}_API_KEY and OPENAI_API_KEY env vars at startup.
+        if not merged_config.get('api_key'):
+            log('DEBUG', 'server.bridge', 'No API key resolved from provider profile; Agent will check env vars')
 
         if self._controller is not None:
             # ── Delegate to controller ──────────────────────────────────
-            # Build an AgentConfig from the merged config and pass it.
-            # The controller path always uses config (never preset).
             session_arg = self._loaded_session
             config = AgentConfig(**merged_config)
             self._config = config
             self._running = True
-            # session_id will be captured from the first controller event
+            self._session = session_arg
             self._controller.start(query, config, session=session_arg)
             self._loaded_session = None  # consumed
             self._loaded_config_overrides = None  # consumed
+            self._agent_running = True
             return
 
         if self.is_running:
@@ -240,14 +243,6 @@ class WebAgentBridge:
         # Build AgentConfig from the merged dict
         config = AgentConfig(**merged_config)
         self._config = config
-
-        # ── Bridge diagnostic log ──────────────────────────────────────
-        log('INFO', 'server.bridge',
-            f"[BRIDGE CONFIG] starting: enabled_tools={merged_config.get('enabled_tools')}, "
-            f"overrides={'yes' if self._loaded_config_overrides else 'no'}")
-        log('DEBUG', 'server.bridge',
-            f"[BRIDGE CONFIG] overrides_keys={list(self._loaded_config_overrides.keys()) if self._loaded_config_overrides else None}, "
-            f"frontend_keys={list(config_dict.keys()) if config_dict else None}")
 
         # Create session for this run (no Qt dependency, pure Python)
         if self._loaded_session is not None:
@@ -270,6 +265,7 @@ class WebAgentBridge:
             name="web-bridge-agent",
         )
         self._thread.start()
+        self._agent_running = True
 
     def continue_session(self, query: str) -> None:
         """
@@ -307,9 +303,11 @@ class WebAgentBridge:
         """Request the agent to stop (finishes current operation then exits)."""
         if self._controller is not None:
             self._controller.stop()
+            self._agent_running = False
             return
         self._stop_event.set()
         self._pause_event.set()  # unblock if paused
+        self._agent_running = False
 
     # ── Query API ───────────────────────────────────────────────────────────
 
@@ -333,7 +331,7 @@ class WebAgentBridge:
         try:
             return self._session_store.list_sessions()
         except Exception as e:
-            print(f"⚠ list_sessions error: {e}")
+            log('ERROR', 'server.bridge', f"list_sessions error: {e}")
             return []
 
     def save_session(self, name: Optional[str] = None) -> Optional[Session]:
@@ -375,12 +373,12 @@ class WebAgentBridge:
             session.ensure_name()
             self._session_store.save_session(session)
             self._loaded_session = session
-            print(f"✅ Session saved: {session.session_id} ({session.metadata.get('name')})")
+            log('INFO', 'server.bridge', f"Session saved: {session.session_id} ({session.metadata.get('name')})")
             return session
         except Exception as e:
             import traceback
             traceback.print_exc()
-            print(f"⚠ save_session error: {e}")
+            log('ERROR', 'server.bridge', f"save_session error: {e}")
             return None
 
     def load_session(self, session_id: str) -> bool:
@@ -396,7 +394,7 @@ class WebAgentBridge:
         try:
             session = self._session_store.load_session(session_id)
             if session is None:
-                print(f"⚠ Session not found: {session_id}")
+                log('WARNING', 'server.bridge', f"Session not found: {session_id}")
                 return False
             self.history = list(session.user_history)
 
@@ -444,19 +442,19 @@ class WebAgentBridge:
             agent_config_raw = session.metadata.get('agent_config', {})
             if agent_config_raw and isinstance(agent_config_raw, dict):
                 self._loaded_config_overrides = dict(agent_config_raw)
-                print(f"🔧 Loaded agent_config overrides from session metadata: {len(agent_config_raw)} keys")
+                log('INFO', 'server.bridge', f"Loaded agent_config overrides from session metadata: {len(agent_config_raw)} keys")
             else:
                 self._loaded_config_overrides = None
-                print(f"ℹ️ No agent_config in session metadata")
+                log('INFO', 'server.bridge', "No agent_config in session metadata")
 
             # Ensure enabled_tools is always present — merge from global config if missing
             if self._loaded_config_overrides and 'enabled_tools' not in self._loaded_config_overrides:
                 try:
                     global_config = self._build_global_agent_config()
                     self._loaded_config_overrides['enabled_tools'] = global_config.enabled_tools
-                    print(f"🔧 Merged enabled_tools from global config: {len(global_config.enabled_tools)} tools")
+                    log('INFO', 'server.bridge', f"Merged enabled_tools from global config: {len(global_config.enabled_tools)} tools")
                 except Exception as exc:
-                    print(f"⚠ Could not merge enabled_tools: {exc}")
+                    log('WARNING', 'server.bridge', f"Could not merge enabled_tools: {exc}")
 
             # Emit conversation_changed so the frontend updates
             self._emit({
@@ -476,17 +474,21 @@ class WebAgentBridge:
                     "type": "config_changed",
                     "config": self._loaded_config_overrides,
                 })
-            print(f"✅ Session loaded: {session_id} ({session.metadata.get('name')}) — {len(self.history)} messages")
+            log('INFO', 'server.bridge', f"Session loaded: {session_id} ({session.metadata.get('name')}) — {len(self.history)} messages")
 
             # Register this session as an open session (persists to open_sessions.json)
             # so it survives server restarts and the hub WS can return it.
-            self.save_open_session(session_id)
+            # Use add_open_session directly to avoid an unnecessary full session write.
+            try:
+                self._session_store.add_open_session(session_id)
+            except Exception as e:
+                log('WARNING', 'server.bridge', f"Could not register open session: {e}")
 
             return True
         except Exception as e:
             import traceback
             traceback.print_exc()
-            print(f"⚠ load_session error: {e}")
+            log('ERROR', 'server.bridge', f"load_session error: {e}")
             return False
 
     def delete_session(self, session_id: str) -> bool:
@@ -494,12 +496,12 @@ class WebAgentBridge:
         try:
             result = self._session_store.delete_session(session_id)
             if result:
-                print(f"🗑️ Session deleted: {session_id}")
+                log('INFO', 'server.bridge', f"Session deleted: {session_id}")
             else:
-                print(f"⚠ Session not found for deletion: {session_id}")
+                log('WARNING', 'server.bridge', f"Session not found for deletion: {session_id}")
             return result
         except Exception as e:
-            print(f"⚠ delete_session error: {e}")
+            log('ERROR', 'server.bridge', f"delete_session error: {e}")
             return False
 
     def rename_session(self, session_id: str, new_name: str) -> bool:
@@ -507,17 +509,17 @@ class WebAgentBridge:
         try:
             session = self._session_store.load_session(session_id)
             if session is None:
-                print(f"⚠ Session not found for rename: {session_id}")
+                log('WARNING', 'server.bridge', f"Session not found for rename: {session_id}")
                 return False
             session.metadata['name'] = new_name
             self._session_store.save_session(session)
             # Update loaded session name if it's the one being renamed
             if self._loaded_session and self._loaded_session.session_id == session_id:
                 self._loaded_session.metadata['name'] = new_name
-            print(f"✏️ Session renamed: {session_id} → {new_name}")
+            log('INFO', 'server.bridge', f"Session renamed: {session_id} → {new_name}")
             return True
         except Exception as e:
-            print(f"⚠ rename_session error: {e}")
+            log('ERROR', 'server.bridge', f"rename_session error: {e}")
             return False
 
     # ── Open sessions management ────────────────────────────────────────────
@@ -530,7 +532,7 @@ class WebAgentBridge:
         try:
             return self._session_store.get_open_sessions()
         except Exception as e:
-            print(f"⚠ get_open_sessions error: {e}")
+            log('ERROR', 'server.bridge', f"get_open_sessions error: {e}")
             return []
 
     def save_open_session(self, session_id: Optional[str] = None) -> None:
@@ -543,16 +545,16 @@ class WebAgentBridge:
             self._loaded_session.session_id if self._loaded_session else None
         )
         if sid is None:
-            print("⚠ save_open_session: no session ID available")
+            log('WARNING', 'server.bridge', "save_open_session: no session ID available")
             return
         # Save the session first (so it exists on disk)
         self.save_session()
         # Then add to open list
         try:
             self._session_store.add_open_session(sid)
-            print(f"📋 Session {sid} added to open sessions")
+            log('INFO', 'server.bridge', f"Session {sid} added to open sessions")
         except Exception as e:
-            print(f"⚠ save_open_session error: {e}")
+            log('ERROR', 'server.bridge', f"save_open_session error: {e}")
 
     def remove_open_session(self, session_id: Optional[str] = None) -> None:
         """
@@ -564,13 +566,13 @@ class WebAgentBridge:
             self._loaded_session.session_id if self._loaded_session else None
         )
         if sid is None:
-            print("⚠ remove_open_session: no session ID available")
+            log('WARNING', 'server.bridge', "remove_open_session: no session ID available")
             return
         try:
             self._session_store.remove_open_session(sid)
-            print(f"📋 Session {sid} removed from open sessions")
+            log('INFO', 'server.bridge', f"Session {sid} removed from open sessions")
         except Exception as e:
-            print(f"⚠ remove_open_session error: {e}")
+            log('ERROR', 'server.bridge', f"remove_open_session error: {e}")
 
     def close_session(self, session_id: Optional[str] = None) -> None:
         """
@@ -584,7 +586,7 @@ class WebAgentBridge:
         sid = session_id or self._session_id or (
             self._loaded_session.session_id if self._loaded_session else None
         )
-        print(f"🚪 Closing session: {sid or '(no id)'}")
+        log('INFO', 'server.bridge', f"Closing session: {sid or '(no id)'}")
         # Save current state
         if sid:
             self.save_session()
@@ -605,7 +607,7 @@ class WebAgentBridge:
             "state": "IDLE",
             "is_running": False,
         })
-        print(f"🚪 Session closed: {sid or '(no id)'}")
+        log('INFO', 'server.bridge', f"Session closed: {sid or '(no id)'}")
 
     def clear_loaded_session(self) -> None:
         """Clear the loaded session reference for a fresh start."""
@@ -617,13 +619,13 @@ class WebAgentBridge:
             "type": "conversation_changed",
             "messages": [],
         })
-        print("🆕 Session cleared for fresh start")
+        log('INFO', 'server.bridge', "Session cleared for fresh start")
 
     # ── Internal: event emission ────────────────────────────────────────────
 
     def _emit(self, event: Dict[str, Any]) -> None:
         """Thread‑safe event emission via callback."""
-        print(f"📤 Sending to frontend: {event}")
+        log('DEBUG', 'server.bridge', f"Sending to frontend: {event}")
 
         if self._event_callback is not None:
             try:
@@ -642,14 +644,14 @@ class WebAgentBridge:
         and triggers save_open_session() — deferred from start() because
         the session ID isn't known until the controller has created its agent.
         """
-        print(f"🔹 Bridge received event: {event.get('type')} — {str(event)[:200]}")
+        log('DEBUG', 'server.bridge', f"Bridge received event: {event.get('type')}")
         # Capture session ID from first event that has one
         if self._session_id is None:
             sid = event.get('session_id')
             if sid is not None:
                 self._session_id = sid
                 self.save_open_session()
-                print(f"📋 Session ID captured from controller event: {sid}")
+                log('INFO', 'server.bridge', f"Session ID captured from controller event: {sid}")
         self._map_and_emit(event)
 
     def _event_to_message(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -671,19 +673,19 @@ class WebAgentBridge:
                 "content": content,
                 "reasoning_content": reasoning,
             }
-            print(f"✅ Converted {event_type} to message: {msg}")
+            log('DEBUG', 'server.bridge', f"Converted {event_type} to message")
             return msg
 
         elif event_type == "final":
             content = event.get("content", "")
             if content == self._last_assistant_content:
-                print(f"⏭️ Skipping final — content matches last turn")
+                log('DEBUG', 'server.bridge', "Skipping final — content matches last turn")
                 return None
             msg = {
                 "role": "assistant",
                 "content": content,
             }
-            print(f"✅ Converted {event_type} to message: {msg}")
+            log('DEBUG', 'server.bridge', f"Converted {event_type} to message")
             return msg
 
         elif event_type == "user_query":
@@ -691,7 +693,7 @@ class WebAgentBridge:
                 "role": "user",
                 "content": event.get("content", ""),
             }
-            print(f"✅ Converted {event_type} to message: {msg}")
+            log('DEBUG', 'server.bridge', f"Converted {event_type} to message")
             return msg
 
         elif event_type == "tool_call":
@@ -700,12 +702,12 @@ class WebAgentBridge:
                 "arguments": event.get("arguments", {}),
             })
             msg = {"role": "tool_call", "content": content}
-            print(f"✅ Converted {event_type} to tool_call message")
+            log('DEBUG', 'server.bridge', f"Converted {event_type} to tool_call message")
             return msg
 
         elif event_type == "tool_result":
             msg = {"role": "tool_result", "content": event.get("result", "")}
-            print(f"✅ Converted {event_type} to tool_result message")
+            log('DEBUG', 'server.bridge', f"Converted {event_type} to tool_result message")
             return msg
 
         return None
@@ -927,6 +929,7 @@ class WebAgentBridge:
             })
         finally:
             self._running = False
+            self._agent_running = False
             self._emit({
                 "type": "state_changed",
                 "state": "IDLE",
