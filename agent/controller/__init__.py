@@ -57,6 +57,7 @@ class AgentController(QObject):
         self._pause_requested = False
         self._processing_query = False
         # Plain Python callbacks (non-Qt consumers like Web UI)
+        self._config: Optional[AgentConfig] = None
         self._event_callbacks: List[Callable[[Dict[str, Any]], None]] = []
 
     def set_event_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:

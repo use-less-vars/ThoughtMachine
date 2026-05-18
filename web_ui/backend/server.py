@@ -232,7 +232,10 @@ async def websocket_endpoint(ws: WebSocket):
                     # Case 2: Agent is already running — continue normally
                     if bridge is not None and bridge._agent_running:
                         try:
-                            bridge.continue_session(query)
+                            config_dict = msg.get("config", {})
+                            if config_dict:
+                                config_dict = _translate_frontend_config(config_dict)
+                            bridge.continue_session(query, config_dict)
                         except Exception as exc:
                             await ws.send_json({
                                 "type": "status_message",
@@ -259,18 +262,11 @@ async def websocket_endpoint(ws: WebSocket):
                         await ws.send_json({"type": "status_message", "text": "⏹ Stopped."})
 
                 elif command == "get_config":
-                    if bridge is not None:
-                        cfg = bridge.get_config()
-                        if cfg is not None:
-                            await ws.send_json({
-                                "type": "config_changed",
-                                "config": _config_to_dict(cfg),
-                            })
-                    else:
-                        await ws.send_json({
-                            "type": "config_changed",
-                            "config": _default_frontend_config(),
-                        })
+                    # _frontend_config_from_bridge handles bridge=None and cfg=None gracefully
+                    await ws.send_json({
+                        "type": "config_changed",
+                        "config": _frontend_config_from_bridge(bridge),
+                    })
 
                 elif command == "get_conversation":
                     if bridge is not None:
@@ -458,6 +454,12 @@ async def websocket_endpoint(ws: WebSocket):
                             "state": "IDLE",
                             "is_running": bridge.is_running,
                         })
+                        # Send config_changed so the frontend shows the session's actual config
+                        fe_config = _frontend_config_from_bridge(bridge)
+                        await ws.send_json({
+                            "type": "config_changed",
+                            "config": fe_config,
+                        })
                         await ws.send_json({"type": "status_message", "text": f"Session {session_id} loaded. Click Run to continue."})
                     except Exception as exc:
                         await ws.send_json({
@@ -577,7 +579,6 @@ async def websocket_endpoint(ws: WebSocket):
 
                     # Store as the loaded session so continue_session picks it up
                     bridge._loaded_session = new_session
-                    bridge._loaded_config_overrides = None
 
                     await ws.send_json({
                         "type": "session_loaded",
@@ -587,6 +588,11 @@ async def websocket_endpoint(ws: WebSocket):
                         "type": "state_changed",
                         "state": "IDLE",
                         "is_running": False,
+                    })
+                    # Send default config so the frontend shows proper defaults
+                    await ws.send_json({
+                        "type": "config_changed",
+                        "config": _default_frontend_config(),
                     })
                     await ws.send_json({"type": "status_message", "text": "Ready. Type a query to start."})
 
@@ -669,8 +675,14 @@ def _translate_frontend_config(fe_config: Dict[str, Any]) -> Dict[str, Any]:
     if provider:
         cfg["provider_type"] = provider_map.get(provider, provider)
 
-    # [REMOVED] tools→enabled_tools translation — frontend placeholder list must not override global config
-    cfg.pop("tools", None)
+    # Translate frontend tools list → backend enabled_tools
+    # Frontend: [{name: "bash", enabled: true}, {name: "file_read", enabled: false}, ...]
+    # Backend:  ["bash", ...]  (only enabled tools)
+    tools_list = cfg.pop("tools", None)
+    if isinstance(tools_list, list):
+        enabled = [t["name"] for t in tools_list if isinstance(t, dict) and t.get("enabled")]
+        if enabled:
+            cfg["enabled_tools"] = enabled
 
     # Remove any keys that start with _
     cfg = {k: v for k, v in cfg.items() if not k.startswith("_")}
@@ -688,6 +700,8 @@ def _translate_frontend_config(fe_config: Dict[str, Any]) -> Dict[str, Any]:
 
 def _frontend_config_from_bridge(bridge) -> Dict[str, Any]:
     """Convert bridge's AgentConfig back to frontend config format."""
+    if bridge is None:
+        return _default_frontend_config()
     from web_ui.backend.bridge import WebAgentBridge
     cfg = bridge.get_config()
     if cfg is None:
@@ -704,6 +718,7 @@ def _frontend_config_from_bridge(bridge) -> Dict[str, Any]:
     enabled = raw.pop("enabled_tools", [])
     raw["tools"] = [{"name": t, "enabled": True} for t in enabled]
     return raw
+
 
 
 def _default_frontend_config() -> Dict[str, Any]:

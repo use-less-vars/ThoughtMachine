@@ -104,7 +104,6 @@ class WebAgentBridge:
         self._session_store = FileSystemSessionStore()
         self._session: Optional[Session] = None
         self._loaded_session: Optional[Session] = None
-        self._loaded_config_overrides: Optional[Dict[str, Any]] = None
 
         # Agent running flag — set True when controller.start() succeeds,
         # reset on stop/disconnect.  More reliable than is_running for
@@ -193,13 +192,7 @@ class WebAgentBridge:
         global_config = self._build_global_agent_config()
         merged_config = global_config.model_dump(exclude={'api_key'}, exclude_none=True)
 
-        # ── Layer 2: loaded session config overrides ──────────────────────
-        if self._loaded_config_overrides:
-            for k, v in self._loaded_config_overrides.items():
-                if v is not None and v != '':
-                    merged_config[k] = v
-
-        # ── Layer 3: frontend config_dict ─────────────────────────────────
+        # ── Layer 2: frontend config_dict ─────────────────────────────────
         if config_dict:
             for k, v in config_dict.items():
                 if k not in ('session_id', 'created_at', 'updated_at'):
@@ -225,7 +218,6 @@ class WebAgentBridge:
             self._session = session_arg
             self._controller.start(query, config, session=session_arg)
             self._loaded_session = None  # consumed
-            self._loaded_config_overrides = None  # consumed
             self._agent_running = True
             return
 
@@ -265,10 +257,32 @@ class WebAgentBridge:
         self._thread.start()
         self._agent_running = True
 
-    def continue_session(self, query: str) -> None:
+    def continue_session(self, query: str, config_dict: Optional[Dict[str, Any]] = None) -> None:
         """
         Submit a follow‑up query to a running (or paused) agent.
+
+        If config_dict is provided, it is merged into the current config
+        via apply_config() (validated, provider-resolved, persisted) and
+        pushed to the controller via request_config_update() so the agent
+        picks it up on the next process_query() boundary.
         """
+        # ── Apply config update if provided ──────────────────────────────
+        if config_dict:
+            result = self.apply_config(config_dict)
+            if result.get("success"):
+                log('INFO', 'server.bridge',
+                    f"Config updated during continue_session: "
+                    f"provider={self._config.provider_type}, "
+                    f"model={self._config.model}")
+                # Push to controller so running agent picks it up
+                if self._controller is not None:
+                    self._controller.request_config_update(self._config)
+            else:
+                log('WARNING', 'server.bridge',
+                    f"Config update skipped during continue_session: "
+                    f"{result.get('error', 'unknown error')}")
+
+        # ── Submit the query ──────────────────────────────────────────────
         if self._controller is not None:
             self._controller.continue_session(query)
             return
@@ -319,7 +333,7 @@ class WebAgentBridge:
 
     def get_config(self) -> Optional[AgentConfig]:
         if self._controller is not None:
-            return self._controller.get_config()
+            return self._controller.get_config() or self._config
         return self._config
 
     def apply_config(self, config_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -367,6 +381,8 @@ class WebAgentBridge:
 
         # Step 5: Store the validated config
         self._config = validated
+        if self._controller is not None:
+            self._controller._config = validated
 
         # Step 6: Persist to session
         self.save_session()
@@ -434,12 +450,12 @@ class WebAgentBridge:
     def load_session(self, session_id: str) -> bool:
         """Load a session from the store, replacing current conversation.
 
-        Also extracts ``session.metadata['agent_config']`` and stores it as
-        ``self._loaded_config_overrides`` so that the next ``start()`` call
-        applies the saved configuration (system prompt, tools, etc.).
+        Also extracts ``session.metadata['agent_config']`` and merges it into
+        ``self._config`` so that ``get_config()`` returns the saved configuration
+        immediately and ``start()`` uses it as the base config.
 
-        Emits ``config_changed`` with the restored config so the frontend
-        updates its controls.
+        After calling this, the server handler should send ``config_changed``
+        (in frontend format) so the frontend controls update.
         """
         try:
             session = self._session_store.load_session(session_id)
@@ -488,23 +504,37 @@ class WebAgentBridge:
             self._session = session
             self._loaded_session = session
 
-            # ── Extract agent_config from session metadata ────────────────
+            # ── Extract agent_config from session metadata into self._config ──
+            # This makes self._config the single source of truth so bridge.get_config()
+            # returns the saved config immediately (config_changed broadcasts show correct values).
             agent_config_raw = session.metadata.get('agent_config', {})
             if agent_config_raw and isinstance(agent_config_raw, dict):
-                self._loaded_config_overrides = dict(agent_config_raw)
-                log('INFO', 'server.bridge', f"Loaded agent_config overrides from session metadata: {len(agent_config_raw)} keys")
-            else:
-                self._loaded_config_overrides = None
-                log('INFO', 'server.bridge', "No agent_config in session metadata")
-
-            # Ensure enabled_tools is always present — merge from global config if missing
-            if self._loaded_config_overrides and 'enabled_tools' not in self._loaded_config_overrides:
                 try:
-                    global_config = self._build_global_agent_config()
-                    self._loaded_config_overrides['enabled_tools'] = global_config.enabled_tools
-                    log('INFO', 'server.bridge', f"Merged enabled_tools from global config: {len(global_config.enabled_tools)} tools")
+                    from agent.config.loader import validate_config
+                    if self._config is not None:
+                        base = self._config.model_dump(exclude={'api_key'}, exclude_none=True)
+                    else:
+                        base = {}
+                    merged = dict(base)
+                    merged.update(agent_config_raw)
+                    # Ensure enabled_tools is always present — merge from global config if missing
+                    if 'enabled_tools' not in merged:
+                        try:
+                            global_config = self._build_global_agent_config()
+                            merged['enabled_tools'] = global_config.enabled_tools
+                            log('INFO', 'server.bridge', f"Merged enabled_tools from global config: {len(global_config.enabled_tools)} tools")
+                        except Exception as exc:
+                            log('WARNING', 'server.bridge', f"Could not merge enabled_tools: {exc}")
+                    validated = validate_config(merged)
+                    if validated is not None:
+                        self._config = validated
+                        log('INFO', 'server.bridge', f"Loaded agent_config from session metadata: {len(agent_config_raw)} keys")
+                    else:
+                        log('WARNING', 'server.bridge', 'load_session: validate_config returned None, keeping existing _config')
                 except Exception as exc:
-                    log('WARNING', 'server.bridge', f"Could not merge enabled_tools: {exc}")
+                    log('WARNING', 'server.bridge', f'load_session: config merge failed: {exc}')
+            else:
+                log('INFO', 'server.bridge', "No agent_config in session metadata")
 
             # Emit conversation_changed so the frontend updates
             self._emit({
@@ -518,12 +548,6 @@ class WebAgentBridge:
                 "session_name": session.metadata.get('name', 'Untitled Session'),
                 "message_count": len(self.history),
             })
-            # Emit config_changed with the restored config so frontend controls update
-            if self._loaded_config_overrides:
-                self._emit({
-                    "type": "config_changed",
-                    "config": self._loaded_config_overrides,
-                })
             log('INFO', 'server.bridge', f"Session loaded: {session_id} ({session.metadata.get('name')}) — {len(self.history)} messages")
 
             # Register this session as an open session (persists to open_sessions.json)
@@ -646,7 +670,6 @@ class WebAgentBridge:
         # Reset state
         self._session = None
         self._loaded_session = None
-        self._loaded_config_overrides = None
         self.history = []
         self._session_id = None
         self._emit({
@@ -663,7 +686,6 @@ class WebAgentBridge:
         """Clear the loaded session reference for a fresh start."""
         self._session = None
         self._loaded_session = None
-        self._loaded_config_overrides = None
         self.history = []
         self._emit({
             "type": "conversation_changed",
@@ -824,9 +846,17 @@ class WebAgentBridge:
                 "text": f"⚠ Error: {raw_event.get('message', 'unknown')}",
             })
 
-        # ── Synthetic bridge event: don't forward to frontend ────────────
+        # ── Synthetic bridge event: don't forward raw session_stop ──────
+        # but still emit the stop_reason as state_changed IDLE so the
+        # frontend learns the agent has stopped.
         if event_type == "session_stop":
-            return []
+            if raw_event.get("stop_reason"):
+                results.append({
+                    "type": "state_changed",
+                    "state": "IDLE",
+                    "is_running": self._get_is_running(),
+                })
+            return results
 
         # Stop handling
         if raw_event.get("stop_reason"):
