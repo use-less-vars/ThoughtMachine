@@ -1243,3 +1243,31 @@ Config engineer proposed adding logging/RAG/KB fields to AgentConfig, but they w
 3. Change all `model_dump()` calls to `exclude={'api_key'}, exclude_none=True`
 4. Add stray-keys assertion after every save-write
 5. Add load-time null backfill from global config in session lifecycle
+
+## 2026-05-18 — ## Config Variable Elimination — Complete
+
+The `_loaded_conf...
+
+## Config Variable Elimination — Complete
+
+The `_loaded_config_overrides` intermediate storage has been fully eliminated from bridge.py, simplifying config flow:
+
+**Old flow (3 paths):**
+1. `apply_config()` → writes to both `_loaded_config_overrides` AND `_config`
+2. `load_session()` → writes to `_loaded_config_overrides` (not `_config`)
+3. `start()` → merges `_loaded_config_overrides` into `merged_config`
+
+**New flow (1 path):**
+1. `apply_config()` → writes directly to `_config`
+2. `load_session()` → writes `agent_config_raw` directly into `_config` via `validate_config()`
+3. `start()` → uses `self._config` directly (no merge needed)
+
+**Backend server.py changes:**
+- `get_config` handler now uses `_frontend_config_from_bridge(bridge)` instead of `_config_to_dict(cfg)` — consistently converts backend AgentConfig fields (provider_type, enabled_tools) to frontend format (provider, tools).
+- Dead `_overrides_to_frontend_config()` function deleted.
+
+**Frontend changes:**
+- `SessionTab.jsx`: `INITIAL_STATE.config` set to `null` (no more hardcoded defaults)
+- `SessionTab.jsx`: `config_changed` handler uses direct assignment (`update({ config: msg.config })`) instead of merging — backend is the single source of truth
+- `ConfigPanel.jsx`: handles null config safely (`config ?? {}`)
+- `QueryBar.jsx`: handles null config in `start_session` (`config: config ?? {}`)
