@@ -41,6 +41,7 @@ class AgentConfig(BaseModel):
         'jsonl_format': GLOBAL_STATIC,
         'log_categories': GLOBAL_STATIC,
         'max_file_size_mb': GLOBAL_STATIC,
+        'max_backup_files': GLOBAL_STATIC,
         'workspace_path': RESTART_REQUIRED,
         'detail': HOT_SWAPPABLE,
         'rag_enabled': RESTART_REQUIRED,
@@ -83,6 +84,7 @@ class AgentConfig(BaseModel):
     jsonl_format: bool = Field(default=True, description='Use JSONL format for log files')
     log_categories: List[str] = Field(default_factory=lambda: ['SESSION', 'LLM', 'TOOLS'], description='List of log categories to enable (SESSION, UI, LLM, TOOLS, SECURITY, PERFORMANCE). Can be overridden by AGENT_LOG_CATEGORIES environment variable.')
     max_file_size_mb: int = Field(default=10, description='Maximum log file size in MB before rotation')
+    max_backup_files: int = Field(default=5, description='Maximum number of backup log files to keep')
     workspace_path: Optional[str] = Field(default=None, description='Root directory for file operations (None = unrestricted)')
     rag_enabled: bool = Field(default=False, description='Enable RAG functionality')
     rag_embedding_model: str = Field(default='BAAI/bge-small-en-v1.5', description='Model name for sentence-transformers embeddings')

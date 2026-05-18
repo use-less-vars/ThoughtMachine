@@ -261,21 +261,18 @@ def create_agent_config_service(config_path: str='agent_config.json') -> ConfigS
     """
     Create a ConfigService with default agent configuration.
     
+    Uses the full AgentConfig schema as the source of defaults.
+    Legacy field name mappings (warning_threshold, critical_threshold,
+    tool_output_limit) are handled by loaders/state_bridge for
+    backward compatibility.
+    
     Args:
         config_path: Path to config file
         
     Returns:
         ConfigService instance with agent defaults
     """
-    from tools import SIMPLIFIED_TOOL_CLASSES
     from agent.config import AgentConfig
     default_agent_config = AgentConfig()
-    default_config = default_agent_config.model_dump()
-    default_config['warning_threshold'] = default_agent_config.token_monitor_warning_threshold // 1000
-    default_config['critical_threshold'] = default_agent_config.token_monitor_critical_threshold // 1000
-    default_config['tool_output_limit'] = default_agent_config.tool_output_token_limit
-    fields_to_remove = ['initial_input_tokens', 'initial_output_tokens', 'enable_logging', 'log_dir', 'log_level', 'enable_file_logging', 'enable_console_logging', 'jsonl_format', 'max_file_size_mb', 'tool_output_token_limit']
-    for key in fields_to_remove:
-        default_config.pop(key, None)
-
+    default_config = default_agent_config.model_dump(exclude={'api_key'}, exclude_none=True)
     return ConfigService(config_path, default_config)

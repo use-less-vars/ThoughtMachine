@@ -130,6 +130,7 @@ class ProviderManager:
         dict.  Values already present in *config_dict* take precedence.
         """
         profile_id = config_dict.get('provider_id')
+
         if not profile_id:
             return config_dict
 

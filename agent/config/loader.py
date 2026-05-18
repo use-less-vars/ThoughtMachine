@@ -5,7 +5,7 @@ Handles loading, saving, and validation of agent configurations.
 import os
 import json
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Set
 from agent.logging import log
 from .models import AgentConfig
 
@@ -66,10 +66,47 @@ def load_config(config_path: str) -> Dict[str, Any]:
             else:
                 merged_config[key] = value
         log('DEBUG', 'config.loader', f'Loaded config from {config_path}')
+        merged_config = _backfill_nulls(merged_config)
         return merged_config
     except Exception as e:
         log('WARNING', 'config.loader', f'Error loading config from {config_path}: {e}')
         return default_config
+
+def _get_valid_field_names() -> Set[str]:
+    """Return the set of valid field names for AgentConfig."""
+    return set(AgentConfig.model_fields.keys())
+
+
+def _warn_stray_keys(config: Dict[str, Any]) -> None:
+    """Log a warning if config dict contains keys not in AgentConfig model.
+
+    This catches stray/injected keys that would otherwise vanish silently
+    on save-write, preventing data corruption from spreading.
+    """
+    valid = _get_valid_field_names()
+    stray = [k for k in config if k not in valid]
+    if stray:
+        log('WARNING', 'config.loader',
+            f'Stray keys detected in config (will NOT be persisted): {stray}')
+        for key in stray:
+            del config[key]
+
+
+def _backfill_nulls(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Replace None/null values with model defaults.
+
+    If a saved config explicitly contains null for a field, use the
+    AgentConfig default for that field instead. This prevents None
+    values from propagating through the runtime.
+    """
+    default_cfg = AgentConfig()
+    for field_name in AgentConfig.model_fields:
+        if field_name in config and config[field_name] is None:
+            default_value = getattr(default_cfg, field_name, None)
+            if default_value is not None:
+                config[field_name] = default_value
+    return config
+
 
 def save_config(config: Dict[str, Any], config_path: str) -> bool:
     """Save configuration to file.
@@ -82,6 +119,7 @@ def save_config(config: Dict[str, Any], config_path: str) -> bool:
         True if successful, False otherwise
     """
     try:
+        _warn_stray_keys(config)
         os.makedirs(os.path.dirname(os.path.abspath(config_path)), exist_ok=True)
         with open(config_path, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2)
