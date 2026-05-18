@@ -270,7 +270,7 @@ class Session:
         Convert session to a dictionary suitable for JSON serialization.
         Excludes non-persistable fields like agent_context (derived) and objects.
         """
-        data = {'session_id': self.session_id, 'created_at': self.created_at.isoformat(), 'updated_at': datetime.now().isoformat(), 'runtime_params': self.runtime_params.to_dict(), 'user_history': list(self.user_history), 'containers': [c.to_dict() for c in self.containers], 'preset_name': self.preset_name, 'metadata': self.metadata, 'security_config': self.security_config, 'version': self.version, 'summary': self.summary, 'total_input_tokens': self.total_input_tokens, 'total_output_tokens': self.total_output_tokens, 'context_length': self.context_length}
+        data = {'session_id': self.session_id, 'created_at': self.created_at.isoformat(), 'updated_at': datetime.now().isoformat(), 'user_history': list(self.user_history), 'containers': [c.to_dict() for c in self.containers], 'preset_name': self.preset_name, 'metadata': self.metadata, 'security_config': self.security_config, 'version': self.version, 'summary': self.summary, 'total_input_tokens': self.total_input_tokens, 'total_output_tokens': self.total_output_tokens, 'context_length': self.context_length}
         return data
 
     @classmethod
@@ -284,8 +284,12 @@ class Session:
         if config_data and 'agent_config' not in metadata:
             if isinstance(config_data, dict):
                 metadata['agent_config'] = config_data
-        runtime_params_data = data.get('runtime_params', {})
-        runtime_params = RuntimeParams.from_dict(runtime_params_data) if runtime_params_data else RuntimeParams()
+        # Derive runtime params from metadata.agent_config (sole source of truth)
+        agent_cfg = metadata.get('agent_config', {})
+        runtime_params = RuntimeParams(
+            temperature=agent_cfg.get('temperature', 0.2),
+            max_tokens=agent_cfg.get('max_tokens', None),
+        )
         user_history = data.get('user_history', [])
         max_seq = 0
         for i, msg in enumerate(user_history):
@@ -320,8 +324,12 @@ class Session:
         if config_data and 'agent_config' not in metadata:
             if isinstance(config_data, dict):
                 metadata['agent_config'] = config_data
-        runtime_params_data = data.get('runtime_params', {})
-        runtime_params = RuntimeParams.from_dict(runtime_params_data) if runtime_params_data else RuntimeParams()
+        # Derive runtime params from metadata.agent_config (sole source of truth)
+        agent_cfg = metadata.get('agent_config', {})
+        runtime_params = RuntimeParams(
+            temperature=agent_cfg.get('temperature', 0.2),
+            max_tokens=agent_cfg.get('max_tokens', None),
+        )
         user_history = data.get('user_history', [])
         max_seq = 0
         for i, msg in enumerate(user_history):
