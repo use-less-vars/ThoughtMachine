@@ -53,6 +53,8 @@ const INITIAL_STATE = {
 function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewSession, onSessionSaved, onRegister, onRunningChange }) {
   const [state, setState] = useState(INITIAL_STATE)
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
+  const [providers, setProviders] = useState([])
+  const [availableTools, setAvailableTools] = useState([])
   const wsRef = useRef(null)
   const closedRef = useRef(false)  // prevent double-close
   const tabConnectingRef = useRef(false)  // prevent StrictMode duplicate
@@ -128,6 +130,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
       } else {
         ws.send(JSON.stringify({ command: 'new_session' }))
       }
+
+      // Fetch providers and tools list for this session
+      sendCommand('get_providers')
+      sendCommand('get_available_tools')
     }
 
     ws.onmessage = (event) => {
@@ -237,6 +243,14 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
         }
         break
 
+      case 'providers_list':
+        setProviders(msg.providers || [])
+        break
+
+      case 'tools_list':
+        setAvailableTools(msg.tools || [])
+        break
+
       case 'session_saved':
         onSessionSaved?.()
         break
@@ -263,7 +277,12 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
         contextLength={state.contextLength}
       />
       <div className="app-main">
-        <ConfigPanel config={state.config} sendCommand={sendCommand} />
+        <ConfigPanel
+          config={state.config}
+          sendCommand={sendCommand}
+          providers={providers}
+          availableTools={availableTools}
+        />
         <div className="app-center">
           <ChatPanel messages={state.history} />
           <QueryBar

@@ -322,6 +322,58 @@ class WebAgentBridge:
             return self._controller.get_config()
         return self._config
 
+    def apply_config(self, config_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Apply a full config dict to the session, merging with existing config.
+
+        Steps:
+        1. Start with existing self._config as base (if available)
+        2. Merge incoming config_dict on top
+        3. Validate the merged dict via validate_config()
+        4. Resolve provider credentials if provider_id is present
+        5. Store validated config in self._config
+        6. Persist to session via save_session()
+
+        Returns:
+            {"success": True} or {"success": False, "error": "..."}
+        """
+        from agent.config.loader import validate_config
+
+        # Step 1: Start with current config as base
+        if self._config is not None:
+            base = self._config.model_dump(exclude={'api_key'}, exclude_none=True)
+        else:
+            base = {}
+
+        # Step 2: Merge incoming on top (shallow merge)
+        merged = dict(base)
+        merged.update(config_dict)
+
+        # Step 3: Validate the merged dict
+        validated = validate_config(merged)
+        if validated is None:
+            return {"success": False, "error": "Configuration validation failed"}
+
+        # Step 4: Resolve provider if provider_id is present
+        validated_dict = validated.model_dump(exclude={'api_key'}, exclude_none=True)
+        provider_id = validated_dict.get('provider_id')
+        if provider_id:
+            try:
+                manager = ProviderManager()
+                validated_dict = manager.resolve_config(validated_dict)
+                validated = AgentConfig(**validated_dict)
+            except Exception as e:
+                log('WARNING', 'server.bridge', f"Provider resolution failed during apply_config: {e}")
+
+        # Step 5: Store the validated config
+        self._config = validated
+
+        # Step 6: Persist to session
+        self.save_session()
+
+        log('INFO', 'server.bridge', 'Config applied and persisted via apply_config')
+        return {"success": True}
+
     # ── Session persistence ──────────────────────────────────────────────────
 
     def list_sessions(self) -> List[Dict[str, Any]]:

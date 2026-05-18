@@ -38,9 +38,12 @@ Client → Server (JSON):
     { "command": "get_config" }
     { "command": "get_conversation" }
     { "command": "update_config",     "field": "...", "value": ... }
+    { "command": "apply_config",      "config": {...} }
     { "command": "list_sessions" }
     { "command": "save_session",          "name": "..." (optional) }
     { "command": "load_session",          "session_id": "..." }
+    { "command": "get_providers" }
+    { "command": "get_available_tools" }
     { "command": "delete_session",        "session_id": "..." }
     { "command": "rename_session",        "session_id": "...", "new_name": "..." }
     { "command": "get_open_sessions" }
@@ -62,6 +65,8 @@ Server → Client (JSON):
     open_sessions_list  { "type": "open_sessions_list",  "session_ids": ["..."] }
     session_closed      { "type": "session_closed",      "session_id": "..." }
     session_cleared     { "type": "session_cleared" }
+    providers_list      { "type": "providers_list",      "providers": [...] }
+    tools_list          { "type": "tools_list",          "tools": [...] }
 """
 
 from __future__ import annotations
@@ -304,6 +309,92 @@ async def websocket_endpoint(ws: WebSocket):
                         "type": "config_changed",
                         "config": _frontend_config_from_bridge(bridge) if bridge else _default_frontend_config(),
                     })
+
+                elif command == "apply_config":
+                    # Receive full config from frontend, validate, merge, persist
+                    config = msg.get("config", {})
+                    if not config:
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": "⚠ apply_config: empty config received",
+                        })
+                        continue
+
+                    if bridge is None:
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": "⚠ No active session to configure",
+                        })
+                        continue
+
+                    # Translate frontend format → backend AgentConfig format
+                    backend_config = _translate_frontend_config(config)
+
+                    # Apply via bridge (validates, merges, resolves provider, persists)
+                    result = bridge.apply_config(backend_config)
+
+                    if result.get("success"):
+                        await ws.send_json({
+                            "type": "config_changed",
+                            "config": _frontend_config_from_bridge(bridge),
+                        })
+                        log('INFO', 'server.config', "Config applied and persisted via apply_config")
+                    else:
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": f"⚠ Failed to apply config: {result.get('error', 'unknown error')}",
+                        })
+
+                elif command == "get_providers":
+                    # Return list of provider profiles (safe fields only)
+                    from agent.config.provider_profile import ProviderManager
+                    try:
+                        manager = ProviderManager()
+                        profiles = manager.list_profiles()
+                        safe_profiles = []
+                        for p in profiles:
+                            safe_profiles.append({
+                                "id": p.id,
+                                "label": p.label,
+                                "provider_type": p.provider_type,
+                                "base_url": p.base_url,
+                                "default_model": p.default_model,
+                                "models": list(p.models) if p.models else [],
+                                "timeout": p.timeout,
+                            })
+                        await ws.send_json({
+                            "type": "providers_list",
+                            "providers": safe_profiles,
+                        })
+                        log('INFO', 'server.config', f"Returned {len(safe_profiles)} provider profiles")
+                    except Exception as exc:
+                        log('ERROR', 'server.config', f"get_providers failed: {exc}")
+                        await ws.send_json({
+                            "type": "providers_list",
+                            "providers": [],
+                        })
+
+                elif command == "get_available_tools":
+                    # Return list of available tool definitions
+                    try:
+                        from tools import SIMPLIFIED_TOOL_CLASSES
+                        tool_defs = []
+                        for cls in SIMPLIFIED_TOOL_CLASSES:
+                            tool_defs.append({
+                                "name": cls.__name__,
+                                "description": (cls.__doc__ or "").strip(),
+                            })
+                        await ws.send_json({
+                            "type": "tools_list",
+                            "tools": tool_defs,
+                        })
+                        log('INFO', 'server.config', f"Returned {len(tool_defs)} available tools")
+                    except Exception as exc:
+                        log('ERROR', 'server.config', f"get_available_tools failed: {exc}")
+                        await ws.send_json({
+                            "type": "tools_list",
+                            "tools": [],
+                        })
 
                 elif command == "list_sessions":
                     try:
