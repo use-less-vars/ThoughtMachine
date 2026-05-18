@@ -1220,3 +1220,26 @@ This is by design — old keys in session files are a liability we eliminate on 
 - **Automatic exclusion** — Pydantic field attribute ensures keys can't leak through serialization.
 - **Named profiles** — switch providers with a dropdown, no re‑typing.
 - **Minimal complexity** — no encryption, no OS keyring, no background threads. The threat model is accidental leakage, not targeted attack. Encryption can be added later without changing the architecture.
+
+## 2026-05-18 — ## 2026-05-18: AgentConfig Audit — Corrected Scope
+
+### Cont...
+
+## 2026-05-18: AgentConfig Audit — Corrected Scope
+
+### Context
+Config engineer proposed adding logging/RAG/KB fields to AgentConfig, but they were **already present** (added by a previous developer). Proposed removing `logging_format`, `logging_file`, `logging_level` — these don't exist anywhere. Proposed adding `stop_check_enabled`/`stop_check_timeout` — these don't exist.
+
+### Genuine gaps found
+1. `max_backup_files: int = 5` — exists in `agent_config.json` but missing from `AgentConfig` model
+2. `create_agent_config_service()` in `agent/config/service.py` strips model fields and injects non-model field names (`warning_threshold`, `critical_threshold`, `tool_output_limit`) — creates a parallel config representation
+3. `model_dump()` calls lack `exclude={'api_key'}, exclude_none=True` — causes null propagation in session metadata
+4. No guardrails against stray keys in write paths
+5. No load-time null backfill from global config
+
+### Corrected plan (being executed)
+1. Add `max_backup_files` to AgentConfig model + FIELD_CATEGORIES
+2. Fix `create_agent_config_service()` to stop stripping/injecting fields
+3. Change all `model_dump()` calls to `exclude={'api_key'}, exclude_none=True`
+4. Add stray-keys assertion after every save-write
+5. Add load-time null backfill from global config in session lifecycle
