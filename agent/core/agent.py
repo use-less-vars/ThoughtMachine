@@ -256,6 +256,7 @@ class Agent:
                 self.tool_classes, new_config, None, self.logger,
                 self.security_available, agent=self
             )
+            self.tool_executor.state = self.state
             changed.append(f'enabled_tools={", ".join(new_config.enabled_tools)}')
         
         if changed:
