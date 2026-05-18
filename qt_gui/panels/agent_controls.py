@@ -391,7 +391,7 @@ class AgentControlsPanel(QGroupBox):
         persisted to the shared default config file.
         """
         config = self.get_config()
-        config_dict = config.model_dump()
+        config_dict = config.model_dump(exclude={'api_key'}, exclude_none=True)
         from PyQt6.QtWidgets import QMessageBox
         from agent.config import get_config_paths
         import json
@@ -466,7 +466,7 @@ class AgentControlsPanel(QGroupBox):
 
         Uses ProviderSelector for profile/model fields.
         """
-        config_dict = config.model_dump()
+        config_dict = config.model_dump(exclude={'api_key'}, exclude_none=True)
         log('DEBUG', 'core.config', f'[CONFIG_TRACE] AgentControlsPanel.set_config received: token_monitor_warning_threshold={config_dict.get("token_monitor_warning_threshold", "NOT_IN_DICT")}, token_monitor_critical_threshold={config_dict.get("token_monitor_critical_threshold", "NOT_IN_DICT")}')
         set_val = config_dict.get  # shorthand
 

@@ -191,11 +191,13 @@ class WebAgentBridge:
         """
         # ── Layer 1: global config from agent_config.json ──────────────────
         global_config = self._build_global_agent_config()
-        merged_config = global_config.model_dump()
+        merged_config = global_config.model_dump(exclude={'api_key'}, exclude_none=True)
 
         # ── Layer 2: loaded session config overrides ──────────────────────
         if self._loaded_config_overrides:
-            merged_config.update(self._loaded_config_overrides)
+            for k, v in self._loaded_config_overrides.items():
+                if v is not None and v != '':
+                    merged_config[k] = v
 
         # ── Layer 3: frontend config_dict ─────────────────────────────────
         if config_dict:
@@ -203,7 +205,6 @@ class WebAgentBridge:
                 if k not in ('session_id', 'created_at', 'updated_at'):
                     merged_config[k] = v
 
-        # ── Provider resolution ────────────────────────────────────────────
         provider_id = merged_config.get('provider_id')
         if provider_id:
             try:
@@ -212,9 +213,6 @@ class WebAgentBridge:
             except Exception:
                 pass
 
-        # ── API key is resolved by ProviderManager.resolve_config() above ──
-        # The Agent's own _has_api_key() will additionally check
-        # {provider_type}_API_KEY and OPENAI_API_KEY env vars at startup.
         if not merged_config.get('api_key'):
             log('DEBUG', 'server.bridge', 'No API key resolved from provider profile; Agent will check env vars')
 
@@ -354,7 +352,7 @@ class WebAgentBridge:
                     session_id=session_id,
                     user_history=list(self.history),
                     metadata={
-                        'agent_config': self._config.model_dump() if self._config else {},
+                        'agent_config': self._config.model_dump(exclude={'api_key'}, exclude_none=True) if self._config else {},
                         'source': 'web_ui',
                     }
                 )
@@ -362,7 +360,7 @@ class WebAgentBridge:
                 # Update existing session metadata
                 session.metadata.setdefault('agent_config', {})
                 if self._config:
-                    session.metadata['agent_config'] = self._config.model_dump()
+                    session.metadata['agent_config'] = self._config.model_dump(exclude={'api_key'}, exclude_none=True)
                 session.metadata.setdefault('source', 'web_ui')
 
             # Apply name: explicit arg > existing loaded session name > generated

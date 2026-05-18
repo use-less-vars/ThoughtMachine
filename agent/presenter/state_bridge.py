@@ -45,7 +45,7 @@ class StateBridge:
 
     def get_config(self) -> dict:
         """Return current configuration dictionary."""
-        return self.current_config.model_dump()
+        return self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
 
     def get_agent_config(self) -> AgentConfig:
         """Return current configuration as an AgentConfig instance."""
@@ -72,21 +72,21 @@ class StateBridge:
         log('DEBUG', 'core.config', f'[CONFIG_TRACE] state_bridge update_config before: workspace_path={self.current_config.workspace_path}')
         log('DEBUG', 'core.config', f'[CONFIG_TRACE] state_bridge update_config incoming: workspace_path={config_updates.get("workspace_path", "KEY_MISSING")}')
         # Merge updates into current config
-        current_dict = self.current_config.model_dump()
+        current_dict = self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
         current_dict.update(config_updates)
         self.current_config = AgentConfig(**current_dict)
         log('DEBUG', 'core.config', f'[CONFIG_TRACE] state_bridge update_config after: workspace_path={self.current_config.workspace_path}')
-        return self.current_config.model_dump()
+        return self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
 
     def save_config(self, config: Optional[dict]=None, path: Optional[str]=None) -> bool:
         """Save configuration to file."""
-        config_to_save = config or self.current_config.model_dump()
+        config_to_save = config or self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
         save_path = path or self.config_path
         return save_config(config_to_save, save_path)
 
     def save_user_config(self, config: Optional[dict]=None) -> bool:
         """Save configuration to user config file."""
-        config_to_save = config or self.current_config.model_dump()
+        config_to_save = config or self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
         return save_config(config_to_save, self.user_config_path)
 
     def load_config(self, path: Optional[str]=None) -> dict:
@@ -94,13 +94,13 @@ class StateBridge:
         load_path = path or self.config_path
         config_dict = load_config(load_path)
         self.current_config = AgentConfig(**config_dict)
-        return self.current_config.model_dump()
+        return self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
 
     def load_user_config(self) -> dict:
         """Load configuration from user config file."""
         config_dict = load_config(self.user_config_path)
         self.current_config = AgentConfig(**config_dict)
-        return self.current_config.model_dump()
+        return self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
 
     def create_agent_config(self, config_dict: Optional[dict]=None, total_input: int=0, total_output: int=0) -> AgentConfig:
         """
@@ -119,9 +119,9 @@ class StateBridge:
             AgentConfig instance ready for use with controller
         """
         if config_dict is not None:
-            config = {**self.current_config.model_dump(), **config_dict}
+            config = {**self.current_config.model_dump(exclude={'api_key'}, exclude_none=True), **config_dict}
         else:
-            config = self.current_config.model_dump()
+            config = self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
 
         # Resolve provider profile if provider_id is present
         provider_id = config.get('provider_id')
@@ -139,7 +139,7 @@ class StateBridge:
                 tool_classes.append(tool_cls)
         agent_kwargs = {}
         agent_kwargs['api_key'] = api_key
-        direct_mappings = [('model', 'model'), ('provider_type', 'provider_type'), ('provider_config', 'provider_config'), ('temperature', 'temperature'), ('max_turns', 'max_turns'), ('workspace_path', 'workspace_path'), ('detail', 'detail'), ('token_monitor_enabled', 'token_monitor_enabled'), ('enabled_tools', 'enabled_tools'), ('turn_monitor_enabled', 'turn_monitor_enabled'), ('system_prompt', 'system_prompt')]
+        direct_mappings = [('model', 'model'), ('provider_type', 'provider_type'), ('provider_config', 'provider_config'), ('temperature', 'temperature'), ('max_turns', 'max_turns'), ('workspace_path', 'workspace_path'), ('detail', 'detail'), ('token_monitor_enabled', 'token_monitor_enabled'), ('enabled_tools', 'enabled_tools'), ('turn_monitor_enabled', 'turn_monitor_enabled'), ('system_prompt', 'system_prompt'), ('provider_id', 'provider_id'), ('model_override', 'model_override')]
         for config_key, agent_key in direct_mappings:
             if config_key in config:
                 agent_kwargs[agent_key] = config[config_key]
@@ -179,7 +179,7 @@ class StateBridge:
         # Restore workspace_path from session metadata into the active config
         ws = session.metadata.get('workspace_path')
         if ws:
-            current_dict = self.current_config.model_dump()
+            current_dict = self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
             current_dict['workspace_path'] = ws
             self.current_config = AgentConfig(**current_dict)
         external_file_path = session.metadata.get('external_file_path')

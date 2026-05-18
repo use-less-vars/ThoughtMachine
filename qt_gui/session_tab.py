@@ -121,7 +121,7 @@ class SessionTab(QWidget):
             return
         old_session_id = self.session.session_id if self.session else None
         log('DEBUG', 'debug.unknown', f'[CALLBACK] create_new_session: replacing session {old_session_id} with new session')
-        self.session = Session(session_id=str(uuid.uuid4()), user_history=[], metadata={'agent_config': agent_config.model_dump()})
+        self.session = Session(session_id=str(uuid.uuid4()), user_history=[], metadata={'agent_config': agent_config.model_dump(exclude={'api_key'}, exclude_none=True)})
         log('DEBUG', 'debug.unknown', f'[SessionTab] Binding session to presenter, session: {self.session}')
         self.presenter.bind_session(self.session)
         self.presenter.save_session()
@@ -137,7 +137,7 @@ class SessionTab(QWidget):
         if self.session is None:
             log('DEBUG', 'debug.unknown', f'Creating placeholder session for loading')
             agent_config = self.presenter.create_agent_config()
-            self.session = Session(session_id=session_id, user_history=[], metadata={'agent_config': agent_config.model_dump()})
+            self.session = Session(session_id=session_id, user_history=[], metadata={'agent_config': agent_config.model_dump(exclude={'api_key'}, exclude_none=True)})
             self.presenter.bind_session(self.session)
         try:
             log('DEBUG', 'debug.unknown', f'Calling presenter.load_session_by_id({session_id}, target_session=self.session)')
@@ -475,7 +475,7 @@ class SessionTab(QWidget):
         """Start or continue agent with current query."""
         query = self.query_entry.toPlainText().strip()
         agent_config = self.agent_controls_panel.get_config()
-        config_dict = agent_config.model_dump()
+        config_dict = agent_config.model_dump(exclude={'api_key'}, exclude_none=True)
         preset_name = config_dict.pop('preset_name', None)
         self.presenter.update_config(config_dict)
         current_state = self.presenter.state
@@ -603,7 +603,7 @@ class SessionTab(QWidget):
         try:
             agent_config = self.agent_controls_panel.get_config()
             self.working_config = agent_config
-            config_dict = agent_config.model_dump()
+            config_dict = agent_config.model_dump(exclude={'api_key'}, exclude_none=True)
             # Determine which file path will be used
             from agent.config import get_config_paths
             paths = get_config_paths()
@@ -633,7 +633,7 @@ class SessionTab(QWidget):
             # so that the new workspace survives agent restart and session reload.
             self.working_config = config
             # Sync state_bridge._config so auto-save picks up the new workspace_path
-            self.presenter.update_config(config.model_dump())
+            self.presenter.update_config(config.model_dump(exclude={'api_key'}, exclude_none=True))
             log('DEBUG', 'core.config', '[CONFIG_TRACE] after presenter.update_config')
             self._save_config_to_session()
             log('DEBUG', 'core.config', '[CONFIG_TRACE] after _save_config_to_session')
@@ -642,7 +642,7 @@ class SessionTab(QWidget):
         """Handle configuration change from UI controls — update runtime state only."""
         agent_config = self.agent_controls_panel.get_config()
         self.working_config = agent_config
-        self.presenter.update_config(agent_config.model_dump())
+        self.presenter.update_config(agent_config.model_dump(exclude={'api_key'}, exclude_none=True))
 
     def _save_config_to_session(self):
         """Save agent_config to current session metadata for per-session persistence.
@@ -658,7 +658,7 @@ class SessionTab(QWidget):
         try:
             from datetime import datetime
             session = self.presenter.current_session
-            config_dict = self.working_config.model_dump(exclude={'api_key'}) if hasattr(self.working_config, 'model_dump') else self.working_config
+            config_dict = self.working_config.model_dump(exclude={'api_key'}, exclude_none=True) if hasattr(self.working_config, 'model_dump') else self.working_config
             session.metadata['agent_config'] = config_dict
             session.updated_at = datetime.now()
             log('DEBUG', 'session_tab', f'Saved agent_config to session.metadata ({len(config_dict)} keys)')

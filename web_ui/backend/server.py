@@ -631,7 +631,7 @@ def _default_frontend_config() -> Dict[str, Any]:
 def _config_to_dict(cfg) -> Dict[str, Any]:
     """Convert an AgentConfig to a plain dict for JSON serialization."""
     if hasattr(cfg, "model_dump"):
-        return cfg.model_dump()
+        return cfg.model_dump(exclude={'api_key'}, exclude_none=True)
     if hasattr(cfg, "dict"):
         return cfg.dict()
     return {k: str(v) for k, v in vars(cfg).items() if not k.startswith("_")}
