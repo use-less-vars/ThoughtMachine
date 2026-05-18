@@ -24,6 +24,10 @@ import QueryBar from './QueryBar'
 import StatusBar from './StatusBar'
 import ConfigPanel from './ConfigPanel'
 
+const CONFIG_PANEL_MIN_WIDTH = 200
+const CONFIG_PANEL_MAX_WIDTH = 500
+const CONFIG_PANEL_DEFAULT_WIDTH = 280
+
 const WS_URL = `ws://${window.location.hostname}:8000/ws`
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -36,15 +40,7 @@ const INITIAL_STATE = {
   tokensOut: 0,
   contextLength: 0,
   isRunning: false,
-  config: {
-    temperature: 0.7,
-    max_turns: 20,
-    provider: 'openai',
-    tools: [
-      { name: 'bash', enabled: true },
-      { name: 'file_read', enabled: false },
-    ],
-  },
+  config: null,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -59,6 +55,37 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
   const closedRef = useRef(false)  // prevent double-close
   const tabConnectingRef = useRef(false)  // prevent StrictMode duplicate
 
+  // ── Config panel resize state ──────────────────────────────────────
+  const [configPanelWidth, setConfigPanelWidth] = useState(CONFIG_PANEL_DEFAULT_WIDTH)
+  const dragRef = useRef(null) // { startX, startWidth }
+
+  const handleResizeStart = useCallback((e) => {
+    e.preventDefault()
+    dragRef.current = { startX: e.clientX, startWidth: configPanelWidth }
+
+    // Set cursor on body during drag
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+
+    const handleMouseMove = (e) => {
+      if (!dragRef.current) return
+      const delta = e.clientX - dragRef.current.startX
+      const newWidth = Math.max(CONFIG_PANEL_MIN_WIDTH, Math.min(CONFIG_PANEL_MAX_WIDTH, dragRef.current.startWidth + delta))
+      setConfigPanelWidth(newWidth)
+    }
+
+    const handleMouseUp = () => {
+      dragRef.current = null
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+      document.removeEventListener('mousemove', handleMouseMove)
+      document.removeEventListener('mouseup', handleMouseUp)
+    }
+
+    document.addEventListener('mousemove', handleMouseMove)
+    document.addEventListener('mouseup', handleMouseUp)
+  }, [configPanelWidth])
+
   // ── Derived helpers ─────────────────────────────────────────────────────
   const update = useCallback((patch) => {
     setState((prev) => ({ ...prev, ...patch }))
@@ -66,8 +93,8 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
 
   // ── Notify parent when running state changes (for tab color) ────────
   useEffect(() => {
-    onRunningChange?.(tabId, state.isRunning)
-  }, [state.isRunning, tabId, onRunningChange])
+    onRunningChange?.(tabId, state.status)
+  }, [state.status, tabId, onRunningChange])
 
   // ── Debug: log whenever history changes ─────────────────────────────
   useEffect(() => {
@@ -216,11 +243,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
         break
 
       case 'config_changed':
-        // Merge received config with existing defaults so missing fields
-        // (like tools, provider) don't get nuked into undefined
-        update((prev) => ({
-          config: { ...prev.config, ...msg.config }
-        }))
+        // Replace config entirely with what the backend sends.
+        // The backend is now the single source of truth; it always sends
+        // a complete frontend-format config (including tools, provider, etc.).
+        update({ config: msg.config })
         break
 
       case 'status_message':
@@ -282,6 +308,12 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
           sendCommand={sendCommand}
           providers={providers}
           availableTools={availableTools}
+          panelWidth={configPanelWidth}
+        />
+        <div
+          className="resize-handle"
+          onMouseDown={handleResizeStart}
+          title="Drag to resize"
         />
         <div className="app-center">
           <ChatPanel messages={state.history} />

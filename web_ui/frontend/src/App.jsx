@@ -225,8 +225,8 @@ export default function App() {
     loadTab(sessionId)
   }, [loadTab])
 
-  const handleRunningChange = useCallback((tabId, isRunning) => {
-    setTabRunningStates((prev) => ({ ...prev, [tabId]: isRunning }))
+  const handleRunningChange = useCallback((tabId, status) => {
+    setTabRunningStates((prev) => ({ ...prev, [tabId]: status }))
   }, [])
 
   const handleSessionSaved = useCallback((sessionId) => {

@@ -30,11 +30,15 @@ export default function QueryBar({ sendCommand, status, isRunning, config, sessi
   const handleRun = () => {
     if (!query.trim()) return
     if (sessionId) {
-      // Loaded session — continue with existing context
-      sendCommand('continue_session', { query: query.trim(), session_id: sessionId })
+      // Loaded session — continue with existing context, passing config
+      sendCommand('continue_session', {
+        query: query.trim(),
+        session_id: sessionId,
+        config: config ?? {}
+      })
     } else {
       // Fresh start — create new agent session
-      sendCommand('start_session', { query: query.trim(), config })
+      sendCommand('start_session', { query: query.trim(), config: config ?? {} })
     }
   }
 

@@ -15,6 +15,19 @@
 
 import React from 'react'
 
+function _tabStatusClass(status) {
+  switch (status) {
+    case 'RUNNING':
+      return 'running'
+    case 'PAUSED':
+      return 'pausing'
+    case 'WAITING_FOR_USER':
+      return 'running'
+    default:
+      return 'idle'
+  }
+}
+
 export default function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onNewTab, runningStates = {} }) {
   if (tabs.length === 0) {
     return null
@@ -26,7 +39,7 @@ export default function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onN
         {tabs.map((tab) => (
           <div
             key={tab.id}
-            className={`tab-item ${activeTabId === tab.id ? 'tab-active' : ''} ${runningStates[tab.id] ? 'running' : 'idle'}`}
+            className={`tab-item ${activeTabId === tab.id ? 'tab-active' : ''} ${_tabStatusClass(runningStates[tab.id])}`}
             onClick={() => onSelectTab(tab.id)}
             title={tab.name}
           >

@@ -556,6 +556,23 @@ body {
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
+   Resize handle (ConfigPanel drag)
+   ────────────────────────────────────────────────────────────────────────── */
+.resize-handle {
+  width: 5px;
+  cursor: col-resize;
+  background: transparent;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 10;
+  transition: background 0.15s;
+}
+
+.resize-handle:hover {
+  background: var(--accent);
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
    TabBar (open sessions)
    ────────────────────────────────────────────────────────────────────────── */
 .tab-bar {
@@ -611,8 +628,12 @@ body {
   border-bottom: 3px solid #4caf50;
 }
 
+.tab-item.pausing {
+  border-bottom: 3px solid #f1c40f;
+}
+
 .tab-item.idle {
-  border-bottom: 3px solid #888;
+  border-bottom: 3px solid #3498db;
 }
 
 .tab-label {

@@ -1,14 +1,26 @@
 import React, { useState, useEffect, useMemo } from 'react';
 
-const ConfigPanel = ({ config, sendCommand, providers, availableTools }) => {
-  const [draft, setDraft] = useState({ ...config });
+const ConfigPanel = ({ config, sendCommand, providers, availableTools, panelWidth }) => {
+  const getSafeDraft = (cfg) => ({
+    temperature: cfg?.temperature ?? 0.7,
+    max_turns: cfg?.max_turns ?? 20,
+    provider: cfg?.provider ?? 'openai',
+    provider_id: cfg?.provider_id ?? null,
+    model: cfg?.model ?? null,
+    system_prompt: cfg?.system_prompt ?? '',
+    tools: cfg?.tools ?? [],
+  });
+
+  const [draft, setDraft] = useState(getSafeDraft(config));
 
   useEffect(() => {
-    setDraft({ ...config });
+    setDraft(getSafeDraft(config));
   }, [config]);
 
   // ── Derived: selected provider object ──────────────────────────────
-  const selectedProvider = providers.find((p) => p.id === draft.provider_id)
+  // Backend sends 'provider' in config_changed; fall back if 'provider_id' not set.
+  const activeProviderId = draft.provider_id || draft.provider || '';
+  const selectedProvider = providers.find((p) => p.id === activeProviderId);
   const availableModels = useMemo(() => {
     if (!selectedProvider) return []
     const models = selectedProvider.models || []
@@ -33,7 +45,7 @@ const ConfigPanel = ({ config, sendCommand, providers, availableTools }) => {
   }
 
   return (
-    <div style={{ padding: '1rem', fontFamily: 'sans-serif', background: '#f5f5f5' }}>
+    <div style={{ padding: '1rem', fontFamily: 'sans-serif', background: '#313244', color: '#cdd6f4', width: panelWidth || 280, minWidth: 200, maxWidth: 500, flexShrink: 0, overflowY: 'auto', height: '100%' }}>
       <h3>Config</h3>
 
       {/* Provider */}
@@ -42,11 +54,11 @@ const ConfigPanel = ({ config, sendCommand, providers, availableTools }) => {
           <strong>Provider:</strong>
         </label>
         <select
-          value={draft.provider_id || ''}
+          value={activeProviderId}
           onChange={handleProviderChange}
-          style={{ width: '100%', marginTop: '0.25rem' }}
+          style={{ width: '100%', marginTop: '0.25rem', background: '#1e1e2e', color: '#cdd6f4', border: '1px solid #45475a', borderRadius: '4px', padding: '0.3rem' }}
         >
-          <option value="">-- Select provider --</option>
+          <option value="" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>-- Select provider --</option>
           {providers.map((p) => (
             <option key={p.id} value={p.id}>
               {p.label}
@@ -64,9 +76,9 @@ const ConfigPanel = ({ config, sendCommand, providers, availableTools }) => {
           value={draft.model || ''}
           onChange={handleModelChange}
           disabled={!selectedProvider}
-          style={{ width: '100%', marginTop: '0.25rem' }}
+          style={{ width: '100%', marginTop: '0.25rem', background: '#1e1e2e', color: '#cdd6f4', border: '1px solid #45475a', borderRadius: '4px', padding: '0.3rem' }}
         >
-          <option value="">-- Select model --</option>
+          <option value="" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>-- Select model --</option>
           {availableModels.map((m) => (
             <option key={m} value={m}>
               {m}
@@ -100,7 +112,7 @@ const ConfigPanel = ({ config, sendCommand, providers, availableTools }) => {
           max="100"
           value={draft.max_turns}
           onChange={(e) => setDraft({ ...draft, max_turns: parseInt(e.target.value, 10) || 1 })}
-          style={{ width: '80px', marginLeft: '0.5rem' }}
+          style={{ width: '80px', marginLeft: '0.5rem', background: '#1e1e2e', color: '#cdd6f4', border: '1px solid #45475a', borderRadius: '4px', padding: '0.3rem' }}
         />
       </div>
 
@@ -139,8 +151,8 @@ const ConfigPanel = ({ config, sendCommand, providers, availableTools }) => {
       <div style={{ marginBottom: '1rem' }}>
         <strong>System Prompt:</strong>
         <textarea
-          rows={6}
-          style={{ width: '100%', marginTop: '0.25rem' }}
+          rows={3}
+          style={{ width: '100%', marginTop: '0.25rem', background: '#1e1e2e', color: '#cdd6f4', border: '1px solid #45475a', borderRadius: '4px', padding: '0.3rem', fontFamily: 'monospace' }}
           value={draft.system_prompt || ''}
           onChange={(e) => setDraft({ ...draft, system_prompt: e.target.value })}
           placeholder="Optional system-level instructions for the agent..."
@@ -148,7 +160,9 @@ const ConfigPanel = ({ config, sendCommand, providers, availableTools }) => {
       </div>
 
       <div>
-        <button onClick={() => sendCommand('apply_config', { config: draft })}>Apply</button>
+        <button onClick={() => sendCommand('apply_config', { config: draft })}
+          style={{ background: '#89b4fa', color: '#1e1e2e', border: 'none', borderRadius: '4px', padding: '0.5rem 1.5rem', fontWeight: 600, cursor: 'pointer' }}
+        >Apply</button>
       </div>
     </div>
   );
