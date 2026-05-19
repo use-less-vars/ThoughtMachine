@@ -54,6 +54,9 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
   const wsRef = useRef(null)
   const closedRef = useRef(false)  // prevent double-close
   const tabConnectingRef = useRef(false)  // prevent StrictMode duplicate
+  const pendingCommandsRef = useRef([])  // queued commands for retry
+  const connectSessionWsRef = useRef(null)  // ref to avoid circular deps in sendCommand
+  const [wsConnected, setWsConnected] = useState(false)
 
   // ── Config panel resize state ──────────────────────────────────────
   const [configPanelWidth, setConfigPanelWidth] = useState(CONFIG_PANEL_DEFAULT_WIDTH)
@@ -103,12 +106,21 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
       'last role:', state.history[state.history.length - 1]?.role)
   }, [state.history])
 
-  // ── sendCommand — sends over this tab's WebSocket ──────────────────────
+  // ── sendCommand — sends over this tab's WebSocket with auto-queue ───
+  // If the WS is not OPEN, the command is queued and resent once the
+  // connection is re-established.
   const sendCommandRef = useRef(null)
   const sendCommand = useCallback((command, payload = {}) => {
     const ws = wsRef.current
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      console.warn('[SessionTab] Cannot send — WS not connected')
+      console.warn('[SessionTab] WebSocket not connected. Command queued for retry.')
+      pendingCommandsRef.current.push({ command, payload })
+      // Attempt immediate reconnect
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current)
+        reconnectTimeoutRef.current = null
+      }
+      connectSessionWsRef.current?.()
       return
     }
     console.log(`[SessionTab] Sending command: ${command}`, JSON.stringify({ command, ...payload }))
@@ -143,6 +155,15 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
     ws.onopen = () => {
       console.log(`[SessionTab ${sessionId || 'new'}] WS onopen`)
       tabConnectingRef.current = false
+      setWsConnected(true)
+
+      // Drain any commands that were queued while disconnected
+      const pending = pendingCommandsRef.current
+      pendingCommandsRef.current = []
+      for (const cmd of pending) {
+        console.log(`[SessionTab] Sending queued command: ${cmd.command}`)
+        ws.send(JSON.stringify({ command: cmd.command, ...cmd.payload }))
+      }
 
       // Register sendCommand with parent (use ref to avoid stale closure)
       onRegister?.({ sendCommand: sendCommandRef.current, getSessionId: () => currentSessionId })
@@ -174,6 +195,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
 
     ws.onclose = (e) => {
       tabConnectingRef.current = false
+      setWsConnected(false)
       // 1001 = normal close (component unmounting), don't reconnect
       if (e.code !== 1001 && !closedRef.current) {
         const delay = 1000 + Math.random() * 3000  // 1–4s jitter
@@ -186,6 +208,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
       // onclose fires right after onerror, so we let onclose handle reconnection
     }
   }, [sessionId, onRegister])  // no sendCommand dep needed — accessed via ref
+  connectSessionWsRef.current = connectSessionWs
 
   // Connect only after hub is ready, with optional stagger delay
   useEffect(() => {
@@ -309,6 +332,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
           providers={providers}
           availableTools={availableTools}
           panelWidth={configPanelWidth}
+          wsConnected={wsConnected}
         />
         <div
           className="resize-handle"
