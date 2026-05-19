@@ -1271,3 +1271,52 @@ The `_loaded_config_overrides` intermediate storage has been fully eliminated fr
 - `SessionTab.jsx`: `config_changed` handler uses direct assignment (`update({ config: msg.config })`) instead of merging — backend is the single source of truth
 - `ConfigPanel.jsx`: handles null config safely (`config ?? {}`)
 - `QueryBar.jsx`: handles null config in `start_session` (`config: config ?? {}`)
+
+## 2026-05-19 — ## 2026-05-19: Incremental Assistant Message Commit
+
+**Task ...
+
+## 2026-05-19: Incremental Assistant Message Commit
+
+**Task 4 — Commit Flow Change**
+
+Modified TurnTransaction to support partial (assistant-only) commit:
+
+- Added `_assistant_committed` flag to track whether assistant message was committed separately.
+- Added `commit_assistant_only()` method: commits just the assistant message to user_history immediately, clears context builder cache, keeps transaction open for tool results.
+- Modified `commit()`: when `_assistant_committed` is True, only tool results in `_tool_calls_buffer` are committed; otherwise full atomic commit as before.
+
+In `agent.py` `process_query()` loop:
+- Before `execute_tool_calls()`, calls `turn_transaction.commit_assistant_only()` so the assistant message is visible in user_history before tool execution begins.
+- Subsequent `turn_transaction.commit()` after tool execution commits only tool results.
+
+This prevents assistant message loss if tool execution triggers pause/interrupt.
+
+## 2026-05-19: Session-Load Orphan Tool Message Cleanup
+
+**Task 5 — Session Load Flow Change**
+
+In `session_lifecycle.py`:
+
+- Added import: `from session.context_builder import ContextBuilder`
+- In `load_session()`: after creating/binding the session, calls `ContextBuilder._cleanup_orphaned_tool_messages()` on `session.user_history` to remove any orphaned tool messages that may have been persisted.
+- In `load_session_by_id()`: same cleanup after loading session from store.
+- Both log a WARNING when orphaned messages are found and cleaned.
+
+## 2026-05-19 — ## 2026-05-19: Config Pipeline Clarification — Qt Desktop Ap...
+
+## 2026-05-19: Config Pipeline Clarification — Qt Desktop App, Not Web UI
+
+The codebase at `/home/jojo/PycharmProjects/ThoughtMachine-dev` is a **PyQt6 desktop application**, not a web-based UI. There is no `web_ui/backend/server.py`, no `ConfigPanel.jsx`, no WebSocket protocol, and no `_translate_frontend_config` / `_frontend_config_from_bridge` translation layer.
+
+**Config flow:**
+1. `AgentControlsPanel.get_config()` → returns `AgentConfig` (Pydantic model)
+2. `AgentControlsPanel.apply_to_agent_requested.emit(config)` → pyqtSignal
+3. `SessionTab._on_apply_runtime_params(config)` → `controller.request_config_update(config)`
+4. Agent internally processes the config update
+
+**Key difference from web UI:**
+- No field name translation needed — frontend and model use the same field names
+- Config changes flow as `AgentConfig` objects, not raw dicts
+- Error handling is via logging + system messages in chat, not `status_message` events
+- The "Apply" button is always active (desktop app, no connection state)

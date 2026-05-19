@@ -92,7 +92,9 @@ class AgentState:
                     f'**Token usage warning: Conversation is nearing context window limits** ({formatted} tokens). '
                     f'Critical threshold is at {critical_formatted} tokens. '
                     f'This is not a problem: simply use SummarizeTool to summarize the session and keep a number of recent turns. '
-                    f'The summary will free up the context window and you can continue working smoothly.'
+                    f'The summary will free up the context window and you can continue working smoothly. '
+                    f'Tip: For long-running tasks, store intermediate results and subtask status in KnowledgeBase '
+                    f'to avoid losing context when summarizing.'
                 )
             else:
                 formatted = self._format_tokens(total_tokens)
