@@ -105,12 +105,16 @@ class WebAgentBridge:
         self._session: Optional[Session] = None
         self._loaded_session: Optional[Session] = None
 
-        # Agent running flag — set True when controller.start() succeeds,
-        # reset on stop/disconnect.  More reliable than is_running for
-        # routing decisions in the WebSocket handler.
-        self._agent_running: bool = False
+        # Agent running flag — delegated to controller.is_busy.
 
     # ── Public API ──────────────────────────────────────────────────────────
+
+    @property
+    def agent_is_running(self) -> bool:
+        """True if the agent controller exists and is busy (running or pausing)."""
+        if self._controller is not None:
+            return self._controller.is_busy
+        return False
 
     @property
     def is_running(self) -> bool:
@@ -218,7 +222,6 @@ class WebAgentBridge:
             self._session = session_arg
             self._controller.start(query, config, session=session_arg)
             self._loaded_session = None  # consumed
-            self._agent_running = True
             return
 
         if self.is_running:
@@ -255,7 +258,6 @@ class WebAgentBridge:
             name="web-bridge-agent",
         )
         self._thread.start()
-        self._agent_running = True
 
     def continue_session(self, query: str, config_dict: Optional[Dict[str, Any]] = None) -> None:
         """
@@ -315,11 +317,9 @@ class WebAgentBridge:
         """Request the agent to stop (finishes current operation then exits)."""
         if self._controller is not None:
             self._controller.stop()
-            self._agent_running = False
             return
         self._stop_event.set()
         self._pause_event.set()  # unblock if paused
-        self._agent_running = False
 
     # ── Query API ───────────────────────────────────────────────────────────
 
@@ -353,22 +353,29 @@ class WebAgentBridge:
         """
         from agent.config.loader import validate_config
 
-        # Step 1: Start with current config as base
+        # Step 1: Validate positive integer fields before merging
+        for field_name in ('max_tokens', 'context_length'):
+            val = config_dict.get(field_name)
+            if val is not None:
+                if not isinstance(val, int) or val < 1:
+                    return {"success": False, "error": f"{field_name} must be a positive integer or null"}
+
+        # Step 2: Start with current config as base
         if self._config is not None:
             base = self._config.model_dump(exclude={'api_key'}, exclude_none=True)
         else:
             base = {}
 
-        # Step 2: Merge incoming on top (shallow merge)
+        # Step 3: Merge incoming on top (shallow merge)
         merged = dict(base)
         merged.update(config_dict)
 
-        # Step 3: Validate the merged dict
+        # Step 4: Validate the merged dict
         validated = validate_config(merged)
         if validated is None:
             return {"success": False, "error": "Configuration validation failed"}
 
-        # Step 4: Resolve provider if provider_id is present
+        # Step 5: Resolve provider if provider_id is present
         validated_dict = validated.model_dump(exclude={'api_key'}, exclude_none=True)
         provider_id = validated_dict.get('provider_id')
         if provider_id:
@@ -379,12 +386,12 @@ class WebAgentBridge:
             except Exception as e:
                 log('WARNING', 'server.bridge', f"Provider resolution failed during apply_config: {e}")
 
-        # Step 5: Store the validated config
+        # Step 6: Store the validated config
         self._config = validated
         if self._controller is not None:
             self._controller._config = validated
 
-        # Step 6: Persist to session
+        # Step 7: Persist to session
         self.save_session()
 
         log('INFO', 'server.bridge', 'Config applied and persisted via apply_config')
@@ -841,9 +848,25 @@ class WebAgentBridge:
             })
 
         elif event_type == "error":
+            msg_text = raw_event.get('message', 'unknown')
+            error_type = raw_event.get('error_type', 'PROVIDER_ERROR')
             results.append({
                 "type": "status_message",
-                "text": f"⚠ Error: {raw_event.get('message', 'unknown')}",
+                "text": f"⚠ Error: {msg_text}",
+            })
+            # Convert error to a system notification message in the conversation
+            # so it appears in the chat history and survives page reload/reconnect.
+            # This mirrors the Qt GUI fix where _process_error_event emits
+            # conversation_changed to make the system notification visible.
+            error_msg = {
+                "role": "user",
+                "content": f"[SYSTEM NOTIFICATION] Error: {error_type}: {msg_text}",
+                "is_system_notification": True,
+            }
+            self.history.append(error_msg)
+            results.append({
+                "type": "conversation_changed",
+                "messages": list(self.history),
             })
 
         # ── Synthetic bridge event: don't forward raw session_stop ──────
@@ -1009,7 +1032,6 @@ class WebAgentBridge:
             })
         finally:
             self._running = False
-            self._agent_running = False
             self._emit({
                 "type": "state_changed",
                 "state": "IDLE",

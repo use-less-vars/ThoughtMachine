@@ -212,7 +212,7 @@ async def websocket_endpoint(ws: WebSocket):
 
                     # Case 1: Bridge has a loaded session (first query for a new session)
                     # Only start if the agent is not already running.
-                    if bridge is not None and bridge._loaded_session is not None and not bridge._agent_running:
+                    if bridge is not None and bridge._loaded_session is not None and not bridge.agent_is_running:
                         log('INFO', 'server.ws', f'continue_session: loaded session exists — starting bridge with session {bridge._loaded_session.session_id}')
                         try:
                             # Pass the frontend config if available (for first query)
@@ -230,7 +230,7 @@ async def websocket_endpoint(ws: WebSocket):
                         continue
 
                     # Case 2: Agent is already running — continue normally
-                    if bridge is not None and bridge._agent_running:
+                    if bridge is not None and bridge.agent_is_running:
                         try:
                             config_dict = msg.get("config", {})
                             if config_dict:
@@ -731,6 +731,8 @@ def _default_frontend_config() -> Dict[str, Any]:
             {"name": "bash", "enabled": True},
             {"name": "file_read", "enabled": False},
         ],
+        "max_tokens": None,
+        "context_length": None,
     }
 
 

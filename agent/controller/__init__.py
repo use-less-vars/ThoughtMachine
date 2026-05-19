@@ -32,11 +32,24 @@ except ImportError:
         """Return a dummy signal object when PyQt6 is not available."""
         return _DummySignal()
 from agent.logging import log
+from agent.core.state import ExecutionState
 
 class AgentController(QObject):
     """
     Runs the agent in a background thread and provides thread‑safe control
     via start/stop/pause/resume and a queue for receiving events.
+
+    Properties
+    ----------
+    is_busy : bool
+        True when the agent is RUNNING or PAUSING.
+        Safe to call from synchronous code (WebSocket handlers, etc.).
+        Returns False when state is READY or no agent exists.
+        Note: This reads the agent's ExecutionState which is set asynchronously
+        inside the background thread. After start() returns, the agent thread
+        may not have reached RUNNING yet; consumers that need to poll should
+        allow a brief settling period or rely on the controller's own _running
+        flag for the synchronous "thread is alive" check.
     """
     event_occurred = pyqtSignal(dict)
     conversation_updated = pyqtSignal(str)
@@ -103,6 +116,17 @@ class AgentController(QObject):
         self._processing_query = False
         self.current_session_id = None
         log('DEBUG', 'core.controller', f'Reset to initial state')
+
+    @property
+    def is_busy(self) -> bool:
+        """True when the agent is RUNNING or PAUSING.
+
+        Safe to call from synchronous code (WebSocket handlers, etc.).
+        Returns False when state is READY or no agent exists.
+        """
+        if self.agent is None:
+            return False
+        return self.agent.state.execution_state in (ExecutionState.RUNNING, ExecutionState.PAUSING)
 
     @property
     def is_running(self):
