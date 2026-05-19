@@ -272,10 +272,13 @@ async def websocket_endpoint(ws: WebSocket):
                     if bridge is not None:
                         conv = bridge.get_conversation()
                         if conv is not None:
-                            messages = [
-                                {"role": _map_role(m), "content": _map_content(m)}
-                                for m in conv
-                            ]
+                            messages = []
+                            for m in conv:
+                                msg = {"role": _map_role(m), "content": _map_content(m)}
+                                # Preserve system notification flag on reload
+                                if m.get("is_system_notification"):
+                                    msg["is_system_notification"] = True
+                                messages.append(msg)
                             await ws.send_json({
                                 "type": "conversation_changed",
                                 "messages": messages,
@@ -721,9 +724,23 @@ def _frontend_config_from_bridge(bridge) -> Dict[str, Any]:
 
 
 
+def _load_global_defaults() -> Dict[str, Any]:
+    """Load global defaults from ~/.thoughtmachine/agent_config.json."""
+    import json
+    from pathlib import Path
+    path = Path.home() / '.thoughtmachine' / 'agent_config.json'
+    if path.exists():
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception as e:
+            log('WARNING', 'server.config', f'Failed to load global defaults: {e}')
+    return {}
+
+
 def _default_frontend_config() -> Dict[str, Any]:
-    """Return config in frontend format."""
-    return {
+    """Return config in frontend format, merged with global defaults."""
+    fallback = {
         "temperature": 0.7,
         "max_turns": 20,
         "provider": "openai",
@@ -732,8 +749,14 @@ def _default_frontend_config() -> Dict[str, Any]:
             {"name": "file_read", "enabled": False},
         ],
         "max_tokens": None,
-        "context_length": None,
+        "token_monitor_enabled": True,
+        "token_monitor_warning_threshold": 35000,
+        "token_monitor_critical_threshold": 50000,
+        "workspace_path": "",
     }
+    global_defaults = _load_global_defaults()
+    fallback.update(global_defaults)
+    return fallback
 
 
 def _config_to_dict(cfg) -> Dict[str, Any]:

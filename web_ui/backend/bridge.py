@@ -96,6 +96,9 @@ class WebAgentBridge:
         self._config: Optional[AgentConfig] = None
         self._session_id: Optional[str] = None
 
+        # Track session conversation version for efficient history sync
+        self._history_version: int = 0
+
         # Controller integration (optional — used when Web UI wants to
         # reuse the existing AgentController instead of creating an Agent directly)
         self._controller: Optional[AgentController] = None
@@ -354,11 +357,16 @@ class WebAgentBridge:
         from agent.config.loader import validate_config
 
         # Step 1: Validate positive integer fields before merging
-        for field_name in ('max_tokens', 'context_length'):
+        for field_name in ('max_tokens',):
             val = config_dict.get(field_name)
             if val is not None:
                 if not isinstance(val, int) or val < 1:
                     return {"success": False, "error": f"{field_name} must be a positive integer or null"}
+        for field_name in ('token_monitor_warning_threshold', 'token_monitor_critical_threshold'):
+            val = config_dict.get(field_name)
+            if val is not None:
+                if not isinstance(val, int) or val < 0:
+                    return {"success": False, "error": f"{field_name} must be a non-negative integer"}
 
         # Step 2: Start with current config as base
         if self._config is not None:
@@ -470,6 +478,7 @@ class WebAgentBridge:
                 log('WARNING', 'server.bridge', f"Session not found: {session_id}")
                 return False
             self.history = list(session.user_history)
+            self._history_version = session.conversation_version
 
             # ── Normalize old message formats ────────────────────────────────
             # Convert pre-standardization role names ("tool", assistant with
@@ -800,6 +809,24 @@ class WebAgentBridge:
         results: List[Dict[str, Any]] = []
         event_type = raw_event.get("type", "")
 
+        # ── Sync from session BEFORE processing this event ──────────────────
+        # Covers silent mutations to user_history (e.g. _pending_warnings
+        # flushed after tool commit, which don't yield a separate event).
+        # Doing this before the event handler ensures warning messages land
+        # in self.history BEFORE the new event's content, preserving
+        # chronological order from the frontend's perspective.
+        if self._session is not None:
+            current_version = self._session.conversation_version
+            if current_version != self._history_version:
+                self._history_version = current_version
+                if len(self._session.user_history) > len(self.history):
+                    new_msgs = self._session.user_history[len(self.history):]
+                    self.history.extend(new_msgs)
+                    results.append({
+                        "type": "conversation_changed",
+                        "messages": list(self.history),
+                    })
+
         if event_type == "execution_state_change":
             new_state = raw_event.get("new_state", "")
             frontend_state = self._map_agent_state(new_state)
@@ -824,10 +851,32 @@ class WebAgentBridge:
                     "context_length": ctx,
                 })
 
+        elif event_type in ("token_warning", "turn_warning"):
+            # System notification warnings (token limits, turn limits, etc.)
+            # These events are yielded by the agent but were not being forwarded
+            # to the frontend, so token/turn warnings were invisible in the UI.
+            msg_text = raw_event.get('message', raw_event.get('warning', ''))
+            warning_msg = {
+                "role": "user",
+                "content": f"[SYSTEM NOTIFICATION] {msg_text}",
+                "is_system_notification": True,
+            }
+            self.history.append(warning_msg)
+            # Keep version tracking in sync with session
+            if self._session is not None:
+                self._history_version = self._session.conversation_version
+            results.append({
+                "type": "conversation_changed",
+                "messages": list(self.history),
+            })
+
         elif event_type in ("user_query", "turn", "tool_call", "tool_result", "final"):
             msg = self._event_to_message(raw_event)
             if msg is not None:
                 self.history.append(msg)
+                # Keep version tracking in sync with session
+                if self._session is not None:
+                    self._history_version = self._session.conversation_version
                 # Send full conversation snapshot — only when history actually changed
                 results.append({
                     "type": "conversation_changed",
@@ -864,6 +913,9 @@ class WebAgentBridge:
                 "is_system_notification": True,
             }
             self.history.append(error_msg)
+            # Keep version tracking in sync with session
+            if self._session is not None:
+                self._history_version = self._session.conversation_version
             results.append({
                 "type": "conversation_changed",
                 "messages": list(self.history),

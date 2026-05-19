@@ -10,7 +10,10 @@ const ConfigPanel = ({ config, sendCommand, providers, availableTools, panelWidt
     system_prompt: cfg?.system_prompt ?? '',
     tools: cfg?.tools ?? [],
     max_tokens: cfg?.max_tokens,
-    context_length: cfg?.context_length,
+    token_monitor_enabled: cfg?.token_monitor_enabled ?? true,
+    token_monitor_warning_threshold: cfg?.token_monitor_warning_threshold ?? 35000,
+    token_monitor_critical_threshold: cfg?.token_monitor_critical_threshold ?? 50000,
+    workspace_path: cfg?.workspace_path ?? '',
   });
 
   const [activeTab, setActiveTab] = useState('general');
@@ -136,12 +139,12 @@ const ConfigPanel = ({ config, sendCommand, providers, availableTools, panelWidt
           </div>
 
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Context Length</strong> <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(leave empty for model default)</span></label>
+            <label style={labelStyle}><strong>Workspace Path</strong> <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(working directory for agent)</span></label>
             <input
-              type="number" min="1"
-              placeholder="Default"
-              value={draft.context_length ?? ''}
-              onChange={(e) => setDraft({ ...draft, context_length: e.target.value === '' ? undefined : parseInt(e.target.value, 10) })}
+              type="text"
+              placeholder="/home/user/project"
+              value={draft.workspace_path}
+              onChange={(e) => setDraft({ ...draft, workspace_path: e.target.value })}
               style={inputStyle}
             />
           </div>
@@ -242,9 +245,36 @@ const ConfigPanel = ({ config, sendCommand, providers, availableTools, panelWidt
       {/* ── Advanced Tab ──────────────────────────────────────────────── */}
       {activeTab === 'advanced' && (
         <div>
-          <p style={{ color: '#6c7086', fontStyle: 'italic', fontSize: '0.85rem' }}>
-            Advanced settings coming soon.
-          </p>
+          <div style={{ marginBottom: '1rem' }}>
+            <label style={{ ...labelStyle, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+              <input
+                type="checkbox"
+                checked={draft.token_monitor_enabled}
+                onChange={(e) => setDraft({ ...draft, token_monitor_enabled: e.target.checked })}
+              />
+              <strong>Token Monitor</strong>
+            </label>
+          </div>
+
+          <div style={{ marginBottom: '1rem' }}>
+            <label style={labelStyle}><strong>Warning Threshold</strong> <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(tokens)</span></label>
+            <input
+              type="number" min="0"
+              value={draft.token_monitor_warning_threshold}
+              onChange={(e) => setDraft({ ...draft, token_monitor_warning_threshold: parseInt(e.target.value, 10) || 0 })}
+              style={inputStyle}
+            />
+          </div>
+
+          <div style={{ marginBottom: '1rem' }}>
+            <label style={labelStyle}><strong>Critical Threshold</strong> <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(tokens)</span></label>
+            <input
+              type="number" min="0"
+              value={draft.token_monitor_critical_threshold}
+              onChange={(e) => setDraft({ ...draft, token_monitor_critical_threshold: parseInt(e.target.value, 10) || 0 })}
+              style={inputStyle}
+            />
+          </div>
         </div>
       )}
 
