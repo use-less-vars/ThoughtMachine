@@ -6,7 +6,6 @@ and stores vectors in ChromaDB for semantic search.
 """
 
 import hashlib
-import logging
 import os
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
@@ -38,7 +37,7 @@ def _signal_handler(sig, frame):
 atexit.register(_cleanup_client)
 signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
-logger = logging.getLogger(__name__)
+from agent.logging import log
 
 
 def split_text_with_overlap(text: str, chunk_size: int = 1500, chunk_overlap: int = 200) -> List[str]:
@@ -134,7 +133,7 @@ def load_gitignore_spec(workspace_path: Path):
                                 # Pattern is relative to subdirectory
                                 patterns.append(f"{rel_path}/{line}")
             except Exception as e:
-                logger.warning(f"Could not read {gitignore_path}: {e}")
+                log('WARNING', 'indexer', f"Could not read {gitignore_path}: {e}")
                 continue
         
         # Also include global .gitignore if exists
@@ -147,20 +146,20 @@ def load_gitignore_spec(workspace_path: Path):
                         if line and not line.startswith('#'):
                             patterns.append(line)
             except Exception as e:
-                logger.warning(f"Could not read global .gitignore: {e}")
+                log('WARNING', 'indexer', f"Could not read global .gitignore: {e}")
         
         if patterns:
             spec = pathspec.PathSpec.from_lines('gitwildmatch', patterns)
             _GITIGNORE_CACHE[workspace_path] = spec
-            logger.debug(f"Loaded {len(patterns)} gitignore patterns for {workspace_path}")
+            log('DEBUG', 'indexer', f"Loaded {len(patterns)} gitignore patterns for {workspace_path}")
         else:
             _GITIGNORE_CACHE[workspace_path] = None
-            logger.debug(f"No gitignore patterns found for {workspace_path}")
+            log('DEBUG', 'indexer', f"No gitignore patterns found for {workspace_path}")
         
         return _GITIGNORE_CACHE[workspace_path]
     
     except Exception as e:
-        logger.warning(f"Failed to load gitignore patterns: {e}")
+        log('WARNING', 'indexer', f"Failed to load gitignore patterns: {e}")
         _GITIGNORE_CACHE[workspace_path] = None
         return None
 
@@ -207,7 +206,7 @@ def should_skip_file(file_path: Path, workspace_path: Path) -> bool:
             # pathspec expects forward slashes
             rel_str = str(rel_path).replace('\\', '/')
             if spec.match_file(rel_str):
-                logger.debug(f"File {rel_path} matches gitignore pattern")
+                log('DEBUG', 'indexer', f"File {rel_path} matches gitignore pattern")
                 return True
         except ValueError:
             # File not relative to workspace (should not happen)
@@ -237,7 +236,7 @@ def get_supported_languages() -> Dict[str, Any]:
             from tree_sitter_python import language as python_language
             languages["python"] = python_language()
         except ImportError:
-            logger.warning("tree_sitter_python not installed. Python parsing disabled.")
+            log('WARNING', 'indexer', "tree_sitter_python not installed. Python parsing disabled.")
         
         # Try to load JavaScript/TypeScript parser  
         try:
@@ -245,33 +244,33 @@ def get_supported_languages() -> Dict[str, Any]:
             languages["javascript"] = js_language()
             languages["typescript"] = js_language()  # TypeScript uses same parser
         except ImportError:
-            logger.warning("tree_sitter_javascript not installed. JavaScript/TypeScript parsing disabled.")
+            log('WARNING', 'indexer', "tree_sitter_javascript not installed. JavaScript/TypeScript parsing disabled.")
         
         # Try to load Java parser
         try:
             from tree_sitter_java import language as java_language
             languages["java"] = java_language()
         except ImportError:
-            logger.warning("tree_sitter_java not installed. Java parsing disabled.")
+            log('WARNING', 'indexer', "tree_sitter_java not installed. Java parsing disabled.")
         
         # Try to load Go parser
         try:
             from tree_sitter_go import language as go_language
             languages["go"] = go_language()
         except ImportError:
-            logger.warning("tree_sitter_go not installed. Go parsing disabled.")
+            log('WARNING', 'indexer', "tree_sitter_go not installed. Go parsing disabled.")
         
         # Try to load Rust parser
         try:
             from tree_sitter_rust import language as rust_language
             languages["rust"] = rust_language()
         except ImportError:
-            logger.warning("tree_sitter_rust not installed. Rust parsing disabled.")
+            log('WARNING', 'indexer', "tree_sitter_rust not installed. Rust parsing disabled.")
         
         return languages
     
     except Exception as e:
-        logger.warning(f"Failed to load tree-sitter languages: {e}")
+        log('WARNING', 'indexer', f"Failed to load tree-sitter languages: {e}")
         return {}
 
 
@@ -295,16 +294,16 @@ def parse_file_with_tree_sitter(file_path: Path, language: str, config: AgentCon
     # Get language parsers
     languages = get_supported_languages()
     if language not in languages:
-        logger.debug(f"No tree-sitter parser for language '{language}', using fallback")
+        log('DEBUG', 'indexer', f"No tree-sitter parser for language '{language}', using fallback")
         return _fallback_file_chunk(file_path, language, chunk_size=config.rag_chunk_size, chunk_overlap=config.rag_chunk_overlap)
     
     try:
         content = file_path.read_text(encoding='utf-8')
     except UnicodeDecodeError:
-        logger.warning(f"Cannot decode {file_path} as UTF-8, skipping")
+        log('WARNING', 'indexer', f"Cannot decode {file_path} as UTF-8, skipping")
         return []
     except Exception as e:
-        logger.warning(f"Error reading {file_path}: {e}")
+        log('WARNING', 'indexer', f"Error reading {file_path}: {e}")
         return []
     
     try:
@@ -333,7 +332,7 @@ def parse_file_with_tree_sitter(file_path: Path, language: str, config: AgentCon
             chunks = _extract_rust_chunks(content, root_node, file_path, language)
         else:
             # For unsupported languages, use file-level chunking
-            logger.debug(f"No specific extractor for language '{language}', using fallback")
+            log('DEBUG', 'indexer', f"No specific extractor for language '{language}', using fallback")
             return _fallback_file_chunk(file_path, language, chunk_size=config.rag_chunk_size, chunk_overlap=config.rag_chunk_overlap)
         
         # If no semantic chunks found, fall back to file chunk
@@ -343,7 +342,7 @@ def parse_file_with_tree_sitter(file_path: Path, language: str, config: AgentCon
         return chunks
         
     except Exception as e:
-        logger.warning(f"Tree-sitter parsing failed for {file_path}: {e}")
+        log('WARNING', 'indexer', f"Tree-sitter parsing failed for {file_path}: {e}")
         # Fall back to file-level chunking
         return _fallback_file_chunk(file_path, language, chunk_size=config.rag_chunk_size, chunk_overlap=config.rag_chunk_overlap)
 
@@ -361,10 +360,10 @@ def _fallback_file_chunk(file_path: Path, language: str, chunk_size: int = 1500,
     try:
         content = file_path.read_text(encoding='utf-8')
     except UnicodeDecodeError:
-        logger.warning(f"Cannot decode {file_path} as UTF-8, skipping")
+        log('WARNING', 'indexer', f"Cannot decode {file_path} as UTF-8, skipping")
         return []
     except Exception as e:
-        logger.warning(f"Error reading {file_path}: {e}")
+        log('WARNING', 'indexer', f"Error reading {file_path}: {e}")
         return []
     
     # Split content into chunks with overlap
@@ -401,7 +400,7 @@ def _fallback_file_chunk(file_path: Path, language: str, chunk_size: int = 1500,
             }
         })
     
-    logger.debug(f"Created {len(chunks)} fallback chunks for {file_path}")
+    log('DEBUG', 'indexer', f"Created {len(chunks)} fallback chunks for {file_path}")
     return chunks
 
 def _extract_python_chunks(content: str, root_node, file_path: Path, language: str) -> List[Dict[str, Any]]:
@@ -874,7 +873,7 @@ def chunk_codebase(workspace_path: Path, config: AgentConfig) -> List[Dict[str, 
                 continue
             
             relative_path = file_path.relative_to(workspace_path)
-            logger.debug(f"Processing {relative_path}")
+            log('DEBUG', 'indexer', f"Processing {relative_path}")
             
             file_chunks = parse_file_with_tree_sitter(file_path, lang, config)
             chunks.extend(file_chunks)
@@ -925,7 +924,7 @@ def create_or_get_chroma_collection(workspace_hash: str, config: AgentConfig, fo
     if force:
         try:
             client.delete_collection(collection_name)
-            logger.info(f"Deleted existing collection: {collection_name}")
+            log('INFO', 'indexer', f"Deleted existing collection: {collection_name}")
         except Exception:
             # Collection may not exist, ignore
             pass
@@ -933,13 +932,13 @@ def create_or_get_chroma_collection(workspace_hash: str, config: AgentConfig, fo
     # Get or create collection
     try:
         collection = client.get_collection(collection_name)
-        logger.info(f"Using existing collection: {collection_name}")
+        log('INFO', 'indexer', f"Using existing collection: {collection_name}")
     except Exception:
         collection = client.create_collection(
             name=collection_name,
             metadata={"description": f"Codebase embeddings for workspace {workspace_hash}"}
         )
-        logger.info(f"Created new collection: {collection_name}")
+        log('INFO', 'indexer', f"Created new collection: {collection_name}")
     
     return collection
 def embed_chunks_batched(chunks: List[Dict[str, Any]], config: AgentConfig, collection, workspace_hash: str, batch_size: int = 32, truncate_dim: int = 256):
@@ -965,7 +964,7 @@ def embed_chunks_batched(chunks: List[Dict[str, Any]], config: AgentConfig, coll
     
     # Check for CUDA availability
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    logger.info(f"Loading embedding model: {model_name} (device: {device})")
+    log('INFO', 'indexer', f"Loading embedding model: {model_name} (device: {device})")
     
     # Load model with appropriate device
     model = SentenceTransformer(model_name, device=device)
@@ -981,7 +980,7 @@ def embed_chunks_batched(chunks: List[Dict[str, Any]], config: AgentConfig, coll
         metadatas = [chunk["metadata"] for chunk in batch]
         
         # Generate embeddings for this batch
-        logger.debug(f"Embedding batch {i//batch_size + 1}/{(total_chunks + batch_size - 1)//batch_size} ({len(batch)} chunks)")
+        log('DEBUG', 'indexer', f"Embedding batch {i//batch_size + 1}/{(total_chunks + batch_size - 1)//batch_size} ({len(batch)} chunks)")
         
         # Use truncate_dim to reduce memory (e.g., 256 dimensions instead of default model dimensions)
         # This dramatically reduces memory usage with minimal quality loss
@@ -1002,14 +1001,14 @@ def embed_chunks_batched(chunks: List[Dict[str, Any]], config: AgentConfig, coll
         
         # Show progress every 10 batches or at the end
         if (i // batch_size) % 10 == 0 or i + batch_size >= total_chunks:
-            logger.info(f"Processed {processed}/{total_chunks} chunks ({processed/total_chunks*100:.1f}%)")
+            log('INFO', 'indexer', f"Processed {processed}/{total_chunks} chunks ({processed/total_chunks*100:.1f}%)")
         
         # Force garbage collection to free memory
         del embeddings
         gc.collect()
         time.sleep(0.05)  # Small pause to let GC work
     
-    logger.info(f"Finished embedding all {total_chunks} chunks")
+    log('INFO', 'indexer', f"Finished embedding all {total_chunks} chunks")
     return processed
 
 def index_codebase(workspace_path: str, config: AgentConfig, force: bool = False) -> Tuple[bool, str]:
@@ -1029,56 +1028,56 @@ def index_codebase(workspace_path: str, config: AgentConfig, force: bool = False
     """
     if not deps.RAG_AVAILABLE:
         msg = "RAG dependencies not available. Cannot index codebase."
-        logger.error(msg)
+        log('ERROR', 'indexer', msg)
         return False, msg
     
     workspace_path = Path(workspace_path)
     if not workspace_path.exists():
         msg = f"Workspace path does not exist: {workspace_path}"
-        logger.error(msg)
+        log('ERROR', 'indexer', msg)
         return False, msg
     if not workspace_path.is_dir():
         msg = f"Workspace path is not a directory: {workspace_path}"
-        logger.error(msg)
+        log('ERROR', 'indexer', msg)
         return False, msg
     
-    logger.info(f"Starting codebase indexing for: {workspace_path}")
+    log('INFO', 'indexer', f"Starting codebase indexing for: {workspace_path}")
     
     try:
         # Compute workspace hash
         workspace_hash = compute_workspace_hash(str(workspace_path))
-        logger.info(f"Workspace hash: {workspace_hash}")
+        log('INFO', 'indexer', f"Workspace hash: {workspace_hash}")
         
         # Chunk the codebase
-        logger.info("Scanning and chunking codebase...")
+        log('INFO', 'indexer', "Scanning and chunking codebase...")
         chunks = chunk_codebase(workspace_path, config)
         if not chunks:
             msg = "No code chunks found. Is the workspace empty?"
-            logger.warning(msg)
+            log('WARNING', 'indexer', msg)
             return False, msg
         
-        logger.info(f"Found {len(chunks)} code chunks")
+        log('INFO', 'indexer', f"Found {len(chunks)} code chunks")
         
         # Create ChromaDB collection (with force option)
         collection = create_or_get_chroma_collection(workspace_hash, config, force=force)
         
         # Generate embeddings and add to collection in batches
-        logger.info("Generating embeddings and adding to vector store in batches...")
+        log('INFO', 'indexer', "Generating embeddings and adding to vector store in batches...")
         processed_count = embed_chunks_batched(chunks, config, collection, workspace_hash, batch_size=config.rag_batch_size, truncate_dim=config.rag_truncate_dim)
         
         if processed_count != len(chunks):
-            logger.warning(f"Processed {processed_count} chunks but expected {len(chunks)}")
+            log('WARNING', 'indexer', f"Processed {processed_count} chunks but expected {len(chunks)}")
         
         # Count total documents
         count = collection.count()
         msg = f"Indexed {len(chunks)} chunks successfully. Collection now contains {count} documents."
-        logger.info(msg)
+        log('INFO', 'indexer', msg)
         
         return True, msg
         
     except Exception as e:
         msg = f"Indexing failed: {e}"
-        logger.exception(msg)
+        log('EXCEPTION', 'indexer', msg)
         return False, msg
 
 
@@ -1100,25 +1099,25 @@ def incremental_index(workspace_path: str, config: AgentConfig) -> Tuple[bool, s
     """
     if not deps.RAG_AVAILABLE:
         msg = "RAG dependencies not available. Cannot perform incremental indexing."
-        logger.error(msg)
+        log('ERROR', 'indexer', msg)
         return False, msg
     
     workspace_path = Path(workspace_path)
     if not workspace_path.exists():
         msg = f"Workspace path does not exist: {workspace_path}"
-        logger.error(msg)
+        log('ERROR', 'indexer', msg)
         return False, msg
     if not workspace_path.is_dir():
         msg = f"Workspace path is not a directory: {workspace_path}"
-        logger.error(msg)
+        log('ERROR', 'indexer', msg)
         return False, msg
     
-    logger.info(f"Starting incremental indexing for: {workspace_path}")
+    log('INFO', 'indexer', f"Starting incremental indexing for: {workspace_path}")
     
     try:
         # Compute workspace hash
         workspace_hash = compute_workspace_hash(str(workspace_path))
-        logger.info(f"Workspace hash: {workspace_hash}")
+        log('INFO', 'indexer', f"Workspace hash: {workspace_hash}")
         
         # Load or create index state file
         state_file = Path(config.vector_store_path) / f"index_state_{workspace_hash}.json"
@@ -1128,17 +1127,17 @@ def incremental_index(workspace_path: str, config: AgentConfig) -> Tuple[bool, s
                 import json
                 with open(state_file, 'r', encoding='utf-8') as f:
                     index_state = json.load(f)
-                logger.info(f"Loaded existing index state from: {state_file}")
+                log('INFO', 'indexer', f"Loaded existing index state from: {state_file}")
             except Exception as e:
-                logger.warning(f"Failed to load index state: {e}. Creating new state.")
+                log('WARNING', 'indexer', f"Failed to load index state: {e}. Creating new state.")
         
         # Get collection to check existing documents
         collection = create_or_get_chroma_collection(workspace_hash, config, force=False)
         existing_count = collection.count()
-        logger.info(f"Collection currently contains {existing_count} documents")
+        log('INFO', 'indexer', f"Collection currently contains {existing_count} documents")
         
         # Scan for modified files
-        logger.info("Scanning for modified files...")
+        log('INFO', 'indexer', "Scanning for modified files...")
         modified_files = []
         deleted_files = []
         
@@ -1174,7 +1173,7 @@ def incremental_index(workspace_path: str, config: AgentConfig) -> Tuple[bool, s
                 index_state[file_key] = {"mtime": mtime, "size": file_size}
                 
             except Exception as e:
-                logger.warning(f"Could not stat file {file_path}: {e}")
+                log('WARNING', 'indexer', f"Could not stat file {file_path}: {e}")
                 continue
         
         # Identify deleted files (present in state but not on disk)
@@ -1185,16 +1184,16 @@ def incremental_index(workspace_path: str, config: AgentConfig) -> Tuple[bool, s
                 # Remove from state
                 del index_state[file_key]
         
-        logger.info(f"Found {len(modified_files)} modified/new files and {len(deleted_files)} deleted files")
+        log('INFO', 'indexer', f"Found {len(modified_files)} modified/new files and {len(deleted_files)} deleted files")
         
         if not modified_files and not deleted_files:
             msg = "No changes detected. Index is up to date."
-            logger.info(msg)
+            log('INFO', 'indexer', msg)
             return True, msg
         
         # Delete documents for removed files
         if deleted_files:
-            logger.info(f"Removing {len(deleted_files)} deleted files from index...")
+            log('INFO', 'indexer', f"Removing {len(deleted_files)} deleted files from index...")
             deleted_ids = []
             for file_key in deleted_files:
                 # Query for documents from this file
@@ -1205,11 +1204,11 @@ def incremental_index(workspace_path: str, config: AgentConfig) -> Tuple[bool, s
                     if results and results.get("ids"):
                         deleted_ids.extend(results["ids"])
                 except Exception as e:
-                    logger.warning(f"Failed to query documents for deleted file {file_key}: {e}")
+                    log('WARNING', 'indexer', f"Failed to query documents for deleted file {file_key}: {e}")
             
             if deleted_ids:
                 collection.delete(ids=deleted_ids)
-                logger.info(f"Removed {len(deleted_ids)} documents for deleted files")
+                log('INFO', 'indexer', f"Removed {len(deleted_ids)} documents for deleted files")
         
         # Process modified/new files
         total_chunks = 0
@@ -1241,7 +1240,7 @@ def incremental_index(workspace_path: str, config: AgentConfig) -> Tuple[bool, s
                 )
                 if existing_results and existing_results.get("ids"):
                     collection.delete(ids=existing_results["ids"])
-                    logger.debug(f"Removed {len(existing_results['ids'])} existing chunks for {file_key}")
+                    log('DEBUG', 'indexer', f"Removed {len(existing_results['ids'])} existing chunks for {file_key}")
                 
                 # Parse and create new chunks
                 file_chunks = parse_file_with_tree_sitter(file_path, language, config)
@@ -1251,10 +1250,10 @@ def incremental_index(workspace_path: str, config: AgentConfig) -> Tuple[bool, s
                 # Add new chunks to collection
                 processed = embed_chunks_batched(file_chunks, config, collection, workspace_hash, batch_size=config.rag_batch_size, truncate_dim=config.rag_truncate_dim)
                 total_chunks += processed
-                logger.debug(f"Added {processed} chunks for {file_key}")
+                log('DEBUG', 'indexer', f"Added {processed} chunks for {file_key}")
                 
             except Exception as e:
-                logger.warning(f"Failed to process file {file_path}: {e}")
+                log('WARNING', 'indexer', f"Failed to process file {file_path}: {e}")
                 continue
         
         # Save updated state
@@ -1263,18 +1262,18 @@ def incremental_index(workspace_path: str, config: AgentConfig) -> Tuple[bool, s
             state_file.parent.mkdir(parents=True, exist_ok=True)
             with open(state_file, 'w', encoding='utf-8') as f:
                 json.dump(index_state, f, indent=2)
-            logger.info(f"Saved index state to: {state_file}")
+            log('INFO', 'indexer', f"Saved index state to: {state_file}")
         except Exception as e:
-            logger.warning(f"Failed to save index state: {e}")
+            log('WARNING', 'indexer', f"Failed to save index state: {e}")
         
         # Count total documents
         final_count = collection.count()
         msg = f"Incremental indexing completed. Added {total_chunks} chunks, removed {len(deleted_files)} files. Collection now contains {final_count} documents."
-        logger.info(msg)
+        log('INFO', 'indexer', msg)
         
         return True, msg
         
     except Exception as e:
         msg = f"Incremental indexing failed: {e}"
-        logger.exception(msg)
+        log('EXCEPTION', 'indexer', msg)
         return False, msg

@@ -5,16 +5,14 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-import logging
 from agent.logging import log
-logger = logging.getLogger(__name__)
 try:
     import yaml
     YAML_AVAILABLE = True
 except ImportError:
     yaml = None
     YAML_AVAILABLE = False
-    logger.warning('PyYAML not installed; presets will not be available.')
+    log('WARNING', 'config.preset', 'PyYAML not installed; presets will not be available.')
 
 @dataclass
 class Preset:
@@ -55,7 +53,7 @@ class PresetLoader:
     def _load_all(self):
         """Load all YAML files in the presets directory."""
         if not self.presets_dir.exists():
-            logger.info(f'Presets directory {self.presets_dir} not found; no presets loaded.')
+            log('INFO', 'config.preset', f'Presets directory {self.presets_dir} not found; no presets loaded.')
             return
         if not YAML_AVAILABLE:
             return
@@ -64,18 +62,18 @@ class PresetLoader:
                 with open(yaml_file, 'r', encoding='utf-8') as f:
                     data = yaml.safe_load(f)
                 if not data:
-                    logger.warning(f'Preset file {yaml_file} is empty; skipping.')
+                    log('WARNING', 'config.preset', f'Preset file {yaml_file} is empty; skipping.')
                     continue
                 required = ['name', 'system_prompt', 'model']
                 missing = [k for k in required if k not in data]
                 if missing:
-                    logger.warning(f'Preset {yaml_file} missing required fields: {missing}; skipping.')
+                    log('WARNING', 'config.preset', f'Preset {yaml_file} missing required fields: {missing}; skipping.')
                     continue
                 preset = Preset(name=data['name'], system_prompt=data['system_prompt'], model=data['model'], temperature=data.get('temperature', 0.2), tools=data.get('tools', []), safety_level=data.get('safety_level', 'standard'))
                 self._presets[preset.name] = preset
-                logger.debug(f'Loaded preset: {preset.name}')
+                log('DEBUG', 'config.preset', f'Loaded preset: {preset.name}')
             except Exception as e:
-                logger.error(f'Failed to load preset {yaml_file}: {e}')
+                log('ERROR', 'config.preset', f'Failed to load preset {yaml_file}: {e}')
 
     def list_presets(self) -> List[str]:
         """Return list of preset names."""
@@ -101,13 +99,13 @@ class PresetLoader:
         """
         preset = self.get_preset(name)
         if not preset:
-            logger.warning(f"Preset '{name}' not found")
+            log('WARNING', 'config.preset', f"Preset '{name}' not found")
             return config
         updated = config.copy()
         updated.update({'system_prompt': preset.system_prompt, 'model': preset.model, 'temperature': preset.temperature})
         if preset.tools:
             updated['enabled_tools'] = preset.tools
-        logger.debug(f"Applied preset '{name}' to configuration")
+        log('DEBUG', 'config.preset', f"Applied preset '{name}' to configuration")
         return updated
 _preset_loader: Optional[PresetLoader] = None
 

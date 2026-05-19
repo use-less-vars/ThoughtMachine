@@ -1,0 +1,945 @@
+"""
+WebAgentBridge — Pure‑Python bridge wrapping the Agent class for WebSocket
+frontends.  No Qt / PyQt dependencies.
+
+Architecture
+────────────
+A single bridge instance manages one agent session.  The lifecycle is:
+
+    bridge.start(query, config_dict)
+        → creates Agent in a daemon thread
+        → runs process_query() → yields events
+        → calls event_callback(event_dict) for each event
+
+    bridge.pause()   / bridge.resume()   / bridge.stop()
+        → thread‑safe control signals (events + threading.Event)
+
+    bridge.get_conversation()
+        → returns current message list
+
+The event_callback is the glue to the outside world (FastAPI WebSocket,
+CLI, or any consumer).  It receives raw dicts from the Agent's process_query
+generator, plus synthetic events injected by the bridge itself.
+
+Mapping: Agent events → frontend events
+────────────────────────────────────────
+The bridge translates raw agent events into the simplified event protocol
+that the React frontend expects (see frontend/src/App.jsx):
+
+    Agent → process_query yields:    Frontend receives:
+    ──────────────────────────────────────────────────
+    execution_state_change          → state_changed
+    token_update                   → tokens_updated + context_updated
+    user_query / turn / tool_call
+      / tool_result / final        → conversation_changed
+    (synthetic bridge events)      → status_message
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import threading
+import queue
+import traceback
+import uuid
+from typing import Any, Callable, Dict, List, Optional
+
+from agent import Agent
+from agent.config import AgentConfig
+from agent.config.provider_profile import ProviderManager
+from agent.config.service import create_agent_config_service
+from agent.controller import AgentController
+from agent.logging import log
+from session.models import Session
+from session.store import FileSystemSessionStore
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Bridge class
+# ══════════════════════════════════════════════════════════════════════════════
+
+class WebAgentBridge:
+    """
+    Thread‑safe bridge that runs one Agent session and emits events through
+    a callback.  Designed to be driven by a FastAPI WebSocket endpoint.
+    """
+
+    def __init__(self, event_callback: Optional[Callable[[Dict[str, Any]], None]] = None):
+        self._agent: Optional[Agent] = None
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+        self._processing = False
+
+        # Event primitives
+        self._stop_event = threading.Event()
+        self._pause_event = threading.Event()
+        self._pause_event.set()          # start in "running" (not paused)
+
+        # Query queue — the agent thread pulls from this
+        self._query_queue: queue.Queue = queue.Queue()
+
+        # Mailbox for config updates
+        self._pending_config: Optional[AgentConfig] = None
+
+        # Callback — called from the agent thread for every event
+        self._event_callback = event_callback
+
+        # Accumulated conversation history for frontend protocol
+        self.history: List[Dict[str, Any]] = []
+
+        # Track last assistant content to deduplicate turn vs final
+        self._last_assistant_content: Optional[str] = None
+
+        # Current config (for get_config / get_conversation)
+        self._config: Optional[AgentConfig] = None
+        self._session_id: Optional[str] = None
+
+        # Controller integration (optional — used when Web UI wants to
+        # reuse the existing AgentController instead of creating an Agent directly)
+        self._controller: Optional[AgentController] = None
+
+        # Session persistence
+        self._session_store = FileSystemSessionStore()
+        self._session: Optional[Session] = None
+        self._loaded_session: Optional[Session] = None
+        self._loaded_config_overrides: Optional[Dict[str, Any]] = None
+
+        # Agent running flag — set True when controller.start() succeeds,
+        # reset on stop/disconnect.  More reliable than is_running for
+        # routing decisions in the WebSocket handler.
+        self._agent_running: bool = False
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    @property
+    def is_running(self) -> bool:
+        """
+        Whether the agent thread (standalone) or controller thread (controller mode)
+        is still alive and can accept follow-up queries.
+        """
+        return self._get_is_running()
+
+    @property
+    def is_paused(self) -> bool:
+        return not self._pause_event.is_set()
+
+    @property
+    def is_processing(self) -> bool:
+        return self._processing
+
+    # ── Event callback ──────────────────────────────────────────────────────
+
+    def set_event_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """
+        Set or replace the event callback.  The callback will be called from
+        the agent thread for every event generated by process_query().
+        """
+        self._event_callback = callback
+
+    def set_controller(self, controller: AgentController) -> None:
+        """
+        Attach an existing AgentController instance.
+        When set, bridge delegates start/pause/resume/stop to the controller
+        and receives events via controller.set_event_callback().
+        """
+        self._controller = controller
+        controller.set_event_callback(self._on_controller_event)
+
+    # ── Lifecycle ───────────────────────────────────────────────────────────
+
+    def _build_global_agent_config(self) -> AgentConfig:
+        """
+        Build an AgentConfig from the global config file (agent_config.json)
+        via ConfigService, mirroring what the PyQt GUI does in
+        SessionTab.create_new_session() -> state_bridge.create_agent_config().
+
+        This removes the dependency on presets for config defaults.
+
+        Note: provider resolution and API-key fallback happen *after* all
+        three config layers are merged in start(), so they are not done here.
+        """
+        try:
+            service = create_agent_config_service()
+            raw_config = service.get_all()
+            return AgentConfig(**raw_config)
+        except Exception as e:
+            log('ERROR', 'server.bridge', f"Could not build global agent config: {e}")
+            # Fall back to minimal AgentConfig with env-var key
+            return AgentConfig(api_key='')
+
+    def start(self, query: str,
+              config_dict: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Start a new agent session.
+
+        Configuration is built from three layers (each overriding the previous):
+          1. Global config (from agent_config.json via ConfigService)
+          2. Session config overrides (from a loaded session's metadata)
+          3. Frontend config_dict (the caller's runtime overrides)
+
+        If a session was previously loaded via load_session(), the loaded
+        session's conversation is passed to the controller so the agent
+        can continue from that context.  After starting, the loaded-session
+        reference is cleared (the new run owns its own session).
+
+        Args:
+            query: Initial user query string.
+            config_dict: Frontend configuration overrides (see AgentConfig fields).
+                         Applied on top of global config + loaded session config.
+        """
+        # ── Layer 1: global config from agent_config.json ──────────────────
+        global_config = self._build_global_agent_config()
+        merged_config = global_config.model_dump(exclude={'api_key'}, exclude_none=True)
+
+        # ── Layer 2: loaded session config overrides ──────────────────────
+        if self._loaded_config_overrides:
+            for k, v in self._loaded_config_overrides.items():
+                if v is not None and v != '':
+                    merged_config[k] = v
+
+        # ── Layer 3: frontend config_dict ─────────────────────────────────
+        if config_dict:
+            for k, v in config_dict.items():
+                if k not in ('session_id', 'created_at', 'updated_at'):
+                    merged_config[k] = v
+
+        provider_id = merged_config.get('provider_id')
+        if provider_id:
+            try:
+                manager = ProviderManager()
+                merged_config = manager.resolve_config(merged_config)
+            except Exception:
+                pass
+
+        if not merged_config.get('api_key'):
+            log('DEBUG', 'server.bridge', 'No API key resolved from provider profile; Agent will check env vars')
+
+        if self._controller is not None:
+            # ── Delegate to controller ──────────────────────────────────
+            session_arg = self._loaded_session
+            config = AgentConfig(**merged_config)
+            self._config = config
+            self._running = True
+            self._session = session_arg
+            self._controller.start(query, config, session=session_arg)
+            self._loaded_session = None  # consumed
+            self._loaded_config_overrides = None  # consumed
+            self._agent_running = True
+            return
+
+        if self.is_running:
+            raise RuntimeError("Bridge is already running. Stop it first.")
+
+        # Reset primitives
+        self._stop_event.clear()
+        self._pause_event.set()
+        self._running = True
+        self._processing = False
+
+        # Build AgentConfig from the merged dict
+        config = AgentConfig(**merged_config)
+        self._config = config
+
+        # Create session for this run (no Qt dependency, pure Python)
+        if self._loaded_session is not None:
+            session = self._loaded_session
+            self._loaded_session = None  # consumed
+        else:
+            session = Session()
+            session.metadata['source'] = 'web_ui'
+        self._session = session
+        self._agent = Agent(config, session=session)
+        self._session_id = session.session_id
+
+        # Queue the initial query
+        self._query_queue.put(query)
+
+        # Start background thread
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            daemon=True,
+            name="web-bridge-agent",
+        )
+        self._thread.start()
+        self._agent_running = True
+
+    def continue_session(self, query: str) -> None:
+        """
+        Submit a follow‑up query to a running (or paused) agent.
+        """
+        if self._controller is not None:
+            self._controller.continue_session(query)
+            return
+        if not self.is_running:
+            raise RuntimeError("Bridge is not running. Start it first.")
+        self.resume()
+        self._query_queue.put(query)
+
+    def pause(self) -> None:
+        """Request the agent to pause after the current turn."""
+        if self._controller is not None:
+            self._controller.pause()
+            return
+        if not self.is_running:
+            return
+        self._pause_event.clear()
+        if self._agent is not None:
+            self._agent.request_pause()
+
+    def resume(self) -> None:
+        """Resume a paused agent."""
+        if self._controller is not None:
+            self._controller.resume()
+            return
+        self._pause_event.set()
+        if self._agent is not None:
+            self._agent._pause_requested = False
+
+    def stop(self) -> None:
+        """Request the agent to stop (finishes current operation then exits)."""
+        if self._controller is not None:
+            self._controller.stop()
+            self._agent_running = False
+            return
+        self._stop_event.set()
+        self._pause_event.set()  # unblock if paused
+        self._agent_running = False
+
+    # ── Query API ───────────────────────────────────────────────────────────
+
+    def get_conversation(self) -> Optional[List[Dict[str, Any]]]:
+        """Return the current conversation from the agent, if available."""
+        if self._controller is not None:
+            return self._controller.get_conversation()
+        if self._agent is not None:
+            return self._agent.conversation.copy()
+        return None
+
+    def get_config(self) -> Optional[AgentConfig]:
+        if self._controller is not None:
+            return self._controller.get_config()
+        return self._config
+
+    # ── Session persistence ──────────────────────────────────────────────────
+
+    def list_sessions(self) -> List[Dict[str, Any]]:
+        """List all saved sessions from the session store."""
+        try:
+            return self._session_store.list_sessions()
+        except Exception as e:
+            log('ERROR', 'server.bridge', f"list_sessions error: {e}")
+            return []
+
+    def save_session(self, name: Optional[str] = None) -> Optional[Session]:
+        """
+        Save current conversation as a session to the store.
+
+        Args:
+            name: Optional display name for the session.
+
+        Returns:
+            The saved Session object, or None on failure.
+        """
+        try:
+            # Use the active session if available (standalone or controller path)
+            session = getattr(self, '_session', None)
+            if session is None:
+                # Fallback when no session is active — build from self.history
+                session_id = self._loaded_session.session_id if self._loaded_session else str(uuid.uuid4())
+                session = Session(
+                    session_id=session_id,
+                    user_history=list(self.history),
+                    metadata={
+                        'agent_config': self._config.model_dump(exclude={'api_key'}, exclude_none=True) if self._config else {},
+                        'source': 'web_ui',
+                    }
+                )
+            else:
+                # Update existing session metadata
+                session.metadata.setdefault('agent_config', {})
+                if self._config:
+                    session.metadata['agent_config'] = self._config.model_dump(exclude={'api_key'}, exclude_none=True)
+                session.metadata.setdefault('source', 'web_ui')
+
+            # Apply name: explicit arg > existing loaded session name > generated
+            if name:
+                session.metadata['name'] = name
+            elif self._loaded_session and self._loaded_session.metadata.get('name'):
+                session.metadata['name'] = self._loaded_session.metadata['name']
+            session.ensure_name()
+            self._session_store.save_session(session)
+            self._loaded_session = session
+            log('INFO', 'server.bridge', f"Session saved: {session.session_id} ({session.metadata.get('name')})")
+            return session
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            log('ERROR', 'server.bridge', f"save_session error: {e}")
+            return None
+
+    def load_session(self, session_id: str) -> bool:
+        """Load a session from the store, replacing current conversation.
+
+        Also extracts ``session.metadata['agent_config']`` and stores it as
+        ``self._loaded_config_overrides`` so that the next ``start()`` call
+        applies the saved configuration (system prompt, tools, etc.).
+
+        Emits ``config_changed`` with the restored config so the frontend
+        updates its controls.
+        """
+        try:
+            session = self._session_store.load_session(session_id)
+            if session is None:
+                log('WARNING', 'server.bridge', f"Session not found: {session_id}")
+                return False
+            self.history = list(session.user_history)
+
+            # ── Normalize old message formats ────────────────────────────────
+            # Convert pre-standardization role names ("tool", assistant with
+            # "[Tool call:") to the canonical "tool_call" / "tool_result" that
+            # the frontend ChatPanel expects.
+            normalized = []
+            for msg in self.history:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+
+                # Convert old tool_call: stored as assistant with "[Tool call: name(args)]"
+                if role == "assistant" and content.startswith("[Tool call:"):
+                    match = re.match(r'^\[Tool call:\s*(\w+)\(([^)]*)\)\]$', content)
+                    if match:
+                        tool_name = match.group(1)
+                        args_str = match.group(2)
+                        try:
+                            args_json = args_str.replace("'", '"')
+                            args = json.loads(args_json)
+                        except Exception:
+                            args = {}
+                        new_content = json.dumps({"name": tool_name, "arguments": args})
+                        normalized.append({"role": "tool_call", "content": new_content})
+                        continue
+
+                # Convert old tool_result: role "tool" -> "tool_result"
+                if role == "tool":
+                    normalized.append({"role": "tool_result", "content": content})
+                    continue
+
+                # Remove empty assistant messages that were placeholders for tool calls
+                if role == "assistant" and content.strip() == "":
+                    continue
+
+                # Keep everything else unchanged
+                normalized.append(msg)
+
+            self.history = normalized
+            self._session = session
+            self._loaded_session = session
+
+            # ── Extract agent_config from session metadata ────────────────
+            agent_config_raw = session.metadata.get('agent_config', {})
+            if agent_config_raw and isinstance(agent_config_raw, dict):
+                self._loaded_config_overrides = dict(agent_config_raw)
+                log('INFO', 'server.bridge', f"Loaded agent_config overrides from session metadata: {len(agent_config_raw)} keys")
+            else:
+                self._loaded_config_overrides = None
+                log('INFO', 'server.bridge', "No agent_config in session metadata")
+
+            # Ensure enabled_tools is always present — merge from global config if missing
+            if self._loaded_config_overrides and 'enabled_tools' not in self._loaded_config_overrides:
+                try:
+                    global_config = self._build_global_agent_config()
+                    self._loaded_config_overrides['enabled_tools'] = global_config.enabled_tools
+                    log('INFO', 'server.bridge', f"Merged enabled_tools from global config: {len(global_config.enabled_tools)} tools")
+                except Exception as exc:
+                    log('WARNING', 'server.bridge', f"Could not merge enabled_tools: {exc}")
+
+            # Emit conversation_changed so the frontend updates
+            self._emit({
+                "type": "conversation_changed",
+                "messages": list(self.history),
+            })
+            # Emit session_loaded for metadata
+            self._emit({
+                "type": "session_loaded",
+                "session_id": session_id,
+                "session_name": session.metadata.get('name', 'Untitled Session'),
+                "message_count": len(self.history),
+            })
+            # Emit config_changed with the restored config so frontend controls update
+            if self._loaded_config_overrides:
+                self._emit({
+                    "type": "config_changed",
+                    "config": self._loaded_config_overrides,
+                })
+            log('INFO', 'server.bridge', f"Session loaded: {session_id} ({session.metadata.get('name')}) — {len(self.history)} messages")
+
+            # Register this session as an open session (persists to open_sessions.json)
+            # so it survives server restarts and the hub WS can return it.
+            # Use add_open_session directly to avoid an unnecessary full session write.
+            try:
+                self._session_store.add_open_session(session_id)
+            except Exception as e:
+                log('WARNING', 'server.bridge', f"Could not register open session: {e}")
+
+            return True
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            log('ERROR', 'server.bridge', f"load_session error: {e}")
+            return False
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete a session from the store."""
+        try:
+            result = self._session_store.delete_session(session_id)
+            if result:
+                log('INFO', 'server.bridge', f"Session deleted: {session_id}")
+            else:
+                log('WARNING', 'server.bridge', f"Session not found for deletion: {session_id}")
+            return result
+        except Exception as e:
+            log('ERROR', 'server.bridge', f"delete_session error: {e}")
+            return False
+
+    def rename_session(self, session_id: str, new_name: str) -> bool:
+        """Rename a session in the store."""
+        try:
+            session = self._session_store.load_session(session_id)
+            if session is None:
+                log('WARNING', 'server.bridge', f"Session not found for rename: {session_id}")
+                return False
+            session.metadata['name'] = new_name
+            self._session_store.save_session(session)
+            # Update loaded session name if it's the one being renamed
+            if self._loaded_session and self._loaded_session.session_id == session_id:
+                self._loaded_session.metadata['name'] = new_name
+            log('INFO', 'server.bridge', f"Session renamed: {session_id} → {new_name}")
+            return True
+        except Exception as e:
+            log('ERROR', 'server.bridge', f"rename_session error: {e}")
+            return False
+
+    # ── Open sessions management ────────────────────────────────────────────
+
+    def get_open_sessions(self) -> List[str]:
+        """
+        Return the list of open session IDs from open_sessions.json.
+        Delegates to FileSystemSessionStore.
+        """
+        try:
+            return self._session_store.get_open_sessions()
+        except Exception as e:
+            log('ERROR', 'server.bridge', f"get_open_sessions error: {e}")
+            return []
+
+    def save_open_session(self, session_id: Optional[str] = None) -> None:
+        """
+        Save the current session and add it to the open sessions list.
+        If session_id is provided, that ID is added; otherwise uses the
+        bridge's current session ID.
+        """
+        sid = session_id or self._session_id or (
+            self._loaded_session.session_id if self._loaded_session else None
+        )
+        if sid is None:
+            log('WARNING', 'server.bridge', "save_open_session: no session ID available")
+            return
+        # Save the session first (so it exists on disk)
+        self.save_session()
+        # Then add to open list
+        try:
+            self._session_store.add_open_session(sid)
+            log('INFO', 'server.bridge', f"Session {sid} added to open sessions")
+        except Exception as e:
+            log('ERROR', 'server.bridge', f"save_open_session error: {e}")
+
+    def remove_open_session(self, session_id: Optional[str] = None) -> None:
+        """
+        Remove a session from the open sessions list.
+        If session_id is provided, that ID is removed; otherwise uses the
+        bridge's current session ID.
+        """
+        sid = session_id or self._session_id or (
+            self._loaded_session.session_id if self._loaded_session else None
+        )
+        if sid is None:
+            log('WARNING', 'server.bridge', "remove_open_session: no session ID available")
+            return
+        try:
+            self._session_store.remove_open_session(sid)
+            log('INFO', 'server.bridge', f"Session {sid} removed from open sessions")
+        except Exception as e:
+            log('ERROR', 'server.bridge', f"remove_open_session error: {e}")
+
+    def close_session(self, session_id: Optional[str] = None) -> None:
+        """
+        Save session, remove from open sessions list, and stop the bridge.
+        This is the complete "close tab" sequence.
+
+        Args:
+            session_id: Session to close. If None, uses the bridge's current
+                        session or loaded session.
+        """
+        sid = session_id or self._session_id or (
+            self._loaded_session.session_id if self._loaded_session else None
+        )
+        log('INFO', 'server.bridge', f"Closing session: {sid or '(no id)'}")
+        # Save current state
+        if sid:
+            self.save_session()
+            self.remove_open_session(sid)
+        # Stop the bridge
+        self.stop()
+        # Reset state
+        self._session = None
+        self._loaded_session = None
+        self._loaded_config_overrides = None
+        self.history = []
+        self._session_id = None
+        self._emit({
+            "type": "session_cleared",
+        })
+        self._emit({
+            "type": "state_changed",
+            "state": "IDLE",
+            "is_running": False,
+        })
+        log('INFO', 'server.bridge', f"Session closed: {sid or '(no id)'}")
+
+    def clear_loaded_session(self) -> None:
+        """Clear the loaded session reference for a fresh start."""
+        self._session = None
+        self._loaded_session = None
+        self._loaded_config_overrides = None
+        self.history = []
+        self._emit({
+            "type": "conversation_changed",
+            "messages": [],
+        })
+        log('INFO', 'server.bridge', "Session cleared for fresh start")
+
+    # ── Internal: event emission ────────────────────────────────────────────
+
+    def _emit(self, event: Dict[str, Any]) -> None:
+        """Thread‑safe event emission via callback."""
+        log('DEBUG', 'server.bridge', f"Sending to frontend: {event}")
+
+        if self._event_callback is not None:
+            try:
+                self._event_callback(event)
+            except Exception:
+                traceback.print_exc()
+
+    def _on_controller_event(self, event: Dict[str, Any]) -> None:
+        """
+        Callback registered with the controller via set_event_callback().
+        Receives raw events from the controller's agent thread and maps
+        them to the frontend protocol, exactly like _map_and_emit does
+        for the standalone agent loop.
+
+        Also captures the session ID from the first event that carries one
+        and triggers save_open_session() — deferred from start() because
+        the session ID isn't known until the controller has created its agent.
+        """
+        log('DEBUG', 'server.bridge', f"Bridge received event: {event.get('type')}")
+        # Capture session ID from first event that has one
+        if self._session_id is None:
+            sid = event.get('session_id')
+            if sid is not None:
+                self._session_id = sid
+                self.save_open_session()
+                log('INFO', 'server.bridge', f"Session ID captured from controller event: {sid}")
+        self._map_and_emit(event)
+
+    def _event_to_message(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Convert a process_query event into a frontend message dict.
+        Raw events from process_query() have no 'role' key and use
+        type-specific fields for content (e.g. 'result' for tool_result,
+        'arguments' for tool_call).
+        Returns None if the event doesn't map to a message.
+        """
+        event_type = event.get("type", "")
+
+        if event_type == "turn":
+            content = event.get("content", "")
+            reasoning = event.get("reasoning", "")
+            self._last_assistant_content = content
+            msg = {
+                "role": "assistant",
+                "content": content,
+                "reasoning_content": reasoning,
+            }
+            log('DEBUG', 'server.bridge', f"Converted {event_type} to message")
+            return msg
+
+        elif event_type == "final":
+            content = event.get("content", "")
+            if content == self._last_assistant_content:
+                log('DEBUG', 'server.bridge', "Skipping final — content matches last turn")
+                return None
+            msg = {
+                "role": "assistant",
+                "content": content,
+            }
+            log('DEBUG', 'server.bridge', f"Converted {event_type} to message")
+            return msg
+
+        elif event_type == "user_query":
+            msg = {
+                "role": "user",
+                "content": event.get("content", ""),
+            }
+            log('DEBUG', 'server.bridge', f"Converted {event_type} to message")
+            return msg
+
+        elif event_type == "tool_call":
+            content = json.dumps({
+                "name": event.get("tool_name", "?"),
+                "arguments": event.get("arguments", {}),
+            })
+            msg = {"role": "tool_call", "content": content}
+            log('DEBUG', 'server.bridge', f"Converted {event_type} to tool_call message")
+            return msg
+
+        elif event_type == "tool_result":
+            msg = {"role": "tool_result", "content": event.get("result", "")}
+            log('DEBUG', 'server.bridge', f"Converted {event_type} to tool_result message")
+            return msg
+
+        return None
+
+    def _translate_event(self, raw_event: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Translate a raw agent event into frontend protocol events.
+        Returns a list of event dicts to send to the frontend.
+        Does NOT forward the raw event — only high-level protocol events.
+        """
+        results: List[Dict[str, Any]] = []
+        event_type = raw_event.get("type", "")
+
+        if event_type == "execution_state_change":
+            new_state = raw_event.get("new_state", "")
+            frontend_state = self._map_agent_state(new_state)
+            results.append({
+                "type": "state_changed",
+                "state": frontend_state,
+                "is_running": self._get_is_running(),
+            })
+
+        elif event_type == "token_update":
+            tokens_in = raw_event.get("total_input", 0)
+            tokens_out = raw_event.get("total_output", 0)
+            results.append({
+                "type": "tokens_updated",
+                "input": tokens_in,
+                "output": tokens_out,
+            })
+            ctx = raw_event.get("context_length", 0)
+            if ctx:
+                results.append({
+                    "type": "context_updated",
+                    "context_length": ctx,
+                })
+
+        elif event_type in ("user_query", "turn", "tool_call", "tool_result", "final"):
+            msg = self._event_to_message(raw_event)
+            if msg is not None:
+                self.history.append(msg)
+                # Send full conversation snapshot — only when history actually changed
+                results.append({
+                    "type": "conversation_changed",
+                    "messages": list(self.history),
+                })
+            if event_type == "final":
+                results.append({
+                    "type": "state_changed",
+                    "state": "IDLE",
+                    "is_running": self._get_is_running(),
+                })
+
+        elif event_type == "user_interaction_requested":
+            results.append({
+                "type": "state_changed",
+                "state": "WAITING_FOR_USER",
+                "is_running": self._get_is_running(),
+            })
+
+        elif event_type == "error":
+            results.append({
+                "type": "status_message",
+                "text": f"⚠ Error: {raw_event.get('message', 'unknown')}",
+            })
+
+        # ── Synthetic bridge event: don't forward to frontend ────────────
+        if event_type == "session_stop":
+            return []
+
+        # Stop handling
+        if raw_event.get("stop_reason"):
+            results.append({
+                "type": "state_changed",
+                "state": "IDLE",
+                "is_running": self._get_is_running(),
+            })
+
+        return results
+
+    def _map_and_emit(self, raw_event: Dict[str, Any]) -> None:
+        """
+        Map a raw agent event to frontend protocol events and emit each.
+        Uses _translate_event to do the conversion.
+        """
+        for frontend_event in self._translate_event(raw_event):
+            self._emit(frontend_event)
+
+    # ── Internal: helpers ───────────────────────────────────────────────────
+
+    def _get_is_running(self) -> bool:
+        """
+        Determine whether the agent/controller is still alive and can accept
+        follow-up queries.  Works in both standalone and controller modes.
+        """
+        if self._controller is not None:
+            # Controller mode — check controller's is_running if available
+            if hasattr(self._controller, 'is_running'):
+                return bool(self._controller.is_running)
+            return True  # assume alive if we can't check
+        # Standalone mode — check _running + thread alive
+        return self._running and (self._thread is not None and self._thread.is_alive())
+
+    @staticmethod
+    def _map_agent_state(agent_state: str) -> str:
+        """Map Agent/Controller state strings to frontend status values."""
+        mapping = {
+            "running": "RUNNING",
+            "pausing": "PAUSED",
+            "paused": "PAUSED",
+            "idle": "IDLE",
+            "error": "IDLE",
+            "stopped": "IDLE",
+            "completed": "IDLE",
+            "ready": "IDLE",
+            "waiting": "WAITING_FOR_USER",
+        }
+        return mapping.get(agent_state.lower(), agent_state.upper())
+
+    @staticmethod
+    def _map_role(msg: Dict[str, Any]) -> str:
+        """Map internal message role to frontend role."""
+        role = msg.get("role", "system")
+        mapping = {
+            "user": "user",
+            "assistant": "assistant",
+            "system": "system",
+            "tool": "tool_result",
+        }
+        return mapping.get(role, role)
+
+    @staticmethod
+    def _map_content(msg: Dict[str, Any]) -> str:
+        """Extract display content from a message dict."""
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            # Multi‑part content — concatenate text parts
+            texts = []
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get("type") == "text":
+                        texts.append(part.get("text", ""))
+                    elif part.get("type") == "tool_use":
+                        texts.append(f"[Tool: {part.get('name', '?')}]")
+                elif isinstance(part, str):
+                    texts.append(part)
+            return "\n".join(texts)
+        if not isinstance(content, str):
+            return str(content)
+        return content
+
+    # ── Internal: agent thread ──────────────────────────────────────────────
+
+    def _run_loop(self) -> None:
+        """Background thread: owns the Agent and runs process_query()."""
+        try:
+            while self._running and not self._stop_event.is_set():
+                # Check pause
+                if not self._pause_event.is_set():
+                    self._pause_event.wait(timeout=0.5)
+                    continue
+
+                # Wait for a query
+                try:
+                    query = self._query_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+
+                # Handle special commands
+                if query == "[STOP]":
+                    break
+                if query == "[RESET]":
+                    if self._agent is not None:
+                        self._agent.reset()
+                    continue
+
+                # Process the query
+                self._processing = True
+                try:
+                    for raw_event in self._agent.process_query(query):
+                        if self._stop_event.is_set():
+                            break
+                        self._map_and_emit(raw_event)
+
+                        # Check pause after each event
+                        if not self._pause_event.is_set():
+                            break
+
+                        # If the agent yielded a stop_reason, break
+                        if raw_event.get("stop_reason"):
+                            break
+                except Exception as exc:
+                    traceback.print_exc()
+                    self._emit({
+                        "type": "error",
+                        "error_type": "PROCESS_QUERY_ERROR",
+                        "message": str(exc),
+                        "traceback": traceback.format_exc(),
+                    })
+                finally:
+                    self._processing = False
+                    self._map_and_emit({
+                        "type": "session_stop",
+                        "stop_reason": "completed",
+                        "is_running": self._get_is_running(),
+                    })
+                    self._emit({
+                        "type": "state_changed",
+                        "state": "IDLE",
+                        "is_running": self._get_is_running(),
+                    })
+        except Exception as exc:
+            traceback.print_exc()
+            self._emit({
+                "type": "error",
+                "error_type": "BRIDGE_LOOP_ERROR",
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+            })
+        finally:
+            self._running = False
+            self._agent_running = False
+            self._emit({
+                "type": "state_changed",
+                "state": "IDLE",
+                "is_running": False,
+            })
+            self._emit({"type": "thread_finished"})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Convenience factory
+# ══════════════════════════════════════════════════════════════════════════════
+
+def create_bridge(event_callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> WebAgentBridge:
+    """Factory function – create a WebAgentBridge with optional callback."""
+    return WebAgentBridge(event_callback=event_callback)

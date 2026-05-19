@@ -4,7 +4,6 @@ LLM client for handling LLM provider interactions.
 Extracted from agent.py to separate LLM communication concerns.
 """
 import os
-import logging
 from typing import Optional, List, Dict, Any
 from agent.logging import log
 from llm_providers.factory import ProviderFactory
@@ -46,17 +45,17 @@ class LLMClient:
         from session.history_provider import HistoryProvider
         if self.session is None:
             if self.logger and hasattr(self.logger, 'py_logger'):
-                self.logger.py_logger.warning('Creating HistoryProvider without session')
+                log('WARNING', 'core.llm_client', 'Creating HistoryProvider without session')
             elif self.logger:
                 self.logger.log_warning('Creating HistoryProvider without session')
             else:
-                logging.warning('Creating HistoryProvider without session')
+                log('WARNING', 'core.llm_client', 'Creating HistoryProvider without session')
             log('DEBUG', 'core.context_builder', f'LLMClient.create_context_builder: session is None, returning None')
             return None
         if token_limit is None:
             token_limit = 8000
         if self.logger and hasattr(self.logger, 'py_logger'):
-            self.logger.py_logger.info(f'[CONTEXT_BUILDER] Creating HistoryProvider with token_limit={token_limit}')
+            log('INFO', 'core.llm_client', f'[CONTEXT_BUILDER] Creating HistoryProvider with token_limit={token_limit}')
         return HistoryProvider(session=self.session, token_limit=token_limit)
 
     def load_system_prompt(self) -> str:

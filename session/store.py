@@ -7,10 +7,11 @@ that stores each session as a JSON file in a configured directory.
 import json
 import os
 import re
+import time
 import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 import logging
 logger = logging.getLogger(__name__)
@@ -87,13 +88,16 @@ class FileSystemSessionStore(SessionStore):
     Saves each session as a JSON file in the sessions_dir with friendly filenames: {sanitized_name}_{short_id}.json
     """
 
-    def __init__(self, sessions_dir: Optional[str] = None, enable_session_history_pruning: bool = True):
+    def __init__(self, sessions_dir: Optional[str] = None, state_dir: Optional[str] = None,
+                 enable_session_history_pruning: bool = True):
         """
         Initialize.
 
         Args:
             sessions_dir: Directory to store session files. If None, defaults to
                          ~/.thoughtmachine/sessions
+            state_dir: Directory for state files (open_sessions.json, .current_session).
+                      If None, defaults to ~/.thoughtmachine/state
             enable_session_history_pruning: If True (default), old summarization cycles
                          are pruned on save to keep the session file compact. Set to
                          False to disable pruning (useful for debugging or rollback).
@@ -102,6 +106,23 @@ class FileSystemSessionStore(SessionStore):
         self._enable_session_history_pruning = enable_session_history_pruning
         logger.debug(f"[SessionStore] Session history pruning enabled: {self._enable_session_history_pruning}")
         self._original_sessions_dir = sessions_dir  # Store original parameter
+
+        # In-memory caches to reduce disk I/O
+        self._cached_list: Optional[Tuple[float, List[Dict[str, Any]]]] = None  # (timestamp, list)
+        self._cached_paths: Dict[str, Optional[Path]] = {}  # session_id -> path (None = not found)
+        self._cached_paths_ts: Dict[str, float] = {}  # when each path entry was cached
+        self._cache_ttl = 5.0  # seconds
+
+        # Resolve state directory
+        if state_dir is None:
+            home = os.path.expanduser("~")
+            state_dir = os.path.join(home, ".thoughtmachine", "state")
+        self.state_dir = Path(state_dir)
+        try:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            logger.warning(f"[SessionStore] Could not create state directory at {self.state_dir}")
+
         if sessions_dir is None:
             home = os.path.expanduser("~")
             sessions_dir = os.path.join(home, ".thoughtmachine", "sessions")
@@ -140,15 +161,27 @@ class FileSystemSessionStore(SessionStore):
         return self.sessions_dir / f"{session_id}.json"
 
     def _find_session_path(self, session_id: str) -> Optional[Path]:
-        """Find the actual file path for a session ID by scanning JSON files."""
+        """Find the actual file path for a session ID by scanning JSON files.
+        Uses an in-memory cache (TTL: 5s) that is invalidated on save/delete.
+        """
+        # Check cache first (with TTL)
+        if session_id in self._cached_paths:
+            ts = self._cached_paths_ts.get(session_id, 0)
+            if time.time() - ts < self._cache_ttl:
+                return self._cached_paths[session_id]
+        # Scan files
         for file_path in self.sessions_dir.glob("*.json"):
             try:
                 with open(file_path, 'r') as f:
                     data = json.load(f)
                 if data.get('session_id') == session_id:
+                    self._cached_paths[session_id] = file_path
+                    self._cached_paths_ts[session_id] = time.time()
                     return file_path
             except Exception:
                 continue
+        self._cached_paths[session_id] = None  # cache as not found
+        self._cached_paths_ts[session_id] = time.time()
         return None
 
     def _get_friendly_path(self, session: Session) -> Path:
@@ -159,6 +192,10 @@ class FileSystemSessionStore(SessionStore):
 
     def save_session(self, session: Session) -> None:
         """Save a session to a JSON file."""
+        # Invalidate caches
+        self._cached_paths.pop(session.session_id, None)
+        self._cached_paths_ts.pop(session.session_id, None)
+        self._cached_list = None
         logger.debug(f"[SessionStore] Saving session {session.session_id}")
         # Update the updated_at timestamp
         session.updated_at = datetime.now()
@@ -190,12 +227,22 @@ class FileSystemSessionStore(SessionStore):
                 logger.warning(f"[SessionStore] Target file {new_path} already exists, overwriting")
             old_path.rename(new_path)
         
-        # Write the session data
-        logger.debug(f"[SessionStore] Writing to {new_path}")
-        with open(new_path, 'w') as f:
-            json.dump(data, f, indent=2, default=str)  # default=str handles datetime
-        
-        logger.debug(f"[SessionStore] Session {session.session_id} saved to {new_path}")
+        # Write the session data atomically via temp file
+        temp_path = new_path.with_suffix('.tmp')
+        logger.debug(f"[SessionStore] Writing to {temp_path} (atomic)")
+        try:
+            with open(temp_path, 'w') as f:
+                json.dump(data, f, indent=2, default=str)  # default=str handles datetime
+            temp_path.replace(new_path)
+            logger.debug(f"[SessionStore] Session {session.session_id} saved to {new_path}")
+            # Invalidate path cache so subsequent _find_session_path re-scans
+            self._cached_paths.pop(session.session_id, None)
+            self._cached_paths_ts.pop(session.session_id, None)
+        except Exception:
+            # Clean up temp file on failure
+            if temp_path.exists():
+                temp_path.unlink()
+            raise
 
     def load_session(self, session_id: str) -> Optional[Session]:
         """Load a session from a JSON file."""
@@ -217,13 +264,23 @@ class FileSystemSessionStore(SessionStore):
     def list_sessions(self) -> List[Dict[str, Any]]:
         """
         List all saved sessions with basic metadata.
-        Reads each JSON file and extracts a few fields.
+        Uses an in-memory cache (TTL: 5s) to avoid re-reading all files on every call.
+        Skips files that are not valid session objects (e.g. open_sessions.json).
         """
+        now = time.time()
+        if self._cached_list is not None:
+            ts, cached = self._cached_list
+            if now - ts < self._cache_ttl:
+                return cached
         sessions = []
         for file_path in self.sessions_dir.glob("*.json"):
             try:
                 with open(file_path, 'r') as f:
                     data = json.load(f)
+                # Skip files that aren't session objects (e.g. open_sessions.json is a list)
+                if not isinstance(data, dict):
+                    logger.debug(f"[SessionStore] Skipping {file_path.name}: not a session object")
+                    continue
                 # Extract minimal metadata for listing
                 session_info = {
                     'session_id': data.get('session_id'),
@@ -233,11 +290,15 @@ class FileSystemSessionStore(SessionStore):
                     'preview': self._extract_preview(data.get('user_history', [])),
                 }
                 sessions.append(session_info)
+            except json.JSONDecodeError as e:
+                logger.warning(f"[SessionStore] Corrupt session file {file_path.name}: {e}")
+                continue
             except Exception as e:
                 logger.error(f"[SessionStore] Error reading {file_path}: {e}")
                 continue
         # Sort by updated_at descending (most recent first)
         sessions.sort(key=lambda s: s.get('updated_at', ''), reverse=True)
+        self._cached_list = (time.time(), sessions)
         return sessions
 
     def _extract_preview(self, user_history: List[Dict[str, Any]], max_length: int = 100) -> str:
@@ -251,6 +312,10 @@ class FileSystemSessionStore(SessionStore):
 
     def delete_session(self, session_id: str) -> bool:
         """Delete a session file."""
+        # Invalidate caches
+        self._cached_paths.pop(session_id, None)
+        self._cached_paths_ts.pop(session_id, None)
+        self._cached_list = None
         path = self._find_session_path(session_id)
         if path is not None and path.exists():
             path.unlink()
@@ -265,13 +330,75 @@ class FileSystemSessionStore(SessionStore):
         # Session not saved yet, return the default path (for compatibility)
         return self._get_session_path(session_id)
 
+    # ── Open sessions management ────────────────────────────────────────────
+
+    def get_open_sessions_path(self) -> Path:
+        """Get the path for the open_sessions.json state file."""
+        return self.state_dir / 'open_sessions.json'
+
+    def get_open_sessions(self) -> List[str]:
+        """
+        Read the list of open session IDs from open_sessions.json.
+        Returns an empty list if the file does not exist or is corrupt.
+        """
+        path = self.get_open_sessions_path()
+        if not path.exists():
+            return []
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return [str(sid) for sid in data]
+            logger.warning(f"[SessionStore] open_sessions.json content is not a list: {type(data)}")
+            return []
+        except Exception as e:
+            logger.error(f"[SessionStore] Error reading open_sessions.json: {e}")
+            return []
+
+    def save_open_sessions(self, session_ids: List[str]) -> None:
+        """
+        Write the list of open session IDs to open_sessions.json.
+        """
+        path = self.get_open_sessions_path()
+        try:
+            # Atomic write via temp file
+            temp_path = path.with_suffix('.tmp')
+            with open(temp_path, 'w') as f:
+                json.dump(session_ids, f)
+            temp_path.replace(path)
+            logger.debug(f"[SessionStore] Saved {len(session_ids)} open sessions to {path}")
+        except Exception as e:
+            logger.error(f"[SessionStore] Error saving open_sessions.json: {e}")
+
+    def add_open_session(self, session_id: str) -> None:
+        """
+        Add a session ID to the open sessions list (idempotent).
+        """
+        ids = self.get_open_sessions()
+        if session_id not in ids:
+            ids.append(session_id)
+            self.save_open_sessions(ids)
+
+    def remove_open_session(self, session_id: str) -> None:
+        """
+        Remove a session ID from the open sessions list.
+        """
+        ids = self.get_open_sessions()
+        if session_id in ids:
+            ids.remove(session_id)
+            self.save_open_sessions(ids)
+
     def get_current_session_id(self) -> Optional[str]:
         """
         Get the ID of the current session from the marker file.
         Returns None if no marker exists.
+
+        Migrates the marker from the old sessions_dir location to the
+        new state_dir location on first access if needed.
         """
-        marker = self.sessions_dir / ".current_session"
+        marker = self.state_dir / ".current_session"
         logger.debug(f"[SessionStore] get_current_session_id: marker={marker}, exists={marker.exists()}")
+
         if marker.exists():
             try:
                 content = marker.read_text().strip()
@@ -280,6 +407,24 @@ class FileSystemSessionStore(SessionStore):
             except Exception as e:
                 logger.error(f"[SessionStore] Error reading current session marker: {e}")
                 return None
+
+        # Migration: check old location in sessions_dir
+        old_marker = self.sessions_dir / ".current_session"
+        if old_marker.exists():
+            try:
+                content = old_marker.read_text().strip()
+                if content:
+                    logger.info(f"[SessionStore] Migrating .current_session from {old_marker} to {marker}")
+                    # Atomic write to new location
+                    temp_path = marker.with_suffix('.tmp')
+                    temp_path.write_text(content)
+                    temp_path.replace(marker)
+                    # Remove old marker
+                    old_marker.unlink()
+                    return content
+            except Exception as e:
+                logger.error(f"[SessionStore] Error migrating .current_session: {e}")
+
         return None
 
     def set_current_session_id(self, session_id: Optional[str]) -> None:
@@ -287,7 +432,7 @@ class FileSystemSessionStore(SessionStore):
         Set the current session ID by writing to the marker file.
         If session_id is None, the marker file is removed.
         """
-        marker = self.sessions_dir / ".current_session"
+        marker = self.state_dir / ".current_session"
         logger.debug(f"[SessionStore] set_current_session_id: marker={marker}, session_id={session_id}")
         # Ensure session_id is a string if not None
         if session_id is not None and not isinstance(session_id, str):

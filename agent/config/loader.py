@@ -5,11 +5,9 @@ Handles loading, saving, and validation of agent configurations.
 import os
 import json
 from pathlib import Path
-from typing import Dict, Any, Optional, List
-import logging
+from typing import Dict, Any, Optional, List, Set
 from agent.logging import log
 from .models import AgentConfig
-logger = logging.getLogger(__name__)
 
 def _map_legacy_fields(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     """Map legacy field names to new field names for backward compatibility."""
@@ -55,7 +53,7 @@ def load_config(config_path: str) -> Dict[str, Any]:
     """
     default_config = load_default_config()
     if not os.path.exists(config_path):
-        logger.debug(f'Config file {config_path} not found, using defaults')
+        log('DEBUG', 'config.loader', f'Config file {config_path} not found, using defaults')
         return default_config
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
@@ -67,11 +65,48 @@ def load_config(config_path: str) -> Dict[str, Any]:
                 merged_config[key] = value
             else:
                 merged_config[key] = value
-        logger.debug(f'Loaded config from {config_path}')
+        log('DEBUG', 'config.loader', f'Loaded config from {config_path}')
+        merged_config = _backfill_nulls(merged_config)
         return merged_config
     except Exception as e:
-        logger.warning(f'Error loading config from {config_path}: {e}')
+        log('WARNING', 'config.loader', f'Error loading config from {config_path}: {e}')
         return default_config
+
+def _get_valid_field_names() -> Set[str]:
+    """Return the set of valid field names for AgentConfig."""
+    return set(AgentConfig.model_fields.keys())
+
+
+def _warn_stray_keys(config: Dict[str, Any]) -> None:
+    """Log a warning if config dict contains keys not in AgentConfig model.
+
+    This catches stray/injected keys that would otherwise vanish silently
+    on save-write, preventing data corruption from spreading.
+    """
+    valid = _get_valid_field_names()
+    stray = [k for k in config if k not in valid]
+    if stray:
+        log('WARNING', 'config.loader',
+            f'Stray keys detected in config (will NOT be persisted): {stray}')
+        for key in stray:
+            del config[key]
+
+
+def _backfill_nulls(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Replace None/null values with model defaults.
+
+    If a saved config explicitly contains null for a field, use the
+    AgentConfig default for that field instead. This prevents None
+    values from propagating through the runtime.
+    """
+    default_cfg = AgentConfig()
+    for field_name in AgentConfig.model_fields:
+        if field_name in config and config[field_name] is None:
+            default_value = getattr(default_cfg, field_name, None)
+            if default_value is not None:
+                config[field_name] = default_value
+    return config
+
 
 def save_config(config: Dict[str, Any], config_path: str) -> bool:
     """Save configuration to file.
@@ -84,13 +119,14 @@ def save_config(config: Dict[str, Any], config_path: str) -> bool:
         True if successful, False otherwise
     """
     try:
+        _warn_stray_keys(config)
         os.makedirs(os.path.dirname(os.path.abspath(config_path)), exist_ok=True)
         with open(config_path, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2)
-        logger.debug(f'Saved config to {config_path}')
+        log('DEBUG', 'config.loader', f'Saved config to {config_path}')
         return True
     except Exception as e:
-        logger.error(f'Error saving config to {config_path}: {e}')
+        log('ERROR', 'config.loader', f'Error saving config to {config_path}: {e}')
         return False
 
 def validate_config(config_dict: Dict[str, Any]) -> Optional[AgentConfig]:
@@ -105,7 +141,7 @@ def validate_config(config_dict: Dict[str, Any]) -> Optional[AgentConfig]:
     try:
         return AgentConfig(**config_dict)
     except Exception as e:
-        logger.error(f'Configuration validation failed: {e}')
+        log('ERROR', 'config.loader', f'Configuration validation failed: {e}')
         return None
 
 def get_config_paths() -> Dict[str, str]:
@@ -151,7 +187,7 @@ def update_config(current_config: Dict[str, Any], updates: Dict[str, Any]) -> Di
     old_ws = current_config.get('workspace_path', 'KEY_MISSING')
     new_ws = updates.get('workspace_path', 'KEY_MISSING')
     has_ws_key = 'workspace_path' in updates
-    logger.debug(f'[CONFIG_TRACE] loader.update_config: old_workspace_path={old_ws!r}, new_workspace_path={new_ws!r}, has_workspace_path_key={has_ws_key}, update_keys={list(updates.keys())}')
+    log('DEBUG', 'config.loader', f'[CONFIG_TRACE] loader.update_config: old_workspace_path={old_ws!r}, new_workspace_path={new_ws!r}, has_workspace_path_key={has_ws_key}, update_keys={list(updates.keys())}')
     updated = current_config.copy()
     updated.update(updates)
     return updated

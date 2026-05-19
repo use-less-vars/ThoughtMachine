@@ -99,7 +99,8 @@ class DockerExecutor:
         log("DEBUG", "tools.docker_executor.container",
             "_ensure_container called",
             {"workspace_path": self.workspace_path, "image": self.image,
-             "has_container": self.container is not None})
+             "has_container": self.container is not None,
+             "force_rebuild": self.force_rebuild})
 
         if self.container:
             try:
@@ -114,57 +115,107 @@ class DockerExecutor:
         safe_name = hashlib.sha256(self.workspace_path.encode()).hexdigest()[:12]
         container_name = f"agent-exec-{safe_name}"
 
-        # Try to get existing container and check against current policy
-        try:
-            existing = self.client.containers.get(container_name)
-            existing.reload()
-
-            # Check if existing container's config matches current policy
-            policy = _load_policy(self.workspace_path)
-            desired_network = "bridge" if policy.get("docker_network_allowed") else "none"
-            current_network = existing.attrs['HostConfig']['NetworkMode']
-
-            # Check if /home/agent tmpfs is mounted
-            # Docker stores tmpfs in HostConfig.Tmpfs (dict), NOT in Mounts array
-            tmpfs_mounts = existing.attrs.get('HostConfig', {}).get('Tmpfs', {})
-            has_home_tmpfs = '/home/agent' in tmpfs_mounts
-            needs_writable_home = policy.get("writable_home", False)
-
-            if (current_network != desired_network) or (needs_writable_home != has_home_tmpfs):
-                # Config mismatch — remove and recreate
+        # When force_rebuild is True, skip container reuse: close old container
+        # by name and create a fresh one from the newly built image.
+        if self.force_rebuild:
+            try:
+                existing = self.client.containers.get(container_name)
+                existing.reload()
                 try:
                     existing.stop()
                     existing.remove()
                 except docker.errors.NotFound:
                     pass
-                existing = None
+            except docker.errors.NotFound:
+                pass
+            existing = None
+        else:
+            # Try to get existing container and check against current policy
+            try:
+                existing = self.client.containers.get(container_name)
+                existing.reload()
 
-            if existing is not None:
-                self.container = existing
-                # Handle non-running container states
-                if self.container.status == "dead":
-                    self.container.remove()
-                    self.container = None
-                    raise docker.errors.NotFound(f"Container {container_name} was dead and removed")
-                elif self.container.status != "running":
+                # Check if existing container's config matches current policy
+                policy = _load_policy(self.workspace_path)
+                desired_network = "bridge" if policy.get("docker_network_allowed") else "none"
+                current_network = existing.attrs['HostConfig']['NetworkMode']
+
+                # Check if /home/agent tmpfs is mounted
+                # Docker stores tmpfs in HostConfig.Tmpfs (dict), NOT in Mounts array
+                tmpfs_mounts = existing.attrs.get('HostConfig', {}).get('Tmpfs', {})
+                has_home_tmpfs = '/home/agent' in tmpfs_mounts
+                needs_writable_home = policy.get("writable_home", False)
+
+                if (current_network != desired_network) or (needs_writable_home != has_home_tmpfs):
+                    # Config mismatch — remove and recreate
                     try:
-                        self.container.start()
-                    except docker.errors.APIError:
+                        existing.stop()
+                        existing.remove()
+                    except docker.errors.NotFound:
+                        pass
+                    existing = None
+
+                if existing is not None:
+                    # Check if the container's image matches the currently tagged image.
+                    # After a Dockerfile rebuild, the image ID changes even if the tag
+                    # stays the same, and container pooling would otherwise reuse the
+                    # stale container with the old image.
+                    try:
+                        # Container's Image attribute stores the SHA256 of the image
+                        # used at creation time.
+                        container_image_id = existing.attrs.get('Image', '')
+                        current_image = self.client.images.get(self.image)
+                        current_image_id = current_image.id
+                        if container_image_id and current_image_id and container_image_id != current_image_id:
+                            log("INFO", "tools.docker_executor.container",
+                                "Container built from stale image, recreating",
+                                {"container_id": existing.id,
+                                 "container_image": container_image_id[:19] + "...",
+                                 "current_image": current_image_id[:19] + "..."})
+                            try:
+                                existing.stop()
+                                existing.remove()
+                            except docker.errors.NotFound:
+                                pass
+                            existing = None
+                    except docker.errors.ImageNotFound:
+                        # If the image can't be found for comparison, recreate to be safe
+                        log("WARNING", "tools.docker_executor.container",
+                            "Could not compare image IDs (image not found), recreating container",
+                            {"container_id": existing.id})
+                        try:
+                            existing.stop()
+                            existing.remove()
+                        except docker.errors.NotFound:
+                            pass
+                        existing = None
+
+                if existing is not None:
+                    self.container = existing
+                    # Handle non-running container states
+                    if self.container.status == "dead":
                         self.container.remove()
                         self.container = None
-                        raise docker.errors.NotFound(f"Container {container_name} failed to start and was removed")
-                self.last_used = time.time()
-                return
+                        raise docker.errors.NotFound(f"Container {container_name} was dead and removed")
+                    elif self.container.status != "running":
+                        try:
+                            self.container.start()
+                        except docker.errors.APIError:
+                            self.container.remove()
+                            self.container = None
+                            raise docker.errors.NotFound(f"Container {container_name} failed to start and was removed")
+                    self.last_used = time.time()
+                    return
 
-        except docker.errors.NotFound:
-            pass
+            except docker.errors.NotFound:
+                pass
 
         # Create new container with current policy
         policy = _load_policy(self.workspace_path)
         network_mode = "bridge" if policy.get("docker_network_allowed", False) else "none"
         tmpfs = {"/tmp": "rw,noexec,nosuid,size=64m"}
         if policy.get("writable_home", False):
-            tmpfs["/home/agent"] = "rw,size=256M,uid=1000,gid=1000"
+            tmpfs["/home/agent"] = "rw,exec,size=256M,uid=1000,gid=1000"
 
         log('DEBUG', 'tools.docker_executor.container',
             f"Creating container with network={network_mode}, tmpfs={tmpfs}")
@@ -288,7 +339,7 @@ class DockerExecutor:
         """
         if self.force_rebuild:
             self.close()
-            image, _ = self._build_image(verbose_build=verbose_build)
+            image, _ = self._build_image(verbose_build=verbose_build, nocache=True)
             return image
         try:
             image = self.client.images.get(self.image)
@@ -298,7 +349,7 @@ class DockerExecutor:
         image, _ = self._build_image(verbose_build=verbose_build)
         return image
     
-    def _build_image(self, verbose_build=False):
+    def _build_image(self, verbose_build=False, nocache=False):
         """Build Docker image from docker/executor.Dockerfile.
         
         Args:
@@ -315,13 +366,13 @@ class DockerExecutor:
         if not os.path.exists(dockerfile_path):
             raise RuntimeError(f"Dockerfile not found at {dockerfile_path}")
 
-        log('DEBUG', 'docker.build', f"Building Docker image {self.image} from {dockerfile_path}")
-        log('DEBUG', 'docker.build', f"Build context directory: {dockerfile_dir}")
-        log('DEBUG', 'docker.build', f"Absolute path: {os.path.abspath(dockerfile_dir)}")
-        log('DEBUG', 'docker.build', f"Requirements.txt exists: {os.path.exists(os.path.join(dockerfile_dir, 'requirements.txt'))}")
-        log('DEBUG', 'docker.build', f"Files in build context:")
+        log('DEBUG', 'tools.docker_executor.build', f"Building Docker image {self.image} from {dockerfile_path}")
+        log('DEBUG', 'tools.docker_executor.build', f"Build context directory: {dockerfile_dir}")
+        log('DEBUG', 'tools.docker_executor.build', f"Absolute path: {os.path.abspath(dockerfile_dir)}")
+        log('DEBUG', 'tools.docker_executor.build', f"Requirements.txt exists: {os.path.exists(os.path.join(dockerfile_dir, 'requirements.txt'))}")
+        log('DEBUG', 'tools.docker_executor.build', f"Files in build context:")
         for f in os.listdir(dockerfile_dir):
-            log('DEBUG', 'docker.build', f"  {f}")
+            log('DEBUG', 'tools.docker_executor.build', f"  {f}")
 
         log_lines = []
         try:
@@ -330,7 +381,8 @@ class DockerExecutor:
                 dockerfile="docker/executor.Dockerfile",
                 tag=self.image,
                 rm=True,
-                pull=True
+                pull=True,
+                nocache=nocache  # Only nocache=True when force_rebuild
             )
             # Generator iteration must be inside try/except block because
             # Docker SDK raises BuildError from within the generator,
@@ -340,7 +392,7 @@ class DockerExecutor:
                     line = chunk["stream"].strip()
                     if line:
                         log_lines.append(line)
-                        log('DEBUG', 'docker.build', f"Build: {line}")
+                        log('DEBUG', 'tools.docker_executor.build', f"Build: {line}")
         except docker.errors.BuildError as e:
             # BuildError already has build_log; include it in the error message
             build_log_str = "\n".join(str(line) for line in (e.build_log or []))
@@ -352,6 +404,6 @@ class DockerExecutor:
             raise RuntimeError(f"Docker build failed: {e}") from e
 
         if verbose_build and log_lines:
-            log('INFO', 'docker.build', f"Build complete for {self.image}:\n" + "\n".join(log_lines))
+            log('INFO', 'tools.docker_executor.build', f"Build complete for {self.image}:\n" + "\n".join(log_lines))
 
         return image, log_lines

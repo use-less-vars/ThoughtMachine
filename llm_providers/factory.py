@@ -4,20 +4,17 @@ Centralizes provider creation logic and handles configuration.
 """
 from typing import Dict, Any, Optional
 import os
-import logging
-
+from agent.logging import log
 from .base import ProviderConfig, LLMProvider
 from .openai_compatible import OpenAICompatibleProvider
 from .exceptions import ProviderNotFoundError, InvalidConfigError
-
-logger = logging.getLogger(__name__)
 
 # Try to import AnthropicProvider, but handle missing anthropic package gracefully
 AnthropicProvider = None
 try:
     from .anthropic_provider import AnthropicProvider
 except ImportError as e:
-    logger.warning(f"Anthropic provider not available: {e}")
+    log('WARNING', 'llm.factory', f'Anthropic provider not available: {e}')
     # AnthropicProvider remains None
 
 class ProviderFactory:

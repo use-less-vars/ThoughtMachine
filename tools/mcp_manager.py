@@ -325,17 +325,45 @@ def get_mcp_manager() -> MCPServerManager:
         _manager.start_all()
     return _manager
 
-def register_mcp_tools() -> None:
+def register_mcp_tools(timeout: float = 5.0) -> None:
     """Register MCP-generated tool classes with the global TOOL_CLASSES.
     
-    This function is called automatically from tools/__init__.py during
-    module initialization. It discovers all tools from configured MCP
-    servers and adds them to TOOL_CLASSES so they become available to
-    the agent.
+    Called lazily from agent initialization (not during module import)
+    to avoid hangs when MCP servers are unavailable. Uses a thread-based
+    timeout to protect against misconfigured or unreachable servers.
+    
+    Args:
+        timeout: Maximum seconds to wait for MCP servers to start.
+                 Default 5.0 seconds. Set to 0 to skip entirely.
     """
-    manager = get_mcp_manager()
-    from . import TOOL_CLASSES
-    tool_classes = manager.get_tool_classes()
-    for cls in tool_classes:
-        if cls not in TOOL_CLASSES:
-            TOOL_CLASSES.append(cls)
+    if timeout <= 0:
+        logger.warning("register_mcp_tools: timeout <= 0, skipping MCP tool registration")
+        return
+    
+    import concurrent.futures
+    
+    def _do_register():
+        """Perform actual MCP tool registration."""
+        manager = get_mcp_manager()
+        from . import TOOL_CLASSES
+        tool_classes = manager.get_tool_classes()
+        count = 0
+        for cls in tool_classes:
+            if cls not in TOOL_CLASSES:
+                TOOL_CLASSES.append(cls)
+                count += 1
+        return count
+    
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_do_register)
+    try:
+        count = future.result(timeout=timeout)
+        logger.info(f"Registered {count} MCP tool(s)")
+    except concurrent.futures.TimeoutError:
+        logger.warning(f"MCP tool registration timed out after {timeout}s "
+                      "- MCP servers may be unavailable")
+    except Exception as e:
+        logger.warning(f"MCP tool registration failed: {e}")
+    finally:
+        # Shutdown without waiting for hung worker
+        executor.shutdown(wait=False)

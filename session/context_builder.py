@@ -32,6 +32,46 @@ except ImportError:
     dump_messages = lambda messages, label: None
 DEBUG_CONTEXT = os.environ.get('DEBUG_CONTEXT') is not None
 
+# Import shared turn-grouping utility
+try:
+    from agent.core.message_utils import group_messages_into_turns
+except ImportError:
+    # Fallback in case of circular import - define inline
+    def group_messages_into_turns(messages):
+        """Inline fallback for turn grouping (avoids circular imports)."""
+        turns = []
+        current_turn = []
+        for msg in messages:
+            role = msg.get('role')
+            if role == 'system' or msg.get('is_system_notification') is True:
+                continue
+            if role == 'user':
+                if current_turn:
+                    turns.append(current_turn)
+                current_turn = [msg]
+            elif role == 'assistant' and msg.get('tool_calls'):
+                if current_turn:
+                    turns.append(current_turn)
+                current_turn = [msg]
+            elif current_turn:
+                if role == 'tool':
+                    has_tool_call_assistant = any(
+                        m.get('role') == 'assistant' and m.get('tool_calls')
+                        for m in current_turn
+                    )
+                    if has_tool_call_assistant:
+                        current_turn.append(msg)
+                    else:
+                        continue
+                else:
+                    current_turn.append(msg)
+            else:
+                continue
+        if current_turn:
+            turns.append(current_turn)
+        valid = [t for t in turns if t and (t[0].get('role') == 'user' or (t[0].get('role') == 'assistant' and t[0].get('tool_calls')))]
+        return valid
+
 class ContextBuilder(ABC):
     """Abstract base class for context building strategies."""
 
@@ -190,6 +230,11 @@ class SummaryBuilder(ContextBuilder):
                     logger.debug(f'  [{i}] role={role}, content: {content_preview}')
                 if len(user_history) > max_to_show:
                     logger.debug(f'  ... and {len(user_history) - max_to_show} more messages')
+        # [CTXBUILD] ENTER
+        log('DEBUG', 'ctxbuild', f"ENTER: received {len(user_history)} messages")
+        for i, m in enumerate(user_history):
+            log('DEBUG', 'ctxbuild', f"  INPUT[{i}] role={m.get('role')} preview={str(m.get('content',''))[:100]}")
+        
         if not user_history:
             return []
         main_prompt, summary_idx, summary_msg = self._find_main_prompt_and_summary(user_history)
@@ -207,6 +252,10 @@ class SummaryBuilder(ContextBuilder):
             post_summary = user_history[summary_idx + 1:]
         else:
             post_summary = user_history
+        
+        # [CTXBUILD] AFTER SPLIT
+        log('DEBUG', 'ctxbuild', f"AFTER SPLIT: summary_idx={summary_idx}, post_summary has {len(post_summary)} msgs")
+        
         system_warnings = []
         non_system = []
         for msg in post_summary:
@@ -216,7 +265,10 @@ class SummaryBuilder(ContextBuilder):
                 system_warnings.append(msg)
             else:
                 non_system.append(msg)
-
+        
+        # [CTXBUILD] AFTER FILTER
+        log('DEBUG', 'ctxbuild', f"AFTER FILTER: non_system={len(non_system)} msgs, system_warnings={len(system_warnings)} msgs")
+        
         if os.environ.get('DEBUG_CONTEXT'):
             logger.debug(f'[DEBUG_CONTEXT] Collected {len(system_warnings)} system warnings:')
             for i, warn in enumerate(system_warnings):
@@ -224,6 +276,10 @@ class SummaryBuilder(ContextBuilder):
                 logger.debug(f'  [{i}] {content_preview}')
         turns = self._group_messages_into_turns(non_system)
         log('DEBUG', 'session.summary_builder', f'SummaryBuilder.build: grouped {len(non_system)} non-system messages into {len(turns)} turns')
+        # [CTXBUILD] AFTER GROUP
+        log('DEBUG', 'ctxbuild', f"AFTER GROUP: {len(turns)} turns")
+        for ti, turn in enumerate(turns):
+            log('DEBUG', 'ctxbuild', f"  TURN[{ti}] {len(turn)} msgs, starts with role={turn[0].get('role')}")
         if summary_msg is not None:
             pass
         else:
@@ -279,6 +335,18 @@ class SummaryBuilder(ContextBuilder):
                 content = msg.get('content', '')
                 if '[SYSTEM]' in content:
                     logger.info(f'[WARNING_IN_CONTEXT] {content[:100]}')
+        # [CTXBUILD] EXIT
+        log('DEBUG', 'ctxbuild', f"EXIT: returning {len(context)} messages")
+        for i, m in enumerate(context):
+            log('DEBUG', 'ctxbuild', f"  OUTPUT[{i}] role={m.get('role')} preview={str(m.get('content',''))[:100]}")
+        
+        # EMERGENCY TRACE: log context summary before return
+        log('DEBUG', 'debug.emergency', f'====== EMERGENCY TRACE: context_builder.build() returning {len(context)} msgs ======')
+        for i, msg in enumerate(context):
+            role = msg.get('role', 'unknown')
+            content = msg.get('content', '')
+            preview = content[:80].replace('\n', '\\n')
+            log('DEBUG', 'debug.emergency', f'  CTX[{i}] role={role}: {preview}')
         return context
 
     def _find_main_prompt_and_summary(self, user_history: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], int, Optional[Dict[str, Any]]]:
@@ -322,87 +390,17 @@ class SummaryBuilder(ContextBuilder):
 
     def _group_messages_into_turns(self, messages: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
         """Group messages into conversation turns (user + assistant + tool responses).
-        
-        Rules:
-        - User messages always start a new turn
-        - Assistant messages with tool_calls can also start a turn (after pruning)
-        - All messages after a turn start belong to that turn until next user message
-        - System messages should be filtered out before calling this method
-        - Turns that don't start with user or assistant-with-tools are discarded
-        
-        This ensures tool call sequences stay together, even when they start with
-        an assistant (due to pruning cutting off the user part of the turn).
+
+        Delegates to the shared group_messages_into_turns utility which provides
+        a single source of truth for turn-grouping logic. The shared version
+        uses the more robust multi-tool-call approach (checking ANY message in
+        the turn for assistant with tool_calls, not just the last message).
+
+        Additional ctxbuild debug logging is preserved here for backward compatibility.
         """
-        turns = []
-        current_turn = []
-        import os
-        debug = os.environ.get('DEBUG_CONTEXT')
-        if debug:
-            logger.debug(f'[DEBUG_CONTEXT] Grouping {len(messages)} messages')
-            max_to_show = 10
-            for i, msg in enumerate(messages[:max_to_show]):
-                role = msg.get('role')
-                content_preview = str(msg.get('content', ''))[:50]
-                has_tool_calls = 'tool_calls' in msg and msg['tool_calls']
-                logger.debug(f'  [{i}] {role}: {content_preview}... tool_calls={has_tool_calls}')
-            if len(messages) > max_to_show:
-                logger.debug(f'  ... and {len(messages) - max_to_show} more messages')
-        for msg in messages:
-            role = msg.get('role')
-            if role == 'system':
-                continue
-            if role == 'user':
-                if current_turn:
-                    turns.append(current_turn)
-                current_turn = [msg]
-            elif role == 'assistant' and msg.get('tool_calls'):
-                if current_turn:
-                    turns.append(current_turn)
-                current_turn = [msg]
-            elif current_turn:
-                if role == 'tool':
-                    # Check if ANY message in the current turn is an assistant with tool_calls
-                    # (not just the last message), to support multi-tool-call scenarios where
-                    # multiple tool results follow a single assistant message.
-                    has_tool_call_assistant = any(
-                        m.get('role') == 'assistant' and m.get('tool_calls')
-                        for m in current_turn
-                    )
-                    if current_turn and has_tool_call_assistant:
-                        current_turn.append(msg)
-                    else:
-                        if debug:
-                            tool_call_id = msg.get('tool_call_id', 'unknown')
-                            logger.debug(f'[DEBUG_CONTEXT] Discarding orphaned tool message: {tool_call_id}')
-                        continue
-                else:
-                    current_turn.append(msg)
-            else:
-                if debug:
-                    logger.debug(f'[DEBUG_CONTEXT] Discarding orphaned {role} message')
-                continue
-        if current_turn:
-            turns.append(current_turn)
-        valid_turns = []
-        for turn in turns:
-            if not turn:
-                continue
-            first_msg = turn[0]
-            first_role = first_msg.get('role')
-            if first_role == 'user':
-                valid_turns.append(turn)
-            elif first_role == 'assistant' and first_msg.get('tool_calls'):
-                valid_turns.append(turn)
-            elif debug:
-                logger.debug(f'[DEBUG_CONTEXT] Discarding turn starting with {first_role}')
-        if debug:
-            logger.debug(f'[DEBUG_CONTEXT] Returned {len(valid_turns)} valid turns')
-            max_to_show = 10
-            for i, turn in enumerate(valid_turns[:max_to_show]):
-                logger.debug(f"  Turn {i}: {[msg.get('role') for msg in turn]}")
-            if len(valid_turns) > max_to_show:
-                logger.debug(f'  ... and {len(valid_turns) - max_to_show} more turns')
-        return valid_turns
+        result = group_messages_into_turns(messages)
+        log('DEBUG', 'ctxbuild', f"GROUP: {len(result)} turns from {len(messages)} messages")
+        return result
 
     def _truncate_to_max_tokens(self, messages: List[Dict[str, Any]], max_tokens: int, preserve_system: bool=True, remove_from_end: bool=False) -> List[Dict[str, Any]]:
         """Truncate messages until under max_tokens.
@@ -415,6 +413,9 @@ class SummaryBuilder(ContextBuilder):
         except Exception:
             encoder = None
         total = sum((self._estimate_tokens(msg, encoder) for msg in messages))
+        removed_count = 0
+        if total > max_tokens:
+            log('DEBUG', 'session.context_builder', f'Truncating: {len(messages)} messages, removing 0 initially, need to reduce from ~{total} to {max_tokens} tokens')
         if remove_from_end:
             while total > max_tokens and len(messages) > 0:
                 if preserve_system and messages[-1].get('role') == 'system':
@@ -424,6 +425,7 @@ class SummaryBuilder(ContextBuilder):
                         if not (preserve_system and messages[-i].get('role') == 'system'):
                             removed_msg = messages.pop(-i)
                             total -= self._estimate_tokens(removed_msg, encoder)
+                            removed_count += 1
                             if os.environ.get('DEBUG_CONTEXT'):
                                 role = removed_msg.get('role', 'unknown')
                                 content_preview = str(removed_msg.get('content', ''))[:100].replace('\\n', ' ')
@@ -434,6 +436,7 @@ class SummaryBuilder(ContextBuilder):
                 else:
                     removed_msg = messages.pop()
                     total -= self._estimate_tokens(removed_msg, encoder)
+                    removed_count += 1
                     if os.environ.get('DEBUG_CONTEXT'):
                         role = removed_msg.get('role', 'unknown')
                         content_preview = str(removed_msg.get('content', ''))[:100].replace('\\n', ' ')
@@ -446,4 +449,15 @@ class SummaryBuilder(ContextBuilder):
                     continue
                 removed_msg = messages.pop(idx_to_remove)
                 total -= self._estimate_tokens(removed_msg, encoder)
+                removed_count += 1
+        if removed_count > 0:
+            log('DEBUG', 'session.context_builder', f'Truncating: {len(messages)} messages, removing {removed_count} to stay under {max_tokens} tokens')
+            log('DEBUG', 'session.context_builder', f'Truncated: removed {removed_count} messages, now {len(messages)} messages at ~{total} tokens')
+            # Append a system notification to inform the LLM that truncation occurred
+            notification = {
+                'role': 'user',
+                'content': f'[SYSTEM NOTIFICATION] Context truncated: {removed_count} older message(s) were removed to stay within token limits ({total} tokens ≈ {max_tokens} max).',
+                'is_system_notification': True
+            }
+            messages.append(notification)
         return messages

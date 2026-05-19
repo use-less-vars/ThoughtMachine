@@ -10,26 +10,27 @@ All messages are buffered and committed atomically to session.user_history
 at turn completion, or rolled back on pause/interrupt.
 """
 from __future__ import annotations
-import logging
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from agent.logging import log
 from session.models import ObservableList
-logger = logging.getLogger(__name__)
+
 
 class TurnTransaction:
     """Buffer for atomic turn execution."""
 
-    def __init__(self, session, context_builder=None):
+    def __init__(self, session, context_builder=None, conversation=None):
         """
         Initialize empty transaction.
         
         Args:
             session: Session object with user_history attribute
             context_builder: Optional HistoryProvider for cache invalidation
+            conversation: Fallback conversation list when session is None
         """
         self.session = session
         self.context_builder = context_builder
+        self.conversation = conversation
         self._assistant_message: Optional[Dict[str, Any]] = None
         self._tool_calls_buffer: List[Dict[str, Any]] = []
         self._committed = False
@@ -84,19 +85,22 @@ class TurnTransaction:
         tool_calls = self._assistant_message.get('tool_calls', [])
         for tc in tool_calls:
             if tc.get('name') in ('Final', 'FinalReport', 'RequestUserInteraction'):
-                logger.debug(f"TurnTransaction committing {tc['name']} tool call with result in commit_messages")
+                log('DEBUG', 'core.turn_transaction', f"TurnTransaction committing {tc['name']} tool call with result in commit_messages")
                 break
         commit_messages.extend(self._tool_calls_buffer)
         if self.session:
-            log('DEBUG', 'debug.unknown', f'[TurnTransaction] Extending user_history with {len(commit_messages)} messages')
-            log('DEBUG', 'debug.unknown', f'[TurnTransaction] user_history type: {type(self.session.user_history).__name__}, is ObservableList: {isinstance(self.session.user_history, ObservableList)}')
-            log('DEBUG', 'debug.unknown', f'[TurnTransaction] user_history id: {id(self.session.user_history)}')
+            log('DEBUG', 'core.turn_transaction', f'[TurnTransaction] Extending user_history with {len(commit_messages)} messages')
+            log('DEBUG', 'core.turn_transaction', f'[TurnTransaction] user_history type: {type(self.session.user_history).__name__}, is ObservableList: {isinstance(self.session.user_history, ObservableList)}')
+            log('DEBUG', 'core.turn_transaction', f'[TurnTransaction] user_history id: {id(self.session.user_history)}')
             self.session.user_history.extend(commit_messages)
             self.session.updated_at = datetime.now()
+        elif self.conversation is not None:
+            log('DEBUG', 'core.turn_transaction', f'[TurnTransaction] Extending fallback conversation with {len(commit_messages)} messages (session=None)')
+            self.conversation.extend(commit_messages)
         if self.context_builder and hasattr(self.context_builder, 'clear_cache'):
             self.context_builder.clear_cache()
         self._committed = True
-        logger.debug(f'TurnTransaction committed {len(commit_messages)} messages atomically')
+        log('DEBUG', 'core.turn_transaction', f'TurnTransaction committed {len(commit_messages)} messages atomically')
         return commit_messages
 
     def rollback(self) -> None:
@@ -105,7 +109,7 @@ class TurnTransaction:
             raise RuntimeError('Cannot rollback committed transaction')
         self._assistant_message = None
         self._tool_calls_buffer.clear()
-        logger.debug('TurnTransaction rolled back')
+        log('DEBUG', 'core.turn_transaction', 'TurnTransaction rolled back')
 
     def get_buffer(self) -> List[Dict[str, Any]]:
         """

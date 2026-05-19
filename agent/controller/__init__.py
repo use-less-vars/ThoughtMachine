@@ -1,11 +1,36 @@
 import threading
 import os
+import sys
 import queue
 import traceback
+import uuid
 from agent.config import AgentConfig
 from agent import Agent
-from typing import Optional, List, Dict, Any
-from PyQt6.QtCore import QObject, pyqtSignal
+from typing import Optional, Callable, List, Dict, Any
+try:
+    from PyQt6.QtCore import QObject, pyqtSignal
+    _HAS_QT = True
+except ImportError:
+    _HAS_QT = False
+    # Dummy QObject for non-Qt environments
+    class QObject:
+        """Stand-in when PyQt6 is not installed."""
+        pass
+
+    class _DummySignal:
+        """Stand-in for pyqtSignal when PyQt6 is not installed."""
+        def __init__(self, *args, **kwargs):
+            pass
+        def emit(self, *args, **kwargs):
+            pass
+        def connect(self, *args, **kwargs):
+            pass
+        def disconnect(self, *args, **kwargs):
+            pass
+
+    def pyqtSignal(*args, **kwargs):
+        """Return a dummy signal object when PyQt6 is not available."""
+        return _DummySignal()
 from agent.logging import log
 
 class AgentController(QObject):
@@ -31,6 +56,16 @@ class AgentController(QObject):
         self._keep_alive = True
         self._pause_requested = False
         self._processing_query = False
+        # Plain Python callbacks (non-Qt consumers like Web UI)
+        self._event_callbacks: List[Callable[[Dict[str, Any]], None]] = []
+
+    def set_event_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """
+        Register a plain Python callback for events.
+        Unlike the pyqtSignal, this works without a Qt event loop.
+        """
+        if callback not in self._event_callbacks:
+            self._event_callbacks.append(callback)
 
     def _cleanup_if_thread_dead(self):
         """Check if background thread is dead and reset state if needed."""
@@ -97,7 +132,8 @@ class AgentController(QObject):
             preset_name: Name of a preset to use instead of config. If provided, config is ignored.
             **overrides: Additional config overrides when using preset_name.
         """
-        log('DEBUG', 'core.controller', f'start called with query: {query[:50]}...')
+        log('INFO', 'core.controller', 'controller.start() ENTERED')
+        log('INFO', 'core.controller', f'start called with query={query[:80]!r}..., config type={type(config).__name__}, session={session.session_id if session else None}, preset_name={preset_name!r}')
         self._cleanup_if_thread_dead()
         if self._running:
             raise RuntimeError('Agent is already running. Stop it first.')
@@ -118,6 +154,10 @@ class AgentController(QObject):
                 raise ValueError('Must provide either config or preset_name')
             resolved_config = config
             self._agent_override = None
+        if preset_name is not None:
+            log('DEBUG', 'core.controller', f"[CONTROLLER start] preset agent id={id(agent)}, session={session.session_id if session else 'None'}")
+        else:
+            log('DEBUG', 'core.controller', f"[CONTROLLER start] config mode, _agent_override reset, session={session.session_id if session else 'None'}")
         self._query = query
         self._config = resolved_config
         self._session = session
@@ -125,7 +165,9 @@ class AgentController(QObject):
         self.query_queue.put(query)
         self.thread = threading.Thread(target=self._run, daemon=True)
         self._running = True
+        log('DEBUG', 'core.controller', 'start(): _running set to True, starting thread')
         self.thread.start()
+        log('DEBUG', 'core.controller', 'start(): thread.start() returned')
 
     def stop(self):
         """Request the agent to pause after the current turn/tool."""
@@ -133,6 +175,7 @@ class AgentController(QObject):
 
     def continue_session(self, query: str):
         """Submit a new query to the already running agent."""
+        log('DEBUG', 'core.controller', f"[CONTROLLER continue_session] self.agent={'exists' if hasattr(self, 'agent') and self.agent else 'MISSING'}, agent.id={id(self.agent) if hasattr(self, 'agent') and self.agent else 'N/A'}")
         log('DEBUG', 'core.controller', f"continue_session called: query='{query[:50]}...' is_running={self.is_running} pause_event.is_set={self.pause_event.is_set()}")
         if os.environ.get('PAUSE_DEBUG'):
             log('WARNING', 'presenter.pause_flow', f"Controller.continue_session: query='{query[:50]}...', is_running={self.is_running}, pause_event.is_set={self.pause_event.is_set()}, _pause_requested={self._pause_requested}")
@@ -142,6 +185,10 @@ class AgentController(QObject):
             if os.environ.get('PAUSE_DEBUG'):
                 log('WARNING', 'presenter.pause_flow', f'Controller.continue_session: {debug_msg}')
             raise RuntimeError(f'Agent controller not running: {debug_msg}')
+        if self.agent is None:
+            debug_msg = '[Controller] Agent is None (creation failed). Cannot continue session.'
+            log('ERROR', 'core.controller', debug_msg)
+            raise RuntimeError(debug_msg)
         if os.environ.get('PAUSE_DEBUG'):
             log('WARNING', 'presenter.pause_flow', f'Controller.continue_session: calling resume() and queuing query')
         self.resume()
@@ -160,12 +207,11 @@ class AgentController(QObject):
             log('DEBUG', 'core.controller', f'Agent processing query, calling pause()')
             self.pause()
         else:
-            log('DEBUG', 'core.controller', f'Agent idle, sending paused event directly')
+            log('DEBUG', 'core.controller', f'Agent idle (not processing query); setting PAUSING state then emitting session_stop')
             self.pause_event.clear()
             self._pause_requested = True
             if hasattr(self, 'agent') and self.agent is not None and hasattr(self.agent, 'request_pause'):
                 self.agent.request_pause()
-            self._emit_event({'type': 'paused'})
             if hasattr(self, 'agent') and self.agent is not None:
                 from session.context_builder import ContextBuilder
                 if hasattr(self.agent, 'conversation'):
@@ -173,6 +219,13 @@ class AgentController(QObject):
                     self.agent.conversation = ContextBuilder._cleanup_orphaned_tool_messages(self.agent.conversation)
                     if original_len != len(self.agent.conversation):
                         log('WARNING', 'core.controller', f'Cleaned {original_len - len(self.agent.conversation)} orphaned tool messages on idle pause')
+            # Emit execution_state_change (PAUSING) followed by session_stop (READY).
+            # This mirrors the processing-case flow: the agent yields execution_state_change
+            # then 'paused', after which the controller emits session_stop.
+            # The event processor handles the PAUSING→READY transition via session_stop,
+            # giving the GUI time to paint 'Pausing…'.
+            self._emit_event({'type': 'execution_state_change', 'new_state': 'pausing'})
+            self._emit_event({'type': 'session_stop', 'stop_reason': 'paused'})
 
     def get_conversation(self) -> Optional[List[Dict[str, Any]]]:
         """Return the current conversation from the agent, if available."""
@@ -269,31 +322,51 @@ class AgentController(QObject):
                 self.agent._pause_requested = False
 
     def _emit_event(self, event):
-        """Emit event both to queue and signal."""
+        """Emit event to queue, signal, and plain callbacks."""
         event['session_id'] = self.current_session_id
         self.event_queue.put(event)
         log('DEBUG', 'core.controller', f"Emitting event_occurred: {event.get('type')}")
-        self.event_occurred.emit(event)
+        # Qt signal path (requires QApplication running)
+        try:
+            self.event_occurred.emit(event)
+        except RuntimeError:
+            pass  # No QApplication – safe to ignore
+        # Plain callback path (works without Qt — used by Web UI)
+        for cb in self._event_callbacks:
+            try:
+                cb(event)
+            except Exception:
+                import traceback as _tb
+                _tb.print_exc()
         content_event_types = {'user_query', 'turn', 'tool_call', 'tool_result', 'final', 'llm_request', 'llm_response', 'raw_response'}
         if event.get('type') in content_event_types:
             log('DEBUG', 'core.controller', f"Emitting conversation_updated for event type {event.get('type')}")
-            self.conversation_updated.emit(self.current_session_id if self.current_session_id else '')
+            try:
+                self.conversation_updated.emit(self.current_session_id if self.current_session_id else '')
+            except RuntimeError:
+                pass
 
     def _run(self):
         """Internal method that runs in the background thread."""
-        log('DEBUG', 'core.controller', f'_run started')
-        try:
+        log('INFO', 'core.controller', f'_run thread STARTED (threading.get_ident={threading.get_ident()})')
+        log('INFO', 'core.controller', f'_run: self.agent={id(self.agent) if hasattr(self, "agent") and self.agent is not None else None}')
+        if hasattr(self, 'agent') and self.agent is not None:
+            log('DEBUG', 'core.controller', f"[CONTROLLER _run] entering with self.agent={id(self.agent)}, agent.conversation len={len(self.agent.conversation)}, first roles={[m.get('role') for m in self.agent.conversation[:3]]}")
 
-            def should_stop():
-                log('DEBUG', 'core.controller', f'should_stop called, pause_event.is_set={self.pause_event.is_set()}, stop_event.is_set={self.stop_event.is_set()}, _pause_requested={self._pause_requested}')
-                if self.stop_event.is_set():
-                    log('DEBUG', 'core.controller', f'should_stop: stop_event is set, returning True')
-                    return True
-                if not self.pause_event.is_set():
-                    log('DEBUG', 'core.controller', f'should_stop: pause_event not set, returning PAUSED')
-                    return 'PAUSED'
-                log('DEBUG', 'core.controller', f'should_stop: not paused, returning False')
-                return False
+        def should_stop():
+            log('DEBUG', 'core.controller', f'should_stop called, pause_event.is_set={self.pause_event.is_set()}, stop_event.is_set={self.stop_event.is_set()}, _pause_requested={self._pause_requested}')
+            if self.stop_event.is_set():
+                log('DEBUG', 'core.controller', f'should_stop: stop_event is set, returning True')
+                return True
+            if not self.pause_event.is_set():
+                log('DEBUG', 'core.controller', f'should_stop: pause_event not set, returning PAUSED')
+                return 'PAUSED'
+            log('DEBUG', 'core.controller', f'should_stop: not paused, returning False')
+            return False
+
+        log('INFO', 'core.controller', '_run(): about to create agent')
+        # --- Agent creation (separate try/except to keep thread alive on failure) ---
+        try:
             if hasattr(self, '_agent_override') and self._agent_override is not None:
                 agent = self._agent_override
                 agent.config.stop_check = should_stop
@@ -309,9 +382,43 @@ class AgentController(QObject):
             else:
                 run_config = self._config.model_copy() if hasattr(self._config, 'model_copy') else self._config
                 run_config.stop_check = should_stop
+                log('DEBUG', 'core.controller', "[CONTROLLER] creating new Agent instance")
+                # Ensure API key is set from env vars if config doesn't have one
+                api_key_val = getattr(run_config, 'api_key', None) or ''
+                if not api_key_val:
+                    import os
+                    api_key_val = os.getenv('OPENAI_API_KEY') or os.getenv('DEEPSEEK_API_KEY') or os.getenv('OPENAI_COMPATIBLE_API_KEY') or ''
+                    if api_key_val:
+                        run_config.api_key = api_key_val
+                        log('INFO', 'core.controller', f"[CONTROLLER] Filled missing api_key from env var")
                 agent = Agent(run_config, session=self._session if hasattr(self, '_session') else None)
                 self.agent = agent
+            # Propagate agent's session_id so events carry it (needed for Web UI bridge)
+            if self.agent and not self.current_session_id:
+                self.current_session_id = self.agent.session_id or str(uuid.uuid4())
+            log('INFO', 'core.controller', f'_run: Agent created successfully, agent.id={id(self.agent) if self.agent else None}')
+        except Exception as e:
+            log('ERROR', 'core.controller', f'_run: Agent creation FAILED: {e}')
+            traceback.print_exc()
+            self.agent = None
+            self._emit_event({'type': 'error', 'error_type': 'AGENT_CREATION_ERROR', 'message': str(e), 'traceback': traceback.format_exc()})
+
+        # --- Main processing loop ---
+        try:
             while self._keep_alive:
+                if self.agent is None:
+                    # Agent creation failed; wait for stop or reset
+                    log('DEBUG', 'core.controller', '_run: No agent available, waiting in agentless idle loop')
+                    try:
+                        query = self.query_queue.get(timeout=1.0)
+                    except queue.Empty:
+                        continue
+                    if query in ('[RESET]', '[STOP]'):
+                        log('DEBUG', 'core.controller', '_run: Received stop/reset in agentless state, breaking')
+                        break
+                    # Ignore other queries when agent is None
+                    continue
+
                 stop_result = should_stop()
                 if stop_result:
                     if stop_result == 'PAUSED':
@@ -330,33 +437,35 @@ class AgentController(QObject):
                 if query == '[RESET]':
                     agent.reset()
                     continue
-                if query == '[PAUSE]':
-                    log('DEBUG', 'core.controller', f'Pause requested')
-                    self._emit_event({'type': 'paused'})
-                    continue
-                log('DEBUG', 'core.controller', f'Processing query: {query[:50]}...')
+                log('INFO', 'core.controller', f'Processing query: {query[:80]!r}...')
                 self._processing_query = True
-                for event in agent.process_query(query):
-                    log('DEBUG', 'core.controller', f"Event: {event['type']}")
-                    self._emit_event(event)
-                    if event['type'] == 'paused':
-                        self._pause_requested = False
-                        break
-                    if event['type'] in ('stopped', 'error', 'max_turns'):
-                        log('DEBUG', 'core.controller', f"Terminal event {event['type']} detected, treating as pause")
-                        self._pause_requested = False
-                        self._emit_event({'type': 'paused'})
-                        break
-                    elif event['type'] in ('final', 'user_interaction_requested'):
-                        log('DEBUG', 'core.controller', f'Sending paused event')
-                        self._emit_event({'type': 'paused'})
-                        break
-                    if not self.pause_event.is_set():
-                        log('DEBUG', 'core.controller', f'pause_event not set between events, breaking loop')
-                        self._pause_requested = False
-                        self._emit_event({'type': 'paused'})
-                        break
-                self._processing_query = False
+                stop_reason = None
+                try:
+                    # ── Controller diagnostic ───────────────────────────────────────
+                    if hasattr(agent, 'conversation'):
+                        log('INFO', 'core.controller', f"[CONTROLLER _run] passing query to agent. agent.conversation has {len(agent.conversation)} msgs. roles={[m.get('role') for m in agent.conversation]}")
+                        log('INFO', 'core.controller', f'[CONTROLLER _run] about to call agent.process_query()')
+                    else:
+                        log('DEBUG', 'core.controller', "[CONTROLLER _run] agent has NO conversation attribute")
+                    for event in agent.process_query(query):
+                        log('DEBUG', 'core.controller', f"Event: {event['type']}")
+                        self._emit_event(event)
+                        if event.get('stop_reason'):
+                            log('DEBUG', 'core.controller', f"Stop reason: {event['stop_reason']}, breaking loop")
+                            self._pause_requested = False
+                            stop_reason = event['stop_reason']
+                            break
+                        if not self.pause_event.is_set():
+                            log('DEBUG', 'core.controller', f'pause_event not set between events, breaking loop')
+                            self._pause_requested = False
+                            break
+                except Exception as e:
+                    log('ERROR', 'core.controller', f'Unhandled exception during process_query: {e}')
+                    traceback.print_exc()
+                    stop_reason = 'error'
+                finally:
+                    self._processing_query = False
+                    self._emit_event({'type': 'session_stop', 'stop_reason': stop_reason or 'completed'})
                 if not self._keep_alive:
                     log('DEBUG', 'core.controller', f'_keep_alive=False, breaking outer loop')
                     break

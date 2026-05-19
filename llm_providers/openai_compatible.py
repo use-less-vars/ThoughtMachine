@@ -4,7 +4,6 @@ Works with OpenAI, DeepSeek, OpenCode/Big Pickle, and any OpenAI-compatible API.
 """
 from typing import Dict, List, Any, Optional
 import time
-import logging
 import os
 import sys
 from openai import OpenAI, APIError, RateLimitError, APIConnectionError
@@ -12,9 +11,6 @@ import tiktoken
 from .base import LLMProvider, ProviderConfig, LLMResponse
 from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError
 from agent.logging import log
-logger = logging.getLogger(__name__)
-if os.environ.get('DEBUG_OPENAI'):
-    logger.setLevel(logging.DEBUG)
 
 class OpenAICompatibleProvider(LLMProvider):
     """
@@ -26,16 +22,13 @@ class OpenAICompatibleProvider(LLMProvider):
     def __init__(self, config: ProviderConfig):
         super().__init__(config)
         client_kwargs = {'api_key': config.api_key, 'timeout': config.timeout, 'max_retries': config.max_retries}
-        logger.debug(f'OpenAI client config: base_url={config.base_url}, model={config.model}, api_key={config.api_key}, timeout={config.timeout}, max_retries={config.max_retries}, extra_headers={config.extra_headers}')
         log('DEBUG', 'llm.openai', f'client config: base_url={config.base_url}, model={config.model}, api_key={config.api_key}, timeout={config.timeout}, max_retries={config.max_retries}, extra_headers={config.extra_headers}')
         if config.base_url:
             client_kwargs['base_url'] = config.base_url
         if config.extra_headers:
             client_kwargs['default_headers'] = config.extra_headers
-        logger.debug(f"OpenAI client final kwargs: base_url={client_kwargs.get('base_url')}, default_headers={client_kwargs.get('default_headers')}")
         log('DEBUG', 'llm.openai', f"client final kwargs: base_url={client_kwargs.get('base_url')}, default_headers={client_kwargs.get('default_headers')}")
         self.client = OpenAI(**client_kwargs)
-        logger.debug(f"OpenAI client created with base_url={(self.client.base_url if hasattr(self.client, 'base_url') else 'default')}")
         log('DEBUG', 'llm.openai', f"client created with base_url={(self.client.base_url if hasattr(self.client, 'base_url') else 'default')}")
         self.encoding = None
 
@@ -45,7 +38,7 @@ class OpenAICompatibleProvider(LLMProvider):
             return
         try:
             self.encoding = tiktoken.encoding_for_model(self.config.model)
-            logger.debug(f'Loaded tokenizer for model: {self.config.model}')
+            log('DEBUG', 'llm.openai', f'Loaded tokenizer for model: {self.config.model}')
         except KeyError:
             try:
                 model_lower = self.config.model.lower()
@@ -58,10 +51,10 @@ class OpenAICompatibleProvider(LLMProvider):
                 else:
                     self.encoding = tiktoken.get_encoding('cl100k_base')
             except Exception as e:
-                logger.warning(f'Failed to load tokenizer: {e}. Token counting will be approximate.')
+                log('WARNING', 'llm.openai', f'Failed to load tokenizer: {e}. Token counting will be approximate.')
                 self.encoding = None
         except Exception as e:
-            logger.warning(f'Failed to load tokenizer: {e}. Token counting will be approximate.')
+            log('WARNING', 'llm.openai', f'Failed to load tokenizer: {e}. Token counting will be approximate.')
             self.encoding = None
 
     def _normalize_deepseek_tool_calls(self, messages):
@@ -257,7 +250,7 @@ class OpenAICompatibleProvider(LLMProvider):
                     messages_with_ids.append(msg_copy)
                 messages = messages_with_ids
                 messages = self._normalize_deepseek_tool_calls(messages)
-                logger.debug(f'DeepSeek: Added IDs to {len(messages)} messages')
+                log('DEBUG', 'llm.openai', f'DeepSeek: Added IDs to {len(messages)} messages')
                 for i, msg in enumerate(messages):
                     pass
             is_stepfun = 'stepfun' in self.config.model.lower()
@@ -275,7 +268,7 @@ class OpenAICompatibleProvider(LLMProvider):
             if tools:
                 completion_kwargs['tools'] = self.format_tools(tools)
                 completion_kwargs['tool_choice'] = kwargs.get('tool_choice', 'auto')
-            logger.debug(f"OpenAI API call: model={completion_kwargs.get('model')}, temperature={completion_kwargs.get('temperature')}, max_tokens={completion_kwargs.get('max_tokens')}, tools_count={(len(tools) if tools else 0)}, base_url={(self.client.base_url if hasattr(self.client, 'base_url') else 'default')}, api_key={self.config.api_key}")
+            log('DEBUG', 'llm.openai', f"OpenAI API call: model={completion_kwargs.get('model')}, temperature={completion_kwargs.get('temperature')}, max_tokens={completion_kwargs.get('max_tokens')}, tools_count={(len(tools) if tools else 0)}, base_url={(self.client.base_url if hasattr(self.client, 'base_url') else 'default')}, api_key={self.config.api_key}")
             if 'deepseek' in self.config.model.lower() or (self.config.base_url and 'deepseek' in self.config.base_url.lower()):
                 for i, msg in enumerate(completion_kwargs.get('messages', [])):
                     pass
@@ -286,7 +279,51 @@ class OpenAICompatibleProvider(LLMProvider):
                 for i, msg in enumerate(completion_kwargs.get('messages', [])):
                     if msg.get('role') == 'assistant' and 'tool_calls' in msg:
                         pass
+            # ── [REQUEST LOG] Diagnostic: dump full request payload ──────────────
+            import json as _json
+            _safe_messages = []
+            for _m in completion_kwargs.get('messages', []):
+                _mc = {k: v for k, v in _m.items() if k != 'id'}
+                if isinstance(_mc.get('content'), str) and len(_mc['content']) > 200:
+                    _mc['content'] = _mc['content'][:200] + f'... [truncated, total {len(_mc["content"])} chars]'
+                _safe_messages.append(_mc)
+            _log_payload = {
+                'model': completion_kwargs.get('model'),
+                'base_url': str(self.client.base_url) if hasattr(self.client, 'base_url') else 'N/A',
+                'api_key_prefix': (self.config.api_key[:8] + '...') if self.config.api_key else 'NONE',
+                'temperature': completion_kwargs.get('temperature'),
+                'max_tokens': completion_kwargs.get('max_tokens'),
+                'tool_choice': completion_kwargs.get('tool_choice'),
+                'tools_count': len(completion_kwargs.get('tools', [])),
+                'tools_names': [t.get('function', {}).get('name', '?') for t in (completion_kwargs.get('tools') or [])],
+                'messages_count': len(_safe_messages),
+                'messages_roles': [m.get('role') for m in _safe_messages],
+                'messages_preview': _safe_messages[:6],  # first 6 messages
+            }
+            log('DEBUG', 'llm.openai', '[REQUEST LOG] FULL REQUEST PAYLOAD:\n' + _json.dumps(_log_payload, indent=2, default=str, ensure_ascii=False))
+            log('DEBUG', 'llm.openai', f"[NEW REQUEST] model={self.config.model}, tools_count={len(tools) if tools else 0}, tool_choice={kwargs.get('tool_choice', 'NOT SET')}, base_url={self.config.base_url}")
+            log('DEBUG', 'llm.openai', f"[MESSAGES] system_prompt={'present' if any(m['role']=='system' for m in messages) else 'MISSING'}, message_count={len(messages)}")
+            if tools:
+                log('DEBUG', 'llm.openai', f"[TOOLS SAMPLE] first_tool={tools[0]['function']['name']}, format={type(tools)}")
             response = self.client.chat.completions.create(**completion_kwargs)
+            # ── [REQUEST LOG] Diagnostic: log response ────────────────────────
+            _response_lines = ['[REQUEST LOG] RAW RESPONSE (first choice):']
+            try:
+                _choice = response.choices[0] if response.choices else None
+                if _choice:
+                    _msg = _choice.message
+                    _response_lines.append(f'  finish_reason: {_choice.finish_reason}')
+                    _response_lines.append(f'  content_preview: {str(_msg.content)[:200] if _msg.content else "(empty)"}')
+                    _response_lines.append(f'  has_tool_calls: {bool(hasattr(_msg, "tool_calls") and _msg.tool_calls)}')
+                    if hasattr(_msg, 'tool_calls') and _msg.tool_calls:
+                        for _tc in _msg.tool_calls[:5]:
+                            _response_lines.append(f'  -> ToolCall: id={getattr(_tc, "id", "?")} name={getattr(_tc.function, "name", "?") if hasattr(_tc, "function") else "?"}')
+                    if hasattr(_msg, 'reasoning_content') and _msg.reasoning_content:
+                        _response_lines.append(f'  reasoning_content: {str(_msg.reasoning_content)[:200]}')
+                _response_lines.append(f'  usage: {response.usage}')
+            except Exception as _e:
+                _response_lines.append(f'  (error parsing response: {_e})')
+            log('DEBUG', 'llm.openai', '\n'.join(_response_lines))
             import os
             if os.environ.get('DEBUG_OPENAI'):
                 raw_str = str(response)
@@ -492,7 +529,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 text += str(tools)
             return len(self.encoding.encode(text))
         except Exception as e:
-            logger.warning(f'Token counting failed: {e}')
+            log('WARNING', 'llm.openai', f'Token counting failed: {e}')
             return 0
 
     def _calculate_cost(self, response: LLMResponse) -> float:

@@ -113,7 +113,7 @@ class MCPClientBase(ABC):
         
         # Wait for response with timeout
         try:
-            response = q.get(timeout=30.0)
+            response = q.get(timeout=5.0)
         except queue.Empty:
             with self._lock:
                 self.pending_requests.pop(request_id, None)

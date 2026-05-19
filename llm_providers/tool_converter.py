@@ -4,11 +4,9 @@ Handles OpenAI, Anthropic, and other tool formats .
 """
 from typing import List, Dict, Any
 import json
-import logging
 
+from agent.logging import log
 from .exceptions import ToolFormatError
-
-logger = logging.getLogger(__name__)
 
 class ToolFormatConverter:
     """
@@ -100,7 +98,7 @@ class ToolFormatConverter:
         elif provider == "openai_compatible":
             return ToolFormatConverter._from_openai_tool_calls(response)
         else:
-            logger.warning(f"Unknown provider for tool call conversion: {provider}")
+            log('WARNING', 'llm.tool_converter', f'Unknown provider for tool call conversion: {provider}')
             return []
     
     @staticmethod

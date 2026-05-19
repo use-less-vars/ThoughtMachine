@@ -25,7 +25,8 @@ class ProgressReport(ToolBase):
 
     def execute(self) -> str:
         # Ensure reports directory exists
-        reports_dir = Path("./reports")
+        base = Path(self.workspace_path) if self.workspace_path else Path(".")
+        reports_dir = base / "reports"
         reports_dir.mkdir(parents=True, exist_ok=True)
         
         # Generate timestamp for this update

@@ -3,6 +3,7 @@ pydantic>=2.0.0
 python-dotenv>=1.0.0
 PyQt6>=6.5.0
 fast-json-repair>=0.1.0
+uvicorn>=0.27.0
 libcst
 tiktoken
 docker
@@ -20,3 +21,4 @@ langchain
 langchain-community
 pathspec
 tree-sitter 
+fastapi

@@ -4,7 +4,6 @@ Conversation history management.
 Extracted from agent.py to separate conversation management concerns.
 """
 import os
-import logging
 from datetime import datetime
 import time
 from typing import List, Dict, Any, Optional
@@ -73,20 +72,20 @@ class ConversationManager:
         This ensures tool call sequences stay together, even when they start with
         an assistant (due to pruning cutting off the user part of the turn).
         """
-        logger = self.logger.py_logger if self.logger and hasattr(self.logger, 'py_logger') else logging.getLogger(__name__)
+
         turns = []
         current_turn = []
         debug = os.environ.get('DEBUG_TURN_GROUPING')
         if debug:
-            logger.debug(f'[DEBUG_TURN_GROUPING] Grouping {len(messages)} messages')
+            log('DEBUG', 'core.conversation_manager', f'[DEBUG_TURN_GROUPING] Grouping {len(messages)} messages')
             max_to_show = 10
             for i, msg in enumerate(messages[:max_to_show]):
                 role = msg.get('role')
                 content_preview = str(msg.get('content', ''))[:50]
                 has_tool_calls = 'tool_calls' in msg and msg['tool_calls']
-                logger.debug(f'  [{i}] {role}: {content_preview}... tool_calls={has_tool_calls}')
+                log('DEBUG', 'core.conversation_manager', f'  [{i}] {role}: {content_preview}... tool_calls={has_tool_calls}')
             if len(messages) > max_to_show:
-                logger.debug(f'  ... and {len(messages) - max_to_show} more messages')
+                log('DEBUG', 'core.conversation_manager', f'  ... and {len(messages) - max_to_show} more messages')
         for msg in messages:
             role = msg.get('role')
             if role == 'system':
@@ -111,13 +110,13 @@ class ConversationManager:
                     else:
                         if debug:
                             tool_call_id = msg.get('tool_call_id', 'unknown')
-                            logger.debug(f'[DEBUG_TURN_GROUPING] Discarding orphaned tool message: {tool_call_id}')
+                            log('DEBUG', 'core.conversation_manager', f'[DEBUG_TURN_GROUPING] Discarding orphaned tool message: {tool_call_id}')
                         continue
                 else:
                     current_turn.append(msg)
             else:
                 if debug:
-                    logger.debug(f'[DEBUG_TURN_GROUPING] Discarding orphaned {role} message')
+                    log('DEBUG', 'core.conversation_manager', f'[DEBUG_TURN_GROUPING] Discarding orphaned {role} message')
                 continue
         if current_turn:
             turns.append(current_turn)
@@ -132,12 +131,12 @@ class ConversationManager:
             elif first_role == 'assistant' and first_msg.get('tool_calls'):
                 valid_turns.append(turn)
             elif debug:
-                logger.debug(f'[DEBUG_TURN_GROUPING] Discarding turn starting with {first_role}')
+                log('DEBUG', 'core.conversation_manager', f'[DEBUG_TURN_GROUPING] Discarding turn starting with {first_role}')
         if debug:
-            logger.debug(f'[DEBUG_TURN_GROUPING] Returned {len(valid_turns)} valid turns')
+            log('DEBUG', 'core.conversation_manager', f'[DEBUG_TURN_GROUPING] Returned {len(valid_turns)} valid turns')
             max_to_show = 10
             for i, turn in enumerate(valid_turns[:max_to_show]):
-                logger.debug(f"  Turn {i}: {[msg.get('role') for msg in turn]}")
+                log('DEBUG', 'core.conversation_manager', f"  Turn {i}: {[msg.get('role') for msg in turn]}")
             if len(valid_turns) > max_to_show:
-                logger.debug(f'  ... and {len(valid_turns) - max_to_show} more turns')
+                log('DEBUG', 'core.conversation_manager', f'  ... and {len(valid_turns) - max_to_show} more turns')
         return valid_turns

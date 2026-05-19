@@ -16,7 +16,6 @@ import os
 import queue
 import time
 import traceback
-import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Any, TYPE_CHECKING, Generator
 from agent.logging import log
@@ -39,10 +38,11 @@ from .conversation_manager import ConversationManager
 from .tool_executor import ToolExecutor
 from .turn_transaction import TurnTransaction
 from .debug_context import DebugContext
+from .message_utils import group_messages_into_turns, group_messages_into_turns_with_indices
 if TYPE_CHECKING:
     from agent.config import AgentConfig
     from session.models import Session
-logger = logging.getLogger(__name__)
+
 from .debug_context import PAUSE_DEBUG, pause_debug
 
 class Agent:
@@ -104,7 +104,19 @@ class Agent:
         self.llm_client = LLMClient(config, session, self.logger)
         self.conversation_manager = ConversationManager(session, None, self.logger)
         self.debug_context = DebugContext(self.logger)
+        self._pending_warnings = []  # Buffer for token warnings, flushed after turn commit
         self.tool_classes = config.get_filtered_tool_classes()
+        # Register MCP tools lazily (not during import to avoid hangs)
+        try:
+            from tools.mcp_manager import register_mcp_tools
+            from tools import _update_simplified_toolset
+            register_mcp_tools(timeout=5.0)
+            # Sync SIMPLIFIED_TOOL_CLASSES with newly added MCP tools
+            _update_simplified_toolset()
+            # Recalculate tool_classes to include MCP tools
+            self.tool_classes = config.get_filtered_tool_classes()
+        except Exception as e:
+            log('WARNING', 'core.agent', f"Failed to register MCP tools: {e}")
         self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
         self.tool_executor = ToolExecutor(self.tool_classes, config, None, self.logger, self.security_available, agent=self)
         self.provider = self.llm_client.provider
@@ -151,7 +163,7 @@ class Agent:
             new_config: New AgentConfig to apply.
         """
         self._pending_config = new_config
-        logger.debug(f'Pending config update queued: provider={new_config.provider_type}, model={new_config.model}')
+        log('DEBUG', 'agent.core', f'Pending config update queued: provider={new_config.provider_type}, model={new_config.model}')
 
     def _apply_pending_config(self):
         """Apply pending configuration update if one exists.
@@ -177,11 +189,9 @@ class Agent:
         else:
             # Validate that the new config has an API key available before attempting restart
             if not self._has_api_key(new_config):
-                logger.warning(
-                    f'Cannot restart with provider {new_config.provider_type}: '
+                log('WARNING', 'agent.core', f'Cannot restart with provider {new_config.provider_type}: '
                     f'no API key available. Set {new_config.provider_type.upper()}_API_KEY '
-                    f'environment variable or provide api_key in config.'
-                )
+                    f'environment variable or provide api_key in config.')
                 log('WARNING', 'core.config',
                     '[CONFIG_TRACE] Pending config PRESERVED for retry on next turn '
                     f'(no API key for provider={new_config.provider_type})')
@@ -232,8 +242,9 @@ class Agent:
         # Update config reference
         old_config = self.config
         self.config = new_config
-        # Also update the ToolExecutor's config reference so it picks up
-        # workspace_path and other non-hot-swappable-but-config fields
+        # Also update downstream config references so they pick up
+        # workspace_path, token thresholds, and other HOT_SWAPPABLE fields
+        self.state.config = new_config
         self.tool_executor.config = new_config
 
         # Rebuild tools if enabled_tools changed
@@ -248,7 +259,7 @@ class Agent:
             changed.append(f'enabled_tools={", ".join(new_config.enabled_tools)}')
         
         if changed:
-            logger.debug(f'Config hot-swapped: {", ".join(changed)}')
+            log('DEBUG', 'agent.core', f'Config hot-swapped: {", ".join(changed)}')
             if self.logger:
                 self.logger.log_system_event(f'Config hot-swapped: {", ".join(changed)}')
 
@@ -260,7 +271,7 @@ class Agent:
         """
         success = self.restart(new_config)
         if not success:
-            logger.error(f'Agent restart with provider={new_config.provider_type} failed')
+            log('ERROR', 'agent.core', f'Agent restart with provider={new_config.provider_type} failed')
 
     @staticmethod
     def _has_api_key(config: AgentConfig) -> bool:
@@ -317,7 +328,7 @@ class Agent:
                 old_tool_executor.close()
 
             # Reset execution state
-            self.state.set_execution_state(ExecutionState.IDLE)
+            self.state.set_execution_state(ExecutionState.READY)
             self._next_query_queue = queue.Queue()
             self._paused = False
             self._pause_requested = False
@@ -325,6 +336,8 @@ class Agent:
 
             # Update config reference
             self.config = new_config
+            # Also update downstream config references (state picks up token thresholds etc.)
+            self.state.config = new_config
             self.token_counter = TokenCounter(new_config)
 
             # Re-initialise LLM client and provider from new_config
@@ -362,19 +375,19 @@ class Agent:
             # Reset rate limiting
             self.reset_rate_limiting()
 
-            logger.debug(f'Agent restarted with provider={new_config.provider_type}, model={new_config.model}')
+            log('DEBUG', 'agent.core', f'Agent restarted with provider={new_config.provider_type}, model={new_config.model}')
             if self.logger:
                 self.logger.log_info('AGENT_RESTART', f'Configuration reloaded, provider: {self.provider}')
             return True
         except Exception as e:
-            logger.error(f'Failed to restart agent: {e}', exc_info=True)
+            log('ERROR', 'agent.core', f'Failed to restart agent: {e}')
             # Restore old LLM client so agent isn't left in a broken state
             if old_config is not None and old_logger is not None:
                 try:
                     self.llm_client = LLMClient(old_config, self._session, old_logger)
                     self.provider = self.llm_client.provider
                 except Exception as restore_error:
-                    logger.critical(f'Failed to restore old LLM client after restart failure: {restore_error}')
+                    log('CRITICAL', 'agent.core', f'Failed to restore old LLM client after restart failure: {restore_error}')
             else:
                 self.llm_client = None
                 self.provider = None
@@ -460,22 +473,16 @@ class Agent:
             old_state = event.get('old_state')
             new_state = event.get('new_state')
             if self.logger:
-                self.logger.py_logger.debug(f'Execution state change: {old_state} -> {new_state}')
+                log('DEBUG', 'agent.core', f'Execution state change: {old_state} -> {new_state}')
             self._add_conversation_data_to_event(event)
             yield event
         elif event.get('type') == 'session_state_change':
             old_state = event.get('old_state')
             new_state = event.get('new_state')
             if self.logger:
-                self.logger.py_logger.debug(f'Session state change: {old_state} -> {new_state}')
+                log('DEBUG', 'agent.core', f'Session state change: {old_state} -> {new_state}')
             self._add_conversation_data_to_event(event)
             yield event
-        elif event.get('type') == 'state_change':
-            if self.logger:
-                self.logger.py_logger.debug(f"State change: {event.get('old_state')} -> {event.get('new_state')}")
-            self._add_conversation_data_to_event(event)
-            yield event
-
     def _update_conversation_token_estimate(self):
         """Update current_conversation_tokens by estimating tokens for runtime context."""
         log('DEBUG', 'core.context_builder', f"_update_conversation_token_estimate: has context_builder={hasattr(self, 'context_builder')}, context_builder is None={(self.context_builder if hasattr(self, 'context_builder') else 'no attr')}")
@@ -510,7 +517,7 @@ class Agent:
         original_len = len(runtime_context)
         runtime_context = ContextBuilder._cleanup_orphaned_tool_messages(runtime_context)
         if original_len != len(runtime_context):
-            logger.debug(f'[DEBUG_CONTEXT] Token estimate: cleaned {original_len - len(runtime_context)} orphaned tool messages')
+            log('DEBUG', 'agent.core', f'[DEBUG_CONTEXT] Token estimate: cleaned {original_len - len(runtime_context)} orphaned tool messages')
         estimated_tokens = 0
         for msg in runtime_context:
             estimated_tokens += self.token_counter.estimate_tokens(msg)
@@ -520,7 +527,7 @@ class Agent:
             log('DEBUG', 'core.token_estimate', f'context_builder.token_limit: {self.context_builder.token_limit}')
         log('DEBUG', 'core.pruning', f'Runtime context token estimate (from {len(runtime_context)}/{len(self.conversation)} messages)', {'tokens': estimated_tokens})
         if self.logger and hasattr(self.logger, 'py_logger'):
-            self.logger.py_logger.info(f'[TOKEN_ESTIMATE] Updated runtime context token estimate: {estimated_tokens} tokens (from {len(runtime_context)}/{len(self.conversation)} messages)')
+            log('INFO', 'agent.core', f'[TOKEN_ESTIMATE] Updated runtime context token estimate: {estimated_tokens} tokens (from {len(runtime_context)}/{len(self.conversation)} messages)')
 
     def _add_to_conversation(self, message):
         """Add a message via conversation_manager (ensures cache invalidation)."""
@@ -553,17 +560,19 @@ class Agent:
         """
         if tool_tokens is not None:
             self.state.current_conversation_tokens += tool_tokens
+            log('DEBUG', 'core.agent.token', f'Tool result added {tool_tokens}, current_tokens now: {self.state.current_conversation_tokens}')
 
         # Process any warnings or state changes from the token update
         for event in self.state.update_token_state(self.state.current_conversation_tokens):
             if event['type'] == 'token_warning':
-                # Inject the warning as a user-visible message so the agent can react
+                # Buffer the warning instead of injecting immediately — it will be flushed
+                # after turn_transaction.commit() so it lands in correct chronological order.
                 warning_msg = {
                     'role': 'user',
                     'content': f'[SYSTEM NOTIFICATION] {event.get("message", event.get("warning", ""))}',
                     'is_system_notification': True
                 }
-                self._add_to_conversation(warning_msg)
+                self._pending_warnings.append(warning_msg)
                 warning_tokens = self._estimate_tokens(warning_msg)
                 self.state.current_conversation_tokens += warning_tokens
     @property
@@ -657,14 +666,11 @@ class Agent:
         # Safety check: ensure LLM client is in a valid state after config update
         llm_client = getattr(self, 'llm_client', None)
         if llm_client is None or getattr(llm_client, 'provider', None) is None:
-            logger.error('LLM client is unavailable or in invalid state after config update')
-            events = self.state.set_execution_state(ExecutionState.WAITING_FOR_USER)
-            for event in events:
-                for yielded_event in self._handle_state_event(event):
-                    yield yielded_event
+            log('ERROR', 'agent.core', 'LLM client is unavailable or in invalid state after config update')
             event_dict = {
                 'type': 'error',
                 'error_type': 'invalid_config',
+                'stop_reason': 'error',
                 'message': 'LLM client unavailable after configuration update. The new configuration may be invalid.',
                 'turn': self._display_turn,
             }
@@ -690,7 +696,7 @@ class Agent:
         if current_exec_state == ExecutionState.RUNNING:
             if self.logger:
                 self.logger.log_error('EXECUTION_STATE', 'process_query called while already RUNNING')
-        elif current_exec_state in (ExecutionState.PAUSED, ExecutionState.WAITING_FOR_USER):
+        elif current_exec_state == ExecutionState.READY:
             events = self.state.set_execution_state(ExecutionState.RUNNING)
             for event in events:
                 for yielded_event in self._handle_state_event(event):
@@ -732,16 +738,12 @@ class Agent:
                 for event in events:
                     for yielded_event in self._handle_state_event(event):
                         yield yielded_event
-                events = self.state.set_execution_state(ExecutionState.PAUSED)
-                for event in events:
-                    for yielded_event in self._handle_state_event(event):
-                        yield yielded_event
                 if self.logger:
                     self.logger.log_stop_signal()
                     self.logger.log_system_resources()
                     self.logger.log_agent_end('stopped', 'Stop signal received')
                     self.logger.close()
-                stopped_event = {'type': 'stopped', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                stopped_event = {'type': 'stopped', 'stop_reason': 'stopped', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                 self._add_conversation_data_to_event(stopped_event)
                 yield stopped_event
                 return
@@ -776,10 +778,10 @@ class Agent:
                         msg['reasoning_content'] = ''
             if self.logger and hasattr(self.logger, 'py_logger'):
                 system_msgs = [msg for msg in self.conversation if msg.get('role') == 'system']
-                self.logger.py_logger.info(f'[CONVERSATION] Total messages: {len(self.conversation)}, system messages: {len(system_msgs)}')
+                log('INFO', 'agent.core', f'[CONVERSATION] Total messages: {len(self.conversation)}, system messages: {len(system_msgs)}')
             max_context_tokens = self._get_max_context_tokens()
             if self.logger and hasattr(self.logger, 'py_logger'):
-                self.logger.py_logger.info(f'[CONTEXT] Max context tokens: {max_context_tokens}, model: {self.config.model}')
+                log('INFO', 'agent.core', f'[CONTEXT] Max context tokens: {max_context_tokens}, model: {self.config.model}')
             self.debug_context.debug_context('before_build', context_builder=self.context_builder)
             if hasattr(self, 'context_builder') and self.context_builder is not None:
                 messages = self.context_builder.build(self.conversation, max_tokens=max_context_tokens)
@@ -794,7 +796,7 @@ class Agent:
             original_len = len(messages)
             messages = ContextBuilder._cleanup_orphaned_tool_messages(messages)
             if original_len != len(messages):
-                logger.debug(f'[DEBUG_CONTEXT] Agent: cleaned {original_len - len(messages)} orphaned tool messages from final context')
+                log('DEBUG', 'agent.core', f'[DEBUG_CONTEXT] Agent: cleaned {original_len - len(messages)} orphaned tool messages from final context')
             if self.logger and hasattr(self.logger, 'py_logger'):
                 import tiktoken
                 try:
@@ -802,63 +804,50 @@ class Agent:
                 except Exception:
                     encoder = None
                 total_tokens = sum((self.token_counter.estimate_tokens(msg) for msg in messages))
-                self.logger.py_logger.info(f'[CONTEXT] Built context: {len(messages)} messages, ~{total_tokens} tokens')
+                log('INFO', 'agent.core', f'[CONTEXT] Built context: {len(messages)} messages, ~{total_tokens} tokens')
             if self.logger:
                 self.logger.log_llm_request(messages, self.tool_definitions)
             if self.rate_limit_active:
                 delay = min(self.rate_limit_delay, self.rate_limit_max_wait)
                 if delay > 0:
                     if self.logger and hasattr(self.logger, 'py_logger'):
-                        self.logger.py_logger.info(f'[RATE_LIMIT] Applying rate limit delay: {delay}s between turns')
+                        log('INFO', 'agent.core', f'[RATE_LIMIT] Applying rate limit delay: {delay}s between turns')
                     time.sleep(delay)
             tools = self.llm_client.format_tools(self.tool_definitions)
-            request_tokens = self.token_counter.estimate_request_tokens(messages, tools)
-            model_context_window = self.token_counter.get_model_context_window()
-            critical_threshold = int(model_context_window * 0.95)
-            warning_threshold = int(model_context_window * 0.85)
-            if request_tokens > critical_threshold:
-                warning = f'Request token count ({request_tokens}) is near model context window limit ({model_context_window}). Please use SummarizeTool immediately to reduce context size.'
-                warning_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + warning, 'is_system_notification': True}
-                self._add_to_conversation(warning_msg)
-                # Also add to messages so the LLM sees the warning in this turn
-                messages.append(warning_msg)
-                warning_tokens = self._estimate_tokens(warning_msg)
-                self.state.current_conversation_tokens += warning_tokens
-                yield self._create_token_update_event()
-                event_dict = {'type': 'token_warning', 'message': warning, 'token_count': request_tokens, 'old_state': 'low', 'new_state': 'critical', 'state': 'critical', 'request_tokens': request_tokens, 'model_context_window': model_context_window}
-                self._add_conversation_data_to_event(event_dict)
-                yield event_dict
-                if self.logger:
-                    self.logger.log_token_warning('low', 'critical', request_tokens, f'Request tokens {request_tokens} near model context window {model_context_window}')
-            elif request_tokens > warning_threshold:
-                warning = f'Request token count ({request_tokens}) is approaching model context window ({model_context_window}). Consider using SummarizeTool soon.'
-                warning_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + warning, 'is_system_notification': True}
-                self._add_to_conversation(warning_msg)
-                # Also add to messages so the LLM sees the warning in this turn
-                messages.append(warning_msg)
-                warning_tokens = self._estimate_tokens(warning_msg)
-                self.state.current_conversation_tokens += warning_tokens
-                yield self._create_token_update_event()
-                event_dict = {'type': 'token_warning', 'message': warning, 'token_count': request_tokens, 'old_state': 'low', 'new_state': 'warning', 'state': 'warning', 'request_tokens': request_tokens, 'model_context_window': model_context_window}
-                self._add_conversation_data_to_event(event_dict)
-                yield event_dict
-                if self.logger:
-                    self.logger.log_token_warning('low', 'warning', request_tokens, f'Request tokens {request_tokens} approaching model context window {model_context_window}')
+            # EMERGENCY TRACE: dump conversation and messages before LLM call
+            log('DEBUG', 'debug.emergency', f'====== EMERGENCY TRACE: self.conversation ({len(self.conversation)} msgs) ======')
+            for i, msg in enumerate(self.conversation):
+                role = msg.get('role', 'unknown')
+                content = msg.get('content', '')
+                preview = content[:80].replace('\n', '\\n')
+                log('DEBUG', 'debug.emergency', f'  CONV[{i}] role={role}: {preview}')
+            log('DEBUG', 'debug.emergency', f'====== EMERGENCY TRACE: messages from build() ({len(messages)} msgs) ======')
+            for i, msg in enumerate(messages):
+                role = msg.get('role', 'unknown')
+                content = msg.get('content', '')
+                preview = content[:80].replace('\n', '\\n')
+                log('DEBUG', 'debug.emergency', f'  MSG[{i}] role={role}: {preview}')
             try:
                 chat_kwargs = {'temperature': self.runtime_params.temperature}
                 if self.runtime_params.max_tokens is not None:
                     chat_kwargs['max_tokens'] = self.runtime_params.max_tokens
                 if self.runtime_params.top_p is not None:
                     chat_kwargs['top_p'] = self.runtime_params.top_p
+                # ── Agent messages diagnostic ──────────────────────────────────
+                log('DEBUG', 'core.agent', f"[AGENT MESSAGES BEFORE API] turn={turn} len(messages)={len(messages)} "
+                    f"roles={[m.get('role') for m in messages[-5:]]} "
+                    f"last_user={'present' if any(m['role']=='user' for m in messages[-2:]) else 'MISSING'}")
                 llm_start_time = time.time()
                 response = self.llm_client.chat_completion(messages=messages, tools=tools if tools else None, **chat_kwargs)
                 llm_duration_ms = (time.time() - llm_start_time) * 1000
                 if self.logger:
-                    self.logger.log_latency('llm_call', llm_duration_ms, {'turn': turn, 'request_tokens': request_tokens, 'model': self.config.model, 'has_tools': bool(tools)})
+                    self.logger.log_latency('llm_call', llm_duration_ms, {'turn': turn, 'model': self.config.model, 'has_tools': bool(tools)})
                 input_tokens = response.usage.get('prompt_tokens', 0) if response.usage else 0
                 output_tokens = response.usage.get('completion_tokens', 0) if response.usage else 0
                 # Use LLM-reported prompt_tokens as ground truth for conversation token count
+                previous_tokens = self.state.current_conversation_tokens
                 self.state.current_conversation_tokens = input_tokens
+                log('DEBUG', 'core.agent.token', f'LLM prompt_tokens={input_tokens}, overwriting current_tokens (was {previous_tokens})')
                 last_input_tokens = input_tokens
                 last_output_tokens = output_tokens
                 self.total_input_tokens += input_tokens
@@ -875,12 +864,13 @@ class Agent:
                 self._add_conversation_data_to_event(event_dict)
                 yield event_dict
                 time.sleep(wait_time)
-                break
+                if self.session is not None:
+                    self._add_to_conversation({'role': 'user', 'content': f'[SYSTEM NOTIFICATION] Error: RATE_LIMIT_EXCEEDED: rate limit exceeded after {self.rate_limit_count} attempts', 'is_system_notification': True})
+                stop_reason_event = {'type': 'stop_reason', 'stop_reason': 'rate_limit', 'message': f'Rate limit exceeded after {self.rate_limit_count} attempts', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                self._add_conversation_data_to_event(stop_reason_event)
+                yield stop_reason_event
+                return
             except (ProviderError, LLMError) as e:
-                events = self.state.set_execution_state(ExecutionState.STOPPED)
-                for event in events:
-                    for yielded_event in self._handle_state_event(event):
-                        yield yielded_event
                 error_type = 'PROVIDER_ERROR'
                 if isinstance(e, LLMError):
                     error_type = e.error_type.upper()
@@ -889,22 +879,22 @@ class Agent:
                     self.logger.log_system_resources()
                     self.logger.log_agent_end('provider_error', f'Provider error: {e}')
                     self.logger.close()
-                event_dict = {'type': 'error', 'error_type': error_type, 'message': str(e), 'traceback': traceback.format_exc(), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                if self.session is not None:
+                    self._add_to_conversation({'role': 'user', 'content': f'[SYSTEM NOTIFICATION] Error: {error_type}: {e}', 'is_system_notification': True})
+                event_dict = {'type': 'error', 'error_type': error_type, 'message': str(e), 'stop_reason': 'error', 'traceback': traceback.format_exc(), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                 self._add_conversation_data_to_event(event_dict)
                 yield event_dict
                 return
             except Exception as e:
-                logger.exception(f'[Agent] Unexpected exception in process_query: {e}')
-                events = self.state.set_execution_state(ExecutionState.STOPPED)
-                for event in events:
-                    for yielded_event in self._handle_state_event(event):
-                        yield yielded_event
+                log('ERROR', 'agent.core', f'[Agent] Unexpected exception in process_query: {e}')
                 if self.logger:
                     self.logger.log_error('UNEXPECTED_ERROR', str(e))
                     self.logger.log_system_resources()
                     self.logger.log_agent_end('unexpected_error', f'Unexpected error: {e}')
                     self.logger.close()
-                event_dict = {'type': 'error', 'error_type': 'UNEXPECTED_ERROR', 'message': str(e), 'traceback': traceback.format_exc(), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                if self.session is not None:
+                    self._add_to_conversation({'role': 'user', 'content': f'[SYSTEM NOTIFICATION] Error: UNEXPECTED_ERROR: {e}', 'is_system_notification': True})
+                event_dict = {'type': 'error', 'error_type': 'UNEXPECTED_ERROR', 'message': str(e), 'stop_reason': 'error', 'traceback': traceback.format_exc(), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                 self._add_conversation_data_to_event(event_dict)
                 yield event_dict
                 return
@@ -914,26 +904,38 @@ class Agent:
             user_interaction_message = None
             pause_debug(f'Checking pause request before turn: _pause_requested={self._pause_requested}')
             if self._pause_requested:
-                pause_debug(f'Pause detected! Transitioning to PAUSING then PAUSED')
-                events = self.state.set_execution_state(ExecutionState.PAUSING)
-                for event in events:
-                    for yielded_event in self._handle_state_event(event):
-                        yield yielded_event
-                events = self.state.set_execution_state(ExecutionState.PAUSED)
-                for event in events:
-                    for yielded_event in self._handle_state_event(event):
-                        yield yielded_event
-                pause_debug(f'Clearing _pause_requested after pause')
-                self._pause_requested = False
-                pause_event = {'type': 'paused', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens}
-                self._add_conversation_data_to_event(pause_event)
-                yield pause_event
-                turn_duration = time.time() - turn_start_time
-                if self.logger:
-                    self.logger.log_system_resources()
-                    self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
-                return
-            turn_transaction = TurnTransaction(self.session, self.context_builder)
+                if tool_calls:
+                    # Defer pause: tools need to execute first.
+                    # _pause_requested stays True -> checkpoint 2 (line ~998) will catch it
+                    # after tools have run and turn_transaction has been committed.
+                    pause_debug(f'Pause requested but tool_calls present, deferring to after tool execution')
+                else:
+                    pause_debug(f'Pause detected! Transitioning to PAUSING')
+                    # Save grace turn: commit LLM response to user_history BEFORE yielding pause
+                    assistant_msg = {'role': 'assistant', 'content': content}
+                    if reasoning is not None:
+                        assistant_msg['reasoning_content'] = reasoning
+                    elif tool_calls:
+                        assistant_msg['reasoning_content'] = ''
+                    # Don't include tool_calls — they weren't executed
+                    grace_tx = TurnTransaction(self.session, self.context_builder, conversation=None if self._session is not None else self._conversation)
+                    grace_tx.add_assistant_message(assistant_msg)
+                    grace_tx.commit()
+                    events = self.state.set_execution_state(ExecutionState.PAUSING)
+                    for event in events:
+                        for yielded_event in self._handle_state_event(event):
+                            yield yielded_event
+                    pause_debug(f'Clearing _pause_requested after pause')
+                    self._pause_requested = False
+                    pause_event = {'type': 'paused', 'stop_reason': 'paused', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens}
+                    self._add_conversation_data_to_event(pause_event)
+                    yield pause_event
+                    turn_duration = time.time() - turn_start_time
+                    if self.logger:
+                        self.logger.log_system_resources()
+                        self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
+                    return
+            turn_transaction = TurnTransaction(self.session, self.context_builder, conversation=None if self._session is not None else self._conversation)
             assistant_msg = {'role': 'assistant', 'content': content}
             if reasoning is not None:
                 assistant_msg['reasoning_content'] = reasoning
@@ -972,12 +974,14 @@ class Agent:
                     yield event_dict
                 if turn_transaction:
                     turn_transaction.commit()
+                # Flush any buffered token warnings after the turn is committed
+                # so they land chronologically after tool results in user_history
+                for warning in self._pending_warnings:
+                    self._add_to_conversation(warning)
+                self._pending_warnings.clear()
+                log('DEBUG', 'core.agent', f"[TOOL LOOP] conversation length now {len(self.conversation)}, last 3 roles: {[m.get('role') for m in self.conversation[-3:]]}")
                 if final_detected:
-                    events = self.state.set_execution_state(ExecutionState.FINALIZED)
-                    for event in events:
-                        for yielded_event in self._handle_state_event(event):
-                            yield yielded_event
-                    final_event = {'type': 'final', 'content': final_content if final_content is not None else content, 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                    final_event = {'type': 'final', 'stop_reason': 'final', 'content': final_content if final_content is not None else content, 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                     if reasoning is not None:
                         final_event['reasoning'] = reasoning
                     elif tool_calls:
@@ -990,10 +994,6 @@ class Agent:
                         self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
                     return
                 if user_interaction_message is not None:
-                    events = self.state.set_execution_state(ExecutionState.WAITING_FOR_USER)
-                    for event in events:
-                        for yielded_event in self._handle_state_event(event):
-                            yield yielded_event
                     turn_duration = time.time() - turn_start_time
                     if self.logger:
                         self.logger.log_system_resources()
@@ -1005,18 +1005,14 @@ class Agent:
                     yield self._create_token_update_event()
             pause_debug(f'Checking pause request after turn processing: _pause_requested={self._pause_requested}')
             if self._pause_requested:
-                pause_debug(f'Pause detected after turn processing! Transitioning to PAUSING then PAUSED')
+                pause_debug(f'Pause detected after turn processing! Transitioning to PAUSING')
                 events = self.state.set_execution_state(ExecutionState.PAUSING)
-                for event in events:
-                    for yielded_event in self._handle_state_event(event):
-                        yield yielded_event
-                events = self.state.set_execution_state(ExecutionState.PAUSED)
                 for event in events:
                     for yielded_event in self._handle_state_event(event):
                         yield yielded_event
                 pause_debug(f'Clearing _pause_requested after pause (after turn processing)')
                 self._pause_requested = False
-                pause_event = {'type': 'paused', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens}
+                pause_event = {'type': 'paused', 'stop_reason': 'paused', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens}
                 self._add_conversation_data_to_event(pause_event)
                 yield pause_event
                 turn_duration = time.time() - turn_start_time
@@ -1027,19 +1023,15 @@ class Agent:
             if not tool_calls:
                 if turn_transaction and turn_transaction.has_assistant_message():
                     turn_transaction.commit()
-                events = self.state.set_execution_state(ExecutionState.PAUSING)
-                for event in events:
-                    for yielded_event in self._handle_state_event(event):
-                        yield yielded_event
-                events = self.state.set_execution_state(ExecutionState.PAUSED)
-                for event in events:
-                    for yielded_event in self._handle_state_event(event):
-                        yield yielded_event
+                # Flush any buffered token warnings (unlikely here, but be safe)
+                for warning in self._pending_warnings:
+                    self._add_to_conversation(warning)
+                self._pending_warnings.clear()
                 if self.logger:
                     self.logger.log_system_resources()
                     self.logger.log_agent_end('completed', 'Assistant provided direct answer with no tool calls')
                     self.logger.close()
-                final_event = {'type': 'final', 'content': content, 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                final_event = {'type': 'final', 'stop_reason': 'final', 'content': content, 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                 if reasoning is not None:
                     final_event['reasoning'] = reasoning
                 elif tool_calls:
@@ -1047,6 +1039,22 @@ class Agent:
                 self._add_conversation_data_to_event(final_event)
                 yield final_event
                 return
+
+        # Max turns reached - loop exhausted naturally
+        if self.logger:
+            self.logger.log_agent_end('max_turns_reached', f'Max turns ({self.config.max_turns}) reached')
+            self.logger.close()
+        max_turns_event = {
+            'type': 'stop_reason',
+            'stop_reason': 'max_turns_reached',
+            'turns': self.config.max_turns,
+            'turn': self._display_turn,
+            'context_length': self.state.current_conversation_tokens,
+            'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}
+        }
+        self._add_conversation_data_to_event(max_turns_event)
+        yield max_turns_event
+        return
 
     def _apply_summary_pruning(self, summary: str, keep_recent_turns: int):
         """Add summary message to append-only history with metadata.
@@ -1063,14 +1071,15 @@ class Agent:
         if self.conversation:
             dump_messages(self.conversation, "Conversation before summarization")
         if self.session is None:
-            logger.warning('[DEBUG_PRUNING] No session available, using fallback pruning')
-            log('DEBUG', 'core.pruning', 'No session available, using fallback pruning')
+            log('WARNING', 'core.pruning', 'No session available, using fallback pruning')
             self._apply_summary_pruning_fallback(summary, keep_recent_turns)
             old_token_count = self.state.current_conversation_tokens
             self._update_conversation_token_estimate()
+            # Immediately re-evaluate token state to clear restrictions if below critical
+            self.state.update_token_state(self.state.current_conversation_tokens)
             log('DEBUG', 'core.pruning', f'Fallback pruning token change: {old_token_count} -> {self.state.current_conversation_tokens}')
             if self.logger and hasattr(self.logger, 'py_logger'):
-                self.logger.py_logger.info(f'[PRUNING] Updated token estimate after fallback: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
+                log('INFO', 'agent.core', f'[PRUNING] Updated token estimate after fallback: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
             return
         user_history = self.session.user_history
         log('DEBUG', 'core.session_history', f'session.user_history length: {len(user_history)}')
@@ -1119,186 +1128,76 @@ class Agent:
             self.logger.log_conversation_prune(len(user_history) - 1, len(user_history), 'summary_pruning_append_only')
         log('DEBUG', 'core.summary', f'Added summary to append-only history: kept {kept_turns_count} turns, inserted at index {insertion_idx}')
         if self.logger and hasattr(self.logger, 'py_logger'):
-            self.logger.py_logger.info(f'[PRUNING] Added summary to append-only history: kept {kept_turns_count} turns, inserted summary at index {insertion_idx}, history length: {len(user_history)} messages')
+            log('INFO', 'agent.core', f'[PRUNING] Added summary to append-only history: kept {kept_turns_count} turns, inserted summary at index {insertion_idx}, history length: {len(user_history)} messages')
         old_token_count = self.state.current_conversation_tokens
         self._update_conversation_token_estimate()
+        # Immediately re-evaluate token state to clear restrictions if below critical
+        self.state.update_token_state(self.state.current_conversation_tokens)
         log('DEBUG', 'core.pruning', f'Summary pruning token change: {old_token_count} -> {self.state.current_conversation_tokens}, summary_idx={insertion_idx}, kept_turns={kept_turns_count}')
         if self.logger and hasattr(self.logger, 'py_logger'):
-            self.logger.py_logger.info(f'[PRUNING] Updated token estimate: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
+            log('INFO', 'agent.core', f'[PRUNING] Updated token estimate: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
         log('DEBUG', 'core.pruning', f'_apply_summary_pruning completed. History length: {len(user_history)} messages')
         log('DEBUG', 'core.session_history', f'session.summary exists: {self.session.summary is not None}')
 
     def _apply_summary_pruning_fallback(self, summary: str, keep_recent_turns: int):
-        """Fallback pruning for when no session is available (legacy behavior)."""
-        logger.warning('[DEBUG_PRUNING] Using fallback pruning (no session)')
-        system_messages = [msg for msg in self.conversation if msg.get('role') == 'system']
-        other_messages = [msg for msg in self.conversation if msg.get('role') != 'system']
-        if not other_messages:
+        """Fallback pruning for when no session is available (legacy behavior).
+
+        This mirrors the main _apply_summary_pruning path: it mutates the existing
+        conversation list via insert/append rather than replacing it entirely.
+        """
+        log('WARNING', 'core.pruning', '[DEBUG_PRUNING] Using fallback pruning (no session)')
+        if not self.conversation:
             return
-        turns = self._group_messages_into_turns(other_messages)
-        if keep_recent_turns <= 0:
-            kept_turns = []
-        else:
-            kept_turns = turns[-keep_recent_turns:] if keep_recent_turns <= len(turns) else turns
-        MAX_SUMMARY_LENGTH = 4000
+        # Use _find_summary_insertion_index (which uses the shared turn-grouping utility)
+        # to find the correct insertion point
+        insertion_idx = self._find_summary_insertion_index(self.conversation, keep_recent_turns)
+        MAX_SUMMARY_LENGTH = 20000
         truncated_summary = summary
         if len(truncated_summary) > MAX_SUMMARY_LENGTH:
             truncated_summary = truncated_summary[:MAX_SUMMARY_LENGTH] + '... (truncated)'
-        if kept_turns:
-            first_kept_turn_idx = len(turns) - len(kept_turns)
-            discarded_msg_count = sum((len(turns[i]) for i in range(first_kept_turn_idx)))
-        else:
-            discarded_msg_count = len(other_messages)
-        insertion_idx = discarded_msg_count + len(system_messages)
-        summary_msg = {'role': 'system', 'content': f'Summary of previous conversation: {truncated_summary}', 'summary': True, 'pruning_keep_recent_turns': keep_recent_turns, 'pruning_discarded_msg_count': discarded_msg_count, 'pruning_insertion_idx': insertion_idx}
-        cleaned_system_messages = []
-        if system_messages:
-            cleaned_system_messages.append(system_messages[0])
-        pruned_other = []
-        for turn in kept_turns:
-            pruned_other.extend(turn)
-        new_conversation = cleaned_system_messages + [summary_msg] + pruned_other
+        summary_msg = {'role': 'system', 'content': f'Summary of previous conversation: {truncated_summary}', 'summary': True, 'pruning_keep_recent_turns': keep_recent_turns, 'pruning_insertion_idx': insertion_idx}
         context_cleared_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] Context has been summarized. You now have a fresh context window and full access to tools.', 'is_system_notification': True}
-        # Append unwarning after the tool result (at the end of new_conversation)
-        new_conversation.append(context_cleared_msg)
-        self.conversation = new_conversation
-        logger.debug(f'[DEBUG_PRUNING] Fallback pruning: new conversation length {len(self.conversation)}')
+        # Insert summary at the computed position (mutating the existing list)
+        self.conversation.insert(insertion_idx, summary_msg)
+        log('DEBUG', 'core.message_insertion', f'Fallback: inserted summary at index {insertion_idx}')
+        # Append context-cleared notification at the end
+        self.conversation.append(context_cleared_msg)
+        log('DEBUG', 'core.message_insertion', f'Fallback: appended context cleared message (history length: {len(self.conversation)})')
+        # Invalidate context_builder cache to pick up the new summary
+        if hasattr(self, 'context_builder') and self.context_builder is not None and hasattr(self.context_builder, '_cached_context'):
+            self.context_builder._cached_context = None
+            log('DEBUG', 'core.context_builder', 'Fallback pruning: cleared _cached_context')
+        log('DEBUG', 'core.pruning', f'[DEBUG_PRUNING] Fallback pruning: conversation length {len(self.conversation)}')
 
     def _find_summary_insertion_index(self, user_history: List[Dict[str, Any]], keep_recent_turns: int) -> int:
         """Find index in user_history where summary should be inserted.
-        
+
+        Uses the shared group_messages_into_turns_with_indices utility which
+        supports multi-tool-call scenarios (checking ANY message in the turn
+        for assistant with tool_calls, not just the last message).
+
         Returns the index of the first message of the first kept turn.
         If keep_recent_turns is 0 or no turns to keep, returns len(user_history).
         """
         if keep_recent_turns <= 0:
             return len(user_history)
-        turns = []
-        current_turn = []
-        turn_start_indices = []
-        for i, msg in enumerate(user_history):
-            role = msg.get('role')
-            content = msg.get('content', '')
-            # Skip system messages and system notifications
-            if role == 'system' or msg.get('is_system_notification') is True or '[SYSTEM NOTIFICATION]' in content or '[**SYSTEM NOTIFICATION**]' in content:
-                continue
-            if role == 'user':
-                if current_turn:
-                    turns.append(current_turn)
-                current_turn = [msg]
-                turn_start_indices.append(i)
-            elif role == 'assistant' and msg.get('tool_calls'):
-                if current_turn:
-                    turns.append(current_turn)
-                current_turn = [msg]
-                turn_start_indices.append(i)
-            elif current_turn:
-                if role == 'tool':
-                    if current_turn and current_turn[-1].get('role') == 'assistant' and current_turn[-1].get('tool_calls'):
-                        current_turn.append(msg)
-                    else:
-                        continue
-                else:
-                    current_turn.append(msg)
-            else:
-                continue
-        if current_turn:
-            turns.append(current_turn)
-        valid_turn_indices = []
-        for idx, turn in enumerate(turns):
-            if not turn:
-                continue
-            first_msg = turn[0]
-            first_role = first_msg.get('role')
-            if first_role == 'user' or (first_role == 'assistant' and first_msg.get('tool_calls')):
-                valid_turn_indices.append(idx)
-        if not valid_turn_indices:
+        turns, turn_start_indices = group_messages_into_turns_with_indices(user_history)
+        if not turns:
             return len(user_history)
-        if keep_recent_turns > len(valid_turn_indices):
-            keep_recent_turns = len(valid_turn_indices)
-        first_kept_valid_idx = len(valid_turn_indices) - keep_recent_turns
-        first_kept_turn_idx = valid_turn_indices[first_kept_valid_idx]
-        if first_kept_turn_idx < len(turn_start_indices):
-            return turn_start_indices[first_kept_turn_idx]
-        else:
-            return len(user_history)
+        if keep_recent_turns > len(turns):
+            keep_recent_turns = len(turns)
+        first_kept_idx = len(turns) - keep_recent_turns
+        return turn_start_indices[first_kept_idx]
 
     def _group_messages_into_turns(self, messages: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
         """Group non-system messages into turns.
-        
-        Rules:
-        - User messages always start a new turn
-        - Assistant messages with tool_calls can also start a turn (after pruning)
-        - All messages after a turn start belong to that turn until next user message
-        - System messages should be filtered out before calling this method
-        - Turns that don't start with user or assistant-with-tools are discarded
-        
-        This ensures tool call sequences stay together, even when they start with
-        an assistant (due to pruning cutting off the user part of the turn).
+
+        Delegates to the shared group_messages_into_turns utility which provides
+        a single source of truth for turn-grouping logic. The shared version
+        uses the more robust multi-tool-call approach (checking ANY message in
+        the turn for assistant with tool_calls, not just the last message).
         """
-        turns = []
-        current_turn = []
-        import os
-        debug = os.environ.get('DEBUG_TURN_GROUPING')
-        if debug:
-            logger.debug(f'[DEBUG_TURN_GROUPING] Grouping {len(messages)} messages')
-            max_to_show = 10
-            for i, msg in enumerate(messages[:max_to_show]):
-                role = msg.get('role')
-                content_preview = str(msg.get('content', ''))[:50]
-                has_tool_calls = 'tool_calls' in msg and msg['tool_calls']
-                logger.debug(f'  [{i}] {role}: {content_preview}... tool_calls={has_tool_calls}')
-            if len(messages) > max_to_show:
-                logger.debug(f'  ... and {len(messages) - max_to_show} more messages')
-        for msg in messages:
-            role = msg.get('role')
-            content = msg.get('content', '')
-            if role == 'system' or msg.get('is_system_notification') is True or '[SYSTEM NOTIFICATION]' in content or '[**SYSTEM NOTIFICATION**]' in content:
-                continue
-            if role == 'user':
-                if current_turn:
-                    turns.append(current_turn)
-                current_turn = [msg]
-            elif role == 'assistant' and msg.get('tool_calls'):
-                if current_turn:
-                    turns.append(current_turn)
-                current_turn = [msg]
-            elif current_turn:
-                if role == 'tool':
-                    if current_turn and current_turn[-1].get('role') == 'assistant' and current_turn[-1].get('tool_calls'):
-                        current_turn.append(msg)
-                    else:
-                        if debug:
-                            tool_call_id = msg.get('tool_call_id', 'unknown')
-                            logger.debug(f'[DEBUG_TURN_GROUPING] Discarding orphaned tool message: {tool_call_id}')
-                        continue
-                else:
-                    current_turn.append(msg)
-            else:
-                if debug:
-                    logger.debug(f'[DEBUG_TURN_GROUPING] Discarding orphaned {role} message')
-                continue
-        if current_turn:
-            turns.append(current_turn)
-        valid_turns = []
-        for turn in turns:
-            if not turn:
-                continue
-            first_msg = turn[0]
-            first_role = first_msg.get('role')
-            if first_role == 'user':
-                valid_turns.append(turn)
-            elif first_role == 'assistant' and first_msg.get('tool_calls'):
-                valid_turns.append(turn)
-            elif debug:
-                logger.debug(f'[DEBUG_TURN_GROUPING] Discarding turn starting with {first_role}')
-        if debug:
-            logger.debug(f'[DEBUG_TURN_GROUPING] Returned {len(valid_turns)} valid turns')
-            max_to_show = 10
-            for i, turn in enumerate(valid_turns[:max_to_show]):
-                logger.debug(f"  Turn {i}: {[msg.get('role') for msg in turn]}")
-            if len(valid_turns) > max_to_show:
-                logger.debug(f'  ... and {len(valid_turns) - max_to_show} more turns')
-        return valid_turns
+        return group_messages_into_turns(messages)
 
     def reset(self):
         """Reset agent state."""
@@ -1334,7 +1233,7 @@ class Agent:
         for tool_cls in SIMPLIFIED_TOOL_CLASSES:
             if tool_cls.__name__ in preset_tool_names:
                 tool_classes.append(tool_cls)
-        config_data = {'api_key': api_key or '', 'base_url': base_url, 'model': preset.model, 'temperature': preset.temperature, 'enabled_tools': list(preset_tool_names), 'system_prompt': preset.system_prompt, 'provider_type': 'openai_compatible', 'max_turns': overrides.get('max_turns', 100), 'detail': overrides.get('detail', 'normal'), 'workspace_path': overrides.get('workspace_path'), 'tool_output_token_limit': overrides.get('tool_output_token_limit', 10000), 'token_monitor_enabled': overrides.get('token_monitor_enabled', True), 'token_monitor_warning_threshold': overrides.get('token_monitor_warning_threshold', 35000), 'token_monitor_critical_threshold': overrides.get('token_monitor_critical_threshold', 50000), 'turn_monitor_enabled': overrides.get('turn_monitor_enabled', True), 'turn_monitor_warning_threshold': overrides.get('turn_monitor_warning_threshold', 0.8), 'turn_monitor_critical_threshold': overrides.get('turn_monitor_critical_threshold', 0.95), 'enable_logging': overrides.get('enable_logging', True), 'log_dir': overrides.get('log_dir', './logs'), 'log_level': overrides.get('log_level', 'INFO'), 'enable_file_logging': overrides.get('enable_file_logging', True), 'enable_console_logging': overrides.get('enable_console_logging', False), 'jsonl_format': overrides.get('jsonl_format', True), 'log_categories': overrides.get('log_categories', ['SESSION', 'LLM', 'TOOLS']), 'max_file_size_mb': overrides.get('max_file_size_mb', 10), 'max_backup_files': overrides.get('max_backup_files', 5)}
+        config_data = {'api_key': api_key or '', 'base_url': base_url, 'model': preset.model, 'temperature': preset.temperature, 'enabled_tools': list(preset_tool_names), 'system_prompt': preset.system_prompt, 'provider_type': 'openai_compatible', 'max_turns': overrides.get('max_turns', 100), 'detail': overrides.get('detail', 'normal'), 'workspace_path': overrides.get('workspace_path'), 'tool_output_token_limit': overrides.get('tool_output_token_limit', 10000), 'token_monitor_enabled': overrides.get('token_monitor_enabled', True), 'token_monitor_warning_threshold': overrides.get('token_monitor_warning_threshold', 35000), 'token_monitor_critical_threshold': overrides.get('token_monitor_critical_threshold', 50000), 'turn_monitor_enabled': overrides.get('turn_monitor_enabled', True), 'enable_logging': overrides.get('enable_logging', True), 'log_dir': overrides.get('log_dir', './logs'), 'log_level': overrides.get('log_level', 'INFO'), 'enable_file_logging': overrides.get('enable_file_logging', True), 'enable_console_logging': overrides.get('enable_console_logging', False), 'jsonl_format': overrides.get('jsonl_format', True), 'log_categories': overrides.get('log_categories', ['SESSION', 'LLM', 'TOOLS']), 'max_file_size_mb': overrides.get('max_file_size_mb', 10)}
         config_data.update(overrides)
         from agent.config import AgentConfig
         config = AgentConfig(**config_data)

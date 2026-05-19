@@ -16,18 +16,12 @@ class TurnState(enum.Enum):
     """Turn usage state based on turn count."""
     LOW = 'low'
     WARNING = 'warning'
-    CRITICAL = 'critical'
 
 class ExecutionState(enum.Enum):
     """Unified execution state for agent and GUI."""
-    IDLE = 'idle'
     RUNNING = 'running'
     PAUSING = 'pausing'
-    PAUSED = 'paused'
-    WAITING_FOR_USER = 'waiting_for_user'
-    FINALIZED = 'finalized'
-    STOPPED = 'stopped'
-    MAX_TURNS_REACHED = 'max_turns_reached'
+    READY = 'ready'
 
 class SessionState(enum.Enum):
     """Session state of the agent."""
@@ -43,7 +37,7 @@ class AgentState:
     security_config: Optional[Dict[str, Any]] = None
     token_state: TokenState = TokenState.LOW
     turn_state: TurnState = TurnState.LOW
-    execution_state: ExecutionState = ExecutionState.IDLE
+    execution_state: ExecutionState = ExecutionState.READY
     session_state: SessionState = SessionState.NEW
     current_conversation_tokens: int = 0
     current_turn: int = 0
@@ -90,8 +84,6 @@ class AgentState:
         self.token_state = new_state
         events = []
         state_order = {TokenState.LOW: 0, TokenState.WARNING: 1, TokenState.CRITICAL: 2}
-        # Save pre-warning pending state so we can defer promotion to next turn
-        old_restrictions_pending = self.restrictions_pending
         if state_order[new_state] > state_order[old_state] and self.last_token_warning_state != new_state and (new_state in (TokenState.WARNING, TokenState.CRITICAL)):
             if new_state == TokenState.WARNING:
                 formatted = self._format_tokens(total_tokens)
@@ -103,24 +95,20 @@ class AgentState:
                     f'The summary will free up the context window and you can continue working smoothly.'
                 )
             else:
-                self.restrictions_pending = True
                 formatted = self._format_tokens(total_tokens)
                 warning = f'Token usage is at the critical threshold ({formatted} tokens). Please summarize to reduce context size or complete work. Only SummarizeTool, Final, and FinalReport will be available.'
-            if new_state != TokenState.CRITICAL:
-                self.last_token_warning = warning
-                self.last_token_warning_count = total_tokens
-                self.last_token_warning_state = new_state
+            self.last_token_warning = warning
+            self.last_token_warning_count = total_tokens
+            self.last_token_warning_state = new_state
             if self.logger:
                 self.logger.log_token_warning(old_state.value, new_state.value, total_tokens, warning)
             token_warning_data = {'old_state': old_state.value, 'new_state': new_state.value, 'token_count': total_tokens, 'warning_message': warning, 'state': new_state.value}
             events.append(self._create_event('token_warning', token_warning_data))
-        # Transition block: promote pending to active, or clear when no longer critical
-        # Deferred promotion: only promote if restrictions_pending was set in a PREVIOUS call
-        # (not just set by the warning block above), giving the agent one turn to summarise
-        if old_restrictions_pending and self.token_state == TokenState.CRITICAL:
+        # Immediate restriction activation: no grace turn
+        if self.token_state == TokenState.CRITICAL:
             self.restrictions_active = True
             self.restrictions_pending = False
-        elif self.token_state != TokenState.CRITICAL and self.turn_state != TurnState.CRITICAL:
+        elif self.token_state != TokenState.CRITICAL and self.turn_state == TurnState.LOW:
             self.restrictions_pending = False
             self.restrictions_active = False
 
@@ -130,7 +118,10 @@ class AgentState:
 
     def update_turn_state(self, current_turn: int) -> List[Dict[str, Any]]:
         """Update turn state based on current turn count.
-        
+
+        Uses a fixed warning threshold: when current_turn >= max_turns - 3,
+        a single final warning is issued and tool restrictions activate.
+
         Returns list of events (e.g., warnings) that should be yielded.
         """
         self.current_turn = current_turn
@@ -138,47 +129,35 @@ class AgentState:
             self.turn_state = TurnState.LOW
             return []
         max_turns = self.config.max_turns
-        warning_threshold = int(max_turns * self.config.turn_monitor_warning_threshold)
-        critical_threshold = int(max_turns * self.config.turn_monitor_critical_threshold)
-        if current_turn < warning_threshold:
+        warning_turn = max_turns - 3
+        if current_turn < warning_turn:
             new_state = TurnState.LOW
-        elif current_turn < critical_threshold:
-            new_state = TurnState.WARNING
         else:
-            new_state = TurnState.CRITICAL
+            new_state = TurnState.WARNING
         old_state = self.turn_state
         self.turn_state = new_state
         events = []
-        state_order = {TurnState.LOW: 0, TurnState.WARNING: 1, TurnState.CRITICAL: 2}
-        # Save pre-warning pending state so we can defer promotion to next turn
-        old_restrictions_pending = self.restrictions_pending
-        if state_order[new_state] > state_order[old_state] and self.last_turn_warning_state != new_state and (new_state in (TurnState.WARNING, TurnState.CRITICAL)):
-            if new_state == TurnState.WARNING:
-                warning = f'**Turn limit warning**: Agent is nearing maximum turn limit ({current_turn}/{max_turns} turns). Please consider wrapping up soon.'
-            else:
-                self.restrictions_pending = True
-                warning = f'Turn usage is at the critical threshold ({current_turn}/{max_turns} turns). Please consider completing your work or summarizing. Only SummarizeTool, Final, and FinalReport will be available.'
-            if new_state != TurnState.CRITICAL:
-                self.last_turn_warning = warning
-                self.last_turn_warning_count = current_turn
-                self.last_turn_warning_state = new_state
+        if new_state == TurnState.WARNING and old_state != TurnState.WARNING and self.last_turn_warning_state != TurnState.WARNING:
+            self.restrictions_active = True
+            self.restrictions_pending = False
+            warning = (
+                f'**Turn limit warning**: You are running out of turns ({current_turn}/{max_turns}). '
+                f'You must wait for the user to re-enable your session. Please provide a final answer now '
+                f'so the user can decide if they want to send you further queries or if they are happy '
+                f'with the result you have so far. Only Final and FinalReport are available.'
+            )
+            self.last_turn_warning = warning
+            self.last_turn_warning_count = current_turn
+            self.last_turn_warning_state = TurnState.WARNING
             if self.logger:
                 self.logger.log_turn_warning(old_state.value, new_state.value, current_turn, warning)
             turn_warning_data = {'old_state': old_state.value, 'new_state': new_state.value, 'turn_count': current_turn, 'warning_message': warning, 'state': new_state.value}
             events.append(self._create_event('turn_warning', turn_warning_data))
-        # Transition block: promote pending to active, or clear when no longer critical
-        # Deferred promotion: only promote if restrictions_pending was set in a PREVIOUS call
-        if old_restrictions_pending and self.turn_state == TurnState.CRITICAL:
-            self.restrictions_active = True
-            self.restrictions_pending = False
-        elif self.turn_state != TurnState.CRITICAL and self.token_state != TokenState.CRITICAL:
-            self.restrictions_pending = False
-            self.restrictions_active = False
-
         if new_state == TurnState.LOW:
             self.last_turn_warning_state = TurnState.LOW
+            self.restrictions_active = False
+            self.restrictions_pending = False
         return events
-
     def set_execution_state(self, new_state: ExecutionState) -> List[Dict[str, Any]]:
         """Transition to a new execution state.
         
@@ -221,7 +200,7 @@ class AgentState:
         self.last_turn_warning_state = TurnState.LOW
         self.last_turn_warning = None
         self.last_turn_warning_count = 0
-        events.extend(self.set_execution_state(ExecutionState.IDLE))
+        events.extend(self.set_execution_state(ExecutionState.READY))
         events.extend(self.set_session_state(SessionState.NEW))
         return events
 
@@ -229,10 +208,10 @@ class AgentState:
     def get_allowed_tools(self) -> List[str]:
         """Get list of allowed tool names based on current states.
 
-        When restrictions_active is True, only summary and final tools are allowed.
+        When restrictions_active is True, only Final, FinalReport, and SummarizeTool are allowed.
         """
         if self.restrictions_active:
-            return ['SummarizeTool', 'Final', 'FinalReport']
+            return ['Final', 'FinalReport', 'SummarizeTool']
         return []
 
     def is_tool_allowed(self, tool_name: str) -> bool:

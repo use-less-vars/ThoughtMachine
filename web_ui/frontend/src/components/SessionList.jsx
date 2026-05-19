@@ -1,0 +1,219 @@
+/*
+ * SessionList.jsx
+ *
+ * Right‑sidebar panel that displays saved sessions.
+ * Supports opening (in a new tab), deleting, and renaming sessions.
+ *
+ * Props:
+ *   sessions   — array of { session_id, name, created_at, updated_at, preview }
+ *   onNew      — create a new tab
+ *   onOpenTab  — called with (sessionId) to open a session in a new tab
+ *   onDelete   — called with (sessionId)
+ *   onRename   — called with (sessionId, newName)
+ *   onSave     — called to save the active tab's session
+ *   saveEnabled — boolean, whether save button is enabled
+ */
+
+import React, { useState, useEffect, useRef, useMemo } from 'react'
+import { List } from 'react-window'
+
+const ITEM_HEIGHT = 72
+
+/**
+ * Row component for react-window v2 List.
+ * Receives { index, style } plus spread rowProps (sessions, callbacks, etc.)
+ */
+const Row = React.memo(({ index, style, sessions, renamingId, renameValue, onOpenTab, onDelete, startRename, submitRename, cancelRename, setRenameValue }) => {
+  const s = sessions && sessions[index]
+  if (!s) return null
+
+  const isRenaming = renamingId === s.session_id
+
+  const handleKeyDown = (e) => {
+    if (e.key === 'Enter') submitRename(s.session_id)
+    if (e.key === 'Escape') cancelRename()
+  }
+
+  return (
+    <div style={style}>
+      <div className={`session-item${isRenaming ? ' session-item-renaming' : ''}`}>
+        {isRenaming ? (
+          <div className="session-rename-form">
+            <input
+              type="text"
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+              onKeyDown={handleKeyDown}
+              autoFocus
+              className="session-rename-input"
+            />
+            <button className="btn btn-sm" onClick={() => submitRename(s.session_id)}>
+              ✓
+            </button>
+            <button className="btn btn-sm" onClick={cancelRename}>
+              ✗
+            </button>
+          </div>
+        ) : (
+          <>
+            <div
+              className="session-item-info"
+              onClick={() => onOpenTab(s.session_id)}
+              title="Open in new tab"
+            >
+              <div className="session-item-name">
+                {s.name || 'Untitled'}
+              </div>
+              <div className="session-item-meta">
+                {formatDate(s.updated_at || s.created_at)}
+                {s.preview && ` — ${s.preview}`}
+              </div>
+            </div>
+            <div className="session-item-actions">
+              <button
+                className="btn btn-icon"
+                onClick={() => startRename(s.session_id, s.name)}
+                title="Rename"
+              >
+                ✏️
+              </button>
+              <button
+                className="btn btn-icon"
+                onClick={() => onDelete(s.session_id)}
+                title="Delete"
+              >
+                🗑️
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  )
+})
+
+function formatDate(isoStr) {
+  if (!isoStr) return ''
+  try {
+    const d = new Date(isoStr)
+    return d.toLocaleDateString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    })
+  } catch {
+    return isoStr
+  }
+}
+
+export default function SessionList({ sessions, onNew, onOpenTab, onDelete, onRename, onSave, saveEnabled }) {
+  const [renamingId, setRenamingId] = useState(null)
+  const [renameValue, setRenameValue] = useState('')
+  const [listHeight, setListHeight] = useState(300)
+  const panelRef = useRef(null)
+  const headerRef = useRef(null)
+
+
+
+  // Profile initial render of the virtual list
+  useEffect(() => {
+    console.time('SessionList.mount')
+    // timeEnd fires after first paint with listHeight > 0
+  }, [])
+
+  // Measure available height for the virtual list
+  useEffect(() => {
+    const panel = panelRef.current
+    if (!panel) return
+    const measure = () => {
+      const headerEl = headerRef.current
+      const headerH = headerEl ? headerEl.offsetHeight : 130
+      const panelStyle = window.getComputedStyle(panel)
+      const padTop = parseFloat(panelStyle.paddingTop) || 0
+      const padBot = parseFloat(panelStyle.paddingBottom) || 0
+      setListHeight(panel.clientHeight - headerH - padTop - padBot)
+    }
+    measure()
+    // Re-measure on resize
+    window.addEventListener('resize', measure)
+    return () => window.removeEventListener('resize', measure)
+  }, [sessions.length])
+
+  // Profile once list has items and measured height > 0
+  useEffect(() => {
+    if (sessions.length > 0 && listHeight > 0) {
+      console.timeEnd('SessionList.mount')
+    }
+  }, [sessions.length, listHeight])
+
+  const startRename = (sessionId, currentName) => {
+    setRenamingId(sessionId)
+    setRenameValue(currentName || '')
+  }
+
+  const submitRename = (sessionId) => {
+    if (renameValue.trim()) {
+      onRename(sessionId, renameValue.trim())
+    }
+    setRenamingId(null)
+    setRenameValue('')
+  }
+
+  const cancelRename = () => {
+    setRenamingId(null)
+    setRenameValue('')
+  }
+
+  // Memoize rowProps to avoid unnecessary re-renders of rows
+  const rowProps = useMemo(() => ({
+    sessions,
+    renamingId,
+    renameValue,
+    onOpenTab,
+    onDelete,
+    startRename,
+    submitRename,
+    cancelRename,
+    setRenameValue,
+  }), [sessions, renamingId, renameValue, onOpenTab, onDelete, onRename])
+
+  return (
+    <div className="session-list-panel" ref={panelRef}>
+      <div ref={headerRef}>
+        <div className="session-list-header">
+          <h3>Sessions</h3>
+        </div>
+        <div className="session-list-actions">
+        {onSave && (
+          <button
+            className="btn btn-save"
+            onClick={onSave}
+            disabled={!saveEnabled}
+            title={saveEnabled ? 'Save current session' : 'No active session to save'}
+          >
+            💾 Save Current
+          </button>
+        )}
+        <button className="btn btn-new" onClick={onNew}>
+          ✨ New Session
+        </button>
+      </div>
+      </div>
+
+      {sessions.length === 0 ? (
+        <p className="session-list-empty">No saved sessions yet.</p>
+      ) : (
+        <List
+          rowComponent={Row}
+          rowCount={sessions.length}
+          rowHeight={ITEM_HEIGHT}
+          rowProps={rowProps}
+          style={{ height: listHeight }}
+          overscanCount={3}
+
+        />
+      )}
+    </div>
+  )
+}

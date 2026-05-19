@@ -90,3 +90,9 @@ Logging_cleanup_*.json
 dummy_test/
 agent_config.json
 output_panel_phase1.py
+# Personal knowledge base (user-generated, should not be in repo)
+.thoughtmachine/knowledge/personal/
+
+
+dummy_data/
+tmp_packages/
