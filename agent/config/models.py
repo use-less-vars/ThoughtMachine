@@ -54,8 +54,6 @@ class AgentConfig(BaseModel):
         'kb_enabled': RESTART_REQUIRED,
         'kb_path': RESTART_REQUIRED,
         'tool_output_token_limit': HOT_SWAPPABLE,
-        'max_history_tokens': HOT_SWAPPABLE,
-        'context_length': HOT_SWAPPABLE,
         'enabled_tools': HOT_SWAPPABLE,
         'provider_id': RESTART_REQUIRED,
         'model_override': RESTART_REQUIRED,
@@ -72,8 +70,6 @@ class AgentConfig(BaseModel):
     max_turns: int = 100
     stop_check: Optional[Callable[[], bool]] = None
     max_tokens: Optional[int] = None
-    max_history_tokens: Optional[int] = Field(default=None, description='Maximum number of history tokens to include in context (None = unlimited)')
-    context_length: Optional[int] = Field(default=None, description='Maximum context window size in tokens (None = model default)')
     system_prompt: Optional[str] = None
     token_monitor_enabled: bool = Field(default=True, description='Enable automatic token usage warnings')
     token_monitor_warning_threshold: int = Field(default=35000, description='Token count threshold for warning (user)')

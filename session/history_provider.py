@@ -173,31 +173,6 @@ class HistoryProvider:
         """Explicitly clear the cached context."""
         self._cached_context = None
 
-    def check_token_limit(self) -> Tuple[bool, Optional[str]]:
-        """
-        Check if token limit is approaching or exceeded.
-        
-        Returns:
-            (needs_pruning, warning_message)
-            - needs_pruning: True if pruning should be triggered
-            - warning_message: Optional warning to display to user
-        """
-        if self.token_limit is None:
-            return (False, None)
-        context = self.get_context_for_llm()
-        token_count = self._estimate_context_tokens(context)
-        log('DEBUG', 'core.pruning', f'Token count: {token_count}/{self.token_limit}')
-        warning_threshold = self.token_limit * 0.8
-        prune_threshold = self.token_limit * 0.95
-        if token_count >= prune_threshold:
-            warning = f'Token limit almost reached ({token_count}/{self.token_limit}). Pruning recommended.'
-            return (True, warning)
-        elif token_count >= warning_threshold:
-            warning = f'Token usage high ({token_count}/{self.token_limit}). Consider pruning.'
-            return (False, warning)
-        else:
-            return (False, None)
-
     def create_summary(self, summary_text: str, keep_recent_turns: int) -> Dict[str, Any]:
         """
         Create a summary system message with metadata and add it to history.
