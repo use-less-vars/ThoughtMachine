@@ -1320,3 +1320,37 @@ The codebase at `/home/jojo/PycharmProjects/ThoughtMachine-dev` is a **PyQt6 des
 - Config changes flow as `AgentConfig` objects, not raw dicts
 - Error handling is via logging + system messages in chat, not `status_message` events
 - The "Apply" button is always active (desktop app, no connection state)
+
+## 2026-05-20 — Web UI Config Pipeline — Cleanup & New Fields
+
+## Web UI Config Pipeline — Cleanup & New Fields (2026-05-20)
+
+**Changes made to align Web UI with the cleaned-up AgentConfig model:**
+
+### Removed
+- `context_length` from:
+  - `server.py` `_default_frontend_config()` defaults
+  - `bridge.py` `apply_config()` validation loop
+  - `ConfigPanel.jsx` `getSafeDraft()` and General tab input
+
+### Added to `_default_frontend_config()` (server.py)
+- `token_monitor_enabled: True`
+- `token_monitor_warning_threshold: 35000`
+- `token_monitor_critical_threshold: 50000`
+- `workspace_path: ""` (replaces context_length slot in General tab)
+
+### New `_load_global_defaults()` helper (server.py)
+- Loads `~/.thoughtmachine/agent_config.json` if it exists
+- Merges its values into `_default_frontend_config()` fallback, allowing file overrides
+- Parses JSON, logs warning on failure
+
+### Token monitor validation (bridge.py)
+- Removed `context_length` from positive-integer validation
+- Added validation for `token_monitor_warning_threshold` and `token_monitor_critical_threshold` (must be non-negative int)
+
+### Frontend (ConfigPanel.jsx)
+- General tab: Workspace Path text input replaces old Context Length number input
+- Advanced tab: Token Monitor checkbox + Warning/Critical threshold number inputs
+
+### System notification flag fix (server.py)
+- `get_conversation` handler now preserves `is_system_notification` flag on page reload
