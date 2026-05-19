@@ -954,6 +954,10 @@ class Agent:
             self._add_conversation_data_to_event(turn_event)
             yield turn_event
             if tool_calls:
+                # Commit assistant message immediately before tool execution
+                # so it's visible in user_history even if execution is interrupted
+                if turn_transaction and turn_transaction.has_assistant_message():
+                    turn_transaction.commit_assistant_only()
                 executed_tools, final_detected, final_content, user_interaction_message, summary_text, summary_keep_recent_turns = self.tool_executor.execute_tool_calls(tool_calls, add_to_conversation_func=self._add_to_conversation, agent_id=0, turn_transaction=turn_transaction)
                 processed_tools = []
                 for tool_info in executed_tools:
@@ -995,6 +999,9 @@ class Agent:
                         self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
                     return
                 if user_interaction_message is not None:
+                    user_interaction_event = {'type': 'user_interaction_requested', 'message': user_interaction_message, 'turn': self._display_turn}
+                    self._add_conversation_data_to_event(user_interaction_event)
+                    yield user_interaction_event
                     turn_duration = time.time() - turn_start_time
                     if self.logger:
                         self.logger.log_system_resources()
