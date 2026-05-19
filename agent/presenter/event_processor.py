@@ -78,6 +78,10 @@ class EventProcessor:
             self._process_execution_state_change_event(event)
         elif event_type == 'session_state_change':
             self._process_session_state_change_event(event)
+        elif event_type in ('tool_call', 'tool_result'):
+            self._process_tool_event(event, event_type)
+        elif event_type == 'rate_limit_warning':
+            self._process_rate_limit_warning_event(event)
         elif event_type == 'token_warning':
             self._process_token_warning_event(event)
         elif event_type == 'turn_warning':
@@ -187,6 +191,10 @@ class EventProcessor:
         if self.gui_integration:
             self.gui_integration.emit_error_occurred(error_msg, traceback_text)
             self.gui_integration.emit_status_message(f'Error: {error_msg}')
+            # Emit conversation_changed to trigger GUI display of any new messages
+            # (e.g., system notifications injected by agent before yielding error).
+            # Without this, the error notification is invisible until manual refresh.
+            self.gui_integration.emit_conversation_changed()
         self.session_lifecycle.auto_save_current_session()
 
     def _process_session_stop_event(self, event: Dict[str, Any]) -> None:
@@ -240,6 +248,23 @@ class EventProcessor:
             self.gui_integration.emit_status_message(f'Turn warning: {warning_message}')
             if hasattr(self.gui_integration, 'emit_warning'):
                 self.gui_integration.emit_warning(f'Turn limit warning: {turn_count} turns')
+
+    def _process_tool_event(self, event: Dict[str, Any], event_type: str) -> None:
+        """Process tool_call or tool_result event."""
+        tool_name = event.get('tool_name', 'unknown')
+        success = event.get('success', True)
+        if self.gui_integration:
+            status = 'succeeded' if success else 'failed'
+            self.gui_integration.emit_status_message(f'Tool {event_type}: {tool_name} {status}')
+
+    def _process_rate_limit_warning_event(self, event: Dict[str, Any]) -> None:
+        """Process rate limit warning event."""
+        message = event.get('message', 'Rate limit warning')
+        wait_time = event.get('wait_time', 0)
+        if self.gui_integration:
+            self.gui_integration.emit_status_message(f'Rate limit: {message}')
+            if hasattr(self.gui_integration, 'emit_warning'):
+                self.gui_integration.emit_warning(f'Rate limit exceeded, waiting {wait_time}s')
 
 
     def _extract_token_counts(self, event: Dict[str, Any]) -> tuple[Optional[int], Optional[int]]:

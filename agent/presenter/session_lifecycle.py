@@ -18,6 +18,7 @@ from session.models import Session
 from session.store import FileSystemSessionStore
 from session.context_builder import SummaryBuilder
 from .state_bridge import StateBridge
+from session.context_builder import ContextBuilder
 
 class SessionLifecycle:
     """Manages session lifecycle operations."""
@@ -273,6 +274,11 @@ class SessionLifecycle:
                 session = Session.from_persistable_dict(session_dict)
                 session.ensure_name()
                 self._register_session_callbacks(session)
+            # Clean up orphaned tool messages that may have been persisted
+            original_len = len(session.user_history)
+            session.user_history = ContextBuilder._cleanup_orphaned_tool_messages(session.user_history)
+            if original_len != len(session.user_history):
+                log('WARNING', 'presenter.lifecycle', f'Cleaned {original_len - len(session.user_history)} orphaned tool messages on session load')
             self.state_bridge.bind_session(session)
             self.state_bridge.update_external_file_path(filepath)
             if not self.state_bridge.session_name:
@@ -306,6 +312,11 @@ class SessionLifecycle:
             session = loaded_session
             session.ensure_name()
             self._register_session_callbacks(session)
+        # Clean up orphaned tool messages that may have been persisted
+        original_len = len(session.user_history)
+        session.user_history = ContextBuilder._cleanup_orphaned_tool_messages(session.user_history)
+        if original_len != len(session.user_history):
+            log('WARNING', 'presenter.lifecycle', f'Cleaned {original_len - len(session.user_history)} orphaned tool messages on session load')
         self.state_bridge.current_session = session
         self.state_bridge.current_session_id = str(session.session_id)
         self.state_bridge.bind_session(session)
