@@ -276,7 +276,8 @@ class SessionLifecycle:
                 self._register_session_callbacks(session)
             # Clean up orphaned tool messages that may have been persisted
             original_len = len(session.user_history)
-            session.user_history = ContextBuilder._cleanup_orphaned_tool_messages(session.user_history)
+            cleaned = ContextBuilder._cleanup_orphaned_tool_messages(session.user_history)
+            session.user_history[:] = cleaned
             if original_len != len(session.user_history):
                 log('WARNING', 'presenter.lifecycle', f'Cleaned {original_len - len(session.user_history)} orphaned tool messages on session load')
             self.state_bridge.bind_session(session)
@@ -314,7 +315,8 @@ class SessionLifecycle:
             self._register_session_callbacks(session)
         # Clean up orphaned tool messages that may have been persisted
         original_len = len(session.user_history)
-        session.user_history = ContextBuilder._cleanup_orphaned_tool_messages(session.user_history)
+        cleaned = ContextBuilder._cleanup_orphaned_tool_messages(session.user_history)
+        session.user_history[:] = cleaned
         if original_len != len(session.user_history):
             log('WARNING', 'presenter.lifecycle', f'Cleaned {original_len - len(session.user_history)} orphaned tool messages on session load')
         self.state_bridge.current_session = session

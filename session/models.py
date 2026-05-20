@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 import uuid, hashlib, json, os
+from typing import Any
 from thoughtmachine.security import merge_security_config, get_default_security_config
 from agent.logging import log
 
@@ -150,6 +151,17 @@ class Session:
     _conversation_changed_callbacks: List[Any] = field(default_factory=list, compare=False, repr=False)
     _conversation_version: int = field(default=0, compare=False, repr=False)
     conversation_hash: str = field(default='', compare=False, repr=False)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # Intercept assignment to user_history to ensure it always stays ObservableList.
+        if name == 'user_history':
+            if not isinstance(value, ObservableList):
+                # Wrap plain list back into ObservableList, preserving callback.
+                new_list = ObservableList(list(value), callback=self._on_conversation_changed)
+                object.__setattr__(self, name, new_list)
+                return
+        # Default behavior for all other attributes.
+        super().__setattr__(name, value)
 
     def __post_init__(self):
         if self.context_length == 0:
