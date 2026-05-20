@@ -1354,3 +1354,64 @@ The codebase at `/home/jojo/PycharmProjects/ThoughtMachine-dev` is a **PyQt6 des
 
 ### System notification flag fix (server.py)
 - `get_conversation` handler now preserves `is_system_notification` flag on page reload
+
+## 2026-05-20 — ## 2026-05-20 — Agent Core Stabilization — Engineer's Final ...
+
+## 2026-05-20 — Agent Core Stabilization — Engineer's Final Report
+
+A comprehensive stabilization push resolved 15 critical issues in the agent core. The system is now in a significantly more reliable state.
+
+### Key Architectural Decisions Enforced
+
+**1. Notification Visibility in Turn Grouping**
+System notifications (is_system_notification=True) must remain inside their parent turns during message grouping — not stripped out or counted as separate turns. Both `_group_messages_into_turns()` variants (context_builder.py, message_utils.py) now include all notification roles alongside user/assistant/tool.
+
+**2. Temporal Ordering via Pending Warnings**
+Token warnings are now buffered into `_pending_warnings` and flushed at the start of the *next* turn (after the pruner has run). This prevents mid-turn warning injection that could disrupt context assembly or confuse the agent mid-thought.
+
+**3. Deduplication of Critical Warnings**
+`last_token_warning_state` is now updated for ALL states including CRITICAL (removed the `if new_state != TokenState.CRITICAL:` guard). This prevents duplicate CRITICAL warnings from being emitted across multiple call sites.
+
+**4. Error Path Cache Invalidation**
+Three error paths (RateLimitExceeded, ProviderError/LLMError, Unexpected Exception) now add proper [SYSTEM NOTIFICATION] messages to the conversation AND clear the HistoryProvider's `_cached_context` so the error is reflected in the next LLM context build.
+
+**5. Fallback Summary Pruning**
+The fallback path (`_apply_summary_pruning_fallback` for no-session mode) now clears `_cached_context` explicitly and respects `MAX_SUMMARY_LENGTH=20000` consistently with the main path.
+
+**6. Dynamic Tool Rejection Messages**
+`ToolExecutor` rejection messages now dynamically list the actual allowed tools from `state.get_allowed_tools()` — no more hardcoded lists that could be out of sync.
+
+**7. Unified Turn Grouping Logic**
+Turn grouping extracted from context_builder.py into `agent/core/message_utils.py` as a shared utility. Rules: user message starts turn, assistant-with-tool_calls starts turn, tool results attach to nearest prior assistant-with-tool_calls within same turn. This eliminates duplication between context_builder.py and summarization.py.
+
+**8. Tiktoken-Based Tool Token Counting**
+Replaced `len(str(tool_result)) // 4` crude estimation with proper tiktoken encoding in tool_executor.py (via `agent.token_counter.estimate_tokens(tool_result)` with //4 fallback if agent is None).
+
+**9. Truncation Awareness**
+When the pruner truncates tool outputs, it now injects a "[SYSTEM NOTIFICATION: Tool output was truncated]" message into the conversation, making the agent aware that content was dropped.
+
+**10. `is_busy` Property on Controller**
+Added `controller.is_busy` property — returns True if agent thread is alive AND processing (not just idling between turns). Used by GUI for accurate run/continue routing.
+
+**11. Incremental Tool Visibility (commit_assistant_only)**
+TurnTransaction now supports `commit_assistant_only()` — commits the assistant message to user_history BEFORE tool execution begins. This prevents assistant message loss if a pause/interrupt occurs during tool execution. Tool results are committed separately via the subsequent `commit()` call.
+
+**12. Orphan Cleanup on Session Load**
+Both `load_session()` and `load_session_by_id()` in session_lifecycle.py now call `ContextBuilder._cleanup_orphaned_tool_messages()` after loading a session to remove any orphaned tool messages that may have been persisted.
+
+**13. GUI Notification Pipeline Restored (Path A Re-enabled)**
+EventProcessor had disabled the main-thread `emit_conversation_changed()` signal (Path A), leaving only the fragile ObservableList callback (Path B). Path A is now re-enabled: `self.gui_integration.emit_conversation_changed()` runs for all non-token-update events, providing a robust dual-path notification mechanism.
+
+**14. Commit-Before-Yield Ordering Fixed**
+In agent.py, `turn_transaction.commit_assistant_only()` is now called BEFORE `yield turn_event`. Previously, the turn event was yielded before data was committed, causing GUI handlers checking `conversation_version` to find no change.
+
+**15. ObservableList Destruction Prevented (__setattr__ Guardrail)**
+Plain list assignment to `session.user_history` (e.g., in session_lifecycle.py's orphan cleanup) bypassed the ObservableList wrapping, severing the callback chain. Fixed: (a) changed assignments to slice assignment `session.user_history[:] = ...` (in-place mutation), and (b) added `__setattr__` override to Session dataclass that automatically wraps any plain list assigned to `user_history` into an ObservableList with the correct callback.
+
+### Current State After Stabilization
+- Dual-path GUI notification (Path A: main-thread signal + Path B: ObservableList callback) provides redundancy
+- Turn data is committed to user_history BEFORE yielding events — no more data races
+- Session loading properly preserves ObservableList integrity
+- Token warnings are deferred, deduplicated, and accurate
+- Error paths leave proper trail in conversation history
+- The system handles pause/resume, session load, and multi-turn conversations reliably
