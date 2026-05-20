@@ -23,7 +23,7 @@ function statusDisplay(status) {
   }
 }
 
-export default function StatusBar({ status, tokensIn, tokensOut, contextLength }) {
+function StatusBar({ status, tokensIn, tokensOut, contextLength }) {
   const { className, label } = statusDisplay(status)
 
   return (
@@ -36,3 +36,5 @@ export default function StatusBar({ status, tokensIn, tokensOut, contextLength }
     </div>
   )
 }
+
+export default React.memo(StatusBar)

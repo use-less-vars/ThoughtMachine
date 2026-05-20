@@ -1,6 +1,125 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 
-const ConfigPanel = ({ config, sendCommand, providers, availableTools, panelWidth, wsConnected }) => {
+// ── Directory Browser sub-component ──────────────────────────────────────
+function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect, setLoading, setEntries, setError }) {
+  const fetchDir = useCallback(async (dirPath) => {
+    setLoading(true);
+    setError('');
+    try {
+      const url = `http://${window.location.hostname}:8000/api/browse?path=${encodeURIComponent(dirPath || '')}`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (data.success) {
+        setEntries(data.entries || []);
+      } else {
+        setError(data.error || 'Failed to list directory');
+        setEntries([]);
+      }
+    } catch (err) {
+      setError('Network error: ' + err.message);
+      setEntries([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [setLoading, setEntries, setError]);
+
+  useEffect(() => {
+    fetchDir(path);
+  }, [path, fetchDir]);
+
+  const goUp = () => {
+    const parts = path.replace(/\\/g, '/').replace(/\/$/, '').split('/');
+    parts.pop();
+    const parent = parts.join('/') || '/';
+    onNavigate(parent);
+  };
+
+  const listStyle = {
+    listStyle: 'none',
+    margin: 0,
+    padding: 0,
+    overflowY: 'auto',
+    flex: 1,
+    minHeight: 0,
+  };
+
+  const itemStyle = (isDir) => ({
+    padding: '0.3rem 0.5rem',
+    cursor: isDir ? 'pointer' : 'default',
+    borderRadius: '4px',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '0.4rem',
+    fontSize: '0.85rem',
+    color: isDir ? '#89b4fa' : '#cdd6f4',
+  });
+
+  if (loading) {
+    return <div style={{ ...listStyle, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#a6adc8' }}>Loading...</div>;
+  }
+
+  if (error) {
+    return (
+      <div style={{ ...listStyle, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}>
+        <span style={{ color: '#f38ba8', fontSize: '0.85rem' }}>{error}</span>
+        <button onClick={() => fetchDir(path)} style={{
+          background: '#45475a', color: '#cdd6f4', border: '1px solid #585b70',
+          borderRadius: '4px', padding: '0.3rem 0.8rem', cursor: 'pointer', fontSize: '0.8rem'
+        }}>Retry</button>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+      <div style={{ marginBottom: '0.3rem', display: 'flex', gap: '0.3rem' }}>
+        {path && path !== '/' && (
+          <button onClick={goUp} style={{
+            background: '#45475a', color: '#cdd6f4', border: '1px solid #585b70',
+            borderRadius: '4px', padding: '0.2rem 0.5rem', cursor: 'pointer', fontSize: '0.75rem'
+          }}>↑ Parent</button>
+        )}
+        <button onClick={() => onSelect(path)} style={{
+          background: '#89b4fa', color: '#1e1e2e', border: 'none',
+          borderRadius: '4px', padding: '0.2rem 0.5rem', cursor: 'pointer', fontWeight: 600, fontSize: '0.75rem',
+          marginLeft: 'auto',
+        }}>Select This Folder</button>
+      </div>
+      <ul style={listStyle}>
+        {entries.length === 0 && (
+          <li style={{ padding: '0.5rem', color: '#6c7086', fontSize: '0.8rem', textAlign: 'center' }}>
+            (empty directory)
+          </li>
+        )}
+        {entries.map((entry) => (
+          <li
+            key={entry.name}
+            style={itemStyle(entry.is_dir)}
+            onClick={() => {
+              if (entry.is_dir) {
+                const newPath = path.replace(/\\/g, '/').replace(/\/$/, '') + '/' + entry.name;
+                onNavigate(newPath);
+              }
+            }}
+            onMouseEnter={(e) => { if (entry.is_dir) e.target.style.background = '#45475a'; }}
+            onMouseLeave={(e) => { e.target.style.background = 'transparent'; }}
+          >
+            <span>{entry.is_dir ? '📁' : '📄'}</span>
+            <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.name}</span>
+            {!entry.is_dir && entry.size != null && (
+              <span style={{ color: '#6c7086', fontSize: '0.7rem', marginLeft: 'auto' }}>
+                {entry.size < 1024 ? `${entry.size} B` : entry.size < 1048576 ? `${(entry.size / 1024).toFixed(0)} KB` : `${(entry.size / 1048576).toFixed(1)} MB`}
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+
+function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected }) {
   const getSafeDraft = (cfg) => ({
     temperature: cfg?.temperature,
     max_turns: cfg?.max_turns,
@@ -17,8 +136,14 @@ const ConfigPanel = ({ config, sendCommand, providers, availableTools, panelWidt
   });
 
   const [activeTab, setActiveTab] = useState('general');
-
   const [draft, setDraft] = useState(getSafeDraft(config));
+
+  // ── Directory browser state ────────────────────────────────────────
+  const [browserOpen, setBrowserOpen] = useState(false);
+  const [browserPath, setBrowserPath] = useState('');
+  const [browserEntries, setBrowserEntries] = useState([]);
+  const [browserLoading, setBrowserLoading] = useState(false);
+  const [browserError, setBrowserError] = useState('');
 
   useEffect(() => {
     setDraft(getSafeDraft(config));
@@ -140,13 +265,33 @@ const ConfigPanel = ({ config, sendCommand, providers, availableTools, panelWidt
 
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>Workspace Path</strong> <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(working directory for agent)</span></label>
-            <input
-              type="text"
-              placeholder="/home/user/project"
-              value={draft.workspace_path}
-              onChange={(e) => setDraft({ ...draft, workspace_path: e.target.value })}
-              style={inputStyle}
-            />
+            <div style={{ display: 'flex', gap: '0.3rem' }}>
+              <input
+                type="text"
+                placeholder="/home/user/project"
+                value={draft.workspace_path}
+                onChange={(e) => setDraft({ ...draft, workspace_path: e.target.value })}
+                style={{ ...inputStyle, flex: 1 }}
+              />
+              <button
+                onClick={() => {
+                  setBrowserPath(draft.workspace_path || '');
+                  setBrowserOpen(true);
+                  setBrowserError('');
+                }}
+                style={{
+                  background: '#45475a',
+                  color: '#cdd6f4',
+                  border: '1px solid #585b70',
+                  borderRadius: '4px',
+                  padding: '0.3rem 0.6rem',
+                  cursor: 'pointer',
+                  fontWeight: 600,
+                  fontSize: '0.8rem',
+                  whiteSpace: 'nowrap',
+                }}
+              >Browse</button>
+            </div>
           </div>
         </div>
       )}
@@ -278,6 +423,67 @@ const ConfigPanel = ({ config, sendCommand, providers, availableTools, panelWidt
         </div>
       )}
 
+      {/* ── Directory Browser Overlay ────────────────────────────────── */}
+      {browserOpen && (
+        <div style={{
+          position: 'fixed',
+          top: 0, left: 0, right: 0, bottom: 0,
+          background: 'rgba(0,0,0,0.6)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 1000,
+        }} onClick={() => setBrowserOpen(false)}>
+          <div style={{
+            background: '#313244',
+            border: '1px solid #585b70',
+            borderRadius: '8px',
+            padding: '1rem',
+            width: '400px',
+            maxHeight: '60vh',
+            display: 'flex',
+            flexDirection: 'column',
+            boxShadow: '0 4px 20px rgba(0,0,0,0.4)',
+          }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
+              <strong style={{ fontSize: '0.9rem' }}>Select Directory</strong>
+              <button onClick={() => setBrowserOpen(false)} style={{
+                background: 'none', border: 'none', color: '#a6adc8', cursor: 'pointer', fontSize: '1.2rem'
+              }}>✕</button>
+            </div>
+            <div style={{
+              background: '#1e1e2e',
+              borderRadius: '4px',
+              padding: '0.3rem 0.5rem',
+              marginBottom: '0.5rem',
+              fontSize: '0.8rem',
+              color: '#a6adc8',
+              fontFamily: 'monospace',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}>{browserPath || '~'}</div>
+            <DirectoryBrowser
+              path={browserPath}
+              entries={browserEntries}
+              loading={browserLoading}
+              error={browserError}
+              onNavigate={(newPath) => {
+                setBrowserPath(newPath);
+                setBrowserError('');
+              }}
+              onSelect={(selectedPath) => {
+                setDraft({ ...draft, workspace_path: selectedPath });
+                setBrowserOpen(false);
+              }}
+              setLoading={setBrowserLoading}
+              setEntries={setBrowserEntries}
+              setError={setBrowserError}
+            />
+          </div>
+        </div>
+      )}
+
       {/* ── Apply Button ─────────────────────────────────────────────── */}
       <div style={{ marginTop: '1rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
         <button
@@ -304,4 +510,4 @@ const ConfigPanel = ({ config, sendCommand, providers, availableTools, panelWidt
   );
 };
 
-export default ConfigPanel;
+export default React.memo(ConfigPanel)

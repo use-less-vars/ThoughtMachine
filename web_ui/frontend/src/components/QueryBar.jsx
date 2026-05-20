@@ -19,7 +19,7 @@
 
 import React, { useState } from 'react'
 
-export default function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
+function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
   const [query, setQuery] = useState('')
 
   const isIdle = status === 'IDLE'
@@ -42,27 +42,20 @@ export default function QueryBar({ sendCommand, status, isRunning, config, sessi
     }
   }
 
-  const handlePause = () => {
-    sendCommand('pause_session', {})
-  }
-
-  const handleContinue = () => {
-    sendCommand('continue_session', { query: query.trim() })
-  }
-
-  const handleStop = () => {
-    sendCommand('stop_session', {})
+  const handleToggle = () => {
+    if (isBusy) {
+      sendCommand('pause_session', {})
+    } else if (isPaused) {
+      sendCommand('continue_session', { query: query.trim() })
+    } else {
+      handleRun()
+    }
   }
 
   const handleKeyDown = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey && (isIdle || isWaiting)) {
+    if (e.key === 'Enter' && !e.shiftKey && (isIdle || isWaiting || isPaused)) {
       e.preventDefault()
-      handleRun()
-    }
-    // Enter while paused → resume + continue
-    if (e.key === 'Enter' && !e.shiftKey && isPaused) {
-      e.preventDefault()
-      handleRun()
+      handleToggle()
     }
   }
 
@@ -82,38 +75,27 @@ export default function QueryBar({ sendCommand, status, isRunning, config, sessi
         rows={1}
       />
       <div className="query-buttons">
-        {/* Run — visible when IDLE or WAITING_FOR_USER */}
-        {(isIdle || isWaiting) && (
+        {/* Toggle Run/Pause/Resume — always visible */}
+        {isBusy ? (
+          <button className="btn btn-pause" onClick={handleToggle}>
+            ⏸ Pause
+          </button>
+        ) : isPaused ? (
+          <button className="btn btn-run" onClick={handleToggle}>
+            ▶ Resume
+          </button>
+        ) : (
           <button
             className="btn btn-run"
-            onClick={handleRun}
+            onClick={handleToggle}
             disabled={!query.trim()}
           >
             ▶ Run
-          </button>
-        )}
-
-        {/* Pause — visible when RUNNING */}
-        {isBusy && (
-          <button className="btn btn-pause" onClick={handlePause}>
-            ⏸ Pause
-          </button>
-        )}
-
-        {/* Continue/Resume — visible when PAUSED */}
-        {isPaused && (
-          <button className="btn btn-pause" onClick={handleContinue}>
-            ▶ Resume
-          </button>
-        )}
-
-        {/* Stop — visible when RUNNING, PAUSED, or WAITING_FOR_USER */}
-        {(isBusy || isPaused || isWaiting) && (
-          <button className="btn btn-stop" onClick={handleStop}>
-            ⏹ Stop
           </button>
         )}
       </div>
     </div>
   )
 }
+
+export default React.memo(QueryBar)

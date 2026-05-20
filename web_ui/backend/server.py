@@ -457,6 +457,19 @@ async def websocket_endpoint(ws: WebSocket):
                             "state": "IDLE",
                             "is_running": bridge.is_running,
                         })
+                        # Send tokens_updated so the frontend shows saved token counts
+                        loaded = bridge._session or bridge._loaded_session
+                        if loaded:
+                            await ws.send_json({
+                                "type": "tokens_updated",
+                                "input": loaded.total_input_tokens,
+                                "output": loaded.total_output_tokens,
+                            })
+                            if loaded.context_length:
+                                await ws.send_json({
+                                    "type": "context_updated",
+                                    "context_length": loaded.context_length,
+                                })
                         # Send config_changed so the frontend shows the session's actual config
                         fe_config = _frontend_config_from_bridge(bridge)
                         await ws.send_json({
@@ -592,6 +605,16 @@ async def websocket_endpoint(ws: WebSocket):
                         "state": "IDLE",
                         "is_running": False,
                     })
+                    # Reset token display for a fresh session
+                    await ws.send_json({
+                        "type": "tokens_updated",
+                        "input": 0,
+                        "output": 0,
+                    })
+                    await ws.send_json({
+                        "type": "context_updated",
+                        "context_length": 0,
+                    })
                     # Send default config so the frontend shows proper defaults
                     await ws.send_json({
                         "type": "config_changed",
@@ -632,6 +655,38 @@ async def websocket_endpoint(ws: WebSocket):
 #  REST endpoints (health, information)
 # ══════════════════════════════════════════════════════════════════════════════
 
+@app.get("/api/browse")
+async def browse_directory(path: str = ""):
+    """List directory contents for the workspace path browser."""
+    try:
+        base_path = path or os.path.expanduser("~")
+        if not os.path.isdir(base_path):
+            return {"success": False, "error": f"Not a directory: {base_path}", "entries": []}
+        entries = []
+        try:
+            for name in sorted(os.listdir(base_path)):
+                full = os.path.join(base_path, name)
+                try:
+                    entries.append({
+                        "name": name,
+                        "is_dir": os.path.isdir(full),
+                        "size": os.path.getsize(full) if os.path.isfile(full) else None,
+                    })
+                except (OSError, PermissionError):
+                    entries.append({"name": name, "is_dir": False, "size": None})
+        except PermissionError:
+            pass
+        parent = os.path.dirname(base_path.rstrip("/")) if base_path != "/" else None
+        return {
+            "success": True,
+            "current_path": os.path.abspath(base_path),
+            "parent_path": parent,
+            "entries": entries,
+        }
+    except Exception as exc:
+        return {"success": False, "error": str(exc), "entries": []}
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "thoughtmachine-web-ui"}
@@ -644,6 +699,7 @@ async def root():
         "endpoints": {
             "ws": "/ws — WebSocket for agent interaction",
             "health": "/health — Health check",
+            "browse": "/api/browse?path=… — Directory listing for workspace browser",
         },
     }
 
@@ -710,53 +766,123 @@ def _frontend_config_from_bridge(bridge) -> Dict[str, Any]:
     if cfg is None:
         return _default_frontend_config()
     raw = _config_to_dict(cfg)
-    # Reverse provider mapping
+    return _backend_to_frontend_config(raw)
+
+
+
+_FALLBACK_FRONTEND_CONFIG = {
+    "base_url": "https://api.deepseek.com/v1/",
+    "model": "deepseek-v4-flash",
+    "provider_type": "openai_compatible",
+    "provider_config": {},
+    "provider_id": "v4_flash",
+    "model_override": None,
+    "temperature": 1.0,
+    "max_turns": 200,
+    "stop_check": None,
+    "max_tokens": None,
+    "system_prompt": None,
+    "token_monitor_enabled": True,
+    "token_monitor_warning_threshold": 60000,
+    "token_monitor_critical_threshold": 75000,
+    "turn_monitor_enabled": True,
+    "enable_logging": True,
+    "log_dir": "./logs",
+    "log_level": "INFO",
+    "enable_file_logging": True,
+    "enable_console_logging": False,
+    "jsonl_format": True,
+    "log_categories": ["SESSION", "LLM", "TOOLS"],
+    "max_file_size_mb": 10,
+    "max_backup_files": 5,
+    "workspace_path": "/home/jojo/PycharmProjects/ThoughtMachine-dev",
+    "rag_enabled": False,
+    "rag_embedding_model": "BAAI/bge-small-en-v1.5",
+    "rag_vector_store_path": None,
+    "rag_chunk_size": 1500,
+    "rag_chunk_overlap": 200,
+    "rag_batch_size": 16,
+    "rag_truncate_dim": 256,
+    "kb_enabled": True,
+    "kb_path": None,
+    "tool_output_token_limit": 10000,
+    "detail": "normal",
+    "enabled_tools": [
+        "FileEditor",
+        "FilePreviewTool",
+        "DirectoryTreeTool",
+        "GlobTool",
+        "FileSearchTool",
+        "ApplyEdits",
+        "CodeModifier",
+        "RefactorTool",
+        "DateTimeTool",
+        "DirectoryCreator",
+        "DockerCodeRunner",
+        "FieldViewer",
+        "FileMover",
+        "FileSummaryTool",
+        "Final",
+        "FinalReport",
+        "GitInfoTool",
+        "KnowledgeBaseTool",
+        "MCPValidator",
+        "PaginateTool",
+        "ProgressReport",
+        "RequestUserInteraction",
+        "SummarizeTool",
+        "Thought"
+    ],
+}
+
+
+def _load_global_defaults() -> Dict[str, Any]:
+    """Load global defaults from ~/.thoughtmachine/agent_config.json.
+    Auto-creates the file with sensible defaults on first run."""
+    import json
+    from pathlib import Path
+    config_dir = Path.home() / '.thoughtmachine'
+    config_path = config_dir / 'agent_config.json'
+
+    config_dir.mkdir(parents=True, exist_ok=True)
+
+    if config_path.exists():
+        try:
+            with open(config_path) as f:
+                return json.load(f)
+        except Exception:
+            log('ERROR', 'server.config', f'Could not parse {config_path}, using fallback')
+            return dict(_FALLBACK_FRONTEND_CONFIG)
+    else:
+        log('INFO', 'server.config', f'Creating default config at {config_path}')
+        with open(config_path, 'w') as f:
+            json.dump(_FALLBACK_FRONTEND_CONFIG, f, indent=2)
+        return dict(_FALLBACK_FRONTEND_CONFIG)
+
+
+def _backend_to_frontend_config(backend: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert backend AgentConfig format to frontend format for WS messages."""
+    cfg = dict(backend)
+    # Map provider_type → provider
     provider_reverse = {
         "openai": "openai",
         "anthropic": "anthropic",
         "openai_compatible": "local",
     }
-    raw["provider"] = provider_reverse.get(raw.get("provider_type", ""), "local")
-    # Convert enabled_tools back to tools list
-    enabled = raw.pop("enabled_tools", [])
-    raw["tools"] = [{"name": t, "enabled": True} for t in enabled]
-    return raw
-
-
-
-def _load_global_defaults() -> Dict[str, Any]:
-    """Load global defaults from ~/.thoughtmachine/agent_config.json."""
-    import json
-    from pathlib import Path
-    path = Path.home() / '.thoughtmachine' / 'agent_config.json'
-    if path.exists():
-        try:
-            with open(path) as f:
-                return json.load(f)
-        except Exception as e:
-            log('WARNING', 'server.config', f'Failed to load global defaults: {e}')
-    return {}
+    provider_type = cfg.pop("provider_type", None)
+    cfg["provider"] = provider_reverse.get(provider_type, "local")
+    # Map enabled_tools → tools list
+    enabled = cfg.pop("enabled_tools", [])
+    cfg["tools"] = [{"name": t, "enabled": True} for t in enabled] if enabled else []
+    return cfg
 
 
 def _default_frontend_config() -> Dict[str, Any]:
     """Return config in frontend format, merged with global defaults."""
-    fallback = {
-        "temperature": 0.7,
-        "max_turns": 20,
-        "provider": "openai",
-        "tools": [
-            {"name": "bash", "enabled": True},
-            {"name": "file_read", "enabled": False},
-        ],
-        "max_tokens": None,
-        "token_monitor_enabled": True,
-        "token_monitor_warning_threshold": 35000,
-        "token_monitor_critical_threshold": 50000,
-        "workspace_path": "",
-    }
+    defaults = dict(_FALLBACK_FRONTEND_CONFIG)
     global_defaults = _load_global_defaults()
-    fallback.update(global_defaults)
-    return fallback
+    defaults.update(global_defaults)
+    return _backend_to_frontend_config(defaults)
 
 
 def _config_to_dict(cfg) -> Dict[str, Any]:

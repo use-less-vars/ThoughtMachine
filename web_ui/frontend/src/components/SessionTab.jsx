@@ -58,9 +58,23 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
   const connectSessionWsRef = useRef(null)  // ref to avoid circular deps in sendCommand
   const [wsConnected, setWsConnected] = useState(false)
 
-  // ── Config panel resize state ──────────────────────────────────────
-  const [configPanelWidth, setConfigPanelWidth] = useState(CONFIG_PANEL_DEFAULT_WIDTH)
+  // ── Config panel resize state (persisted per tab) ──────────────────
+  const [configPanelWidth, setConfigPanelWidth] = useState(() => {
+    if (tabId) {
+      const saved = localStorage.getItem(`config-panel-width:${tabId}`)
+      if (saved) return Math.max(CONFIG_PANEL_MIN_WIDTH, Math.min(CONFIG_PANEL_MAX_WIDTH, Number(saved)))
+    }
+    return CONFIG_PANEL_DEFAULT_WIDTH
+  })
   const dragRef = useRef(null) // { startX, startWidth }
+
+  // Persist width changes
+  const handleWidthChange = useCallback((newWidth) => {
+    setConfigPanelWidth(newWidth)
+    if (tabId) {
+      localStorage.setItem(`config-panel-width:${tabId}`, String(newWidth))
+    }
+  }, [tabId])
 
   const handleResizeStart = useCallback((e) => {
     e.preventDefault()
@@ -74,7 +88,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
       if (!dragRef.current) return
       const delta = e.clientX - dragRef.current.startX
       const newWidth = Math.max(CONFIG_PANEL_MIN_WIDTH, Math.min(CONFIG_PANEL_MAX_WIDTH, dragRef.current.startWidth + delta))
-      setConfigPanelWidth(newWidth)
+      handleWidthChange(newWidth)
     }
 
     const handleMouseUp = () => {
@@ -262,7 +276,16 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
         break
 
       case 'conversation_changed':
-        update({ history: msg.messages ?? [] })
+        // Preserve is_system_notification on live updates (same as reload path)
+        const serverMessages = msg.messages ?? [];
+        const mergedMessages = serverMessages.map((m, i) => {
+          if (m.is_system_notification ||
+              (state.history[i] && state.history[i].is_system_notification)) {
+            return { ...m, is_system_notification: true };
+          }
+          return m;
+        });
+        update({ history: mergedMessages })
         break
 
       case 'config_changed':
@@ -276,7 +299,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
         update((prev) => ({
           history: [
             ...prev.history,
-            { role: 'system', content: msg.text ?? '' },
+            { role: 'system', content: msg.text ?? '', is_system_notification: true },
           ],
         }))
         break

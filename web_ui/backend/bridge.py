@@ -327,12 +327,14 @@ class WebAgentBridge:
     # ── Query API ───────────────────────────────────────────────────────────
 
     def get_conversation(self) -> Optional[List[Dict[str, Any]]]:
-        """Return the current conversation from the agent, if available."""
-        if self._controller is not None:
-            return self._controller.get_conversation()
-        if self._agent is not None:
-            return self._agent.conversation.copy()
-        return None
+        """
+        Return the current conversation for frontend display.
+
+        Uses self.history (frontend-formatted messages from _event_to_message)
+        instead of raw agent conversation, ensuring roles like 'tool_call'
+        and 'tool_result' have correct role keys.
+        """
+        return list(self.history) if self.history else None
 
     def get_config(self) -> Optional[AgentConfig]:
         if self._controller is not None:
@@ -766,6 +768,10 @@ class WebAgentBridge:
 
         elif event_type == "final":
             content = event.get("content", "")
+            # Skip duplicate — Final tool result already shown as purple bubble
+            if self.history and self.history[-1].get("is_final"):
+                log('DEBUG', 'server.bridge', "Skipping final — already shown as Final tool result")
+                return None
             if content == self._last_assistant_content:
                 log('DEBUG', 'server.bridge', "Skipping final — content matches last turn")
                 return None
@@ -794,7 +800,10 @@ class WebAgentBridge:
             return msg
 
         elif event_type == "tool_result":
+            is_final = event.get("tool_name", "") in ("Final", "FinalReport")
             msg = {"role": "tool_result", "content": event.get("result", "")}
+            if is_final:
+                msg["is_final"] = True
             log('DEBUG', 'server.bridge', f"Converted {event_type} to tool_result message")
             return msg
 

@@ -946,6 +946,11 @@ class Agent:
                 assistant_msg['tool_calls'] = tool_calls
             turn_transaction.add_assistant_message(assistant_msg)
             yield self._create_token_update_event()
+            # Commit assistant message to user_history BEFORE yielding the turn event
+            # so that GUI signal handlers (both Path A via queued signal and Path B
+            # via ObservableList callback) see the data when they check conversation_version.
+            if turn_transaction and turn_transaction.has_assistant_message():
+                turn_transaction.commit_assistant_only()
             turn_event = {'type': 'turn', 'content': content, 'assistant_content': content, 'tool_calls': [], 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
             if reasoning is not None:
                 turn_event['reasoning'] = reasoning
@@ -954,10 +959,6 @@ class Agent:
             self._add_conversation_data_to_event(turn_event)
             yield turn_event
             if tool_calls:
-                # Commit assistant message immediately before tool execution
-                # so it's visible in user_history even if execution is interrupted
-                if turn_transaction and turn_transaction.has_assistant_message():
-                    turn_transaction.commit_assistant_only()
                 executed_tools, final_detected, final_content, user_interaction_message, summary_text, summary_keep_recent_turns = self.tool_executor.execute_tool_calls(tool_calls, add_to_conversation_func=self._add_to_conversation, agent_id=0, turn_transaction=turn_transaction)
                 processed_tools = []
                 for tool_info in executed_tools:
