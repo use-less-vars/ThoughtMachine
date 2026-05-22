@@ -86,11 +86,8 @@ class WebAgentBridge:
         # Callback — called from the agent thread for every event
         self._event_callback = event_callback
 
-        # Accumulated conversation history for frontend protocol
-        self.history: List[Dict[str, Any]] = []
-
-        # Track last assistant content to deduplicate turn vs final
-        self._last_assistant_content: Optional[str] = None
+        # Track last known controller busy state for state_changed is_running
+        self._last_state_busy: Optional[bool] = None
 
         # Current config (for get_config / get_conversation)
         self._config: Optional[AgentConfig] = None
@@ -114,9 +111,9 @@ class WebAgentBridge:
 
     @property
     def agent_is_running(self) -> bool:
-        """True if the agent controller exists and is busy (running or pausing)."""
+        """True if the agent controller exists and its thread is alive (can accept queries)."""
         if self._controller is not None:
-            return self._controller.is_busy
+            return self._controller.is_running
         return False
 
     @property
@@ -125,7 +122,9 @@ class WebAgentBridge:
         Whether the agent thread (standalone) or controller thread (controller mode)
         is still alive and can accept follow-up queries.
         """
-        return self._get_is_running()
+        if self._controller is not None:
+            return self._controller.is_busy
+        return self._running and (self._thread is not None and self._thread.is_alive())
 
     @property
     def is_paused(self) -> bool:
@@ -330,11 +329,12 @@ class WebAgentBridge:
         """
         Return the current conversation for frontend display.
 
-        Uses self.history (frontend-formatted messages from _event_to_message)
-        instead of raw agent conversation, ensuring roles like 'tool_call'
-        and 'tool_result' have correct role keys.
+        Normalizes roles (``tool" → ``tool_result") for the frontend
+        without modifying the underlying session data.
         """
-        return list(self.history) if self.history else None
+        if self._session is not None:
+            return self._normalize_for_frontend(self._session.user_history)
+        return None
 
     def get_config(self) -> Optional[AgentConfig]:
         if self._controller is not None:
@@ -431,11 +431,11 @@ class WebAgentBridge:
             # Use the active session if available (standalone or controller path)
             session = getattr(self, '_session', None)
             if session is None:
-                # Fallback when no session is active — build from self.history
+                # Fallback when no session is active — build from existing session data
                 session_id = self._loaded_session.session_id if self._loaded_session else str(uuid.uuid4())
                 session = Session(
                     session_id=session_id,
-                    user_history=list(self.history),
+                    user_history=list(self._session.user_history) if self._session else [],
                     metadata={
                         'agent_config': self._config.model_dump(exclude={'api_key'}, exclude_none=True) if self._config else {},
                         'source': 'web_ui',
@@ -464,6 +464,72 @@ class WebAgentBridge:
             log('ERROR', 'server.bridge', f"save_session error: {e}")
             return None
 
+    @staticmethod
+    def _normalize_for_frontend(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Normalize messages for frontend display without modifying the originals.
+
+        The session stores roles in canonical API format (e.g. ``role: "tool"``),
+        but the frontend ChatPanel expects roles like ``tool_result`` and ``tool_call``.
+        This method returns a *new* list with normalized roles, leaving the
+        original messages untouched so they remain valid for API calls.
+        """
+        normalized = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            # Handle structured tool_calls array (current format)
+            if role == "assistant" and msg.get("tool_calls"):
+                # Emit the assistant message without the tool_calls array
+                assistant_msg = {k: v for k, v in msg.items() if k != "tool_calls"}
+                if assistant_msg.get("content"):
+                    normalized.append(assistant_msg)
+                # Emit each tool call as a separate display message
+                for tc in msg["tool_calls"]:
+                    normalized.append({
+                        "role": "tool_call",
+                        "content": json.dumps({
+                            "name": tc.get("name", "?"),
+                            "arguments": tc.get("arguments", {}),
+                        }),
+                        "is_final": msg.get("is_final", False),
+                    })
+                continue
+
+            # Convert old tool_call: stored as assistant with "[Tool call: name(args)]"
+            if role == "assistant" and isinstance(content, str) and content.startswith("[Tool call:"):
+                match = re.match(r'^\[Tool call:\s*(\w+)\(([^)]*)\)\]$', content)
+                if match:
+                    tool_name = match.group(1)
+                    args_str = match.group(2)
+                    try:
+                        args_json = args_str.replace("'", '"')
+                        args = json.loads(args_json)
+                    except Exception:
+                        args = {}
+                    new_content = json.dumps({"name": tool_name, "arguments": args})
+                    normalized.append({"role": "tool_call", "content": new_content})
+                    continue
+
+            # Convert role "tool" -> "tool_result" for frontend display
+            if role == "tool":
+                new_msg = dict(msg)
+                new_msg["role"] = "tool_result"
+                # Preserve is_final flag if present
+                if msg.get("is_final"):
+                    new_msg["is_final"] = True
+                normalized.append(new_msg)
+                continue
+
+            # Remove empty assistant messages that were placeholders for tool calls
+            if role == "assistant" and isinstance(content, str) and content.strip() == "":
+                continue
+
+            normalized.append(msg)
+
+        return normalized
+
     def load_session(self, session_id: str) -> bool:
         """Load a session from the store, replacing current conversation.
 
@@ -473,53 +539,34 @@ class WebAgentBridge:
 
         After calling this, the server handler should send ``config_changed``
         (in frontend format) so the frontend controls update.
+
+        Important: The session's ``user_history`` is kept in canonical API format
+        (``role: "tool"``). Frontend display normalization happens at emit time
+        via ``_normalize_for_frontend()`` so the data stays valid for API calls.
         """
         try:
             session = self._session_store.load_session(session_id)
             if session is None:
                 log('WARNING', 'server.bridge', f"Session not found: {session_id}")
                 return False
-            self.history = list(session.user_history)
+            self._session = session
             self._history_version = session.conversation_version
 
-            # ── Normalize old message formats ────────────────────────────────
-            # Convert pre-standardization role names ("tool", assistant with
-            # "[Tool call:") to the canonical "tool_call" / "tool_result" that
-            # the frontend ChatPanel expects.
-            normalized = []
-            for msg in self.history:
-                role = msg.get("role", "")
-                content = msg.get("content", "")
+            # ── Repair: restore corrupted roles ─────────────────────────────
+            # Sessions previously saved via a buggy bridge version may have
+            # "tool_result" as a role (introduced by in-place frontend normalization).
+            # The canonical API format is "tool" – fix it here so the session
+            # stays valid for API calls.
+            repaired = False
+            for msg in session.user_history:
+                if msg.get("role") == "tool_result":
+                    msg["role"] = "tool"
+                    repaired = True
+            if repaired:
+                log('WARNING', 'server.bridge',
+                    f"Repaired {session_id}: corrected 'tool_result' roles back to 'tool'")
+                self._session_store.save_session(session)
 
-                # Convert old tool_call: stored as assistant with "[Tool call: name(args)]"
-                if role == "assistant" and content.startswith("[Tool call:"):
-                    match = re.match(r'^\[Tool call:\s*(\w+)\(([^)]*)\)\]$', content)
-                    if match:
-                        tool_name = match.group(1)
-                        args_str = match.group(2)
-                        try:
-                            args_json = args_str.replace("'", '"')
-                            args = json.loads(args_json)
-                        except Exception:
-                            args = {}
-                        new_content = json.dumps({"name": tool_name, "arguments": args})
-                        normalized.append({"role": "tool_call", "content": new_content})
-                        continue
-
-                # Convert old tool_result: role "tool" -> "tool_result"
-                if role == "tool":
-                    normalized.append({"role": "tool_result", "content": content})
-                    continue
-
-                # Remove empty assistant messages that were placeholders for tool calls
-                if role == "assistant" and content.strip() == "":
-                    continue
-
-                # Keep everything else unchanged
-                normalized.append(msg)
-
-            self.history = normalized
-            self._session = session
             self._loaded_session = session
 
             # ── Extract agent_config from session metadata into self._config ──
@@ -555,18 +602,21 @@ class WebAgentBridge:
                 log('INFO', 'server.bridge', "No agent_config in session metadata")
 
             # Emit conversation_changed so the frontend updates
+            # Use _normalize_for_frontend to convert API roles
+            # (e.g. "tool") to frontend roles (e.g. "tool_result")
+            # without modifying the session data.
             self._emit({
                 "type": "conversation_changed",
-                "messages": list(self.history),
+                "messages": self._normalize_for_frontend(session.user_history),
             })
             # Emit session_loaded for metadata
             self._emit({
                 "type": "session_loaded",
                 "session_id": session_id,
                 "session_name": session.metadata.get('name', 'Untitled Session'),
-                "message_count": len(self.history),
+                "message_count": len(session.user_history),
             })
-            log('INFO', 'server.bridge', f"Session loaded: {session_id} ({session.metadata.get('name')}) — {len(self.history)} messages")
+            log('INFO', 'server.bridge', f"Session loaded: {session_id} ({session.metadata.get('name')}) — {len(session.user_history)} messages")
 
             # Register this session as an open session (persists to open_sessions.json)
             # so it survives server restarts and the hub WS can return it.
@@ -688,7 +738,6 @@ class WebAgentBridge:
         # Reset state
         self._session = None
         self._loaded_session = None
-        self.history = []
         self._session_id = None
         self._emit({
             "type": "session_cleared",
@@ -704,10 +753,9 @@ class WebAgentBridge:
         """Clear the loaded session reference for a fresh start."""
         self._session = None
         self._loaded_session = None
-        self.history = []
         self._emit({
             "type": "conversation_changed",
-            "messages": [],
+            "messages": []
         })
         log('INFO', 'server.bridge', "Session cleared for fresh start")
 
@@ -744,284 +792,129 @@ class WebAgentBridge:
                 log('INFO', 'server.bridge', f"Session ID captured from controller event: {sid}")
         self._map_and_emit(event)
 
-    def _event_to_message(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _map_and_emit(self, raw_event: Dict[str, Any]) -> None:
         """
-        Convert a process_query event into a frontend message dict.
-        Raw events from process_query() have no 'role' key and use
-        type-specific fields for content (e.g. 'result' for tool_result,
-        'arguments' for tool_call).
-        Returns None if the event doesn't map to a message.
+        Dual-stream event mapping: tick state and conversation changes
+        from raw agent events to frontend protocol events.
+
+        State stream: state_changed, tokens_updated, context_updated, status_message
+        Conversation stream: conversation_changed (always sourced from session)
         """
-        event_type = event.get("type", "")
-
-        if event_type == "turn":
-            content = event.get("content", "")
-            reasoning = event.get("reasoning", "")
-            self._last_assistant_content = content
-            msg = {
-                "role": "assistant",
-                "content": content,
-                "reasoning_content": reasoning,
-            }
-            log('DEBUG', 'server.bridge', f"Converted {event_type} to message")
-            return msg
-
-        elif event_type == "final":
-            content = event.get("content", "")
-            # Skip duplicate — Final tool result already shown as purple bubble
-            if self.history and self.history[-1].get("is_final"):
-                log('DEBUG', 'server.bridge', "Skipping final — already shown as Final tool result")
-                return None
-            if content == self._last_assistant_content:
-                log('DEBUG', 'server.bridge', "Skipping final — content matches last turn")
-                return None
-            msg = {
-                "role": "assistant",
-                "content": content,
-            }
-            log('DEBUG', 'server.bridge', f"Converted {event_type} to message")
-            return msg
-
-        elif event_type == "user_query":
-            msg = {
-                "role": "user",
-                "content": event.get("content", ""),
-            }
-            log('DEBUG', 'server.bridge', f"Converted {event_type} to message")
-            return msg
-
-        elif event_type == "tool_call":
-            content = json.dumps({
-                "name": event.get("tool_name", "?"),
-                "arguments": event.get("arguments", {}),
-            })
-            msg = {"role": "tool_call", "content": content}
-            log('DEBUG', 'server.bridge', f"Converted {event_type} to tool_call message")
-            return msg
-
-        elif event_type == "tool_result":
-            is_final = event.get("tool_name", "") in ("Final", "FinalReport")
-            msg = {"role": "tool_result", "content": event.get("result", "")}
-            if is_final:
-                msg["is_final"] = True
-            log('DEBUG', 'server.bridge', f"Converted {event_type} to tool_result message")
-            return msg
-
-        return None
-
-    def _translate_event(self, raw_event: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """
-        Translate a raw agent event into frontend protocol events.
-        Returns a list of event dicts to send to the frontend.
-        Does NOT forward the raw event — only high-level protocol events.
-        """
-        results: List[Dict[str, Any]] = []
         event_type = raw_event.get("type", "")
 
-        # ── Sync from session BEFORE processing this event ──────────────────
-        # Covers silent mutations to user_history (e.g. _pending_warnings
-        # flushed after tool commit, which don't yield a separate event).
-        # Doing this before the event handler ensures warning messages land
-        # in self.history BEFORE the new event's content, preserving
-        # chronological order from the frontend's perspective.
+        # ── 1. Sync conversation changes from session ──────────────────────
+        # This picks up silent mutations (e.g. _pending_warnings flushed
+        # after tool commit, errors added as system notifications) so they
+        # arrive chronologically before the new event's content.
         if self._session is not None:
             current_version = self._session.conversation_version
             if current_version != self._history_version:
                 self._history_version = current_version
-                if len(self._session.user_history) > len(self.history):
-                    new_msgs = self._session.user_history[len(self.history):]
-                    self.history.extend(new_msgs)
-                    results.append({
-                        "type": "conversation_changed",
-                        "messages": list(self.history),
-                    })
+                self._emit({
+                    "type": "conversation_changed",
+                    "messages": self._normalize_for_frontend(self._session.user_history),
+                })
+
+        # ── 2. Handle event-type-specific logic ───────────────────────────
+        _is_busy = self._controller.is_busy if self._controller else False
 
         if event_type == "execution_state_change":
             new_state = raw_event.get("new_state", "")
-            frontend_state = self._map_agent_state(new_state)
-            results.append({
+            frontend_state = {
+                "running": "RUNNING",
+                "pausing": "PAUSED",
+                "paused": "PAUSED",
+                "idle": "IDLE",
+                "error": "IDLE",
+                "stopped": "IDLE",
+                "completed": "IDLE",
+                "ready": "IDLE",
+                "waiting": "WAITING_FOR_USER",
+            }.get(new_state.lower(), new_state.upper())
+            self._emit({
                 "type": "state_changed",
                 "state": frontend_state,
-                "is_running": self._get_is_running(),
+                "is_running": _is_busy,
             })
 
         elif event_type == "token_update":
             tokens_in = raw_event.get("total_input", 0)
             tokens_out = raw_event.get("total_output", 0)
-            results.append({
+            self._emit({
                 "type": "tokens_updated",
                 "input": tokens_in,
                 "output": tokens_out,
             })
             ctx = raw_event.get("context_length", 0)
             if ctx:
-                results.append({
+                self._emit({
                     "type": "context_updated",
                     "context_length": ctx,
                 })
 
         elif event_type in ("token_warning", "turn_warning"):
-            # System notification warnings (token limits, turn limits, etc.)
-            # These events are yielded by the agent but were not being forwarded
-            # to the frontend, so token/turn warnings were invisible in the UI.
-            msg_text = raw_event.get('message', raw_event.get('warning', ''))
-            warning_msg = {
-                "role": "user",
-                "content": f"[SYSTEM NOTIFICATION] {msg_text}",
-                "is_system_notification": True,
-            }
-            self.history.append(warning_msg)
-            # Keep version tracking in sync with session
+            # Conversation should already reflect the warning in session;
+            # re-read to ensure frontend gets the full snapshot.
             if self._session is not None:
                 self._history_version = self._session.conversation_version
-            results.append({
-                "type": "conversation_changed",
-                "messages": list(self.history),
-            })
+                self._emit({
+                    "type": "conversation_changed",
+                    "messages": self._normalize_for_frontend(self._session.user_history),
+                })
 
         elif event_type in ("user_query", "turn", "tool_call", "tool_result", "final"):
-            msg = self._event_to_message(raw_event)
-            if msg is not None:
-                self.history.append(msg)
-                # Keep version tracking in sync with session
-                if self._session is not None:
-                    self._history_version = self._session.conversation_version
-                # Send full conversation snapshot — only when history actually changed
-                results.append({
+            # Session has been updated by the agent; sync to frontend.
+            if self._session is not None:
+                self._history_version = self._session.conversation_version
+                self._emit({
                     "type": "conversation_changed",
-                    "messages": list(self.history),
+                    "messages": self._normalize_for_frontend(self._session.user_history),
                 })
             if event_type == "final":
-                results.append({
+                self._emit({
                     "type": "state_changed",
                     "state": "IDLE",
-                    "is_running": self._get_is_running(),
+                    "is_running": _is_busy,
                 })
 
         elif event_type == "user_interaction_requested":
-            results.append({
+            self._emit({
                 "type": "state_changed",
                 "state": "WAITING_FOR_USER",
-                "is_running": self._get_is_running(),
+                "is_running": _is_busy,
             })
 
         elif event_type == "error":
             msg_text = raw_event.get('message', 'unknown')
             error_type = raw_event.get('error_type', 'PROVIDER_ERROR')
-            results.append({
+            self._emit({
                 "type": "status_message",
                 "text": f"⚠ Error: {msg_text}",
             })
-            # Convert error to a system notification message in the conversation
-            # so it appears in the chat history and survives page reload/reconnect.
-            # This mirrors the Qt GUI fix where _process_error_event emits
-            # conversation_changed to make the system notification visible.
-            error_msg = {
-                "role": "user",
-                "content": f"[SYSTEM NOTIFICATION] Error: {error_type}: {msg_text}",
-                "is_system_notification": True,
-            }
-            self.history.append(error_msg)
-            # Keep version tracking in sync with session
+            # Error may have added a system notification to session; sync it
             if self._session is not None:
                 self._history_version = self._session.conversation_version
-            results.append({
-                "type": "conversation_changed",
-                "messages": list(self.history),
-            })
+                self._emit({
+                    "type": "conversation_changed",
+                    "messages": self._normalize_for_frontend(self._session.user_history),
+                })
 
-        # ── Synthetic bridge event: don't forward raw session_stop ──────
-        # but still emit the stop_reason as state_changed IDLE so the
-        # frontend learns the agent has stopped.
+        # ── 3. Handle stop signals ────────────────────────────────────────
         if event_type == "session_stop":
             if raw_event.get("stop_reason"):
-                results.append({
+                self._emit({
                     "type": "state_changed",
                     "state": "IDLE",
-                    "is_running": self._get_is_running(),
+                    "is_running": _is_busy,
                 })
-            return results
+            return
 
-        # Stop handling
         if raw_event.get("stop_reason"):
-            results.append({
+            self._emit({
                 "type": "state_changed",
                 "state": "IDLE",
-                "is_running": self._get_is_running(),
+                "is_running": _is_busy,
             })
-
-        return results
-
-    def _map_and_emit(self, raw_event: Dict[str, Any]) -> None:
-        """
-        Map a raw agent event to frontend protocol events and emit each.
-        Uses _translate_event to do the conversion.
-        """
-        for frontend_event in self._translate_event(raw_event):
-            self._emit(frontend_event)
-
-    # ── Internal: helpers ───────────────────────────────────────────────────
-
-    def _get_is_running(self) -> bool:
-        """
-        Determine whether the agent/controller is still alive and can accept
-        follow-up queries.  Works in both standalone and controller modes.
-        """
-        if self._controller is not None:
-            # Controller mode — check controller's is_running if available
-            if hasattr(self._controller, 'is_running'):
-                return bool(self._controller.is_running)
-            return True  # assume alive if we can't check
-        # Standalone mode — check _running + thread alive
-        return self._running and (self._thread is not None and self._thread.is_alive())
-
-    @staticmethod
-    def _map_agent_state(agent_state: str) -> str:
-        """Map Agent/Controller state strings to frontend status values."""
-        mapping = {
-            "running": "RUNNING",
-            "pausing": "PAUSED",
-            "paused": "PAUSED",
-            "idle": "IDLE",
-            "error": "IDLE",
-            "stopped": "IDLE",
-            "completed": "IDLE",
-            "ready": "IDLE",
-            "waiting": "WAITING_FOR_USER",
-        }
-        return mapping.get(agent_state.lower(), agent_state.upper())
-
-    @staticmethod
-    def _map_role(msg: Dict[str, Any]) -> str:
-        """Map internal message role to frontend role."""
-        role = msg.get("role", "system")
-        mapping = {
-            "user": "user",
-            "assistant": "assistant",
-            "system": "system",
-            "tool": "tool_result",
-        }
-        return mapping.get(role, role)
-
-    @staticmethod
-    def _map_content(msg: Dict[str, Any]) -> str:
-        """Extract display content from a message dict."""
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            # Multi‑part content — concatenate text parts
-            texts = []
-            for part in content:
-                if isinstance(part, dict):
-                    if part.get("type") == "text":
-                        texts.append(part.get("text", ""))
-                    elif part.get("type") == "tool_use":
-                        texts.append(f"[Tool: {part.get('name', '?')}]")
-                elif isinstance(part, str):
-                    texts.append(part)
-            return "\n".join(texts)
-        if not isinstance(content, str):
-            return str(content)
-        return content
 
     # ── Internal: agent thread ──────────────────────────────────────────────
 
@@ -1076,12 +969,6 @@ class WebAgentBridge:
                     self._map_and_emit({
                         "type": "session_stop",
                         "stop_reason": "completed",
-                        "is_running": self._get_is_running(),
-                    })
-                    self._emit({
-                        "type": "state_changed",
-                        "state": "IDLE",
-                        "is_running": self._get_is_running(),
                     })
         except Exception as exc:
             traceback.print_exc()

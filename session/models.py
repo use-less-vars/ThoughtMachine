@@ -11,10 +11,11 @@ Backward compatibility: Old sessions with 'config' key are migrated to metadata[
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-import uuid, hashlib, json, os
+import uuid, hashlib, json, os, threading
 from typing import Any
 from thoughtmachine.security import merge_security_config, get_default_security_config
 from agent.logging import log
+from agent.core.message import Message
 
 class ObservableList(list):
     """A list that notifies a callback when mutated."""
@@ -29,23 +30,27 @@ class ObservableList(list):
             log('ERROR', 'debug.unknown', f'[ObservableList.__init__] ERROR during initialization: {e}')
             raise
         self.callback = callback
+        self._lock = threading.Lock()
 
     def _notify(self):
-        callback_repr = self.callback.__qualname__ if self.callback else None
-        log('DEBUG', 'debug.unknown', f'[ObservableList._notify] called on id={id(self)}, callback={callback_repr}')
-        if self.callback:
-            self.callback()
+        log('DEBUG', 'core.history_notify', f"_notify called: len={len(self)}, version will bump")
+        with self._lock:
+            if self.callback:
+                self.callback()
 
     def __setitem__(self, key, value):
-        super().__setitem__(key, value)
+        with self._lock:
+            super().__setitem__(key, value)
         self._notify()
 
     def __delitem__(self, key):
-        super().__delitem__(key)
+        with self._lock:
+            super().__delitem__(key)
         self._notify()
 
     def append(self, item):
-        super().append(item)
+        with self._lock:
+            super().append(item)
         self._notify()
 
     def extend(self, iterable):
@@ -54,42 +59,51 @@ class ObservableList(list):
         except:
             length = 'unknown'
         log('DEBUG', 'debug.unknown', f'[ObservableList.extend] called on id={id(self)} with iterable length={length}')
-        super().extend(iterable)
+        with self._lock:
+            super().extend(iterable)
         self._notify()
 
     def insert(self, index, item):
-        super().insert(index, item)
+        with self._lock:
+            super().insert(index, item)
         self._notify()
 
     def pop(self, index=-1):
-        result = super().pop(index)
+        with self._lock:
+            result = super().pop(index)
         self._notify()
         return result
 
     def remove(self, item):
-        super().remove(item)
+        with self._lock:
+            super().remove(item)
         self._notify()
 
     def clear(self):
-        super().clear()
+        with self._lock:
+            super().clear()
         self._notify()
 
     def __iadd__(self, other):
-        result = super().__iadd__(other)
+        with self._lock:
+            result = super().__iadd__(other)
         self._notify()
         return result
 
     def __imul__(self, other):
-        result = super().__imul__(other)
+        with self._lock:
+            result = super().__imul__(other)
         self._notify()
         return result
 
     def sort(self, *, key=None, reverse=False):
-        super().sort(key=key, reverse=reverse)
+        with self._lock:
+            super().sort(key=key, reverse=reverse)
         self._notify()
 
     def reverse(self):
-        super().reverse()
+        with self._lock:
+            super().reverse()
         self._notify()
 
 @dataclass
@@ -156,6 +170,7 @@ class Session:
         # Intercept assignment to user_history to ensure it always stays ObservableList.
         if name == 'user_history':
             if not isinstance(value, ObservableList):
+                log('WARNING', 'core.history', f"Plain list assignment to user_history intercepted — auto-wrapped to ObservableList")
                 # Wrap plain list back into ObservableList, preserving callback.
                 new_list = ObservableList(list(value), callback=self._on_conversation_changed)
                 object.__setattr__(self, name, new_list)
@@ -176,7 +191,7 @@ class Session:
 
     def _wrap_user_history(self):
         """Wrap user_history with ObservableList if not already wrapped."""
-        log('DEBUG', 'debug.unknown', f"[Session] _wrap_user_history called, session_id={self.session_id}, is_ObservableList={isinstance(self.user_history, ObservableList)}, type={type(self.user_history)}, len={(len(self.user_history) if hasattr(self.user_history, '__len__') else 'N/A')}")
+        log('DEBUG', 'core.history', f"wrapping user_history: is_ObservableList={isinstance(self.user_history, ObservableList)}")
         if not isinstance(self.user_history, ObservableList):
             log('DEBUG', 'debug.unknown', f'[Session] _wrap_user_history: Creating ObservableList from current user_history')
             new_list = ObservableList(self.user_history, callback=self._on_conversation_changed)
@@ -221,8 +236,8 @@ class Session:
     def _on_conversation_changed(self):
         """Called when user_history is mutated."""
         import os
-        log('DEBUG', 'session.session', f'_on_conversation_changed called, session_id={self.session_id}, callbacks={len(self._conversation_changed_callbacks)}')
-        log('DEBUG', 'session.session', f'[SESSION] _on_conversation_changed: {len(self._conversation_changed_callbacks)} callbacks')
+        old_version = self._conversation_version
+        log('DEBUG', 'core.history_notify', f"conversation version: {old_version} → {old_version + 1}, hash={self.conversation_hash}, callbacks={len(self._conversation_changed_callbacks)}")
         for i, cb in enumerate(self._conversation_changed_callbacks):
             cb_repr = cb.__qualname__ if hasattr(cb, '__qualname__') else repr(cb)
             log('DEBUG', 'session.session', f'  Callback {i}: {cb_repr}')
@@ -385,7 +400,7 @@ class Session:
         Add a message to the session's user_history.
         Automatically updates the updated_at timestamp.
         """
-        message = {'role': role, 'content': content, **kwargs}
+        message = Message(role=role, content=content, **kwargs)
         if 'created_at' not in message:
             message['created_at'] = datetime.now().isoformat()
         if 'seq' not in message:

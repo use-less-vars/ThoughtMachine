@@ -77,7 +77,9 @@ class HistoryProvider:
         """Return messages suitable for LLM context (pruned view)."""
         log('DEBUG', 'session.history_provider', f'get_context_for_llm called: cached_context is None={self._cached_context is None}')
         if self._cached_context is not None:
+            log('DEBUG', 'core.cache', f"cache hit: {len(self._cached_context)} messages")
             return self._cached_context
+        log('DEBUG', 'core.cache', 'cache miss — rebuilding')
         context = self.context_builder.build(self.session.user_history, max_tokens=self.token_limit)
         if DEBUG_CONTEXT:
             log('DEBUG', 'session.history_provider', f'get_context_for_llm: {len(self.session.user_history)} history → {len(context)} context')
@@ -171,6 +173,7 @@ class HistoryProvider:
 
     def clear_cache(self) -> None:
         """Explicitly clear the cached context."""
+        log('DEBUG', 'core.cache', 'cache cleared: reason=explicit')
         self._cached_context = None
 
     def create_summary(self, summary_text: str, keep_recent_turns: int) -> Dict[str, Any]:
@@ -184,6 +187,7 @@ class HistoryProvider:
         Returns:
             The summary message dict
         """
+        log('DEBUG', 'core.history_provider', f'create_summary: text_len={len(summary_text)}, keep_recent_turns={keep_recent_turns}')
         summary_msg = {'role': 'system', 'content': f'Summary of previous conversation: {summary_text}', 'pruning_keep_recent_turns': keep_recent_turns, 'pruning_insertion_idx': len(self.session.user_history), 'timestamp': datetime.now().isoformat()}
         self.add_message(summary_msg)
         self.session.summary = summary_msg

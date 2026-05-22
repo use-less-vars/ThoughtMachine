@@ -96,6 +96,7 @@ class AgentController(QObject):
 
     def reset(self):
         """Reset controller to initial state, clearing all queues and events."""
+        log('DEBUG', 'core.controller', 'reset() called')
         while True:
             try:
                 self.event_queue.get_nowait()
@@ -161,6 +162,10 @@ class AgentController(QObject):
         log('INFO', 'core.controller', f'start called with query={query[:80]!r}..., config type={type(config).__name__}, session={session.session_id if session else None}, preset_name={preset_name!r}')
         self._cleanup_if_thread_dead()
         if self._running:
+            if self.thread is not None and self.thread.is_alive() and self._keep_alive:
+                # Thread exists and is in keep-alive mode; route to continue_session.
+                self.continue_session(query)
+                return
             raise RuntimeError('Agent is already running. Stop it first.')
         self.stop_event.clear()
         self.pause_event.set()
@@ -196,6 +201,7 @@ class AgentController(QObject):
 
     def stop(self):
         """Request the agent to pause after the current turn/tool."""
+        log('DEBUG', 'core.controller', 'stop() called - delegating to pause()')
         self.pause()
 
     def continue_session(self, query: str):
@@ -379,14 +385,14 @@ class AgentController(QObject):
             log('DEBUG', 'core.controller', f"[CONTROLLER _run] entering with self.agent={id(self.agent)}, agent.conversation len={len(self.agent.conversation)}, first roles={[m.get('role') for m in self.agent.conversation[:3]]}")
 
         def should_stop():
-            log('DEBUG', 'core.controller', f'should_stop called, pause_event.is_set={self.pause_event.is_set()}, stop_event.is_set={self.stop_event.is_set()}, _pause_requested={self._pause_requested}')
+            # Entry log removed to reduce idle polling noise (fires every loop iteration)
             if self.stop_event.is_set():
                 log('DEBUG', 'core.controller', f'should_stop: stop_event is set, returning True')
                 return True
             if not self.pause_event.is_set():
                 log('DEBUG', 'core.controller', f'should_stop: pause_event not set, returning PAUSED')
                 return 'PAUSED'
-            log('DEBUG', 'core.controller', f'should_stop: not paused, returning False')
+            # Not-logged: idle return (no decision made)
             return False
 
         log('INFO', 'core.controller', '_run(): about to create agent')
@@ -452,12 +458,12 @@ class AgentController(QObject):
                         log('DEBUG', 'core.controller', f'Resumed from pause_event.wait()')
                         continue
                     continue
-                log('DEBUG', 'core.controller', f'Before query_queue.get, queue size: {self.query_queue.qsize()}')
+                # Before-query_queue log removed (idle polling noise)
                 try:
                     query = self.query_queue.get(timeout=1.0)
                     log('DEBUG', 'core.controller', f"Got query from queue: '{query[:50]}...'")
                 except queue.Empty:
-                    log('DEBUG', 'core.controller', f'Queue empty after timeout')
+                    # Queue-empty log removed (idle polling noise)
                     continue
                 if query == '[RESET]':
                     agent.reset()
@@ -490,6 +496,11 @@ class AgentController(QObject):
                     stop_reason = 'error'
                 finally:
                     self._processing_query = False
+                    # Reset agent's internal execution state to READY so the next query
+                    # triggers a proper ready→running transition.
+                    if hasattr(self, 'agent') and self.agent is not None:
+                        self.agent.state.set_execution_state(ExecutionState.READY)
+                        log('DEBUG', 'core.controller', 'Resetting agent execution state to READY after query completion')
                     self._emit_event({'type': 'session_stop', 'stop_reason': stop_reason or 'completed'})
                 if not self._keep_alive:
                     log('DEBUG', 'core.controller', f'_keep_alive=False, breaking outer loop')

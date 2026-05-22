@@ -276,15 +276,16 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
         break
 
       case 'conversation_changed':
-        // Preserve is_system_notification on live updates (same as reload path)
+        console.log('conversation_changed RAW:', msg)
+        // Trust the server's is_system_notification flag — no index-based
+        // fallback that could leak the flag to wrong messages (Bug 2 & 3).
         const serverMessages = msg.messages ?? [];
-        const mergedMessages = serverMessages.map((m, i) => {
-          if (m.is_system_notification ||
-              (state.history[i] && state.history[i].is_system_notification)) {
-            return { ...m, is_system_notification: true };
-          }
-          return m;
-        });
+        const mergedMessages = serverMessages.map((m) => ({
+          ...m,
+          is_system_notification: m.is_system_notification || false,
+        }));
+        const notes = mergedMessages.filter(m => m.is_system_notification);
+        if (notes.length > 0) console.log('🔔 SYSTEM NOTIFICATIONS:', notes);
         update({ history: mergedMessages })
         break
 

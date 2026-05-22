@@ -272,16 +272,11 @@ async def websocket_endpoint(ws: WebSocket):
                     if bridge is not None:
                         conv = bridge.get_conversation()
                         if conv is not None:
-                            messages = []
-                            for m in conv:
-                                msg = {"role": _map_role(m), "content": _map_content(m)}
-                                # Preserve system notification flag on reload
-                                if m.get("is_system_notification"):
-                                    msg["is_system_notification"] = True
-                                messages.append(msg)
+                            # Session user_history already has normalized roles;
+                            # use directly without remapping.
                             await ws.send_json({
                                 "type": "conversation_changed",
-                                "messages": messages,
+                                "messages": conv,
                             })
 
                 elif command == "update_config":
@@ -455,7 +450,7 @@ async def websocket_endpoint(ws: WebSocket):
                         await ws.send_json({
                             "type": "state_changed",
                             "state": "IDLE",
-                            "is_running": bridge.is_running,
+                            "is_running": False,
                         })
                         # Send tokens_updated so the frontend shows saved token counts
                         loaded = bridge._session or bridge._loaded_session
@@ -892,33 +887,6 @@ def _config_to_dict(cfg) -> Dict[str, Any]:
     if hasattr(cfg, "dict"):
         return cfg.dict()
     return {k: str(v) for k, v in vars(cfg).items() if not k.startswith("_")}
-
-def _map_role(msg: Dict[str, Any]) -> str:
-    role = msg.get("role", "system")
-    mapping = {
-        "user": "user",
-        "assistant": "assistant",
-        "system": "system",
-        "tool": "tool_result",
-    }
-    return mapping.get(role, role)
-
-def _map_content(msg: Dict[str, Any]) -> str:
-    content = msg.get("content", "")
-    if isinstance(content, list):
-        texts = []
-        for part in content:
-            if isinstance(part, dict):
-                if part.get("type") == "text":
-                    texts.append(part.get("text", ""))
-                elif part.get("type") == "tool_use":
-                    texts.append(f"[Tool: {part.get('name', '?')}]")
-            elif isinstance(part, str):
-                texts.append(part)
-        return "\n".join(texts)
-    if not isinstance(content, str):
-        return str(content)
-    return content
 
 
 # ══════════════════════════════════════════════════════════════════════════════

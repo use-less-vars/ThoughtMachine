@@ -38,6 +38,7 @@ class EventProcessor:
         """
         typed_event = ev.convert_from_legacy_format(event)
         event_type = typed_event.type.value
+        log('DEBUG', 'core.signal', f"event: type={event_type}")
         log('DEBUG', 'presenter.event_processor', f'Processing event: {event_type}')
         state_event_types = ['error', 'paused', 'stopped', 'thread_finished', 'final', 'max_turns', 'user_interaction_requested', 'rate_limit_warning', 'token_warning', 'turn_warning', 'user_query']
         if event_type not in state_event_types:
@@ -51,6 +52,7 @@ class EventProcessor:
         if self.gui_integration:
             log('DEBUG', 'presenter.event_processor', f'GUI integration available, checking emission for {event_type}')
             if event_type != 'token_update':
+                log('DEBUG', 'core.signal', 'Path A: emit_conversation_changed()')
                 self.gui_integration.emit_conversation_changed()
             else:
                 log('DEBUG', 'presenter.event_processor', f'Skipping token_update event (handled separately)')
@@ -91,6 +93,7 @@ class EventProcessor:
 
     def _process_turn_event(self, event: Dict[str, Any]) -> None:
         """Process a turn event."""
+        log('DEBUG', 'presenter.event_processor', f'_process_turn_event: turn={event.get("turn")}')
         input_tokens, output_tokens = self._extract_token_counts(event)
         if input_tokens is not None and output_tokens is not None:
             self.state_bridge.update_token_totals(input_tokens, output_tokens)
@@ -104,6 +107,7 @@ class EventProcessor:
 
     def _process_token_update_event(self, event: Dict[str, Any]) -> None:
         """Process a token update event."""
+        log('DEBUG', 'presenter.event_processor', f'_process_token_update_event: context_length={event.get("context_length")}')
         input_tokens, output_tokens = self._extract_token_counts(event)
         if input_tokens is not None and output_tokens is not None:
             self.state_bridge.update_token_totals(input_tokens, output_tokens)
@@ -134,6 +138,7 @@ class EventProcessor:
         to 'Ready'. The session_stop event (which follows 'paused') handles
         the PAUSING→READY transition naturally.
         """
+        log('DEBUG', 'presenter.event_processor', f'_process_paused_event: stop_reason={event.get("stop_reason","unknown")}')
         if self.gui_integration:
             self.gui_integration.emit_status_message('Paused')
 
@@ -151,6 +156,7 @@ class EventProcessor:
 
     def _process_terminal_event(self, event: Dict[str, Any], event_type: str) -> None:
         """Process terminal event (final, stopped, max_turns, thread_finished)."""
+        log('DEBUG', 'presenter.event_processor', f'_process_terminal_event: type={event_type}, turn={event.get("turn")}')
         if event_type == 'final':
             self.session_lifecycle.state = ExecutionState.READY
             if self.gui_integration:
@@ -185,6 +191,7 @@ class EventProcessor:
 
     def _process_error_event(self, event: Dict[str, Any]) -> None:
         """Process error event."""
+        log('DEBUG', 'presenter.event_processor', f'_process_error_event: error_type={event.get("error_type","unknown")}')
         self.session_lifecycle.state = ExecutionState.READY
         error_msg = event.get('message', 'Unknown error')
         traceback_text = event.get('traceback', '')

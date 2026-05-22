@@ -40,10 +40,7 @@ class TokenCounter:
         Returns:
             Estimated token count.
         """
-        log('DEBUG', 'core.token_counter', f'estimate_tokens called with type: {type(text_or_message)}')
-        if isinstance(text_or_message, dict):
-            content_preview = str(text_or_message.get('content', ''))[:100].replace('\n', ' ') if 'content' in text_or_message else 'no content'
-            log('DEBUG', 'core.token_counter', f"  role: {text_or_message.get('role', 'unknown')}, content preview: {content_preview}")
+        # Per-message logging removed to reduce noise (was 2+ lines per message)
         encoder = self._get_encoder()
         if isinstance(text_or_message, dict):
             text = json.dumps(text_or_message)
@@ -70,11 +67,7 @@ class TokenCounter:
         Returns:
             Estimated total tokens for the request.
         """
-        log('DEBUG', 'core.token_counter', f'estimate_request_tokens called with {len(messages)} messages')
-        if messages:
-            first_msg = messages[0]
-            last_msg = messages[-1]
-            log('DEBUG', 'core.token_counter', f"  first msg role: {first_msg.get('role', 'unknown')}, last msg role: {last_msg.get('role', 'unknown')}")
+        # estimate_request_tokens entry log removed to reduce noise
         total_tokens = 0
         for msg in messages:
             total_tokens += self.estimate_tokens(msg)

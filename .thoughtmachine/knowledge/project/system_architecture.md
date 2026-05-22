@@ -1415,3 +1415,101 @@ Plain list assignment to `session.user_history` (e.g., in session_lifecycle.py's
 - Token warnings are deferred, deduplicated, and accurate
 - Error paths leave proper trail in conversation history
 - The system handles pause/resume, session load, and multi-turn conversations reliably
+
+## 2026-05-21 — ## Dual-Stream Bridge (Agent State → GUI Wiring)
+
+### Overvi...
+
+## Dual-Stream Bridge (Agent State → GUI Wiring)
+
+### Overview
+The "Dual-Stream Bridge" refers to two parallel event delivery paths from AgentController to the GUI/presenter:
+
+**Path A — Qt pyqtSignal (event_occurred):**
+- `AgentController.event_occurred` is a `pyqtSignal(dict)`
+- Connected in `RefactoredAgentPresenter._connect_signals()`: `self.controller.event_occurred.connect(self._handle_controller_event)`
+- Forwards to `EventProcessor.process_event()` which dispatches by event type
+- `GUIIntegration` provides 7 signals: state_changed, tokens_updated, context_updated, status_message, error_occurred, config_changed, conversation_changed
+- Captured in `RefactoredAgentPresenter` and re-emitted to consumers
+- Requires QApplication event loop (thread-safe due to Qt's queued connections)
+
+**Path B — Plain Python Callbacks (_event_callbacks):**
+- `AgentController._event_callbacks: List[Callable]`
+- Registered via `set_event_callback(callback)` 
+- Works without Qt event loop — for Web UI, CLI, etc.
+- Both paths fire in `_emit_event()` which:
+  1. Puts event on `event_queue` (for polling)
+  2. Emits via `event_occurred.emit(event)` (Path A)
+  3. Iterates `_event_callbacks` (Path B)
+
+### Event Flow
+1. Agent background thread (`_run()`) calls `agent.process_query(query)` which yields events
+2. Each event goes through `_emit_event(event)` 
+3. `session_id` is injected into each event
+4. Content events (turn, tool_call, tool_result, final, etc.) also emit `conversation_updated` signal
+
+### Token Warning System (demonstrated live)
+- `AgentState.update_token_state(total_tokens)` transitions: LOW → WARNING → CRITICAL
+- Thresholds from config: `token_monitor_warning_threshold` and `token_monitor_critical_threshold`
+- At WARNING: emits `token_warning` event, but restrictions not active yet
+- At CRITICAL: sets `restrictions_active=True`, filters tools to SummarizeTool/Final/FinalReport
+- The `ToolFilter` in main agent loop uses `AgentState.is_tool_allowed()` to enforce restrictions
+- Turn warnings (at max_turns-3) also activate restrictions
+
+### Component Hierarchy
+```
+AgentController (background thread)
+  └─ _emit_event()
+      ├─ event_queue.put(event)        [queue for polling]
+      ├─ event_occurred.emit(event)    [Path A: Qt signal]
+      └─ _event_callbacks callbacks    [Path B: plain Python]
+           │
+RefactoredAgentPresenter (main thread)
+  ├─ StateBridge          [config & session state]
+  ├─ GUIIntegration       [Qt signals for GUI]
+  ├─ SessionLifecycle     [start/stop/pause/save/load]
+  └─ EventProcessor       [routes events to state updates]
+       └─ GUIIntegration emit methods → QML/PyQt GUI
+
+
+## 2026-05-21 — System Notification Injection Points & Dual-Stream Convergence
+
+## System Notification Injection Points
+
+### 9 injection points across 2 files:
+
+**session/context_builder.py (1):**
+- `_truncate_to_max_tokens()` line 481 — "Context truncated: X older message(s) removed"
+
+**agent/core/agent.py (8):**
+- `_update_tokens_after_tool()` line 581 — Token warning (buffered)
+- run loop line 767 — Turn warning (direct `_add_to_conversation`)
+- run loop line 781 — Token warning (direct `_add_to_conversation`)
+- run loop line 882 — Rate limit exceeded
+- run loop line 897 — ProviderError
+- run loop line 910 — UnexpectedError
+- `summarize_and_prune()` line 1141 — "Context has been summarized" (session path)
+- `summarize_and_prune()` line 1190 — "Context has been summarized" (fallback path)
+
+### Dual-Stream Convergence (Path A + Path B)
+
+- **Path A**: Agent events → AgentController._emit_event() → pyqtSignal (queued to main thread) → EventProcessor.process_event() → gui_integration.emit_conversation_changed()
+- **Path B**: Agent._add_to_conversation() → session.user_history (ObservableList) → _notify() → Session._on_conversation_changed() → registered callbacks → display_conversation_from_history()
+- Both converge at GUI layer. Path A is main-thread-safe signal, Path B is worker-thread ObservableList callback.
+- Key convergence: EventProcessor line 55-56 explicitly marks "Path A" with logging. Error/pause handlers explicitly call emit_conversation_changed() as fallback when Path B unreliable.
+
+
+## 2026-05-22 — Message(dict) class with derived is_system_notification property
+
+## Message Class — `agent/core/message.py`
+
+Created a `Message(dict)` subclass that derives `is_system_notification` from `role` and `content`. The flag is computed on-the-fly: `True` iff `role == 'user'` and `content` starts with `'[SYSTEM NOTIFICATION]'`. This eliminates the need to manually set `is_system_notification: True` at 16 injection sites across agent.py, agent_presenter.py, and context_builder.py.
+
+Key design decisions:
+- Inherits from `dict` for JSON serializability and backward compatibility
+- Overrides `__getitem__`, `__setitem__`, `get`, `__contains__`, `pop`, `__delitem__` to make the key read-only
+- Setting `msg['is_system_notification']` logs a warning and is ignored
+- Provides `to_dict()` which returns a plain dict with the derived flag included
+- Provides `from_dict()` class method for creating from existing dicts
+- Empty Message objects (no role/content) have `is_system_notification = False`
+- The validation in `_add_to_conversation` still works for both Message objects and plain dicts

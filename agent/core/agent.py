@@ -11,6 +11,7 @@ This is the main Agent class that delegates to specialized modules:
 The original Agent class (1972 lines) is reduced to a coordinator.
 """
 from __future__ import annotations
+import hashlib
 import json
 import os
 import queue
@@ -27,6 +28,7 @@ from tools.utils import model_to_openai_tool
 from tools.final import Final
 from tools.request_user_interaction import RequestUserInteraction
 from tools.summarize_tool import SummarizeTool
+from agent.core.message import Message
 from fast_json_repair import loads as repair_loads
 from session.models import RuntimeParams
 from session.context_builder import ContextBuilder
@@ -310,6 +312,7 @@ class Agent:
         Returns:
             True on success, False on error.
         """
+        log('DEBUG', 'core.agent', f'restart: new_config provider={new_config.provider_type}, model={new_config.model}')
         # Save old references BEFORE closing, so we can restore on failure
         old_logger = self.logger
         old_system_event_logger = getattr(self, 'system_event_logger', None)
@@ -440,6 +443,7 @@ class Agent:
         When no session: assigns to _conversation.
         """
         if self._session is not None:
+            log('DEBUG', 'core.agent', f'conversation setter: replacing session.user_history with {len(value)} messages')
             self._session.user_history[:] = value
             self._session.updated_at = datetime.now()
             self._session._on_conversation_changed()
@@ -450,6 +454,7 @@ class Agent:
 
     def _initialize_session_state(self):
         """Initialize session state based on existing history."""
+        log('DEBUG', 'core.agent', f'_initialize_session_state: session exists={self.session is not None}')
         if self.session is not None:
             if len(self.session.user_history) > 0:
                 events = self.state.set_session_state(SessionState.CONTINUING)
@@ -538,7 +543,28 @@ class Agent:
         self.conversation = updated
         # Phase 1 logging: user_history after add
         log("DEBUG", "core.history", "Message added", {"role": message.get("role"), "content_preview": message.get("content", "")[:100]})
+        is_sys_notif = message.get('is_system_notification', False)
+        content_hash = hashlib.md5(str(message.get('content', '')).encode()).hexdigest()[:8]
+        log('DEBUG', 'core.history', f"append: role={message.get('role')}, is_sys_notif={is_sys_notif}, content_hash={content_hash}")
         dump_messages(self.conversation, "user_history after add")
+        # Validation: flag consistency check
+        role = message.get('role', '')
+        content = message.get('content', '')
+        content_preview = content[:100]
+        if content.startswith('[SYSTEM NOTIFICATION]'):
+            if message.get('is_system_notification') is not True:
+                log('WARNING', 'core.validation', 'Flag inconsistency detected', {
+                    'reason': 'missing is_system_notification flag',
+                    'role': role,
+                    'content_preview': content_preview,
+                })
+        else:
+            if message.get('is_system_notification') is True:
+                log('WARNING', 'core.validation', 'Flag inconsistency detected', {
+                    'reason': 'unexpected is_system_notification flag',
+                    'role': role,
+                    'content_preview': content_preview,
+                })
         pause_debug(f'After add, conversation length: {len(self.conversation)}')
         if hasattr(self, 'context_builder') and self.context_builder is not None:
             if hasattr(self.context_builder, '_cached_context'):
@@ -562,18 +588,16 @@ class Agent:
         if tool_tokens is not None:
             self.state.current_conversation_tokens += tool_tokens
             log('DEBUG', 'core.agent.token', f'Tool result added {tool_tokens}, current_tokens now: {self.state.current_conversation_tokens}')
+            log('DEBUG', 'core.token', f"tool tokens added: {tool_tokens}, total={self.state.current_conversation_tokens}, token_state={self.state.token_state.value if hasattr(self.state, 'token_state') else 'N/A'}")
 
         # Process any warnings or state changes from the token update
         for event in self.state.update_token_state(self.state.current_conversation_tokens):
             if event['type'] == 'token_warning':
                 # Buffer the warning instead of injecting immediately — it will be flushed
                 # after turn_transaction.commit() so it lands in correct chronological order.
-                warning_msg = {
-                    'role': 'user',
-                    'content': f'[SYSTEM NOTIFICATION] {event.get("message", event.get("warning", ""))}',
-                    'is_system_notification': True
-                }
+                warning_msg = Message(role='user', content=f'[SYSTEM NOTIFICATION] {event.get("message", event.get("warning", ""))}')
                 self._pending_warnings.append(warning_msg)
+                log('DEBUG', 'core.token', f"warning buffered: state={self.state.token_state.value if hasattr(self.state, 'token_state') else 'N/A'}, count={len(self._pending_warnings)}")
                 warning_tokens = self._estimate_tokens(warning_msg)
                 self.state.current_conversation_tokens += warning_tokens
     @property
@@ -661,272 +685,394 @@ class Agent:
     def process_query(self, query):
         """Process a user query, appending it to conversation and running the agent.
         Yields events as dicts."""
-        # Apply any pending configuration update before processing
-        self._apply_pending_config()
+        try:
+            # Apply any pending configuration update before processing
+            self._apply_pending_config()
+            log('DEBUG', 'core.agent', f'process_query: query="{query[:80]}..." turn_display={self._display_turn}')
 
-        # Safety check: ensure LLM client is in a valid state after config update
-        llm_client = getattr(self, 'llm_client', None)
-        if llm_client is None or getattr(llm_client, 'provider', None) is None:
-            log('ERROR', 'agent.core', 'LLM client is unavailable or in invalid state after config update')
-            event_dict = {
-                'type': 'error',
-                'error_type': 'invalid_config',
-                'stop_reason': 'error',
-                'message': 'LLM client unavailable after configuration update. The new configuration may be invalid.',
-                'turn': self._display_turn,
-            }
-            self._add_conversation_data_to_event(event_dict)
-            yield event_dict
-            return
+            # Safety check: ensure LLM client is in a valid state after config update
+            llm_client = getattr(self, 'llm_client', None)
+            if llm_client is None or getattr(llm_client, 'provider', None) is None:
+                log('ERROR', 'core.agent', 'LLM client is unavailable or in invalid state after config update')
+                event_dict = {
+                    'type': 'error',
+                    'error_type': 'invalid_config',
+                    'stop_reason': 'error',
+                    'message': 'LLM client unavailable after configuration update. The new configuration may be invalid.',
+                    'turn': self._display_turn,
+                }
+                self._add_conversation_data_to_event(event_dict)
+                yield event_dict
+                return
 
-        pause_debug(f"process_query called with query: '{query[:50]}...'")
-        pause_debug(f'Current execution state: {self.state.execution_state}')
-        pause_debug(f'Conversation length before adding query: {len(self.conversation)}')
-        pause_debug(f'context_builder exists: {self.context_builder is not None}')
-        if self.context_builder and hasattr(self.context_builder, 'session'):
-            pause_debug(f'context_builder.session: {self.context_builder.session}')
-            if self.context_builder.session:
-                pause_debug(f'context_builder.session.session_id: {self.context_builder.session.session_id}')
-        pause_debug(f'agent.session: {self.session}')
-        if self.session:
-            pause_debug(f'agent.session.session_id: {self.session.session_id}')
-        self.conversation = self.llm_client.ensure_system_prompt(self.conversation)
-        pause_debug(f'Clearing _pause_requested (was {self._pause_requested})')
-        self._pause_requested = False
-        current_exec_state = self.state.execution_state
-        if current_exec_state == ExecutionState.RUNNING:
-            if self.logger:
-                self.logger.log_error('EXECUTION_STATE', 'process_query called while already RUNNING')
-        elif current_exec_state == ExecutionState.READY:
-            events = self.state.set_execution_state(ExecutionState.RUNNING)
-            for event in events:
-                for yielded_event in self._handle_state_event(event):
-                    yield yielded_event
-        else:
-            events = self.state.set_execution_state(ExecutionState.RUNNING)
-            for event in events:
-                for yielded_event in self._handle_state_event(event):
-                    yield yielded_event
-        if self.logger:
-            config_data = {'model': self.config.model, 'temperature': self.config.temperature, 'max_turns': self.config.max_turns, 'max_tokens': self.config.max_tokens}
-            self.logger.log_agent_start(query, config_data)
-            self.logger.log_system_resources()
-        pause_debug(f"Adding user message to conversation: '{query[:50]}...'")
-        user_msg = {'role': 'user', 'content': query}
-        self._add_to_conversation(user_msg)
-        pause_debug(f'After adding user message, conversation length: {len(self.conversation)}')
-        estimated_tokens = self._estimate_tokens(user_msg)
-        self.state.current_conversation_tokens += estimated_tokens
-        yield self._create_token_update_event()
-        self._display_turn = getattr(self, '_display_turn', 0) + 1
-        log('WARNING', 'debug.agent.user_query', f"query='{query[:50]}...', _display_turn={self._display_turn}")
-        event_dict = {'type': 'user_query', 'content': query, 'turn': self._display_turn}
-        self._add_conversation_data_to_event(event_dict)
-        if 'timestamp' not in event_dict:
-            event_dict['timestamp'] = event_dict.get('created_at', time.time())
-        yield event_dict
-        prev_conversation_len = len(self.conversation)
-        last_input_tokens = 0
-        last_output_tokens = 0
-        for turn in range(self.config.max_turns):
-            turn_start_time = time.time()
-            if self.logger:
-                self.logger.log_turn_start(turn)
-                if turn % 5 == 0:
-                    self.logger.log_system_resources()
-            if self.stop_check and self.stop_check():
-                events = self.state.set_execution_state(ExecutionState.PAUSING)
+            pause_debug(f"process_query called with query: '{query[:50]}...'")
+            pause_debug(f'Current execution state: {self.state.execution_state}')
+            pause_debug(f'Conversation length before adding query: {len(self.conversation)}')
+            pause_debug(f'context_builder exists: {self.context_builder is not None}')
+            if self.context_builder and hasattr(self.context_builder, 'session'):
+                pause_debug(f'context_builder.session: {self.context_builder.session}')
+                if self.context_builder.session:
+                    pause_debug(f'context_builder.session.session_id: {self.context_builder.session.session_id}')
+            pause_debug(f'agent.session: {self.session}')
+            if self.session:
+                pause_debug(f'agent.session.session_id: {self.session.session_id}')
+            self.conversation = self.llm_client.ensure_system_prompt(self.conversation)
+            pause_debug(f'Clearing _pause_requested (was {self._pause_requested})')
+            self._pause_requested = False
+            current_exec_state = self.state.execution_state
+            if current_exec_state == ExecutionState.RUNNING:
+                log('WARNING', 'core.agent', f'process_query called while already in RUNNING state')
+                if self.logger:
+                    self.logger.log_error('EXECUTION_STATE', 'process_query called while already RUNNING')
+            elif current_exec_state == ExecutionState.READY:
+                events = self.state.set_execution_state(ExecutionState.RUNNING)
                 for event in events:
                     for yielded_event in self._handle_state_event(event):
                         yield yielded_event
-                if self.logger:
-                    self.logger.log_stop_signal()
-                    self.logger.log_system_resources()
-                    self.logger.log_agent_end('stopped', 'Stop signal received')
-                    self.logger.close()
-                stopped_event = {'type': 'stopped', 'stop_reason': 'stopped', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
-                self._add_conversation_data_to_event(stopped_event)
-                yield stopped_event
-                return
-            turn_events = self.state.update_turn_state(turn)
-            for event in turn_events:
-                if event['type'] == 'turn_warning':
-                    warning_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + event.get('message', event.get('warning', '')), 'is_system_notification': True}
-                    self._add_to_conversation(warning_msg)
-                    warning_tokens = self._estimate_tokens(warning_msg)
-                    self.state.current_conversation_tokens += warning_tokens
-                    yield self._create_token_update_event()
-                event_dict = {'type': event['type'], 'message': event.get('message', event.get('warning', '')), 'turn_count': event.get('turn_count', turn), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
-                self._add_conversation_data_to_event(event_dict)
-                yield event_dict
-            # Don't recalculate full estimate here - truth-based current_conversation_tokens
-            # is maintained by LLM prompt_tokens + estimated additions for new content
-            yield self._create_token_update_event()
-            token_events = self.state.update_token_state(self.state.current_conversation_tokens)
-            for event in token_events:
-                if event['type'] == 'token_warning':
-                    warning_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] ' + event.get('message', event.get('warning', '')), 'is_system_notification': True}
-                    self._add_to_conversation(warning_msg)
-                    warning_tokens = self._estimate_tokens(warning_msg)
-                    self.state.current_conversation_tokens += warning_tokens
-                    yield self._create_token_update_event()
-                event_dict = {'type': event['type'], 'message': event.get('message', event.get('warning', '')), 'token_count': event.get('token_count', self.state.current_conversation_tokens), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
-                self._add_conversation_data_to_event(event_dict)
-                yield event_dict
-            for msg in self.conversation:
-                if msg.get('role') == 'assistant' and 'tool_calls' in msg:
-                    if msg.get('reasoning_content') is None:
-                        msg['reasoning_content'] = ''
-            if self.logger and hasattr(self.logger, 'py_logger'):
-                system_msgs = [msg for msg in self.conversation if msg.get('role') == 'system']
-                log('INFO', 'agent.core', f'[CONVERSATION] Total messages: {len(self.conversation)}, system messages: {len(system_msgs)}')
-            max_context_tokens = self._get_max_context_tokens()
-            if self.logger and hasattr(self.logger, 'py_logger'):
-                log('INFO', 'agent.core', f'[CONTEXT] Max context tokens: {max_context_tokens}, model: {self.config.model}')
-            self.debug_context.debug_context('before_build', context_builder=self.context_builder)
-            if hasattr(self, 'context_builder') and self.context_builder is not None:
-                messages = self.context_builder.build(self.conversation, max_tokens=max_context_tokens)
             else:
-                messages = self.conversation
-            self.debug_context.debug_context('after_build', messages=messages, context_builder=self.context_builder)
-            pause_debug(f'Messages being sent to LLM ({len(messages)}):')
-            for i, msg in enumerate(messages):
-                role = msg.get('role', 'unknown')
-                content_preview = str(msg.get('content', ''))[:100]
-                pause_debug(f'  [{i}] {role}: {content_preview}...')
-            original_len = len(messages)
-            messages = ContextBuilder._cleanup_orphaned_tool_messages(messages)
-            if original_len != len(messages):
-                log('DEBUG', 'agent.core', f'[DEBUG_CONTEXT] Agent: cleaned {original_len - len(messages)} orphaned tool messages from final context')
-            if self.logger and hasattr(self.logger, 'py_logger'):
-                import tiktoken
-                try:
-                    encoder = tiktoken.get_encoding('cl100k_base')
-                except Exception:
-                    encoder = None
-                total_tokens = sum((self.token_counter.estimate_tokens(msg) for msg in messages))
-                log('INFO', 'agent.core', f'[CONTEXT] Built context: {len(messages)} messages, ~{total_tokens} tokens')
+                events = self.state.set_execution_state(ExecutionState.RUNNING)
+                for event in events:
+                    for yielded_event in self._handle_state_event(event):
+                        yield yielded_event
             if self.logger:
-                self.logger.log_llm_request(messages, self.tool_definitions)
-            if self.rate_limit_active:
-                delay = min(self.rate_limit_delay, self.rate_limit_max_wait)
-                if delay > 0:
-                    if self.logger and hasattr(self.logger, 'py_logger'):
-                        log('INFO', 'agent.core', f'[RATE_LIMIT] Applying rate limit delay: {delay}s between turns')
-                    time.sleep(delay)
-            tools = self.llm_client.format_tools(self.tool_definitions)
-            # EMERGENCY TRACE: dump conversation and messages before LLM call
-            log('DEBUG', 'debug.emergency', f'====== EMERGENCY TRACE: self.conversation ({len(self.conversation)} msgs) ======')
-            for i, msg in enumerate(self.conversation):
-                role = msg.get('role', 'unknown')
-                content = msg.get('content', '')
-                preview = content[:80].replace('\n', '\\n')
-                log('DEBUG', 'debug.emergency', f'  CONV[{i}] role={role}: {preview}')
-            log('DEBUG', 'debug.emergency', f'====== EMERGENCY TRACE: messages from build() ({len(messages)} msgs) ======')
-            for i, msg in enumerate(messages):
-                role = msg.get('role', 'unknown')
-                content = msg.get('content', '')
-                preview = content[:80].replace('\n', '\\n')
-                log('DEBUG', 'debug.emergency', f'  MSG[{i}] role={role}: {preview}')
-            try:
-                chat_kwargs = {'temperature': self.runtime_params.temperature}
-                if self.runtime_params.max_tokens is not None:
-                    chat_kwargs['max_tokens'] = self.runtime_params.max_tokens
-                if self.runtime_params.top_p is not None:
-                    chat_kwargs['top_p'] = self.runtime_params.top_p
-                # ── Agent messages diagnostic ──────────────────────────────────
-                log('DEBUG', 'core.agent', f"[AGENT MESSAGES BEFORE API] turn={turn} len(messages)={len(messages)} "
-                    f"roles={[m.get('role') for m in messages[-5:]]} "
-                    f"last_user={'present' if any(m['role']=='user' for m in messages[-2:]) else 'MISSING'}")
-                llm_start_time = time.time()
-                response = self.llm_client.chat_completion(messages=messages, tools=tools if tools else None, **chat_kwargs)
-                llm_duration_ms = (time.time() - llm_start_time) * 1000
+                config_data = {'model': self.config.model, 'temperature': self.config.temperature, 'max_turns': self.config.max_turns, 'max_tokens': self.config.max_tokens}
+                self.logger.log_agent_start(query, config_data)
+                self.logger.log_system_resources()
+            pause_debug(f"Adding user message to conversation: '{query[:50]}...'")
+            user_msg = {'role': 'user', 'content': query}
+            self._add_to_conversation(user_msg)
+            pause_debug(f'After adding user message, conversation length: {len(self.conversation)}')
+            estimated_tokens = self._estimate_tokens(user_msg)
+            self.state.current_conversation_tokens += estimated_tokens
+            yield self._create_token_update_event()
+            self._display_turn = getattr(self, '_display_turn', 0) + 1
+            log('DEBUG', 'core.agent', f"User query processed: turn={self._display_turn}, query='{query[:80]}...'")
+            log('WARNING', 'debug.agent.user_query', f"query='{query[:50]}...', _display_turn={self._display_turn}")
+            event_dict = {'type': 'user_query', 'content': query, 'turn': self._display_turn}
+            self._add_conversation_data_to_event(event_dict)
+            if 'timestamp' not in event_dict:
+                event_dict['timestamp'] = event_dict.get('created_at', time.time())
+            yield event_dict
+            prev_conversation_len = len(self.conversation)
+            last_input_tokens = 0
+            last_output_tokens = 0
+            for turn in range(self.config.max_turns):
+                turn_start_time = time.time()
+                log('DEBUG', 'core.agent', f'process_query: starting turn {turn}/{self.config.max_turns}, conversation length={len(self.conversation)}')
                 if self.logger:
-                    self.logger.log_latency('llm_call', llm_duration_ms, {'turn': turn, 'model': self.config.model, 'has_tools': bool(tools)})
-                input_tokens = response.usage.get('prompt_tokens', 0) if response.usage else 0
-                output_tokens = response.usage.get('completion_tokens', 0) if response.usage else 0
-                # Use LLM-reported prompt_tokens as ground truth for conversation token count
-                previous_tokens = self.state.current_conversation_tokens
-                self.state.current_conversation_tokens = input_tokens
-                log('DEBUG', 'core.agent.token', f'LLM prompt_tokens={input_tokens}, overwriting current_tokens (was {previous_tokens})')
-                last_input_tokens = input_tokens
-                last_output_tokens = output_tokens
-                self.total_input_tokens += input_tokens
-                self.total_output_tokens += output_tokens
-            except RateLimitExceeded as e:
-                self.rate_limit_count += 1
-                self.rate_limit_active = True
-                if self.rate_limit_count > 1:
-                    self.rate_limit_delay = min(self.rate_limit_delay * self.rate_limit_backoff_factor, self.rate_limit_max_wait)
-                wait_time = self.rate_limit_base_wait
-                if self.logger:
-                    self.logger.log_error('RATE_LIMIT', f'Rate limit exceeded, waiting {wait_time}s, delay between turns: {self.rate_limit_delay}s')
-                event_dict = {'type': 'rate_limit_warning', 'message': f'Rate limit exceeded. Waiting {wait_time}s before retrying. Delay between turns: {self.rate_limit_delay}s', 'wait_time': wait_time, 'turn_delay': self.rate_limit_delay, 'rate_limit_count': self.rate_limit_count, 'turn': self._display_turn}
-                self._add_conversation_data_to_event(event_dict)
-                yield event_dict
-                time.sleep(wait_time)
-                if self.session is not None:
-                    self._add_to_conversation({'role': 'user', 'content': f'[SYSTEM NOTIFICATION] Error: RATE_LIMIT_EXCEEDED: rate limit exceeded after {self.rate_limit_count} attempts', 'is_system_notification': True})
-                stop_reason_event = {'type': 'stop_reason', 'stop_reason': 'rate_limit', 'message': f'Rate limit exceeded after {self.rate_limit_count} attempts', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
-                self._add_conversation_data_to_event(stop_reason_event)
-                yield stop_reason_event
-                return
-            except (ProviderError, LLMError) as e:
-                error_type = 'PROVIDER_ERROR'
-                if isinstance(e, LLMError):
-                    error_type = e.error_type.upper()
-                if self.logger:
-                    self.logger.log_error(error_type, str(e))
-                    self.logger.log_system_resources()
-                    self.logger.log_agent_end('provider_error', f'Provider error: {e}')
-                    self.logger.close()
-                if self.session is not None:
-                    self._add_to_conversation({'role': 'user', 'content': f'[SYSTEM NOTIFICATION] Error: {error_type}: {e}', 'is_system_notification': True})
-                event_dict = {'type': 'error', 'error_type': error_type, 'message': str(e), 'stop_reason': 'error', 'traceback': traceback.format_exc(), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
-                self._add_conversation_data_to_event(event_dict)
-                yield event_dict
-                return
-            except Exception as e:
-                log('ERROR', 'agent.core', f'[Agent] Unexpected exception in process_query: {e}')
-                if self.logger:
-                    self.logger.log_error('UNEXPECTED_ERROR', str(e))
-                    self.logger.log_system_resources()
-                    self.logger.log_agent_end('unexpected_error', f'Unexpected error: {e}')
-                    self.logger.close()
-                if self.session is not None:
-                    self._add_to_conversation({'role': 'user', 'content': f'[SYSTEM NOTIFICATION] Error: UNEXPECTED_ERROR: {e}', 'is_system_notification': True})
-                event_dict = {'type': 'error', 'error_type': 'UNEXPECTED_ERROR', 'message': str(e), 'stop_reason': 'error', 'traceback': traceback.format_exc(), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
-                self._add_conversation_data_to_event(event_dict)
-                yield event_dict
-                return
-            content = response.content or ''
-            reasoning = response.reasoning
-            tool_calls = response.tool_calls
-            user_interaction_message = None
-            pause_debug(f'Checking pause request before turn: _pause_requested={self._pause_requested}')
-            if self._pause_requested:
-                if tool_calls:
-                    # Defer pause: tools need to execute first.
-                    # _pause_requested stays True -> checkpoint 2 (line ~998) will catch it
-                    # after tools have run and turn_transaction has been committed.
-                    pause_debug(f'Pause requested but tool_calls present, deferring to after tool execution')
-                else:
-                    pause_debug(f'Pause detected! Transitioning to PAUSING')
-                    # Save grace turn: commit LLM response to user_history BEFORE yielding pause
-                    assistant_msg = {'role': 'assistant', 'content': content}
-                    if reasoning is not None:
-                        assistant_msg['reasoning_content'] = reasoning
-                    elif tool_calls:
-                        assistant_msg['reasoning_content'] = ''
-                    # Don't include tool_calls — they weren't executed
-                    grace_tx = TurnTransaction(self.session, self.context_builder, conversation=None if self._session is not None else self._conversation)
-                    grace_tx.add_assistant_message(assistant_msg)
-                    grace_tx.commit()
+                    self.logger.log_turn_start(turn)
+                    if turn % 5 == 0:
+                        self.logger.log_system_resources()
+                if self.stop_check and self.stop_check():
                     events = self.state.set_execution_state(ExecutionState.PAUSING)
                     for event in events:
                         for yielded_event in self._handle_state_event(event):
                             yield yielded_event
-                    pause_debug(f'Clearing _pause_requested after pause')
+                    if self.logger:
+                        self.logger.log_stop_signal()
+                        self.logger.log_system_resources()
+                        self.logger.log_agent_end('stopped', 'Stop signal received')
+                        self.logger.close()
+                    stopped_event = {'type': 'stopped', 'stop_reason': 'stopped', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                    self._add_conversation_data_to_event(stopped_event)
+                    yield stopped_event
+                    return
+                turn_events = self.state.update_turn_state(turn)
+                for event in turn_events:
+                    if event['type'] == 'turn_warning':
+                        warning_msg = Message(role='user', content='[SYSTEM NOTIFICATION] ' + event.get('message', event.get('warning', '')))
+                        self._add_to_conversation(warning_msg)
+                        warning_tokens = self._estimate_tokens(warning_msg)
+                        self.state.current_conversation_tokens += warning_tokens
+                        yield self._create_token_update_event()
+                    event_dict = {'type': event['type'], 'message': event.get('message', event.get('warning', '')), 'turn_count': event.get('turn_count', turn), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                    self._add_conversation_data_to_event(event_dict)
+                    yield event_dict
+                # Don't recalculate full estimate here - truth-based current_conversation_tokens
+                # is maintained by LLM prompt_tokens + estimated additions for new content
+                yield self._create_token_update_event()
+                token_events = self.state.update_token_state(self.state.current_conversation_tokens)
+                for event in token_events:
+                    if event['type'] == 'token_warning':
+                        warning_msg = Message(role='user', content='[SYSTEM NOTIFICATION] ' + event.get('message', event.get('warning', '')))
+                        self._add_to_conversation(warning_msg)
+                        warning_tokens = self._estimate_tokens(warning_msg)
+                        self.state.current_conversation_tokens += warning_tokens
+                        yield self._create_token_update_event()
+                    event_dict = {'type': event['type'], 'message': event.get('message', event.get('warning', '')), 'token_count': event.get('token_count', self.state.current_conversation_tokens), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                    self._add_conversation_data_to_event(event_dict)
+                    yield event_dict
+                for msg in self.conversation:
+                    if msg.get('role') == 'assistant' and 'tool_calls' in msg:
+                        if msg.get('reasoning_content') is None:
+                            msg['reasoning_content'] = ''
+                if self.logger and hasattr(self.logger, 'py_logger'):
+                    system_msgs = [msg for msg in self.conversation if msg.get('role') == 'system']
+                    log('INFO', 'agent.core', f'[CONVERSATION] Total messages: {len(self.conversation)}, system messages: {len(system_msgs)}')
+                max_context_tokens = self._get_max_context_tokens()
+                if self.logger and hasattr(self.logger, 'py_logger'):
+                    log('INFO', 'agent.core', f'[CONTEXT] Max context tokens: {max_context_tokens}, model: {self.config.model}')
+                self.debug_context.debug_context('before_build', context_builder=self.context_builder)
+                if hasattr(self, 'context_builder') and self.context_builder is not None:
+                    messages = self.context_builder.build(self.conversation, max_tokens=max_context_tokens)
+                else:
+                    messages = self.conversation
+                self.debug_context.debug_context('after_build', messages=messages, context_builder=self.context_builder)
+                pause_debug(f'Messages being sent to LLM ({len(messages)}):')
+                for i, msg in enumerate(messages):
+                    role = msg.get('role', 'unknown')
+                    content_preview = str(msg.get('content', ''))[:100]
+                    pause_debug(f'  [{i}] {role}: {content_preview}...')
+                original_len = len(messages)
+                messages = ContextBuilder._cleanup_orphaned_tool_messages(messages)
+                if original_len != len(messages):
+                    log('DEBUG', 'agent.core', f'[DEBUG_CONTEXT] Agent: cleaned {original_len - len(messages)} orphaned tool messages from final context')
+                if self.logger and hasattr(self.logger, 'py_logger'):
+                    import tiktoken
+                    try:
+                        encoder = tiktoken.get_encoding('cl100k_base')
+                    except Exception:
+                        encoder = None
+                    total_tokens = sum((self.token_counter.estimate_tokens(msg) for msg in messages))
+                    log('INFO', 'agent.core', f'[CONTEXT] Built context: {len(messages)} messages, ~{total_tokens} tokens')
+                if self.logger:
+                    self.logger.log_llm_request(messages, self.tool_definitions)
+                if self.rate_limit_active:
+                    delay = min(self.rate_limit_delay, self.rate_limit_max_wait)
+                    if delay > 0:
+                        if self.logger and hasattr(self.logger, 'py_logger'):
+                            log('INFO', 'agent.core', f'[RATE_LIMIT] Applying rate limit delay: {delay}s between turns')
+                        time.sleep(delay)
+                tools = self.llm_client.format_tools(self.tool_definitions)
+                # EMERGENCY TRACE: dump conversation and messages before LLM call
+                log('DEBUG', 'debug.emergency', f'====== EMERGENCY TRACE: self.conversation ({len(self.conversation)} msgs) ======')
+                for i, msg in enumerate(self.conversation):
+                    role = msg.get('role', 'unknown')
+                    content = msg.get('content', '')
+                    preview = content[:80].replace('\n', '\\n')
+                    log('DEBUG', 'debug.emergency', f'  CONV[{i}] role={role}: {preview}')
+                log('DEBUG', 'debug.emergency', f'====== EMERGENCY TRACE: messages from build() ({len(messages)} msgs) ======')
+                for i, msg in enumerate(messages):
+                    role = msg.get('role', 'unknown')
+                    content = msg.get('content', '')
+                    preview = content[:80].replace('\n', '\\n')
+                    log('DEBUG', 'debug.emergency', f'  MSG[{i}] role={role}: {preview}')
+                try:
+                    chat_kwargs = {'temperature': self.runtime_params.temperature}
+                    if self.runtime_params.max_tokens is not None:
+                        chat_kwargs['max_tokens'] = self.runtime_params.max_tokens
+                    if self.runtime_params.top_p is not None:
+                        chat_kwargs['top_p'] = self.runtime_params.top_p
+                    # ── Agent messages diagnostic ──────────────────────────────────
+                    log('DEBUG', 'core.agent', f"[AGENT MESSAGES BEFORE API] turn={turn} len(messages)={len(messages)} "
+                        f"roles={[m.get('role') for m in messages[-5:]]} "
+                        f"last_user={'present' if any(m['role']=='user' for m in messages[-2:]) else 'MISSING'}")
+                    llm_start_time = time.time()
+                    response = self.llm_client.chat_completion(messages=messages, tools=tools if tools else None, **chat_kwargs)
+                    llm_duration_ms = (time.time() - llm_start_time) * 1000
+                    if self.logger:
+                        self.logger.log_latency('llm_call', llm_duration_ms, {'turn': turn, 'model': self.config.model, 'has_tools': bool(tools)})
+                    input_tokens = response.usage.get('prompt_tokens', 0) if response.usage else 0
+                    output_tokens = response.usage.get('completion_tokens', 0) if response.usage else 0
+                    # Use LLM-reported prompt_tokens as ground truth for conversation token count
+                    previous_tokens = self.state.current_conversation_tokens
+                    self.state.current_conversation_tokens = input_tokens
+                    log('DEBUG', 'core.agent.token', f'LLM prompt_tokens={input_tokens}, overwriting current_tokens (was {previous_tokens})')
+                    # Token drift detection: compare pre-call estimate vs LLM-reported
+                    if previous_tokens is not None and previous_tokens > 0 and input_tokens > 0:
+                        drift = abs(input_tokens - previous_tokens)
+                        drift_pct = (drift / input_tokens) * 100
+                        if drift_pct > 5:
+                            log('WARNING', 'core.token', 'Token estimate drift detected', {
+                                'estimated': previous_tokens,
+                                'reported': input_tokens,
+                                'drift_pct': round(drift_pct, 2),
+                            })
+                        else:
+                            log('DEBUG', 'core.token', 'Token estimate within tolerance', {
+                                'estimated': previous_tokens,
+                                'reported': input_tokens,
+                                'drift_pct': round(drift_pct, 2),
+                            })
+                    elif input_tokens > 0:
+                        log('INFO', 'core.token', 'LLM prompt_tokens received (no prior estimate)', {
+                            'reported': input_tokens,
+                        })
+                    last_input_tokens = input_tokens
+                    last_output_tokens = output_tokens
+                    self.total_input_tokens += input_tokens
+                    self.total_output_tokens += output_tokens
+                except RateLimitExceeded as e:
+                    self.rate_limit_count += 1
+                    self.rate_limit_active = True
+                    if self.rate_limit_count > 1:
+                        self.rate_limit_delay = min(self.rate_limit_delay * self.rate_limit_backoff_factor, self.rate_limit_max_wait)
+                    wait_time = self.rate_limit_base_wait
+                    if self.logger:
+                        self.logger.log_error('RATE_LIMIT', f'Rate limit exceeded, waiting {wait_time}s, delay between turns: {self.rate_limit_delay}s')
+                    event_dict = {'type': 'rate_limit_warning', 'message': f'Rate limit exceeded. Waiting {wait_time}s before retrying. Delay between turns: {self.rate_limit_delay}s', 'wait_time': wait_time, 'turn_delay': self.rate_limit_delay, 'rate_limit_count': self.rate_limit_count, 'turn': self._display_turn}
+                    self._add_conversation_data_to_event(event_dict)
+                    yield event_dict
+                    time.sleep(wait_time)
+                    if self.session is not None:
+                        self._add_to_conversation(Message(role='user', content=f'[SYSTEM NOTIFICATION] Error: RATE_LIMIT_EXCEEDED: rate limit exceeded after {self.rate_limit_count} attempts'))
+                    stop_reason_event = {'type': 'stop_reason', 'stop_reason': 'rate_limit', 'message': f'Rate limit exceeded after {self.rate_limit_count} attempts', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                    self._add_conversation_data_to_event(stop_reason_event)
+                    yield stop_reason_event
+                    return
+                except (ProviderError, LLMError) as e:
+                    error_type = 'PROVIDER_ERROR'
+                    if isinstance(e, LLMError):
+                        error_type = e.error_type.upper()
+                    if self.logger:
+                        self.logger.log_error(error_type, str(e))
+                        self.logger.log_system_resources()
+                        self.logger.log_agent_end('provider_error', f'Provider error: {e}')
+                        self.logger.close()
+                    if self.session is not None:
+                        self._add_to_conversation(Message(role='user', content=f'[SYSTEM NOTIFICATION] Error: {error_type}: {e}'))
+                    event_dict = {'type': 'error', 'error_type': error_type, 'message': str(e), 'stop_reason': 'error', 'traceback': traceback.format_exc(), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                    self._add_conversation_data_to_event(event_dict)
+                    yield event_dict
+                    return
+                except Exception as e:
+                    log('ERROR', 'agent.core', f'[Agent] Unexpected exception in process_query: {e}')
+                    if self.logger:
+                        self.logger.log_error('UNEXPECTED_ERROR', str(e))
+                        self.logger.log_system_resources()
+                        self.logger.log_agent_end('unexpected_error', f'Unexpected error: {e}')
+                        self.logger.close()
+                    if self.session is not None:
+                        self._add_to_conversation(Message(role='user', content=f'[SYSTEM NOTIFICATION] Error: UNEXPECTED_ERROR: {e}'))
+                    event_dict = {'type': 'error', 'error_type': 'UNEXPECTED_ERROR', 'message': str(e), 'stop_reason': 'error', 'traceback': traceback.format_exc(), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                    self._add_conversation_data_to_event(event_dict)
+                    yield event_dict
+                    return
+                content = response.content or ''
+                reasoning = response.reasoning
+                tool_calls = response.tool_calls
+                user_interaction_message = None
+                pause_debug(f'Checking pause request before turn: _pause_requested={self._pause_requested}')
+                log('DEBUG', 'core.pause', f"checkpoint 1: pause_requested={self._pause_requested}, has_tool_calls={bool(tool_calls)}")
+                if self._pause_requested:
+                    if tool_calls:
+                        # Defer pause: tools need to execute first.
+                        # _pause_requested stays True -> checkpoint 2 (line ~998) will catch it
+                        # after tools have run and turn_transaction has been committed.
+                        pause_debug(f'Pause requested but tool_calls present, deferring to after tool execution')
+                    else:
+                        pause_debug(f'Pause detected! Transitioning to PAUSING')
+                        # Save grace turn: commit LLM response to user_history BEFORE yielding pause
+                        assistant_msg = {'role': 'assistant', 'content': content}
+                        if reasoning is not None:
+                            assistant_msg['reasoning_content'] = reasoning
+                        elif tool_calls:
+                            assistant_msg['reasoning_content'] = ''
+                        # Don't include tool_calls — they weren't executed
+                        grace_tx = TurnTransaction(self.session, self.context_builder, conversation=None if self._session is not None else self._conversation)
+                        grace_tx.add_assistant_message(assistant_msg)
+                        grace_tx.commit()
+                        events = self.state.set_execution_state(ExecutionState.PAUSING)
+                        for event in events:
+                            for yielded_event in self._handle_state_event(event):
+                                yield yielded_event
+                        pause_debug(f'Clearing _pause_requested after pause')
+                        self._pause_requested = False
+                        pause_event = {'type': 'paused', 'stop_reason': 'paused', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens}
+                        self._add_conversation_data_to_event(pause_event)
+                        yield pause_event
+                        turn_duration = time.time() - turn_start_time
+                        if self.logger:
+                            self.logger.log_system_resources()
+                            self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
+                        return
+                turn_transaction = TurnTransaction(self.session, self.context_builder, conversation=None if self._session is not None else self._conversation)
+                assistant_msg = {'role': 'assistant', 'content': content}
+                if reasoning is not None:
+                    assistant_msg['reasoning_content'] = reasoning
+                elif tool_calls:
+                    assistant_msg['reasoning_content'] = ''
+                if tool_calls:
+                    assistant_msg['tool_calls'] = tool_calls
+                turn_transaction.add_assistant_message(assistant_msg)
+                log('DEBUG', 'core.agent', f'Added assistant message to turn_transaction: has_tool_calls={bool(tool_calls)}, content_len={len(content)}')
+                yield self._create_token_update_event()
+                # Commit assistant message to user_history BEFORE yielding the turn event
+                # so that GUI signal handlers (both Path A via queued signal and Path B
+                # via ObservableList callback) see the data when they check conversation_version.
+                if turn_transaction and turn_transaction.has_assistant_message():
+                    turn_transaction.commit_assistant_only()
+                turn_event = {'type': 'turn', 'content': content, 'assistant_content': content, 'tool_calls': [], 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                if reasoning is not None:
+                    turn_event['reasoning'] = reasoning
+                elif tool_calls:
+                    turn_event['reasoning'] = ''
+                self._add_conversation_data_to_event(turn_event)
+                yield turn_event
+                if tool_calls:
+                    executed_tools, final_detected, final_content, user_interaction_message, summary_text, summary_keep_recent_turns = self.tool_executor.execute_tool_calls(tool_calls, add_to_conversation_func=self._add_to_conversation, agent_id=0, turn_transaction=turn_transaction)
+                    processed_tools = []
+                    for tool_info in executed_tools:
+                        result = tool_info.get('result', '')
+                        success = True
+                        error = None
+                        if isinstance(result, str):
+                            if result.startswith('❌') or 'TOOL CALL REJECTED' in result or 'Error executing tool' in result:
+                                success = False
+                                error = result
+                        processed_tools.append({'name': tool_info.get('name'), 'arguments': tool_info.get('arguments'), 'result': result, 'success': success, 'error': error, 'turn': self._display_turn})
+                    for tool in processed_tools:
+                        event_dict = {'type': 'tool_call', 'tool_name': tool['name'], 'arguments': tool['arguments'], 'success': tool['success'], 'error': tool['error'], 'turn': tool['turn']}
+                        self._add_conversation_data_to_event(event_dict)
+                        yield event_dict
+                    for tool in processed_tools:
+                        event_dict = {'type': 'tool_result', 'tool_name': tool['name'], 'result': tool['result'], 'success': tool['success'], 'error': tool['error'], 'turn': tool['turn']}
+                        self._add_conversation_data_to_event(event_dict)
+                        yield event_dict
+                    if turn_transaction:
+                        turn_transaction.commit()
+                    # Flush any buffered token warnings after the turn is committed
+                    # so they land chronologically after tool results in user_history
+                    for warning in self._pending_warnings:
+                        self._add_to_conversation(warning)
+                    log('DEBUG', 'core.token', f"warning flushed (tool path): count={len(self._pending_warnings)}")
+                    self._pending_warnings.clear()
+                    log('DEBUG', 'core.agent', f"[TOOL LOOP] conversation length now {len(self.conversation)}, last 3 roles: {[m.get('role') for m in self.conversation[-3:]]}")
+                    if final_detected:
+                        final_event = {'type': 'final', 'stop_reason': 'final', 'content': final_content if final_content is not None else content, 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                        if reasoning is not None:
+                            final_event['reasoning'] = reasoning
+                        elif tool_calls:
+                            final_event['reasoning'] = ''
+                        self._add_conversation_data_to_event(final_event)
+                        yield final_event
+                        turn_duration = time.time() - turn_start_time
+                        if self.logger:
+                            self.logger.log_system_resources()
+                            self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
+                        return
+                    if user_interaction_message is not None:
+                        user_interaction_event = {'type': 'user_interaction_requested', 'message': user_interaction_message, 'turn': self._display_turn}
+                        self._add_conversation_data_to_event(user_interaction_event)
+                        yield user_interaction_event
+                        turn_duration = time.time() - turn_start_time
+                        if self.logger:
+                            self.logger.log_system_resources()
+                            self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
+                        return
+                    if summary_text is not None:
+                        log('DEBUG', 'core.summary', f'Processing summary request: summary length={len(summary_text)}, keep_recent_turns={summary_keep_recent_turns}')
+                        self._apply_summary_pruning(summary_text, summary_keep_recent_turns)
+                        yield self._create_token_update_event()
+                pause_debug(f'Checking pause request after turn processing: _pause_requested={self._pause_requested}')
+                log('DEBUG', 'core.pause', f"checkpoint 2: pause_requested={self._pause_requested}")
+                if self._pause_requested:
+                    pause_debug(f'Pause detected after turn processing! Transitioning to PAUSING')
+                    events = self.state.set_execution_state(ExecutionState.PAUSING)
+                    for event in events:
+                        for yielded_event in self._handle_state_event(event):
+                            yield yielded_event
+                    pause_debug(f'Clearing _pause_requested after pause (after turn processing)')
                     self._pause_requested = False
                     pause_event = {'type': 'paused', 'stop_reason': 'paused', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens}
                     self._add_conversation_data_to_event(pause_event)
@@ -936,135 +1082,48 @@ class Agent:
                         self.logger.log_system_resources()
                         self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
                     return
-            turn_transaction = TurnTransaction(self.session, self.context_builder, conversation=None if self._session is not None else self._conversation)
-            assistant_msg = {'role': 'assistant', 'content': content}
-            if reasoning is not None:
-                assistant_msg['reasoning_content'] = reasoning
-            elif tool_calls:
-                assistant_msg['reasoning_content'] = ''
-            if tool_calls:
-                assistant_msg['tool_calls'] = tool_calls
-            turn_transaction.add_assistant_message(assistant_msg)
-            yield self._create_token_update_event()
-            # Commit assistant message to user_history BEFORE yielding the turn event
-            # so that GUI signal handlers (both Path A via queued signal and Path B
-            # via ObservableList callback) see the data when they check conversation_version.
-            if turn_transaction and turn_transaction.has_assistant_message():
-                turn_transaction.commit_assistant_only()
-            turn_event = {'type': 'turn', 'content': content, 'assistant_content': content, 'tool_calls': [], 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
-            if reasoning is not None:
-                turn_event['reasoning'] = reasoning
-            elif tool_calls:
-                turn_event['reasoning'] = ''
-            self._add_conversation_data_to_event(turn_event)
-            yield turn_event
-            if tool_calls:
-                executed_tools, final_detected, final_content, user_interaction_message, summary_text, summary_keep_recent_turns = self.tool_executor.execute_tool_calls(tool_calls, add_to_conversation_func=self._add_to_conversation, agent_id=0, turn_transaction=turn_transaction)
-                processed_tools = []
-                for tool_info in executed_tools:
-                    result = tool_info.get('result', '')
-                    success = True
-                    error = None
-                    if isinstance(result, str):
-                        if result.startswith('❌') or 'TOOL CALL REJECTED' in result or 'Error executing tool' in result:
-                            success = False
-                            error = result
-                    processed_tools.append({'name': tool_info.get('name'), 'arguments': tool_info.get('arguments'), 'result': result, 'success': success, 'error': error, 'turn': self._display_turn})
-                for tool in processed_tools:
-                    event_dict = {'type': 'tool_call', 'tool_name': tool['name'], 'arguments': tool['arguments'], 'success': tool['success'], 'error': tool['error'], 'turn': tool['turn']}
-                    self._add_conversation_data_to_event(event_dict)
-                    yield event_dict
-                for tool in processed_tools:
-                    event_dict = {'type': 'tool_result', 'tool_name': tool['name'], 'result': tool['result'], 'success': tool['success'], 'error': tool['error'], 'turn': tool['turn']}
-                    self._add_conversation_data_to_event(event_dict)
-                    yield event_dict
-                if turn_transaction:
-                    turn_transaction.commit()
-                # Flush any buffered token warnings after the turn is committed
-                # so they land chronologically after tool results in user_history
-                for warning in self._pending_warnings:
-                    self._add_to_conversation(warning)
-                self._pending_warnings.clear()
-                log('DEBUG', 'core.agent', f"[TOOL LOOP] conversation length now {len(self.conversation)}, last 3 roles: {[m.get('role') for m in self.conversation[-3:]]}")
-                if final_detected:
-                    final_event = {'type': 'final', 'stop_reason': 'final', 'content': final_content if final_content is not None else content, 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                if not tool_calls:
+                    log('DEBUG', 'core.agent', f'No tool calls in turn {turn}, committing directly and yielding final')
+                    if turn_transaction and turn_transaction.has_assistant_message():
+                        turn_transaction.commit()
+                    # Flush any buffered token warnings (unlikely here, but be safe)
+                    for warning in self._pending_warnings:
+                        self._add_to_conversation(warning)
+                    log('DEBUG', 'core.token', f"warning flushed (no-tool path): count={len(self._pending_warnings)}")
+                    self._pending_warnings.clear()
+                    if self.logger:
+                        self.logger.log_system_resources()
+                        self.logger.log_agent_end('completed', 'Assistant provided direct answer with no tool calls')
+                        self.logger.close()
+                    final_event = {'type': 'final', 'stop_reason': 'final', 'content': content, 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                     if reasoning is not None:
                         final_event['reasoning'] = reasoning
                     elif tool_calls:
                         final_event['reasoning'] = ''
                     self._add_conversation_data_to_event(final_event)
                     yield final_event
-                    turn_duration = time.time() - turn_start_time
-                    if self.logger:
-                        self.logger.log_system_resources()
-                        self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
                     return
-                if user_interaction_message is not None:
-                    user_interaction_event = {'type': 'user_interaction_requested', 'message': user_interaction_message, 'turn': self._display_turn}
-                    self._add_conversation_data_to_event(user_interaction_event)
-                    yield user_interaction_event
-                    turn_duration = time.time() - turn_start_time
-                    if self.logger:
-                        self.logger.log_system_resources()
-                        self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
-                    return
-                if summary_text is not None:
-                    log('DEBUG', 'core.summary', f'Processing summary request: summary length={len(summary_text)}, keep_recent_turns={summary_keep_recent_turns}')
-                    self._apply_summary_pruning(summary_text, summary_keep_recent_turns)
-                    yield self._create_token_update_event()
-            pause_debug(f'Checking pause request after turn processing: _pause_requested={self._pause_requested}')
-            if self._pause_requested:
-                pause_debug(f'Pause detected after turn processing! Transitioning to PAUSING')
-                events = self.state.set_execution_state(ExecutionState.PAUSING)
-                for event in events:
-                    for yielded_event in self._handle_state_event(event):
-                        yield yielded_event
-                pause_debug(f'Clearing _pause_requested after pause (after turn processing)')
-                self._pause_requested = False
-                pause_event = {'type': 'paused', 'stop_reason': 'paused', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens}
-                self._add_conversation_data_to_event(pause_event)
-                yield pause_event
-                turn_duration = time.time() - turn_start_time
-                if self.logger:
-                    self.logger.log_system_resources()
-                    self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
-                return
-            if not tool_calls:
-                if turn_transaction and turn_transaction.has_assistant_message():
-                    turn_transaction.commit()
-                # Flush any buffered token warnings (unlikely here, but be safe)
-                for warning in self._pending_warnings:
-                    self._add_to_conversation(warning)
-                self._pending_warnings.clear()
-                if self.logger:
-                    self.logger.log_system_resources()
-                    self.logger.log_agent_end('completed', 'Assistant provided direct answer with no tool calls')
-                    self.logger.close()
-                final_event = {'type': 'final', 'stop_reason': 'final', 'content': content, 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
-                if reasoning is not None:
-                    final_event['reasoning'] = reasoning
-                elif tool_calls:
-                    final_event['reasoning'] = ''
-                self._add_conversation_data_to_event(final_event)
-                yield final_event
-                return
 
-        # Max turns reached - loop exhausted naturally
-        if self.logger:
-            self.logger.log_agent_end('max_turns_reached', f'Max turns ({self.config.max_turns}) reached')
-            self.logger.close()
-        max_turns_event = {
-            'type': 'stop_reason',
-            'stop_reason': 'max_turns_reached',
-            'turns': self.config.max_turns,
-            'turn': self._display_turn,
-            'context_length': self.state.current_conversation_tokens,
-            'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}
-        }
-        self._add_conversation_data_to_event(max_turns_event)
-        yield max_turns_event
-        return
+            # Max turns reached - loop exhausted naturally
+            log('WARNING', 'core.agent', f'Max turns ({self.config.max_turns}) reached - loop exhausted')
+            if self.logger:
+                self.logger.log_agent_end('max_turns_reached', f'Max turns ({self.config.max_turns}) reached')
+                self.logger.close()
+            max_turns_event = {
+                'type': 'stop_reason',
+                'stop_reason': 'max_turns_reached',
+                'turns': self.config.max_turns,
+                'turn': self._display_turn,
+                'context_length': self.state.current_conversation_tokens,
+                'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}
+            }
+            self._add_conversation_data_to_event(max_turns_event)
+            yield max_turns_event
+            return
 
+        finally:
+            self.state.execution_state = ExecutionState.READY
+            log('DEBUG', 'agent.core', 'process_query finished, reset execution_state to READY')
     def _apply_summary_pruning(self, summary: str, keep_recent_turns: int):
         """Add summary message to append-only history with metadata.
         
@@ -1094,6 +1153,7 @@ class Agent:
         log('DEBUG', 'core.session_history', f'session.user_history length: {len(user_history)}')
         log('DEBUG', 'core.session_history', f'session.summary set: {self.session.summary is not None}')
         insertion_idx = self._find_summary_insertion_index(user_history, keep_recent_turns)
+        log('DEBUG', 'core.summary', f"insertion_idx={insertion_idx}, keep_recent_turns={keep_recent_turns}")
         log('DEBUG', 'core.pruning', f'Computed insertion_idx={insertion_idx} for keep_recent_turns={keep_recent_turns}')
         other_messages = [msg for msg in user_history if msg.get('role') != 'system']
         turns = self._group_messages_into_turns(other_messages) if other_messages else []
@@ -1117,7 +1177,7 @@ class Agent:
         else:
             user_history.insert(insertion_idx, summary_msg)
             log('DEBUG', 'core.message_insertion', f'Inserted summary at index {insertion_idx}')
-        context_cleared_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] Context has been summarized. You now have a fresh context window and full access to tools.', 'is_system_notification': True}
+        context_cleared_msg = Message(role='user', content='[SYSTEM NOTIFICATION] Context has been summarized. You now have a fresh context window and full access to tools.')
         # Append unwarning after the tool result (at the end of user_history)
         user_history.append(context_cleared_msg)
         log('DEBUG', 'core.message_insertion', f'Appended context cleared message at end (history length: {len(user_history)})')
@@ -1142,6 +1202,7 @@ class Agent:
         self._update_conversation_token_estimate()
         # Immediately re-evaluate token state to clear restrictions if below critical
         self.state.update_token_state(self.state.current_conversation_tokens)
+        log('INFO', 'core.token', f"post-summary: tokens={self.state.current_conversation_tokens}, token_state={self.state.token_state.value if hasattr(self.state, 'token_state') else 'N/A'}, turn_state={self.state.turn_state.value if hasattr(self.state, 'turn_state') else 'N/A'}, restrictions_active={self.state.restrictions_active}")
         log('DEBUG', 'core.pruning', f'Summary pruning token change: {old_token_count} -> {self.state.current_conversation_tokens}, summary_idx={insertion_idx}, kept_turns={kept_turns_count}')
         if self.logger and hasattr(self.logger, 'py_logger'):
             log('INFO', 'agent.core', f'[PRUNING] Updated token estimate: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
@@ -1165,7 +1226,7 @@ class Agent:
         if len(truncated_summary) > MAX_SUMMARY_LENGTH:
             truncated_summary = truncated_summary[:MAX_SUMMARY_LENGTH] + '... (truncated)'
         summary_msg = {'role': 'system', 'content': f'Summary of previous conversation: {truncated_summary}', 'summary': True, 'pruning_keep_recent_turns': keep_recent_turns, 'pruning_insertion_idx': insertion_idx}
-        context_cleared_msg = {'role': 'user', 'content': '[SYSTEM NOTIFICATION] Context has been summarized. You now have a fresh context window and full access to tools.', 'is_system_notification': True}
+        context_cleared_msg = Message(role='user', content='[SYSTEM NOTIFICATION] Context has been summarized. You now have a fresh context window and full access to tools.')
         # Insert summary at the computed position (mutating the existing list)
         self.conversation.insert(insertion_idx, summary_msg)
         log('DEBUG', 'core.message_insertion', f'Fallback: inserted summary at index {insertion_idx}')

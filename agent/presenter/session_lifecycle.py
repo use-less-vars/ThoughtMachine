@@ -58,7 +58,7 @@ class SessionLifecycle:
                 try:
                     self._session_callback(old_state, new_state)
                 except Exception as e:
-                    log('DEBUG', 'presenter.lifecycle', f'Error in state callback: {e}')
+                    log('ERROR', 'presenter.lifecycle', f'Error in state callback: {e}')
 
     def mark_clean(self) -> None:
         """Mark session as clean (no unsaved changes). Dummy method after removing dirty tracking."""
@@ -126,6 +126,7 @@ class SessionLifecycle:
         Args:
             name: Optional name for the new session. If None, session will be unnamed.
         """
+        log('DEBUG', 'presenter.lifecycle', f'new_session called: name={name}')
         log('DEBUG', 'presenter.lifecycle', f'Auto-saving current session before starting new session')
         self.auto_save_current_session()
         if self.controller.is_running:
@@ -166,6 +167,7 @@ class SessionLifecycle:
 
     def pause_session(self):
         """Request pause of current session."""
+        log('DEBUG', 'presenter.lifecycle', f'pause_session called, state={self.state}')
         if self.state == ExecutionState.RUNNING:
             self.controller.request_pause()
             self.state = ExecutionState.PAUSING

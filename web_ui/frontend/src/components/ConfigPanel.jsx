@@ -121,8 +121,8 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
 
 function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected }) {
   const getSafeDraft = (cfg) => ({
-    temperature: cfg?.temperature,
-    max_turns: cfg?.max_turns,
+    temperature: cfg?.temperature ?? 0.7,
+    max_turns: cfg?.max_turns ?? 10,
     provider: cfg?.provider,
     provider_id: cfg?.provider_id,
     model: cfg?.model,
@@ -293,6 +293,37 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
               >Browse</button>
             </div>
           </div>
+
+          <div style={{ marginBottom: '1rem' }}>
+            <label style={{ ...labelStyle, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+              <input
+                type="checkbox"
+                checked={draft.token_monitor_enabled}
+                onChange={(e) => setDraft({ ...draft, token_monitor_enabled: e.target.checked })}
+              />
+              <strong>Token Warnings</strong>
+            </label>
+          </div>
+
+          <div style={{ marginBottom: '1rem' }}>
+            <label style={labelStyle}><strong>Warning Threshold</strong> <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(tokens × 1000)</span></label>
+            <input
+              type="number" min="0"
+              value={draft.token_monitor_warning_threshold}
+              onChange={(e) => setDraft({ ...draft, token_monitor_warning_threshold: parseInt(e.target.value, 10) || 0 })}
+              style={inputStyle}
+            />
+          </div>
+
+          <div style={{ marginBottom: '1rem' }}>
+            <label style={labelStyle}><strong>Critical Threshold</strong> <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(tokens × 1000)</span></label>
+            <input
+              type="number" min="0"
+              value={draft.token_monitor_critical_threshold}
+              onChange={(e) => setDraft({ ...draft, token_monitor_critical_threshold: parseInt(e.target.value, 10) || 0 })}
+              style={inputStyle}
+            />
+          </div>
         </div>
       )}
 
@@ -390,36 +421,7 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
       {/* ── Advanced Tab ──────────────────────────────────────────────── */}
       {activeTab === 'advanced' && (
         <div>
-          <div style={{ marginBottom: '1rem' }}>
-            <label style={{ ...labelStyle, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-              <input
-                type="checkbox"
-                checked={draft.token_monitor_enabled}
-                onChange={(e) => setDraft({ ...draft, token_monitor_enabled: e.target.checked })}
-              />
-              <strong>Token Monitor</strong>
-            </label>
-          </div>
-
-          <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Warning Threshold</strong> <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(tokens)</span></label>
-            <input
-              type="number" min="0"
-              value={draft.token_monitor_warning_threshold}
-              onChange={(e) => setDraft({ ...draft, token_monitor_warning_threshold: parseInt(e.target.value, 10) || 0 })}
-              style={inputStyle}
-            />
-          </div>
-
-          <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Critical Threshold</strong> <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(tokens)</span></label>
-            <input
-              type="number" min="0"
-              value={draft.token_monitor_critical_threshold}
-              onChange={(e) => setDraft({ ...draft, token_monitor_critical_threshold: parseInt(e.target.value, 10) || 0 })}
-              style={inputStyle}
-            />
-          </div>
+          <p style={{ color: '#6c7086', fontSize: '0.85rem', fontStyle: 'italic' }}>No advanced options at this time.</p>
         </div>
       )}
 

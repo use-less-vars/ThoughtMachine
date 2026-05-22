@@ -113,13 +113,17 @@ export default function SessionList({ sessions, onNew, onOpenTab, onDelete, onRe
   const [listHeight, setListHeight] = useState(300)
   const panelRef = useRef(null)
   const headerRef = useRef(null)
+  const mountTimerRef = useRef(null)
 
 
 
   // Profile initial render of the virtual list
   useEffect(() => {
-    console.time('SessionList.mount')
-    // timeEnd fires after first paint with listHeight > 0
+    if (!mountTimerRef.current) {
+      console.time('SessionList.mount')
+      mountTimerRef.current = true
+    }
+    return () => { mountTimerRef.current = null }
   }, [])
 
   // Measure available height for the virtual list
@@ -142,8 +146,9 @@ export default function SessionList({ sessions, onNew, onOpenTab, onDelete, onRe
 
   // Profile once list has items and measured height > 0
   useEffect(() => {
-    if (sessions.length > 0 && listHeight > 0) {
+    if (sessions.length > 0 && listHeight > 0 && mountTimerRef.current) {
       console.timeEnd('SessionList.mount')
+      mountTimerRef.current = false
     }
   }, [sessions.length, listHeight])
 
