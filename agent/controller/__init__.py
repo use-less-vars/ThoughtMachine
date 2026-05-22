@@ -363,10 +363,29 @@ class AgentController(QObject):
         if self._processing_query:
             log('DEBUG', 'core.controller', f'Agent processing query, calling pause()')
             self.pause()
+            # ── PAUSING state set immediately (processing branch) ──
+            if self.agent is not None and self.agent.state.execution_state == ExecutionState.RUNNING:
+                self.agent.state.execution_state = ExecutionState.PAUSING
+                self._emit_event({
+                    'type': 'execution_state_change',
+                    'old_state': 'running',
+                    'new_state': 'pausing',
+                })
+                log('DEBUG', 'core.controller', 'PAUSING state set immediately on pause request (processing)')
         else:
             log('DEBUG', 'core.controller', f'Agent idle (not processing query); setting PAUSING state then emitting session_stop')
             self.pause_event.clear()
             self._pause_requested = True
+            # ── PAUSING state set immediately (idle branch) ──
+            if self.agent is not None:
+                old_state = self.agent.state.execution_state.value
+                self.agent.state.execution_state = ExecutionState.PAUSING
+                self._emit_event({
+                    'type': 'execution_state_change',
+                    'old_state': old_state,
+                    'new_state': 'pausing',
+                })
+                log('DEBUG', 'core.controller', 'PAUSING state set immediately on pause request (idle)')
             if hasattr(self, 'agent') and self.agent is not None and hasattr(self.agent, 'request_pause'):
                 self.agent.request_pause()
             if hasattr(self, 'agent') and self.agent is not None:
@@ -377,20 +396,6 @@ class AgentController(QObject):
                     if original_len != len(self.agent.conversation):
                         log('WARNING', 'core.controller', f'Cleaned {original_len - len(self.agent.conversation)} orphaned tool messages on idle pause')
             self._emit_event({'type': 'session_stop', 'stop_reason': 'paused'})
-
-        # ── PAUSING state set immediately (both branches) ──
-        # The GUI must show 'Pausing…' the instant the user clicks Pause,
-        # not after the current LLM call or tool execution finishes.
-        if self.agent is not None and self.agent.state.execution_state == ExecutionState.RUNNING:
-            self.agent.state.execution_state = ExecutionState.PAUSING
-            self._emit_event({
-                'type': 'execution_state_change',
-                'old_state': 'running',
-                'new_state': 'pausing',
-            })
-            log('DEBUG', 'core.controller', 'PAUSING state set immediately on pause request')
-        else:
-            log('DEBUG', 'core.controller', f'request_pause: no PAUSING state change (agent={self.agent is not None}, state={self.agent.state.execution_state.value if self.agent else "N/A"})')
 
     def get_conversation(self) -> Optional[List[Dict[str, Any]]]:
         """Return the current conversation from the agent, if available."""
@@ -462,6 +467,16 @@ class AgentController(QObject):
         log('DEBUG', 'core.controller', f'pause() called, clearing pause_event, setting _pause_requested=True')
         self.pause_event.clear()
         self._pause_requested = True
+        # ── PAUSING state set immediately so GUI shows feedback ──
+        if self.agent is not None:
+            old_state = self.agent.state.execution_state.value
+            self.agent.state.execution_state = ExecutionState.PAUSING
+            self._emit_event({
+                'type': 'execution_state_change',
+                'old_state': old_state,
+                'new_state': 'pausing',
+            })
+            log('DEBUG', 'core.controller', 'PAUSING state set immediately on pause request (via pause())')
         if hasattr(self, 'agent') and self.agent is not None and hasattr(self.agent, 'request_pause'):
             self.agent.request_pause()
         if hasattr(self, 'agent') and self.agent is not None:

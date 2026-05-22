@@ -595,7 +595,7 @@ class Agent:
             if event['type'] == 'token_warning':
                 # Buffer the warning instead of injecting immediately — it will be flushed
                 # after turn_transaction.commit() so it lands in correct chronological order.
-                warning_msg = Message(role='user', content=f'[SYSTEM NOTIFICATION] {event.get("message", event.get("warning", ""))}')
+                warning_msg = Message(role='user', content=f'[SYSTEM NOTIFICATION] {event.get("message", event.get("warning", ""))}', is_system_notification=True)
                 self._pending_warnings.append(warning_msg)
                 log('DEBUG', 'core.token', f"warning buffered: state={self.state.token_state.value if hasattr(self.state, 'token_state') else 'N/A'}, count={len(self._pending_warnings)}")
                 warning_tokens = self._estimate_tokens(warning_msg)
@@ -780,7 +780,7 @@ class Agent:
                 turn_events = self.state.update_turn_state(turn)
                 for event in turn_events:
                     if event['type'] == 'turn_warning':
-                        warning_msg = Message(role='user', content='[SYSTEM NOTIFICATION] ' + event.get('message', event.get('warning', '')))
+                        warning_msg = Message(role='user', content='[SYSTEM NOTIFICATION] ' + event.get('message', event.get('warning', '')), is_system_notification=True)
                         self._add_to_conversation(warning_msg)
                         warning_tokens = self._estimate_tokens(warning_msg)
                         self.state.current_conversation_tokens += warning_tokens
@@ -794,7 +794,7 @@ class Agent:
                 token_events = self.state.update_token_state(self.state.current_conversation_tokens)
                 for event in token_events:
                     if event['type'] == 'token_warning':
-                        warning_msg = Message(role='user', content='[SYSTEM NOTIFICATION] ' + event.get('message', event.get('warning', '')))
+                        warning_msg = Message(role='user', content='[SYSTEM NOTIFICATION] ' + event.get('message', event.get('warning', '')), is_system_notification=True)
                         self._add_to_conversation(warning_msg)
                         warning_tokens = self._estimate_tokens(warning_msg)
                         self.state.current_conversation_tokens += warning_tokens
@@ -915,7 +915,7 @@ class Agent:
                     yield event_dict
                     time.sleep(wait_time)
                     if self.session is not None:
-                        self._add_to_conversation(Message(role='user', content=f'[SYSTEM NOTIFICATION] Error: RATE_LIMIT_EXCEEDED: rate limit exceeded after {self.rate_limit_count} attempts'))
+                        self._add_to_conversation(Message(role='user', content=f'[SYSTEM NOTIFICATION] Error: RATE_LIMIT_EXCEEDED: rate limit exceeded after {self.rate_limit_count} attempts', is_system_notification=True))
                     stop_reason_event = {'type': 'stop_reason', 'stop_reason': 'rate_limit', 'message': f'Rate limit exceeded after {self.rate_limit_count} attempts', 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                     self._add_conversation_data_to_event(stop_reason_event)
                     yield stop_reason_event
@@ -930,7 +930,7 @@ class Agent:
                         self.logger.log_agent_end('provider_error', f'Provider error: {e}')
                         self.logger.close()
                     if self.session is not None:
-                        self._add_to_conversation(Message(role='user', content=f'[SYSTEM NOTIFICATION] Error: {error_type}: {e}'))
+                        self._add_to_conversation(Message(role='user', content=f'[SYSTEM NOTIFICATION] Error: {error_type}: {e}', is_system_notification=True))
                     event_dict = {'type': 'error', 'error_type': error_type, 'message': str(e), 'stop_reason': 'error', 'traceback': traceback.format_exc(), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                     self._add_conversation_data_to_event(event_dict)
                     yield event_dict
@@ -943,7 +943,7 @@ class Agent:
                         self.logger.log_agent_end('unexpected_error', f'Unexpected error: {e}')
                         self.logger.close()
                     if self.session is not None:
-                        self._add_to_conversation(Message(role='user', content=f'[SYSTEM NOTIFICATION] Error: UNEXPECTED_ERROR: {e}'))
+                        self._add_to_conversation(Message(role='user', content=f'[SYSTEM NOTIFICATION] Error: UNEXPECTED_ERROR: {e}', is_system_notification=True))
                     event_dict = {'type': 'error', 'error_type': 'UNEXPECTED_ERROR', 'message': str(e), 'stop_reason': 'error', 'traceback': traceback.format_exc(), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                     self._add_conversation_data_to_event(event_dict)
                     yield event_dict
@@ -996,12 +996,12 @@ class Agent:
                     assistant_msg['tool_calls'] = tool_calls
                 turn_transaction.add_assistant_message(assistant_msg)
                 log('DEBUG', 'core.agent', f'Added assistant message to turn_transaction: has_tool_calls={bool(tool_calls)}, content_len={len(content)}')
-                yield self._create_token_update_event()
-                # Commit assistant message to user_history BEFORE yielding the turn event
-                # so that GUI signal handlers (both Path A via queued signal and Path B
-                # via ObservableList callback) see the data when they check conversation_version.
+                # Commit assistant message to user_history BEFORE yielding ANY event
+                # (token_update, turn, tool_call, tool_result) so a pause between yields
+                # doesn't lose the assistant's tool_calls data from user_history.
                 if turn_transaction and turn_transaction.has_assistant_message():
                     turn_transaction.commit_assistant_only()
+                yield self._create_token_update_event()
                 turn_event = {'type': 'turn', 'content': content, 'assistant_content': content, 'tool_calls': [], 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                 if reasoning is not None:
                     turn_event['reasoning'] = reasoning
@@ -1021,6 +1021,10 @@ class Agent:
                                 success = False
                                 error = result
                         processed_tools.append({'name': tool_info.get('name'), 'arguments': tool_info.get('arguments'), 'result': result, 'success': success, 'error': error, 'turn': self._display_turn})
+                    # Commit ALL tool results to user_history BEFORE yielding any events
+                    # (tool_call, tool_result) so a pause between yields doesn't lose data.
+                    if turn_transaction:
+                        turn_transaction.commit()
                     for tool in processed_tools:
                         event_dict = {'type': 'tool_call', 'tool_name': tool['name'], 'arguments': tool['arguments'], 'success': tool['success'], 'error': tool['error'], 'turn': tool['turn']}
                         self._add_conversation_data_to_event(event_dict)
@@ -1029,8 +1033,6 @@ class Agent:
                         event_dict = {'type': 'tool_result', 'tool_name': tool['name'], 'result': tool['result'], 'success': tool['success'], 'error': tool['error'], 'turn': tool['turn']}
                         self._add_conversation_data_to_event(event_dict)
                         yield event_dict
-                    if turn_transaction:
-                        turn_transaction.commit()
                     # Flush any buffered token warnings after the turn is committed
                     # so they land chronologically after tool results in user_history
                     for warning in self._pending_warnings:
@@ -1177,7 +1179,7 @@ class Agent:
         else:
             user_history.insert(insertion_idx, summary_msg)
             log('DEBUG', 'core.message_insertion', f'Inserted summary at index {insertion_idx}')
-        context_cleared_msg = Message(role='user', content='[SYSTEM NOTIFICATION] Context has been summarized. You now have a fresh context window and full access to tools.')
+        context_cleared_msg = Message(role='user', content='[SYSTEM NOTIFICATION] Context has been summarized. You now have a fresh context window and full access to tools.', is_system_notification=True)
         # Append unwarning after the tool result (at the end of user_history)
         user_history.append(context_cleared_msg)
         log('DEBUG', 'core.message_insertion', f'Appended context cleared message at end (history length: {len(user_history)})')
@@ -1226,7 +1228,7 @@ class Agent:
         if len(truncated_summary) > MAX_SUMMARY_LENGTH:
             truncated_summary = truncated_summary[:MAX_SUMMARY_LENGTH] + '... (truncated)'
         summary_msg = {'role': 'system', 'content': f'Summary of previous conversation: {truncated_summary}', 'summary': True, 'pruning_keep_recent_turns': keep_recent_turns, 'pruning_insertion_idx': insertion_idx}
-        context_cleared_msg = Message(role='user', content='[SYSTEM NOTIFICATION] Context has been summarized. You now have a fresh context window and full access to tools.')
+        context_cleared_msg = Message(role='user', content='[SYSTEM NOTIFICATION] Context has been summarized. You now have a fresh context window and full access to tools.', is_system_notification=True)
         # Insert summary at the computed position (mutating the existing list)
         self.conversation.insert(insertion_idx, summary_msg)
         log('DEBUG', 'core.message_insertion', f'Fallback: inserted summary at index {insertion_idx}')

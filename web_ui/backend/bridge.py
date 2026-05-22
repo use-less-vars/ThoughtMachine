@@ -52,7 +52,7 @@ from agent.config.provider_profile import ProviderManager
 from agent.config.service import create_agent_config_service
 from agent.controller import AgentController
 from agent.logging import log
-from agent.core.message import SYSTEM_NOTIFICATION_PREFIX
+
 from session.models import Session
 from session.store import FileSystemSessionStore
 
@@ -536,15 +536,10 @@ class WebAgentBridge:
             # (Message subclass derives it as a property, but json.dumps won't include it)
             normalized.append(dict(msg))
 
-        # Inject is_system_notification into every output message.
-        # Message derives it from role+content but never stores it as a real key,
-        # so json.dumps misses it entirely.  The frontend needs the flag.
+        # Ensure is_system_notification is present in every output message
+        # (the frontend needs the flag to style system notifications correctly).
         for m in normalized:
             m.setdefault("is_system_notification", False)
-            role = m.get("role", "")
-            content = m.get("content", "")
-            if role == "user" and isinstance(content, str) and content.startswith(SYSTEM_NOTIFICATION_PREFIX):
-                m["is_system_notification"] = True
 
         return normalized
 

@@ -481,6 +481,7 @@ class SummaryBuilder(ContextBuilder):
             notification = Message(
                 role='user',
                 content=f'[SYSTEM NOTIFICATION] Context truncated: {removed_count} older message(s) were removed to stay within token limits ({total} tokens ≈ {max_tokens} max).',
+                is_system_notification=True,
             )
             messages.append(notification)
         return messages
