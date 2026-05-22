@@ -86,9 +86,10 @@ class MessageRenderer:
             header_text_color="#4B0082",
         ),
         MessageType.USER_SYSTEM: MessageStyle(
-            border_color="#cda2a2",
-            background_color="#000000",
-            header_text_color="#000000"
+            border_color="#B8860B",
+            background_color="#2D2D00",
+            text_color="#FFD700",
+            header_text_color="#FFD700",
         ),
         MessageType.ASSISTANT: MessageStyle(
             border_color="#ecf5ff",
@@ -183,7 +184,7 @@ class MessageRenderer:
         """
         # Determine style and header
         if is_system_notification:
-            style_key = MessageType.SYSTEM
+            style_key = MessageType.USER_SYSTEM
             header = "System Notification"
         else:
             style_key = MessageType.USER
@@ -582,7 +583,7 @@ class MessageRenderer:
             if is_system_notification:
                 return Recipe(
                     title="System Notification",
-                    style_key=MessageType.SYSTEM,
+                    style_key=MessageType.USER_SYSTEM,
                     indent_level=0,
                     show_arguments=False,
                     truncate_content=False,

@@ -263,11 +263,19 @@ class EventDelegate(QStyledItemDelegate):
             rendered = self.message_renderer.render_event(event)
             lines.append(rendered)
         elif etype == 'user_query':
-            lines.append('<div style="border: 1px solid #FF69B4; border-radius: 5px; margin-bottom: 8px; overflow: hidden;">')
-            lines.append('<div style="background-color: #FFE6F2; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid #FF69B4;">USER QUERY</div>')
-            content = event.get('content', '')
-            add_line(f'User: {content}')
-            lines.append('</div>')
+            is_system = event.get('is_system_notification', False) or self.message_renderer._is_system_message(event.get('content', ''))
+            if is_system:
+                lines.append('<div style="border: 1px solid #B8860B; border-radius: 5px; margin-bottom: 8px; overflow: hidden;">')
+                lines.append('<div style="background-color: #2D2D00; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid #B8860B; color: #FFD700;">SYSTEM NOTIFICATION</div>')
+                content = event.get('content', '')
+                add_line(content, style='color: #FFD700;')
+                lines.append('</div>')
+            else:
+                lines.append('<div style="border: 1px solid #FF69B4; border-radius: 5px; margin-bottom: 8px; overflow: hidden;">')
+                lines.append('<div style="background-color: #FFE6F2; padding: 8px 10px; font-weight: bold; border-bottom: 1px solid #FF69B4;">USER QUERY</div>')
+                content = event.get('content', '')
+                add_line(f'User: {content}')
+                lines.append('</div>')
         elif etype == 'tool_call':
             tool_name = event.get('tool_name', event.get('name', 'unknown'))
             arguments = event.get('arguments', '')
@@ -287,7 +295,8 @@ class EventDelegate(QStyledItemDelegate):
         elif etype == 'processing':
             add_line(f"⏳ {event.get('content', '')}", style='color: #808080; font-style: italic; background-color: #f8f8f8; padding: 4px; border-radius: 3px;', use_markdown=False)
         elif etype == 'system':
-            add_line(f"System: {event.get('content', '')}", style='color: #808080; font-style: italic;', use_markdown=True)
+            content = event.get('content', '')
+            add_line(f"System: {content}", style='color: #808080; font-style: italic;', use_markdown=True)
             if 'summary' in event:
                 summary_content = event.get('content', event['summary'])
                 # Strip the 'Summary of previous conversation: ' prefix if present
@@ -306,9 +315,11 @@ class EventDelegate(QStyledItemDelegate):
                 add_line('Agent requests interaction', style='color: #006699; background-color: #f0faff; padding: 12px; margin: 0; border: none;', use_markdown=True)
             lines.append('</div>')
         elif etype == 'token_warning':
-            pass
+            rendered = self.message_renderer.render_event(event)
+            lines.append(rendered)
         elif etype == 'turn_warning':
-            pass
+            rendered = self.message_renderer.render_event(event)
+            lines.append(rendered)
         elif etype == 'rate_limit_warning':
             add_line(event.get('message', ''), style='color: #FF8C00; font-weight: bold;')
         elif etype == 'paused':
@@ -337,7 +348,8 @@ class EventDelegate(QStyledItemDelegate):
         if user_query:
             content = user_query.get('content', '')
             if content:
-                html_content += self.message_renderer.render_user_message(content=content, is_system_notification=False)
+                is_system = user_query.get('is_system_notification', False)
+                html_content += self.message_renderer.render_user_message(content=content, is_system_notification=is_system)
         assistant = turn_data.get('assistant')
         if assistant:
             content = assistant.get('assistant_content', '')

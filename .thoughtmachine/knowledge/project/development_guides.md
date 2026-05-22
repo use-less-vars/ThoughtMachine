@@ -15,60 +15,106 @@ Coding conventions, setup instructions, and development workflows.
 (To be populated)
 
 ## Logging API Reference
-## Logging API Reference
 
-*(Migrated from docs/logging_manual.md — Last validated: 2026-05-05)*
+*(Migrated from docs/logging_manual.md — Last validated: 2026-05-22)*
 
 ### Adding a Log Statement
 ```python
 from agent.logging import log
 
-log(level: str, tag: str, message: str, data: dict = None)
+log(level: str | LogLevel, tag: str, message: str, data: dict = None)
 ```
 
 | Parameter | Description | Example |
 |-----------|-------------|---------|
-| `level` | "DEBUG", "INFO", "WARNING", "ERROR" | `"DEBUG"` |
+| `level` | `"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"` | `"DEBUG"` |
 | `tag` | Hierarchical component name (area.component) | `"tools.file_editor"` |
 | `message` | Human-readable description | `"Writing file"` |
-| `data` | Optional dict (auto-truncated) | `{"path": p, "size": n}` |
+| `data` | Optional dict (auto‑truncated) | `{"path": p, "size": n}` |
 
 Example:
 ```python
 log("DEBUG", "core.pruning", "Pruning context", {"kept": 5, "removed": 2})
 ```
 
+### Console Output Format
+Every console line includes an `[HH:MM:SS]` timestamp:
+```
+[14:23:01] DEBUG    [core.pruning] Pruning context | {"kept": 5, "removed": 2}
+[14:23:02] INFO     [server.config] Config loaded
+[14:23:05] WARNING  [llm.stepfun] Rate limit approaching
+```
+
 ### Tag Naming Convention
-Use `area.component` format:
-- **core** — agent core, session, pruning, config
-- **tools** — file_editor, docker, search
-- **llm** — anthropic, openai, stepfun
-- **ui** — presenter, output_panel, events
-- **session** — history_provider, context_builder
+Use `area.component`. Components are organized as:
+
+| Area | Components |
+|------|------------|
+| `core` | session, pruning, config, controller, context_builder, turn_transaction, token_counter |
+| `tools` | file_editor, docker_code_runner, docker_executor (container, policy, build), search |
+| `llm` | anthropic, openai, stepfun |
+| `server` | config, bridge |
+| `ui` | presenter, output_panel, events |
+| `session` | history_provider, context_builder |
 
 ### Console Output Control
 | Variable | Effect | Default |
 |----------|--------|---------|
-| `TM_LOG_LEVEL` | Minimum console level | WARNING |
-| `TM_LOG_TAGS` | Comma-separated tags to show at DEBUG/INFO | (empty) |
+| `TM_LOG_LEVEL` | Minimum console level | `INFO` |
+| `TM_LOG_TAGS` | Comma‑separated tags to show (empty = only WARNING+) | _(empty)_ |
 | `DEBUG_<COMP>` | Legacy flag for a single component | – |
-| `THOUGHTMACHINE_DEBUG=1` | Firehose (all debug) | – |
+| `THOUGHTMACHINE_DEBUG=1` | Firehose (all debug) – use sparingly | – |
 
-Examples:
+**Filtering logic:**
+1. If `TM_LOG_TAGS` is empty → only WARNING, ERROR, CRITICAL shown
+2. If `TM_LOG_TAGS` is set → matching tags shown at `>= TM_LOG_LEVEL`
+3. Wildcard: `server.*` matches `server.config`, `server.bridge`, etc.
+4. Per‑component `DEBUG_*` env vars override everything
+5. Runtime `set_log_tags()` / `set_log_level()` override env vars at runtime
+
+**Workflow examples:**
 ```bash
-# Debug only pruning and all tools
-export TM_LOG_LEVEL=DEBUG
-export TM_LOG_TAGS=core.pruning,tools.*
+# See everything in the server layer (INFO + DEBUG)
+export TM_LOG_TAGS=server.*
 
-# Quick single-component debug
+# Focus: only server config + bridge + controller lifecycle
+export TM_LOG_TAGS=server.*,core.controller
+
+# Firehose: everything at DEBUG (warning: very verbose!)
+export THOUGHTMACHINE_DEBUG=1
+
+# Quick single-component debug (legacy)
 export DEBUG_EVENTBUS=1
 
-# Back to quiet (default)
-unset TM_LOG_LEVEL TM_LOG_TAGS DEBUG_EVENTBUS
+# Back to quiet
+unset TM_LOG_LEVEL TM_LOG_TAGS THOUGHTMACHINE_DEBUG
+```
+
+### Runtime API
+These functions change filtering at runtime without restarting:
+
+```python
+from agent.logging import set_log_level, set_log_tags, show_log_config
+
+set_log_level("DEBUG")                              # string form
+set_log_level("INFO")                                # back to normal
+
+set_log_tags("core.*,tools.file_editor")             # string (comma-separated)
+set_log_tags(["core.session", "llm.stepfun"])         # list
+set_log_tags("*")                                     # firehose (all tags)
+set_log_tags("")                                      # back to default (WARNING+ only)
+
+config = show_log_config()   # returns dict: log_level, log_tags, truncation, env_vars
 ```
 
 ### File Logging (JSONL)
-`TM_LOG_FILE_LEVEL` controls minimum level written to JSONL file (default: DEBUG). All logs go to `logs/agent_<session_id>.jsonl`. Rotation: 10 MB, 5 backups.
+| Variable | Effect | Default |
+|----------|--------|---------|
+| `TM_LOG_FILE_LEVEL` | Minimum level written to JSONL file | `DEBUG` |
+| `TM_LOG_DIR_MAX_MB` | Hard limit on total log directory size (0 = unlimited) | `50` |
+
+All logs written to `logs/agent_<session_id>.jsonl`. Rotation: 10 MB, 5 backups.
+Total directory size capped at `TM_LOG_DIR_MAX_MB` — oldest files deleted when exceeded.
 
 ### Truncation (Prevents Bloat)
 | Variable | Default | Applies To |
@@ -81,11 +127,15 @@ unset TM_LOG_LEVEL TM_LOG_TAGS DEBUG_EVENTBUS
 | `TM_CONVERSATION_CONTENT_TRUNCATE` | 10000 | Conversation messages in JSONL |
 | `TM_DOCKER_OUTPUT_TRUNCATE` | 10000 | Docker sandbox output |
 
+> **Note:** JSONL files receive data truncated once by type‑specific limits; console applies an additional truncation pass for readability.
+
 ### Best Practices
-- Use **DEBUG** for temporary instrumentation (won't spam unless explicitly enabled)
-- Use **INFO** for normal noteworthy events
-- Choose a **specific tag** (e.g., `"tools.my_new_tool"`)
-- Provide a **data dict** even for minimal context
+- Use **DEBUG** for temporary instrumentation – it won't spam unless explicitly enabled.
+- Use **INFO** for normal noteworthy events.
+- Choose a **specific tag** (e.g., `"tools.my_new_tool"`).
+- Provide a **data dict** even for minimal context.
+- Use `set_log_tags()` and `set_log_level()` during development to toggle filters.
+- Use `show_log_config()` in diagnostic output or `/debug` endpoints.
 
 ## DockerCodeRunner Usage
 ## DockerCodeRunner Usage

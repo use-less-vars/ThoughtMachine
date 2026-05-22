@@ -229,7 +229,11 @@ class AgentController(QObject):
             log('WARNING', 'presenter.pause_flow', f'Controller.continue_session: query queued, queue size={self.query_queue.qsize()}')
 
     def request_pause(self):
-        """Request agent to pause after current turn."""
+        """Request agent to pause after current turn.
+
+        Sets PAUSING state *immediately* — not deferred to a checkpoint — so the
+        GUI shows feedback the moment the user presses the Pause button.
+        """
         log('DEBUG', 'core.controller', f'request_pause called: is_running={self.is_running} _processing_query={self._processing_query} pause_event.is_set={self.pause_event.is_set()}')
         if not self.is_running:
             log('DEBUG', 'core.controller', f'Agent not running, nothing to pause')
@@ -250,13 +254,21 @@ class AgentController(QObject):
                     self.agent.conversation = ContextBuilder._cleanup_orphaned_tool_messages(self.agent.conversation)
                     if original_len != len(self.agent.conversation):
                         log('WARNING', 'core.controller', f'Cleaned {original_len - len(self.agent.conversation)} orphaned tool messages on idle pause')
-            # Emit execution_state_change (PAUSING) followed by session_stop (READY).
-            # This mirrors the processing-case flow: the agent yields execution_state_change
-            # then 'paused', after which the controller emits session_stop.
-            # The event processor handles the PAUSING→READY transition via session_stop,
-            # giving the GUI time to paint 'Pausing…'.
-            self._emit_event({'type': 'execution_state_change', 'new_state': 'pausing'})
             self._emit_event({'type': 'session_stop', 'stop_reason': 'paused'})
+
+        # ── PAUSING state set immediately (both branches) ──
+        # The GUI must show 'Pausing…' the instant the user clicks Pause,
+        # not after the current LLM call or tool execution finishes.
+        if self.agent is not None and self.agent.state.execution_state == ExecutionState.RUNNING:
+            self.agent.state.execution_state = ExecutionState.PAUSING
+            self._emit_event({
+                'type': 'execution_state_change',
+                'old_state': 'running',
+                'new_state': 'pausing',
+            })
+            log('DEBUG', 'core.controller', 'PAUSING state set immediately on pause request')
+        else:
+            log('DEBUG', 'core.controller', f'request_pause: no PAUSING state change (agent={self.agent is not None}, state={self.agent.state.execution_state.value if self.agent else "N/A"})')
 
     def get_conversation(self) -> Optional[List[Dict[str, Any]]]:
         """Return the current conversation from the agent, if available."""

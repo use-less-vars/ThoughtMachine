@@ -26,7 +26,7 @@ SYSTEM_NOTIFICATION_PREFIX: str = '[SYSTEM NOTIFICATION]'
 
 
 def _is_notification_role_and_content(role: Any, content: Any) -> bool:
-    """Return True if *role* is ``'user'`` and *content* is a string starting with the prefix."""
+    """Return True if *role* is ``'user'`` and *content* starts with the prefix."""
     return role == 'user' and isinstance(content, str) and content.startswith(SYSTEM_NOTIFICATION_PREFIX)
 
 
