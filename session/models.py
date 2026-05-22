@@ -318,6 +318,10 @@ class Session:
             max_tokens=agent_cfg.get('max_tokens', None),
         )
         user_history = data.get('user_history', [])
+        # Ensure all messages are Message objects so is_system_notification
+        # is derived from role+content (never from content-substring matching).
+        from agent.core.message import Message
+        user_history = [Message(m) if not isinstance(m, Message) else m for m in user_history]
         max_seq = 0
         for i, msg in enumerate(user_history):
             if isinstance(msg, dict):
@@ -358,6 +362,10 @@ class Session:
             max_tokens=agent_cfg.get('max_tokens', None),
         )
         user_history = data.get('user_history', [])
+        # Ensure all messages are Message objects so is_system_notification
+        # is derived from role+content (never from content-substring matching).
+        from agent.core.message import Message
+        user_history = [Message(m) if not isinstance(m, Message) else m for m in user_history]
         max_seq = 0
         for i, msg in enumerate(user_history):
             if isinstance(msg, dict):

@@ -1513,3 +1513,20 @@ Key design decisions:
 - Provides `from_dict()` class method for creating from existing dicts
 - Empty Message objects (no role/content) have `is_system_notification = False`
 - The validation in `_add_to_conversation` still works for both Message objects and plain dicts
+
+## 2026-05-22 — Controller API unification: added set_session(), update_config(), process_query() — deprecated start() and continue_session()
+
+## Controller API Unification (Task 3)
+
+Three new methods added to `AgentController` in `agent/controller/__init__.py`:
+
+1. **`set_session(session, config)`** — Stores session and AgentConfig for later use by `process_query()`. Also clears `_agent_override` so `_run()` falls through to the config-based agent creation path.
+
+2. **`update_config(config)`** — Sets a pending config update. If agent exists, forwards via mailbox pattern (`agent.request_config_update()`). Always stores the config for next thread start.
+
+3. **`process_query(query)`** — Unified entry point handling three scenarios:
+   - **No agent**: Starts new thread (resets events, queues query, spawns thread)
+   - **Thread alive**: Resumes agent + queues query (equivalent to old continue_session)
+   - **Thread dead**: Cleans up dead state, restarts fresh
+
+`start()` and `continue_session()` are now deprecated wrappers with WARNING-level deprecation logs, pointing users to `set_session() + process_query()`.

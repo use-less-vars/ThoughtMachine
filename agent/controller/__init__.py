@@ -147,6 +147,126 @@ class AgentController(QObject):
         """Return the current AgentConfig being used."""
         return self._config
 
+    # ── New unified API ────────────────────────────────────────────────────
+
+    def set_session(self, session, config: AgentConfig) -> None:
+        """
+        Store a session and config for later use by process_query().
+
+        Call this before the first process_query() call to configure
+        the session the agent should use.
+
+        Args:
+            session: A Session instance (with user_history, session_id, etc.).
+            config: An AgentConfig instance (api_key, model, etc.).
+        """
+        self._session = session
+        self._config = config
+        self._agent_override = None
+        self.current_session_id = session.session_id if session is not None else None
+        log('DEBUG', 'core.controller',
+            f'set_session: session_id={self.current_session_id}, '
+            f'config provider={config.provider_type}, model={config.model}')
+
+    def update_config(self, config: AgentConfig) -> None:
+        """
+        Set a pending configuration update.
+
+        If the agent already exists the update is forwarded via the
+        mailbox pattern; otherwise it is stored and picked up when
+        process_query() starts a new thread.
+
+        Args:
+            config: New AgentConfig to apply.
+        """
+        self._config = config
+        if self.agent is not None:
+            self.agent.request_config_update(config)
+            log('DEBUG', 'core.controller',
+                f'update_config: forwarded to agent, provider={config.provider_type}')
+        else:
+            log('DEBUG', 'core.controller',
+                f'update_config: stored for next start, provider={config.provider_type}')
+
+    def process_query(self, query: str) -> None:
+        """
+        Unified entry point for submitting a query to the agent.
+
+        Automatically handles three scenarios:
+
+        1. **No agent exists** – starts a new background thread with
+           the session and config previously stored via set_session().
+
+        2. **Thread is alive** (possibly paused) – resumes the agent
+           and queues the query so it is processed on the next turn.
+
+        3. **Thread is dead** – cleans up stale state and starts
+           a fresh thread.
+
+        Call ``set_session(session, config)`` once before the first
+        ``process_query()`` call.
+
+        Args:
+            query: The user query string.
+        """
+        self._cleanup_if_thread_dead()
+
+        if self.agent is None:
+            # ── Scenario 1: No agent — start fresh thread ──
+            self.stop_event.clear()
+            self.pause_event.set()
+            self._keep_alive = True
+            self._pause_requested = False
+            self._processing_query = False
+            self._query = query
+            self.current_session_id = (
+                self._session.session_id
+                if getattr(self, '_session', None) is not None
+                else None
+            )
+            self.query_queue.put(query)
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self._running = True
+            log('DEBUG', 'core.controller',
+                f'process_query: starting new thread for query={query[:80]!r}...')
+            self.thread.start()
+
+        elif self.thread is not None and self.thread.is_alive():
+            # ── Scenario 2: Thread alive — continue session ──
+            if self.agent is None:
+                raise RuntimeError(
+                    'Agent is None (creation failed). Cannot process query.'
+                )
+            log('DEBUG', 'core.controller',
+                f'process_query: continuing alive thread, query={query[:80]!r}...')
+            self.resume()
+            self.query_queue.put(query)
+
+        else:
+            # ── Scenario 3: Thread dead — restart fresh ──
+            log('DEBUG', 'core.controller',
+                'process_query: thread dead, cleaning up and restarting')
+            self._running = False
+            self.thread = None
+            self.agent = None
+            self.stop_event.clear()
+            self.pause_event.set()
+            self._keep_alive = True
+            self._pause_requested = False
+            self._processing_query = False
+            self._query = query
+            self.current_session_id = (
+                self._session.session_id
+                if getattr(self, '_session', None) is not None
+                else None
+            )
+            self.query_queue.put(query)
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self._running = True
+            self.thread.start()
+
+    # ── Deprecated wrappers ───────────────────────────────────────────────
+
     def start(self, query: str, config: AgentConfig=None, session=None, preset_name: str=None, **overrides):
         """
         Start the agent with the given query and configuration.
@@ -158,6 +278,7 @@ class AgentController(QObject):
             preset_name: Name of a preset to use instead of config. If provided, config is ignored.
             **overrides: Additional config overrides when using preset_name.
         """
+        log('WARNING', 'core.controller', 'start() is deprecated. Use set_session() + process_query() instead.')
         log('INFO', 'core.controller', 'controller.start() ENTERED')
         log('INFO', 'core.controller', f'start called with query={query[:80]!r}..., config type={type(config).__name__}, session={session.session_id if session else None}, preset_name={preset_name!r}')
         self._cleanup_if_thread_dead()
@@ -206,6 +327,7 @@ class AgentController(QObject):
 
     def continue_session(self, query: str):
         """Submit a new query to the already running agent."""
+        log('WARNING', 'core.controller', 'continue_session() is deprecated. Use process_query() instead.')
         log('DEBUG', 'core.controller', f"[CONTROLLER continue_session] self.agent={'exists' if hasattr(self, 'agent') and self.agent else 'MISSING'}, agent.id={id(self.agent) if hasattr(self, 'agent') and self.agent else 'N/A'}")
         log('DEBUG', 'core.controller', f"continue_session called: query='{query[:50]}...' is_running={self.is_running} pause_event.is_set={self.pause_event.is_set()}")
         if os.environ.get('PAUSE_DEBUG'):
