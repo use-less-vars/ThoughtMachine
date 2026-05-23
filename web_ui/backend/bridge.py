@@ -469,77 +469,99 @@ class WebAgentBridge:
     def _normalize_for_frontend(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Normalize messages for frontend display without modifying the originals.
-
-        The session stores roles in canonical API format (e.g. ``role: "tool"``),
-        but the frontend ChatPanel expects roles like ``tool_result`` and ``tool_call``.
-        This method returns a *new* list with normalized roles, leaving the
-        original messages untouched so they remain valid for API calls.
-
-        Additionally injects ``is_system_notification`` into every output message
-        because the ``Message`` class derives this flag as a read-only property
-        that is **not** included when ``json.dumps`` serializes the dict subclass.
-        The frontend needs the flag to style system notifications correctly.
         """
+        FINAL_TOOL_NAMES = {"Final", "FinalReport"}
         normalized = []
+        last_tool_call_name = None       # track for final detection
+        pending_final_assistant = False  # mark next assistant as final
+
         for msg in messages:
             role = msg.get("role", "")
             content = msg.get("content", "")
 
-            # Handle structured tool_calls array (current format)
+            # ── structured tool_calls array (current format) ──
             if role == "assistant" and msg.get("tool_calls"):
-                # Emit the assistant message without the tool_calls array
                 assistant_msg = {k: v for k, v in msg.items() if k != "tool_calls"}
                 if assistant_msg.get("content"):
                     normalized.append(assistant_msg)
-                # Emit each tool call as a separate display message
                 for tc in msg["tool_calls"]:
+                    # 🟢 FIX 1: extract from nested function object
+                    func = tc.get("function", {})
+                    tool_name = func.get("name", "?")
+                    args_str = func.get("arguments", "{}")
+                    # arguments is a JSON string; parse if possible, else keep raw
+                    try:
+                        args_obj = json.loads(args_str)
+                    except (json.JSONDecodeError, TypeError):
+                        args_obj = args_str  # fallback: display raw string
                     normalized.append({
                         "role": "tool_call",
                         "content": json.dumps({
-                            "name": tc.get("name", "?"),
-                            "arguments": tc.get("arguments", {}),
+                            "name": tool_name,
+                            "arguments": args_obj,
                         }),
-                        "is_final": msg.get("is_final", False),
+                        "is_final": False,
+                        "is_system_notification": False,
                     })
+                    last_tool_call_name = tool_name   # remember for final detection
                 continue
 
-            # Convert old tool_call: stored as assistant with "[Tool call: name(args)]"
+            # ── old-format tool call fallback ──
             if role == "assistant" and isinstance(content, str) and content.startswith("[Tool call:"):
                 match = re.match(r'^\[Tool call:\s*(\w+)\(([^)]*)\)\]$', content)
                 if match:
                     tool_name = match.group(1)
                     args_str = match.group(2)
                     try:
-                        args_json = args_str.replace("'", '"')
-                        args = json.loads(args_json)
+                        args_obj = json.loads(args_str.replace("'", '"'))
                     except Exception:
-                        args = {}
-                    new_content = json.dumps({"name": tool_name, "arguments": args})
-                    normalized.append({"role": "tool_call", "content": new_content})
+                        args_obj = {}
+                    normalized.append({
+                        "role": "tool_call",
+                        "content": json.dumps({"name": tool_name, "arguments": args_obj}),
+                        "is_final": False,
+                        "is_system_notification": False,
+                    })
+                    last_tool_call_name = tool_name
                     continue
 
-            # Convert role "tool" -> "tool_result" for frontend display
+            # ── tool result → tool_result + final detection ──
             if role == "tool":
                 new_msg = dict(msg)
                 new_msg["role"] = "tool_result"
-                # Preserve is_final flag if present
-                if msg.get("is_final"):
+                # 🟣 FIX 2: if preceding tool call was Final/FinalReport, mark final
+                if last_tool_call_name in FINAL_TOOL_NAMES:
                     new_msg["is_final"] = True
+                    pending_final_assistant = True   # next assistant also final
                 normalized.append(new_msg)
                 continue
 
-            # Remove empty assistant messages that were placeholders for tool calls
-            if role == "assistant" and isinstance(content, str) and content.strip() == "":
+            # ── assistant message (no tool_calls) ──
+            if role == "assistant":
+                # drop empty placeholder messages
+                if isinstance(content, str) and content.strip() == "":
+                    continue
+                new_msg = dict(msg)
+                if pending_final_assistant:
+                    new_msg["is_final"] = True
+                    pending_final_assistant = False
+                normalized.append(new_msg)
                 continue
 
-            # Ensure the message is a plain dict and inject is_system_notification
-            # (Message subclass derives it as a property, but json.dumps won't include it)
+            # ── everything else (user, system notifications) ──
             normalized.append(dict(msg))
 
-        # Ensure is_system_notification is present in every output message
-        # (the frontend needs the flag to style system notifications correctly).
+        # ── post-processing: inject is_system_notification for frontend ──
+        from agent.core.message import SYSTEM_NOTIFICATION_PREFIX
         for m in normalized:
-            m.setdefault("is_system_notification", False)
+            if m.get("role") == "user" and isinstance(m.get("content"), str):
+                if m["content"].startswith(SYSTEM_NOTIFICATION_PREFIX):
+                    m["is_system_notification"] = True
+                else:
+                    m.setdefault("is_system_notification", False)
+            else:
+                m.setdefault("is_system_notification", False)
+            m.setdefault("is_final", False)
 
         return normalized
 
