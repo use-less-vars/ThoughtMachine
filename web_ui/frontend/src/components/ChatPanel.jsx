@@ -62,6 +62,7 @@ function TruncatableContent({ text }) {
 
 /* ── Tool call display ── */
 function ToolCallContent({ content }) {
+  const MAX_LINES = 5
   let parsed = null
   try {
     parsed = JSON.parse(content)
@@ -69,14 +70,29 @@ function ToolCallContent({ content }) {
     return <pre className="tool-call-raw">{content}</pre>
   }
   const { name, arguments: args } = parsed
+
+  /* Pretty-print args and limit to MAX_LINES lines */
+  let argsText = ''
+  let truncated = false
+  if (args) {
+    const full = JSON.stringify(args, null, 2)
+    const lines = full.split('\n')
+    if (lines.length > MAX_LINES) {
+      argsText = lines.slice(0, MAX_LINES).join('\n') + '\n...'
+      truncated = true
+    } else {
+      argsText = full
+    }
+  }
+
   return (
-    <details className="tool-call-details">
+    <details className="tool-call-details" open>
       <summary className="tool-call-summary">
         🛠️ Tool Call: <strong>{name}</strong>
       </summary>
       <div className="tool-call-body">
         {args ? (
-          <pre className="tool-call-args">{JSON.stringify(args, null, 2)}</pre>
+          <pre className="tool-call-args">{argsText}</pre>
         ) : (
           <em>No arguments</em>
         )}

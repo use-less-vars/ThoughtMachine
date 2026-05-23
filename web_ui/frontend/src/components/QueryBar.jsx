@@ -17,10 +17,11 @@
  *   status, isRunning, config
  */
 
-import React, { useState } from 'react'
+import React, { useState, useRef } from 'react'
 
 function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
   const [query, setQuery] = useState('')
+  const textareaRef = useRef(null)
 
   const isIdle = status === 'IDLE'
   const isBusy = status === 'RUNNING'
@@ -40,6 +41,10 @@ function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
       // Fresh start — create new agent session
       sendCommand('start_session', { query: query.trim(), config: config ?? {} })
     }
+    setQuery('')  // Clear input after sending
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto'
+    }
   }
 
   const handleToggle = () => {
@@ -47,6 +52,10 @@ function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
       sendCommand('pause_session', {})
     } else if (isPaused) {
       sendCommand('continue_session', { query: query.trim() })
+      setQuery('')  // Clear input after resuming
+      if (textareaRef.current) {
+        textareaRef.current.style.height = 'auto'
+      }
     } else {
       handleRun()
     }
@@ -62,6 +71,7 @@ function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
   return (
     <div className="query-bar">
       <textarea
+        ref={textareaRef}
         className="query-input"
         placeholder="Enter your query…"
         value={query}
@@ -71,7 +81,7 @@ function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
           e.target.style.height = 'auto';
           e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px';
         }}
-        disabled={isBusy || isPaused}
+        disabled={false}  /* Always writable — buttons control what's allowed */
         rows={1}
       />
       <div className="query-buttons">

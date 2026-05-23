@@ -286,7 +286,7 @@ class MessageRenderer:
         if not verbose and len(args_str) > 80:
             args_str = args_str[:80] + '...'
         escaped_args = html.escape(args_str)
-        extra_html = f"Arguments: {escaped_args}"        
+        extra_html = f"Arguments: {escaped_args}"
         # Use unified card layout
         if is_special:
             # Special tool: use per-tool styling from TOOL_OVERRIDES
@@ -305,8 +305,8 @@ class MessageRenderer:
                 indent_level=0,
                 content_html="",
                 extra_html=extra_html
-            )    
-    def render_tool_result(self, content: str, tool_call_id: str = "", tool_name: str = "", 
+            )
+    def render_tool_result(self, content: str, tool_call_id: str = "", tool_name: str = "",
                           success: bool = True, error: str = "", enable_truncation: bool = True) -> str:
         """
         Render a tool result.
