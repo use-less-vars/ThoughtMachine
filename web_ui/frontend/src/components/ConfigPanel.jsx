@@ -72,7 +72,7 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
-      <div style={{ marginBottom: '0.3rem', display: 'flex', gap: '0.3rem' }}>
+      <div style={{ marginTop: '0.1rem', marginBottom: '0.4rem', display: 'flex', gap: '0.3rem' }}>
         {path && path !== '/' && (
           <button onClick={goUp} style={{
             background: '#45475a', color: '#cdd6f4', border: '1px solid #585b70',
@@ -86,31 +86,24 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
         }}>Select This Folder</button>
       </div>
       <ul style={listStyle}>
-        {entries.length === 0 && (
+        {entries.filter(e => e.is_dir).length === 0 && (
           <li style={{ padding: '0.5rem', color: '#6c7086', fontSize: '0.8rem', textAlign: 'center' }}>
-            (empty directory)
+            (no subdirectories)
           </li>
         )}
-        {entries.map((entry) => (
+        {entries.filter(e => e.is_dir).map((entry) => (
           <li
             key={entry.name}
-            style={itemStyle(entry.is_dir)}
+            style={itemStyle(true)}
             onClick={() => {
-              if (entry.is_dir) {
-                const newPath = path.replace(/\\/g, '/').replace(/\/$/, '') + '/' + entry.name;
-                onNavigate(newPath);
-              }
+              const newPath = path.replace(/\\/g, '/').replace(/\/$/, '') + '/' + entry.name;
+              onNavigate(newPath);
             }}
-            onMouseEnter={(e) => { if (entry.is_dir) e.target.style.background = '#45475a'; }}
+            onMouseEnter={(e) => { e.target.style.background = '#45475a'; }}
             onMouseLeave={(e) => { e.target.style.background = 'transparent'; }}
           >
-            <span>{entry.is_dir ? '📁' : '📄'}</span>
+            <span>📁</span>
             <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.name}</span>
-            {!entry.is_dir && entry.size != null && (
-              <span style={{ color: '#6c7086', fontSize: '0.7rem', marginLeft: 'auto' }}>
-                {entry.size < 1024 ? `${entry.size} B` : entry.size < 1048576 ? `${(entry.size / 1024).toFixed(0)} KB` : `${(entry.size / 1048576).toFixed(1)} MB`}
-              </span>
-            )}
           </li>
         ))}
       </ul>
@@ -232,6 +225,41 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
       {/* ── General Tab ──────────────────────────────────────────────── */}
       {activeTab === 'general' && (
         <div>
+          {/* ── Workspace (first) ── */}
+          <div style={{ marginBottom: '1rem' }}>
+            <label style={labelStyle}><strong>Workspace</strong></label>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.3rem' }}>
+              {draft.workspace_path ? (
+                <span style={{ color: '#cdd6f4', fontSize: '0.9rem' }}>
+                  📁 {draft.workspace_path.split('/').filter(Boolean).pop() || '/'}
+                </span>
+              ) : (
+                <span style={{ color: '#6c7086', fontSize: '0.85rem', fontStyle: 'italic' }}>
+                  No workspace selected
+                </span>
+              )}
+              <button
+                onClick={() => {
+                  setBrowserPath(draft.workspace_path || '');
+                  setBrowserOpen(true);
+                  setBrowserError('');
+                }}
+                style={{
+                  background: '#45475a',
+                  color: '#cdd6f4',
+                  border: '1px solid #585b70',
+                  borderRadius: '4px',
+                  padding: '0.3rem 0.6rem',
+                  cursor: 'pointer',
+                  fontWeight: 600,
+                  fontSize: '0.8rem',
+                  whiteSpace: 'nowrap',
+                  marginLeft: 'auto',
+                }}
+              >Browse</button>
+            </div>
+          </div>
+
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>Temperature:</strong> {draft.temperature}</label>
             <input
@@ -264,37 +292,6 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
           </div>
 
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Workspace Path</strong> <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(working directory for agent)</span></label>
-            <div style={{ display: 'flex', gap: '0.3rem' }}>
-              <input
-                type="text"
-                placeholder="/home/user/project"
-                value={draft.workspace_path}
-                onChange={(e) => setDraft({ ...draft, workspace_path: e.target.value })}
-                style={{ ...inputStyle, flex: 1 }}
-              />
-              <button
-                onClick={() => {
-                  setBrowserPath(draft.workspace_path || '');
-                  setBrowserOpen(true);
-                  setBrowserError('');
-                }}
-                style={{
-                  background: '#45475a',
-                  color: '#cdd6f4',
-                  border: '1px solid #585b70',
-                  borderRadius: '4px',
-                  padding: '0.3rem 0.6rem',
-                  cursor: 'pointer',
-                  fontWeight: 600,
-                  fontSize: '0.8rem',
-                  whiteSpace: 'nowrap',
-                }}
-              >Browse</button>
-            </div>
-          </div>
-
-          <div style={{ marginBottom: '1rem' }}>
             <label style={{ ...labelStyle, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
               <input
                 type="checkbox"
@@ -306,21 +303,18 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
           </div>
 
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Warning Threshold</strong> <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(tokens × 1000)</span></label>
-            <input
-              type="number" min="0"
-              value={draft.token_monitor_warning_threshold}
-              onChange={(e) => setDraft({ ...draft, token_monitor_warning_threshold: parseInt(e.target.value, 10) || 0 })}
-              style={inputStyle}
-            />
-          </div>
-
-          <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Critical Threshold</strong> <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(tokens × 1000)</span></label>
+            <label style={labelStyle}><strong>Critical Threshold</strong> <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(tokens, warning is 15k below)</span></label>
             <input
               type="number" min="0"
               value={draft.token_monitor_critical_threshold}
-              onChange={(e) => setDraft({ ...draft, token_monitor_critical_threshold: parseInt(e.target.value, 10) || 0 })}
+              onChange={(e) => {
+                const critical = parseInt(e.target.value, 10) || 0;
+                setDraft({
+                  ...draft,
+                  token_monitor_critical_threshold: critical,
+                  token_monitor_warning_threshold: Math.max(critical - 15000, 0),
+                });
+              }}
               style={inputStyle}
             />
           </div>
@@ -456,14 +450,16 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
             <div style={{
               background: '#1e1e2e',
               borderRadius: '4px',
-              padding: '0.3rem 0.5rem',
-              marginBottom: '0.5rem',
-              fontSize: '0.8rem',
-              color: '#a6adc8',
+              padding: '0.65rem 0.7rem',
+              marginBottom: '0.75rem',
+              fontSize: '0.9rem',
+              color: '#cdd6f4',
               fontFamily: 'monospace',
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
+              lineHeight: '1.5',
+              flexShrink: 0,
+              overflowX: 'auto',
+              whiteSpace: 'pre',
+              wordBreak: 'keep-all',
             }}>{browserPath || '~'}</div>
             <DirectoryBrowser
               path={browserPath}
