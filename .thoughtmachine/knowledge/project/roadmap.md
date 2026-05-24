@@ -143,3 +143,42 @@ Project milestones, planned features, and long-term goals.
 - Would require modifying `unified.py` to read from a mutable source (settings object or polling env vars) instead of import-time constants
 
 **Why it wasn't done yet**: This is a cross-cutting change to the logging facade itself. The import-time env var approach is simple and works for restart-driven development. A proper GUI toggle needs careful design to avoid perf overhead from polling or callback registration.
+
+## 2026-05-25 — ## 2026-05-25 — Non-Urgent Items (Parked by Engineering Team...
+
+## 2026-05-25 — Non-Urgent Items (Parked by Engineering Team)
+
+Items with one-line dispositions so they don't clutter active thinking:
+
+| Item | Disposition |
+|------|-------------|
+| **F17 — Session management bugs** (naming, restore, third-query issue) | Real bugs. Session engineer to investigate with current code, not old assumptions. |
+| **F18 — Provider config + defaults for new installs** | Essential before public release. GUI engineer's next task after security prompts. |
+| **F19 — Installation (venv, Electron, one-click)** | Defer until provider config works. Then package. |
+| **F20 — Drag-and-drop file import** | See detailed design below (appended). GUI engineer side task. Pure frontend + one backend endpoint. |
+| **F21 — Scroll-to-latest button when user is scrolled up** | GUI engineer side task. |
+| **F22 — Config changes → system messages to LLM** | Core engineer. Tricky — the LLM might overreact. Needs a design doc. |
+| **F23 — Test other providers (not just DeepSeek)** | Do during provider config work (F18). |
+| **F24 — Delta message updates (not full snapshot each turn)** | GUI engineer optimization. After security prompts. |
+| **F25 — Docker: long-running tasks, Dockerfile view in GUI, "ask user" for env changes** | Part of the workspace-centric security model. |
+| **F26 — KB: semantic search, central "meta KB" vs workspace KB distinction** | KB engineer. After notebook panel. |
+
+*(Items already in roadmap — not duplicated: live logging toggle F15, streaming Phase 6, sysprompt library F7, async multi-agent F13)*
+
+## 2026-05-25 — F20 Design Detail: Drag-and-Drop File Import
+
+**Implementation sketch:**
+
+1. **Frontend:**
+   - Add `onDrop` / `onDragOver` handlers to the chat area (or a dedicated drop zone).
+   - Extract `File` objects from the drop event, create `FormData`, `POST` to a new backend endpoint.
+   
+2. **Backend:**
+   - `POST /api/workspace/upload` — receives the file, sanitises the filename (no path traversal), writes to the current session's workspace folder.
+   - Emit `workspace_changed` so the file browser refreshes.
+
+3. **Security:**
+   - Same‑origin check, token validation, file size cap (e.g. 50 MB).
+
+4. **UX:**
+   - Dashed border / highlight appears when a file is dragged over the agent area.

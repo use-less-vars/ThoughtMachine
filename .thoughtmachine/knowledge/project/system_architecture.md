@@ -1530,3 +1530,47 @@ Three new methods added to `AgentController` in `agent/controller/__init__.py`:
    - **Thread dead**: Cleans up dead state, restarts fresh
 
 `start()` and `continue_session()` are now deprecated wrappers with WARNING-level deprecation logs, pointing users to `set_session() + process_query()`.
+
+## 2026-05-25 — ## 2026-06-01 — Architectural Issues Investigation
+
+### Issu...
+
+## 2026-06-01 — Architectural Issues Investigation
+
+### Issue 1: Tool Output Truncation at Framework Level (NOT enforced)
+
+**Current design (broken):**
+- Every tool implements `self._truncate_output()` voluntarily — OPT-IN, easy to miss
+- KnowledgeBaseTool (tools/knowledge_base.py, 679 lines) NEVER calls `_truncate_output()` — returns raw strings from all 9 mode methods directly
+- ToolExecutor._execute_single_tool() just calls `tool_class(**tool_args).execute()` and stores the result — NO truncation enforcement
+- ToolBase._truncate_output() at tools/base.py:192 uses `self.token_limit` (default None = no limit)
+- token_limit is populated from config.tool_output_token_limit (default 10,000) at tool_executor.py:166
+
+**Tools verified to use _truncate_output:** FileEditor, FilePreviewTool, DirectoryTreeTool, DateTimeTool, FileSummaryTool, GitInfoTool, CodeModifier, Thought, RequestUserInteraction
+**Tools that MAY bypass it:** KnowledgeBaseTool (confirmed), SearchCodebaseTool (needs check), PaginateTool, MCP tools, DockerCodeRunner, FieldViewer
+
+**Root cause:** ToolExecutor at agent/core/tool_executor.py:116 calls tool.execute() and stores the result raw. All truncation happens inside individual tools' execute() methods, not at the framework level.
+
+**Fix needed:** Move truncation enforcement into ToolExecutor.execute_tool_calls() AFTER the tool executes, wrapping the result string in a post-execution truncation pass.
+
+### Issue 2: Context Builder Truncation — Wrong Mechanism
+
+**Current design (broken):**
+1. **Wrong max_tokens source** (agent/core/agent.py:627-635):
+   - Uses `model_context_window - SAFETY_MARGIN(1000) - max_tokens/DEFAULT_RESPONSE_TOKENS(4096)`
+   - Model context window comes from a hardcoded dict in token_counter.py:86
+   - Ignores user's configured token_monitor_critical_threshold (default 50,000)
+
+2. **Wrong truncation direction after summarization** (session/context_builder.py:315):
+   - Line 315: `remove_from_end=summary_msg is not None`
+   - When a summary EXISTS, it removes the NEWEST messages first — DROPPING THE CURRENT TURN
+   - When no summary exists, it correctly removes from BEGINNING (oldest)
+   - The design intent (comment line 207-208): "preserve originally-kept turns" — but this is WRONG because the current turn is what the LLM needs
+
+3. **No emergency recovery** — if truncation can't get under limit, there's no fallback
+
+**Correct design needed:**
+- Use user's configured critical token limit (token_monitor_critical_threshold) as the max for context
+- Always truncate from OLDEST messages first (remove_from_end=False always)
+- When a summary exists, drop summary content/preserved turns before dropping current turn
+- Add an emergency recovery: if removal from oldest can't get under limit, generate a forced summary and restart
