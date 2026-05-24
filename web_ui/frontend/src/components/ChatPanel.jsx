@@ -38,6 +38,7 @@ const ROLE_STYLE = {
   assistant:   { className: 'message-assistant',       label: 'Assistant' },
   tool_call:   { className: 'message-tool-call',       label: 'Tool Call' },
   tool_result: { className: 'message-tool-result',     label: 'Tool Result' },
+  summary:     { className: 'message-summary',           label: '📝 Summary' },
   final:       { className: 'message-final',            label: '🎯 Final' },
   system:      { className: 'message-system-as-user',  label: 'System' },
 }
@@ -61,6 +62,17 @@ function TruncatableContent({ text }) {
 }
 
 /* ── Tool call display ── */
+/* ── Summary tool result (dark golden, full markdown, no truncation) ── */
+function SummaryContent({ content }) {
+  return (
+    <div className="summary-markdown">
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+        {content}
+      </ReactMarkdown>
+    </div>
+  )
+}
+
 function ToolCallContent({ content }) {
   const MAX_LINES = 5
   let parsed = null
@@ -129,6 +141,11 @@ function AssistantContent({ msg }) {
 
 /* ── Route content based on role ── */
 function MessageContent({ msg }) {
+  /* Summary results: dark golden, full markdown, no truncation */
+  if (msg.is_summary) {
+    return <SummaryContent content={msg.content} />
+  }
+
   /* Final results render as full markdown (blueish, no truncation) */
   if (msg.is_final) {
     return (
@@ -160,7 +177,7 @@ function MessageContent({ msg }) {
 /* ── Single bubble ── */
 function MessageBubble({ msg, index }) {
   /* ── System notifications are stored as 'user' role with is_system_notification flag ── */
-  const effectiveRole = msg.is_final ? 'final' : (msg.is_system_notification ? 'system' : msg.role)
+  const effectiveRole = msg.is_final ? 'final' : (msg.is_summary ? 'summary' : (msg.is_system_notification ? 'system' : msg.role))
   const style = ROLE_STYLE[effectiveRole] || ROLE_STYLE.system
   const copyText = msg.reasoning_content
     ? `${msg.reasoning_content}\n\n---\n\n${msg.content}`

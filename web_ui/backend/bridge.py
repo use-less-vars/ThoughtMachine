@@ -471,6 +471,7 @@ class WebAgentBridge:
         Normalize messages for frontend display without modifying the originals.
         """
         FINAL_TOOL_NAMES = {"Final", "FinalReport"}
+        SUMMARY_TOOL_NAMES = {"SummarizeTool", "summarize", "Summarize"}
         normalized = []
         last_tool_call_name = None       # track for final detection
         pending_final_assistant = False  # mark next assistant as final
@@ -533,6 +534,9 @@ class WebAgentBridge:
                 if last_tool_call_name in FINAL_TOOL_NAMES:
                     new_msg["is_final"] = True
                     pending_final_assistant = True   # next assistant also final
+                # 🟡 SummarizeTool results: dark golden, full markdown, no truncation
+                if last_tool_call_name in SUMMARY_TOOL_NAMES:
+                    new_msg["is_summary"] = True
                 normalized.append(new_msg)
                 continue
 
