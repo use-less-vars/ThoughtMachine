@@ -1589,3 +1589,24 @@ Three new methods added to `AgentController` in `agent/controller/__init__.py`:
   - Removed `import concurrent.futures` dependency, replaced with `threading.Thread`
   - `agent/core/agent.py`: simplified to just call `register_mcp_tools()` without timeout, no sync steps
 - **Impact:** App start is never delayed by MCP. MCP tools become available asynchronously after registration completes.
+
+## 2026-05-26 — ## Removed `token_monitor_enabled` and `max_tokens` config p...
+
+## Removed `token_monitor_enabled` and `max_tokens` config params (2025-07-17)
+
+### `token_monitor_enabled` → always-on
+The token monitor checkbox was removed. Token monitoring is now always active. Removed from:
+- Config model (agent/config/models.py), state logic (agent/core/state.py), agent config passthrough (agent/core/agent.py)
+- UI bindings (agent/presenter/state_bridge.py, web_ui/backend/server.py)
+- Frontends: ConfigPanel.jsx (removed checkbox), agent_controls.py (removed checkbox, update method, layout, config read/write)
+
+### `max_tokens` → removed as config param
+The LLM response token limit was removed as a user-facing config. Removed from:
+- Config model (agent/config/models.py), RuntimeParams dataclass (session/models.py), agent RuntimeParams/chat_kwargs (agent/core/agent.py)
+- Provider creation (agent/core/llm_client.py, llm_providers/factory.py)
+- Provider internals: openai_compatible.py (no longer sets from config), anthropic_provider.py (uses hardcoded 4096 fallback)
+- ProviderConfig dataclass (llm_providers/base.py) — removed max_tokens field
+- Web UI validation (web_ui/backend/bridge.py) — removed from apply_config validation
+- Docstrings/tooltips updated
+
+`max_tokens` still exists in the context builder (session/context_builder.py, session/history_provider.py) for context window truncation — that is a separate concern.
