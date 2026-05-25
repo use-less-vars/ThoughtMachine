@@ -2,7 +2,7 @@
 Session management data models.
 
 Defines the core concepts:
-- RuntimeParams: Mutable parameters for LLM generation (temperature, max_tokens, top_p)
+- RuntimeParams: Mutable parameters for LLM generation (temperature, top_p)
 - ContainerMetadata: Metadata for session-scoped containers (not the live objects)
 - Session: The atomic conversation unit containing all state.
 
@@ -110,7 +110,6 @@ class ObservableList(list):
 class RuntimeParams:
     """Mutable runtime parameters that can be adjusted during a session."""
     temperature: float = 0.2
-    max_tokens: Optional[int] = None
     top_p: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -316,7 +315,6 @@ class Session:
         agent_cfg = metadata.get('agent_config', {})
         runtime_params = RuntimeParams(
             temperature=agent_cfg.get('temperature', 0.2),
-            max_tokens=agent_cfg.get('max_tokens', None),
         )
         user_history = data.get('user_history', [])
         # Ensure all messages are Message objects so is_system_notification
@@ -360,7 +358,6 @@ class Session:
         agent_cfg = metadata.get('agent_config', {})
         runtime_params = RuntimeParams(
             temperature=agent_cfg.get('temperature', 0.2),
-            max_tokens=agent_cfg.get('max_tokens', None),
         )
         user_history = data.get('user_history', [])
         # Ensure all messages are Message objects so is_system_notification

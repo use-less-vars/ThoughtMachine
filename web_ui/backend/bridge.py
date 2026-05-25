@@ -359,12 +359,7 @@ class WebAgentBridge:
         """
         from agent.config.loader import validate_config
 
-        # Step 1: Validate positive integer fields before merging
-        for field_name in ('max_tokens',):
-            val = config_dict.get(field_name)
-            if val is not None:
-                if not isinstance(val, int) or val < 1:
-                    return {"success": False, "error": f"{field_name} must be a positive integer or null"}
+        # Step 1: Validate non-negative integer fields before merging
         for field_name in ('token_monitor_warning_threshold', 'token_monitor_critical_threshold'):
             val = config_dict.get(field_name)
             if val is not None:
