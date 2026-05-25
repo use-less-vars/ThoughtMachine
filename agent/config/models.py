@@ -24,12 +24,10 @@ class AgentConfig(BaseModel):
         'api_key': RESTART_REQUIRED,
         'base_url': RESTART_REQUIRED,
         'temperature': HOT_SWAPPABLE,
-        'max_tokens': HOT_SWAPPABLE,
         'stop_check': RESTART_REQUIRED,
         'provider_config': RESTART_REQUIRED,
         'max_turns': HOT_SWAPPABLE,
         'system_prompt': RESTART_REQUIRED,
-        'token_monitor_enabled': HOT_SWAPPABLE,
         'token_monitor_warning_threshold': HOT_SWAPPABLE,
         'token_monitor_critical_threshold': HOT_SWAPPABLE,
         'turn_monitor_enabled': HOT_SWAPPABLE,
@@ -69,9 +67,7 @@ class AgentConfig(BaseModel):
     temperature: float = 0.2
     max_turns: int = 100
     stop_check: Optional[Callable[[], bool]] = None
-    max_tokens: Optional[int] = None
     system_prompt: Optional[str] = None
-    token_monitor_enabled: bool = Field(default=True, description='Enable automatic token usage warnings')
     token_monitor_warning_threshold: int = Field(default=35000, description='Token count threshold for warning (user)')
     token_monitor_critical_threshold: int = Field(default=50000, description='Token count threshold for critical warning (user)')
     turn_monitor_enabled: bool = Field(default=True, description='Enable automatic turn limit warnings')
