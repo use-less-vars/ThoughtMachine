@@ -53,8 +53,7 @@ class SessionTab(QWidget):
         self.filter_lineedit = self.output_panel.filter_lineedit
         self.filter_type_combo = self.output_panel.filter_type_combo
         self.query_entry = self.query_panel.query_entry
-        self.run_btn = self.query_panel.run_btn
-        self.pause_btn = self.query_panel.pause_btn
+        self.run_pause_btn = self.query_panel.run_pause_btn
         self.init_ui()
         self.setup_signal_connections()
         self._conversation_debounce_timer = QTimer(self)
@@ -265,10 +264,11 @@ class SessionTab(QWidget):
 
         for checkbox in self.agent_controls_panel.tool_checkboxes.values():
             checkbox.stateChanged.connect(self._handle_config_change)
+        # Wire query_panel callbacks (it dispatches via on_run/on_pause)
+        self.query_panel.on_run = self.run_agent
+        self.query_panel.on_pause = self.pause_agent
         right_layout.addWidget(self.output_panel, 4)
         right_layout.addWidget(self.query_panel)
-        self.query_panel.run_btn.clicked.connect(self.run_agent)
-        self.query_panel.pause_btn.clicked.connect(self.pause_agent)
         splitter.addWidget(right_container)
         splitter.setSizes([200, 150, 1050])
         main_layout.addWidget(splitter)
@@ -277,8 +277,7 @@ class SessionTab(QWidget):
 
     def setup_accessibility(self):
         """Set up accessibility features: keyboard navigation, screen reader support, tooltips."""
-        self.run_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.pause_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.run_pause_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.agent_controls_panel.toggle_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.agent_controls_panel.set_workspace_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.agent_controls_panel.clear_workspace_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -296,10 +295,8 @@ class SessionTab(QWidget):
             checkbox.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.query_entry.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.output_textedit.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.run_btn.setAccessibleName('Run agent')
-        self.run_btn.setAccessibleDescription('Start executing the agent with the current query')
-        self.pause_btn.setAccessibleName('Pause agent')
-        self.pause_btn.setAccessibleDescription('Pause the currently running agent')
+        self.run_pause_btn.setAccessibleName('Run/Pause agent')
+        self.run_pause_btn.setAccessibleDescription('Start or pause the agent')
         self.filter_lineedit.setAccessibleName('Event filter')
         self.filter_lineedit.setAccessibleDescription('Filter events by text content')
         self.filter_type_combo.setAccessibleName('Event type filter')
@@ -331,8 +328,7 @@ class SessionTab(QWidget):
         for name, checkbox in self.agent_controls_panel.tool_checkboxes.items():
             checkbox.setAccessibleName(f'Tool: {name}')
             checkbox.setAccessibleDescription(f'Enable or disable {name} tool')
-        self.run_btn.setToolTip('Run the agent (Ctrl+R)')
-        self.pause_btn.setToolTip('Pause the agent (Ctrl+P)')
+        self.run_pause_btn.setToolTip('Run/Pause the agent (Ctrl+R)')
         self.agent_controls_panel.toggle_button.setToolTip('Show/hide agent controls (Ctrl+T)')
         self.agent_controls_panel.set_workspace_btn.setToolTip('Set workspace directory')
         self.agent_controls_panel.clear_workspace_btn.setToolTip('Clear workspace restriction')
@@ -388,8 +384,7 @@ class SessionTab(QWidget):
             self.update_buttons(running=True, idle=False)
         elif state == ExecutionState.PAUSING:
             self.status_panel.update_status('Pausing…')
-            self.update_buttons(running=True, idle=False)
-            self.pause_btn.setEnabled(False)
+            self.query_panel.set_buttons_pausing()
 
     @pyqtSlot(int, int)
     def on_tokens_updated(self, total_input, total_output):
@@ -532,20 +527,17 @@ class SessionTab(QWidget):
         self.update_window_title()
 
     def update_buttons(self, running=None, idle=False):
-        """Update button states based on agent state."""
+        """Update the single run/pause button based on agent state."""
         if running is None:
             running = self.presenter.state == ExecutionState.RUNNING
             idle = False
         if running:
             if idle:
-                self.run_btn.setEnabled(True)
-                self.pause_btn.setEnabled(False)
+                self.query_panel.set_buttons_idle()
             else:
-                self.run_btn.setEnabled(False)
-                self.pause_btn.setEnabled(True)
+                self.query_panel.set_buttons_running()
         else:
-            self.run_btn.setEnabled(True)
-            self.pause_btn.setEnabled(False)
+            self.query_panel.set_buttons_idle()
 
     def load_config(self):
         """Load configuration from file and update controls.

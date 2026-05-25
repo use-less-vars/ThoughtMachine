@@ -34,15 +34,10 @@ class QueryPanel(QWidget):
 
         button_layout = QHBoxLayout()
 
-        # Run button
-        self.run_btn = QPushButton("RUN")
-        self.run_btn.setMinimumWidth(80)
-        button_layout.addWidget(self.run_btn)
-
-        # Pause button
-        self.pause_btn = QPushButton("PAUSE")
-        self.pause_btn.setMinimumWidth(80)
-        button_layout.addWidget(self.pause_btn)
+        # Single run/pause button — toggles label and behavior
+        self.run_pause_btn = QPushButton("RUN")
+        self.run_pause_btn.setMinimumWidth(80)
+        button_layout.addWidget(self.run_pause_btn)
 
         button_layout.addStretch()
 
@@ -51,18 +46,16 @@ class QueryPanel(QWidget):
 
     def setup_signal_connections(self):
         """Connect button signals to callbacks."""
-        self.run_btn.clicked.connect(self._on_run_clicked)
-        self.pause_btn.clicked.connect(self._on_pause_clicked)
+        self.run_pause_btn.clicked.connect(self._on_run_pause_clicked)
 
-    def _on_run_clicked(self):
-        """Handle run button click."""
-        if self.on_run:
-            self.on_run()
-
-    def _on_pause_clicked(self):
-        """Handle pause button click."""
-        if self.on_pause:
-            self.on_pause()
+    def _on_run_pause_clicked(self):
+        """Handle run/pause button click — dispatches based on current label."""
+        if self.run_pause_btn.text() == "RUN":
+            if self.on_run:
+                self.on_run()
+        else:
+            if self.on_pause:
+                self.on_pause()
 
     def get_query_text(self):
         """Get the current query text."""
@@ -72,28 +65,25 @@ class QueryPanel(QWidget):
         """Clear the query input."""
         self.query_entry.clear()
 
-    def set_run_enabled(self, enabled):
-        """Enable/disable run button."""
-        self.run_btn.setEnabled(enabled)
-
-    def set_pause_enabled(self, enabled):
-        """Enable/disable pause button."""
-        self.pause_btn.setEnabled(enabled)
-
     def set_buttons_running(self):
-        """Set buttons for running state."""
-        self.run_btn.setEnabled(False)
-        self.pause_btn.setEnabled(True)
+        """Set button for running state — shows PAUSE (enabled)."""
+        self.run_pause_btn.setText("PAUSE")
+        self.run_pause_btn.setEnabled(True)
+
+    def set_buttons_pausing(self):
+        """Set button for pausing transition — shows PAUSE (disabled/greyed)."""
+        self.run_pause_btn.setText("PAUSE")
+        self.run_pause_btn.setEnabled(False)
 
     def set_buttons_paused(self):
-        """Set buttons for paused state."""
-        self.run_btn.setEnabled(True)
-        self.pause_btn.setEnabled(False)
+        """Set button for paused state — shows RUN (to resume)."""
+        self.run_pause_btn.setText("RUN")
+        self.run_pause_btn.setEnabled(True)
 
     def set_buttons_idle(self):
-        """Set buttons for idle state."""
-        self.run_btn.setEnabled(True)
-        self.pause_btn.setEnabled(False)
+        """Set button for idle state — shows RUN (enabled)."""
+        self.run_pause_btn.setText("RUN")
+        self.run_pause_btn.setEnabled(True)
 
     def set_focus_to_query(self):
         """Set focus to query entry."""

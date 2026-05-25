@@ -23,6 +23,14 @@ class OutputPanel(QWidget):
         self.total_output = 0
         self.context_length = 0
         self._tool_call_map = {}
+        # Debounced scroll timer — single timer, reset on each append, cancels on user interaction
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.setSingleShot(True)
+        self._scroll_timer.timeout.connect(self._on_scroll_timer_fire)
+        # Guards: _user_interacted is set True when user manually scrolls
+        self._user_interacted = False
+        # _suppress_value_guard prevents re-entering valueChanged when we scroll programmatically
+        self._suppress_value_guard = False
         self.init_ui()
         self.markdown_renderer = MarkdownRenderer()
         self.message_renderer = MessageRenderer(self.markdown_renderer)
@@ -58,6 +66,9 @@ class OutputPanel(QWidget):
         self.output_textedit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.output_textedit.setStyleSheet('\n            QTextEdit:focus {\n                border: none;\n                outline: none;\n            }\n            QTextEdit {\n                selection-background-color: #3399ff;\n                selection-color: white;\n            }\n        ')
         layout.addWidget(self.output_textedit, 4)
+        # Detect user scroll interaction — drag, wheel, keyboard, etc.
+        scrollbar = self.output_textedit.verticalScrollBar()
+        scrollbar.valueChanged.connect(self._on_user_scroll)
 
     def setup_signal_connections(self):
         """Connect filter signals."""
@@ -143,6 +154,26 @@ class OutputPanel(QWidget):
 
 
 
+    def _on_user_scroll(self, value: int) -> None:
+        """Detect user-initiated scroll and cancel pending auto-scroll.
+
+        Connected to the vertical scrollbar's valueChanged signal. Uses a guard
+        flag (_suppress_value_guard) to distinguish programmatic setValue() calls
+        from real user interaction.
+        """
+        if self._suppress_value_guard:
+            self._suppress_value_guard = False
+            return
+        # Real user interaction — cancel any pending auto-scroll
+        self._user_interacted = True
+        self._scroll_timer.stop()
+
+    def _on_scroll_timer_fire(self) -> None:
+        """Debounced scroll timer fired — actually scroll to bottom."""
+        scrollbar = self.output_textedit.verticalScrollBar()
+        self._suppress_value_guard = True
+        scrollbar.setValue(scrollbar.maximum())
+
     def _append_html(self, html: str) -> None:
         # Log the full HTML being inserted into the QTextEdit for debugging
         log('DEBUG', 'ui.output_panel', 'Full HTML inserted into QTextEdit', {
@@ -173,15 +204,26 @@ class OutputPanel(QWidget):
         # Move cursor to end again
         cursor.movePosition(QTextCursor.MoveOperation.End)
 
-        # If user was near bottom before new content, scroll to new bottom
-        if was_near_bottom:
+        # If user was near bottom AND hasn't manually scrolled away,
+        # schedule a debounced scroll (resets on each call, avoids timer pile-up)
+        if was_near_bottom and not self._user_interacted:
             self.output_textedit.setTextCursor(cursor)
-            QTimer.singleShot(0, lambda: scrollbar.setValue(scrollbar.maximum()))
+            self._scroll_timer.stop()
+            self._scroll_timer.start(30)  # 30ms debounce — resets on each append
 
     def _auto_scroll_if_bottom(self) -> None:
         scrollbar = self.output_textedit.verticalScrollBar()
-        if scrollbar.value() >= scrollbar.maximum() - 5:
-            QTimer.singleShot(0, lambda: scrollbar.setValue(scrollbar.maximum()))
+        if scrollbar.value() >= scrollbar.maximum() - 5 and not self._user_interacted:
+            self._scroll_timer.stop()
+            self._scroll_timer.start(30)
+
+    def scroll_to_bottom(self) -> None:
+        """Force scroll to bottom, also resets user-interacted flag."""
+        self._user_interacted = False
+        self._scroll_timer.stop()
+        scrollbar = self.output_textedit.verticalScrollBar()
+        self._suppress_value_guard = True
+        scrollbar.setValue(scrollbar.maximum())
 
     def set_updates_enabled(self, enabled: bool) -> None:
         """Enable or disable widget updates for bulk operations."""
