@@ -1574,3 +1574,18 @@ Three new methods added to `AgentController` in `agent/controller/__init__.py`:
 - Always truncate from OLDEST messages first (remove_from_end=False always)
 - When a summary exists, drop summary content/preserved turns before dropping current turn
 - Add an emergency recovery: if removal from oldest can't get under limit, generate a forced summary and restart
+
+## 2026-05-25 — ## 2026-06-01 — MCP Registration Made Non-Blocking
+
+- **Prob...
+
+## 2026-06-01 — MCP Registration Made Non-Blocking
+
+- **Problem:** `register_mcp_tools(timeout=5.0)` blocked agent startup for up to 5 seconds. Three cascading timeouts: agent → ThreadPoolExecutor (5s) → per-request queue.get (5s). Orphaned subprocesses on timeout.
+- **Fix:** Made MCP registration fully asynchronous:
+  - `tools/mcp_manager.py:register_mcp_tools()` now checks for `mcp_config.json` first — if absent, returns instantly (no thread, no delay)
+  - If config exists, spawns a **daemon background thread** that handles server startup and tool registration
+  - Background thread also calls `_update_simplified_toolset()` after registration
+  - Removed `import concurrent.futures` dependency, replaced with `threading.Thread`
+  - `agent/core/agent.py`: simplified to just call `register_mcp_tools()` without timeout, no sync steps
+- **Impact:** App start is never delayed by MCP. MCP tools become available asynchronously after registration completes.
