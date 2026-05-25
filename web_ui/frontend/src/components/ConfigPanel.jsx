@@ -121,8 +121,7 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
     model: cfg?.model,
     system_prompt: cfg?.system_prompt ?? '',
     tools: cfg?.tools ?? [],
-    max_tokens: cfg?.max_tokens,
-    token_monitor_enabled: cfg?.token_monitor_enabled ?? true,
+
     token_monitor_warning_threshold: cfg?.token_monitor_warning_threshold ?? 35000,
     token_monitor_critical_threshold: cfg?.token_monitor_critical_threshold ?? 50000,
     workspace_path: cfg?.workspace_path ?? '',
@@ -280,27 +279,7 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
             />
           </div>
 
-          <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Max Tokens</strong> <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(leave empty for model default)</span></label>
-            <input
-              type="number" min="1"
-              placeholder="Unlimited"
-              value={draft.max_tokens ?? ''}
-              onChange={(e) => setDraft({ ...draft, max_tokens: e.target.value === '' ? undefined : parseInt(e.target.value, 10) })}
-              style={inputStyle}
-            />
-          </div>
 
-          <div style={{ marginBottom: '1rem' }}>
-            <label style={{ ...labelStyle, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-              <input
-                type="checkbox"
-                checked={draft.token_monitor_enabled}
-                onChange={(e) => setDraft({ ...draft, token_monitor_enabled: e.target.checked })}
-              />
-              <strong>Token Warnings</strong>
-            </label>
-          </div>
 
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>Critical Threshold</strong> <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>(tokens, warning is 15k below)</span></label>

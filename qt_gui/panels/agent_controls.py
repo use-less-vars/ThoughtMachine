@@ -64,31 +64,29 @@ class AgentControlsPanel(QGroupBox):
         self.clear_workspace_btn.setMaximumWidth(60)
         workspace_layout.addWidget(self.clear_workspace_btn)
         self.left_column.addWidget(workspace_row)
-        token_monitor_row = QWidget()
-        token_monitor_layout = QHBoxLayout()
-        token_monitor_row.setLayout(token_monitor_layout)
-        token_monitor_layout.setSpacing(5)
-        self.token_monitor_checkbox = QCheckBox('Token warnings')
-        self.token_monitor_checkbox.setChecked(True)
-        token_monitor_layout.addWidget(self.token_monitor_checkbox)
-        token_monitor_layout.addWidget(QLabel('Warning:'))
+        # Token thresholds (always active — no enable/disable toggle)
+        thresholds_row = QWidget()
+        thresholds_layout = QHBoxLayout()
+        thresholds_row.setLayout(thresholds_layout)
+        thresholds_layout.setSpacing(5)
+        thresholds_layout.addWidget(QLabel('Warning:'))
         self.warning_threshold_spinbox = QSpinBox()
         self.warning_threshold_spinbox.setRange(1, 200)
         self.warning_threshold_spinbox.setValue(35)
         self.warning_threshold_spinbox.setSingleStep(1)
-        token_monitor_layout.addWidget(self.warning_threshold_spinbox)
+        thresholds_layout.addWidget(self.warning_threshold_spinbox)
         self.warning_formatted_label = QLabel('(35k)')
-        token_monitor_layout.addWidget(self.warning_formatted_label)
-        token_monitor_layout.addWidget(QLabel('tokens'))
-        token_monitor_layout.addWidget(QLabel('Critical:'))
+        thresholds_layout.addWidget(self.warning_formatted_label)
+        thresholds_layout.addWidget(QLabel('tokens'))
+        thresholds_layout.addWidget(QLabel('Critical:'))
         self.critical_threshold_spinbox = QSpinBox()
         self.critical_threshold_spinbox.setRange(1, 200)
         self.critical_threshold_spinbox.setValue(50)
         self.critical_threshold_spinbox.setSingleStep(1)
-        token_monitor_layout.addWidget(self.critical_threshold_spinbox)
+        thresholds_layout.addWidget(self.critical_threshold_spinbox)
         self.critical_formatted_label = QLabel('(50k)')
-        token_monitor_layout.addWidget(self.critical_formatted_label)
-        self.left_column.addWidget(token_monitor_row)
+        thresholds_layout.addWidget(self.critical_formatted_label)
+        self.left_column.addWidget(thresholds_row)
         max_turns_row = QWidget()
         max_turns_layout = QHBoxLayout()
         max_turns_row.setLayout(max_turns_layout)
@@ -180,7 +178,7 @@ class AgentControlsPanel(QGroupBox):
         apply_layout = QHBoxLayout()
         apply_row.setLayout(apply_layout)
         self.apply_btn = QPushButton('Apply to Agent')
-        self.apply_btn.setToolTip('Apply runtime changes (temperature, max_tokens, top_p) without restarting the agent.')
+        self.apply_btn.setToolTip('Apply runtime changes (temperature, top_p) without restarting the agent.')
         self.apply_btn.setMaximumWidth(150)
         self.apply_btn.clicked.connect(self._on_apply_to_agent)
         apply_layout.addWidget(self.apply_btn)
@@ -200,7 +198,6 @@ class AgentControlsPanel(QGroupBox):
 
         self.warning_threshold_spinbox.valueChanged.connect(self._on_warning_threshold_changed)
         self.critical_threshold_spinbox.valueChanged.connect(self._on_critical_threshold_changed)
-        self.token_monitor_checkbox.stateChanged.connect(self.update_token_monitor_controls)
 
         self.mcp_config_btn.clicked.connect(self._open_mcp_config)
         self._update_token_threshold_labels()
@@ -310,12 +307,6 @@ class AgentControlsPanel(QGroupBox):
         if col == 1:
             tool_layout.addWidget(QWidget(), tool_row, col)
         tool_layout.setRowStretch(tool_row + 1, 1)
-
-    def update_token_monitor_controls(self):
-        """Enable/disable token monitor threshold controls based on checkbox."""
-        enabled = self.token_monitor_checkbox.isChecked()
-        self.warning_threshold_spinbox.setEnabled(enabled)
-        self.critical_threshold_spinbox.setEnabled(enabled)
 
     def _on_warning_threshold_changed(self, value):
         """Start debounced adjustment of warning threshold."""
@@ -442,7 +433,6 @@ class AgentControlsPanel(QGroupBox):
             config['api_key'] = ''
         config['temperature'] = self.temperature_spinbox.value()
         config['max_turns'] = self.max_turns_spinbox.value()
-        config['token_monitor_enabled'] = self.token_monitor_checkbox.isChecked()
         config['token_monitor_warning_threshold'] = self.warning_threshold_spinbox.value() * 1000
         config['token_monitor_critical_threshold'] = self.critical_threshold_spinbox.value() * 1000
 
@@ -487,9 +477,6 @@ class AgentControlsPanel(QGroupBox):
         max_turns = set_val('max_turns')
         if max_turns is not None:
             self.max_turns_spinbox.setValue(max_turns)
-        token_monitor_enabled = set_val('token_monitor_enabled')
-        if token_monitor_enabled is not None:
-            self.token_monitor_checkbox.setChecked(token_monitor_enabled)
         token_monitor_warning = set_val('token_monitor_warning_threshold')
         if token_monitor_warning is not None:
             self.warning_threshold_spinbox.setValue(token_monitor_warning // 1000)

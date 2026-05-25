@@ -38,7 +38,7 @@ class AnthropicProvider(LLMProvider):
                 else:
                     role = 'user' if msg['role'] == 'user' else 'assistant'
                     anthropic_messages.append({'role': role, 'content': msg['content']})
-            api_kwargs = {'model': self.config.model, 'messages': anthropic_messages, 'max_tokens': kwargs.get('max_tokens', self.config.max_tokens or 4096), 'temperature': kwargs.get('temperature', self.config.temperature), **kwargs}
+            api_kwargs = {'model': self.config.model, 'messages': anthropic_messages, 'max_tokens': kwargs.get('max_tokens', 4096), 'temperature': kwargs.get('temperature', self.config.temperature), **kwargs}
             if system_msg:
                 api_kwargs['system'] = system_msg
             if tools:

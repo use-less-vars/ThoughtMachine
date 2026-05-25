@@ -167,7 +167,7 @@ class Agent:
 
         Called at the start of process_query(). Determines whether
         the change can be hot-swapped (simple parameter changes like
-        temperature, max_tokens, top_p, enabled_tools) or requires
+        temperature, top_p, enabled_tools) or requires
         a full agent restart.
 
         Preserves _pending_config on failure so the change can be
@@ -200,7 +200,7 @@ class Agent:
         """Check if a config change can be applied via hot-swap.
         
         Hot-swap is safe when only simple runtime parameters change
-        (temperature, max_tokens, top_p, enabled_tools). Changes to
+        (temperature, top_p, enabled_tools). Changes to
         model, provider, system_prompt, tool_classes, api_key, base_url
         etc. require a full restart.
         """

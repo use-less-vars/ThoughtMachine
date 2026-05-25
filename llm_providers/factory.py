@@ -93,7 +93,6 @@ class ProviderFactory:
             base_url=config.get("base_url"),
             model=config.get("model", ""),
             temperature=config.get("temperature", 0.7),
-            max_tokens=config.get("max_tokens"),
             timeout=config.get("timeout", 120),
             max_retries=config.get("max_retries", 3),
             extra_headers=config.get("extra_headers", {})
