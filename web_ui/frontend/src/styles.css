@@ -80,6 +80,9 @@ body {
 .status-running {
   color: var(--success);
 }
+.status-pausing {
+  color: var(--warning);
+}
 .status-paused {
   color: var(--warning);
 }
@@ -156,6 +159,12 @@ body {
 /* ──────────────────────────────────────────────────────────────────────────
    ChatPanel
    ────────────────────────────────────────────────────────────────────────── */
+.chat-panel-wrapper {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  display: flex;
+}
 .chat-panel {
   flex: 1;
   overflow-y: auto;
@@ -172,6 +181,38 @@ body {
   height: 100%;
   color: var(--text-secondary);
   font-style: italic;
+}
+
+/* ── Scroll-navigation buttons (previous query + bottom) ──── */
+.scroll-nav-group {
+  position: absolute;
+  bottom: 1rem;
+  right: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  z-index: 10;
+}
+.scroll-bottom-btn,
+.scroll-prev-btn {
+  width: 2.2rem;
+  height: 2.2rem;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: 0.8rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+  transition: opacity 0.2s, transform 0.2s;
+}
+.scroll-bottom-btn:hover,
+.scroll-prev-btn:hover {
+  background: var(--bg-hover);
+  transform: scale(1.1);
 }
 
 /* ── Message bubbles ─────────────────────────────────────────────────────── */

@@ -4,13 +4,14 @@
  * Text input + contextual action buttons.
  *
  * Button logic:
- *   status     Run | Pause | Resume | Stop       Command sent
- *   ──────────────────────────────────────────────────────────
- *   IDLE       ✓   |       |        |            start_session (fresh) /
- *                                                  continue_session (if isRunning)
- *   RUNNING        | ✓    |        | ✓          pause_session / stop_session
- *   PAUSED         |       | ✓     | ✓          continue_session(query) / stop_session
- *   WAITING... ✓   |       |        | ✓          continue_session(query)
+ *   status     Run | Pause | Stop         Command sent
+ *   ────────────────────────────────────────────────────
+ *   IDLE       ✓   |       |              start_session (fresh) /
+ *                                            continue_session (if isRunning)
+ *   RUNNING        | ✓    | ✓            pause_session / stop_session
+ *   PAUSING    ⛔  |      |              single disabled Pause button
+ *   PAUSED     ✓   |       | ✓            continue_session(query) / stop_session
+ *   WAITING... ✓   |       | ✓            continue_session(query)
  *
  * Props:
  *   sendCommand(command, payload)
@@ -26,6 +27,7 @@ function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
   const isIdle = status === 'IDLE'
   const isBusy = status === 'RUNNING'
   const isPaused = status === 'PAUSED'
+  const isPausing = status === 'PAUSING'
   const isWaiting = status === 'WAITING_FOR_USER'
 
   const handleRun = () => {
@@ -52,7 +54,7 @@ function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
       sendCommand('pause_session', {})
     } else if (isPaused) {
       sendCommand('continue_session', { query: query.trim() })
-      setQuery('')  // Clear input after resuming
+      setQuery('')
       if (textareaRef.current) {
         textareaRef.current.style.height = 'auto'
       }
@@ -85,20 +87,20 @@ function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
         rows={1}
       />
       <div className="query-buttons">
-        {/* Toggle Run/Pause/Resume — always visible */}
+        {/* Toggle Run/Pause — always visible. No Resume button. */}
         {isBusy ? (
           <button className="btn btn-pause" onClick={handleToggle}>
             ⏸ Pause
           </button>
-        ) : isPaused ? (
-          <button className="btn btn-run" onClick={handleToggle}>
-            ▶ Resume
-          </button>
+        ) : isPausing ? (
+            <button className="btn btn-pause" disabled>
+              ⏸ Pausing…
+            </button>
         ) : (
           <button
             className="btn btn-run"
             onClick={handleToggle}
-            disabled={!query.trim()}
+            disabled={!query.trim() && isIdle}
           >
             ▶ Run
           </button>

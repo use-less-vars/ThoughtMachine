@@ -14,6 +14,8 @@ function statusDisplay(status) {
       return { className: 'status-idle', label: '● Idle' }
     case 'RUNNING':
       return { className: 'status-running', label: '● Running' }
+    case 'PAUSING':
+      return { className: 'status-pausing', label: '⏸ Pausing…' }
     case 'PAUSED':
       return { className: 'status-paused', label: '⏸ Paused' }
     case 'WAITING_FOR_USER':
