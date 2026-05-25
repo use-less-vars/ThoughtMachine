@@ -213,14 +213,55 @@ function ChatPanel({ messages }) {
     }
   }, [messages, shouldAutoScroll])
 
+  const scrollToBottom = () => {
+    if (chatRef.current) {
+      chatRef.current.scrollTop = chatRef.current.scrollHeight
+      setShouldAutoScroll(true)
+    }
+  }
+
+  // Scroll to the previous user query above the current viewport
+  const jumpToPrevQuery = () => {
+    const el = chatRef.current
+    if (!el) return
+    const userMessages = Array.from(el.querySelectorAll('.message-user'))
+    // Walk backwards from the last user message
+    for (let i = userMessages.length - 1; i >= 0; i--) {
+      const msgEl = userMessages[i]
+      if (msgEl.offsetTop + msgEl.offsetHeight < el.scrollTop + 10) {
+        // This user message is above the current viewport — scroll to it
+        el.scrollTop = msgEl.offsetTop - 20
+        setShouldAutoScroll(false)
+        return
+      }
+    }
+    // No user message above viewport, go to the first one (top of chat)
+    if (userMessages.length > 0) {
+      el.scrollTop = userMessages[0].offsetTop - 20
+      setShouldAutoScroll(false)
+    }
+  }
+
   return (
-    <div className="chat-panel" ref={chatRef} onScroll={handleScroll}>
-      {(!messages || messages.length === 0) && (
-        <div className="chat-empty">Send a message to start.</div>
+    <div className="chat-panel-wrapper">
+      <div className="chat-panel" ref={chatRef} onScroll={handleScroll}>
+        {(!messages || messages.length === 0) && (
+          <div className="chat-empty">Send a message to start.</div>
+        )}
+        {messages && messages.map((msg, i) => (
+          <MessageBubble key={i} msg={msg} index={i} />
+        ))}
+      </div>
+      {!shouldAutoScroll && (
+        <div className="scroll-nav-group">
+          <button className="scroll-prev-btn" onClick={jumpToPrevQuery} title="Jump to previous query">
+            ↑
+          </button>
+          <button className="scroll-bottom-btn" onClick={scrollToBottom} title="Scroll to bottom">
+            ↓
+          </button>
+        </div>
       )}
-      {messages && messages.map((msg, i) => (
-        <MessageBubble key={i} msg={msg} index={i} />
-      ))}
     </div>
   )
 }
