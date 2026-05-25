@@ -179,8 +179,9 @@ class Session:
         super().__setattr__(name, value)
 
     def __post_init__(self):
-        if self.context_length == 0:
-            self.context_length = self.total_input_tokens + self.total_output_tokens
+        # context_length stays as provided (0 = unknown);
+        # total_input_tokens + total_output_tokens is the cumulative total,
+        # NOT the current conversation's context length, so do NOT use it as fallback.
         self._wrap_user_history()
         self.ensure_name()
         try:

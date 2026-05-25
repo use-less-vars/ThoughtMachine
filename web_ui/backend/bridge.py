@@ -655,6 +655,12 @@ class WebAgentBridge:
                 "session_name": session.metadata.get('name', 'Untitled Session'),
                 "message_count": len(session.user_history),
             })
+            # Emit initial context_length so the frontend status bar shows
+            # the correct value immediately (no need to wait for a live token_update).
+            self._emit({
+                "type": "context_updated",
+                "context_length": self._session.context_length,
+            })
             log('INFO', 'server.bridge', f"Session loaded: {session_id} ({session.metadata.get('name')}) — {len(session.user_history)} messages")
 
             # Register this session as an open session (persists to open_sessions.json)
@@ -861,7 +867,7 @@ class WebAgentBridge:
             new_state = raw_event.get("new_state", "")
             frontend_state = {
                 "running": "RUNNING",
-                "pausing": "PAUSED",
+                "pausing": "PAUSING",
                 "paused": "PAUSED",
                 "idle": "IDLE",
                 "error": "IDLE",
@@ -885,7 +891,9 @@ class WebAgentBridge:
                 "output": tokens_out,
             })
             ctx = raw_event.get("context_length", 0)
-            if ctx:
+            if ctx is not None:
+                if self._session is not None:
+                    self._session.context_length = ctx
                 self._emit({
                     "type": "context_updated",
                     "context_length": ctx,

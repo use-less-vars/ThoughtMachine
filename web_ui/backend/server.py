@@ -460,11 +460,10 @@ async def websocket_endpoint(ws: WebSocket):
                                 "input": loaded.total_input_tokens,
                                 "output": loaded.total_output_tokens,
                             })
-                            if loaded.context_length:
-                                await ws.send_json({
-                                    "type": "context_updated",
-                                    "context_length": loaded.context_length,
-                                })
+                            await ws.send_json({
+                                "type": "context_updated",
+                                "context_length": loaded.context_length,
+                            })
                         # Send config_changed so the frontend shows the session's actual config
                         fe_config = _frontend_config_from_bridge(bridge)
                         await ws.send_json({
@@ -775,9 +774,7 @@ _FALLBACK_FRONTEND_CONFIG = {
     "temperature": 1.0,
     "max_turns": 200,
     "stop_check": None,
-    "max_tokens": None,
     "system_prompt": None,
-    "token_monitor_enabled": True,
     "token_monitor_warning_threshold": 60000,
     "token_monitor_critical_threshold": 75000,
     "turn_monitor_enabled": True,
