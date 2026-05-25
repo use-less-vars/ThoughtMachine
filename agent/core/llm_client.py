@@ -33,7 +33,7 @@ class LLMClient:
         self.config = config
         self.session = session
         self.logger = logger
-        self.provider = ProviderFactory.create_provider(provider_type=config.provider_type, api_key=config.api_key, base_url=config.base_url, model=config.model, temperature=config.temperature, max_tokens=config.max_tokens)
+        self.provider = ProviderFactory.create_provider(provider_type=config.provider_type, api_key=config.api_key, base_url=config.base_url, model=config.model, temperature=config.temperature)
         self.context_builder = None
 
     def create_context_builder(self, token_limit=None):
@@ -52,8 +52,6 @@ class LLMClient:
                 log('WARNING', 'core.llm_client', 'Creating HistoryProvider without session')
             log('DEBUG', 'core.context_builder', f'LLMClient.create_context_builder: session is None, returning None')
             return None
-        if token_limit is None:
-            token_limit = 8000
         if self.logger and hasattr(self.logger, 'py_logger'):
             log('INFO', 'core.llm_client', f'[CONTEXT_BUILDER] Creating HistoryProvider with token_limit={token_limit}')
         return HistoryProvider(session=self.session, token_limit=token_limit)

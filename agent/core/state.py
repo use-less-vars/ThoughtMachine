@@ -71,9 +71,6 @@ class AgentState:
         """
         self.current_conversation_tokens = total_tokens
         log('DEBUG', 'core.token_state', f'total_tokens={total_tokens}, warning_threshold={self.config.token_monitor_warning_threshold}, critical_threshold={self.config.token_monitor_critical_threshold}')
-        if not self.config.token_monitor_enabled:
-            self.token_state = TokenState.LOW
-            return []
         if total_tokens < self.config.token_monitor_warning_threshold:
             new_state = TokenState.LOW
         elif total_tokens < self.config.token_monitor_critical_threshold:

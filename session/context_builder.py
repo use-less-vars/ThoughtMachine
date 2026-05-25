@@ -211,6 +211,7 @@ class SummaryBuilder(ContextBuilder):
     def __init__(self, default_keep_turns: int=5):
         """Initialize with default number of turns to keep when no summary exists."""
         self.default_keep_turns = default_keep_turns
+        self.emergency_mode = False
 
     def build(self, user_history: List[Dict[str, Any]], max_tokens: Optional[int]=None) -> List[Dict[str, Any]]:
         """
@@ -272,6 +273,12 @@ class SummaryBuilder(ContextBuilder):
         # [CTXBUILD] AFTER FILTER
         log('DEBUG', 'ctxbuild', f"AFTER FILTER: non_system={len(non_system)} msgs, system_warnings={len(system_warnings)} msgs")
         
+        # Emergency mode: skip oldest 20% of non-system messages since last summary
+        if self.emergency_mode and non_system:
+            skip_count = max(1, int(len(non_system) * 0.2))
+            log('INFO', 'core.context', f'[EMERGENCY] Skipping oldest {skip_count}/{len(non_system)} non-system messages in SummaryBuilder')
+            non_system = non_system[skip_count:]
+        
         if os.environ.get('DEBUG_CONTEXT'):
             logger.debug(f'[DEBUG_CONTEXT] Collected {len(system_warnings)} system warnings:')
             for i, warn in enumerate(system_warnings):
@@ -312,7 +319,7 @@ class SummaryBuilder(ContextBuilder):
                 logger.debug(f'  [{i}] role={role}: {content_preview}')
         before_trunc_count = len(context)
         if max_tokens is not None:
-            context = self._truncate_to_max_tokens(context, max_tokens, preserve_system=True, remove_from_end=summary_msg is not None)
+            context = self._truncate_to_max_tokens(context, max_tokens, preserve_system=True, remove_from_end=False)
         truncated_count = before_trunc_count - len(context)
         if truncated_count > 0:
             log('INFO', 'core.context', f"truncation: removed={truncated_count}, tokens_before={before_trunc_count}_msgs, tokens_after={len(context)}_msgs")

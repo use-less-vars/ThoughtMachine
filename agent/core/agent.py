@@ -108,30 +108,25 @@ class Agent:
         self.debug_context = DebugContext(self.logger)
         self._pending_warnings = []  # Buffer for token warnings, flushed after turn commit
         self.tool_classes = config.get_filtered_tool_classes()
-        # Register MCP tools lazily (not during import to avoid hangs)
+        # Register MCP tools in background (non-blocking, no startup delay)
+        # MCP tools become available later once background registration completes.
         try:
             from tools.mcp_manager import register_mcp_tools
-            from tools import _update_simplified_toolset
-            register_mcp_tools(timeout=5.0)
-            # Sync SIMPLIFIED_TOOL_CLASSES with newly added MCP tools
-            _update_simplified_toolset()
-            # Recalculate tool_classes to include MCP tools
-            self.tool_classes = config.get_filtered_tool_classes()
+            register_mcp_tools()
         except Exception as e:
-            log('WARNING', 'core.agent', f"Failed to register MCP tools: {e}")
+            log('WARNING', 'core.agent', f"Failed to start MCP background registration: {e}")
         self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
         self.tool_executor = ToolExecutor(self.tool_classes, config, None, self.logger, self.security_available, agent=self)
         self.provider = self.llm_client.provider
-        self.runtime_params = RuntimeParams(temperature=config.temperature, max_tokens=config.max_tokens, top_p=None)
+        self.runtime_params = RuntimeParams(temperature=config.temperature, top_p=None)
         self._token_encoder = None
         if session is not None:
             self._token_counts = {'input': session.total_input_tokens, 'output': session.total_output_tokens}
         else:
             self._token_counts = {'input': 0, 'output': 0}
         self.conversation = self.llm_client.ensure_system_prompt(self.conversation)
-        max_context_tokens = self._get_max_context_tokens()
-        log('DEBUG', 'core.context_builder', f'Agent init: session is None={session is None}, max_context_tokens={max_context_tokens}')
-        self.context_builder = self.llm_client.create_context_builder(token_limit=max_context_tokens)
+        log('DEBUG', 'core.context_builder', f'Agent init: session is None={session is None}')
+        self.context_builder = self.llm_client.create_context_builder(token_limit=None)
         log('DEBUG', 'core.context_builder', f'Agent init: context_builder created, is None={self.context_builder is None}')
         if self.context_builder:
             self.conversation_manager.context_builder = self.context_builder
@@ -228,7 +223,7 @@ class Agent:
     def _hot_swap(self, new_config: AgentConfig):
         """Apply a lightweight config update without restarting.
         
-        Updates only runtime parameters (temperature, max_tokens, top_p)
+        Updates only runtime parameters (temperature, top_p)
         and tool definitions. Does NOT re-initialise the LLM provider.
         """
         changed = []
@@ -237,10 +232,6 @@ class Agent:
         if new_config.temperature != self.config.temperature:
             self.runtime_params.temperature = new_config.temperature
             changed.append(f'temperature={new_config.temperature}')
-        if new_config.max_tokens != self.config.max_tokens:
-            self.runtime_params.max_tokens = new_config.max_tokens
-            changed.append(f'max_tokens={new_config.max_tokens}')
-        
         # Update config reference
         old_config = self.config
         self.config = new_config
@@ -355,15 +346,13 @@ class Agent:
             self.tool_executor = ToolExecutor(self.tool_classes, new_config, self.state, old_logger, self.security_available, agent=self)
 
             # Rebuild context builder
-            max_context_tokens = self._get_max_context_tokens()
-            self.context_builder = self.llm_client.create_context_builder(token_limit=max_context_tokens)
+            self.context_builder = self.llm_client.create_context_builder(token_limit=None)
             if self.context_builder:
                 self.conversation_manager.context_builder = self.context_builder
 
             # Update runtime params
             self.runtime_params = RuntimeParams(
                 temperature=new_config.temperature,
-                max_tokens=new_config.max_tokens,
                 top_p=None
             )
 
@@ -413,9 +402,8 @@ class Agent:
             self.context_builder.session = value
             log('DEBUG', 'core.context_builder', f'Updated existing context_builder.session')
         elif value is not None and hasattr(self, 'llm_client') and (self.llm_client is not None):
-            max_context_tokens = self._get_max_context_tokens()
-            self.context_builder = self.llm_client.create_context_builder(token_limit=max_context_tokens)
-            log('DEBUG', 'core.context_builder', f'Created new context_builder with token_limit={max_context_tokens}: is None={self.context_builder is None}')
+            self.context_builder = self.llm_client.create_context_builder(token_limit=None)
+            log('DEBUG', 'core.context_builder', f'Created new context_builder with token_limit=None: is None={self.context_builder is None}')
             if hasattr(self, 'conversation_manager') and self.conversation_manager is not None:
                 self.conversation_manager.context_builder = self.context_builder
         if hasattr(self, 'conversation_manager') and self.conversation_manager is not None:
@@ -494,21 +482,15 @@ class Agent:
         log('DEBUG', 'core.context_builder', f"_update_conversation_token_estimate: has context_builder={hasattr(self, 'context_builder')}, context_builder is None={(self.context_builder if hasattr(self, 'context_builder') else 'no attr')}")
         log('DEBUG', 'core.context_builder', f'conversation length: {len(self.conversation)}')
         if self.session is not None:
-            correct_token_limit = self._get_max_context_tokens()
             needs_update = False
             if not hasattr(self, 'context_builder') or self.context_builder is None:
                 log('DEBUG', 'core.context_builder', 'Creating missing context_builder for token estimation')
                 needs_update = True
-            elif hasattr(self.context_builder, 'token_limit'):
-                current_limit = self.context_builder.token_limit
-                if current_limit != correct_token_limit:
-                    log('DEBUG', 'core.context_builder', f'Context builder token_limit mismatch: {current_limit} != {correct_token_limit}, recreating')
-                    needs_update = True
             if needs_update:
                 if hasattr(self, 'llm_client') and self.llm_client is not None:
                     self.llm_client.session = self.session
-                    self.context_builder = self.llm_client.create_context_builder(token_limit=correct_token_limit)
-                    log('DEBUG', 'core.context_builder', f'Created/updated context_builder with token_limit={correct_token_limit}')
+                    self.context_builder = self.llm_client.create_context_builder(token_limit=None)
+                    log('DEBUG', 'core.context_builder', 'Created/updated context_builder with token_limit=None')
                     if self.context_builder and hasattr(self, 'conversation_manager') and (self.conversation_manager is not None):
                         self.conversation_manager.context_builder = self.context_builder
         if not hasattr(self, 'context_builder') or self.context_builder is None:
@@ -628,10 +610,7 @@ class Agent:
         """Calculate maximum tokens available for context."""
         context_window = self.token_counter.get_model_context_window()
         max_context = context_window - self.SAFETY_MARGIN
-        if self.config.max_tokens is not None:
-            max_context -= self.config.max_tokens
-        else:
-            max_context -= self.DEFAULT_RESPONSE_TOKENS
+        max_context -= self.DEFAULT_RESPONSE_TOKENS
         return max_context
 
     def _get_conversation_data_for_event(self) -> Dict[str, Any]:
@@ -685,6 +664,7 @@ class Agent:
     def process_query(self, query):
         """Process a user query, appending it to conversation and running the agent.
         Yields events as dicts."""
+        self._emergency_retries = 0
         try:
             # Apply any pending configuration update before processing
             self._apply_pending_config()
@@ -735,7 +715,7 @@ class Agent:
                     for yielded_event in self._handle_state_event(event):
                         yield yielded_event
             if self.logger:
-                config_data = {'model': self.config.model, 'temperature': self.config.temperature, 'max_turns': self.config.max_turns, 'max_tokens': self.config.max_tokens}
+                config_data = {'model': self.config.model, 'temperature': self.config.temperature, 'max_turns': self.config.max_turns}
                 self.logger.log_agent_start(query, config_data)
                 self.logger.log_system_resources()
             pause_debug(f"Adding user message to conversation: '{query[:50]}...'")
@@ -809,12 +789,9 @@ class Agent:
                 if self.logger and hasattr(self.logger, 'py_logger'):
                     system_msgs = [msg for msg in self.conversation if msg.get('role') == 'system']
                     log('INFO', 'agent.core', f'[CONVERSATION] Total messages: {len(self.conversation)}, system messages: {len(system_msgs)}')
-                max_context_tokens = self._get_max_context_tokens()
-                if self.logger and hasattr(self.logger, 'py_logger'):
-                    log('INFO', 'agent.core', f'[CONTEXT] Max context tokens: {max_context_tokens}, model: {self.config.model}')
                 self.debug_context.debug_context('before_build', context_builder=self.context_builder)
                 if hasattr(self, 'context_builder') and self.context_builder is not None:
-                    messages = self.context_builder.build(self.conversation, max_tokens=max_context_tokens)
+                    messages = self.context_builder.build(self.conversation)
                 else:
                     messages = self.conversation
                 self.debug_context.debug_context('after_build', messages=messages, context_builder=self.context_builder)
@@ -859,8 +836,6 @@ class Agent:
                     log('DEBUG', 'debug.emergency', f'  MSG[{i}] role={role}: {preview}')
                 try:
                     chat_kwargs = {'temperature': self.runtime_params.temperature}
-                    if self.runtime_params.max_tokens is not None:
-                        chat_kwargs['max_tokens'] = self.runtime_params.max_tokens
                     if self.runtime_params.top_p is not None:
                         chat_kwargs['top_p'] = self.runtime_params.top_p
                     # ── Agent messages diagnostic ──────────────────────────────────
@@ -902,6 +877,28 @@ class Agent:
                     last_output_tokens = output_tokens
                     self.total_input_tokens += input_tokens
                     self.total_output_tokens += output_tokens
+                except LLMError as e:
+                    if e.error_type == 'token_limit_exceeded':
+                        if self._emergency_retries >= 2:
+                            # All retries exhausted – clear emergency mode and stop
+                            self.context_builder.emergency_mode = False
+                            self._emergency_retries = 0
+                            log('ERROR', 'core.agent', 'Emergency recovery failed after retries',
+                                {'error': str(e)})
+                            yield {
+                                'type': 'error',
+                                'error': f'Context too large. Please summarise manually and retry. ({str(e)})',
+                                'stop_reason': 'context_full'
+                            }
+                            return
+                        # Activate emergency mode and retry the whole turn
+                        self._emergency_retries += 1
+                        self.context_builder.emergency_mode = True
+                        log('WARNING', 'core.agent', 'Token limit exceeded – emergency retry',
+                            {'attempt': self._emergency_retries})
+                        continue  # jumps back to the top of the turn loop, which rebuilds messages
+                    # For any other LLMError, re-raise to be caught by the generic handler below
+                    raise
                 except RateLimitExceeded as e:
                     self.rate_limit_count += 1
                     self.rate_limit_active = True
@@ -1210,6 +1207,9 @@ class Agent:
             log('INFO', 'agent.core', f'[PRUNING] Updated token estimate: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
         log('DEBUG', 'core.pruning', f'_apply_summary_pruning completed. History length: {len(user_history)} messages')
         log('DEBUG', 'core.session_history', f'session.summary exists: {self.session.summary is not None}')
+        # Reset emergency mode after a successful summary
+        self.context_builder.emergency_mode = False
+        self._emergency_retries = 0
 
     def _apply_summary_pruning_fallback(self, summary: str, keep_recent_turns: int):
         """Fallback pruning for when no session is available (legacy behavior).
@@ -1305,7 +1305,7 @@ class Agent:
         for tool_cls in SIMPLIFIED_TOOL_CLASSES:
             if tool_cls.__name__ in preset_tool_names:
                 tool_classes.append(tool_cls)
-        config_data = {'api_key': api_key or '', 'base_url': base_url, 'model': preset.model, 'temperature': preset.temperature, 'enabled_tools': list(preset_tool_names), 'system_prompt': preset.system_prompt, 'provider_type': 'openai_compatible', 'max_turns': overrides.get('max_turns', 100), 'detail': overrides.get('detail', 'normal'), 'workspace_path': overrides.get('workspace_path'), 'tool_output_token_limit': overrides.get('tool_output_token_limit', 10000), 'token_monitor_enabled': overrides.get('token_monitor_enabled', True), 'token_monitor_warning_threshold': overrides.get('token_monitor_warning_threshold', 35000), 'token_monitor_critical_threshold': overrides.get('token_monitor_critical_threshold', 50000), 'turn_monitor_enabled': overrides.get('turn_monitor_enabled', True), 'enable_logging': overrides.get('enable_logging', True), 'log_dir': overrides.get('log_dir', './logs'), 'log_level': overrides.get('log_level', 'INFO'), 'enable_file_logging': overrides.get('enable_file_logging', True), 'enable_console_logging': overrides.get('enable_console_logging', False), 'jsonl_format': overrides.get('jsonl_format', True), 'log_categories': overrides.get('log_categories', ['SESSION', 'LLM', 'TOOLS']), 'max_file_size_mb': overrides.get('max_file_size_mb', 10)}
+        config_data = {'api_key': api_key or '', 'base_url': base_url, 'model': preset.model, 'temperature': preset.temperature, 'enabled_tools': list(preset_tool_names), 'system_prompt': preset.system_prompt, 'provider_type': 'openai_compatible', 'max_turns': overrides.get('max_turns', 100), 'detail': overrides.get('detail', 'normal'), 'workspace_path': overrides.get('workspace_path'), 'tool_output_token_limit': overrides.get('tool_output_token_limit', 10000), 'token_monitor_warning_threshold': overrides.get('token_monitor_warning_threshold', 35000), 'token_monitor_critical_threshold': overrides.get('token_monitor_critical_threshold', 50000), 'turn_monitor_enabled': overrides.get('turn_monitor_enabled', True), 'enable_logging': overrides.get('enable_logging', True), 'log_dir': overrides.get('log_dir', './logs'), 'log_level': overrides.get('log_level', 'INFO'), 'enable_file_logging': overrides.get('enable_file_logging', True), 'enable_console_logging': overrides.get('enable_console_logging', False), 'jsonl_format': overrides.get('jsonl_format', True), 'log_categories': overrides.get('log_categories', ['SESSION', 'LLM', 'TOOLS']), 'max_file_size_mb': overrides.get('max_file_size_mb', 10)}
         config_data.update(overrides)
         from agent.config import AgentConfig
         config = AgentConfig(**config_data)
