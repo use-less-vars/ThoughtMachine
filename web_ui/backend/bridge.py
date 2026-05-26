@@ -81,9 +81,6 @@ class WebAgentBridge:
         # Query queue — the agent thread pulls from this
         self._query_queue: queue.Queue = queue.Queue()
 
-        # Mailbox for config updates
-        self._pending_config: Optional[AgentConfig] = None
-
         # Callback — called from the agent thread for every event
         self._event_callback = event_callback
 
@@ -396,6 +393,7 @@ class WebAgentBridge:
         self._config = validated
         if self._controller is not None:
             self._controller._config = validated
+            self._controller.request_config_update(validated)
 
         # Step 7: Persist to session
         self.save_session()

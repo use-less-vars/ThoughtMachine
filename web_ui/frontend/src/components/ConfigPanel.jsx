@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import ManageProvidersModal from './ManageProvidersModal';
 
 // ── Directory Browser sub-component ──────────────────────────────────────
 function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect, setLoading, setEntries, setError }) {
@@ -113,6 +114,7 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
 
 
 function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected }) {
+  const [showManageProviders, setShowManageProviders] = useState(false);
   const getSafeDraft = (cfg) => ({
     temperature: cfg?.temperature ?? 0.7,
     max_turns: cfg?.max_turns ?? 10,
@@ -338,6 +340,33 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
               ))}
             </select>
           </div>
+
+          {/* Manage Providers button */}
+          <div style={{ marginTop: '0.75rem' }}>
+            <button
+              onClick={() => setShowManageProviders(true)}
+              style={{
+                background: '#45475a',
+                color: '#89b4fa',
+                border: '1px solid #89b4fa',
+                borderRadius: '4px',
+                padding: '0.35rem 0.75rem',
+                cursor: 'pointer',
+                fontSize: '0.8rem',
+                fontWeight: 500,
+                width: '100%',
+              }}
+            >⚙ Manage Providers...</button>
+          </div>
+
+          {/* Manage Providers Modal */}
+          {showManageProviders && (
+            <ManageProvidersModal
+              providers={providers}
+              sendCommand={sendCommand}
+              onClose={() => setShowManageProviders(false)}
+            />
+          )}
         </div>
       )}
 

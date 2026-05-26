@@ -1610,3 +1610,59 @@ The LLM response token limit was removed as a user-facing config. Removed from:
 - Docstrings/tooltips updated
 
 `max_tokens` still exists in the context builder (session/context_builder.py, session/history_provider.py) for context window truncation — that is a separate concern.
+
+## 2026-05-26 — **Provider Management (Web UI)**
+
+The Web UI now supports fu...
+
+**Provider Management (Web UI)**
+
+The Web UI now supports full provider CRUD via the Model tab in ConfigPanel:
+- **Backend**: `save_provider` and `delete_provider` WS commands in `server.py` use `ProviderManager.add_profile()/.delete_profile()` to manage `~/.thoughtmachine/providers.json`
+- **Frontend**: `ManageProvidersModal` (table + Add/Edit/Delete) and `ProviderEditModal` (form with ID, Label, Type, Base URL, API Key, Default Model, Models list, Timeout)
+- **Data flow**: ManageProvidersModal calls `sendCommand('save_provider'/'delete_provider')` → backend persists + broadcasts `providers_list` → SessionTab updates providers state → ConfigPanel re-renders dropdowns
+- API key is stored in providers.json; masked in UI with `type="password"`
+
+## 2026-05-26 — ## Config-failure notification chain (traced 2025-05-26)
+
+Th...
+
+## Config-failure notification chain (traced 2025-05-26)
+
+The full notification chain for config-failure errors flows through 6 layers:
+
+### Layer 1 — Agent (agent/core/agent.py)
+- Line 717: Creates `Message(role='user', content='[SYSTEM NOTIFICATION] ...', is_system_notification=True)`
+- Line 718: Calls `_add_to_conversation(notif_msg)` 
+- `_add_to_conversation` → `conversation_manager.add_message()` → appends to `session.user_history`
+- Yields `{'type': 'error', 'error_type': 'invalid_config', 'message': ..., 'stop_reason': 'error'}`
+
+### Layer 2 — ObservableList → Session version bump (session/models.py)
+- `ObservableList.append()` → `_notify()` → `Session._on_conversation_changed()`
+- Bumps `_conversation_version`, recomputes `conversation_hash`, fires all registered callbacks
+
+### Layer 3 — Controller → Bridge (agent/controller/__init__.py → web_ui/backend/bridge.py)
+- Controller's `_run()` loop receives the event → calls `_emit_event(event)` → bridge's `_on_controller_event()`
+- Bridge's `_on_controller_event()` calls `_map_and_emit(raw_event)`
+
+### Layer 4 — Bridge event mapping (web_ui/backend/bridge.py lines 833-940)
+- **Step 1** (lines 847-854): Checks `conversation_version` difference → if message was added, emits `{"type": "conversation_changed", "messages": normalized_history}`
+- **Step 2** (lines 927-940): For `error` type specifically:
+  - Emits `{"type": "status_message", "text": "⚠ Error: ..."}` 
+  - Also syncs conversation_changed again (redundant but harmless)
+- `_normalize_for_frontend()` (line 462): Copies `is_system_notification` from backend messages; also has prefix-based fallback check
+
+### Layer 5 — WebSocket delivery (web_ui/backend/server.py)
+- `_emit()` → `self._event_callback(event)` → server.py's `event_callback()` closure
+- `event_callback`: `asyncio.run_coroutine_threadsafe(send_event(event), _loop)`
+- `send_event`: `ws.send_json(event)` — sends JSON over WebSocket
+
+### Layer 6 — Frontend handling (web_ui/frontend/src/components/SessionTab.jsx)
+- `conversation_changed` case (line 278): Replaces `history` with server messages (which include the system notification as `role: 'user', is_system_notification: true`)
+- `status_message` case (line 299): Appends `{role: 'system', content: '⚠ Error: ...', is_system_notification: true}` to history
+
+### Key finding: duplicate notification
+The notification appears **twice** in the frontend history:
+1. Once as a `user`-role message with `is_system_notification: true` (from `conversation_changed`)
+2. Once as a `system`-role message (from `status_message`)
+This is because `_add_to_conversation()` adds the message to the session (triggering `conversation_changed`), AND the error handler in `_map_and_emit()` also emits a separate `status_message`. The duplication is visible in the chat UI.

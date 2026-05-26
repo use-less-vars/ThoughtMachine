@@ -147,6 +147,7 @@ class Agent:
         self._update_conversation_token_estimate()
         # Mailbox pattern: pending config update to be applied at next process_query()
         self._pending_config: Optional[AgentConfig] = None
+        self._last_config_error: Optional[str] = None
 
     def request_config_update(self, new_config: AgentConfig):
         """
@@ -162,7 +163,7 @@ class Agent:
         self._pending_config = new_config
         log('DEBUG', 'agent.core', f'Pending config update queued: provider={new_config.provider_type}, model={new_config.model}')
 
-    def _apply_pending_config(self):
+    def _apply_pending_config(self) -> bool:
         """Apply pending configuration update if one exists.
 
         Called at the start of process_query(). Determines whether
@@ -172,9 +173,13 @@ class Agent:
 
         Preserves _pending_config on failure so the change can be
         retried on the next process_query() call.
+
+        Returns:
+            True if config was successfully applied (or no pending config),
+            False if restart failed or no API key available.
         """
         if self._pending_config is None:
-            return
+            return True
 
         new_config = self._pending_config
         log('DEBUG', 'core.config', f'[CONFIG_TRACE] _apply_pending_config incoming workspace_path={new_config.workspace_path}')
@@ -183,6 +188,7 @@ class Agent:
             self._hot_swap(new_config)
             self._pending_config = None
             log('DEBUG', 'core.config', '[CONFIG_TRACE] Pending config cleared after successful hot-swap')
+            return True
         else:
             # Validate that the new config has an API key available before attempting restart
             if not self._has_api_key(new_config):
@@ -192,9 +198,15 @@ class Agent:
                 log('WARNING', 'core.config',
                     '[CONFIG_TRACE] Pending config PRESERVED for retry on next turn '
                     f'(no API key for provider={new_config.provider_type})')
-                return
-            self._pending_config = None
-            self._restart_with_config(new_config)
+                self._last_config_error = (
+                    f'No API key available for provider "{new_config.provider_type}". '
+                    f'Set {new_config.provider_type.upper()}_API_KEY environment variable '
+                    f'or provide an api_key in the configuration.')
+                return False
+            success = self._restart_with_config(new_config)
+            if success:
+                self._pending_config = None
+            return success
 
     def _can_hot_swap(self, new_config: AgentConfig) -> bool:
         """Check if a config change can be applied via hot-swap.
@@ -257,15 +269,20 @@ class Agent:
             if self.logger:
                 self.logger.log_system_event(f'Config hot-swapped: {", ".join(changed)}')
 
-    def _restart_with_config(self, new_config: AgentConfig):
+    def _restart_with_config(self, new_config: AgentConfig) -> bool:
         """Perform a full agent restart with new configuration.
 
         Closes old LLM client and tool executor, then re-initialises
         everything from the new config while preserving conversation history.
+
+        Returns:
+            True if restart succeeded, False otherwise.
         """
         success = self.restart(new_config)
         if not success:
-            log('ERROR', 'agent.core', f'Agent restart with provider={new_config.provider_type} failed')
+            error_detail = self._last_config_error or 'Unknown error during restart'
+            log('ERROR', 'agent.core', f'Agent restart with provider={new_config.provider_type} failed: {error_detail}')
+        return success
 
     @staticmethod
     def _has_api_key(config: AgentConfig) -> bool:
@@ -374,6 +391,7 @@ class Agent:
             return True
         except Exception as e:
             log('ERROR', 'agent.core', f'Failed to restart agent: {e}')
+            self._last_config_error = str(e)
             # Restore old LLM client so agent isn't left in a broken state
             if old_config is not None and old_logger is not None:
                 try:
@@ -666,19 +684,44 @@ class Agent:
         Yields events as dicts."""
         self._emergency_retries = 0
         try:
-            # Apply any pending configuration update before processing
-            self._apply_pending_config()
             log('DEBUG', 'core.agent', f'process_query: query="{query[:80]}..." turn_display={self._display_turn}')
 
-            # Safety check: ensure LLM client is in a valid state after config update
-            llm_client = getattr(self, 'llm_client', None)
-            if llm_client is None or getattr(llm_client, 'provider', None) is None:
-                log('ERROR', 'core.agent', 'LLM client is unavailable or in invalid state after config update')
+            # Add query to conversation FIRST so it's never lost, even on config failure
+            user_msg = {'role': 'user', 'content': query}
+            self._add_to_conversation(user_msg)
+            estimated_tokens = self._estimate_tokens(user_msg)
+            self.state.current_conversation_tokens += estimated_tokens
+            yield self._create_token_update_event()
+            self._display_turn = getattr(self, '_display_turn', 0) + 1
+            log('DEBUG', 'core.agent', f"User query added: turn={self._display_turn}")
+            event_dict = {'type': 'user_query', 'content': query, 'turn': self._display_turn}
+            self._add_conversation_data_to_event(event_dict)
+            if 'timestamp' not in event_dict:
+                event_dict['timestamp'] = event_dict.get('created_at', time.time())
+            yield event_dict
+
+            # Apply any pending configuration update before processing
+            config_applied = self._apply_pending_config()
+
+            if not config_applied:
+                error_detail = self._last_config_error or 'Unknown error'
+                log('ERROR', 'core.agent', f'Configuration update failed: {error_detail}')
+
+                # Add a visible system notification to the conversation
+                error_message = (
+                    '[SYSTEM NOTIFICATION] Configuration change failed: '
+                    f'{error_detail}. '
+                    'The previous configuration remains active. '
+                    'Please fix the settings and retry.'
+                )
+                notif_msg = Message(role='user', content=error_message, is_system_notification=True)
+                self._add_to_conversation(notif_msg)
+
                 event_dict = {
                     'type': 'error',
                     'error_type': 'invalid_config',
                     'stop_reason': 'error',
-                    'message': 'LLM client unavailable after configuration update. The new configuration may be invalid.',
+                    'message': error_detail,
                     'turn': self._display_turn,
                 }
                 self._add_conversation_data_to_event(event_dict)
@@ -687,7 +730,7 @@ class Agent:
 
             pause_debug(f"process_query called with query: '{query[:50]}...'")
             pause_debug(f'Current execution state: {self.state.execution_state}')
-            pause_debug(f'Conversation length before adding query: {len(self.conversation)}')
+            pause_debug(f'Conversation length after adding query: {len(self.conversation)}')
             pause_debug(f'context_builder exists: {self.context_builder is not None}')
             if self.context_builder and hasattr(self.context_builder, 'session'):
                 pause_debug(f'context_builder.session: {self.context_builder.session}')
@@ -718,21 +761,6 @@ class Agent:
                 config_data = {'model': self.config.model, 'temperature': self.config.temperature, 'max_turns': self.config.max_turns}
                 self.logger.log_agent_start(query, config_data)
                 self.logger.log_system_resources()
-            pause_debug(f"Adding user message to conversation: '{query[:50]}...'")
-            user_msg = {'role': 'user', 'content': query}
-            self._add_to_conversation(user_msg)
-            pause_debug(f'After adding user message, conversation length: {len(self.conversation)}')
-            estimated_tokens = self._estimate_tokens(user_msg)
-            self.state.current_conversation_tokens += estimated_tokens
-            yield self._create_token_update_event()
-            self._display_turn = getattr(self, '_display_turn', 0) + 1
-            log('DEBUG', 'core.agent', f"User query processed: turn={self._display_turn}, query='{query[:80]}...'")
-            log('WARNING', 'debug.agent.user_query', f"query='{query[:50]}...', _display_turn={self._display_turn}")
-            event_dict = {'type': 'user_query', 'content': query, 'turn': self._display_turn}
-            self._add_conversation_data_to_event(event_dict)
-            if 'timestamp' not in event_dict:
-                event_dict['timestamp'] = event_dict.get('created_at', time.time())
-            yield event_dict
             prev_conversation_len = len(self.conversation)
             last_input_tokens = 0
             last_output_tokens = 0

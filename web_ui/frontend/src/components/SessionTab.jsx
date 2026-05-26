@@ -320,6 +320,14 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
         setProviders(msg.providers || [])
         break
 
+      case 'provider_saved':
+        console.log('[SessionTab] Provider saved:', msg.provider?.id)
+        break
+
+      case 'provider_deleted':
+        console.log('[SessionTab] Provider deleted:', msg.provider_id)
+        break
+
       case 'tools_list':
         setAvailableTools(msg.tools || [])
         break

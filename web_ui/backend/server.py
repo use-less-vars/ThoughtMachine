@@ -43,6 +43,8 @@ Client → Server (JSON):
     { "command": "save_session",          "name": "..." (optional) }
     { "command": "load_session",          "session_id": "..." }
     { "command": "get_providers" }
+    { "command": "save_provider",      "provider": {...} }
+    { "command": "delete_provider",    "provider_id": "..." }
     { "command": "get_available_tools" }
     { "command": "delete_session",        "session_id": "..." }
     { "command": "rename_session",        "session_id": "...", "new_name": "..." }
@@ -66,6 +68,8 @@ Server → Client (JSON):
     session_closed      { "type": "session_closed",      "session_id": "..." }
     session_cleared     { "type": "session_cleared" }
     providers_list      { "type": "providers_list",      "providers": [...] }
+    provider_saved      { "type": "provider_saved",      "provider": {...} }
+    provider_deleted    { "type": "provider_deleted",    "provider_id": "..." }
     tools_list          { "type": "tools_list",          "tools": [...] }
 """
 
@@ -366,6 +370,105 @@ async def websocket_endpoint(ws: WebSocket):
                         await ws.send_json({
                             "type": "providers_list",
                             "providers": [],
+                        })
+
+                elif command == "save_provider":
+                    # Save (add or update) a provider profile
+                    from agent.config.provider_profile import ProviderManager, ProviderProfile
+                    try:
+                        provider_data = msg.get('provider', {})
+                        if not provider_data.get('id'):
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": "⚠ Provider must have an id",
+                            })
+                        else:
+                            manager = ProviderManager()
+                            profile = ProviderProfile(**provider_data)
+                            manager.add_profile(profile)
+                            if manager.save():
+                                # Re-read to confirm and broadcast updated list
+                                manager2 = ProviderManager()
+                                profiles = manager2.list_profiles()
+                                safe_profiles = []
+                                for p in profiles:
+                                    safe_profiles.append({
+                                        "id": p.id,
+                                        "label": p.label,
+                                        "provider_type": p.provider_type,
+                                        "base_url": p.base_url,
+                                        "default_model": p.default_model,
+                                        "models": list(p.models) if p.models else [],
+                                        "timeout": p.timeout,
+                                    })
+                                await ws.send_json({
+                                    "type": "provider_saved",
+                                    "provider": provider_data,
+                                })
+                                await ws.send_json({
+                                    "type": "providers_list",
+                                    "providers": safe_profiles,
+                                })
+                                log('INFO', 'server.config', f"Saved provider: {provider_data.get('id')}")
+                            else:
+                                await ws.send_json({
+                                    "type": "status_message",
+                                    "text": "⚠ Failed to save provider",
+                                })
+                    except Exception as exc:
+                        log('ERROR', 'server.config', f"save_provider failed: {exc}")
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": f"⚠ Failed to save provider: {exc}",
+                        })
+
+                elif command == "delete_provider":
+                    # Delete a provider profile by id
+                    from agent.config.provider_profile import ProviderManager
+                    try:
+                        provider_id = msg.get('provider_id', '')
+                        if not provider_id:
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": "⚠ Provider id is required",
+                            })
+                        else:
+                            manager = ProviderManager()
+                            if manager.delete_profile(provider_id):
+                                manager.save()
+                                # Broadcast updated list
+                                manager2 = ProviderManager()
+                                profiles = manager2.list_profiles()
+                                safe_profiles = []
+                                for p in profiles:
+                                    safe_profiles.append({
+                                        "id": p.id,
+                                        "label": p.label,
+                                        "provider_type": p.provider_type,
+                                        "base_url": p.base_url,
+                                        "default_model": p.default_model,
+                                        "models": list(p.models) if p.models else [],
+                                        "timeout": p.timeout,
+                                    })
+                                await ws.send_json({
+                                    "type": "provider_deleted",
+                                    "provider_id": provider_id,
+                                })
+                                await ws.send_json({
+                                    "type": "providers_list",
+                                    "providers": safe_profiles,
+                                })
+                                log('INFO', 'server.config', f"Deleted provider: {provider_id}")
+                            else:
+                                await ws.send_json({
+                                    "type": "status_message",
+                                    "text": f"⚠ Provider '{provider_id}' not found",
+                                })
+                    except Exception as exc:
+                        log('ERROR', 'server.config', f"delete_provider failed: {exc}")
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": f"⚠ Failed to delete provider: {exc}",
                         })
 
                 elif command == "get_available_tools":
