@@ -70,6 +70,19 @@ function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
     }
   }
 
+  // Debounced auto-resize using requestAnimationFrame to avoid layout thrashing
+  const resizeRafRef = useRef(null)
+  const handleResize = (e) => {
+    if (resizeRafRef.current) return  // coalesce multiple events into one frame
+    resizeRafRef.current = requestAnimationFrame(() => {
+      resizeRafRef.current = null
+      const el = textareaRef.current
+      if (!el) return
+      el.style.height = 'auto'
+      el.style.height = Math.min(el.scrollHeight, 200) + 'px'
+    })
+  }
+
   return (
     <div className="query-bar">
       <textarea
@@ -79,10 +92,7 @@ function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         onKeyDown={handleKeyDown}
-        onInput={(e) => {
-          e.target.style.height = 'auto';
-          e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px';
-        }}
+        onInput={handleResize}
         disabled={false}  /* Always writable — buttons control what's allowed */
         rows={1}
       />

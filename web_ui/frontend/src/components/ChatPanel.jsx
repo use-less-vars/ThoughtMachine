@@ -175,7 +175,8 @@ function MessageContent({ msg }) {
 }
 
 /* ── Single bubble ── */
-function MessageBubble({ msg, index }) {
+const MessageBubble = React.memo(
+  function MessageBubble({ msg, index }) {
   /* ── System notifications are stored as 'user' role with is_system_notification flag ── */
   const effectiveRole = msg.is_final ? 'final' : (msg.is_summary ? 'summary' : (msg.is_system_notification ? 'system' : msg.role))
   const style = ROLE_STYLE[effectiveRole] || ROLE_STYLE.system
@@ -191,7 +192,16 @@ function MessageBubble({ msg, index }) {
       <MessageContent msg={msg} />
     </div>
   )
-}
+  },
+  (prev, next) =>
+    prev.index === next.index &&
+    prev.msg.content === next.msg.content &&
+    prev.msg.role === next.msg.role &&
+    prev.msg.reasoning_content === next.msg.reasoning_content &&
+    prev.msg.is_system_notification === next.msg.is_system_notification &&
+    prev.msg.is_final === next.msg.is_final &&
+    prev.msg.is_summary === next.msg.is_summary
+)
 
 /* ── Main panel ── */
 function ChatPanel({ messages }) {
