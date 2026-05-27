@@ -9,10 +9,8 @@ import tiktoken
 from pydantic import ValidationError
 from agent.logging import log
 from fast_json_repair import loads as repair_loads
-from tools.final import Final
-from tools.final_report import FinalReport
 from agent.core.turn_transaction import TurnTransaction
-from tools.request_user_interaction import RequestUserInteraction
+from tools.respond import Respond
 from tools.summarize_tool import SummarizeTool
 
 class ToolExecutor:
@@ -190,10 +188,10 @@ class ToolExecutor:
             # Apply framework-level output truncation unless tool opts out
             if not tool_instance.skip_output_truncation:
                 tool_result = tool_instance._truncate_output(tool_result)
-            if isinstance(tool_instance, Final) or isinstance(tool_instance, FinalReport):
+            if isinstance(tool_instance, Respond):
+                if tool_instance.response_type == 'question':
+                    return {'result': tool_result, 'tool_type': 'user_interaction', 'user_interaction_message': tool_result}
                 return {'result': tool_result, 'tool_type': 'final', 'final_content': tool_result}
-            elif isinstance(tool_instance, RequestUserInteraction):
-                return {'result': tool_result, 'tool_type': 'user_interaction', 'user_interaction_message': tool_result}
             elif isinstance(tool_instance, SummarizeTool):
                 return {'result': tool_result, 'tool_type': 'summary', 'summary_text': tool_instance.summary, 'summary_keep_recent_turns': tool_instance.keep_recent_turns}
             else:

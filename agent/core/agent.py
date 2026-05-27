@@ -25,8 +25,6 @@ from pydantic import ValidationError
 from llm_providers.exceptions import ProviderError, RateLimitExceeded
 from tools import SIMPLIFIED_TOOL_CLASSES
 from tools.utils import model_to_openai_tool
-from tools.final import Final
-from tools.request_user_interaction import RequestUserInteraction
 from tools.summarize_tool import SummarizeTool
 from agent.core.message import Message
 from fast_json_repair import loads as repair_loads

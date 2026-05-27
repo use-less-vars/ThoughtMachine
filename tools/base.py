@@ -35,7 +35,7 @@ class ToolBase(BaseModel):
     requires_capabilities: ClassVar[List[str]] = []
 
     # If True, framework-level output truncation is skipped for this tool.
-    # Use this for tools whose output must always be complete (e.g., Final, SummarizeTool).
+    # Use this for tools whose output must always be complete (e.g., Respond, SummarizeTool).
     skip_output_truncation: ClassVar[bool] = False
 
     # Logger instance for tool debugging

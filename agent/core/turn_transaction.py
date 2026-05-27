@@ -122,7 +122,7 @@ class TurnTransaction:
             commit_messages.append(self._assistant_message)
             tool_calls = self._assistant_message.get('tool_calls', [])
             for tc in tool_calls:
-                if tc.get('name') in ('Final', 'FinalReport', 'RequestUserInteraction'):
+                if tc.get('name') == 'Respond':
                     log('DEBUG', 'core.turn_transaction', f"TurnTransaction committing {tc['name']} tool call with result in commit_messages")
                     break
             commit_messages.extend(self._tool_calls_buffer)
