@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import ClassVar, Literal
 from pydantic import Field
 from .base import ToolBase
 
@@ -6,6 +6,7 @@ class SummarizeTool(ToolBase):
     """Summarize Tool: Write a summary of the conversation and specify how many most recent turns to keep.
     The agent will replace older turns with the summary, preserving the specified number of recent turns."""
     tool: Literal["SummarizeTool"] = "SummarizeTool"
+    skip_output_truncation: ClassVar[bool] = True
     
     summary: str = Field(description="The summary text to insert into the conversation history.")
     keep_recent_turns: int = Field(description="Number of most recent turns to keep (excluding the summary).", ge=0)

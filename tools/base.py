@@ -34,6 +34,10 @@ class ToolBase(BaseModel):
     # Security capabilities required by this tool
     requires_capabilities: ClassVar[List[str]] = []
 
+    # If True, framework-level output truncation is skipped for this tool.
+    # Use this for tools whose output must always be complete (e.g., Final, SummarizeTool).
+    skip_output_truncation: ClassVar[bool] = False
+
     # Logger instance for tool debugging
     _logger: Optional[logging.Logger] = None
     _agent_logger: Optional[Any] = None
@@ -191,6 +195,8 @@ class ToolBase(BaseModel):
     
     def _truncate_output(self, output: str, limit: Optional[int] = None) -> str:
         """Truncate output to token limit if specified."""
+        if self.skip_output_truncation:
+            return output
         if limit is None:
             limit = self.token_limit
         if limit is None or limit <= 0:

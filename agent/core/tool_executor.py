@@ -187,6 +187,9 @@ class ToolExecutor:
                     if hasattr(self.logger, 'log_tool_debug') and hasattr(tool_instance, '_set_agent_logger'):
                         tool_instance._set_agent_logger(self.logger)
             tool_result = tool_instance.execute()
+            # Apply framework-level output truncation unless tool opts out
+            if not tool_instance.skip_output_truncation:
+                tool_result = tool_instance._truncate_output(tool_result)
             if isinstance(tool_instance, Final) or isinstance(tool_instance, FinalReport):
                 return {'result': tool_result, 'tool_type': 'final', 'final_content': tool_result}
             elif isinstance(tool_instance, RequestUserInteraction):
