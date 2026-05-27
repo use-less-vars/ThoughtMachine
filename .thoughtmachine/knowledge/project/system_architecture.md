@@ -1740,3 +1740,43 @@ Changed `.session-list-panel` width from 320px → 400px (min-width 260px → 30
 1. **`tools/base.py`** — Added `skip_output_truncation: ClassVar[bool] = False` on `ToolBase`. Also added an early return in `_truncate_output()` if `self.skip_output_truncation` is True.
 2. **`agent/core/tool_executor.py`** — After `tool_result = tool_instance.execute()`, added: `if not tool_instance.skip_output_truncation: tool_result = tool_instance._truncate_output(tool_result)`
 3. **Opt-out tools** — Set `skip_output_truncation: ClassVar[bool] = True` on `Final`, `FinalReport`, `SummarizeTool`, `RequestUserInteraction`. Also removed the manual `_truncate_output` call from `RequestUserInteraction.execute()`.
+
+## 2026-05-27 — ## Batch 5 — Tool Output Token Limit Config UI + Save as Def...
+
+## Batch 5 — Tool Output Token Limit Config UI + Save as Default Config (2026-05-27)
+
+### Changes Made
+
+**1. web_ui/frontend/src/components/ConfigPanel.jsx**
+- Added `tool_output_token_limit` field to `getSafeDraft()`, defaulting to 10000
+- Added dirty tracking via `lastAppliedConfig` state:
+  - `lastAppliedConfig` stores a deep-clone of the last successfully applied config
+  - `isDirty` derived state compares current draft vs lastAppliedConfig
+  - `isApplying` boolean for button feedback during save
+  - `applyError` string for timeout-based error feedback (10s timeout)
+- Added `<label>` and `<input type="number">` for `tool_output_token_limit` in the Tools tab section
+- Apply button: disabled when not dirty, shows spinner + "Applying…" when applying, shows "Unsaved changes" indicator
+- `lastAppliedConfig` is reset whenever new config arrives from server (inside the `config` useEffect)
+
+**2. web_ui/frontend/src/components/SessionActionsPanel.jsx**
+- Added `onSaveAsDefault` callback prop
+- Added "Save as Default Config" button with optimistic feedback:
+  - On click, calls `onSaveAsDefault?.()` and sets `defaultSaved` state to true
+  - Shows checkmark feedback for 2.5 seconds before reverting
+
+**3. web_ui/frontend/src/App.jsx**
+- Added `onSaveAsDefault` prop to `<SessionActionsPanel />`:
+  - Finds the active tab entry from `tabs` by `activeSessionId`
+  - Sends `set_default_config` command via the tab's WebSocket actions
+
+**4. web_ui/backend/server.py**
+- Added `set_default_config` WebSocket command handler:
+  - Reads the active session's config from `bridge._config`
+  - Creates `~/.thoughtmachine/` directory if needed
+  - Serializes config to JSON and atomically writes to `~/.thoughtmachine/agent_config.json`
+  - Sends `{type: "default_config_saved", status: "ok"}` on success
+  - Sends `{type: "default_config_saved", status: "error", message: ...}` on failure
+
+**5. web_ui/frontend/src/styles.css**
+- Added `@keyframes config-spin` animation and `.config-spinner` CSS class
+
