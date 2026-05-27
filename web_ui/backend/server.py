@@ -78,7 +78,9 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import traceback
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -156,7 +158,6 @@ async def websocket_endpoint(ws: WebSocket):
             asyncio.run_coroutine_threadsafe(send_event(event), _loop)
         except Exception as exc:
             log('ERROR', 'server.ws', f'event_callback error: {exc}')
-            import traceback
             traceback.print_exc()
 
     try:
@@ -341,6 +342,44 @@ async def websocket_endpoint(ws: WebSocket):
                         await ws.send_json({
                             "type": "status_message",
                             "text": f"⚠ Failed to apply config: {result.get('error', 'unknown error')}",
+                        })
+
+                elif command == "set_default_config":
+                    """Save the current session config as the global default."""
+                    if bridge is None or bridge._config is None:
+                        await ws.send_json({
+                            "type": "default_config_saved",
+                            "status": "error",
+                            "message": "No active session config available",
+                        })
+                        continue
+                    try:
+                        config_dir = Path.home() / '.thoughtmachine'
+                        config_dir.mkdir(parents=True, exist_ok=True)
+                        config_path = config_dir / 'agent_config.json'
+                        # Dump current config to dict (backend format — matches _load_global_defaults expectations)
+                        cfg_dict = bridge.get_config().model_dump(exclude={'api_key'}, exclude_none=True)
+                        with tempfile.NamedTemporaryFile(
+                            mode='w', delete=False,
+                            dir=str(config_dir),
+                            suffix='.tmp',
+                            prefix='agent_config_'
+                        ) as tmp:
+                            json.dump(cfg_dict, tmp, indent=2, default=str)
+                            tmp.flush()
+                            os.replace(tmp.name, str(config_path))
+                        log('INFO', 'server.config', f"Default config saved to {config_path}")
+                        await ws.send_json({
+                            "type": "default_config_saved",
+                            "status": "ok",
+                            "message": "Default config saved successfully",
+                        })
+                    except Exception as exc:
+                        log('ERROR', 'server.config', f"set_default_config failed: {exc}")
+                        await ws.send_json({
+                            "type": "default_config_saved",
+                            "status": "error",
+                            "message": f"Failed to save default config: {exc}",
                         })
 
                 elif command == "get_providers":
@@ -746,7 +785,6 @@ async def websocket_endpoint(ws: WebSocket):
                     })
             except Exception as exc:
                 log('ERROR', 'server.ws', f'FATAL WebSocket error: {exc}')
-                import traceback
                 traceback.print_exc()
                 try:
                     await ws.send_json({"type": "status_message", "text": f"⚠ Internal error: {exc}"})

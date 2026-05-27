@@ -114,6 +114,7 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
 
 
 function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected }) {
+  const [defaultSaved, setDefaultSaved] = useState(false);
   const [showManageProviders, setShowManageProviders] = useState(false);
   const getSafeDraft = (cfg) => ({
     temperature: cfg?.temperature ?? 0.7,
@@ -127,12 +128,18 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
     token_monitor_warning_threshold: cfg?.token_monitor_warning_threshold ?? 35000,
     token_monitor_critical_threshold: cfg?.token_monitor_critical_threshold ?? 50000,
     workspace_path: cfg?.workspace_path ?? '',
+    tool_output_token_limit: cfg?.tool_output_token_limit ?? 10000,
   });
 
   const [activeTab, setActiveTab] = useState('general');
   const [draft, setDraft] = useState(getSafeDraft(config));
 
   // ── Directory browser state ────────────────────────────────────────
+  // ── Dirty tracking & apply feedback ────────────────────────────────
+  const [lastAppliedConfig, setLastAppliedConfig] = useState(null);
+  const [isApplying, setIsApplying] = useState(false);
+  const [applyError, setApplyError] = useState(null);
+
   const [browserOpen, setBrowserOpen] = useState(false);
   const [browserPath, setBrowserPath] = useState('');
   const [browserEntries, setBrowserEntries] = useState([]);
@@ -141,7 +148,37 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
 
   useEffect(() => {
     setDraft(getSafeDraft(config));
+    setLastAppliedConfig(getSafeDraft(config));
+    // Clear applying state when config arrives (apply succeeded)
+    if (isApplying) {
+      setIsApplying(false);
+    }
   }, [config]);
+
+  // Apply error timeout: if no config change after 6s, show error
+  const applyTimeoutRef = React.useRef(null);
+  useEffect(() => {
+    if (isApplying) {
+      applyTimeoutRef.current = setTimeout(() => {
+        setIsApplying(false);
+        setApplyError('Apply timed out — check server connection');
+      }, 6000);
+    }
+    return () => {
+      if (applyTimeoutRef.current) {
+        clearTimeout(applyTimeoutRef.current);
+        applyTimeoutRef.current = null;
+      }
+    };
+  }, [isApplying]);
+
+  // Auto-clear error after 5 seconds
+  useEffect(() => {
+    if (applyError) {
+      const t = setTimeout(() => setApplyError(null), 5000);
+      return () => clearTimeout(t);
+    }
+  }, [applyError]);
 
   // ── Derived: selected provider object ──────────────────────────────
   // Backend sends 'provider' in config_changed; fall back if 'provider_id' not set.
@@ -154,6 +191,12 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
     const combined = defaultModel ? [defaultModel, ...models] : models
     return [...new Set(combined)] // deduplicate
   }, [selectedProvider])
+
+  // ── Dirty detection ────────────────────────────────────────────────
+  const isDirty = useMemo(() => {
+    if (!lastAppliedConfig || !draft) return false;
+    return JSON.stringify(draft) !== JSON.stringify(lastAppliedConfig);
+  }, [draft, lastAppliedConfig]);
 
   const handleProviderChange = (e) => {
     const providerId = e.target.value
@@ -212,7 +255,20 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
 
   return (
     <div style={{ padding: '1rem', fontFamily: 'sans-serif', background: '#313244', color: '#cdd6f4', width: panelWidth || 280, minWidth: 200, maxWidth: 500, flexShrink: 0, overflowY: 'auto', height: '100%' }}>
-      <h3 style={{ marginTop: 0, marginBottom: '0.75rem' }}>Config</h3>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem' }}>
+        <h3 style={{ margin: 0 }}>Config</h3>
+        <button
+          className="btn btn-accent"
+          style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem' }}
+          onClick={() => {
+            sendCommand('set_default_config');
+            setDefaultSaved(true);
+            setTimeout(() => setDefaultSaved(false), 2500);
+          }}
+        >
+          {defaultSaved ? '✓ Default saved!' : '💾 Save as Default'}
+        </button>
+      </div>
 
       {/* Tab bar */}
       <div style={{ display: 'flex', gap: '0.25rem', marginBottom: '1rem', borderBottom: '1px solid #45475a', paddingBottom: '0.5rem' }}>
@@ -373,7 +429,33 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
       {/* ── Tools Tab ────────────────────────────────────────────────── */}
       {activeTab === 'tools' && (
         <div>
+          {/* ── Tool Output Token Limit (above tool checkboxes) ───── */}
           <div style={{ marginBottom: '1rem' }}>
+            <label style={labelStyle} htmlFor="tool_output_token_limit">
+              <strong>Tool Output Token Limit</strong>
+            </label>
+            <input
+              id="tool_output_token_limit"
+              type="number"
+              min="0"
+              step="100"
+              style={{
+                ...inputStyle,
+                width: '100%',
+                marginTop: '0.3rem',
+              }}
+              value={draft.tool_output_token_limit ?? 10000}
+              onChange={(e) => {
+                const val = e.target.value === '' ? null : parseInt(e.target.value, 10);
+                setDraft({ ...draft, tool_output_token_limit: val });
+              }}
+              placeholder="Default: 10000"
+            />
+            <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
+              Maximum tokens per tool output. 0 or empty = no limit.
+            </small>
+          </div>
+          <div style={{ borderTop: '1px solid #45475a', paddingTop: '0.75rem' }}>
             <label style={labelStyle}><strong>Tools</strong></label>
             {availableTools.map((tool) => {
               const toolName = tool.name || tool;
@@ -491,24 +573,45 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
       )}
 
       {/* ── Apply Button ─────────────────────────────────────────────── */}
-      <div style={{ marginTop: '1rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+      <div style={{ marginTop: '1rem', display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
         <button
-          onClick={() => sendCommand('apply_config', { config: draft })}
-          disabled={!wsConnected}
+          onClick={() => {
+            setIsApplying(true);
+            setApplyError(null);
+            sendCommand('apply_config', { config: draft });
+          }}
+          disabled={!wsConnected || !isDirty || isApplying}
           style={{
-            background: wsConnected ? '#89b4fa' : '#585b70',
-            color: wsConnected ? '#1e1e2e' : '#a6adc8',
+            background: !wsConnected ? '#585b70' : isApplying ? '#585b70' : isDirty ? '#89b4fa' : '#45475a',
+            color: !wsConnected || (!isDirty && !isApplying) ? '#6c7086' : '#1e1e2e',
             border: 'none',
             borderRadius: '4px',
             padding: '0.5rem 1.5rem',
             fontWeight: 600,
-            cursor: wsConnected ? 'pointer' : 'not-allowed',
+            cursor: !wsConnected || !isDirty || isApplying ? 'not-allowed' : 'pointer',
             width: '100%',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: '0.4rem',
           }}
-        >Apply</button>
+        >
+          {isApplying && <span className="config-spinner" />}
+          {isApplying ? 'Applying…' : 'Apply'}
+        </button>
         {!wsConnected && (
           <span style={{ color: '#f9e2af', fontSize: '0.8rem', fontWeight: 500 }}>
             ⚠ Reconnecting...
+          </span>
+        )}
+        {isDirty && !isApplying && wsConnected && (
+          <span style={{ color: '#f9e2af', fontSize: '0.75rem', fontStyle: 'italic' }}>
+            Unsaved changes
+          </span>
+        )}
+        {applyError && (
+          <span style={{ color: '#f38ba8', fontSize: '0.8rem' }}>
+            ⚠ {applyError}
           </span>
         )}
       </div>
