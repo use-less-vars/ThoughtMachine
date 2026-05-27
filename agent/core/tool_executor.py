@@ -124,7 +124,10 @@ class ToolExecutor:
                     log('DEBUG', 'core.summary', f'SummarizeTool executed: summary length={len(summary_text)}, keep_recent_turns={summary_keep_recent_turns}')
             if self.logger:
                 self.logger.log_tool_result(tool_name, tool_result, tool_call['id'])
-            add_tool_result({'role': 'tool', 'tool_call_id': tool_call['id'], 'content': tool_result})
+            tool_result_msg = {'role': 'tool', 'tool_call_id': tool_call['id'], 'content': tool_result}
+            if tool_type == 'respond':
+                tool_result_msg['response_type'] = tool_execution_result.get('response_type')
+            add_tool_result(tool_result_msg)
             tool_tokens = self.agent.token_counter.estimate_tokens(tool_result) if self.agent is not None else self._estimate_tokens_fallback(tool_result)
             update_token_func(tool_tokens)
             if self.logger:
@@ -182,7 +185,9 @@ class ToolExecutor:
                     tool_instance._set_logger(self.logger)
                     if hasattr(self.logger, 'log_tool_debug') and hasattr(tool_instance, '_set_agent_logger'):
                         tool_instance._set_agent_logger(self.logger)
+            log('DEBUG', 'core.pause', f'TOOL EXECUTE START [{tool_name}]')
             tool_result = tool_instance.execute()
+            log('DEBUG', 'core.pause', f'TOOL EXECUTE END [{tool_name}]')
             # Apply framework-level output truncation unless tool opts out
             if not tool_instance.skip_output_truncation:
                 tool_result = tool_instance._truncate_output(tool_result)

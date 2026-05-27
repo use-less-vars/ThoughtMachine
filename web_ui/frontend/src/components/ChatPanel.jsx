@@ -40,6 +40,7 @@ const ROLE_STYLE = {
   tool_result: { className: 'message-tool-result',     label: 'Tool Result' },
   summary:     { className: 'message-summary',           label: '📝 Summary' },
   final:       { className: 'message-final',            label: '🎯 Final' },
+  question:    { className: 'message-question',          label: '❓ Question' },
   system:      { className: 'message-system-as-user',  label: 'System' },
 }
 
@@ -178,7 +179,9 @@ function MessageContent({ msg }) {
 const MessageBubble = React.memo(
   function MessageBubble({ msg, index }) {
   /* ── System notifications are stored as 'user' role with is_system_notification flag ── */
-  const effectiveRole = msg.is_final ? 'final' : (msg.is_summary ? 'summary' : (msg.is_system_notification ? 'system' : msg.role))
+  const effectiveRole = msg.is_final
+    ? (msg.response_type === 'question' ? 'question' : 'final')
+    : (msg.is_summary ? 'summary' : (msg.is_system_notification ? 'system' : msg.role))
   const style = ROLE_STYLE[effectiveRole] || ROLE_STYLE.system
   const copyText = msg.reasoning_content
     ? `${msg.reasoning_content}\n\n---\n\n${msg.content}`
@@ -200,7 +203,8 @@ const MessageBubble = React.memo(
     prev.msg.reasoning_content === next.msg.reasoning_content &&
     prev.msg.is_system_notification === next.msg.is_system_notification &&
     prev.msg.is_final === next.msg.is_final &&
-    prev.msg.is_summary === next.msg.is_summary
+    prev.msg.is_summary === next.msg.is_summary &&
+    prev.msg.response_type === next.msg.response_type
 )
 
 /* ── Main panel ── */

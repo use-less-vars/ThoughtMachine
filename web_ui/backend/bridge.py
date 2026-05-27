@@ -401,6 +401,14 @@ class WebAgentBridge:
         # Step 7: Persist to session
         self.save_session()
 
+        # Step 8: Notify frontend immediately so the config panel reflects the new values
+        cfg = self.get_config()
+        if cfg is not None:
+            self._emit({
+                'type': 'config_changed',
+                'config': cfg.model_dump(exclude={'api_key'}, exclude_none=True),
+            })
+
         log('INFO', 'server.bridge', 'Config applied and persisted via apply_config')
         return {"success": True}
 
@@ -570,6 +578,7 @@ class WebAgentBridge:
             else:
                 m.setdefault("is_system_notification", False)
             m.setdefault("is_final", False)
+            m.setdefault("response_type", None)
 
         return normalized
 
@@ -934,7 +943,7 @@ class WebAgentBridge:
                     "messages": self._normalize_for_frontend(self._session.user_history),
                 })
             # Then decide UI state based on response_type
-            if event.get('response_type') == 'question':
+            if raw_event.get('response_type') == 'question':
                 self._emit({
                     "type": "state_changed",
                     "state": "WAITING_FOR_USER",

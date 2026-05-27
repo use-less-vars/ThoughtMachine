@@ -464,6 +464,7 @@ class AgentController(QObject):
 
     def pause(self):
         """Pause the agent before the next turn (finishes current turn first)."""
+        log('DEBUG', 'core.pause', f'PAUSE REQUESTED by user')
         log('DEBUG', 'core.controller', f'pause() called, clearing pause_event, setting _pause_requested=True')
         self.pause_event.clear()
         self._pause_requested = True
@@ -476,7 +477,7 @@ class AgentController(QObject):
                 'old_state': old_state,
                 'new_state': 'pausing',
             })
-            log('DEBUG', 'core.controller', 'PAUSING state set immediately on pause request (via pause())')
+            log('DEBUG', 'core.pause', f'PAUSE REQUESTED by user (state before: {old_state}), execution_state_change emitted')
         if hasattr(self, 'agent') and self.agent is not None and hasattr(self.agent, 'request_pause'):
             self.agent.request_pause()
         if hasattr(self, 'agent') and self.agent is not None:
@@ -534,7 +535,7 @@ class AgentController(QObject):
             log('DEBUG', 'core.controller', f"[CONTROLLER _run] entering with self.agent={id(self.agent)}, agent.conversation len={len(self.agent.conversation)}, first roles={[m.get('role') for m in self.agent.conversation[:3]]}")
 
         def should_stop():
-            # Entry log removed to reduce idle polling noise (fires every loop iteration)
+            log('DEBUG', 'core.pause', f'stop_check called, pause_event.is_set()={self.pause_event.is_set()}')
             if self.stop_event.is_set():
                 log('DEBUG', 'core.controller', f'should_stop: stop_event is set, returning True')
                 return True
@@ -599,6 +600,7 @@ class AgentController(QObject):
                     # Ignore other queries when agent is None
                     continue
 
+                log('DEBUG', 'core.pause', 'CHECKING should_stop')
                 stop_result = should_stop()
                 if stop_result:
                     if stop_result == 'PAUSED':
@@ -628,7 +630,7 @@ class AgentController(QObject):
                     else:
                         log('DEBUG', 'core.controller', "[CONTROLLER _run] agent has NO conversation attribute")
                     for event in agent.process_query(query):
-                        log('DEBUG', 'core.controller', f"Event: {event['type']}")
+                        log('DEBUG', 'core.pause', f"POST-YIELD: event_type={event['type']}")
                         self._emit_event(event)
                         if event.get('stop_reason'):
                             log('DEBUG', 'core.controller', f"Stop reason: {event['stop_reason']}, breaking loop")

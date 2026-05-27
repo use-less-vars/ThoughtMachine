@@ -181,22 +181,21 @@ class Agent:
 
         new_config = self._pending_config
         old_config = self.config  # Capture pre-application config for diff
-        log('DEBUG', 'core.config', f'[CONFIG_TRACE] _apply_pending_config incoming workspace_path={new_config.workspace_path}')
 
         if self._can_hot_swap(new_config):
             self._hot_swap(new_config)
             self._pending_config = None
-            log('DEBUG', 'core.config', '[CONFIG_TRACE] Pending config cleared after successful hot-swap')
             self._notify_config_change(old_config, new_config)
             return True
         else:
+
             # Validate that the new config has an API key available before attempting restart
             if not self._has_api_key(new_config):
                 log('WARNING', 'agent.core', f'Cannot restart with provider {new_config.provider_type}: '
                     f'no API key available. Set {new_config.provider_type.upper()}_API_KEY '
                     f'environment variable or provide api_key in config.')
                 log('WARNING', 'core.config',
-                    '[CONFIG_TRACE] Pending config PRESERVED for retry on next turn '
+                    'Pending config PRESERVED for retry on next turn '
                     f'(no API key for provider={new_config.provider_type})')
                 self._last_config_error = (
                     f'No API key available for provider "{new_config.provider_type}". '
@@ -214,21 +213,44 @@ class Agent:
 
         Called after a successful hot-swap or restart so the LLM and the user
         are explicitly aware of what changed.
+
+        Uses programmatic field comparison across all AgentConfig model fields,
+        excluding sensitive fields (api_key) and non-comparable fields (stop_check).
         """
         changes = []
-        if new_config.provider_type != old_config.provider_type:
-            changes.append(f"provider={new_config.provider_type}")
-        if new_config.model != old_config.model:
-            changes.append(f"model={new_config.model}")
-        if new_config.workspace_path != old_config.workspace_path:
-            changes.append(f"workspace={new_config.workspace_path}")
-        if new_config.system_prompt != old_config.system_prompt:
-            changes.append("system_prompt updated")
-        if new_config.enabled_tools != old_config.enabled_tools:
-            changes.append("tools updated")
+        # Fields to exclude from diff notification
+        sensitive_fields = {'api_key', 'stop_check'}
+
+        import json as _json2
+        field_log = []
+
+        for field_name in type(new_config).model_fields:
+            if field_name in sensitive_fields:
+                continue
+
+            old_val = getattr(old_config, field_name)
+            new_val = getattr(new_config, field_name)
+            changed = old_val != new_val
+
+            field_log.append(f'{field_name}: changed={changed} old={_json2.dumps(old_val, default=str) if not callable(old_val) else "<callable>"} new={_json2.dumps(new_val, default=str) if not callable(new_val) else "<callable>"}')
+
+            if changed:
+                # Use friendlier display names for certain fields
+                if field_name == 'enabled_tools':
+                    changes.append("tools updated")
+                elif field_name == 'system_prompt':
+                    changes.append("system_prompt updated")
+                elif field_name == 'provider_type':
+                    changes.append(f"provider={new_val}")
+                elif field_name == 'workspace_path':
+                    changes.append(f"workspace={new_val}")
+                else:
+                    changes.append(f"{field_name}={new_val}")
+
 
         if changes:
             msg = "[SYSTEM NOTIFICATION] Configuration updated: " + ", ".join(changes) + "."
+            log('DEBUG', 'core.config', f'NOTIFICATION CREATED: {msg}')
             self._add_to_conversation(Message(role='user', content=msg, is_system_notification=True))
 
     def _can_hot_swap(self, new_config: AgentConfig) -> bool:
@@ -382,7 +404,6 @@ class Agent:
             # Rebuild tool_classes and tool_definitions
             self.tool_classes = new_config.get_filtered_tool_classes()
             self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
-            log('DEBUG', 'core.config', f'[CONFIG_TRACE] restart: creating executors with workspace={new_config.workspace_path}')
             self.tool_executor = ToolExecutor(self.tool_classes, new_config, self.state, old_logger, self.security_available, agent=self)
 
             # Rebuild context builder
@@ -717,13 +738,10 @@ class Agent:
             yield self._create_token_update_event()
             self._display_turn = getattr(self, '_display_turn', 0) + 1
             log('DEBUG', 'core.agent', f"User query added: turn={self._display_turn}")
-            event_dict = {'type': 'user_query', 'content': query, 'turn': self._display_turn}
-            self._add_conversation_data_to_event(event_dict)
-            if 'timestamp' not in event_dict:
-                event_dict['timestamp'] = event_dict.get('created_at', time.time())
-            yield event_dict
 
-            # Apply any pending configuration update before processing
+            # Apply any pending configuration update BEFORE yielding user_query,
+            # so the [SYSTEM NOTIFICATION] is already in user_history when the
+            # bridge syncs the conversation for the frontend.
             config_applied = self._apply_pending_config()
 
             if not config_applied:
@@ -750,6 +768,14 @@ class Agent:
                 self._add_conversation_data_to_event(event_dict)
                 yield event_dict
                 return
+
+            # Now yield user_query — the bridge syncs the conversation, and any
+            # config-change notification from _apply_pending_config is already visible.
+            event_dict = {'type': 'user_query', 'content': query, 'turn': self._display_turn}
+            self._add_conversation_data_to_event(event_dict)
+            if 'timestamp' not in event_dict:
+                event_dict['timestamp'] = event_dict.get('created_at', time.time())
+            yield event_dict
 
             pause_debug(f"process_query called with query: '{query[:50]}...'")
             pause_debug(f'Current execution state: {self.state.execution_state}')
@@ -794,7 +820,9 @@ class Agent:
                     self.logger.log_turn_start(turn)
                     if turn % 5 == 0:
                         self.logger.log_system_resources()
+                log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [1] turn_start')
                 if self.stop_check and self.stop_check():
+                    log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [1] turn_start: DETECTED')
                     events = self.state.set_execution_state(ExecutionState.PAUSING)
                     for event in events:
                         for yielded_event in self._handle_state_event(event):
@@ -893,9 +921,11 @@ class Agent:
                     log('DEBUG', 'core.agent', f"[AGENT MESSAGES BEFORE API] turn={turn} len(messages)={len(messages)} "
                         f"roles={[m.get('role') for m in messages[-5:]]} "
                         f"last_user={'present' if any(m['role']=='user' for m in messages[-2:]) else 'MISSING'}")
+                    log('DEBUG', 'core.pause', 'LLM CALL START')
                     llm_start_time = time.time()
                     response = self.llm_client.chat_completion(messages=messages, tools=tools if tools else None, **chat_kwargs)
                     llm_duration_ms = (time.time() - llm_start_time) * 1000
+                    log('DEBUG', 'core.pause', f'LLM CALL END (duration_ms={llm_duration_ms:.0f})')
                     if self.logger:
                         self.logger.log_latency('llm_call', llm_duration_ms, {'turn': turn, 'model': self.config.model, 'has_tools': bool(tools)})
                     input_tokens = response.usage.get('prompt_tokens', 0) if response.usage else 0
@@ -1001,14 +1031,16 @@ class Agent:
                 tool_calls = response.tool_calls
                 user_interaction_message = None
                 pause_debug(f'Checking pause request before turn: _pause_requested={self._pause_requested}')
-                log('DEBUG', 'core.pause', f"checkpoint 1: pause_requested={self._pause_requested}, has_tool_calls={bool(tool_calls)}")
+                log('DEBUG', 'core.pause', f'PAUSE CHECKPOINT [2] after_llm: _pause_requested={self._pause_requested}, has_tool_calls={bool(tool_calls)}')
                 if self._pause_requested:
                     if tool_calls:
+                        log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [2] after_llm: DEFERRED (tool_calls present)')
                         # Defer pause: tools need to execute first.
                         # _pause_requested stays True -> checkpoint 2 (line ~998) will catch it
                         # after tools have run and turn_transaction has been committed.
                         pause_debug(f'Pause requested but tool_calls present, deferring to after tool execution')
                     else:
+                        log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [2] after_llm: DETECTED')
                         pause_debug(f'Pause detected! Transitioning to PAUSING')
                         # Save grace turn: commit LLM response to user_history BEFORE yielding pause
                         assistant_msg = {'role': 'assistant', 'content': content}
@@ -1115,8 +1147,9 @@ class Agent:
                         self._apply_summary_pruning(summary_text, summary_keep_recent_turns)
                         yield self._create_token_update_event()
                 pause_debug(f'Checking pause request after turn processing: _pause_requested={self._pause_requested}')
-                log('DEBUG', 'core.pause', f"checkpoint 2: pause_requested={self._pause_requested}")
+                log('DEBUG', 'core.pause', f'PAUSE CHECKPOINT [3] after_turn: _pause_requested={self._pause_requested}')
                 if self._pause_requested:
+                    log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [3] after_turn: DETECTED')
                     pause_debug(f'Pause detected after turn processing! Transitioning to PAUSING')
                     events = self.state.set_execution_state(ExecutionState.PAUSING)
                     for event in events:

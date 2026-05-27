@@ -341,6 +341,40 @@ body {
   overflow-x: auto;
 }
 
+/* Question tool results (lighter purple bubble, full markdown, no truncation) */
+.message-question {
+  align-self: flex-start;
+  background: #4e3a72;
+  border-left: 3px solid #dce0ff;
+  border-bottom-left-radius: 2px;
+}
+
+.message-question .final-markdown p {
+  margin: 0.4em 0;
+}
+
+.message-question .final-markdown p:first-child {
+  margin-top: 0;
+}
+
+.message-question .final-markdown p:last-child {
+  margin-bottom: 0;
+}
+
+.message-question .final-markdown code {
+  background: rgba(200, 208, 255, 0.12);
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+
+.message-question .final-markdown pre {
+  background: rgba(0, 0, 0, 0.25);
+  padding: 0.75rem;
+  border-radius: 6px;
+  overflow-x: auto;
+}
+
 /* Summary tool results (dark golden bubble, full markdown, no truncation) */
 .message-summary {
   align-self: flex-start;

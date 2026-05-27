@@ -6,7 +6,14 @@ from .base import ToolBase
 
 
 class Respond(ToolBase):
-    """Unified agent-to-user response tool. Replaces Final, FinalReport, and RequestUserInteraction."""
+    """Unified agent-to-user response tool. Replaces Final, FinalReport, and RequestUserInteraction.
+
+    The `content` field MUST contain the complete message to display to the user — this is
+    the agent's full output for this turn (both answer and question variants).
+    The optional `report_body` field writes a downloadable report file in addition to the
+    `content` shown in chat — use this for detailed reports, analysis, or summaries that
+    the user can download while `content` provides the concise or conversational version.
+    """
     tool: Literal["Respond"] = "Respond"
     skip_output_truncation: ClassVar[bool] = True
 

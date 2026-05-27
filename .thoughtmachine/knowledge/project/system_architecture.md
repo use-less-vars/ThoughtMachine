@@ -1885,3 +1885,23 @@ This is the **canonical reset point** — the only place READY is set after a qu
 ### 7. Legacy Event Type Mapping
 **File:** `agent/events.py:325-328` — maps legacy string types to EventType enum values. Includes: tool_call, tool_result, token_warning, turn_warning, agent_responded, final, stopped, max_turns, thread_finished, paused, error, turn, token_update, user_interaction_requested, user_query, rate_limit_warning, execution_state_change, session_state_change.
 
+
+## 2026-05-27 — ## Generic Config Diff in `_notify_config_change()`
+
+**Appli...
+
+## Generic Config Diff in `_notify_config_change()`
+
+**Applied:** 2026-05-27
+
+**What changed:** Replaced the hardcoded 5-field comparison in `Agent._notify_config_change()` (`agent/core/agent.py` line 212) with a programmatic iteration over all `AgentConfig.model_fields`. This ensures any new fields added to `AgentConfig` are automatically included in config change notifications without manual updates.
+
+**Fields excluded from diff:**
+- `api_key` — sensitive credential
+- `stop_check` — `Callable`, not comparable with `!=`
+
+**Notification format:** Uses friendly display names for `enabled_tools` ("tools updated"), `system_prompt` ("system_prompt updated"), `provider_type` ("provider=..."), `workspace_path` ("workspace=..."). All other changed fields are reported as `field_name=value`.
+
+**Context changes (Fixes 1 & 2 from same session):**
+- Fix 1: `process_query()` reordered so `_apply_pending_config()` runs before yielding `user_query`. On config failure: yields error + returns early. On success: yields `user_query` with notification.
+- Fix 2: `apply_config()` in `web_ui/backend/bridge.py` now emits `config_changed` WebSocket message after persisting config changes.
