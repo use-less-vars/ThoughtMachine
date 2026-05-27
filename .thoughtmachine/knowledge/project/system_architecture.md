@@ -1690,3 +1690,53 @@ await ws.send_json({
     "name": new_session.metadata.get('name', 'Session'),
 })
 ```
+
+## 2026-05-27 — ## Save-before-switch in server.py
+
+Added auto-save before b...
+
+## Save-before-switch in server.py
+
+Added auto-save before bridge replacement in `new_session` and `load_session` WebSocket handlers (server.py). Pattern: `if bridge is not None and bridge.session is not None: bridge.save_session()` before `bridge.stop()`.
+
+Added `@property session` to `WebAgentBridge` that returns `self._session or self._loaded_session`, providing a clean public API for accessing the active session without reaching into private attributes.
+
+Note: `close_session` already had save logic inside `bridge.close_session()`, so no change needed. `continue_session` does not replace the bridge, so no change needed there.
+
+## Session panel CSS widened
+
+Changed `.session-list-panel` width from 320px → 400px (min-width 260px → 300px) and `.session-sidebar.open` width from 320px → 400px in `styles.css`.
+
+## 2026-05-27 — ## Batch 4: Session Actions Panel & UI Cleanup
+
+### Changes ...
+
+## Batch 4: Session Actions Panel & UI Cleanup
+
+### Changes Made
+1. **TabBar.jsx** — Removed save button, save dots, dirty state tracking, savingTabs state. Added cogwheel (⚙️) button with `onCogwheelClick` prop for opening the Session Actions panel.
+2. **SessionTab.jsx** — Removed `versionRef`, `hasUnsavedChanges`, `onDirtyChange` prop, dirty-tracking logic in `conversation_changed` handler, and `session_saved` dirty reset. Kept `onSessionSaved` callback forwarding.
+3. **App.jsx** — Removed `dirtyStates`, `handleDirtyChange`, `handleSaveTab`, `handleSaveActiveTab` functions and all prop passing. Added `sessionPanelOpen` state, `handleToggleSessionPanel`, `handleOpenSessionFromPanel`, `handleDeleteFromPanel` callbacks. Renders `SessionActionsPanel` conditionally.
+4. **SessionList.jsx** — Removed `onSave` and `saveEnabled` props and the "Save Current" button.
+5. **SessionActionsPanel.jsx** (NEW) — Slide-in panel with: Save As… (with name input dialog), Delete Session (with two-step confirmation), and Saved Sessions list (sorted by updated_at, click to open).
+6. **styles.css** — Removed `.tab-save-dot`, `.tab-save-btn`, `.tab-save-pulse`, `.btn-save` styles. Added `.tab-cogwheel-btn`, panel styles (`.session-actions-*`), and button variants (`.btn-accent`, `.btn-danger`).
+
+### Architecture
+- Save button and dirty dots removed from tab bar (auto-save handles persistence).
+- Cogwheel icon opens a slide-in panel from right side (z-index 201).
+- Panel provides Save As (rename+save), Delete (with confirm), and quick session switching.
+- After delete, the panel closes automatically.
+
+
+## 2026-05-27 — ## Tool Output Truncation — Framework-Level with Opt-Out (Im...
+
+## Tool Output Truncation — Framework-Level with Opt-Out (Implemented 2025-07-16)
+
+**Problem:** Previously, output truncation was opt-in — each tool voluntarily called `_truncate_output()`. 8 out of 12 tools didn't, meaning their output was never truncated.
+
+**Solution:** Moved truncation to the framework level in `ToolExecutor._execute_single_tool()`. After `tool_instance.execute()`, the result is automatically truncated unless the tool opts out.
+
+**Changes made:**
+1. **`tools/base.py`** — Added `skip_output_truncation: ClassVar[bool] = False` on `ToolBase`. Also added an early return in `_truncate_output()` if `self.skip_output_truncation` is True.
+2. **`agent/core/tool_executor.py`** — After `tool_result = tool_instance.execute()`, added: `if not tool_instance.skip_output_truncation: tool_result = tool_instance._truncate_output(tool_result)`
+3. **Opt-out tools** — Set `skip_output_truncation: ClassVar[bool] = True` on `Final`, `FinalReport`, `SummarizeTool`, `RequestUserInteraction`. Also removed the manual `_truncate_output` call from `RequestUserInteraction.execute()`.
