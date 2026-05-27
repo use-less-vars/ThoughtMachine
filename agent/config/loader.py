@@ -161,18 +161,6 @@ def get_config_paths() -> Dict[str, str]:
     }
 
 
-def get_config_paths() -> Dict[str, str]:
-    """Return paths for global and user configuration files.
-
-    Returns:
-        dict with keys 'global_config' (project-level agent_config.json)
-        and 'user_config' (~/.thoughtmachine/config.json).
-    """
-    return {
-        'global_config': os.path.join(os.getcwd(), 'agent_config.json'),
-        'user_config': str(Path.home() / '.thoughtmachine' / 'config.json'),
-    }
-
 
 def update_config(current_config: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
     """Update configuration with partial updates.
