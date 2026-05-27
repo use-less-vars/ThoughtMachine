@@ -95,7 +95,7 @@ class AgentState:
                 )
             else:
                 formatted = self._format_tokens(total_tokens)
-                warning = f'Token usage is at the critical threshold ({formatted} tokens). Please summarize to reduce context size or complete work. Only SummarizeTool, Final, and FinalReport will be available.'
+                warning = f'Token usage is at the critical threshold ({formatted} tokens). Please summarize to reduce context size or complete work. Only Respond and SummarizeTool are available.'
             self.last_token_warning = warning
             self.last_token_warning_count = total_tokens
             self.last_token_warning_state = new_state
@@ -143,7 +143,7 @@ class AgentState:
                 f'**Turn limit warning**: You are running out of turns ({current_turn}/{max_turns}). '
                 f'You must wait for the user to re-enable your session. Please provide a final answer now '
                 f'so the user can decide if they want to send you further queries or if they are happy '
-                f'with the result you have so far. Only Final and FinalReport are available.'
+                f'with the result you have so far. Only Respond is available.'
             )
             self.last_turn_warning = warning
             self.last_turn_warning_count = current_turn
@@ -207,10 +207,10 @@ class AgentState:
     def get_allowed_tools(self) -> List[str]:
         """Get list of allowed tool names based on current states.
 
-        When restrictions_active is True, only Final, FinalReport, and SummarizeTool are allowed.
+        When restrictions_active is True, only Respond and SummarizeTool are allowed.
         """
         if self.restrictions_active:
-            return ['Final', 'FinalReport', 'SummarizeTool']
+            return ['Respond', 'SummarizeTool']
         return []
 
     def is_tool_allowed(self, tool_name: str) -> bool:

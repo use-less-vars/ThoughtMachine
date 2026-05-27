@@ -466,7 +466,14 @@ class WebAgentBridge:
         """
         Normalize messages for frontend display without modifying the originals.
         """
-        FINAL_TOOL_NAMES = {"Final", "FinalReport"}
+        FINAL_TOOL_NAMES = {"Respond"}
+        # Map legacy tool calls to Respond equivalents for old session replay
+        # Legacy mapping for old session replay — maps deleted tools to Respond
+        LEGACY_TO_RESPOND = {
+            "Final": {"response_type": "answer"},
+            "FinalReport": {"response_type": "answer"},
+            "RequestUserInteraction": {"response_type": "question"},
+        }
         SUMMARY_TOOL_NAMES = {"SummarizeTool", "summarize", "Summarize"}
         normalized = []
         last_tool_call_name = None       # track for final detection
