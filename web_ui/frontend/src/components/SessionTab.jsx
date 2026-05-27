@@ -46,7 +46,7 @@ const INITIAL_STATE = {
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
-function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewSession, onSessionSaved, onRegister, onRunningChange }) {
+function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewSession, onSessionSaved, onRegister, onRunningChange, onSessionRenamed }) {
   const [state, setState] = useState(INITIAL_STATE)
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
   const [providers, setProviders] = useState([])
@@ -312,7 +312,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
         }
         // If this is a new session (tab had no sessionId), notify parent
         if (msg.session_id && !sessionId) {
-          onNewSession?.(msg.session_id)
+          onNewSession?.(msg.session_id, msg.session_name)
         }
         break
 
@@ -336,8 +336,21 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
         onSessionSaved?.()
         break
 
+      case 'session_renamed':
+        // The session was renamed; update our currentSessionId if needed
+        if (msg.session_id) {
+          setCurrentSessionId(msg.session_id)
+        }
+        onSessionRenamed?.(msg.session_id, msg.new_name)
+        break
+
       case 'session_closed':
         closedRef.current = true
+        onClose?.()
+        break
+
+      case 'session_deleted':
+        // Session was deleted from the store — close the tab
         onClose?.()
         break
 

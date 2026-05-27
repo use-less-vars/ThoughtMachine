@@ -4,13 +4,16 @@
  * Top tab bar that displays open session tabs (like browser tabs).
  * Each tab shows the session name and a close (✕) button.
  * A "+" button creates a new tab.
+ * A ⚙️ cogwheel opens the Session Actions panel.
  *
  * Props:
- *   tabs        — array of { id, name }
- *   activeTabId — currently active tab id
- *   onSelectTab — called with (tabId)
- *   onCloseTab  — called with (tabId)
- *   onNewTab    — called with ()
+ *   tabs            — array of { id, name }
+ *   activeTabId     — currently active tab id
+ *   onSelectTab     — called with (tabId)
+ *   onCloseTab      — called with (tabId)
+ *   onNewTab        — called with ()
+ *   onCogwheelClick — called with () when cogwheel is clicked
+ *   runningStates   — { [tabId]: status }
  */
 
 import React from 'react'
@@ -28,7 +31,7 @@ function _tabStatusClass(status) {
   }
 }
 
-export default function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onNewTab, runningStates = {} }) {
+export default function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onNewTab, onCogwheelClick, runningStates = {} }) {
   if (tabs.length === 0) {
     return null
   }
@@ -60,6 +63,9 @@ export default function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onN
           +
         </button>
       </div>
+      <button className="tab-cogwheel-btn" onClick={onCogwheelClick} title="Session actions">
+        ⚙️
+      </button>
     </div>
   )
 }

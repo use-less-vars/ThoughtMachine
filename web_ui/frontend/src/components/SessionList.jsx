@@ -10,8 +10,7 @@
  *   onOpenTab  — called with (sessionId) to open a session in a new tab
  *   onDelete   — called with (sessionId)
  *   onRename   — called with (sessionId, newName)
- *   onSave     — called to save the active tab's session
- *   saveEnabled — boolean, whether save button is enabled
+
  */
 
 import React, { useState, useEffect, useRef, useMemo } from 'react'
@@ -23,7 +22,7 @@ const ITEM_HEIGHT = 72
  * Row component for react-window v2 List.
  * Receives { index, style } plus spread rowProps (sessions, callbacks, etc.)
  */
-const Row = React.memo(({ index, style, sessions, renamingId, renameValue, onOpenTab, onDelete, startRename, submitRename, cancelRename, setRenameValue }) => {
+const Row = React.memo(({ index, style, sessions, renamingId, renameValue, onOpenTab, onDelete, startRename, submitRename, cancelRename, setRenameValue, deleteConfirmId, onRequestDelete }) => {
   const s = sessions && sessions[index]
   if (!s) return null
 
@@ -78,8 +77,8 @@ const Row = React.memo(({ index, style, sessions, renamingId, renameValue, onOpe
                 ✏️
               </button>
               <button
-                className="btn btn-icon"
-                onClick={() => onDelete(s.session_id)}
+                className={`btn btn-icon${deleteConfirmId === s.session_id ? ' btn-deleting' : ''}`}
+                onClick={() => onRequestDelete(s.session_id)}
                 title="Delete"
               >
                 🗑️
@@ -107,14 +106,14 @@ function formatDate(isoStr) {
   }
 }
 
-export default function SessionList({ sessions, onNew, onOpenTab, onDelete, onRename, onSave, saveEnabled }) {
+export default function SessionList({ sessions, onNew, onOpenTab, onDelete, onRename }) {
   const [renamingId, setRenamingId] = useState(null)
   const [renameValue, setRenameValue] = useState('')
+  const [deleteConfirmId, setDeleteConfirmId] = useState(null)
   const [listHeight, setListHeight] = useState(300)
   const panelRef = useRef(null)
   const headerRef = useRef(null)
   const mountTimerRef = useRef(null)
-
 
 
   // Profile initial render of the virtual list
@@ -130,18 +129,25 @@ export default function SessionList({ sessions, onNew, onOpenTab, onDelete, onRe
   useEffect(() => {
     const panel = panelRef.current
     if (!panel) return
+
     const measure = () => {
       const headerEl = headerRef.current
       const headerH = headerEl ? headerEl.offsetHeight : 130
       const panelStyle = window.getComputedStyle(panel)
       const padTop = parseFloat(panelStyle.paddingTop) || 0
       const padBot = parseFloat(panelStyle.paddingBottom) || 0
-      setListHeight(panel.clientHeight - headerH - padTop - padBot)
+      const available = panel.clientHeight - headerH - padTop - padBot
+      setListHeight(Math.max(available, 100))
     }
+
+    // Use ResizeObserver to catch layout changes (sidebar toggle, etc.)
+    const observer = new ResizeObserver(measure)
+    observer.observe(panel)
+
+    // Also measure on session count change
     measure()
-    // Re-measure on resize
-    window.addEventListener('resize', measure)
-    return () => window.removeEventListener('resize', measure)
+
+    return () => observer.disconnect()
   }, [sessions.length])
 
   // Profile once list has items and measured height > 0
@@ -155,6 +161,21 @@ export default function SessionList({ sessions, onNew, onOpenTab, onDelete, onRe
   const startRename = (sessionId, currentName) => {
     setRenamingId(sessionId)
     setRenameValue(currentName || '')
+  }
+
+  const onRequestDelete = (sessionId) => {
+    setDeleteConfirmId(sessionId)
+  }
+
+  const onConfirmDelete = () => {
+    if (deleteConfirmId) {
+      onDelete(deleteConfirmId)
+    }
+    setDeleteConfirmId(null)
+  }
+
+  const onCancelDelete = () => {
+    setDeleteConfirmId(null)
   }
 
   const submitRename = (sessionId) => {
@@ -181,7 +202,9 @@ export default function SessionList({ sessions, onNew, onOpenTab, onDelete, onRe
     submitRename,
     cancelRename,
     setRenameValue,
-  }), [sessions, renamingId, renameValue, onOpenTab, onDelete, onRename])
+    deleteConfirmId,
+    onRequestDelete,
+  }), [sessions, renamingId, renameValue, onOpenTab, onDelete, onRename, deleteConfirmId, onRequestDelete])
 
   return (
     <div className="session-list-panel" ref={panelRef}>
@@ -190,16 +213,6 @@ export default function SessionList({ sessions, onNew, onOpenTab, onDelete, onRe
           <h3>Sessions</h3>
         </div>
         <div className="session-list-actions">
-        {onSave && (
-          <button
-            className="btn btn-save"
-            onClick={onSave}
-            disabled={!saveEnabled}
-            title={saveEnabled ? 'Save current session' : 'No active session to save'}
-          >
-            💾 Save Current
-          </button>
-        )}
         <button className="btn btn-new" onClick={onNew}>
           ✨ New Session
         </button>
@@ -218,6 +231,23 @@ export default function SessionList({ sessions, onNew, onOpenTab, onDelete, onRe
           overscanCount={3}
 
         />
+      )}
+
+      {/* Delete confirmation overlay */}
+      {deleteConfirmId && (
+        <div className="delete-confirm-overlay" onClick={onCancelDelete}>
+          <div className="delete-confirm-dialog" onClick={(e) => e.stopPropagation()}>
+            <p>Are you sure you want to delete this session?</p>
+            <div className="delete-confirm-actions">
+              <button className="btn btn-sm" onClick={onCancelDelete}>
+                Cancel
+              </button>
+              <button className="btn btn-sm btn-delete-confirm" onClick={onConfirmDelete}>
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   )

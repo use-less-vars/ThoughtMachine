@@ -550,6 +550,7 @@ body {
 .session-list-panel {
   width: 320px;
   min-width: 260px;
+  height: 100%;
   padding: 1rem;
   background: var(--bg-secondary);
   border-left: 1px solid var(--border);
@@ -568,14 +569,6 @@ body {
   display: flex;
   flex-direction: column;
   gap: 0.4rem;
-}
-
-.btn-save {
-  background: var(--success);
-  color: var(--bg-primary);
-}
-.btn-save:hover:not(:disabled) {
-  filter: brightness(1.1);
 }
 
 .btn-new {
@@ -693,11 +686,63 @@ body {
   outline: none;
 }
 
+/* ── Delete confirmation overlay ───────────────────────────────────── */
+.delete-confirm-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.delete-confirm-dialog {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+  max-width: 360px;
+  width: 100%;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+}
+
+.delete-confirm-dialog p {
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+  color: var(--text-primary);
+  line-height: 1.5;
+}
+
+.delete-confirm-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.btn-delete-confirm {
+  background: var(--danger);
+  color: #fff;
+  border: none;
+}
+
+.btn-delete-confirm:hover {
+  filter: brightness(1.1);
+}
+
+.btn-deleting {
+  opacity: 0.5;
+}
+
 /* ──────────────────────────────────────────────────────────────────────────
-   Session sidebar (hidden by default, slides in with toggle)
+   Session sidebar (hidden by default, shown/hidden via ⚙️ cogwheel)
    ────────────────────────────────────────────────────────────────────────── */
 
 .session-sidebar {
+  height: 100%;
   overflow: hidden;
   width: 0;
   transition: width 0.2s ease;
@@ -708,30 +753,6 @@ body {
   width: 320px;
 }
 
-.session-toggle {
-  position: fixed;
-  right: 10px;
-  top: 10px;
-  z-index: 101;
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  color: var(--text-primary);
-  font-size: 1.2rem;
-  padding: 4px 10px;
-  border-radius: var(--radius);
-  cursor: pointer;
-  transition: right 0.2s ease, background 0.15s;
-  line-height: 1;
-}
-
-.session-sidebar.open ~ .session-toggle,
-.session-toggle.shifted {
-  right: 330px;
-}
-
-.session-toggle:hover {
-  background: var(--border);
-}
 
 /* ──────────────────────────────────────────────────────────────────────────
    Scrollbar (Webkit)
@@ -875,7 +896,6 @@ body {
   color: var(--bg-primary);
   border-color: var(--accent);
 }
-
 
 /* ──────────────────────────────────────────────────────────────────────────
    Multi-tab additions
@@ -1152,3 +1172,196 @@ body {
 .message-tool-call .tool-call-args {
   font-family: var(--font-mono, 'SF Mono', 'Fira Code', monospace);
 }
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Session Actions Panel (slide-in from right)
+   ────────────────────────────────────────────────────────────────────────── */
+
+.session-actions-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.4);
+  z-index: 200;
+}
+
+.session-actions-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 300px;
+  background: var(--bg-surface);
+  border-left: 1px solid var(--border);
+  box-shadow: -4px 0 20px rgba(0, 0, 0, 0.3);
+  z-index: 201;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: session-actions-slide-in 0.2s ease-out;
+}
+
+@keyframes session-actions-slide-in {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+.session-actions-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.session-actions-header h3 {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.session-actions-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 1rem;
+  color: var(--text-secondary);
+  padding: 0.2rem 0.4rem;
+  border-radius: 4px;
+  transition: background 0.15s, color 0.15s;
+  line-height: 1;
+}
+
+.session-actions-close:hover {
+  background: var(--danger);
+  color: #fff;
+}
+
+.session-actions-section {
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.session-actions-section h4 {
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+  color: var(--text-secondary);
+}
+
+.session-actions-section-grow {
+  flex: 1;
+  overflow-y: auto;
+  border-bottom: none;
+}
+
+.session-actions-save-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.session-actions-input {
+  padding: 0.4rem 0.6rem;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 0.85rem;
+  outline: none;
+}
+
+.session-actions-input:focus {
+  border-color: var(--accent);
+}
+
+.session-actions-save-form-buttons {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.session-actions-delete-confirm p {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  margin-bottom: 0.5rem;
+  line-height: 1.4;
+}
+
+.session-actions-delete-confirm-buttons {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.session-actions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.session-actions-empty {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  font-style: italic;
+  text-align: center;
+  padding: 1rem 0;
+}
+
+.session-actions-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.4rem 0.6rem;
+  background: var(--bg-primary);
+  border-radius: 4px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.session-actions-item:hover {
+  border-color: var(--border);
+  background: var(--bg-secondary);
+}
+
+.session-actions-item-active {
+  border-color: var(--accent) !important;
+}
+
+.session-actions-item-name {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-actions-item-date {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+}
+
+/* ── Button variants for panel ──────────────────────────── */
+.btn-accent {
+  background: var(--accent);
+  color: var(--bg-primary);
+}
+
+.btn-accent:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.btn-danger {
+  background: var(--danger);
+  color: #fff;
+}
+
+.btn-danger:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+
