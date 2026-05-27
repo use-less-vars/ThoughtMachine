@@ -46,6 +46,7 @@ class SessionTab(QWidget):
         self._display_retry_count = 0
         self._last_conversation_version = 0
         self._displayed_message_count = 0
+        self._pending_save_as_default = False
         self._closing = False
         self.output_panel = OutputPanel(self)
         self.query_panel = QueryPanel(self)
@@ -241,6 +242,21 @@ class SessionTab(QWidget):
         right_layout = QVBoxLayout()
         right_container.setLayout(right_layout)
         self.right_layout = right_layout
+
+        # Config header bar — always visible (not inside collapsible controls)
+        config_header = QWidget()
+        config_header_layout = QHBoxLayout()
+        config_header.setLayout(config_header_layout)
+        config_header_layout.setContentsMargins(0, 0, 0, 0)
+        config_header_layout.addWidget(QLabel('Configuration'))
+        config_header_layout.addStretch()
+        self.save_default_config_btn = QPushButton('Save as Default Config')
+        self.save_default_config_btn.setToolTip('Save current configuration as default for new sessions.')
+        self.save_default_config_btn.setMaximumWidth(180)
+        self.save_default_config_btn.clicked.connect(self._on_save_default_config)
+        config_header_layout.addWidget(self.save_default_config_btn)
+        right_layout.addWidget(config_header)
+
         rag_enabled = self.config_bridge.config_service.get('rag_enabled', False)
         if not rag_enabled:
             filtered_tool_classes = [cls for cls in SIMPLIFIED_TOOL_CLASSES if cls.__name__ != 'SearchCodebaseTool']
@@ -423,10 +439,36 @@ class SessionTab(QWidget):
         if traceback:
             pass
 
+    def _save_default_config_to_file(self):
+        """Persist current config as default (internal, no UI feedback)."""
+        from agent.config import get_config_paths
+        import json
+        try:
+            agent_config = self.agent_controls_panel.get_config()
+            config_dict = agent_config.model_dump(exclude={'api_key'}, exclude_none=True)
+            paths = get_config_paths()
+            user_config_path = paths.get('user_config')
+            if not user_config_path:
+                log('ERROR', 'session_tab', 'Could not determine user config path for default save.')
+                return
+            os.makedirs(os.path.dirname(user_config_path), exist_ok=True)
+            with open(user_config_path, 'w') as f:
+                json.dump(config_dict, f, indent=2)
+            self.config_bridge.save_config(config_dict, immediate=True)
+            log('INFO', 'session_tab', f'Saved default config to {user_config_path}')
+        except Exception as e:
+            log('ERROR', 'session_tab', f'Error saving default config: {e}')
+
     @pyqtSlot(dict)
     def on_config_changed(self, config):
         """Handle configuration changes from presenter."""
-        pass
+        if self._pending_save_as_default:
+            self._pending_save_as_default = False
+            self._save_default_config_to_file()
+            # Show success feedback on button for 2.5 seconds
+            self.save_default_config_btn.setText('\u2713 Default saved!')
+            QTimer.singleShot(2500, lambda: self.save_default_config_btn.setText('Save as Default Config'))
+            QTimer.singleShot(2500, lambda: self.save_default_config_btn.setEnabled(True))
 
     @pyqtSlot()
     def on_conversation_changed(self):
@@ -606,6 +648,20 @@ class SessionTab(QWidget):
             log('DEBUG', 'debug.unknown', 'save_config: bridge save completed')
         except Exception as e:
             log('ERROR', 'debug.unknown', f'save_config error: {e}')
+
+    def _on_save_default_config(self):
+        """Save current configuration as default for new sessions.
+
+        First applies the config (via the Apply flow), then waits for
+        config_changed before persisting to the user config file.
+        This guarantees the default always captures the last applied settings.
+        """
+        self._pending_save_as_default = True
+        self.save_default_config_btn.setEnabled(False)
+        self.save_default_config_btn.setText('Saving…')
+        # Trigger Apply to push current panel config through the pipeline
+        agent_config = self.agent_controls_panel.get_config()
+        self._on_apply_runtime_params(agent_config)
 
     def _on_apply_runtime_params(self, config: AgentConfig):
         """Handle Apply to Agent button press.

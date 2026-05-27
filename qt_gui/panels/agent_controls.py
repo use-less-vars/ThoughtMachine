@@ -182,11 +182,7 @@ class AgentControlsPanel(QGroupBox):
         self.apply_btn.setMaximumWidth(150)
         self.apply_btn.clicked.connect(self._on_apply_to_agent)
         apply_layout.addWidget(self.apply_btn)
-        self.save_global_btn = QPushButton('Save as Global Default')
-        self.save_global_btn.setToolTip('Save current configuration as the global default config file.')
-        self.save_global_btn.setMaximumWidth(180)
-        self.save_global_btn.clicked.connect(self._on_save_global_default)
-        apply_layout.addWidget(self.save_global_btn)
+        # Save as Default Config moved to session_tab.py header bar
         apply_layout.addStretch()
         self.main_layout.addWidget(apply_row)
         self._warning_threshold_timer = QTimer()
@@ -375,35 +371,6 @@ class AgentControlsPanel(QGroupBox):
         config = self.get_config()
         self.apply_to_agent_requested.emit(config)
 
-    def _on_save_global_default(self):
-        """Save current config as global default (agent_config.json).
-
-        Strips sensitive fields (api_key) before saving so they are never
-        persisted to the shared default config file.
-        """
-        config = self.get_config()
-        config_dict = config.model_dump(exclude={'api_key'}, exclude_none=True)
-        from PyQt6.QtWidgets import QMessageBox
-        from agent.config import get_config_paths
-        import json
-        paths = get_config_paths()
-        global_config_path = paths.get('global_config')
-        if not global_config_path:
-            QMessageBox.warning(self, 'Error', 'Could not determine global config path.')
-            return
-        # Remove sensitive fields that should not be saved as global defaults
-        config_dict.pop('api_key', None)
-        log('DEBUG', 'core.config', f'[CONFIG_TRACE] _on_save_global_default: writing to path={global_config_path}')
-        log('DEBUG', 'core.config', f'[CONFIG_TRACE] _on_save_global_default: token_monitor_warning_threshold={config_dict.get("token_monitor_warning_threshold", "NOT_IN_DICT")}, token_monitor_critical_threshold={config_dict.get("token_monitor_critical_threshold", "NOT_IN_DICT")}')
-        try:
-            with open(global_config_path, 'w') as f:
-                json.dump(config_dict, f, indent=2)
-            QMessageBox.information(
-                self, 'Saved',
-                f'Configuration saved as global default to:\n{global_config_path}'
-            )
-        except Exception as e:
-            QMessageBox.critical(self, 'Save Error', f'Failed to save config:\n{e}')
 
     def get_config(self):
         """Return an AgentConfig instance built from current UI control values.
