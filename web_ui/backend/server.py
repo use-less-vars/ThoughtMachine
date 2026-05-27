@@ -509,7 +509,7 @@ async def websocket_endpoint(ws: WebSocket):
                         log("ERROR", "server.config", f"list_sessions failed: {exc}")
 
                 elif command == "save_session":
-                    if bridge is None or not bridge.is_running:
+                    if bridge is None or bridge.session is None:
                         await ws.send_json({"type": "status_message", "text": "⚠ No active session to save."})
                         continue
                     name = msg.get("name", "")
@@ -536,6 +536,9 @@ async def websocket_endpoint(ws: WebSocket):
                     if not session_id:
                         await ws.send_json({"type": "status_message", "text": "⚠ session_id is required."})
                         continue
+                    # Save current session before switching
+                    if bridge is not None and bridge.session is not None:
+                        bridge.save_session()
                     # If a bridge/session is running, stop it first
                     if bridge is not None:
                         bridge.stop()
@@ -606,18 +609,31 @@ async def websocket_endpoint(ws: WebSocket):
                         await ws.send_json({"type": "status_message", "text": "⚠ session_id is required."})
                         continue
                     try:
-                        session = session_store.load_session(session_id)
-                        if session is None:
-                            await ws.send_json({"type": "status_message", "text": f"⚠ Session not found: {session_id}"})
-                            continue
-                        session.metadata['name'] = new_name
-                        session_store.save_session(session)
-                        await ws.send_json({
-                            "type": "session_renamed",
-                            "session_id": session_id,
-                            "new_name": new_name,
-                        })
-                        log("INFO", "server.config", f"Renamed session {session_id} → {new_name}")
+                        # Use bridge.rename_session() when available so in-memory
+                        # state (_session, _loaded_session) stays in sync with
+                        # the renamed session on disk. Fall back to direct store
+                        # access when no bridge is active.
+                        if bridge is not None and bridge.rename_session(session_id, new_name):
+                            await ws.send_json({
+                                "type": "session_renamed",
+                                "session_id": session_id,
+                                "new_name": new_name,
+                            })
+                            log("INFO", "server.config", f"Renamed session {session_id} → {new_name}")
+                        else:
+                            # Fallback: no bridge active, or bridge.rename_session returned False
+                            session = session_store.load_session(session_id)
+                            if session is None:
+                                await ws.send_json({"type": "status_message", "text": f"⚠ Session not found: {session_id}"})
+                                continue
+                            session.metadata['name'] = new_name
+                            session_store.save_session(session)
+                            await ws.send_json({
+                                "type": "session_renamed",
+                                "session_id": session_id,
+                                "new_name": new_name,
+                            })
+                            log("INFO", "server.config", f"Renamed session {session_id} → {new_name}")
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
@@ -671,6 +687,9 @@ async def websocket_endpoint(ws: WebSocket):
                         })
 
                 elif command == "new_session":
+                    # Save current session before switching
+                    if bridge is not None and bridge.session is not None:
+                        bridge.save_session()
                     # Stop any existing bridge
                     if bridge is not None:
                         bridge.stop()
@@ -696,6 +715,7 @@ async def websocket_endpoint(ws: WebSocket):
                     await ws.send_json({
                         "type": "session_loaded",
                         "session_id": new_session.session_id,
+                        "session_name": new_session.metadata.get('name', ''),
                     })
                     await ws.send_json({
                         "type": "state_changed",

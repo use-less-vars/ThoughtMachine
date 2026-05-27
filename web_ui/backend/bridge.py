@@ -103,9 +103,12 @@ class WebAgentBridge:
         self._session: Optional[Session] = None
         self._loaded_session: Optional[Session] = None
 
-        # Agent running flag — delegated to controller.is_busy.
-
     # ── Public API ──────────────────────────────────────────────────────────
+
+    @property
+    def session(self) -> Optional[Session]:
+        """Get the active session, falling back to the loaded session."""
+        return self._session or self._loaded_session
 
     @property
     def agent_is_running(self) -> bool:
@@ -696,6 +699,9 @@ class WebAgentBridge:
             # Update loaded session name if it's the one being renamed
             if self._loaded_session and self._loaded_session.session_id == session_id:
                 self._loaded_session.metadata['name'] = new_name
+            # Also update active in-memory session to prevent save_session() from reverting
+            if self._session and self._session.session_id == session_id:
+                self._session.metadata['name'] = new_name
             log('INFO', 'server.bridge', f"Session renamed: {session_id} → {new_name}")
             return True
         except Exception as e:
