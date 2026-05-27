@@ -9,7 +9,7 @@ learned, and task management.
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, ClassVar, List, Dict, Optional
+from typing import Literal, ClassVar, List, Dict, Optional, Tuple
 
 from pydantic import Field
 
@@ -109,12 +109,13 @@ class KnowledgeBaseTool(ToolBase):
 
     Modes:
       - **list**: List all domains with last-modified dates
-      - **read**: Return full content of a domain file
+      - **read**: Return full content of a domain file (supports optional max_tokens and section parameters)
       - **append**: Append a timestamped entry to a domain file
       - **update**: Replace a section's content in a domain file
       - **status**: Show current status from task_tracker + recent entries across all files
       - **search**: Search all KB files for a query (substring, case-insensitive)
       - **create_domain**: Create a new domain file
+      - **summary**: Return a lightweight section index of a domain file
     """
 
     tool: Literal["KnowledgeBase"] = "KnowledgeBase"
@@ -122,8 +123,8 @@ class KnowledgeBaseTool(ToolBase):
     # Security capabilities required by this tool
     requires_capabilities: ClassVar[List[str]] = ["read_files", "write_files"]
 
-    mode: Literal["list", "read", "append", "update", "status", "search", "create_domain"] = Field(
-        ..., description="Operation mode: list, read, append, update, status, search, or create_domain"
+    mode: Literal["list", "read", "append", "update", "status", "search", "create_domain", "summary"] = Field(
+        ..., description="Operation mode: list, read (with optional max_tokens and section), append, update, status, search, create_domain, or summary"
     )
     domain: Optional[str] = Field(
         None,
@@ -142,11 +143,21 @@ class KnowledgeBaseTool(ToolBase):
     )
     section: Optional[str] = Field(
         None,
-        description="Section header to update (required for update mode, e.g., 'Current Status').",
+        description=(
+            "Section header for update or read mode. In update mode (required): the section to replace. "
+            "In read mode (optional): extract only this section's content."
+        ),
     )
     new_content: Optional[str] = Field(
         None,
         description="New content to replace the section with (required for update mode).",
+    )
+    max_tokens: Optional[int] = Field(
+        None,
+        description=(
+            "Optional max token limit for read mode. When set, content is truncated to this limit. "
+            "Token estimation uses ~4 chars per token (len(content)//4)."
+        ),
     )
     query: Optional[str] = Field(
         None,
@@ -194,8 +205,10 @@ class KnowledgeBaseTool(ToolBase):
                 return self._mode_search(kb_root)
             elif self.mode == "create_domain":
                 return self._mode_create_domain(kb_root)
+            elif self.mode == "summary":
+                return self._mode_summary(kb_root)
             else:
-                return f"Unknown mode: {self.mode}. Supported modes: list, read, append, update, status, search, create_domain."
+                return f"Unknown mode: {self.mode}. Supported modes: list, read, append, update, status, search, create_domain, summary."
         except Exception as e:
             self._log_tool_error(f"Unexpected error in {self.mode} mode: {e}")
             return f"An unexpected error occurred: {e}. Please try again or check the knowledge base files."
@@ -476,8 +489,52 @@ class KnowledgeBaseTool(ToolBase):
             f"It will appear automatically in `mode=list`."
         )
 
+    def _build_section_index(self, content: str, rel_path: str) -> List[Tuple[str, int, int, int]]:
+        """
+        Build a list of (heading, start_line, end_line, token_estimate) for all
+        ##-level sections in the given content.
+
+        Line numbers are 1-indexed. Token estimate uses len(text)//4.
+        """
+        lines = content.split("\n")
+        sections: List[Tuple[str, int, int, int]] = []
+
+        # Find all ## (but not ###) heading lines
+        heading_indices = []
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("## ") and not stripped.startswith("### "):
+                heading_indices.append(i)
+
+        if not heading_indices:
+            # No ## headings — treat entire file as one section
+            token_est = len(content) // 4
+            sections.append("(entire file)", 1, len(lines), token_est)
+            return sections
+
+        for idx, line_idx in enumerate(heading_indices):
+            start_line = line_idx + 1  # 1-indexed
+            if idx + 1 < len(heading_indices):
+                end_line = heading_indices[idx + 1]  # next heading line (exclusive end)
+            else:
+                end_line = len(lines)  # until EOF
+
+            # Content of this section (heading line inclusive)
+            section_content = "\n".join(lines[line_idx:end_line])
+            token_est = len(section_content) // 4
+            heading_text = lines[line_idx].strip()
+            sections.append((heading_text, start_line, end_line, token_est))
+
+        return sections
+
     def _mode_read(self, kb_root: Path) -> str:
-        """Return full content of the specified domain file."""
+        """Return content of the specified domain file.
+
+        Supports optional parameters:
+        - section: extract only content under a matching ## heading
+        - max_tokens: truncate output to token limit
+        - If neither is given and file >4000 tokens, auto-truncate with smart suggestion.
+        """
         if not self.domain:
             return "Error: `domain` parameter is required for read mode."
 
@@ -504,7 +561,154 @@ class KnowledgeBaseTool(ToolBase):
             return f"Error reading '{rel_path}': {e}"
 
         self._log_debug(f"Read {len(content)} characters from {rel_path}")
-        return f"## Domain: {domain_name}\n\n{content}"
+
+        # --- Step 1: Handle section extraction (if section is provided) ---
+        if self.section:
+            clean_section = self.section.lstrip("#").strip()
+            # Try exact match first, then case-insensitive match
+            # Prefer the match with the most content (handles duplicate section headings)
+            match_heading = None
+            match_start = None
+            match_size = 0
+            for candidate_heading, sline, eline, _ in self._build_section_index(content, rel_path):
+                candidate_clean = candidate_heading.lstrip("#").strip()
+                if candidate_clean == clean_section or candidate_clean.lower() == clean_section.lower():
+                    size = eline - sline
+                    if size > match_size:
+                        match_heading = candidate_heading
+                        match_start = sline - 1  # convert to 0-indexed
+                        match_end = eline
+                        match_size = size
+
+            if match_heading is None or match_start is None:
+                # Section not found — build and show available sections
+                available = self._build_section_index(content, rel_path)
+                avail_lines = [f"Section \"{self.section}\" not found in **{domain_name}**. Available sections:\n"]
+                for h, sl, el, tok in available:
+                    avail_lines.append(f"- {h} (lines {sl}–{el}, ~{tok} tokens)")
+                return "\n".join(avail_lines)
+
+            # Extract section content (heading line inclusive)
+            lines = content.split("\n")
+            section_content = "\n".join(lines[match_start:match_end])
+
+            # If max_tokens is also set, apply truncation after section extraction
+            if self.max_tokens is not None:
+                full_tokens = len(section_content) // 4
+                if full_tokens > self.max_tokens:
+                    trunc_chars = self.max_tokens * 4
+                    section_content = section_content[:trunc_chars]
+                    section_content += (
+                        f"\n\n... [truncated from {full_tokens} tokens to {self.max_tokens} tokens. "
+                        f"Use mode=search query=\"...\" for targeted results, "
+                        f"or mode=read section=\"{match_heading}\" with a larger max_tokens.]"
+                    )
+                    self._log_debug(f"Truncated section to {self.max_tokens} tokens")
+
+            return f"## Domain: {domain_name}\n\n{section_content}"
+
+        # --- Step 2: Handle max_tokens-only truncation ---
+        if self.max_tokens is not None:
+            full_tokens = len(content) // 4
+            if full_tokens <= self.max_tokens:
+                result = f"## Domain: {domain_name}\n\n{content}"
+                self._log_debug(f"Content fits within {self.max_tokens} tokens ({full_tokens} total)")
+                return result
+
+            trunc_chars = self.max_tokens * 4
+            truncated = content[:trunc_chars]
+            truncated += (
+                f"\n\n... [truncated from {full_tokens} tokens to {self.max_tokens} tokens. "
+                f"Use mode=search query=\"...\" for targeted results, "
+                f"mode=summary domain={domain_name} for section index, "
+                f"or mode=read section=\"...\" for specific sections.]"
+            )
+            self._log_debug(f"Truncated content to {self.max_tokens} tokens (was {full_tokens})")
+            return f"## Domain: {domain_name}\n\n{truncated}"
+
+        # --- Step 3: Auto-truncation (neither section nor max_tokens given) ---
+        full_tokens = len(content) // 4
+        if full_tokens <= 4000:
+            # File is small enough — return full content
+            self._log_debug(f"File is {full_tokens} tokens, <= 4000, returning full content")
+            return f"## Domain: {domain_name}\n\n{content}"
+
+        # Auto-truncate to 4000 tokens with smart suggestion
+        trunc_chars = 4000 * 4
+        truncated = content[:trunc_chars]
+        warning = (
+            f"⚠️ This file is ~{full_tokens} tokens. Automatically showing first 4000 tokens.\n"
+            f"💡 Better alternatives:\n"
+            f"   - mode=search query=\"...\" for keyword search\n"
+            f"   - mode=summary domain={domain_name} for a section index\n"
+            f"   - mode=read section=\"Section Name\" for a specific section\n"
+        )
+        truncated += (
+            f"\n\n... [truncated from {full_tokens} tokens to 4000 tokens. "
+            f"Use the alternatives above for better results.]"
+        )
+        self._log_debug(f"Auto-truncated {domain_name} from {full_tokens} tokens to 4000")
+        return f"## Domain: {domain_name}\n\n{warning}\n{truncated}"
+
+    def _mode_summary(self, kb_root: Path) -> str:
+        """
+        Return a lightweight section index of a domain file:
+        all ## headings, line ranges, and estimated tokens per section.
+        """
+        if not self.domain:
+            return "Error: `domain` parameter is required for summary mode."
+
+        domain_name = self.domain.lower().replace(" ", "_")
+        rel_path = DOMAINS.get(domain_name)
+        if not rel_path:
+            return (
+                f"Error: Unknown domain '{self.domain}'. "
+                f"Available domains: {', '.join(sorted(DOMAINS.keys()))}. "
+                f"Use `mode=list` to see all domains."
+            )
+
+        file_path = kb_root / rel_path
+        if not file_path.exists():
+            return f"File not found for domain '{domain_name}'. Try `mode=list` to see available domains."
+
+        try:
+            content = file_path.read_text(encoding="utf-8")
+        except PermissionError:
+            self._log_tool_warning(f"Permission denied reading {file_path}")
+            return f"Error: Permission denied reading '{rel_path}'. Check file permissions."
+        except OSError as e:
+            self._log_tool_error(f"Error reading {file_path}: {e}")
+            return f"Error reading '{rel_path}': {e}"
+
+        file_size = len(content)
+        total_tokens = file_size // 4
+        line_count = len(content.split("\n"))
+
+        sections = self._build_section_index(content, rel_path)
+
+        # Build the table
+        lines = [
+            f"📐 **{domain_name}** ({file_size:,} bytes / ~{total_tokens:,} tokens — {line_count} lines)\n",
+            "| Section | Lines | Tokens |",
+            "|---------|-------|--------|",
+        ]
+
+        # Find largest section(s) for warning
+        max_tokens = max((tok for _, _, _, tok in sections), default=0)
+
+        for heading, start_line, end_line, tok in sections:
+            line_range = f"{start_line}–{end_line}"
+            warning_emoji = " ⚠️ LARGE" if tok == max_tokens and tok > 2000 else ""
+            lines.append(f"| {heading} | {line_range} | ~{tok}{warning_emoji} |")
+
+        lines.append("")
+        lines.append(
+            f"💡 Use `mode=read domain={domain_name} section=\"...\"` "
+            f"to read a specific section, or `mode=read domain={domain_name} max_tokens=N` "
+            f"for limited content."
+        )
+
+        return "\n".join(lines)
 
     def _mode_append(self, kb_root: Path) -> str:
         """Append a timestamped entry to the specified domain file."""
@@ -675,5 +879,42 @@ class KnowledgeBaseTool(ToolBase):
                 lines.append(f"*(Showing 5 of {len(all_entries)} total entries)*\n")
         else:
             lines.append("*No dated entries found in the knowledge base yet.*\n")
+
+        # --- KB Storage Statistics ---
+        all_domain_files = []
+        for subdir in ["project", "personal"]:
+            dir_path = kb_root / subdir
+            if not dir_path.exists():
+                continue
+            try:
+                for fpath in dir_path.iterdir():
+                    if fpath.suffix == ".md":
+                        all_domain_files.append(fpath)
+            except OSError:
+                continue
+
+        total_bytes = 0
+        file_stats = []  # (stem, size_bytes, token_est)
+        for fpath in all_domain_files:
+            try:
+                size = fpath.stat().st_size
+                total_bytes += size
+                tok_est = size // 4
+                file_stats.append((fpath.stem, size, tok_est))
+            except OSError:
+                continue
+
+        # Sort by token count descending, take top 3
+        file_stats.sort(key=lambda x: x[2], reverse=True)
+        top3 = file_stats[:3]
+
+        total_tokens = total_bytes // 4
+        lines.append("")
+        lines.append(f"📊 **KB Storage:** total {total_bytes:,} bytes / ~{total_tokens:,} tokens across {len(all_domain_files)} files")
+        lines.append("⚠️ **Largest files:**")
+        for stem, size_bytes, tok_est in top3:
+            lines.append(f"   - {stem}.md: ~{tok_est:,} tokens")
+        lines.append("💡 **Tip:** Use `mode=search` for targeted queries, `mode=summary` for section indexes, "
+                      "and `mode=read` with `max_tokens` for safe reading.")
 
         return "\n".join(lines)
