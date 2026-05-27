@@ -1780,3 +1780,23 @@ Changed `.session-list-panel` width from 320px → 400px (min-width 260px → 30
 **5. web_ui/frontend/src/styles.css**
 - Added `@keyframes config-spin` animation and `.config-spinner` CSS class
 
+
+## 2026-05-27 — ## Phase B Complete — Legacy Tools Replaced with Unified Res...
+
+## Phase B Complete — Legacy Tools Replaced with Unified Respond
+
+**Date:** 2025-05-27
+
+**Summary:** 
+- Deleted `tools/final.py`, `tools/final_report.py`, `tools/request_user_interaction.py`
+- Updated `tools/__init__.py` — removed Final/FinalReport/RequestUserInteraction registrations
+- Updated `agent/core/tool_executor.py` — removed imports, switched isinstance checks to Respond
+- Updated `agent/core/agent.py` — removed Final and RequestUserInteraction imports
+- Updated `agent/core/turn_transaction.py` — switched check from old tools to 'Respond'
+- Updated `agent/core/state.py` — get_allowed_tools() now returns ['Respond', 'SummarizeTool']
+- Updated `web_ui/backend/bridge.py` — FINAL_TOOL_NAMES now only {"Respond"}
+- Updated `agent_config.json` — replaced Final/FinalReport with Respond, removed RequestUserInteraction
+- Updated `tools/base.py` — comment mentions Respond instead of Final
+- Verified: zero remaining references to Final/FinalReport/RequestUserInteraction in active code
+
+**Impact:** The agent's tool completion system is now fully unified under the single Respond tool. Agent state handling and frontend pause/resume detection now check for "Respond" instead of the three legacy tools.

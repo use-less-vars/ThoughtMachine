@@ -28,7 +28,6 @@ export default function SessionActionsPanel({
   const [showSaveAsInput, setShowSaveAsInput] = useState(false)
   const [saveAsName, setSaveAsName] = useState(sessionName || '')
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
-
   // Sort sessions by updated_at descending
   const sortedSessions = useMemo(() => {
     return [...sessionsList].sort((a, b) => {
@@ -140,6 +139,8 @@ export default function SessionActionsPanel({
             </div>
           )}
         </div>
+
+
 
         {/* Saved Sessions list */}
         <div className="session-actions-section session-actions-section-grow">
