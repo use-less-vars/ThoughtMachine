@@ -36,6 +36,7 @@ class EventType(enum.Enum):
     TURN_WARNING = 'turn_warning'
     TOKEN_UPDATE = 'token_update'
     TURN_UPDATE = 'turn_update'
+    AGENT_RESPONDED = 'agent_responded'
     USER_INTERACTION_REQUESTED = 'user_interaction_requested'
     USER_QUERY = 'user_query'
     FINAL_DETECTED = 'final_detected'
@@ -321,7 +322,7 @@ def _map_legacy_event_type(event_type_str: str) -> EventType:
     """Map legacy event type strings to standardized EventType."""
     import os
     log('DEBUG', 'core.events', f"_map_legacy_event_type: '{event_type_str}'")
-    mapping = {'tool_call': EventType.TOOL_CALL, 'tool_result': EventType.TOOL_RESULT, 'token_warning': EventType.TOKEN_WARNING, 'turn_warning': EventType.TURN_WARNING, 'final': EventType.FINAL, 'stopped': EventType.STOPPED, 'max_turns': EventType.MAX_TURNS, 'thread_finished': EventType.THREAD_FINISHED, 'paused': EventType.PAUSED, 'error': EventType.ERROR, 'turn': EventType.TURN, 'token_update': EventType.TOKEN_UPDATE, 'user_interaction_requested': EventType.USER_INTERACTION_REQUESTED, 'user_query': EventType.USER_QUERY, 'rate_limit_warning': EventType.RATE_LIMIT_WARNING, 'execution_state_change': EventType.EXECUTION_STATE_CHANGE, 'session_state_change': EventType.SESSION_STATE_CHANGE}
+    mapping = {'tool_call': EventType.TOOL_CALL, 'tool_result': EventType.TOOL_RESULT, 'token_warning': EventType.TOKEN_WARNING, 'turn_warning': EventType.TURN_WARNING, 'agent_responded': EventType.AGENT_RESPONDED, 'final': EventType.FINAL, 'stopped': EventType.STOPPED, 'max_turns': EventType.MAX_TURNS, 'thread_finished': EventType.THREAD_FINISHED, 'paused': EventType.PAUSED, 'error': EventType.ERROR, 'turn': EventType.TURN, 'token_update': EventType.TOKEN_UPDATE, 'user_interaction_requested': EventType.USER_INTERACTION_REQUESTED, 'user_query': EventType.USER_QUERY, 'rate_limit_warning': EventType.RATE_LIMIT_WARNING, 'execution_state_change': EventType.EXECUTION_STATE_CHANGE, 'session_state_change': EventType.SESSION_STATE_CHANGE}
     result = mapping.get(event_type_str)
     if result is None:
         log('DEBUG', 'core.events', f"No mapping for '{event_type_str}', attempting direct EventType creation")

@@ -467,13 +467,14 @@ class WebAgentBridge:
         Normalize messages for frontend display without modifying the originals.
         """
         FINAL_TOOL_NAMES = {"Respond"}
-        # Map legacy tool calls to Respond equivalents for old session replay
-        # Legacy mapping for old session replay — maps deleted tools to Respond
+        # Legacy tool names that map to Respond for old session replay
         LEGACY_TO_RESPOND = {
             "Final": {"response_type": "answer"},
             "FinalReport": {"response_type": "answer"},
             "RequestUserInteraction": {"response_type": "question"},
         }
+        # Combined set: current Respond + all legacy tools mapped to Respond
+        ALL_RESPOND_NAMES = FINAL_TOOL_NAMES | set(LEGACY_TO_RESPOND.keys())
         SUMMARY_TOOL_NAMES = {"SummarizeTool", "summarize", "Summarize"}
         normalized = []
         last_tool_call_name = None       # track for final detection
@@ -534,7 +535,7 @@ class WebAgentBridge:
                 new_msg = dict(msg)
                 new_msg["role"] = "tool_result"
                 # 🟣 FIX 2: if preceding tool call was Final/FinalReport, mark final
-                if last_tool_call_name in FINAL_TOOL_NAMES:
+                if last_tool_call_name in ALL_RESPOND_NAMES:
                     new_msg["is_final"] = True
                     pending_final_assistant = True   # next assistant also final
                 # 🟡 SummarizeTool results: dark golden, full markdown, no truncation
@@ -923,19 +924,28 @@ class WebAgentBridge:
                     "type": "conversation_changed",
                     "messages": self._normalize_for_frontend(self._session.user_history),
                 })
-            if event_type == "final":
+
+        elif event_type == "agent_responded":
+            # Always sync conversation first — ensures frontend sees the agent's last message.
+            if self._session is not None:
+                self._history_version = self._session.conversation_version
+                self._emit({
+                    "type": "conversation_changed",
+                    "messages": self._normalize_for_frontend(self._session.user_history),
+                })
+            # Then decide UI state based on response_type
+            if event.get('response_type') == 'question':
+                self._emit({
+                    "type": "state_changed",
+                    "state": "WAITING_FOR_USER",
+                    "is_running": _is_busy,
+                })
+            else:
                 self._emit({
                     "type": "state_changed",
                     "state": "IDLE",
                     "is_running": _is_busy,
                 })
-
-        elif event_type == "user_interaction_requested":
-            self._emit({
-                "type": "state_changed",
-                "state": "WAITING_FOR_USER",
-                "is_running": _is_busy,
-            })
 
         elif event_type == "error":
             msg_text = raw_event.get('message', 'unknown')

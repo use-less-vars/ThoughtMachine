@@ -1800,3 +1800,88 @@ Changed `.session-list-panel` width from 320px → 400px (min-width 260px → 30
 - Verified: zero remaining references to Final/FinalReport/RequestUserInteraction in active code
 
 **Impact:** The agent's tool completion system is now fully unified under the single Respond tool. Agent state handling and frontend pause/resume detection now check for "Respond" instead of the three legacy tools.
+
+## 2026-05-27 — ## Respond stop signal unification (2024)
+
+The `Respond` too...
+
+## Respond stop signal unification (2024)
+
+The `Respond` tool previously generated **two distinct stop signals** depending on `response_type`:
+- `response_type="answer"` → `tool_type="final"` → `event_type="final"` with `stop_reason` → syncs conversation + IDLE state
+- `response_type="question"` → `tool_type="user_interaction"` → `event_type="user_interaction_requested"` without `stop_reason` → **no conversation sync** + WAITING_FOR_USER state
+
+This caused two bugs: (1) conversation not synced for questions, (2) state flicker WAITING_FOR_USER→IDLE from session_stop.
+
+### Fix: Unified `"agent_responded"` event
+
+**3 files changed:**
+
+1. **`agent/core/tool_executor.py`** — `_execute_single_tool` now returns `tool_type="respond"` with `response_type` and `content` for all Respond calls. `execute_tool_calls` produces a single `respond_result` dict instead of separate `final_content` and `user_interaction_message`.
+
+2. **`agent/core/agent.py`** — Two separate if-blocks (final_detected, user_interaction_message) collapsed into one that yields `{"type": "agent_responded", "response_type": ..., "content": ...}`.
+
+3. **`web_ui/backend/bridge.py`** — `"user_interaction_requested"` and `"final"`-within-tuple handlers replaced by a single `"agent_responded"` handler that **always syncs conversation first**, then decides state based on `response_type` (WAITING_FOR_USER for question, IDLE for answer).
+
+**Downstream consumers updated:** `agent/events.py` (added `AGENT_RESPONDED` enum), `session/event_schema.py` (added to Literal), `agent/presenter/event_processor.py` (added `agent_responded` to terminal event handler).
+
+**Not changed:** The non-tool-call path still emits `"final"` (direct LLM answer without tool calls) — this is correct.
+
+All 90 tests pass.
+
+## 2026-05-27 — ## Phase 1 Audit — Lifecycle & State Management (2025-07-16)...
+
+## Phase 1 Audit — Lifecycle & State Management (2025-07-16)
+
+### 1. ExecutionState Enum
+**File:** `agent/core/state.py:20-24`
+**Members:** `RUNNING = 'running'`, `PAUSING = 'pausing'`, `READY = 'ready'`
+**No STOPPED state.** The system conflates "not running" and "finished" under READY. The `session_stop` event (emitted in controller's `process_query()` finally block) is the signal consumers use to know execution ended.
+
+### 2. Controller Finally Block (state→READY)
+**File:** `agent/controller/__init__.py:646-653`
+The `finally` block of the event-processing loop in `_run()`:
+- Sets `_processing_query = False`
+- Resets `agent.state.set_execution_state(ExecutionState.READY)`
+- Emits `session_stop` event with `stop_reason` (or `'completed'` default)
+This is the **canonical reset point** — the only place READY is set after a query completes from the controller side.
+
+### 3. Event Types Yielded by agent.process_query()
+- `user_query` (line 699) — user's input added to conversation
+- `turn` — per-LLM-turn data with token/context info
+- `tool_call`, `tool_result` — tool execution events
+- `token_update` — real-time token count updates
+- `agent_responded` (line 1070) — contains `response_type` ('answer'|'question') and `content`
+- `final` (line 1129) — terminal event with `stop_reason: 'final'`, usage stats, reasoning
+- `error` — config failure notifications (injected as system messages to conversation)
+- `execution_state_change`, `session_state_change` — state transitions
+
+### 4. Config Mailbox Pattern
+**Agent** (`agent/core/agent.py`):
+- `request_config_update(new_config)`: sets `self._pending_config = new_config`
+- `_apply_pending_config()`: called at start of `process_query()` (line 702). If `_can_hot_swap()` → `_hot_swap()` (updates temperature, config refs, tools). Else → `_restart_with_config()`. Preserves `_pending_config` on failure for retry.
+- `_can_hot_swap()` checks: provider_type, model, api_key, base_url, system_prompt, workspace_path
+- `_hot_swap()` updates: runtime_params.temperature, self.config, state.config, tool_executor.config; if enabled_tools changed, rebuilds tool_classes/tool_definitions/ToolExecutor
+
+**Controller** (`agent/controller/__init__.py`):
+- `update_config(config)`: stores in `self._config`, calls `agent.request_config_update()` if agent exists
+- `request_config_update(config)`: directly delegates to agent
+
+**Bridge** (`web_ui/backend/bridge.py`):
+- `apply_config()`: validates via `validate_config()`, resolves provider, stores, calls `controller.request_config_update()`
+- `continue_session()`: calls `apply_config()` then pushes to controller
+
+### 5. Tool Executor — No Stop Signal
+**File:** `agent/core/tool_executor.py` — pure synchronous dispatch. No stop/cancel mechanism. All stop control is at the controller level via `threading.Event` (`stop_event`, `pause_event`), checked by `should_stop()` callback injected as `config.stop_check` into agent.
+
+### 6. Event Processor Terminal Handling
+**File:** `agent/presenter/event_processor.py:159-192`
+- `final`/`agent_responded`: sets state→READY, saves final_content/reasoning/timestamp to session
+- `max_turns`: sets state→READY
+- `stopped`/`thread_finished`: sets state→READY (unless `_restarting`)
+- `paused`: does NOT transition to READY (deferred to `session_stop` event)
+- All terminal branches: `auto_save_current_session()`
+
+### 7. Legacy Event Type Mapping
+**File:** `agent/events.py:325-328` — maps legacy string types to EventType enum values. Includes: tool_call, tool_result, token_warning, turn_warning, agent_responded, final, stopped, max_turns, thread_finished, paused, error, turn, token_update, user_interaction_requested, user_query, rate_limit_warning, execution_state_change, session_state_change.
+

@@ -180,12 +180,14 @@ class Agent:
             return True
 
         new_config = self._pending_config
+        old_config = self.config  # Capture pre-application config for diff
         log('DEBUG', 'core.config', f'[CONFIG_TRACE] _apply_pending_config incoming workspace_path={new_config.workspace_path}')
 
         if self._can_hot_swap(new_config):
             self._hot_swap(new_config)
             self._pending_config = None
             log('DEBUG', 'core.config', '[CONFIG_TRACE] Pending config cleared after successful hot-swap')
+            self._notify_config_change(old_config, new_config)
             return True
         else:
             # Validate that the new config has an API key available before attempting restart
@@ -204,7 +206,30 @@ class Agent:
             success = self._restart_with_config(new_config)
             if success:
                 self._pending_config = None
+                self._notify_config_change(old_config, new_config)
             return success
+
+    def _notify_config_change(self, old_config, new_config) -> None:
+        """Add a system notification describing the config changes that were applied.
+
+        Called after a successful hot-swap or restart so the LLM and the user
+        are explicitly aware of what changed.
+        """
+        changes = []
+        if new_config.provider_type != old_config.provider_type:
+            changes.append(f"provider={new_config.provider_type}")
+        if new_config.model != old_config.model:
+            changes.append(f"model={new_config.model}")
+        if new_config.workspace_path != old_config.workspace_path:
+            changes.append(f"workspace={new_config.workspace_path}")
+        if new_config.system_prompt != old_config.system_prompt:
+            changes.append("system_prompt updated")
+        if new_config.enabled_tools != old_config.enabled_tools:
+            changes.append("tools updated")
+
+        if changes:
+            msg = "[SYSTEM NOTIFICATION] Configuration updated: " + ", ".join(changes) + "."
+            self._add_to_conversation(Message(role='user', content=msg, is_system_notification=True))
 
     def _can_hot_swap(self, new_config: AgentConfig) -> bool:
         """Check if a config change can be applied via hot-swap.
@@ -1033,7 +1058,7 @@ class Agent:
                 self._add_conversation_data_to_event(turn_event)
                 yield turn_event
                 if tool_calls:
-                    executed_tools, final_detected, final_content, user_interaction_message, summary_text, summary_keep_recent_turns = self.tool_executor.execute_tool_calls(tool_calls, add_to_conversation_func=self._add_to_conversation, agent_id=0, turn_transaction=turn_transaction)
+                    executed_tools, final_detected, respond_result, summary_text, summary_keep_recent_turns = self.tool_executor.execute_tool_calls(tool_calls, add_to_conversation_func=self._add_to_conversation, agent_id=0, turn_transaction=turn_transaction)
                     processed_tools = []
                     for tool_info in executed_tools:
                         result = tool_info.get('result', '')
@@ -1064,22 +1089,22 @@ class Agent:
                     self._pending_warnings.clear()
                     log('DEBUG', 'core.agent', f"[TOOL LOOP] conversation length now {len(self.conversation)}, last 3 roles: {[m.get('role') for m in self.conversation[-3:]]}")
                     if final_detected:
-                        final_event = {'type': 'final', 'stop_reason': 'final', 'content': final_content if final_content is not None else content, 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                        # Unified respond event — carries response_type so consumers
+                        # can distinguish 'answer' (no reply needed) from 'question' (waiting for user).
+                        respond_event = {
+                            'type': 'agent_responded',
+                            'response_type': respond_result['response_type'] if respond_result else 'answer',
+                            'content': respond_result['content'] if respond_result else content,
+                            'turn': self._display_turn,
+                            'context_length': self.state.current_conversation_tokens,
+                            'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}
+                        }
                         if reasoning is not None:
-                            final_event['reasoning'] = reasoning
+                            respond_event['reasoning'] = reasoning
                         elif tool_calls:
-                            final_event['reasoning'] = ''
-                        self._add_conversation_data_to_event(final_event)
-                        yield final_event
-                        turn_duration = time.time() - turn_start_time
-                        if self.logger:
-                            self.logger.log_system_resources()
-                            self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
-                        return
-                    if user_interaction_message is not None:
-                        user_interaction_event = {'type': 'user_interaction_requested', 'message': user_interaction_message, 'turn': self._display_turn}
-                        self._add_conversation_data_to_event(user_interaction_event)
-                        yield user_interaction_event
+                            respond_event['reasoning'] = ''
+                        self._add_conversation_data_to_event(respond_event)
+                        yield respond_event
                         turn_duration = time.time() - turn_start_time
                         if self.logger:
                             self.logger.log_system_resources()

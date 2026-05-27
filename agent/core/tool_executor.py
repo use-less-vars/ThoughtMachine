@@ -40,7 +40,7 @@ class ToolExecutor:
         else:
             self.CapabilityRegistry = None
 
-    def execute_tool_calls(self, tool_calls: List[Dict[str, Any]], add_to_conversation_func, update_token_func=None, agent_id: int = 0, turn_transaction: Optional[TurnTransaction]=None) -> Tuple[List[Dict[str, Any]], bool, Optional[str], Optional[str], Optional[str], Optional[int]]:
+    def execute_tool_calls(self, tool_calls: List[Dict[str, Any]], add_to_conversation_func, update_token_func=None, agent_id: int = 0, turn_transaction: Optional[TurnTransaction]=None) -> Tuple[List[Dict[str, Any]], bool, Optional[Dict[str, Any]], Optional[str], Optional[int]]:
         """
         Execute multiple tool calls from an assistant message.
         
@@ -54,9 +54,8 @@ class ToolExecutor:
         Returns:
             Tuple of:
             - executed_tools: List of executed tool information
-            - final_detected: Whether a Final tool was executed
-            - final_content: Content from Final/FinalReport tool if final_detected is True, otherwise None
-            - user_interaction_requested: Whether RequestUserInteraction was called
+            - final_detected: Whether a terminal tool was executed (Respond, Final, etc.)
+            - respond_result: Dict with 'response_type' and 'content' if Respond was executed, else None
             - summary_text: Summary text if SummarizeTool was called
             - summary_keep_recent_turns: Number of turns to keep for summarization
         """
@@ -68,9 +67,7 @@ class ToolExecutor:
                 update_token_func = lambda x: None
         executed_tools = []
         final_detected = False
-        final_content = None
-        user_interaction_requested = False
-        user_interaction_message = None
+        respond_result = None
         summary_requested = False
         summary_text = None
         summary_keep_recent_turns = 0
@@ -111,15 +108,15 @@ class ToolExecutor:
                 error_msg = f'Unknown tool: {tool_name}'
                 tool_result = error_msg
             else:
-                tool_execution_result = self._execute_single_tool(tool_class, arguments, tool_name, agent_id, lambda: final_detected, lambda: final_content, lambda: user_interaction_requested, lambda: user_interaction_message, lambda: summary_requested, lambda: summary_text, lambda: summary_keep_recent_turns)
+                tool_execution_result = self._execute_single_tool(tool_class, arguments, tool_name, agent_id, lambda: summary_requested, lambda: summary_text, lambda: summary_keep_recent_turns)
                 tool_result = tool_execution_result['result']
                 tool_type = tool_execution_result.get('tool_type', 'normal')
-                if tool_type == 'final':
+                if tool_type == 'respond':
                     final_detected = True
-                    final_content = tool_execution_result.get('final_content')
-                elif tool_type == 'user_interaction':
-                    user_interaction_requested = True
-                    user_interaction_message = tool_execution_result.get('user_interaction_message')
+                    respond_result = {
+                        'response_type': tool_execution_result.get('response_type'),
+                        'content': tool_execution_result.get('content')
+                    }
                 elif tool_type == 'summary':
                     summary_requested = True
                     summary_text = tool_execution_result.get('summary_text')
@@ -133,19 +130,20 @@ class ToolExecutor:
             if self.logger:
                 pass
             executed_tools.append({'name': tool_name, 'arguments': arguments, 'result': tool_result})
-        return (executed_tools, final_detected, final_content, user_interaction_message if user_interaction_requested else None, summary_text if summary_requested else None, summary_keep_recent_turns if summary_requested else None)
+        return (executed_tools, final_detected, respond_result, summary_text if summary_requested else None, summary_keep_recent_turns if summary_requested else None)
 
-    def _execute_single_tool(self, tool_class, arguments: Dict[str, Any], tool_name: str, agent_id: int, get_final_detected, get_final_content, get_user_interaction_requested, get_user_interaction_message, get_summary_requested, get_summary_text, get_summary_keep_recent_turns) -> Dict[str, Any]:
+    def _execute_single_tool(self, tool_class, arguments: Dict[str, Any], tool_name: str, agent_id: int, get_summary_requested, get_summary_text, get_summary_keep_recent_turns) -> Dict[str, Any]:
         """
         Execute a single tool instance.
-        
+
         Returns:
             Dictionary with keys:
             - result: tool result string
-            - tool_type: 'normal', 'final', 'user_interaction', or 'summary'
+            - tool_type: 'normal', 'respond', or 'summary'
+            - response_type: if tool_type == 'respond'
+            - content: if tool_type == 'respond'
             - summary_text: if tool_type == 'summary'
             - summary_keep_recent_turns: if tool_type == 'summary'
-            - final_content: if tool_type == 'final'
         """
         try:
             tool_args = arguments.copy()
@@ -189,9 +187,7 @@ class ToolExecutor:
             if not tool_instance.skip_output_truncation:
                 tool_result = tool_instance._truncate_output(tool_result)
             if isinstance(tool_instance, Respond):
-                if tool_instance.response_type == 'question':
-                    return {'result': tool_result, 'tool_type': 'user_interaction', 'user_interaction_message': tool_result}
-                return {'result': tool_result, 'tool_type': 'final', 'final_content': tool_result}
+                return {'result': tool_result, 'tool_type': 'respond', 'response_type': tool_instance.response_type, 'content': tool_result}
             elif isinstance(tool_instance, SummarizeTool):
                 return {'result': tool_result, 'tool_type': 'summary', 'summary_text': tool_instance.summary, 'summary_keep_recent_turns': tool_instance.keep_recent_turns}
             else:

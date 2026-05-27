@@ -62,6 +62,8 @@ class EventProcessor:
             self._process_turn_event(event)
         elif event_type == 'token_update':
             self._process_token_update_event(event)
+        elif event_type in ('agent_responded', 'final'):
+            self._process_terminal_event(event, event_type)
         elif event_type == 'user_interaction_requested':
             self._process_user_interaction_event(event)
         elif event_type == 'user_query':
@@ -70,7 +72,7 @@ class EventProcessor:
             self._process_paused_event(event)
         elif event_type == 'stop_reason':
             self._process_stop_reason_event(event)
-        elif event_type in ['final', 'stopped', 'max_turns', 'thread_finished']:
+        elif event_type in ['stopped', 'max_turns', 'thread_finished']:
             self._process_terminal_event(event, event_type)
         elif event_type == 'error':
             self._process_error_event(event)
@@ -157,7 +159,7 @@ class EventProcessor:
     def _process_terminal_event(self, event: Dict[str, Any], event_type: str) -> None:
         """Process terminal event (final, stopped, max_turns, thread_finished)."""
         log('DEBUG', 'presenter.event_processor', f'_process_terminal_event: type={event_type}, turn={event.get("turn")}')
-        if event_type == 'final':
+        if event_type in ('final', 'agent_responded'):
             self.session_lifecycle.state = ExecutionState.READY
             if self.gui_integration:
                 self.gui_integration.emit_status_message('Completed successfully')
