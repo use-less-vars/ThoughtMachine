@@ -3,15 +3,18 @@
 Project milestones, planned features, and long-term goals.
 
 ## Current Status
-## Current Status
-- **Phase 1 (Core State Machine):** ✅ Complete (1.1–1.14)
-- **Phase 2 (Event Pipeline + Token Restrictions):** ✅ Complete (1.15–1.18, plus event fixes)
-- **Phase 2.5 (Multi‑Session Tab Support & Full Session Restore):** 🟢 **Now** — being planned
-- **Phase 3 (GUI Adaptation & Grace-Turn Preservation):** 📋 Queued (after 2.5)
-- **Phase 4 (System Message Injection Audit):** 📋 Planned
-- **Phase 5 (Token Counting & Output Truncation Audit):** 📋 Planned
+
+**All previously planned phases 1–5 are ✅ COMPLETE.** See `task_tracker.md` for full completion details.
+
+### Remaining Future Work (No Immediate Priority)
 - **Phase 6 (Streaming LLM Support):** 📋 Planned
 - **Phase 7 (Standalone Agent Extraction):** 📋 Planned
+- **Security Layer GUI handler:** SECURITY_PROMPT events published but no dialog listens
+- **WebSocket reconnection robustness:** Needs comprehensive testing
+- **Docker container pooling image-ID verification:** Pattern documented, needs tests
+- **DeepSeek Reasoner tool calling:** XML tool call parsing for non-function-calling models
+- **Automatic RAG re-indexing:** No staleness detection; manual update-index only
+- **Performance I/O audit:** Session store caching added, full audit pending
 
 ## Upcoming Milestones (Ordered by Priority)
 

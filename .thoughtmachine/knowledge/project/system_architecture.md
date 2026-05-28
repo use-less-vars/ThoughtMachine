@@ -3,7 +3,10 @@
 Key architectural decisions, component relationships, and data flow patterns.
 
 ## Current Status
-- No architecture notes recorded yet.
+## Current Status
+- ✅ Comprehensive architecture documentation covering all system layers
+- Sections: System Assessment, Pruning & Context Management, System Notifications, Message Metadata, Security Layer, RAG System, State Machine, Session Architecture, Logging, Config System, Web UI, and more
+- Last major update: 2026-05-28 (Tool Output Truncation framework, Respond tool architecture)
 
 ## Components
 (To be populated)
@@ -1905,3 +1908,16 @@ This is the **canonical reset point** — the only place READY is set after a qu
 **Context changes (Fixes 1 & 2 from same session):**
 - Fix 1: `process_query()` reordered so `_apply_pending_config()` runs before yielding `user_query`. On config failure: yields error + returns early. On success: yields `user_query` with notification.
 - Fix 2: `apply_config()` in `web_ui/backend/bridge.py` now emits `config_changed` WebSocket message after persisting config changes.
+
+## 2026-05-28 — ## RAW TOOL CALL LOGGING
+
+Added a `log()` call in `agent/cor...
+
+## RAW TOOL CALL LOGGING
+
+Added a `log()` call in `agent/core/agent.py` at line 1032-1037 (right after `response.tool_calls` is extracted) to log raw tool call arguments from the LLM response. This is placed at the closest point to the LLM response, before any transformation. The log uses `truncate_hint=None` to avoid truncation, ensuring full arguments are captured for debugging (e.g., verifying PaginateTool arguments from other sessions).
+
+- Tag: `core.agent`
+- Message: `'RAW TOOL CALL ARGUMENTS from LLM response'`
+- Data: `{'tool_calls': tool_calls}` (the full list of tool call dicts from `response.tool_calls`)
+- Truncation: disabled via `truncate_hint=None`
