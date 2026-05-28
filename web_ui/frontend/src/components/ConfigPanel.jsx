@@ -124,6 +124,13 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
     model: cfg?.model,
     system_prompt: cfg?.system_prompt ?? '',
     tools: cfg?.tools ?? [],
+    session_permissions: cfg?.session_permissions ?? {
+      filesystem: 'write',
+      network: true,
+      container: true,
+      git: 'write',
+      system: true,
+    },
 
     token_monitor_warning_threshold: cfg?.token_monitor_warning_threshold ?? 35000,
     token_monitor_critical_threshold: cfg?.token_monitor_critical_threshold ?? 50000,
@@ -250,8 +257,8 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
     color: '#a6adc8',
   };
 
-  const TAB_KEYS = ['general', 'model', 'tools', 'system_prompt', 'advanced'];
-  const TAB_LABELS = { general: 'General', model: 'Model', tools: 'Tools', system_prompt: 'Prompt', advanced: 'Advanced' };
+  const TAB_KEYS = ['general', 'model', 'tools', 'permissions', 'system_prompt', 'advanced'];
+  const TAB_LABELS = { general: 'General', model: 'Model', tools: 'Tools', permissions: 'Permissions', system_prompt: 'Prompt', advanced: 'Advanced' };
 
   return (
     <div style={{ padding: '1rem', fontFamily: 'sans-serif', background: '#313244', color: '#cdd6f4', width: panelWidth || 280, minWidth: 200, maxWidth: 500, flexShrink: 0, overflowY: 'auto', height: '100%' }}>
@@ -483,6 +490,122 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
               );
             })}
           </div>
+        </div>
+      )}
+
+      {/* ── Permissions Tab ───────────────────────────────────────────── */}
+      {activeTab === 'permissions' && (
+        <div>
+          <div style={{ marginBottom: '1rem' }}>
+            <label style={labelStyle}><strong>Filesystem</strong></label>
+            <select
+              value={draft.session_permissions?.filesystem ?? 'write'}
+              onChange={(e) => setDraft({
+                ...draft,
+                session_permissions: { ...draft.session_permissions, filesystem: e.target.value }
+              })}
+              style={inputStyle}
+            >
+              <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
+              <option value="read" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Read</option>
+              <option value="none" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>None</option>
+            </select>
+            <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
+              Read/write access to the workspace filesystem.
+            </small>
+          </div>
+
+          <div style={{ marginBottom: '1rem' }}>
+            <label style={labelStyle}><strong>Network</strong></label>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginTop: '0.3rem' }}>
+              <label className="toggle-switch">
+                <input
+                  type="checkbox"
+                  checked={draft.session_permissions?.network ?? true}
+                  onChange={(e) => setDraft({
+                    ...draft,
+                    session_permissions: { ...draft.session_permissions, network: e.target.checked }
+                  })}
+                />
+                <span className="toggle-slider"></span>
+              </label>
+              <span style={{ fontSize: '0.85rem', color: draft.session_permissions?.network ? '#a6e3a1' : '#f38ba8' }}>
+                {draft.session_permissions?.network ? 'Enabled' : 'Disabled'}
+              </span>
+            </div>
+            <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
+              Allow the agent to make network requests.
+            </small>
+          </div>
+
+          <div style={{ marginBottom: '1rem' }}>
+            <label style={labelStyle}><strong>Container</strong></label>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginTop: '0.3rem' }}>
+              <label className="toggle-switch">
+                <input
+                  type="checkbox"
+                  checked={draft.session_permissions?.container ?? true}
+                  onChange={(e) => setDraft({
+                    ...draft,
+                    session_permissions: { ...draft.session_permissions, container: e.target.checked }
+                  })}
+                />
+                <span className="toggle-slider"></span>
+              </label>
+              <span style={{ fontSize: '0.85rem', color: draft.session_permissions?.container ? '#a6e3a1' : '#f38ba8' }}>
+                {draft.session_permissions?.container ? 'Enabled' : 'Disabled'}
+              </span>
+            </div>
+            <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
+              Allow container execution of code.
+            </small>
+          </div>
+
+          <div style={{ marginBottom: '1rem' }}>
+            <label style={labelStyle}><strong>Git</strong></label>
+            <select
+              value={draft.session_permissions?.git ?? 'write'}
+              onChange={(e) => setDraft({
+                ...draft,
+                session_permissions: { ...draft.session_permissions, git: e.target.value }
+              })}
+              style={inputStyle}
+            >
+              <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
+              <option value="read" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Read</option>
+              <option value="none" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>None</option>
+            </select>
+            <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
+              Access level for Git operations.
+            </small>
+          </div>
+
+          <div style={{ marginBottom: '1rem' }}>
+            <label style={labelStyle}><strong>System</strong></label>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginTop: '0.3rem' }}>
+              <label className="toggle-switch">
+                <input
+                  type="checkbox"
+                  checked={draft.session_permissions?.system ?? true}
+                  onChange={(e) => setDraft({
+                    ...draft,
+                    session_permissions: { ...draft.session_permissions, system: e.target.checked }
+                  })}
+                />
+                <span className="toggle-slider"></span>
+              </label>
+              <span style={{ fontSize: '0.85rem', color: draft.session_permissions?.system ? '#a6e3a1' : '#f38ba8' }}>
+                {draft.session_permissions?.system ? 'Enabled' : 'Disabled'}
+              </span>
+            </div>
+            <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
+              Access to system-level operations.
+            </small>
+          </div>
+
+          <p style={{ color: '#6c7086', fontSize: '0.8rem', fontStyle: 'italic', borderTop: '1px solid #45475a', paddingTop: '0.75rem' }}>
+            Changes take effect on the next tool call. No restart required.
+          </p>
         </div>
       )}
 
