@@ -895,8 +895,7 @@ def _translate_frontend_config(fe_config: Dict[str, Any]) -> Dict[str, Any]:
     tools_list = cfg.pop("tools", None)
     if isinstance(tools_list, list):
         enabled = [t["name"] for t in tools_list if isinstance(t, dict) and t.get("enabled")]
-        if enabled:
-            cfg["enabled_tools"] = enabled
+        cfg["enabled_tools"] = enabled
 
     # Remove any keys that start with _
     cfg = {k: v for k, v in cfg.items() if not k.startswith("_")}
@@ -1025,8 +1024,11 @@ def _backend_to_frontend_config(backend: Dict[str, Any]) -> Dict[str, Any]:
     provider_type = cfg.pop("provider_type", None)
     cfg["provider"] = provider_reverse.get(provider_type, "local")
     # Map enabled_tools → tools list
-    enabled = cfg.pop("enabled_tools", [])
-    cfg["tools"] = [{"name": t, "enabled": True} for t in enabled] if enabled else []
+    # If the key is missing, leave tools alone (frontend defaults apply).
+    # If it's an explicit empty list, all tools are disabled.
+    if "enabled_tools" in cfg:
+        enabled = cfg.pop("enabled_tools")
+        cfg["tools"] = [{"name": t, "enabled": True} for t in enabled]
     return cfg
 
 

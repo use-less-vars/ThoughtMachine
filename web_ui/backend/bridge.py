@@ -401,13 +401,8 @@ class WebAgentBridge:
         # Step 7: Persist to session
         self.save_session()
 
-        # Step 8: Notify frontend immediately so the config panel reflects the new values
-        cfg = self.get_config()
-        if cfg is not None:
-            self._emit({
-                'type': 'config_changed',
-                'config': cfg.model_dump(exclude={'api_key'}, exclude_none=True),
-            })
+        # Step 8: Notify frontend — the server handler sends config_changed
+        # in frontend format after this method returns, so no explicit emit needed here.
 
         log('INFO', 'server.bridge', 'Config applied and persisted via apply_config')
         return {"success": True}
