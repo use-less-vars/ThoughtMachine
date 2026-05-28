@@ -1029,6 +1029,12 @@ class Agent:
                 content = response.content or ''
                 reasoning = response.reasoning
                 tool_calls = response.tool_calls
+                # Log raw tool call arguments at the closest point to the LLM response
+                if tool_calls:
+                    log('DEBUG', 'core.agent', 'RAW TOOL CALL ARGUMENTS from LLM response',
+                        {'tool_calls': tool_calls}, truncate_hint=None)
+                else:
+                    log('DEBUG', 'core.agent', 'NO TOOL CALLS in LLM response', truncate_hint=None)
                 user_interaction_message = None
                 pause_debug(f'Checking pause request before turn: _pause_requested={self._pause_requested}')
                 log('DEBUG', 'core.pause', f'PAUSE CHECKPOINT [2] after_llm: _pause_requested={self._pause_requested}, has_tool_calls={bool(tool_calls)}')

@@ -107,6 +107,8 @@ class ToolExecutor:
             if not tool_class:
                 error_msg = f'Unknown tool: {tool_name}'
                 tool_result = error_msg
+                tool_execution_result = {'result': tool_result, 'tool_type': 'normal'}
+                tool_type = 'normal'
             else:
                 tool_execution_result = self._execute_single_tool(tool_class, arguments, tool_name, agent_id, lambda: summary_requested, lambda: summary_text, lambda: summary_keep_recent_turns)
                 tool_result = tool_execution_result['result']
