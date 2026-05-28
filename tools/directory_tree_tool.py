@@ -40,7 +40,7 @@ class DirectoryTreeTool(ToolBase):
     format: str = Field(default='tree', description="Output format: 'tree' (directory tree) or 'list' (flat file list)")
     max_results: int = Field(default=100, description="Maximum files/entries to show (0=unlimited, applies to both list and tree formats)")
     sort_by: str = Field(default='name', description="Sort order for list format: 'name', 'size', or 'modified'")
-    exclude_dirs: List[str] = Field(default_factory=lambda: ["__pycache__", ".git", ".svn", ".hg", "node_modules", ".idea", ".vscode", ".pytest_cache", "build", "dist", "*.egg-info"], description="Directories to exclude from traversal")
+    exclude_dirs: List[str] = Field(default_factory=lambda: ["__pycache__", ".git", ".svn", ".hg", "node_modules", ".idea", ".vscode", ".pytest_cache", "build", "dist", "*.egg-info", "reports", "logs", "temp", "tmp", "tmp_packages"], description="Directories to exclude from traversal")
     
     def execute(self) -> str:
         self._debug_log(f"DirectoryTreeTool.execute called with directory={self.directory}, exclude_dirs={self.exclude_dirs}")
@@ -68,14 +68,6 @@ class DirectoryTreeTool(ToolBase):
     
     def _build_tree(self, dir_path: pathlib.Path, current_depth: int) -> Dict[str, Any]:
         """Recursively build tree structure."""
-        # Debug: write to file
-        try:
-            import os
-            with open('tree_debug.txt', 'a', encoding='utf-8') as f:
-                f.write(f"_build_tree: {dir_path.name}, depth={current_depth}, cwd={os.getcwd()}\n")
-        except Exception as e:
-            with open('debug_error.txt', 'a') as f2:
-                f2.write(f"Error: {e}\n")
         self._debug_log(f"_build_tree: {dir_path.name}, depth={current_depth}")
         if self.max_depth > 0 and current_depth >= self.max_depth:
             self._debug_log(f"max_depth reached, returning empty")
@@ -88,7 +80,8 @@ class DirectoryTreeTool(ToolBase):
             'children': [],
             'file_count': 0,
             'total_size': 0,
-            'line_count': 0
+            'line_count': 0,
+            'skipped': 0
         }
         
         try:
@@ -123,12 +116,19 @@ class DirectoryTreeTool(ToolBase):
                     tree_node['file_count'] += child_node['file_count']
                     tree_node['total_size'] += child_node['total_size']
                     tree_node['line_count'] += child_node['line_count']
+                    tree_node['skipped'] += child_node.get('skipped', 0)
                 elif entry.is_file():
                     # Check pattern filter
                     if not self._matches_pattern(entry.name):
                         continue
 
+                    # Enforce max_results limit for tree format
+                    if self.max_results > 0 and self._tree_file_count >= self.max_results:
+                        tree_node['skipped'] += 1
+                        continue
+
                     file_info = self._get_file_info(entry)
+                    self._tree_file_count += 1
                     tree_node['children'].append(file_info)
                     tree_node['file_count'] += 1
                     tree_node['total_size'] += file_info['size']
@@ -146,32 +146,9 @@ class DirectoryTreeTool(ToolBase):
     def _should_exclude_dir(self, dir_name: str) -> bool:
         """Check if directory should be excluded based on exclude_dirs patterns."""
         import fnmatch
-        import os
-        os.makedirs('temp', exist_ok=True)
-        # Debug: write to file
-        try:
-            with open('temp/debug_exclude.txt', 'a', encoding='utf-8') as f:
-                f.write(f"Checking '{dir_name}' against {self.exclude_dirs}\n")
-        except:
-            pass
-        # Debug: print patterns and matching
-        self._debug_log(f"exclude_dirs: {self.exclude_dirs}, checking dir '{dir_name}'")
         for pattern in self.exclude_dirs:
             if fnmatch.fnmatch(dir_name, pattern):
-                self._debug_log(f"directory '{dir_name}' matches pattern '{pattern}'")
-                # Also write to file
-                try:
-                    with open('temp/debug_exclude.txt', 'a', encoding='utf-8') as f:
-                        f.write(f"  MATCH: '{dir_name}' matches '{pattern}'\n")
-                except:
-                    pass
                 return True
-        # Write no match
-        try:
-            with open('temp/debug_exclude.txt', 'a', encoding='utf-8') as f:
-                f.write(f"  NO MATCH\n")
-        except:
-            pass
         return False
     
     def _get_file_info(self, file_path: pathlib.Path) -> Dict[str, Any]:
@@ -257,9 +234,13 @@ class DirectoryTreeTool(ToolBase):
                 output_lines.append(line)
                 
                 # Recursively process directory children
-                self._format_tree_recursive(child['children'], new_prefix, is_last_child, 
+                self._format_tree_recursive(child['children'], new_prefix, is_last_child,
                                            output_lines, root_path)
-                
+
+                # Show skipped files count for this directory
+                if child.get('skipped', 0) > 0:
+                    msg = new_prefix + f"\u250a ... and {child['skipped']:,} more files (max_results={self.max_results})"
+                    output_lines.append(msg)                
             else:  # file
                 line = f"{prefix}{connector}{child['name']}"
                 if self.include_sizes:
@@ -302,14 +283,17 @@ class DirectoryTreeTool(ToolBase):
         summary.append("SUMMARY:")
         summary.append(f"  Directories: {self._count_directories(tree_node)}")
         summary.append(f"  Files: {tree_node['file_count']}")
-        
+
+        skipped = tree_node.get('skipped', 0)
+        if skipped > 0:
+            summary.append(f"  Files omitted (max_results={self.max_results}): {skipped:,}")
+
         if self.include_sizes:
             summary.append(f"  Total size: {self._format_size(tree_node['total_size'])}")
             if tree_node['line_count'] > 0:
                 summary.append(f"  Total lines: {tree_node['line_count']:,}")
-        
-        return summary
-    
+
+        return summary    
     def _count_directories(self, tree_node: Dict[str, Any]) -> int:
         """Count total directories in tree."""
         count = 0
@@ -324,6 +308,8 @@ class DirectoryTreeTool(ToolBase):
         return count - 1  # Exclude root directory
     def _execute_tree_format(self, dir_path: pathlib.Path) -> str:
         """Generate tree format output."""
+        # Reset the global file counter for max_results enforcement
+        self._tree_file_count = 0
         # Build tree structure
         tree_data = self._build_tree(dir_path, current_depth=0)
 
