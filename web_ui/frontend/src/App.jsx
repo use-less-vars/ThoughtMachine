@@ -52,6 +52,8 @@ export default function App() {
 
   // ── Hub WebSocket (sessions list only) with auto-reconnect ────────────
   const reconnectTimeoutRef = useRef(null)
+  const reconnectAttemptsRef = useRef(0)
+  const MAX_RECONNECT_ATTEMPTS = 5
   const connectHub = useCallback(() => {
     // Guard: prevent duplicate connections (StrictMode double-mount)
     if (hubHasConnectedOnceRef.current) {
@@ -74,6 +76,8 @@ export default function App() {
       console.log("[Hub WS] onopen")
       // Already set at connectHub entry; this is just a sanity double-set
       hubHasConnectedOnceRef.current = true
+      // Reset reconnect counter on successful connection
+      reconnectAttemptsRef.current = 0
       setHubWs(ws)
       ws.send(JSON.stringify({ command: 'list_sessions' }))
     }
@@ -95,11 +99,16 @@ export default function App() {
     ws.onclose = (e) => {
       setHubWs(null)
       setHubReady(false)
-      // 1001 = normal close (component unmounting), keep flag, don't reconnect
+      // 1001 = normal close (component unmounting / page unload), keep flag, don't reconnect
       if (e.code !== 1001) {
+        reconnectAttemptsRef.current += 1
+        if (reconnectAttemptsRef.current > MAX_RECONNECT_ATTEMPTS) {
+          console.warn(`[Hub WS] Reconnect limit (${MAX_RECONNECT_ATTEMPTS}) reached after ${reconnectAttemptsRef.current} attempts — giving up`)
+          return
+        }
         hubHasConnectedOnceRef.current = false  // allow reconnection on real errors
         const delay = 1000 + Math.random() * 3000  // 1–4s jitter
-        console.log(`[Hub WS] disconnected, reconnecting in ${Math.round(delay)}ms...`)
+        console.log(`[Hub WS] disconnected (attempt ${reconnectAttemptsRef.current}/${MAX_RECONNECT_ATTEMPTS}), reconnecting in ${Math.round(delay)}ms...`)
         reconnectTimeoutRef.current = setTimeout(connectHub, delay)
       }
     }
@@ -111,9 +120,31 @@ export default function App() {
     return ws
   }, [])
 
+  // ── WebSocket lifecycle + clean close on page unload ──────────────
   useEffect(() => {
     const ws = connectHub()
+
+    const handleBeforeUnload = () => {
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current)
+        reconnectTimeoutRef.current = null
+      }
+      // Close with code 1001 (going away) — the reconnect logic skips 1001,
+      // so stale/old pages won't keep reconnecting on refresh/close.
+      try {
+        const current = wsRef.current
+        if (current && (current.readyState === WebSocket.OPEN || current.readyState === WebSocket.CONNECTING)) {
+          current.close(1001, 'page unload')
+        }
+      } catch {
+        // ignore — WebSocket may already be closed
+      }
+    }
+
+    window.addEventListener('beforeunload', handleBeforeUnload)
+
     return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload)
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current)
       }
