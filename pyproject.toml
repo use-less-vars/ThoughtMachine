@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=64.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "thoughtmachine"
+dynamic = ["version"]
+description = "ThoughtMachine — AI agent framework"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "ThoughtMachine Contributors" },
+]
+requires-python = ">=3.11"
+
+[tool.setuptools]
+packages = { find = { include = ["thoughtmachine*"] } }
+
+[tool.setuptools.package-data]
+thoughtmachine = [
+    "py.typed",
+]
+# Include the top-level resources directory as data files
+# accessible via importlib.resources when thoughtmachine is installed.
+# The empty string means "any package" — resources are top-level.
+"*" = [
+    "resources/.version",
+    "resources/default_config.json",
+    "resources/default_system_prompt.txt",
+    "resources/default_providers.json",
+    "resources/default_security_policy.json",
+    "resources/global_kb/.version",
+    "resources/global_kb/handbook.md",
+    "resources/global_kb/faq.md",
+    "resources/global_kb/troubleshooting.md",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "thoughtmachine.bootstrap.get_version" }
+
+[project.urls]
+Homepage = "https://github.com/your-org/thoughtmachine"
