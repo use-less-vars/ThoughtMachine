@@ -1921,3 +1921,64 @@ Added a `log()` call in `agent/core/agent.py` at line 1032-1037 (right after `re
 - Message: `'RAW TOOL CALL ARGUMENTS from LLM response'`
 - Data: `{'tool_calls': tool_calls}` (the full list of tool call dicts from `response.tool_calls`)
 - Truncation: disabled via `truncate_hint=None`
+
+## 2026-05-28 — ## Bootstrap subsystem
+
+Created `thoughtmachine/bootstrap.py...
+
+## Bootstrap subsystem
+
+Created `thoughtmachine/bootstrap.py` with `ensure_user_defaults()` that copies bundled default resources from `resources/` to `~/.thoughtmachine/` on first run. Resources include config.json, system_prompt.txt, providers.json, security_policy.json, and .version.
+
+**Resource files** live in the project root `resources/` directory:
+- `.version` — single version string
+- `default_config.json` — AgentConfig defaults as JSON
+- `default_system_prompt.txt` — the standard system prompt
+- `default_providers.json` — empty providers template (`{"profiles": [], "active_profile_id": null}`)
+- `default_security_policy.json` — secure defaults for Docker security policy
+
+**Package data** is declared in `pyproject.toml` under `[tool.setuptools.package-data]` with `"*" = ["resources/..."]` entries.
+
+**Startup wiring**: `web_ui/backend/server.py` lifespan handler calls `ensure_user_defaults()` before accepting connections. The `main()` function also benefits from this since lifespan runs on every uvicorn startup.
+
+## 2026-05-28 — ## 2026-05-28 — Sysprompt & Worker Templates Finalization
+
+*...
+
+## 2026-05-28 — Sysprompt & Worker Templates Finalization
+
+**Tasks Completed:**
+1. **Updated `resources/default_system_prompt.txt`** — Revised prompt with:
+   - Clean `Respond` tool rules (no Final/FinalReport/RequestUserInteraction mentions)
+   - Anti-loop guidance (Rule 13): stop repeating same tool calls, analyze before retrying
+   - KB `scope` parameter documented (global scope via `scope=global`)
+   - Streamlined formatting
+
+2. **Added `@field_validator('system_prompt')` to `AgentConfig`** in `agent/config/models.py`:
+   - Auto-loads from `resources/default_system_prompt.txt` when field is `None` or empty string
+   - Falls back to minimal default text on file-not-found errors
+   - Custom prompts pass through unmodified
+
+3. **Created `resources/worker_templates/` directory** with 3 JSON templates:
+   - `coder.json` — code writing agent with file/code tools (temp=0.2)
+   - `reviewer.json` — code review agent with read-only/analysis tools (temp=0.1)
+   - `researcher.json` — codebase analysis agent with search/KB tools (temp=0.3)
+
+4. **Verification** — All files pass: JSON validity, Python syntax, config loading tests, bootstrap resource integrity
+
+## 2026-05-28 — ## Bootstrap Alignment Fixes
+
+Applied 4 alignment fixes to t...
+
+## Bootstrap Alignment Fixes
+
+Applied 4 alignment fixes to the bootstrap/resource system:
+
+1. **`resources/default_config.json`** — Regenerated from `AgentConfig().model_dump()` at runtime. Previously had stale values (`"base_url": "https://api.deepseek.com/v1/"`, `"model": "deepseek-v4-flash"`, `"enabled_tools": []`). Now matches the actual Pydantic model defaults exactly (`base_url: "https://api.deepseek.com"`, `model: "deepseek-reasoner"`, full enabled_tools list).
+
+2. **`resources/default_security_policy.json`** — Regenerated from `get_default_security_config()` (session schema). Previously had an incorrect schema (`{"default": {"docker_network_allowed": false, "writable_home": false}}`). Now matches the actual session-file schema: `{"version": 1, "session_policy": {...}, "agent_overrides": {}}`.
+
+3. **`~/.thoughtmachine/config.json` → `~/.thoughtmachine/agent_config.json`** — Renamed in all code references:
+   - `agent/presenter/state_bridge.py` line 26
+   - `agent/config/loader.py` lines 153, 157
+   - `web_ui/backend/server.py` was already using `agent_config.json`

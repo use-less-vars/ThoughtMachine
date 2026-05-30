@@ -11,9 +11,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, ClassVar, List, Dict, Optional, Tuple
 
+import re as _re
+
 from pydantic import Field
 
 from .base import ToolBase
+
+# Lazy import for global KB (avoids circular import at module level)
+def _get_ensure_global_kb():
+    from agent.knowledge.global_kb import ensure_global_kb
+    return ensure_global_kb
+
+
+def _get_global_kb_root():
+    from agent.knowledge.global_kb import get_global_kb_root
+    return get_global_kb_root
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +111,12 @@ class KnowledgeBaseTool(ToolBase):
 
     Use this tool to store and retrieve project information that persists
     across sessions. The knowledge base lives in `.thoughtmachine/knowledge/`
-    and is organized into domains:
+    (workspace scope) or `~/.thoughtmachine/knowledge/` (global scope).
+    Use the ``scope`` parameter (``workspace`` or ``global``) to select which KB to use.
+
+    **Workspace scope:** Local to the project, organized into domains:
+    **Global scope:** User-wide, shared across all projects, with ``system/`` (read-only built-in reference)
+    and ``user/`` (writable personal notes) subdirectories.
       - **system_architecture**: Architectural decisions and component relationships
       - **development_guides**: Coding conventions and workflows
       - **roadmap**: Milestones and future plans
@@ -110,7 +127,7 @@ class KnowledgeBaseTool(ToolBase):
     Modes:
       - **list**: List all domains with last-modified dates
       - **read**: Return full content of a domain file (supports optional max_tokens and section parameters)
-      - **append**: Append a timestamped entry to a domain file
+      - **append**: Append a timestamped entry to a domain file (supports ``append_section`` for section-targeted appends)
       - **update**: Replace a section's content in a domain file
       - **status**: Show current status from task_tracker + recent entries across all files
       - **search**: Search all KB files for a query (substring, case-insensitive)
@@ -124,7 +141,7 @@ class KnowledgeBaseTool(ToolBase):
     requires_capabilities: ClassVar[List[str]] = ["read_files", "write_files"]
 
     mode: Literal["list", "read", "append", "update", "status", "search", "create_domain", "summary"] = Field(
-        ..., description="Operation mode: list, read (with optional max_tokens and section), append, update, status, search, create_domain, or summary"
+        ..., description="Operation mode: list, read (with optional max_tokens and section), append (with optional append_section for section-targeted appends), update, status, search, create_domain, or summary"
     )
     domain: Optional[str] = Field(
         None,
@@ -171,6 +188,22 @@ class KnowledgeBaseTool(ToolBase):
         None,
         description="One-line description for the new domain (used in create_domain mode).",
     )
+    append_section: Optional[str] = Field(
+        None,
+        description=(
+            "Optional heading for append mode. If provided, the entry will be "
+            "inserted under this ## heading (creating it if missing). "
+            "Ignored unless mode=append."
+        ),
+    )
+    scope: Literal["workspace", "global"] = Field(
+        "workspace",
+        description=(
+            "Which knowledge base to use: workspace (project-local, "
+            ".thoughtmachine/knowledge/) or global (user-wide, "
+            "~/.thoughtmachine/knowledge/)."
+        ),
+    )
 
     def execute(self) -> str:
         """
@@ -179,15 +212,17 @@ class KnowledgeBaseTool(ToolBase):
         self._log_debug(f"KnowledgeBaseTool.execute called with mode='{self.mode}', domain='{self.domain}'")
 
         # Resolve the knowledge base root directory
-        if self.workspace_path:
-            kb_root = Path(self.workspace_path) / ".thoughtmachine" / "knowledge"
+        if self.scope == "global":
+            kb_root = _get_global_kb_root()
+            init_result = None  # global KB is self-initialising
         else:
-            kb_root = Path.cwd() / ".thoughtmachine" / "knowledge"
-
-        # Initialize the knowledge base (create dirs and missing files)
-        init_result = self._initialize_kb(kb_root)
-        if init_result:
-            self._log_debug(f"Knowledge base initialized: {init_result}")
+            if self.workspace_path:
+                kb_root = Path(self.workspace_path) / ".thoughtmachine" / "knowledge"
+            else:
+                kb_root = Path.cwd() / ".thoughtmachine" / "knowledge"
+            init_result = self._initialize_kb(kb_root)
+            if init_result:
+                self._log_debug(f"Knowledge base initialized: {init_result}")
 
         # Dispatch to mode handler
         try:
@@ -212,6 +247,68 @@ class KnowledgeBaseTool(ToolBase):
         except Exception as e:
             self._log_tool_error(f"Unexpected error in {self.mode} mode: {e}")
             return f"An unexpected error occurred: {e}. Please try again or check the knowledge base files."
+
+    def _resolve_domain_path(self, kb_root: Path, domain_name: str, *, for_write: bool = False) -> tuple[Path, str]:
+        """
+        Resolve a domain name to its (file_path, rel_path).
+
+        **Workspace scope:**
+        First checks the built-in DOMAINS dict, then scans project/ and personal/
+        directories for a matching ``{domain_name}.md`` file.
+
+        **Global scope:**
+        Checks ``system/{domain}.md`` then ``user/{domain}.md``.
+        If ``for_write=True`` and the domain exists in ``system/``, raises
+        ``ValueError`` because system domains are read-only.
+
+        Raises ValueError if the domain cannot be found.
+        """
+        if self.scope == "global":
+            # ── Global scope ────────────────────────────────────────────────
+            system_path = kb_root / "system" / f"{domain_name}.md"
+            user_path = kb_root / "user" / f"{domain_name}.md"
+
+            if for_write:
+                if system_path.exists():
+                    raise ValueError(
+                        f"Domain '{domain_name}' is a system domain and is read-only. "
+                        f"Use a different domain name for personal notes, or use scope=workspace."
+                    )
+                # Always write to user/
+                return user_path, f"user/{domain_name}.md"
+
+            # Read: check system/ first, then user/
+            if system_path.exists():
+                return system_path, f"system/{domain_name}.md"
+            if user_path.exists():
+                return user_path, f"user/{domain_name}.md"
+
+            raise ValueError(
+                f"Unknown domain '{domain_name}' in global knowledge base. "
+                f"Available domains: use `mode=list scope=global` to list all."
+            )
+
+        # ── Workspace scope (existing behaviour) ────────────────────────────
+        # Check built-in registry first
+        rel_path = DOMAINS.get(domain_name)
+        if rel_path:
+            file_path = kb_root / rel_path
+            if file_path.exists():
+                return file_path, rel_path
+            return file_path, rel_path
+
+        # Scan filesystem for custom domain files
+        for subdir in ["project", "personal"]:
+            candidate = kb_root / subdir / f"{domain_name}.md"
+            if candidate.exists():
+                rel = f"{subdir}/{domain_name}.md"
+                return candidate, rel
+
+        raise ValueError(
+            f"Unknown domain '{domain_name}'. "
+            f"Available domains: {', '.join(sorted(DOMAINS.keys()))}. "
+            f"Use `mode=list` to see all domains (including custom)."
+        )
 
     def _initialize_kb(self, kb_root: Path) -> str:
         """
@@ -248,9 +345,14 @@ class KnowledgeBaseTool(ToolBase):
     def _mode_list(self, kb_root: Path) -> str:
         """List all domains with last-modified dates.
 
-        Lists the six built-in domains plus any custom domain files found
-        by scanning the project/ and personal/ directories.
+        For workspace scope: lists built-in domains plus custom files from
+        project/ and personal/ directories.
+        For global scope: lists domains from system/ (read-only) and user/ (writable) directories.
         """
+        if self.scope == "global":
+            return self._mode_list_global(kb_root)
+
+        # ── Workspace scope (existing behaviour) ──────────────────────────
         lines = ["## Knowledge Base - Available Domains\n"]
         lines.append(f"| Domain | File | Category | Last Modified |")
         lines.append(f"|--------|------|----------|---------------|")
@@ -316,6 +418,57 @@ class KnowledgeBaseTool(ToolBase):
         lines.append("- `mode=create_domain domain=<name> category=<project|personal>` — Add a new domain")
         return "\n".join(lines)
 
+    def _mode_list_global(self, kb_root: Path) -> str:
+        """List all domains in the global knowledge base.
+
+        Lists domains from system/ (read-only) and user/ (writable) directories.
+        """
+        lines = ["## Global Knowledge Base - Available Domains\n"]
+        lines.append("> **Scope:** `global` — the knowledge base at `~/.thoughtmachine/knowledge/`")
+        lines.append("> Domains in `system/` are read-only built-in reference materials.")
+        lines.append("> Domains in `user/` are writable personal notes.\n")
+
+        for section_label, subdir, icon in [
+            ("### System Domains (read-only)", "system", "🔒"),
+            ("### User Domains (writable)", "user", "✏️"),
+        ]:
+            dir_path = kb_root / subdir
+            if not dir_path.exists():
+                continue
+            domain_list = []
+            try:
+                for fpath in sorted(dir_path.iterdir()):
+                    if fpath.suffix != ".md":
+                        continue
+                    domain_name = fpath.stem
+                    modified = "N/A"
+                    try:
+                        mtime = fpath.stat().st_mtime
+                        modified = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+                    except OSError:
+                        modified = "unreadable"
+                    domain_list.append((domain_name, f"{subdir}/{fpath.name}", modified))
+            except OSError:
+                continue
+
+            if domain_list:
+                lines.append("")
+                lines.append(f"{icon} {section_label}")
+                lines.append("| Domain | File | Last Modified |")
+                lines.append("|--------|------|---------------|")
+                for domain_name, rel, modified in domain_list:
+                    lines.append(f"| {domain_name} | `{rel}` | {modified} |")
+
+        lines.append("")
+        lines.append("**Usage:**")
+        lines.append("- `mode=read domain=<name> scope=global` — View a global domain")
+        lines.append("- `mode=append domain=<name> scope=global entry=\"...\"` — Add a timestamped entry to a user domain")
+        lines.append("- `mode=update domain=<name> scope=global section=\"...\" new_content=\"...\"` — Update a user domain section")
+        lines.append("- `mode=search query=<term> scope=global` — Search across all global KB files")
+        lines.append("- `mode=status scope=global` — Show current status and recent activity")
+        lines.append("- `mode=create_domain domain=<name> scope=global category=user` — Add a new user domain")
+        return "\n".join(lines)
+
     def _mode_search(self, kb_root: Path) -> str:
         """Search all KB files for a query (case-insensitive substring match)."""
         if not self.query:
@@ -330,27 +483,43 @@ class KnowledgeBaseTool(ToolBase):
         # Collect all .md files: built-in domains + any custom files
         all_files = []  # list of (domain_name, rel_path)
 
-        # Built-in domains
-        for domain_name, rel_path in DOMAINS.items():
-            all_files.append((domain_name, rel_path))
+        if self.scope == "global":
+            # Global scope: scan system/ and user/ directories
+            for subdir in ["system", "user"]:
+                dir_path = kb_root / subdir
+                if not dir_path.exists():
+                    continue
+                try:
+                    for fpath in dir_path.iterdir():
+                        if fpath.suffix != ".md":
+                            continue
+                        rel = f"{subdir}/{fpath.name}"
+                        custom_name = fpath.stem
+                        all_files.append((custom_name, rel))
+                except OSError:
+                    continue
+        else:
+            # Workspace scope: built-in domains first
+            for domain_name, rel_path in DOMAINS.items():
+                all_files.append((domain_name, rel_path))
 
-        # Custom files from filesystem
-        for subdir in ["project", "personal"]:
-            dir_path = kb_root / subdir
-            if not dir_path.exists():
-                continue
-            try:
-                for fpath in dir_path.iterdir():
-                    if fpath.suffix != ".md":
-                        continue
-                    rel = f"{subdir}/{fpath.name}"
-                    # Skip if already in DOMAINS
-                    if rel in DOMAINS.values():
-                        continue
-                    custom_name = fpath.stem
-                    all_files.append((custom_name, rel))
-            except OSError:
-                continue
+            # Custom files from filesystem
+            for subdir in ["project", "personal"]:
+                dir_path = kb_root / subdir
+                if not dir_path.exists():
+                    continue
+                try:
+                    for fpath in dir_path.iterdir():
+                        if fpath.suffix != ".md":
+                            continue
+                        rel = f"{subdir}/{fpath.name}"
+                        # Skip if already in DOMAINS
+                        if rel in DOMAINS.values():
+                            continue
+                        custom_name = fpath.stem
+                        all_files.append((custom_name, rel))
+                except OSError:
+                    continue
 
         for domain_name, rel_path in all_files:
             file_path = kb_root / rel_path
@@ -430,7 +599,6 @@ class KnowledgeBaseTool(ToolBase):
         domain_name = self.domain.lower().replace(" ", "_").strip()
 
         # Validate domain name: alphanumeric + underscores, no path separators
-        import re as _re
         if not _re.match(r"^[a-zA-Z0-9_]+$", domain_name):
             return (
                 f"Error: Invalid domain name '{self.domain}'. "
@@ -438,29 +606,50 @@ class KnowledgeBaseTool(ToolBase):
                 f"(no spaces, slashes, or special characters)."
             )
 
-        # Determine category
-        category = self.category
-        if category is None:
-            category = "personal"
-            self._log_debug(f"No category specified, defaulting to 'personal'")
-        else:
-            category = category.lower().strip()
-            if category not in ("project", "personal"):
+        if self.scope == "global":
+            # Global scope: only user/ is writable
+            category = "user"
+            if self.category is not None and self.category.lower().strip() != "user":
                 return (
-                    f"Error: Invalid category '{self.category}'. "
-                    f"Category must be 'project' (shared) or 'personal' (private)."
+                    f"Error: Invalid category '{self.category}' for global scope. "
+                    f"Only 'user' category is supported (system/ is read-only)."
                 )
 
-        # Check if domain already exists in built-in registry
-        if domain_name in DOMAINS:
-            existing_path = DOMAINS[domain_name]
-            return f"Domain '{domain_name}' already exists (built-in) at `{existing_path}`."
+            # Check if domain already exists in system/ (read-only) or user/
+            system_path = kb_root / "system" / f"{domain_name}.md"
+            user_path = kb_root / "user" / f"{domain_name}.md"
+            if system_path.exists():
+                return f"Domain '{domain_name}' already exists in system/ (read-only). Choose a different name."
+            if user_path.exists():
+                return f"Domain '{domain_name}' already exists at `user/{domain_name}.md`."
 
-        # Check if file already exists on disk
-        rel_path = f"{category}/{domain_name}.md"
-        file_path = kb_root / rel_path
-        if file_path.exists():
-            return f"Domain '{domain_name}' already exists at `{rel_path}`."
+            rel_path = f"user/{domain_name}.md"
+            file_path = user_path
+        else:
+            # Workspace scope
+            category = self.category
+            if category is None:
+                category = "personal"
+                self._log_debug(f"No category specified, defaulting to 'personal'")
+            else:
+                category = category.lower().strip()
+                if category not in ("project", "personal"):
+                    return (
+                        f"Error: Invalid category '{self.category}'. "
+                        f"Category must be 'project' (shared) or 'personal' (private)."
+                    )
+
+            # Check if domain already exists in built-in registry
+            if domain_name in DOMAINS:
+                existing_path = DOMAINS[domain_name]
+                return f"Domain '{domain_name}' already exists (built-in) at `{existing_path}`."
+
+            # Check if file already exists on disk
+            rel_path = f"{category}/{domain_name}.md"
+            file_path = kb_root / rel_path
+            if file_path.exists():
+                return f"Domain '{domain_name}' already exists at `{rel_path}`."
+
 
         # Create the file with a template header
         title = domain_name.replace("_", " ").title()
@@ -539,15 +728,11 @@ class KnowledgeBaseTool(ToolBase):
             return "Error: `domain` parameter is required for read mode."
 
         domain_name = self.domain.lower().replace(" ", "_")
-        rel_path = DOMAINS.get(domain_name)
-        if not rel_path:
-            return (
-                f"Error: Unknown domain '{self.domain}'. "
-                f"Available domains: {', '.join(sorted(DOMAINS.keys()))}. "
-                f"Use `mode=list` to see all domains."
-            )
+        try:
+            file_path, rel_path = self._resolve_domain_path(kb_root, domain_name, for_write=True)
+        except ValueError as e:
+            return str(e)
 
-        file_path = kb_root / rel_path
         if not file_path.exists():
             return f"File not found for domain '{domain_name}'. Try `mode=list` to see available domains."
 
@@ -659,15 +844,11 @@ class KnowledgeBaseTool(ToolBase):
             return "Error: `domain` parameter is required for summary mode."
 
         domain_name = self.domain.lower().replace(" ", "_")
-        rel_path = DOMAINS.get(domain_name)
-        if not rel_path:
-            return (
-                f"Error: Unknown domain '{self.domain}'. "
-                f"Available domains: {', '.join(sorted(DOMAINS.keys()))}. "
-                f"Use `mode=list` to see all domains."
-            )
+        try:
+            file_path, rel_path = self._resolve_domain_path(kb_root, domain_name)
+        except ValueError as e:
+            return str(e)
 
-        file_path = kb_root / rel_path
         if not file_path.exists():
             return f"File not found for domain '{domain_name}'. Try `mode=list` to see available domains."
 
@@ -711,21 +892,23 @@ class KnowledgeBaseTool(ToolBase):
         return "\n".join(lines)
 
     def _mode_append(self, kb_root: Path) -> str:
-        """Append a timestamped entry to the specified domain file."""
+        """Append a timestamped entry to the specified domain file.
+
+        If ``append_section`` is set, the entry is inserted under that ## heading
+        (creating it if missing). Otherwise the entry is appended at the end.
+
+        After writing, a warning is returned if the file exceeds ~25,000 tokens.
+        """
         if not self.domain:
             return "Error: `domain` parameter is required for append mode."
         if not self.entry:
             return "Error: `entry` parameter is required for append mode."
 
         domain_name = self.domain.lower().replace(" ", "_")
-        rel_path = DOMAINS.get(domain_name)
-        if not rel_path:
-            return (
-                f"Error: Unknown domain '{self.domain}'. "
-                f"Available domains: {', '.join(sorted(DOMAINS.keys()))}."
-            )
-
-        file_path = kb_root / rel_path
+        try:
+            file_path, rel_path = self._resolve_domain_path(kb_root, domain_name, for_write=True)
+        except ValueError as e:
+            return str(e)
 
         # Generate the entry block
         today = datetime.now().strftime("%Y-%m-%d")
@@ -733,8 +916,34 @@ class KnowledgeBaseTool(ToolBase):
         entry_block = f"\n## {today} — {entry_summary}\n\n{self.entry}\n"
 
         try:
-            with open(file_path, "a", encoding="utf-8") as f:
-                f.write(entry_block)
+            if self.append_section:
+                # Section-aware append: insert under a named ## heading
+                self._log_debug(f"append_section='{self.append_section}', inserting under that heading")
+                content = file_path.read_text(encoding="utf-8")
+                clean_section = self.append_section.lstrip("#").strip()
+                pattern = _re.compile(rf"^## {_re.escape(clean_section)}\s*$", _re.MULTILINE)
+                match = pattern.search(content)
+
+                if match:
+                    # Heading found — find the next ## heading after it (or EOF)
+                    after_heading = match.end()
+                    next_section = content.find("\n## ", after_heading)
+                    if next_section == -1:
+                        # No next section — append at end
+                        updated = content + entry_block
+                    else:
+                        # Insert before the next heading
+                        updated = content[:next_section] + entry_block + content[next_section:]
+                else:
+                    # Section not found — create it at the end
+                    section_header = f"## {clean_section}"
+                    updated = content.rstrip() + f"\n\n{section_header}\n{entry_block}\n"
+
+                file_path.write_text(updated, encoding="utf-8")
+            else:
+                # Simple append to end of file (existing behavior)
+                with open(file_path, "a", encoding="utf-8") as f:
+                    f.write(entry_block)
         except PermissionError:
             self._log_tool_warning(f"Permission denied appending to {file_path}")
             return f"Error: Permission denied writing to '{rel_path}'. Check file permissions."
@@ -742,8 +951,23 @@ class KnowledgeBaseTool(ToolBase):
             self._log_tool_error(f"Error appending to {file_path}: {e}")
             return f"Error appending to '{rel_path}': {e}"
 
+        # --- Size warning ---
+        APPEND_SIZE_WARNING_TOKENS = 25000
+        try:
+            current_size = file_path.stat().st_size
+            token_est = current_size // 4
+        except OSError:
+            token_est = 0
+
+        result = f"✅ Entry appended to **{domain_name}** (`{rel_path}`).\n\n**Summary:** {entry_summary}"
+        if token_est > APPEND_SIZE_WARNING_TOKENS:
+            result += (
+                f"\n\n⚠️ This file is now ~{token_est:,} tokens. "
+                f"Consider archiving old entries or using mode=read with section= for targeted access."
+            )
+
         self._log_debug(f"Appended entry to {rel_path}: {entry_summary}")
-        return f"✅ Entry appended to **{domain_name}** (`{rel_path}`).\n\n**Summary:** {entry_summary}"
+        return result
 
     def _mode_update(self, kb_root: Path) -> str:
         """Replace a section's content in a domain file."""
@@ -755,14 +979,11 @@ class KnowledgeBaseTool(ToolBase):
             return "Error: `new_content` parameter is required for update mode."
 
         domain_name = self.domain.lower().replace(" ", "_")
-        rel_path = DOMAINS.get(domain_name)
-        if not rel_path:
-            return (
-                f"Error: Unknown domain '{self.domain}'. "
-                f"Available domains: {', '.join(sorted(DOMAINS.keys()))}."
-            )
+        try:
+            file_path, rel_path = self._resolve_domain_path(kb_root, domain_name)
+        except ValueError as e:
+            return str(e)
 
-        file_path = kb_root / rel_path
         if not file_path.exists():
             return f"File not found for domain '{domain_name}'. Try `mode=list` to see available domains."
 
@@ -778,25 +999,27 @@ class KnowledgeBaseTool(ToolBase):
         # Normalize section name: strip leading '#' and whitespace
         clean_section = self.section.lstrip('#').strip()
 
-        # Locate the section header: "## <section>"
-        section_header = f"## {clean_section}"
-        section_start = content.find(section_header)
+        # Locate the section header using regex anchored to line start
+        section_header_re = _re.compile(rf"^## {_re.escape(clean_section)}\s*$", _re.MULTILINE)
+        match = section_header_re.search(content)
 
-        if section_start == -1:
+        if not match:
             # Section not found — append it at the end
+            section_header = f"## {clean_section}"
             updated_content = content.rstrip() + f"\n\n{section_header}\n{self.new_content}\n"
             self._log_debug(f"Section '{clean_section}' not found, appending to end of {rel_path}")
             found = False
         else:
             # Section found — delete from header to next "## " or EOF, then insert new header + content
+            section_start = match.start()
             # Find the next "## " header after the current one
-            next_section = content.find("\n## ", section_start + len(section_header))
+            next_section = content.find("\n## ", match.end())
             if next_section == -1:
                 # No next section, delete until EOF
-                updated_content = content[:section_start] + f"{section_header}\n{self.new_content}\n"
+                updated_content = content[:section_start] + f"## {clean_section}\n{self.new_content}\n"
             else:
                 # Delete until next section
-                updated_content = content[:section_start] + f"{section_header}\n{self.new_content}\n" + content[next_section:]
+                updated_content = content[:section_start] + f"## {clean_section}\n{self.new_content}\n" + content[next_section:]
             found = True
 
         try:
@@ -820,32 +1043,77 @@ class KnowledgeBaseTool(ToolBase):
         date-headed entries across all files (sorted descending)."""
         lines = ["## Knowledge Base — Current Status\n"]
 
-        # Read the "Current Status" from task_tracker
-        task_file = kb_root / DOMAINS["task_tracker"]
-        current_status = "No status available."
-        if task_file.exists():
-            try:
-                content = task_file.read_text(encoding="utf-8")
-                # Extract "## Current Status" section
-                status_start = content.find("## Current Status")
-                if status_start != -1:
-                    after_header = content.index("\n", status_start) + 1
-                    next_section = content.find("\n## ", after_header)
-                    if next_section == -1:
-                        current_status = content[after_header:].strip()
-                    else:
-                        current_status = content[after_header:next_section].strip()
-            except OSError as e:
-                self._log_tool_warning(f"Could not read task_tracker for status: {e}")
-                current_status = f"Error reading task_tracker: {e}"
+        if self.scope == "global":
+            # Global scope: no task_tracker, just show recent entries
+            lines.append("> **Global Knowledge Base** — showing recent activity across all domains.\n")
         else:
-            current_status = "task_tracker.md not found. The knowledge base may need initialization."
+            # Workspace scope: read the "Current Status" from task_tracker
+            task_file = kb_root / DOMAINS["task_tracker"]
+            current_status = "No status available."
+            if task_file.exists():
+                try:
+                    content = task_file.read_text(encoding="utf-8")
+                    # Extract "## Current Status" section
+                    status_start = content.find("## Current Status")
+                    if status_start != -1:
+                        after_header = content.index("\n", status_start) + 1
+                        next_section = content.find("\n## ", after_header)
+                        if next_section == -1:
+                            current_status = content[after_header:].strip()
+                        else:
+                            current_status = content[after_header:next_section].strip()
+                except OSError as e:
+                    self._log_tool_warning(f"Could not read task_tracker for status: {e}")
+                    current_status = f"Error reading task_tracker: {e}"
+            else:
+                current_status = "task_tracker.md not found. The knowledge base may need initialization."
 
-        lines.append(f"### Task Tracker Status\n\n{current_status}\n")
+            lines.append(f"### Task Tracker Status\n\n{current_status}\n")
 
         # Collect all date-headed entries (## YYYY-MM-DD) across all files
         all_entries = []  # List of (date, domain_name, content_preview)
-        for domain_name, rel_path in DOMAINS.items():
+
+        # Collect all .md files
+        all_domain_files_for_entries = []
+
+        if self.scope == "global":
+            # Global scope: scan system/ and user/ directories
+            for subdir in ["system", "user"]:
+                dir_path = kb_root / subdir
+                if not dir_path.exists():
+                    continue
+                try:
+                    for fpath in sorted(dir_path.iterdir()):
+                        if fpath.suffix != ".md":
+                            continue
+                        rel = f"{subdir}/{fpath.name}"
+                        custom_name = fpath.stem
+                        all_domain_files_for_entries.append((custom_name, rel))
+                except OSError:
+                    continue
+        else:
+            # Workspace scope: built-in domains
+            for domain_name, rel_path in DOMAINS.items():
+                all_domain_files_for_entries.append((domain_name, rel_path))
+
+            # Custom files from filesystem
+            for subdir in ["project", "personal"]:
+                dir_path = kb_root / subdir
+                if not dir_path.exists():
+                    continue
+                try:
+                    for fpath in sorted(dir_path.iterdir()):
+                        if fpath.suffix != ".md":
+                            continue
+                        rel = f"{subdir}/{fpath.name}"
+                        if rel in DOMAINS.values():
+                            continue
+                        custom_name = fpath.stem
+                        all_domain_files_for_entries.append((custom_name, rel))
+                except OSError:
+                    continue
+
+        for domain_name, rel_path in all_domain_files_for_entries:
             file_path = kb_root / rel_path
             if not file_path.exists():
                 continue
@@ -855,8 +1123,7 @@ class KnowledgeBaseTool(ToolBase):
                 continue
 
             # Find all ## YYYY-MM-DD entries
-            import re
-            for match in re.finditer(r"^## (\d{4}-\d{2}-\d{2})\s*[—\-–]\s*(.+)$", content, re.MULTILINE):
+            for match in _re.finditer(r"^## (\d{4}-\d{2}-\d{2})\s*[—\-–]\s*(.+)$", content, _re.MULTILINE):
                 date_str = match.group(1)
                 entry_summary = match.group(2).strip()
                 all_entries.append((date_str, domain_name, entry_summary))
