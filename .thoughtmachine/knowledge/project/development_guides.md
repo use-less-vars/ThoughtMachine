@@ -401,3 +401,17 @@ Added `--serve-frontend` flag to `web_ui/backend/server.py` main() so the backen
 - Build failure → warns but still starts (shows build-error page)
 - Missing `dist/` → triggers auto-build
 - API paths under catch-all → returns 404 (not SPA fallback)
+
+## 2026-05-30 — ## Install & Run Scripts (created 2026-05-30)
+
+Two scripts w...
+
+## Install & Run Scripts (created 2026-05-30)
+
+Two scripts were added to the project root:
+
+- **`install_thoughtmachine.sh`** — Full install: checks Python >=3.11 & Node.js, creates `.venv`, pip installs requirements, npm installs & builds frontend.
+- **`start_thoughtmachine.sh`** — Activates `.venv` and starts server with `--serve-frontend` on `127.0.0.1:8000` (override via `HOST`/`PORT` env vars).
+
+Usage: `./install_thoughtmachine.sh && ./start_thoughtmachine.sh`
+
