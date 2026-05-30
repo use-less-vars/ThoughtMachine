@@ -3,10 +3,12 @@
 ## Getting Started
 
 ### First Run
-1. Create `~/.thoughtmachine/config.json` with your LLM provider settings
+1. Run `./install_thoughtmachine.sh` to set up dependencies
 2. Set the `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` environment variable
-3. Run the agent from your project directory
-4. The agent will create `.thoughtmachine/knowledge/` on first use
+3. Run `./start_thoughtmachine.sh` to launch the Web UI
+4. The server will auto-create `~/.thoughtmachine/agent_config.json` on first start
+5. Open `http://127.0.0.1:8000` in your browser
+6. Edit `~/.thoughtmachine/agent_config.json` to set your LLM provider if needed
 
 ### Basic Interaction
 - Give natural language instructions

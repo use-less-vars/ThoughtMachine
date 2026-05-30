@@ -101,10 +101,26 @@ else
     echo "  ! Skipping frontend build."
 fi
 
+# ── Make scripts executable ────────────────────────────────────────────
+echo ""
+echo "[+] Making scripts executable..."
+chmod +x "$PROJECT_DIR/start_thoughtmachine.sh"
+chmod +x "$PROJECT_DIR/install_thoughtmachine.sh"
+echo "  ✓ Scripts are now executable"
+
 echo ""
 echo "============================================"
 echo "  ✓ Install complete!"
 echo ""
-echo "  Activate:  source .venv/bin/activate"
-echo "  Start:     ./start_thoughtmachine.sh"
+echo "  Next steps:"
+echo "    1. Activate the virtual environment:"
+echo "       source .venv/bin/activate"
+echo ""
+echo "    2. Start ThoughtMachine:"
+echo "       ./start_thoughtmachine.sh"
+echo ""
+echo "    3. Open http://127.0.0.1:8000 in your browser"
+echo ""
+echo "  Your config file will be created automatically"
+echo "  at ~/.thoughtmachine/agent_config.json on first run."
 echo "============================================"
