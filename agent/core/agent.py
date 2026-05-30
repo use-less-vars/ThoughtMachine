@@ -28,7 +28,6 @@ from tools.utils import model_to_openai_tool
 from tools.summarize_tool import SummarizeTool
 from agent.core.message import Message
 from fast_json_repair import loads as repair_loads
-from session.models import RuntimeParams
 from session.context_builder import ContextBuilder
 from agent.core.state import AgentState, ExecutionState, SessionState
 from agent import events as ev
@@ -116,6 +115,7 @@ class Agent:
         self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
         self.tool_executor = ToolExecutor(self.tool_classes, config, None, self.logger, self.security_available, agent=self)
         self.provider = self.llm_client.provider
+        from session.models import RuntimeParams
         self.runtime_params = RuntimeParams(temperature=config.temperature, top_p=None)
         self._token_encoder = None
         if session is not None:
@@ -412,6 +412,7 @@ class Agent:
                 self.conversation_manager.context_builder = self.context_builder
 
             # Update runtime params
+            from session.models import RuntimeParams
             self.runtime_params = RuntimeParams(
                 temperature=new_config.temperature,
                 top_p=None

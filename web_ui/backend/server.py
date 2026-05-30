@@ -168,7 +168,7 @@ async def websocket_endpoint(ws: WebSocket):
         try:
             await ws.send_json(event)
         except Exception as exc:
-            log('ERROR', 'server.ws', f'send_event failed: {exc}')
+            log('ERROR', 'server.ws', f'send_event failed: {exc}\n{traceback.format_exc()}')
 
     # Callback wrapper — called from the bridge's agent thread
     def event_callback(event: Dict[str, Any]) -> None:
@@ -545,7 +545,7 @@ async def websocket_endpoint(ws: WebSocket):
                         })
                         log('INFO', 'server.config', f"Returned {len(tool_defs)} available tools")
                     except Exception as exc:
-                        log('ERROR', 'server.config', f"get_available_tools failed: {exc}")
+                        log('ERROR', 'server.config', f"get_available_tools failed: {exc}\n{traceback.format_exc()}")
                         await ws.send_json({
                             "type": "tools_list",
                             "tools": [],
