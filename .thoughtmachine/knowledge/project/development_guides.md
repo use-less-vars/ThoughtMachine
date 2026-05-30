@@ -379,3 +379,25 @@ Added debug logging to `web_ui/backend/bridge.py`:
    - Includes full event dict and keys list
 
 3. **Truncation** — Both `log()` calls use default `truncate_hint=None`, which means `_truncate_data` passes data through unchanged, preserving full diagnostic data in JSONL file logs. Console output may still truncate the display line per `TM_DEBUG_TRUNCATE_LENGTH`.
+
+## 2026-05-30 — ## Feature: `--serve-frontend` CLI flag (2026-06-02)
+
+Added ...
+
+## Feature: `--serve-frontend` CLI flag (2026-06-02)
+
+Added `--serve-frontend` flag to `web_ui/backend/server.py` main() so the backend can build and serve the React frontend directly, eliminating the need for a separate Vite dev server.
+
+**How it works:**
+1. `python -m web_ui.backend.server --serve-frontend` auto-builds the frontend via `npm run build` (if `dist/` doesn't exist)
+2. Mounts `web_ui/frontend/dist/` as `StaticFiles(html=True)` at `/`
+3. Root `/` serves `index.html` instead of the JSON info response
+4. SPA catch-all route `/{path:path}` serves `index.html` for client-side routing paths
+5. API routes (`/health`, `/api/browse`, `/ws`) still work unaffected
+6. Supports `--host`, `--port`, `--reload` flags and env var overrides (`HOST`, `PORT`, `RELOAD`)
+
+**Edge cases handled:**
+- Missing Node.js/npm → graceful error message
+- Build failure → warns but still starts (shows build-error page)
+- Missing `dist/` → triggers auto-build
+- API paths under catch-all → returns 404 (not SPA fallback)

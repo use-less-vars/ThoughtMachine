@@ -75,8 +75,10 @@ Server → Client (JSON):
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -84,6 +86,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from agent.logging import log
 from contextlib import asynccontextmanager
 from session.store import FileSystemSessionStore
@@ -102,6 +106,15 @@ if _project_root not in sys.path:
 async def lifespan(app: FastAPI):
     """Lifespan handler — no global state needed (state is per‑connection)."""
     log('INFO', 'server', 'ThoughtMachine Web UI server starting ...')
+    # Ensure user ~/.thoughtmachine/ defaults exist before any connection
+    try:
+        from thoughtmachine.bootstrap import ensure_user_defaults, get_version
+        touched = ensure_user_defaults()
+        if touched:
+            log('INFO', 'server', f'Created initial user defaults: {len(touched)} file(s)')
+        log('INFO', 'server', f'ThoughtMachine version {get_version()}')
+    except Exception as exc:
+        log('WARNING', 'server', f'Could not initialise user defaults: {exc}')
     yield
     log('INFO', 'server', 'Server shutting down.')
 
@@ -110,6 +123,12 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+# ── Frontend serving state (set by --serve-frontend) ─────────────────────
+# Path to the built frontend dist directory
+_FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+# Whether --serve-frontend was requested (set in main())
+_SERVE_FRONTEND = False
 
 # ── CORS (allow frontend dev server on any port) ────────────────────────────
 from fastapi.middleware.cors import CORSMiddleware
@@ -751,6 +770,10 @@ async def websocket_endpoint(ws: WebSocket):
                     # Store as the loaded session so continue_session picks it up
                     bridge._loaded_session = new_session
 
+                    # Persist to session store so the SessionTab can load it
+                    # via load_session on its own WS connection.
+                    session_store.save_session(new_session)
+
                     await ws.send_json({
                         "type": "session_loaded",
                         "session_id": new_session.session_id,
@@ -848,6 +871,16 @@ async def health():
 
 @app.get("/")
 async def root():
+    if _SERVE_FRONTEND:
+        index = _FRONTEND_DIST / "index.html"
+        if index.exists():
+            return HTMLResponse(index.read_text(encoding="utf-8"))
+        return HTMLResponse(
+            "<html><body><h1>Frontend not built</h1>"
+            "<p>Run <code>cd web_ui/frontend && npm run build</code> first, "
+            "or use <code>--serve-frontend</code> to auto-build.</p></body></html>",
+            status_code=503,
+        )
     return {
         "name": "ThoughtMachine Web UI",
         "version": "0.1.0",
@@ -857,6 +890,9 @@ async def root():
             "browse": "/api/browse?path=… — Directory listing for workspace browser",
         },
     }
+
+
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -895,7 +931,8 @@ def _translate_frontend_config(fe_config: Dict[str, Any]) -> Dict[str, Any]:
     tools_list = cfg.pop("tools", None)
     if isinstance(tools_list, list):
         enabled = [t["name"] for t in tools_list if isinstance(t, dict) and t.get("enabled")]
-        cfg["enabled_tools"] = enabled
+        if enabled:
+            cfg["enabled_tools"] = enabled
 
     # Remove any keys that start with _
     cfg = {k: v for k, v in cfg.items() if not k.startswith("_")}
@@ -919,8 +956,16 @@ def _frontend_config_from_bridge(bridge) -> Dict[str, Any]:
     cfg = bridge.get_config()
     if cfg is None:
         return _default_frontend_config()
+    # Check if API key is configured before stripping it
+    api_key = getattr(cfg, 'api_key', '') or ''
+    if not api_key:
+        import os
+        api_key = os.getenv('OPENAI_API_KEY') or os.getenv('DEEPSEEK_API_KEY') or os.getenv('OPENAI_COMPATIBLE_API_KEY') or ''
+    api_key_configured = bool(api_key)
     raw = _config_to_dict(cfg)
-    return _backend_to_frontend_config(raw)
+    result = _backend_to_frontend_config(raw)
+    result['api_key_configured'] = api_key_configured
+    return result
 
 
 
@@ -935,6 +980,7 @@ _FALLBACK_FRONTEND_CONFIG = {
     "max_turns": 200,
     "stop_check": None,
     "system_prompt": None,
+    "api_key_configured": False,
     "token_monitor_warning_threshold": 60000,
     "token_monitor_critical_threshold": 75000,
     "turn_monitor_enabled": True,
@@ -942,7 +988,6 @@ _FALLBACK_FRONTEND_CONFIG = {
     "log_dir": "./logs",
     "log_level": "INFO",
     "enable_file_logging": True,
-    "enable_console_logging": False,
     "jsonl_format": True,
     "log_categories": ["SESSION", "LLM", "TOOLS"],
     "max_file_size_mb": 10,
@@ -1043,7 +1088,7 @@ def _default_frontend_config() -> Dict[str, Any]:
 def _config_to_dict(cfg) -> Dict[str, Any]:
     """Convert an AgentConfig to a plain dict for JSON serialization."""
     if hasattr(cfg, "model_dump"):
-        return cfg.model_dump(exclude={'api_key'}, exclude_none=True)
+        return cfg.model_dump(exclude={'api_key', 'stop_check'}, exclude_none=True)
     if hasattr(cfg, "dict"):
         return cfg.dict()
     return {k: str(v) for k, v in vars(cfg).items() if not k.startswith("_")}
@@ -1053,20 +1098,121 @@ def _config_to_dict(cfg) -> Dict[str, Any]:
 #  Direct execution
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _build_frontend() -> bool:
+    """Run `npm run build` in the frontend directory.
+
+    Returns True if the build succeeded, False otherwise.
+    """
+    frontend_dir = _FRONTEND_DIST.parent
+    if not (frontend_dir / "package.json").exists():
+        log('ERROR', 'server', f'Frontend package.json not found at {frontend_dir}')
+        return False
+
+    log('INFO', 'server', f'Building frontend in {frontend_dir}...')
+    try:
+        result = subprocess.run(
+            ["npm", "run", "build"],
+            cwd=str(frontend_dir),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            log('ERROR', 'server', f'Frontend build failed:\n{result.stderr}')
+            return False
+        log('INFO', 'server', 'Frontend build succeeded.')
+        return True
+    except FileNotFoundError:
+        log('ERROR', 'server', 'npm not found — is Node.js installed?')
+        return False
+    except subprocess.TimeoutExpired:
+        log('ERROR', 'server', 'Frontend build timed out (120s).')
+        return False
+    except Exception as exc:
+        log('ERROR', 'server', f'Frontend build error: {exc}')
+        return False
+
+
+def _setup_frontend_serving() -> bool:
+    """Build frontend (if needed) and mount static file serving.
+
+    Must be called AFTER all API routes are registered.
+    Returns True if frontend is ready to serve.
+    """
+    global _SERVE_FRONTEND
+    _SERVE_FRONTEND = True
+
+    # Auto-build if dist doesn't exist yet
+    dist = _FRONTEND_DIST
+    if not dist.exists() or not (dist / "index.html").exists():
+        if not _build_frontend():
+            log('WARNING', 'server',
+                'Frontend build failed — will show build-error page on /')
+            return False
+
+    # Mount static files — this catches all non-API paths for assets
+    # FastAPI routes are checked before mounts, so API routes still work.
+    if dist.exists():
+        app.mount(
+            "/",
+            StaticFiles(directory=str(dist), html=True),
+            name="frontend",
+        )
+        log('INFO', 'server', f'Serving frontend from {dist}')
+        return True
+
+    return False
+
+
 def main():
-    """Run the server via `python -m web_ui.backend.server`."""
+    """Run the server via `python -m web_ui.backend.server`.
+
+    Usage:
+        python -m web_ui.backend.server
+        python -m web_ui.backend.server --serve-frontend
+        python -m web_ui.backend.server --serve-frontend --host 127.0.0.1 --port 8080
+    """
     import uvicorn
 
-    host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", "8000"))
-    reload = os.environ.get("RELOAD", "false").lower() == "true"
+    parser = argparse.ArgumentParser(description="ThoughtMachine Web UI Server")
+    parser.add_argument(
+        "--serve-frontend",
+        action="store_true",
+        help="Build and serve the React frontend alongside the API",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("HOST", "0.0.0.0"),
+        help="Host to bind to (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("PORT", "8000")),
+        help="Port to bind to (default: 8000)",
+    )
+    parser.add_argument(
+        "--reload",
+        action="store_true",
+        default=os.environ.get("RELOAD", "false").lower() == "true",
+        help="Enable auto-reload (default: from RELOAD env var)",
+    )
 
-    log('INFO', 'server', f'Starting ThoughtMachine Web UI on {host}:{port}')
+    args = parser.parse_args()
+
+    if args.serve_frontend:
+        _setup_frontend_serving()
+
+    log('INFO', 'server',
+        f'Starting ThoughtMachine Web UI on {args.host}:{args.port}')
+    # Pass the app OBJECT directly — using the string form would
+    # double-import this module, creating a second copy where _SERVE_FRONTEND
+    # is still False and the StaticFiles mount is missing.
     uvicorn.run(
-        "web_ui.backend.server:app",
-        host=host,
-        port=port,
-        reload=reload,
+        app,
+        host=args.host,
+        port=args.port,
+        reload=args.reload,
         log_level="info",
     )
 
