@@ -20,12 +20,12 @@ from .base import ToolBase
 # Lazy import for global KB (avoids circular import at module level)
 def _get_ensure_global_kb():
     from agent.knowledge.global_kb import ensure_global_kb
-    return ensure_global_kb
+    return ensure_global_kb()
 
 
 def _get_global_kb_root():
     from agent.knowledge.global_kb import get_global_kb_root
-    return get_global_kb_root
+    return get_global_kb_root()
 
 logger = logging.getLogger(__name__)
 

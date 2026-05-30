@@ -9,9 +9,7 @@ File structure:
     ~/.thoughtmachine/knowledge/
         .version              — currently deployed version string
         system/               — read-only system files synced from package data
-            handbook.md
-            faq.md
-            troubleshooting.md
+            (all .md files from resources/global_kb/)
         user/                 — writable user area
             my_notes.md
 """
@@ -84,8 +82,8 @@ def ensure_global_kb(version_file: Optional[Path] = None) -> list[str]:
 
     Reads the version from ``resources/global_kb/.version``, compares it with
     the stored version in ``~/.thoughtmachine/knowledge/.version``, and copies
-    system resource files (handbook, FAQ, troubleshooting) if the version has
-    changed or the system directory is missing.
+    system resource files (all .md files from ``resources/global_kb/``) if the
+    version has changed or the system directory is missing.
 
     Also ensures the ``user/`` subdirectory exists and creates a placeholder
     ``my_notes.md`` file if one does not already exist.
@@ -115,15 +113,14 @@ def ensure_global_kb(version_file: Optional[Path] = None) -> list[str]:
     if needs_sync or not SYSTEM_DIR.is_dir():
         SYSTEM_DIR.mkdir(parents=True, exist_ok=True)
         src_dir = _global_kb_resources_dir()
-        for resource_name in ["handbook.md", "faq.md", "troubleshooting.md"]:
-            src = src_dir / resource_name
-            dst = SYSTEM_DIR / resource_name
+        for resource_name in sorted(src_dir.glob("*.md")):
+            dst = SYSTEM_DIR / resource_name.name
             try:
-                shutil.copy2(str(src), str(dst))
+                shutil.copy2(str(resource_name), str(dst))
                 touched.append(str(dst))
-                logger.debug("Copied %s -> %s", resource_name, dst)
+                logger.debug("Copied %s -> %s", resource_name.name, dst)
             except OSError as exc:
-                logger.warning("Failed to copy %s: %s", resource_name, exc)
+                logger.warning("Failed to copy %s: %s", resource_name.name, exc)
 
         # Write the current version marker
         try:
