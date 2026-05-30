@@ -185,3 +185,30 @@ Items with one-line dispositions so they don't clutter active thinking:
 
 4. **UX:**
    - Dashed border / highlight appears when a file is dragged over the agent area.
+
+## 2026-05-28 — ## Feature Ideas (Rough — added 2026-05-28)
+
+### 1. GUI-swit...
+
+## Feature Ideas (Rough — added 2026-05-28)
+
+### 1. GUI-switchable logging with tag selection
+Add a panel in the web UI that lets users:
+- Enable/disable logging in real time
+- Select which specific logging tags/levels are active (e.g., debug, info, tool_calls, sessions, errors)
+- Ideally backed by a dynamic log-filtering mechanism on the Python side so the agent can also toggle it
+
+### 2. Workspace size viewer / bloat monitor
+A small panel or status-bar widget that shows:
+- Total workspace directory size
+- File count and size breakdown by category (e.g., `.py`, logs, temp files, `.git`)
+- A warning indicator when something grows unexpectedly (bloat creeping in)
+- Maybe a "largest files" listing
+
+### 3. ShowFileToUser tool → dedicated GUI panel
+A new agent tool (e.g. `ShowFileToUser`) that:
+- Takes a file path
+- Opens/displays the file content in a special GUI panel in the web UI
+- Allows the user to view, scroll, and maybe copy content
+- The panel could be a dedicated "viewer" tab separate from the chat
+- Useful for the agent to show results without blowing up the context with file content
