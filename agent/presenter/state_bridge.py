@@ -23,7 +23,7 @@ class StateBridge:
 
     def __init__(self, config_path: str='agent_config.json'):
         self.config_path = config_path
-        self.user_config_path = str(Path.home() / '.thoughtmachine' / 'config.json')
+        self.user_config_path = str(Path.home() / '.thoughtmachine' / 'agent_config.json')
         default_dict = load_default_config()
         self.current_config = AgentConfig(**default_dict)
         self.total_input = 0
