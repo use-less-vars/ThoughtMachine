@@ -704,15 +704,18 @@ async def websocket_endpoint(ws: WebSocket):
                     try:
                         open_ids = session_store.get_open_sessions()
                         log("INFO", "server.config", f"get_open_sessions returned {len(open_ids)} ids: {open_ids}")
+                        # Batch-load metadata for all open sessions in a single
+                        # directory scan — avoids reading each session file N times.
+                        all_meta = session_store.load_sessions_metadata_batch(open_ids)
                         open_sessions = []
                         for sid in open_ids:
-                            session = session_store.load_session(sid)
-                            if session:
+                            meta = all_meta.get(sid)
+                            if meta:
                                 open_sessions.append({
-                                    "session_id": session.session_id,
-                                    "name": session.metadata.get('name', 'Untitled'),
-                                    "updated_at": session.updated_at.isoformat(),
-                                    "message_count": len(session.user_history) if session.user_history else 0
+                                    "session_id": meta["session_id"],
+                                    "name": meta["name"],
+                                    "updated_at": meta["updated_at"],
+                                    "message_count": meta["message_count"],
                                 })
                         response = {"type": "open_sessions", "sessions": open_sessions}
                         await ws.send_json(response)
