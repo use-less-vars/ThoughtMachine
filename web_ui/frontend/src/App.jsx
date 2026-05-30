@@ -154,6 +154,16 @@ export default function App() {
         }
         // hubReady is set to true in onmessage after handleHubEvent returns
         break
+      case 'session_loaded':
+        // New session created via hub WS — open a tab with the real sessionId
+        if (msg.session_id) {
+          console.log('[Hub WS] session_loaded, opening tab for', msg.session_id)
+          loadTab(msg.session_id)
+          // Refresh sessions list so the new session appears in the sidebar
+          wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
+        }
+        break
+
       default:
         // Other events (state_changed, conversation_changed, etc.)
         // are handled by individual SessionTab WebSockets.
@@ -225,17 +235,19 @@ export default function App() {
   }, [activeTabId])
 
   const handleNewTab = useCallback(() => {
-    addTab(null) // null sessionId = fresh session
-  }, [addTab])
+    // Send new_session via hub WS — the hub WS handler will respond
+    // with session_loaded, which creates the tab with a real sessionId.
+    hubSend('new_session')
+  }, [hubSend])
 
   // Open an existing session in a tab (called from SessionList sidebar)
   const handleOpenTab = useCallback((sessionId) => {
     loadTab(sessionId)
   }, [loadTab])
 
-  // ── Session Actions Panel ────────────────────────────────────────────
-  const handleToggleSessionPanel = useCallback(() => {
-    setSessionPanelOpen((prev) => !prev)
+  // ── Session sidebar toggle (shown/hidden via ⚙️ cogwheel) ───────────────
+  const handleToggleSessionsSidebar = useCallback(() => {
+    setShowSessions((prev) => !prev)
   }, [])
 
   const handleOpenSessionFromPanel = useCallback((sessionId) => {
@@ -350,7 +362,7 @@ export default function App() {
         onCloseTab={initiateCloseTab}
         onNewTab={handleNewTab}
         runningStates={tabRunningStates}
-        onCogwheelClick={handleToggleSessionPanel}
+        onCogwheelClick={handleToggleSessionsSidebar}
       />
 
       <div className="app-main">
@@ -384,8 +396,8 @@ export default function App() {
           )}
         </div>
 
-        {/* Sessions sidebar — hidden by default, shown/hidden via ⚙️ cogwheel */}
-        <div className={`session-sidebar ${showSessions ? 'open' : ''}`}>
+        {/* Sessions sidebar — always visible when no tabs are open, toggle via ⚙️ cogwheel */}
+        <div className={`session-sidebar ${(showSessions || tabs.length === 0) ? 'open' : ''}`}>
           <SessionList
             sessions={sessions}
             onNew={handleNewTab}

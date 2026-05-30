@@ -220,7 +220,12 @@ export default function SessionList({ sessions, onNew, onOpenTab, onDelete, onRe
       </div>
 
       {sessions.length === 0 ? (
-        <p className="session-list-empty">No saved sessions yet.</p>
+        <div className="session-list-empty">
+          <p>No saved sessions yet.</p>
+          <button className="btn btn-new" onClick={onNew} style={{marginTop: '0.75rem'}}>
+            ✨ New Session
+          </button>
+        </div>
       ) : (
         <List
           rowComponent={Row}
