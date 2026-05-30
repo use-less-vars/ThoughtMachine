@@ -342,6 +342,41 @@ class WebAgentBridge:
             return self._controller.get_config() or self._config
         return self._config
 
+    # ── Controller restart / health check ───────────────────────────────────
+
+    def _restart_controller(self, config: Optional[AgentConfig] = None) -> None:
+        """
+        Restart the controller thread with an optional new config.
+
+        Stops the existing controller (if any), creates a fresh one,
+        re-attaches it to the bridge, and preserves the current session
+        state.  Called automatically by apply_config() when the controller
+        is unresponsive, or explicitly to force a full controller restart.
+
+        Args:
+            config: Optional new AgentConfig.  If None, the current
+                    self._config is kept.
+        """
+        old_controller = self._controller
+        new_config = config or self._config
+
+        if old_controller is not None:
+            log('INFO', 'server.bridge', '_restart_controller: stopping old controller')
+            old_controller.stop()
+
+        # Create a fresh controller
+        from agent.controller import AgentController
+        new_controller = AgentController()
+        self.set_controller(new_controller)
+        self._controller = new_controller
+        self._config = new_config
+
+        # Preserve session ID
+        if self._session is not None:
+            self._session_id = self._session.session_id
+
+        log('INFO', 'server.bridge', '_restart_controller: controller restarted')
+
     def apply_config(self, config_dict: Dict[str, Any]) -> Dict[str, Any]:
         """
         Apply a full config dict to the session, merging with existing config.
@@ -395,8 +430,22 @@ class WebAgentBridge:
         # Step 6: Store the validated config
         self._config = validated
         if self._controller is not None:
-            self._controller._config = validated
-            self._controller.request_config_update(validated)
+            # ── Health check: verify controller thread is alive ──────────────
+            controller_alive = (
+                hasattr(self._controller, 'thread')
+                and self._controller.thread is not None
+                and self._controller.thread.is_alive()
+            )
+            if not controller_alive:
+                log('WARNING', 'server.bridge',
+                    'apply_config: controller thread is dead — restarting controller')
+                self._restart_controller(validated)
+                # Push the config update into the new controller
+                self._controller._config = validated
+                self._controller.request_config_update(validated)
+            else:
+                self._controller._config = validated
+                self._controller.request_config_update(validated)
 
         # Step 7: Persist to session
         self.save_session()
