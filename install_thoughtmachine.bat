@@ -17,7 +17,7 @@ set "SCRIPT_DIR=%~dp0"
 echo ============================================
 echo   ThoughtMachine - Install
 echo ============================================
-echo.
+echo(
 
 REM -- Parse flags -------------------------------------------------------------
 set INSTALL_RAG=false
@@ -34,9 +34,9 @@ if /i "%~1"=="--help" goto :show_help
 if /i "%~1"=="-h" goto :show_help
 
 echo   [x] Unknown argument: %~1
-echo.
+echo(
 echo   Usage: %~nx0 [--with-rag]
-echo.
+echo(
 echo     --with-rag    Also install RAG dependencies
 echo     --help, -h    Show this help
 pause
@@ -44,24 +44,24 @@ exit /b 1
 
 :show_help
 echo   Usage: %~nx0 [--with-rag]
-echo.
+echo(
 echo     --with-rag    Also install RAG dependencies (sentence-transformers,
 echo                   ChromaDB, CPU-only PyTorch ~500 MB)
 echo     --help, -h    Show this help
-echo.
+echo(
 echo   Prerequisites (install manually if missing):
 echo     - Python 3.11+  from https://www.python.org/downloads/
 echo     - Node.js LTS   from https://nodejs.org/
-echo.
+echo(
 pause
 exit /b 0
 
 :after_help
 
 REM -- 1. Check prerequisites -------------------------------------------------
-echo.
+echo(
 echo [1/5] Checking prerequisites...
-echo.
+echo(
 echo   --- Python ---
 
 set PYTHON_CMD=
@@ -94,7 +94,7 @@ if !PYTHON_OK!==1 (
     )
 )
 
-echo.
+echo(
 echo   --- Node.js ---
 
 set NODE_OK=0
@@ -109,7 +109,7 @@ if not errorlevel 1 (
     echo       Then close this window and open a NEW one.
 )
 
-echo.
+echo(
 echo   --- npm ---
 
 set NPM_OK=0
@@ -127,7 +127,7 @@ if !NODE_OK!==1 (
     echo   [ ] (skipped - Node.js missing)
 )
 
-echo.
+echo(
 echo   --- Summary ---
 
 set ALL_OK=1
@@ -146,11 +146,11 @@ if !NPM_OK!==0 (
 
 if !ALL_OK!==1 (
     echo   [PASS] All prerequisites met.
-    echo.
+    echo(
     echo   Starting install...
-    echo.
+    echo(
 ) else (
-    echo.
+    echo(
     echo   Fix the issues above, then run this script again.
     echo   Note: You may need to close this window and open a
     echo   NEW Command Prompt after installing.
@@ -169,7 +169,7 @@ if exist "%VENV_DIR%\Scripts\activate.bat" (
     echo   Running: !PYTHON_CMD! -m venv .venv
     call !PYTHON_CMD! -m venv "%VENV_DIR%"
     if errorlevel 1 (
-        echo.
+        echo(
         echo   [x] Failed to create virtual environment.
         echo       Try reinstalling Python with "pip" included.
         pause
@@ -181,7 +181,7 @@ if exist "%VENV_DIR%\Scripts\activate.bat" (
 REM Activate
 call "%VENV_DIR%\Scripts\activate.bat"
 echo   [+] Virtual environment activated
-echo.
+echo(
 
 REM -- 3. Install Python dependencies -----------------------------------------
 echo [3/5] Installing Python dependencies...
@@ -198,7 +198,7 @@ echo   [+] pip upgraded
 echo   Installing core packages (this may take a minute)...
 pip install -r "%SCRIPT_DIR%requirements.txt"
 if errorlevel 1 (
-    echo.
+    echo(
     echo   [x] pip install failed. Try:
     echo       pip install --pre -r requirements.txt
     pause
@@ -207,7 +207,7 @@ if errorlevel 1 (
 echo   [+] Core Python packages installed
 
 if /i "!INSTALL_RAG!"=="true" (
-    echo.
+    echo(
     echo   Installing RAG dependencies...
     if exist "%SCRIPT_DIR%requirements-rag.txt" (
         pip install -r "%SCRIPT_DIR%requirements-rag.txt"
@@ -221,7 +221,7 @@ if /i "!INSTALL_RAG!"=="true" (
         echo   [!] requirements-rag.txt not found, skipping
     )
 )
-echo.
+echo(
 
 REM -- 4. Install npm dependencies --------------------------------------------
 echo [4/5] Installing npm dependencies...
@@ -232,7 +232,7 @@ if exist "%FRONTEND_DIR%\package.json" (
     echo   Installing npm packages (this may take a while)...
     call npm install
     if errorlevel 1 (
-        echo.
+        echo(
         echo   [x] npm install failed
         popd
         pause
@@ -243,7 +243,7 @@ if exist "%FRONTEND_DIR%\package.json" (
 ) else (
     echo   [!] Frontend directory not found, skipping
 )
-echo.
+echo(
 
 REM -- 5. Build frontend ------------------------------------------------------
 echo [5/5] Building frontend...
@@ -253,7 +253,7 @@ if exist "%FRONTEND_DIR%\package.json" (
     echo   Running npm run build...
     call npm run build
     if errorlevel 1 (
-        echo.
+        echo(
         echo   [x] Frontend build failed
         popd
         pause
@@ -264,21 +264,21 @@ if exist "%FRONTEND_DIR%\package.json" (
 ) else (
     echo   [!] Skipping frontend build
 )
-echo.
+echo(
 
 REM -- Done -------------------------------------------------------------------
 echo ============================================
 echo   [+] Install complete!
-echo.
+echo(
 echo   Next steps:
-echo.
+echo(
 echo     1. Double-click: start_thoughtmachine.bat
-echo.
+echo(
 echo     2. Open http://127.0.0.1:8000 in your browser
-echo.
+echo(
 echo   Config is created automatically on first run at:
 echo     %%USERPROFILE%%\.thoughtmachine\agent_config.json
 echo ============================================
-echo.
+echo(
 
 pause
