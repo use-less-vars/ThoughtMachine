@@ -38,11 +38,17 @@ if $IS_WINDOWS; then
 
     if [[ -z "$PYTHON" ]]; then
         echo "  → Python not found. Installing via winget..."
+        echo "    (Pin: Python 3.12 — 3.14+ lacks package wheels)"
         winget install --silent --accept-package-agreements Python.Python.3.12 2>&1
         # Re-check after install
         for cmd in python3.12 python3 python; do
             if command -v "$cmd" &>/dev/null; then
-                PYTHON="$cmd"
+                version=$("$cmd" --version 2>&1)
+                major=$(echo "$version" | awk '{print $2}' | cut -d. -f1)
+                minor=$(echo "$version" | awk '{print $2}' | cut -d. -f2)
+                if [[ -n "$major" && -n "$minor" && "$major" -eq 3 && "$minor" -ge 11 && "$minor" -lt 14 ]]; then
+                    PYTHON="$cmd"
+                fi
                 break
             fi
         done
@@ -51,14 +57,18 @@ if $IS_WINDOWS; then
             winget install --silent --accept-package-agreements Python.Python.3.11 2>&1
             for cmd in python3.11 python3 python; do
                 if command -v "$cmd" &>/dev/null; then
-                    PYTHON="$cmd"
+                    version=$("$cmd" --version 2>&1)
+                    minor=$(echo "$version" | awk '{print $2}' | cut -d. -f2)
+                    if [[ -n "$minor" && "$minor" -ge 11 && "$minor" -lt 14 ]]; then
+                        PYTHON="$cmd"
+                    fi
                     break
                 fi
             done
         fi
         if [[ -z "$PYTHON" ]]; then
-            echo "  ✗ Could not auto-install Python via winget."
-            echo "    Install Python 3.11+ manually from https://www.python.org/downloads/"
+            echo "  ✗ Could not auto-install a compatible Python via winget."
+            echo "    Install Python 3.11 or 3.12 manually from https://www.python.org/downloads/"
             echo "    Then re-run this script."
             exit 1
         fi
@@ -103,7 +113,8 @@ for cmd in python3.12 python3.11 python3 python; do
         # Parse major.minor — works with "Python 3.12.0" or "Python 3.11"
         major=$(echo "$version" | awk '{print $2}' | cut -d. -f1)
         minor=$(echo "$version" | awk '{print $2}' | cut -d. -f2)
-        if [[ -n "$major" && -n "$minor" && "$major" -ge 3 && "$minor" -ge 11 ]]; then
+        # Require >=3.11, <3.14 (3.14 is too new — packages like torch lack wheels)
+        if [[ -n "$major" && -n "$minor" && "$major" -eq 3 && "$minor" -ge 11 && "$minor" -lt 14 ]]; then
             PYTHON="$cmd"
             echo "  ✓ Found $PYTHON ($version)"
             break
@@ -112,7 +123,10 @@ for cmd in python3.12 python3.11 python3 python; do
 done
 
 if [[ -z "$PYTHON" ]]; then
-    echo "  ✗ Python >=3.11 not found. Install it first (e.g. python3.11-venv)."
+    echo "  ✗ Python 3.11–3.13 not found."
+    echo "    Detected version: $($cmd --version 2>&1 2>/dev/null || echo 'none')"
+    echo "    Install Python 3.11 or 3.12 from https://www.python.org/downloads/"
+    echo "    (Python 3.14+ is not yet supported — packages like torch lack wheels.)"
     exit 1
 fi
 
@@ -171,11 +185,22 @@ if [[ $? -ne 0 ]]; then
 fi
 
 echo "  → Installing Python packages from requirements.txt..."
-pip install -r "$PROJECT_DIR/requirements.txt" 2>&1
-if [[ $? -ne 0 ]]; then
-    echo "  ✗ pip install failed — see output above"
-    exit 1
-fi
+MAX_RETRIES=2
+RETRY_DELAY=3
+for attempt in $(seq 1 $MAX_RETRIES); do
+    pip install -r "$PROJECT_DIR/requirements.txt" 2>&1
+    pip_exit=$?
+    if [[ $pip_exit -eq 0 ]]; then
+        break
+    elif [[ $attempt -lt $MAX_RETRIES ]]; then
+        echo "  → Connection issue? Retrying in ${RETRY_DELAY}s (attempt $((attempt+1))/${MAX_RETRIES})..."
+        sleep $RETRY_DELAY
+    else
+        echo "  ✗ pip install failed after ${MAX_RETRIES} attempts — see output above"
+        echo "    Retry with: pip install -r requirements.txt"
+        exit 1
+    fi
+done
 echo "  ✓ Python deps installed ($(pip list --format=columns 2>/dev/null | wc -l) packages)"
 
 # ── 4. Install npm dependencies ───────────────────────────────────────────────
