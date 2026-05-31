@@ -435,3 +435,16 @@ Usage: `./install_thoughtmachine.sh && ./start_thoughtmachine.sh`
 
 **Files changed:** resources/default_config.json, install_thoughtmachine.sh, resources/global_kb/handbook.md
 
+## Build Scripts
+
+## 2026-05-31 — ## Build Scripts
+
+**2025-07-14**: Created two build scripts ...
+
+## Build Scripts
+
+**2025-07-14**: Created two build scripts for PyInstaller packaging:
+
+- **`build_thoughtmachine_exe.sh`** (Linux/macOS) — Bash script, 5 steps: (1) build React frontend, (2-4) check/install Python deps, (5) run PyInstaller in one-folder (default via `thoughtmachine.spec`) or one-file mode (`ONE_FILE=1`).
+- **`build_thoughtmachine_exe.bat`** (Windows) — Batch script equivalent with same 5 steps. Uses `set ONE_FILE=1` for one-file mode. Uses Windows path separators throughout. Helpers: `:info`, `:ok`, `:warn`, `:err` subroutines.
+

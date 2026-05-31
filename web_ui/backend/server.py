@@ -126,7 +126,31 @@ app = FastAPI(
 
 # ── Frontend serving state (set by --serve-frontend) ─────────────────────
 # Path to the built frontend dist directory
-_FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+# ── Frontend dist path: development vs PyInstaller bundle ─────────────
+# In development:              web_ui/frontend/dist/
+# In PyInstaller one-folder:   <bundle>/frontend_dist/
+# In PyInstaller one-file:     sys._MEIPASS/frontend_dist/
+_MEIPASS = getattr(sys, "_MEIPASS", None)
+if _MEIPASS is not None:
+    # PyInstaller one-file: temp extraction dir
+    _BUNDLE_DIR = Path(_MEIPASS)
+elif getattr(sys, "frozen", False):
+    # PyInstaller one-folder: next to the exe
+    _BUNDLE_DIR = Path(sys.executable).parent
+else:
+    # Normal Python: project root (parent of web_ui/)
+    _BUNDLE_DIR = Path(__file__).resolve().parent.parent.parent
+
+_FRONTEND_DIST_DEV = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+_FRONTEND_DIST_BUNDLE = _BUNDLE_DIR / "frontend_dist"
+
+# Pick the first one that exists
+if _FRONTEND_DIST_BUNDLE.exists():
+    _FRONTEND_DIST = _FRONTEND_DIST_BUNDLE
+elif _FRONTEND_DIST_DEV.exists():
+    _FRONTEND_DIST = _FRONTEND_DIST_DEV
+else:
+    _FRONTEND_DIST = _FRONTEND_DIST_DEV  # fallback (will show build-error page)
 # Whether --serve-frontend was requested (set in main())
 _SERVE_FRONTEND = False
 

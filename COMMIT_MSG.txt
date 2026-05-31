@@ -1,0 +1,24 @@
+feat: PyInstaller packaging infrastructure
+
+Add complete PyInstaller build system for creating standalone
+ThoughtMachine executables on Linux/macOS and Windows.
+
+New files:
+  - thoughtmachine_entry.py — Entry point wrapper that auto-adds
+    --serve-frontend and handles sys.path for PyInstaller bundles
+  - thoughtmachine.spec — PyInstaller spec with hidden imports,
+    data files, excludes, and UPX compression
+  - build_thoughtmachine_exe.sh — Linux/macOS build script (5 steps)
+  - build_thoughtmachine_exe.bat — Windows build script equivalent
+  - PACKAGING.md — Comprehensive packaging guide with quick-start,
+    build modes, troubleshooting, and file reference
+  - start_thoughtmachine.bat — Windows launcher for dev mode
+    (equivalent to start_thoughtmachine.sh)
+
+Modified:
+  - web_ui/backend/server.py — Frontend dist path detection:
+    handles PyInstaller one-file (sys._MEIPASS), one-folder
+    (sys.frozen), and normal development modes
+  - install_thoughtmachine.sh — Shows Windows instructions
+    referencing start_thoughtmachine.bat when run on Windows
+  - development_guides.md — KB entry documenting build scripts
