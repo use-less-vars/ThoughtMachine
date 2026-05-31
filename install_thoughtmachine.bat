@@ -160,13 +160,14 @@ if !ALL_OK!==1 (
 
 REM -- 2. Create venv ---------------------------------------------------------
 echo [2/5] Creating Python virtual environment...
+echo   ..................................................
 
 set "VENV_DIR=%SCRIPT_DIR%.venv"
 
 if exist "%VENV_DIR%\Scripts\activate.bat" (
     echo   [i] Virtual environment already exists at %VENV_DIR%
 ) else (
-    echo   Running: !PYTHON_CMD! -m venv .venv
+    echo   Creating virtual environment (may take 10-20 sec)...
     call !PYTHON_CMD! -m venv "%VENV_DIR%"
     if errorlevel 1 (
         echo(
@@ -185,17 +186,20 @@ echo(
 
 REM -- 3. Install Python dependencies -----------------------------------------
 echo [3/5] Installing Python dependencies...
+echo   ..................................................
 
-echo   Upgrading pip...
-python -m pip install --upgrade pip >nul 2>&1
+echo   [1/4] Upgrading pip...
+python -m pip install --upgrade pip
 if errorlevel 1 (
     echo   [x] pip upgrade failed
     pause
     exit /b 1
 )
-echo   [+] pip upgraded
+echo   [+] pip upgraded (step 1/4 done)
+echo(
 
-echo   Installing core packages (this may take a minute)...
+echo   [2/4] Installing core Python packages...
+echo   This can take 2-5 minutes. Download progress shown below:
 pip install -r "%SCRIPT_DIR%requirements.txt"
 if errorlevel 1 (
     echo(
@@ -204,11 +208,12 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-echo   [+] Core Python packages installed
+echo   [+] Core packages installed (step 2/4 done)
+echo(
 
 if /i "!INSTALL_RAG!"=="true" (
-    echo(
-    echo   Installing RAG dependencies...
+    echo   [3/4] Installing RAG dependencies (sentence-transformers, ChromaDB)...
+    echo   This adds ~500 MB. Download progress shown below:
     if exist "%SCRIPT_DIR%requirements-rag.txt" (
         pip install -r "%SCRIPT_DIR%requirements-rag.txt"
         if errorlevel 1 (
@@ -220,16 +225,18 @@ if /i "!INSTALL_RAG!"=="true" (
     ) else (
         echo   [!] requirements-rag.txt not found, skipping
     )
+    echo(
 )
-echo(
-
-REM -- 4. Install npm dependencies --------------------------------------------
-echo [4/5] Installing npm dependencies...
 
 set "FRONTEND_DIR=%SCRIPT_DIR%web_ui\frontend"
+
+REM -- 4. Install npm dependencies & build frontend ---------------------------
+echo [4/5] Installing npm dependencies...
+echo   ..................................................
+
 if exist "%FRONTEND_DIR%\package.json" (
     pushd "%FRONTEND_DIR%"
-    echo   Installing npm packages (this may take a while)...
+    echo   Running npm install (may take 1-3 minutes)...
     call npm install
     if errorlevel 1 (
         echo(
@@ -239,18 +246,10 @@ if exist "%FRONTEND_DIR%\package.json" (
         exit /b 1
     )
     echo   [+] npm packages installed
-    popd
-) else (
-    echo   [!] Frontend directory not found, skipping
-)
-echo(
-
-REM -- 5. Build frontend ------------------------------------------------------
-echo [5/5] Building frontend...
-
-if exist "%FRONTEND_DIR%\package.json" (
-    pushd "%FRONTEND_DIR%"
-    echo   Running npm run build...
+    echo(
+    echo [5/5] Building frontend...
+    echo   ..................................................
+    echo   Running npm run build (may take 30-60 sec)...
     call npm run build
     if errorlevel 1 (
         echo(
@@ -262,7 +261,7 @@ if exist "%FRONTEND_DIR%\package.json" (
     echo   [+] Frontend built successfully
     popd
 ) else (
-    echo   [!] Skipping frontend build
+    echo   [!] Frontend directory not found, skipping
 )
 echo(
 
