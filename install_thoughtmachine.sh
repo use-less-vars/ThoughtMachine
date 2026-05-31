@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # No -e: we want to continue and report errors ourselves
-set -uo pipefail
+set -o pipefail
 
 # ──────────────────────────────────────────────────────────────────────────────
 # install_thoughtmachine.sh
@@ -22,10 +22,11 @@ echo "[1/5] Checking prerequisites..."
 PYTHON=""
 for cmd in python3.12 python3.11 python3 python; do
     if command -v "$cmd" &>/dev/null; then
-        version=$("$cmd" --version 2>&1 | awk '{print $2}')
-        major=$(echo "$version" | cut -d. -f1)
-        minor=$(echo "$version" | cut -d. -f2)
-        if [[ "$major" -ge 3 && "$minor" -ge 11 ]]; then
+        version=$("$cmd" --version 2>&1)
+        # Parse major.minor — works with "Python 3.12.0" or "Python 3.11"
+        major=$(echo "$version" | awk '{print $2}' | cut -d. -f1)
+        minor=$(echo "$version" | awk '{print $2}' | cut -d. -f2)
+        if [[ -n "$major" && -n "$minor" && "$major" -ge 3 && "$minor" -ge 11 ]]; then
             PYTHON="$cmd"
             echo "  ✓ Found $PYTHON ($version)"
             break
