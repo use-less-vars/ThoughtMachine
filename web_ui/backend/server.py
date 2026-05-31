@@ -97,6 +97,38 @@ _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+# ── Monkey-patch websockets library race condition ──────────────────
+# websockets.legacy.protocol has a race condition: when send_json() is
+# called concurrently from multiple coroutines, two _drain_helper calls
+# can race on _drain_waiter, raising:
+#   AssertionError: assert waiter is None or waiter.cancelled()
+# This patch serialises concurrent drains by awaiting the in-flight
+# waiter instead of asserting.  (Upstream fix in websockets >= 14.0.)
+try:
+    import websockets.legacy.protocol
+    _orig = websockets.legacy.protocol.WebSocketCommonProtocol._drain_helper
+
+    async def _patched_drain_helper(self):
+        if self.connection_lost_waiter.done():
+            raise ConnectionResetError("Connection lost")
+        if not self._paused:
+            return
+        waiter = self._drain_waiter
+        if waiter is not None and not waiter.cancelled():
+            # Another drain is in progress — share it instead of asserting
+            await waiter
+            return
+        waiter = self.loop.create_future()
+        self._drain_waiter = waiter
+        await waiter
+
+    websockets.legacy.protocol.WebSocketCommonProtocol._drain_helper = \
+        _patched_drain_helper
+    log('INFO', 'server',
+        'Patched websockets _drain_helper race condition (concurrent drain)')
+except ImportError:
+    pass  # websockets not installed — nothing to patch
+
 # ── App + lifespan ──────────────────────────────────────────────────────────
 
 # We import bridge lazily inside the lifespan / endpoint to avoid
@@ -193,9 +225,10 @@ async def websocket_endpoint(ws: WebSocket):
             return
         try:
             await ws.send_json(event)
-        except (RuntimeError, ConnectionError) as exc:
-            # Expected during shutdown — websocket already closed
+        except (RuntimeError, ConnectionError, AssertionError) as exc:
+            # Expected during shutdown or websockets race — mark closed
             log('DEBUG', 'server.ws', f'send_event skipped (ws closed): {exc}')
+            ws._closed = True
         except Exception as exc:
             log('ERROR', 'server.ws', f'send_event failed: {exc}\n{traceback.format_exc()}')
 
