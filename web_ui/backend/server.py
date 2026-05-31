@@ -165,8 +165,13 @@ async def websocket_endpoint(ws: WebSocket):
 
     # Asynchronous event sender — queues events to the WebSocket
     async def send_event(event: Dict[str, Any]) -> None:
+        if getattr(ws, '_closed', False):
+            return
         try:
             await ws.send_json(event)
+        except (RuntimeError, ConnectionError) as exc:
+            # Expected during shutdown — websocket already closed
+            log('DEBUG', 'server.ws', f'send_event skipped (ws closed): {exc}')
         except Exception as exc:
             log('ERROR', 'server.ws', f'send_event failed: {exc}\n{traceback.format_exc()}')
 
@@ -819,10 +824,14 @@ async def websocket_endpoint(ws: WebSocket):
 
     except WebSocketDisconnect:
         log('INFO', 'server.ws', f'WebSocket disconnected: {ws.client}')
+        ws._closed = True
     except Exception as exc:
         log('ERROR', 'server.ws', f'WebSocket error: {exc}')
         traceback.print_exc()
+        ws._closed = True
     finally:
+        # Mark closed so pending send_event calls are silently dropped
+        ws._closed = True
         # Cleanup: auto-save open session + stop bridge
         if bridge is not None:
             try:
