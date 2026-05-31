@@ -415,3 +415,23 @@ Two scripts were added to the project root:
 
 Usage: `./install_thoughtmachine.sh && ./start_thoughtmachine.sh`
 
+## Pre-Release Fixes Applied
+
+## 2026-05-31 — **2026-06-02 — Three pre-release fixes applied:**
+
+1. **Fixe...
+
+**2026-06-02 — Three pre-release fixes applied:**
+
+1. **Fixed hardcoded workspace path** (`resources/default_config.json`): Changed `workspace_path` from `"/home/jojo/PycharmProjects/ThoughtMachine-dev"` to `""` — new users no longer get a broken path copied to their config.
+
+2. **Cleaned stale tool names** (`resources/default_config.json`): Removed `"Final"`, `"FinalReport"`, `"RequestUserInteraction"` from `enabled_tools` — these were consolidated into `"Respond"` and no longer exist as tools.
+
+3. **Install script polish** (`install_thoughtmachine.sh`):
+   - Added `chmod +x` for both `start_thoughtmachine.sh` and `install_thoughtmachine.sh` at end of install
+   - Improved completion message: numbered next-steps, mentions auto-config creation, shows URL
+
+4. **Handbook correction** (`resources/global_kb/handbook.md`): Updated "First Run" section to reflect that config is auto-created by the server bootstrap, not manually.
+
+**Files changed:** resources/default_config.json, install_thoughtmachine.sh, resources/global_kb/handbook.md
+

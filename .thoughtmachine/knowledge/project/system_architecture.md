@@ -1982,3 +1982,46 @@ Applied 4 alignment fixes to the bootstrap/resource system:
    - `agent/presenter/state_bridge.py` line 26
    - `agent/config/loader.py` lines 153, 157
    - `web_ui/backend/server.py` was already using `agent_config.json`
+
+## 2026-05-31 — ## Event type duality — final vs agent_responded
+
+**Discover...
+
+## Event type duality — final vs agent_responded
+
+**Discovered:** The event system has a persistent duality:
+- **`'final'`** is emitted on the "no tool calls" direct-answer path (`agent.py:1188`), when the LLM produces content without invoking any tool.
+- **`'agent_responded'`** is emitted when the LLM calls the `Respond` tool (`agent.py:1134`).
+
+The old `'user_interaction_requested'` was properly removed (replaced by `Respond` with `response_type='question'`), but `'final'` remains on the direct-answer path. This may be intentional (signal "agent completed autonomously" vs "agent used a tool to respond") but the retiring engineer's handoff suggests it was supposed to be unified. **Potential inconsistency — needs architectural decision.**
+
+## 2026-05-31 — ## SessionPermissions Model — Landed 2026-06-02
+
+### What wa...
+
+## SessionPermissions Model — Landed 2026-06-02
+
+### What was done
+1. **`SessionPermissions`** Pydantic model added to `thoughtmachine/security.py` with 5 fields matching `DEFAULT_SESSION_PERMISSIONS` in `tool_executor.py`:
+   - `container: bool = False`
+   - `network: bool = False`
+   - `filesystem: Literal['banned','read','write','full'] = 'read'`
+   - `security: Literal['banned','read','write','full'] = 'read'`
+   - `execution: Literal['banned','read','write','full'] = 'banned'`
+   - Includes `to_dict()` helper and `model_config = ConfigDict()`
+
+2. **`AgentConfig.session_permissions`** field added to `agent/config/models.py`:
+   - Type: `Optional[SessionPermissions]`, defaults to `None`
+   - Category: `HOT_SWAPPABLE`
+   - When `None`, `tool_executor` falls back to `DEFAULT_SESSION_PERMISSIONS`
+
+3. **WebSocket pipeline** wire-up in `web_ui/backend/server.py`:
+   - `_FALLBACK_FRONTEND_CONFIG` now includes `session_permissions` with default values
+   - `_translate_frontend_config()` passes the dict through transparently (no special mapping needed)
+   - `_backend_to_frontend_config()` also passes through transparently
+   - Pydantic's `model_dump()` already converts nested models to dicts correctly
+   - `validate_config()` → `AgentConfig(**config_dict)` correctly coerces dict → `SessionPermissions`
+
+### Verified
+- All model construction, coercion, serialization, and translation pipeline works end-to-end
+- Tested with both default and custom permission values

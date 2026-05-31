@@ -34,6 +34,10 @@ class ToolBase(BaseModel):
     # Security capabilities required by this tool
     requires_capabilities: ClassVar[List[str]] = []
 
+    # Permission categories required by this tool (e.g., ['container:true'])
+    # Empty list means no special permissions needed.
+    required_categories: ClassVar[List[str]] = []
+
     # If True, framework-level output truncation is skipped for this tool.
     # Use this for tools whose output must always be complete (e.g., Respond, SummarizeTool).
     skip_output_truncation: ClassVar[bool] = False

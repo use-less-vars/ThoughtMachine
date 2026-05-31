@@ -6,6 +6,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
 from agent.logging import log
 from tools import SIMPLIFIED_TOOL_CLASSES
+from thoughtmachine.security import SessionPermissions
 
 # Category constants for AgentConfig fields
 RESTART_REQUIRED = "restart_required"
@@ -54,6 +55,7 @@ class AgentConfig(BaseModel):
         'enabled_tools': HOT_SWAPPABLE,
         'provider_id': RESTART_REQUIRED,
         'model_override': RESTART_REQUIRED,
+        'session_permissions': HOT_SWAPPABLE,
     }
 
     api_key: str = Field(default='', exclude=True)
@@ -92,6 +94,11 @@ class AgentConfig(BaseModel):
     tool_output_token_limit: int = Field(default=10000, description='Maximum token limit for tool outputs (default 10,000 tokens)')
     detail: Literal['minimal', 'normal', 'verbose'] = Field(default='normal', description='Detail level for event display')
     enabled_tools: List[str] = Field(default_factory=lambda: [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES], description='List of enabled tool class names')
+    session_permissions: Optional[SessionPermissions] = Field(
+        default=None,
+        description='Session permissions profile controlling tool access categories. '
+                    'None = use DEFAULT_SESSION_PERMISSIONS from tool_executor.',
+    )
 
     @field_validator('system_prompt')
     def load_default_system_prompt(cls, v):

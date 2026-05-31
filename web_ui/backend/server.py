@@ -995,7 +995,8 @@ _FALLBACK_FRONTEND_CONFIG = {
     "log_categories": ["SESSION", "LLM", "TOOLS"],
     "max_file_size_mb": 10,
     "max_backup_files": 5,
-    "workspace_path": "/home/jojo/PycharmProjects/ThoughtMachine-dev",
+    "workspace_path": "",
+    # The actual workspace is auto-detected from the project directory at startup
     "rag_enabled": False,
     "rag_embedding_model": "BAAI/bge-small-en-v1.5",
     "rag_vector_store_path": None,
@@ -1007,6 +1008,13 @@ _FALLBACK_FRONTEND_CONFIG = {
     "kb_path": None,
     "tool_output_token_limit": 10000,
     "detail": "normal",
+    "session_permissions": {
+        "container": False,
+        "network": False,
+        "filesystem": "read",
+        "security": "read",
+        "execution": "banned",
+    },
     "enabled_tools": [
         "FileEditor",
         "FilePreviewTool",

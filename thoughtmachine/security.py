@@ -10,11 +10,13 @@ import logging
 import hashlib
 import docker
 from pathlib import Path
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Literal
 from datetime import datetime
 import threading
 import queue
 import uuid
+
+from pydantic import BaseModel, Field, ConfigDict
 
 # Try to import the logging facade and types
 try:
@@ -59,6 +61,48 @@ class DockerSetupError(SecurityError):
 class CapabilityDeniedError(SecurityError):
     """Raised when a capability check fails."""
     pass
+
+
+class SessionPermissions(BaseModel):
+    """
+    Session-level permissions profile controlling tool access categories.
+
+    Maps to the five-category permission system used by
+    ``tool_executor._check_permissions()``:
+
+    - **container**:  Boolean — may the tool spawn containers?
+    - **network**:    Boolean — may the tool access the network?
+    - **filesystem**: ``'banned' | 'read' | 'write' | 'full'``
+    - **security**:   ``'banned' | 'read' | 'write' | 'full'``
+    - **execution**:  ``'banned' | 'read' | 'write' | 'full'``
+    """
+
+    container: bool = Field(
+        default=False,
+        description='May the tool spawn containers?',
+    )
+    network: bool = Field(
+        default=False,
+        description='May the tool access the network?',
+    )
+    filesystem: Literal['banned', 'read', 'write', 'full'] = Field(
+        default='read',
+        description='Filesystem access level for the session.',
+    )
+    security: Literal['banned', 'read', 'write', 'full'] = Field(
+        default='read',
+        description='Security-related operations access level.',
+    )
+    execution: Literal['banned', 'read', 'write', 'full'] = Field(
+        default='banned',
+        description='Code execution access level for the session.',
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return permissions as a plain dict (for JSON serialization)."""
+        return self.model_dump()
+
+    model_config = ConfigDict()
 
 
 def set_logger(logger: Optional[Any]) -> None:

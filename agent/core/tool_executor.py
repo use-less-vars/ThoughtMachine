@@ -13,6 +13,84 @@ from agent.core.turn_transaction import TurnTransaction
 from tools.respond import Respond
 from tools.summarize_tool import SummarizeTool
 
+
+# ---------------------------------------------------------------------------
+# Default session permissions profile (five categories)
+# ---------------------------------------------------------------------------
+# The tooling engineer will wire this to real session permissions later.
+# For now, it provides the hardcoded default that _check_permissions uses.
+DEFAULT_SESSION_PERMISSIONS = {
+    "container": False,
+    "network": False,
+    "filesystem": "read",
+    "security": "read",
+    "execution": "banned",
+}
+
+
+def _value_satisfies(required: str, allowed: object) -> bool:
+    """
+    Check whether a single required value is satisfied by the allowed setting.
+
+    Supports boolean and string levels:
+      - Boolean required 'true' / 'false' matches the allowed bool directly.
+      - String levels: 'banned' < 'read' < 'write' < 'full'.
+      - Exact string match also works.
+    """
+    # Normalise required value
+    if required.lower() in ("true", "yes"):
+        required_val = True
+    elif required.lower() in ("false", "no"):
+        required_val = False
+    else:
+        required_val = required  # keep as string (e.g. "read", "write")
+
+    if isinstance(allowed, bool):
+        if isinstance(required_val, bool):
+            return allowed == required_val or allowed is True  # True satisfies everything
+        # String required vs bool allowed – True satisfies all, False satisfies nothing
+        return allowed is True
+
+    # Both are strings – compare by hierarchy
+    _level_map = {"banned": 0, "read": 1, "write": 2, "full": 3}
+    req_level = _level_map.get(str(required_val).lower(), 0)
+    all_level = _level_map.get(str(allowed).lower(), 0)
+    return all_level >= req_level
+
+
+def _check_permissions(
+    required_categories: list, session_permissions: dict | None = None
+) -> str | None:
+    """
+    Check whether *all* required categories are satisfied by the session profile.
+
+    Args:
+        required_categories: List of strings like ["container:true", "filesystem:write"].
+        session_permissions: Dict of category → value (bool or str level).
+                            Falls back to DEFAULT_SESSION_PERMISSIONS.
+
+    Returns:
+        None if all checks pass.
+        Error message string if any check fails.
+    """
+    if session_permissions is None:
+        session_permissions = DEFAULT_SESSION_PERMISSIONS
+
+    for req in required_categories:
+        if ":" not in req:
+            continue  # malformed, skip
+        category, required_value = req.split(":", 1)
+        allowed = session_permissions.get(category)
+        if allowed is None:
+            return f"Permission denied: Unknown category '{category}' required by tool"
+        if not _value_satisfies(required_value, allowed):
+            return (
+                f"Permission denied: Tool requires {category}:{required_value} "
+                f"but session allows {category}:{allowed}"
+            )
+
+    return None
+
 class ToolExecutor:
     """Handles tool execution, JSON repair, and tool result processing."""
 
@@ -34,11 +112,6 @@ class ToolExecutor:
         self.logger = logger
         self.security_available = security_available
         self.agent = agent
-        if security_available:
-            from thoughtmachine.security import CapabilityRegistry
-            self.CapabilityRegistry = CapabilityRegistry
-        else:
-            self.CapabilityRegistry = None
 
     def execute_tool_calls(self, tool_calls: List[Dict[str, Any]], add_to_conversation_func, update_token_func=None, agent_id: int = 0, turn_transaction: Optional[TurnTransaction]=None) -> Tuple[List[Dict[str, Any]], bool, Optional[Dict[str, Any]], Optional[str], Optional[int]]:
         """
@@ -166,17 +239,10 @@ class ToolExecutor:
                 tool_args['workspace_path'] = self.config.workspace_path
             if self.config.tool_output_token_limit is not None:
                 tool_args['token_limit'] = self.config.tool_output_token_limit
-            if self.security_available and self.CapabilityRegistry:
-                security_config = None
-                if self.state and hasattr(self.state, 'security_config'):
-                    security_config = self.state.security_config
-                try:
-                    allowed = self.CapabilityRegistry.check(agent_id, tool_name, security_config=security_config, **tool_args)
-                    if not allowed:
-                        raise ValueError('Security check denied: insufficient capabilities')
-                except Exception as e:
-                    tool_result = f'Security check failed: {e}'
-                    raise
+            # Check permission categories before executing
+            error = _check_permissions(tool_class.required_categories)
+            if error is not None:
+                return {'result': error, 'tool_type': 'normal'}
             tool_instance = tool_class(**tool_args)
             if self.logger:
                 if hasattr(self.logger, 'py_logger'):
