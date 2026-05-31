@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# No -e: we want to continue and report errors ourselves
+set -uo pipefail
 
 # ──────────────────────────────────────────────────────────────────────────────
 # install_thoughtmachine.sh
@@ -19,7 +20,7 @@ echo ""
 echo "[1/5] Checking prerequisites..."
 
 PYTHON=""
-for cmd in python3.12 python3.11 python3; do
+for cmd in python3.12 python3.11 python3 python; do
     if command -v "$cmd" &>/dev/null; then
         version=$("$cmd" --version 2>&1 | awk '{print $2}')
         major=$(echo "$version" | cut -d. -f1)
@@ -54,24 +55,49 @@ echo "  ✓ npm ($(npm --version))"
 # ── 2. Create venv ────────────────────────────────────────────────────────────
 echo ""
 echo "[2/5] Creating Python virtual environment..."
+echo "  → Using: $PYTHON"
 
 VENV_DIR="$PROJECT_DIR/.venv"
 if [[ -d "$VENV_DIR" ]]; then
     echo "  → Venv already exists at $VENV_DIR"
 else
-    "$PYTHON" -m venv "$VENV_DIR"
-    echo "  ✓ Created venv at $VENV_DIR"
+    echo "  → Running: $PYTHON -m venv .venv"
+    if "$PYTHON" -m venv "$VENV_DIR"; then
+        echo "  ✓ Created venv at $VENV_DIR"
+    else
+        echo "  ✗ Failed to create venv. Try: apt install python3-venv"
+        exit 1
+    fi
 fi
 
-source "$VENV_DIR/bin/activate"
+# Activate — handle both Linux (bin/) and Windows (Scripts/)
+if [[ -f "$VENV_DIR/bin/activate" ]]; then
+    source "$VENV_DIR/bin/activate"
+elif [[ -f "$VENV_DIR/Scripts/activate" ]]; then
+    source "$VENV_DIR/Scripts/activate"
+else
+    echo "  ✗ Cannot find venv activate script"
+    exit 1
+fi
 echo "  → Activated: $(which python)"
 
 # ── 3. Install Python dependencies ────────────────────────────────────────────
 echo ""
 echo "[3/5] Installing Python dependencies..."
 
-pip install --upgrade pip --quiet
-pip install -r "$PROJECT_DIR/requirements.txt" --quiet
+echo "  → Upgrading pip..."
+pip install --upgrade pip 2>&1
+if [[ $? -ne 0 ]]; then
+    echo "  ✗ pip upgrade failed"
+    exit 1
+fi
+
+echo "  → Installing Python packages from requirements.txt..."
+pip install -r "$PROJECT_DIR/requirements.txt" 2>&1
+if [[ $? -ne 0 ]]; then
+    echo "  ✗ pip install failed — see output above"
+    exit 1
+fi
 echo "  ✓ Python deps installed ($(pip list --format=columns 2>/dev/null | wc -l) packages)"
 
 # ── 4. Install npm dependencies ───────────────────────────────────────────────
@@ -81,7 +107,12 @@ echo "[4/5] Installing npm dependencies..."
 FRONTEND_DIR="$PROJECT_DIR/web_ui/frontend"
 if [[ -d "$FRONTEND_DIR" ]]; then
     cd "$FRONTEND_DIR"
-    npm install --silent
+    echo "  → Installing npm packages (this may take a while)..."
+    npm install 2>&1
+    if [[ $? -ne 0 ]]; then
+        echo "  ✗ npm install failed — see output above"
+        exit 1
+    fi
     echo "  ✓ npm deps installed"
     cd "$PROJECT_DIR"
 else
@@ -94,8 +125,13 @@ echo "[5/5] Building frontend..."
 
 if [[ -d "$FRONTEND_DIR" ]]; then
     cd "$FRONTEND_DIR"
-    npm run build
-    echo "  ✓ Frontend built → $FRONTEND_DIR/dist/"
+    echo "  → Building frontend bundle..."
+    if npm run build 2>&1; then
+        echo "  ✓ Frontend built → $FRONTEND_DIR/dist/"
+    else
+        echo "  ✗ Frontend build failed — see output above"
+        exit 1
+    fi
     cd "$PROJECT_DIR"
 else
     echo "  ! Skipping frontend build."
@@ -104,8 +140,8 @@ fi
 # ── Make scripts executable ────────────────────────────────────────────
 echo ""
 echo "[+] Making scripts executable..."
-chmod +x "$PROJECT_DIR/start_thoughtmachine.sh"
-chmod +x "$PROJECT_DIR/install_thoughtmachine.sh"
+chmod +x "$PROJECT_DIR/start_thoughtmachine.sh" 2>/dev/null || true
+chmod +x "$PROJECT_DIR/install_thoughtmachine.sh" 2>/dev/null || true
 echo "  ✓ Scripts are now executable"
 
 echo ""
