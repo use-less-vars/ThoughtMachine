@@ -1,38 +1,42 @@
 @echo off
 REM ──────────────────────────────────────────────────────────────────────────────
 REM install_thoughtmachine.bat
-REM  Windows-native install script for ThoughtMachine.
-REM  Creates venv, installs Python deps, installs npm deps & builds frontend.
+REM  Windows installer for ThoughtMachine.
+REM  Checks prerequisites, then creates venv, installs deps, builds frontend.
+REM
+REM  Prerequisites (install manually if missing):
+REM    - Python 3.11 or 3.12 from https://www.python.org/downloads/
+REM    - Node.js LTS from https://nodejs.org/
 REM ──────────────────────────────────────────────────────────────────────────────
 
 setlocal enabledelayedexpansion
+cd /d "%~dp0"
 
 set "SCRIPT_DIR=%~dp0"
-set "PROJECT_DIR=%SCRIPT_DIR%"
 
 echo ============================================
-echo   ThoughtMachine — Install (Windows)
+echo   ThoughtMachine — Install
 echo ============================================
 echo.
 
-REM ── Parse flags ────────────────────────────────────────────────────────────
+REM ── Parse flags ─────────────────────────────────────────────────────────────
 set INSTALL_RAG=false
 
 :parse_args
 if not "%~1"=="" (
     if /i "%~1"=="--with-rag" (
         set INSTALL_RAG=true
-        echo   ^> RAG support requested (codebase search, embeddings)
+        echo   [i] RAG support enabled (codebase search embeddings)
     ) else if /i "%~1"=="--help" (
         goto :show_help
     ) else if /i "%~1"=="-h" (
         goto :show_help
     ) else (
-        echo   ^? Unknown argument: %~1
+        echo   [x] Unknown argument: %~1
+        echo.
         echo   Usage: %~nx0 [--with-rag]
         echo.
-        echo     --with-rag    Also install RAG dependencies (sentence-transformers,
-        echo                   ChromaDB, CPU-only PyTorch ~500 MB)
+        echo     --with-rag    Also install RAG dependencies
         echo     --help, -h    Show this help
         pause
         exit /b 1
@@ -49,16 +53,16 @@ echo     --with-rag    Also install RAG dependencies (sentence-transformers,
 echo                   ChromaDB, CPU-only PyTorch ~500 MB)
 echo     --help, -h    Show this help
 echo.
+echo   Prerequisites (install manually if missing):
+echo     - Python 3.11+  from https://www.python.org/downloads/
+echo     - Node.js LTS   from https://nodejs.org/
+echo.
 pause
 exit /b 0
 
 :after_help
 
-REM ── 0. Enforce admin for winget auto-install (optional) ─────────────────────
-REM    We don't require admin, but winget install needs it.
-REM    If Python/Node are missing, the user may need to install manually.
-
-REM ── 1. Check prerequisites ────────────────────────────────────────────────────
+REM ── 1. Check prerequisites ─────────────────────────────────────────────────
 echo.
 echo [1/5] Checking prerequisites...
 echo.
@@ -68,22 +72,11 @@ set PYTHON_CMD=
 for %%c in (python3.12 python3.11 python3 python py) do (
     where %%c >nul 2>nul
     if not errorlevel 1 (
-        for /f "tokens=2 delims= " %%v in ('%%c --version 2^>nul') do (
-            set PYTHON_VER=%%v
-        )
+        for /f "tokens=2 delims= " %%v in ('%%c --version 2^>nul') do set PYTHON_VER=%%v
         if defined PYTHON_VER (
             for /f "tokens=1,2 delims=." %%a in ("!PYTHON_VER!") do (
-                set PY_MAJOR=%%a
-                set PY_MINOR=%%b
-            )
-            if !PY_MAJOR!==3 (
-                if !PY_MINOR! GEQ 11 (
+                if %%a==3 if %%b GEQ 11 (
                     set PYTHON_CMD=%%c
-                    echo   ^^! Found %%c (Python !PYTHON_VER!)
-                    if !PY_MINOR! GEQ 14 (
-                        echo   ^?  Python !PY_MAJOR!.!PY_MINOR! is very new — some packages may lack wheels.
-                        echo      If pip install fails, try Python 3.11 or 3.12.
-                    )
                     goto :python_found
                 )
             )
@@ -91,193 +84,169 @@ for %%c in (python3.12 python3.11 python3 python py) do (
     )
 )
 
-REM Python not found — try winget
-echo   ^> Python not found. Attempting auto-install via winget...
-echo   (Pin: Python 3.12 — 3.14+ lacks package wheels)
+echo   [x] Python 3.11 or 3.12 is required but was not found.
 echo.
-echo   Note: winget auto-install may require administrator privileges.
-echo   If it fails, install Python 3.12 manually from https://www.python.org/downloads/
-echo   Then re-run this script.
+echo       Download and install it from:
+echo         https://www.python.org/downloads/
 echo.
-winget install --silent --accept-package-agreements Python.Python.3.12 2>nul
-if errorlevel 1 (
-    winget install --silent --accept-package-agreements Python.Python.3.11 2>nul
-)
-REM Check again
-for %%c in (python3.12 python3.11 python3 python py) do (
-    where %%c >nul 2>nul
-    if not errorlevel 1 (
-        for /f "tokens=2 delims= " %%v in ('%%c --version 2^>nul') do (
-            set PYTHON_VER=%%v
-        )
-        if defined PYTHON_VER (
-            for /f "tokens=1,2 delims=." %%a in ("!PYTHON_VER!") do (
-                set PY_MAJOR=%%a
-                set PY_MINOR=%%b
-            )
-            if !PY_MAJOR!==3 if !PY_MINOR! GEQ 11 (
-                set PYTHON_CMD=%%c
-                echo   ^^! Python installed: !PYTHON_VER!
-                goto :python_found
-            )
-        )
-    )
-)
-
-echo   ^? Python 3.11+ not found and could not be auto-installed.
-echo   Install Python 3.12 from https://www.python.org/downloads/
-echo   Make sure to check "Add Python to PATH" during installation.
-echo   Then re-run this script.
+echo       Make sure to check "Add Python to PATH" during installation.
+echo       Python 3.12 is recommended (3.14+ may lack package wheels).
+echo.
 pause
 exit /b 1
 
 :python_found
-echo.
+echo   [✓] %PYTHON_CMD% (Python %PYTHON_VER%)
 
 REM Check Node.js
 where node >nul 2>nul
 if errorlevel 1 (
-    echo   ^> Node.js not found. Attempting auto-install via winget...
-    echo   Note: winget auto-install may require administrator privileges.
-    echo   If it fails, install Node.js LTS manually from https://nodejs.org/
     echo.
-    winget install --silent --accept-package-agreements OpenJS.NodeJS.LTS 2>nul
-    where node >nul 2>nul
-    if errorlevel 1 (
-        echo   ^? Node.js not found and could not be auto-installed.
-        echo   Install Node.js LTS from https://nodejs.org/
-        echo   Then re-run this script.
-        pause
-        exit /b 1
-    )
+    echo   [x] Node.js is required but was not found.
+    echo.
+    echo       Download and install it from:
+    echo         https://nodejs.org/  (LTS version)
+    echo.
+    pause
+    exit /b 1
 )
 
-for /f "tokens=1 delims=v" %%v in ('node --version 2^>nul') do set NODE_VER=%%v
-if not defined NODE_VER set NODE_VER=unknown
-echo   ^^! Node.js (!NODE_VER!)
-echo   ^^! npm (!NODE_VER!)
+for /f "tokens=1 delims=v" %%v in ('node --version') do set NODE_VER=%%v
+echo   [✓] Node.js (v%NODE_VER%)
 
-REM ── 2. Create venv ────────────────────────────────────────────────────────────
+REM Check npm
+where npm >nul 2>nul
+if errorlevel 1 (
+    echo   [x] npm was not found (it should come with Node.js).
+    pause
+    exit /b 1
+)
+for /f %%v in ('npm --version') do set NPM_VER=%%v
+echo   [✓] npm (v%NPM_VER%)
 echo.
-echo [2/5] Creating Python virtual environment...
-echo   ^> Using: !PYTHON_CMD!
+echo   All prerequisites met. Starting install...
+echo.
 
-set "VENV_DIR=%PROJECT_DIR%.venv"
+REM ── 2. Create venv ─────────────────────────────────────────────────────────
+echo [2/5] Creating Python virtual environment...
+
+set "VENV_DIR=%SCRIPT_DIR%.venv"
 
 if exist "%VENV_DIR%\Scripts\activate.bat" (
-    echo   ^> Venv already exists at %VENV_DIR%
+    echo   [i] Virtual environment already exists at %VENV_DIR%
 ) else (
-    echo   ^> Running: !PYTHON_CMD! -m venv .venv
+    echo   Running: !PYTHON_CMD! -m venv .venv
     call !PYTHON_CMD! -m venv "%VENV_DIR%"
     if errorlevel 1 (
-        echo   ^? Failed to create venv.
-        echo   Try: !PYTHON_CMD! -m ensurepip --upgrade
+        echo.
+        echo   [x] Failed to create virtual environment.
+        echo       Try reinstalling Python with "pip" included.
         pause
         exit /b 1
     )
-    echo   ^^! Created venv at %VENV_DIR%
+    echo   [✓] Created virtual environment
 )
 
 REM Activate
-if exist "%VENV_DIR%\Scripts\activate.bat" (
-    call "%VENV_DIR%\Scripts\activate.bat"
-) else (
-    echo   ^? Cannot find venv activate script at %VENV_DIR%\Scripts\activate.bat
-    pause
-    exit /b 1
-)
-echo   ^> Activated: %VENV_DIR%
-
-REM ── 3. Install Python dependencies ────────────────────────────────────────────
+call "%VENV_DIR%\Scripts\activate.bat"
+echo   [✓] Virtual environment activated
 echo.
+
+REM ── 3. Install Python dependencies ─────────────────────────────────────────
 echo [3/5] Installing Python dependencies...
 
-echo   ^> Upgrading pip...
-python -m pip install --upgrade pip
+echo   Upgrading pip...
+python -m pip install --upgrade pip >nul 2>&1
 if errorlevel 1 (
-    echo   ^? pip upgrade failed
+    echo   [x] pip upgrade failed
     pause
     exit /b 1
 )
+echo   [✓] pip upgraded
 
-echo   ^> Installing core Python packages from requirements.txt...
-pip install -r "%PROJECT_DIR%requirements.txt"
+echo   Installing core packages (this may take a minute)...
+pip install -r "%SCRIPT_DIR%requirements.txt"
 if errorlevel 1 (
-    echo   ^? pip install failed — see output above
-    echo   Try: pip install --pre -r requirements.txt
+    echo.
+    echo   [x] pip install failed. Try:
+    echo       pip install --pre -r requirements.txt
     pause
     exit /b 1
 )
-echo   ^^! Core Python deps installed
+echo   [✓] Core Python packages installed
 
 if /i "!INSTALL_RAG!"=="true" (
     echo.
-    echo   ^> Installing RAG dependencies (CPU-only PyTorch, ChromaDB, etc.)...
-    if exist "%PROJECT_DIR%requirements-rag.txt" (
-        pip install -r "%PROJECT_DIR%requirements-rag.txt"
+    echo   Installing RAG dependencies...
+    if exist "%SCRIPT_DIR%requirements-rag.txt" (
+        pip install -r "%SCRIPT_DIR%requirements-rag.txt"
         if errorlevel 1 (
-            echo   ^?  RAG installation had issues (exit code !errorlevel!)
-            echo      You can install manually later: pip install -r requirements-rag.txt
+            echo   [!] RAG install had issues. You can retry later:
+            echo       pip install -r requirements-rag.txt
         ) else (
-            echo   ^^! RAG dependencies installed
+            echo   [✓] RAG dependencies installed
         )
     ) else (
-        echo   ! requirements-rag.txt not found, skipping RAG install
+        echo   [!] requirements-rag.txt not found, skipping
     )
 )
-
-REM ── 4. Install npm dependencies ───────────────────────────────────────────────
 echo.
+
+REM ── 4. Install npm dependencies ────────────────────────────────────────────
 echo [4/5] Installing npm dependencies...
 
-set "FRONTEND_DIR=%PROJECT_DIR%web_ui\frontend"
+set "FRONTEND_DIR=%SCRIPT_DIR%web_ui\frontend"
 if exist "%FRONTEND_DIR%\package.json" (
     pushd "%FRONTEND_DIR%"
-    echo   ^> Installing npm packages (this may take a while)...
+    echo   Installing npm packages (this may take a while)...
     call npm install
     if errorlevel 1 (
-        echo   ^? npm install failed — see output above
+        echo.
+        echo   [x] npm install failed
         popd
         pause
         exit /b 1
     )
-    echo   ^^! npm deps installed
+    echo   [✓] npm packages installed
     popd
 ) else (
-    echo   ! Frontend directory not found at %FRONTEND_DIR%, skipping.
+    echo   [!] Frontend directory not found, skipping
 )
-
-REM ── 5. Build frontend ─────────────────────────────────────────────────────────
 echo.
+
+REM ── 5. Build frontend ──────────────────────────────────────────────────────
 echo [5/5] Building frontend...
 
 if exist "%FRONTEND_DIR%\package.json" (
     pushd "%FRONTEND_DIR%"
-    echo   ^> Building frontend bundle...
+    echo   Running npm run build...
     call npm run build
     if errorlevel 1 (
-        echo   ^? Frontend build failed — see output above
+        echo.
+        echo   [x] Frontend build failed
         popd
         pause
         exit /b 1
     )
-    echo   ^^! Frontend built
+    echo   [✓] Frontend built successfully
     popd
 ) else (
-    echo   ! Skipping frontend build.
+    echo   [!] Skipping frontend build
 )
-
 echo.
+
+REM ── Done ───────────────────────────────────────────────────────────────────
 echo ============================================
-echo   ^^! Install complete!
+echo   [✓] Install complete!
 echo.
 echo   Next steps:
+echo.
 echo     1. Double-click: start_thoughtmachine.bat
 echo.
 echo     2. Open http://127.0.0.1:8000 in your browser
 echo.
-echo   Your config file will be created automatically
-echo   at %%USERPROFILE%%\.thoughtmachine\agent_config.json on first run.
+echo   Config is created automatically on first run at:
+echo     %%USERPROFILE%%\.thoughtmachine\agent_config.json
 echo ============================================
 echo.
 
