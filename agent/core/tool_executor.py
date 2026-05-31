@@ -234,7 +234,7 @@ class ToolExecutor:
             except ValidationError as e:
                 return {'result': f'Invalid arguments: {e}', 'tool_type': 'normal'}
             # Now inject infrastructure fields (safe because validation passed)
-            if self.config.workspace_path is not None:
+            if self.config.workspace_path:
                 tool_args['workspace_path'] = self.config.workspace_path
             if self.config.tool_output_token_limit is not None:
                 tool_args['token_limit'] = self.config.tool_output_token_limit

@@ -256,7 +256,7 @@ class ToolBase(BaseModel):
                 raise
         else:
             # Fallback to original implementation
-            if self.workspace_path is None:
+            if not self.workspace_path:
                 # No restrictions
                 return os.path.abspath(path)
 

@@ -154,7 +154,7 @@ def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] =
     original_path = path
     
     # If workspace_path is provided, treat relative paths as relative to workspace_path
-    if workspace_path is not None and not os.path.isabs(path):
+    if workspace_path and not os.path.isabs(path):
         # Join with workspace_path
         path = os.path.join(workspace_path, path)
     
@@ -168,7 +168,7 @@ def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] =
     target_abs = requested_abs
     
     # If no workspace restriction, return canonical path if possible
-    if workspace_path is None:
+    if not workspace_path:
         try:
             return os.path.realpath(target_abs)
         except Exception:
