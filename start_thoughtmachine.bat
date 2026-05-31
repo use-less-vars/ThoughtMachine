@@ -20,7 +20,7 @@ if not exist "%VENV_DIR%\Scripts\activate.bat" (
     echo ✗ Virtual environment not found at %VENV_DIR%
     echo.
     echo   Run the install script first:
-    echo     bash install_thoughtmachine.sh
+    echo     install_thoughtmachine.bat
     pause
     exit /b 1
 )

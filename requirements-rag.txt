@@ -1,0 +1,16 @@
+# RAG (Retrieval-Augmented Generation) dependencies
+# Install these if you want codebase search / semantic embedding features.
+#
+# Usage:
+#   pip install -r requirements-rag.txt
+#
+# CPU-only PyTorch is used to avoid downloading 4+ GB of CUDA GPU libraries.
+# If you have an NVIDIA GPU and want GPU acceleration, replace the torch line with:
+#   torch
+# (this will pull in nvidia-cuda-*, triton, etc.)
+
+torch --index-url https://download.pytorch.org/whl/cpu
+sentence-transformers>=3.0.0
+chromadb>=0.5.0
+langchain>=0.3.0
+langchain-community>=0.3.0
