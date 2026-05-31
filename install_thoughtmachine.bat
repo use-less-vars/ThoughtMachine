@@ -5,7 +5,7 @@ REM  Windows installer for ThoughtMachine.
 REM  Checks prerequisites, then creates venv, installs deps, builds frontend.
 REM
 REM  Prerequisites (install manually if missing):
-REM    - Python 3.11 or 3.12 from https://www.python.org/downloads/
+REM    - Python 3.11-3.13 from https://www.python.org/downloads/
 REM    - Node.js LTS from https://nodejs.org/
 REM ---------------------------------------------------------------------------
 
@@ -13,6 +13,8 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 set "SCRIPT_DIR=%~dp0"
+set "LOG=%SCRIPT_DIR%install.log"
+echo Install started: %date% %time% > "%LOG%"
 
 echo ============================================
 echo   ThoughtMachine - Install
@@ -72,9 +74,11 @@ for %%c in (python3.12 python3.11 python3 python py) do (
     if not errorlevel 1 (
         for /f "tokens=2 delims= " %%v in ('%%c --version 2^>nul') do set PYTHON_VER=%%v
         if defined PYTHON_VER (
-            for /f "tokens=1,2 delims=." %%a in ("!PYTHON_VER!") do (
-                if %%a==3 if %%b GEQ 11 if %%b LEQ 13 (
-                    set PYTHON_CMD=%%c
+            REM Save %%c before inner loop shadows it
+            set CMD_NAME=%%c
+            for /f "tokens=1,2 delims=." %%x in ("!PYTHON_VER!") do (
+                if %%x==3 if %%y GEQ 11 if %%y LEQ 13 (
+                    set PYTHON_CMD=!CMD_NAME!
                     set PYTHON_OK=1
                 )
             )
@@ -188,17 +192,18 @@ REM -- 3. Install Python dependencies -----------------------------------------
 echo [3/5] Installing Python dependencies...
 echo   ..................................................
 
-echo   [1/4] Upgrading pip...
+echo   [Step 1] Upgrading pip...
 python -m pip install --upgrade pip
 if errorlevel 1 (
     echo   [x] pip upgrade failed
+    echo   Check %LOG% for details
     pause
     exit /b 1
 )
-echo   [+] pip upgraded (step 1/4 done)
+echo   [+] pip upgraded (step 1 done)
 echo(
 
-echo   [2/4] Installing core Python packages...
+echo   [Step 2] Installing core Python packages...
 echo   This can take 2-5 minutes. Download progress shown below:
 pip install -r "%SCRIPT_DIR%requirements.txt"
 if errorlevel 1 (
@@ -208,11 +213,11 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-echo   [+] Core packages installed (step 2/4 done)
+echo   [+] Core packages installed (step 2 done)
 echo(
 
 if /i "!INSTALL_RAG!"=="true" (
-    echo   [3/4] Installing RAG dependencies (sentence-transformers, ChromaDB)...
+    echo   [Step 3] Installing RAG dependencies (sentence-transformers, ChromaDB)...
     echo   This adds ~500 MB. Download progress shown below:
     if exist "%SCRIPT_DIR%requirements-rag.txt" (
         pip install -r "%SCRIPT_DIR%requirements-rag.txt"
