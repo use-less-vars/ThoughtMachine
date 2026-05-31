@@ -448,3 +448,19 @@ Usage: `./install_thoughtmachine.sh && ./start_thoughtmachine.sh`
 - **`build_thoughtmachine_exe.sh`** (Linux/macOS) — Bash script, 5 steps: (1) build React frontend, (2-4) check/install Python deps, (5) run PyInstaller in one-folder (default via `thoughtmachine.spec`) or one-file mode (`ONE_FILE=1`).
 - **`build_thoughtmachine_exe.bat`** (Windows) — Batch script equivalent with same 5 steps. Uses `set ONE_FILE=1` for one-file mode. Uses Windows path separators throughout. Helpers: `:info`, `:ok`, `:warn`, `:err` subroutines.
 
+## Requirements
+
+## 2026-05-31 — ## Requirements Split (2025-07-14)
+
+Split `requirements.txt`...
+
+## Requirements Split (2025-07-14)
+
+Split `requirements.txt` into core + optional RAG to reduce venv bloat:
+
+- **`requirements.txt`** — Core dependencies only (FastAPI, uvicorn, pydantic, openai, anthropic, tiktoken, docker, etc.). ~200 MB venv.
+- **`requirements-rag.txt`** — Optional RAG stack (CPU-only PyTorch via `--index-url`, sentence-transformers, chromadb, langchain). ~500 MB extra.
+- **`install_thoughtmachine.sh`** — Now accepts `--with-rag` flag to install RAG deps.
+
+Removed from core: `PyQt6` (legacy GUI, not needed for web UI), `sentence-transformers`, `chromadb`, `langchain`, `langchain-community`.
+

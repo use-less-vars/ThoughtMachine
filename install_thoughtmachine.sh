@@ -14,6 +14,32 @@ PROJECT_DIR="$SCRIPT_DIR"
 echo "============================================"
 echo "  ThoughtMachine — Install"
 echo "============================================"
+echo ""
+
+# ── Parse flags ────────────────────────────────────────────────────────────
+INSTALL_RAG=false
+for arg in "$@"; do
+    case "$arg" in
+        --with-rag)
+            INSTALL_RAG=true
+            echo "  → RAG support requested (codebase search, embeddings)"
+            ;;
+        --help|-h)
+            echo "  Usage: $0 [--with-rag]"
+            echo ""
+            echo "    --with-rag    Also install RAG dependencies (sentence-transformers,"
+            echo "                  ChromaDB, CPU-only PyTorch ~500 MB)"
+            echo "    --help, -h    Show this help"
+            echo ""
+            exit 0
+            ;;
+        *)
+            echo "  ✗ Unknown argument: $arg"
+            echo "    Usage: $0 [--with-rag]"
+            exit 1
+            ;;
+    esac
+done
 
 # ── Detect OS ────────────────────────────────────────────────────────────────
 IS_WINDOWS=false
@@ -187,7 +213,7 @@ if [[ $? -ne 0 ]]; then
     exit 1
 fi
 
-echo "  → Installing Python packages from requirements.txt..."
+echo "  → Installing core Python packages from requirements.txt..."
 MAX_RETRIES=2
 RETRY_DELAY=3
 for attempt in $(seq 1 $MAX_RETRIES); do
@@ -205,7 +231,24 @@ for attempt in $(seq 1 $MAX_RETRIES); do
         exit 1
     fi
 done
-echo "  ✓ Python deps installed ($(pip list --format=columns 2>/dev/null | wc -l) packages)"
+echo "  ✓ Core Python deps installed ($(pip list --format=columns 2>/dev/null | wc -l) packages)"
+
+if $INSTALL_RAG; then
+    echo ""
+    echo "  → Installing RAG dependencies (CPU-only PyTorch, ChromaDB, etc.)..."
+    if [[ -f "$PROJECT_DIR/requirements-rag.txt" ]]; then
+        pip install -r "$PROJECT_DIR/requirements-rag.txt" 2>&1
+        rag_exit=$?
+        if [[ $rag_exit -eq 0 ]]; then
+            echo "  ✓ RAG dependencies installed"
+        else
+            echo "  ⚠  RAG installation had issues (exit code $rag_exit)"
+            echo "     You can install manually later: pip install -r requirements-rag.txt"
+        fi
+    else
+        echo "  ! requirements-rag.txt not found, skipping RAG install"
+    fi
+fi
 
 # ── 4. Install npm dependencies ───────────────────────────────────────────────
 echo ""
