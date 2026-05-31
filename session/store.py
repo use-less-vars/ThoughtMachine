@@ -216,6 +216,7 @@ class FileSystemSessionStore(SessionStore):
         }
         temp_path = meta_path.with_suffix('.tmp')
         try:
+            os.makedirs(os.path.dirname(temp_path), exist_ok=True)
             with open(temp_path, 'w') as f:
                 json.dump(meta, f)
             temp_path.replace(meta_path)
@@ -265,6 +266,7 @@ class FileSystemSessionStore(SessionStore):
         temp_path = new_path.with_suffix('.tmp')
         logger.debug(f"[SessionStore] Writing to {temp_path} (atomic)")
         try:
+            os.makedirs(os.path.dirname(temp_path), exist_ok=True)
             with open(temp_path, 'w') as f:
                 json.dump(data, f, indent=2, default=str)  # default=str handles datetime
             temp_path.replace(new_path)
@@ -512,6 +514,7 @@ class FileSystemSessionStore(SessionStore):
         try:
             # Atomic write via temp file
             temp_path = path.with_suffix('.tmp')
+            os.makedirs(os.path.dirname(temp_path), exist_ok=True)
             with open(temp_path, 'w') as f:
                 json.dump(session_ids, f)
             temp_path.replace(path)
@@ -566,6 +569,7 @@ class FileSystemSessionStore(SessionStore):
                     logger.info(f"[SessionStore] Migrating .current_session from {old_marker} to {marker}")
                     # Atomic write to new location
                     temp_path = marker.with_suffix('.tmp')
+                    os.makedirs(os.path.dirname(temp_path), exist_ok=True)
                     temp_path.write_text(content)
                     temp_path.replace(marker)
                     # Remove old marker
@@ -595,6 +599,7 @@ class FileSystemSessionStore(SessionStore):
             # Atomic write via temp file
             temp_path = marker.with_suffix('.tmp')
             try:
+                os.makedirs(os.path.dirname(temp_path), exist_ok=True)
                 temp_path.write_text(session_id)
                 temp_path.replace(marker)
                 logger.info(f"[SessionStore] Wrote marker file with session_id: {session_id}")

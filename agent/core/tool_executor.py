@@ -17,8 +17,7 @@ from tools.summarize_tool import SummarizeTool
 # ---------------------------------------------------------------------------
 # Default session permissions profile (five categories)
 # ---------------------------------------------------------------------------
-# The tooling engineer will wire this to real session permissions later.
-# For now, it provides the hardcoded default that _check_permissions uses.
+# Fallback used when no live SessionPermissions model is available on config.
 DEFAULT_SESSION_PERMISSIONS = {
     "container": False,
     "network": False,
@@ -240,7 +239,11 @@ class ToolExecutor:
             if self.config.tool_output_token_limit is not None:
                 tool_args['token_limit'] = self.config.tool_output_token_limit
             # Check permission categories before executing
-            error = _check_permissions(tool_class.required_categories)
+            session_perms = self.config.session_permissions
+            error = _check_permissions(
+                tool_class.required_categories,
+                session_perms.to_dict() if session_perms is not None else None,
+            )
             if error is not None:
                 return {'result': error, 'tool_type': 'normal'}
             tool_instance = tool_class(**tool_args)
