@@ -12,6 +12,11 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
       const data = await res.json();
       if (data.success) {
         setEntries(data.entries || []);
+        // Sync path if backend resolved it (e.g., empty string -> home directory)
+        if (data.current_path && !dirPath) {
+          onNavigate(data.current_path);
+          return;
+        }
       } else {
         setError(data.error || 'Failed to list directory');
         setEntries([]);
@@ -22,7 +27,7 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
     } finally {
       setLoading(false);
     }
-  }, [setLoading, setEntries, setError]);
+  }, [setLoading, setEntries, setError, onNavigate]);
 
   useEffect(() => {
     fetchDir(path);
