@@ -1,5 +1,5 @@
 @echo off
-REM ──────────────────────────────────────────────────────────────────────────────
+REM ---------------------------------------------------------------------------
 REM install_thoughtmachine.bat
 REM  Windows installer for ThoughtMachine.
 REM  Checks prerequisites, then creates venv, installs deps, builds frontend.
@@ -7,7 +7,7 @@ REM
 REM  Prerequisites (install manually if missing):
 REM    - Python 3.11 or 3.12 from https://www.python.org/downloads/
 REM    - Node.js LTS from https://nodejs.org/
-REM ──────────────────────────────────────────────────────────────────────────────
+REM ---------------------------------------------------------------------------
 
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
@@ -15,36 +15,32 @@ cd /d "%~dp0"
 set "SCRIPT_DIR=%~dp0"
 
 echo ============================================
-echo   ThoughtMachine — Install
+echo   ThoughtMachine - Install
 echo ============================================
 echo.
 
-REM ── Parse flags ─────────────────────────────────────────────────────────────
+REM -- Parse flags -------------------------------------------------------------
 set INSTALL_RAG=false
 
 :parse_args
-if not "%~1"=="" (
-    if /i "%~1"=="--with-rag" (
-        set INSTALL_RAG=true
-        echo   [i] RAG support enabled (codebase search embeddings)
-    ) else if /i "%~1"=="--help" (
-        goto :show_help
-    ) else if /i "%~1"=="-h" (
-        goto :show_help
-    ) else (
-        echo   [x] Unknown argument: %~1
-        echo.
-        echo   Usage: %~nx0 [--with-rag]
-        echo.
-        echo     --with-rag    Also install RAG dependencies
-        echo     --help, -h    Show this help
-        pause
-        exit /b 1
-    )
+if "%~1"=="" goto :after_help
+if /i "%~1"=="--with-rag" (
+    set INSTALL_RAG=true
+    echo   [i] RAG support enabled (codebase search embeddings)
     shift
     goto :parse_args
 )
-goto :after_help
+if /i "%~1"=="--help" goto :show_help
+if /i "%~1"=="-h" goto :show_help
+
+echo   [x] Unknown argument: %~1
+echo.
+echo   Usage: %~nx0 [--with-rag]
+echo.
+echo     --with-rag    Also install RAG dependencies
+echo     --help, -h    Show this help
+pause
+exit /b 1
 
 :show_help
 echo   Usage: %~nx0 [--with-rag]
@@ -62,7 +58,7 @@ exit /b 0
 
 :after_help
 
-REM ── 1. Check prerequisites ─────────────────────────────────────────────────
+REM -- 1. Check prerequisites -------------------------------------------------
 echo.
 echo [1/5] Checking prerequisites...
 echo.
@@ -96,7 +92,7 @@ pause
 exit /b 1
 
 :python_found
-echo   [✓] %PYTHON_CMD% (Python %PYTHON_VER%)
+echo   [+] %PYTHON_CMD% (Python %PYTHON_VER%)
 
 REM Check Node.js
 where node >nul 2>nul
@@ -112,7 +108,7 @@ if errorlevel 1 (
 )
 
 for /f "tokens=1 delims=v" %%v in ('node --version') do set NODE_VER=%%v
-echo   [✓] Node.js (v%NODE_VER%)
+echo   [+] Node.js (v%NODE_VER%)
 
 REM Check npm
 where npm >nul 2>nul
@@ -122,12 +118,12 @@ if errorlevel 1 (
     exit /b 1
 )
 for /f %%v in ('npm --version') do set NPM_VER=%%v
-echo   [✓] npm (v%NPM_VER%)
+echo   [+] npm (v%NPM_VER%)
 echo.
 echo   All prerequisites met. Starting install...
 echo.
 
-REM ── 2. Create venv ─────────────────────────────────────────────────────────
+REM -- 2. Create venv ---------------------------------------------------------
 echo [2/5] Creating Python virtual environment...
 
 set "VENV_DIR=%SCRIPT_DIR%.venv"
@@ -144,15 +140,15 @@ if exist "%VENV_DIR%\Scripts\activate.bat" (
         pause
         exit /b 1
     )
-    echo   [✓] Created virtual environment
+    echo   [+] Created virtual environment
 )
 
 REM Activate
 call "%VENV_DIR%\Scripts\activate.bat"
-echo   [✓] Virtual environment activated
+echo   [+] Virtual environment activated
 echo.
 
-REM ── 3. Install Python dependencies ─────────────────────────────────────────
+REM -- 3. Install Python dependencies -----------------------------------------
 echo [3/5] Installing Python dependencies...
 
 echo   Upgrading pip...
@@ -162,7 +158,7 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-echo   [✓] pip upgraded
+echo   [+] pip upgraded
 
 echo   Installing core packages (this may take a minute)...
 pip install -r "%SCRIPT_DIR%requirements.txt"
@@ -173,7 +169,7 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-echo   [✓] Core Python packages installed
+echo   [+] Core Python packages installed
 
 if /i "!INSTALL_RAG!"=="true" (
     echo.
@@ -184,7 +180,7 @@ if /i "!INSTALL_RAG!"=="true" (
             echo   [!] RAG install had issues. You can retry later:
             echo       pip install -r requirements-rag.txt
         ) else (
-            echo   [✓] RAG dependencies installed
+            echo   [+] RAG dependencies installed
         )
     ) else (
         echo   [!] requirements-rag.txt not found, skipping
@@ -192,7 +188,7 @@ if /i "!INSTALL_RAG!"=="true" (
 )
 echo.
 
-REM ── 4. Install npm dependencies ────────────────────────────────────────────
+REM -- 4. Install npm dependencies --------------------------------------------
 echo [4/5] Installing npm dependencies...
 
 set "FRONTEND_DIR=%SCRIPT_DIR%web_ui\frontend"
@@ -207,14 +203,14 @@ if exist "%FRONTEND_DIR%\package.json" (
         pause
         exit /b 1
     )
-    echo   [✓] npm packages installed
+    echo   [+] npm packages installed
     popd
 ) else (
     echo   [!] Frontend directory not found, skipping
 )
 echo.
 
-REM ── 5. Build frontend ──────────────────────────────────────────────────────
+REM -- 5. Build frontend ------------------------------------------------------
 echo [5/5] Building frontend...
 
 if exist "%FRONTEND_DIR%\package.json" (
@@ -228,16 +224,16 @@ if exist "%FRONTEND_DIR%\package.json" (
         pause
         exit /b 1
     )
-    echo   [✓] Frontend built successfully
+    echo   [+] Frontend built successfully
     popd
 ) else (
     echo   [!] Skipping frontend build
 )
 echo.
 
-REM ── Done ───────────────────────────────────────────────────────────────────
+REM -- Done -------------------------------------------------------------------
 echo ============================================
-echo   [✓] Install complete!
+echo   [+] Install complete!
 echo.
 echo   Next steps:
 echo.
