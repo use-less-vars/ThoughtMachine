@@ -12,11 +12,6 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
       const data = await res.json();
       if (data.success) {
         setEntries(data.entries || []);
-        // Sync path if backend resolved it (e.g., empty string -> home directory)
-        if (data.current_path && !dirPath) {
-          onNavigate(data.current_path);
-          return;
-        }
       } else {
         setError(data.error || 'Failed to list directory');
         setEntries([]);
@@ -27,7 +22,7 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
     } finally {
       setLoading(false);
     }
-  }, [setLoading, setEntries, setError, onNavigate]);
+  }, [setLoading, setEntries, setError]);
 
   useEffect(() => {
     fetchDir(path);
@@ -157,6 +152,10 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
   const [browserEntries, setBrowserEntries] = useState([]);
   const [browserLoading, setBrowserLoading] = useState(false);
   const [browserError, setBrowserError] = useState('');
+  const handleBrowseNavigate = useCallback((newPath) => {
+    setBrowserPath(newPath);
+    setBrowserError('');
+  }, []);
 
   useEffect(() => {
     setDraft(getSafeDraft(config));
@@ -308,8 +307,18 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
                 </span>
               )}
               <button
-                onClick={() => {
-                  setBrowserPath(draft.workspace_path || '');
+                onClick={async () => {
+                  let initialPath = draft.workspace_path;
+                  if (!initialPath) {
+                    try {
+                      const res = await fetch(`http://${window.location.hostname}:8000/api/browse?path=`);
+                      const data = await res.json();
+                      if (data.success && data.current_path) {
+                        initialPath = data.current_path;
+                      }
+                    } catch (_) {}
+                  }
+                  setBrowserPath(initialPath || '/');
                   setBrowserOpen(true);
                   setBrowserError('');
                 }}
@@ -684,10 +693,7 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
               entries={browserEntries}
               loading={browserLoading}
               error={browserError}
-              onNavigate={(newPath) => {
-                setBrowserPath(newPath);
-                setBrowserError('');
-              }}
+              onNavigate={handleBrowseNavigate}
               onSelect={(selectedPath) => {
                 setDraft({ ...draft, workspace_path: selectedPath });
                 setBrowserOpen(false);
