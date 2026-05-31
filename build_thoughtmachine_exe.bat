@@ -254,7 +254,7 @@ if "%ONE_FILE%"=="1" (
 )
 
 :: ── Done ─────────────────────────────────────────────────────────────────
-echo.
+echo(
 if "%ONE_FILE%"=="1" (
     if exist "dist\ThoughtMachine.exe" (
         call :ok "Build complete! Single executable created:"
@@ -266,7 +266,7 @@ if "%ONE_FILE%"=="1" (
     if exist "dist\ThoughtMachine" (
         call :ok "Build complete! One-folder bundle created at:"
         echo     dist\ThoughtMachine\
-        echo.
+echo(
         call :info "To run:"
         call :info "  dist\ThoughtMachine\ThoughtMachine.exe"
     ) else (
