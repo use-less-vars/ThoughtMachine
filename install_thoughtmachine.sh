@@ -15,6 +15,83 @@ echo "============================================"
 echo "  ThoughtMachine — Install"
 echo "============================================"
 
+# ── Detect OS ────────────────────────────────────────────────────────────────
+IS_WINDOWS=false
+if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || "$OSTYPE" == "win32" ]]; then
+    IS_WINDOWS=true
+fi
+
+# ── 0. Auto-install prerequisites (Windows) ────────────────────────────────────
+if $IS_WINDOWS; then
+    echo ""
+    echo "[0/5] Windows detected — checking prerequisites..."
+    echo ""
+
+    # Python
+    PYTHON=""
+    for cmd in python3.12 python3.11 python3 python; do
+        if command -v "$cmd" &>/dev/null; then
+            PYTHON="$cmd"
+            break
+        fi
+    done
+
+    if [[ -z "$PYTHON" ]]; then
+        echo "  → Python not found. Installing via winget..."
+        winget install --silent --accept-package-agreements Python.Python.3.12 2>&1
+        # Re-check after install
+        for cmd in python3.12 python3 python; do
+            if command -v "$cmd" &>/dev/null; then
+                PYTHON="$cmd"
+                break
+            fi
+        done
+        if [[ -z "$PYTHON" ]]; then
+            echo "  → Trying Python 3.11..."
+            winget install --silent --accept-package-agreements Python.Python.3.11 2>&1
+            for cmd in python3.11 python3 python; do
+                if command -v "$cmd" &>/dev/null; then
+                    PYTHON="$cmd"
+                    break
+                fi
+            done
+        fi
+        if [[ -z "$PYTHON" ]]; then
+            echo "  ✗ Could not auto-install Python via winget."
+            echo "    Install Python 3.11+ manually from https://www.python.org/downloads/"
+            echo "    Then re-run this script."
+            exit 1
+        fi
+        echo "  ✓ Python installed: $($PYTHON --version 2>&1)"
+        # Refresh PATH so winget-installed python is found
+        export PATH="$PATH:/c/Program Files/Python312:/c/Program Files/Python312/Scripts"
+        export PATH="$PATH:/c/Program Files/Python311:/c/Program Files/Python311/Scripts"
+    else
+        echo "  ✓ Python found"
+    fi
+
+    # Node.js
+    if ! command -v node &>/dev/null; then
+        echo "  → Node.js not found. Installing via winget..."
+        winget install --silent --accept-package-agreements OpenJS.NodeJS.LTS 2>&1
+        # Refresh PATH
+        export PATH="$PATH:/c/Program Files/nodejs"
+        if ! command -v node &>/dev/null; then
+            echo "  ✗ Could not auto-install Node.js via winget."
+            echo "    Install Node.js LTS manually from https://nodejs.org/"
+            echo "    Then re-run this script."
+            exit 1
+        fi
+        echo "  ✓ Node.js installed: $(node --version 2>&1)"
+        echo "  ✓ npm installed: $(npm --version 2>&1)"
+    else
+        echo "  ✓ Node.js found"
+    fi
+
+    echo ""
+    echo "  → Prerequisites ready, continuing with full install..."
+fi
+
 # ── 1. Check prerequisites ────────────────────────────────────────────────────
 echo ""
 echo "[1/5] Checking prerequisites..."
