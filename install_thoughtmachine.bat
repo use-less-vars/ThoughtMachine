@@ -28,7 +28,7 @@ set INSTALL_RAG=false
 if "%~1"=="" goto :after_help
 if /i "%~1"=="--with-rag" (
     set INSTALL_RAG=true
-    echo   [i] RAG support enabled (codebase search embeddings)
+    echo   [i] RAG support enabled ^(codebase search embeddings^)
     shift
     goto :parse_args
 )
@@ -47,11 +47,11 @@ exit /b 1
 :show_help
 echo   Usage: %~nx0 [--with-rag]
 echo(
-echo     --with-rag    Also install RAG dependencies (sentence-transformers,
-echo                   ChromaDB, CPU-only PyTorch ~500 MB)
+echo     --with-rag    Also install RAG dependencies ^(sentence-transformers,
+echo                   ChromaDB, CPU-only PyTorch ~500 MB^)
 echo     --help, -h    Show this help
 echo(
-echo   Prerequisites (install manually if missing):
+echo   Prerequisites ^(install manually if missing^):
 echo     - Python 3.11+  from https://www.python.org/downloads/
 echo     - Node.js LTS   from https://nodejs.org/
 echo(
@@ -69,30 +69,43 @@ echo   --- Python ---
 set PYTHON_CMD=
 set PYTHON_VER=
 set PYTHON_OK=0
-for %%c in (python3.12 python3.11 python3 python py) do (
-    where %%c >nul 2>nul
+
+REM Try py launcher first, then python, then python3
+py -c "import sys;exit(0 if (3,11)<=sys.version_info[:2]<=(3,13) else 1)" >nul 2>&1
+if not errorlevel 1 (
+    set PYTHON_CMD=py
+    set PYTHON_OK=1
+)
+
+if not defined PYTHON_CMD (
+    python -c "import sys;exit(0 if (3,11)<=sys.version_info[:2]<=(3,13) else 1)" >nul 2>&1
     if not errorlevel 1 (
-        for /f "tokens=2 delims= " %%v in ('%%c --version 2^>nul') do set PYTHON_VER=%%v
-        if defined PYTHON_VER (
-            REM Save %%c before inner loop shadows it
-            set CMD_NAME=%%c
-            for /f "tokens=1,2 delims=." %%x in ("!PYTHON_VER!") do (
-                if %%x==3 if %%y GEQ 11 if %%y LEQ 13 (
-                    set PYTHON_CMD=!CMD_NAME!
-                    set PYTHON_OK=1
-                )
-            )
-        )
+        set PYTHON_CMD=python
+        set PYTHON_OK=1
     )
 )
 
+if not defined PYTHON_CMD (
+    python3 -c "import sys;exit(0 if (3,11)<=sys.version_info[:2]<=(3,13) else 1)" >nul 2>&1
+    if not errorlevel 1 (
+        set PYTHON_CMD=python3
+        set PYTHON_OK=1
+    )
+)
+
+REM Get version string for display
+if defined PYTHON_CMD (
+    %PYTHON_CMD% --version > "%TEMP%\tm_pyver.txt" 2>&1
+    set /p PYTHON_VER=<"%TEMP%\tm_pyver.txt"
+    del "%TEMP%\tm_pyver.txt" 2>nul
+)
+
 if !PYTHON_OK!==1 (
-    echo   [+] %PYTHON_CMD% (Python %PYTHON_VER%)
+    echo   [+] !PYTHON_CMD! -- version !PYTHON_VER!
 ) else (
     if defined PYTHON_VER (
         echo   [x] Python !PYTHON_VER! found but not supported.
         echo       Need Python 3.11, 3.12, or 3.13.
-        echo       !PYTHON_VER! is too new (lacks package wheels).
     ) else (
         echo   [x] Python not found.
     )
@@ -102,11 +115,14 @@ echo(
 echo   --- Node.js ---
 
 set NODE_OK=0
+set NODE_VER=
 where node >nul 2>nul
 if not errorlevel 1 (
-    for /f "tokens=1 delims=v" %%v in ('node --version') do set NODE_VER=%%v
-    echo   [+] Node.js (v!NODE_VER!)
-    set NODE_OK=1
+    for /f "tokens=*" %%v in ('node --version') do set NODE_VER=%%v
+    if defined NODE_VER (
+        echo   [+] Node.js ^(!NODE_VER!^)
+        set NODE_OK=1
+    )
 ) else (
     echo   [x] Node.js not found. Install Node.js LTS from:
     echo       https://nodejs.org/
@@ -118,17 +134,20 @@ echo   --- npm ---
 
 set NPM_OK=0
 if !NODE_OK!==1 (
+    set NPM_VER=
     where npm >nul 2>nul
     if not errorlevel 1 (
-        for /f %%v in ('npm --version') do set NPM_VER=%%v
-        echo   [+] npm (v!NPM_VER!)
-        set NPM_OK=1
+        for /f "tokens=*" %%v in ('npm --version') do set NPM_VER=%%v
+        if defined NPM_VER (
+            echo   [+] npm ^(!NPM_VER!^)
+            set NPM_OK=1
+        )
     ) else (
-        echo   [x] npm not found (should come with Node.js).
-        echo       Reinstall Node.js and select "npm package manager".
+        echo   [x] npm not found
+        echo       Reinstall Node.js and select npm package manager.
     )
 ) else (
-    echo   [ ] (skipped - Node.js missing)
+    echo   [ ] skipped - Node.js missing
 )
 
 echo(
@@ -164,14 +183,13 @@ if !ALL_OK!==1 (
 
 REM -- 2. Create venv ---------------------------------------------------------
 echo [2/5] Creating Python virtual environment...
-echo   ..................................................
 
 set "VENV_DIR=%SCRIPT_DIR%.venv"
 
 if exist "%VENV_DIR%\Scripts\activate.bat" (
     echo   [i] Virtual environment already exists at %VENV_DIR%
 ) else (
-    echo   Creating virtual environment (may take 10-20 sec)...
+    echo   Creating virtual environment ^(may take 10-20 sec^)...
     call !PYTHON_CMD! -m venv "%VENV_DIR%"
     if errorlevel 1 (
         echo(
@@ -217,7 +235,7 @@ echo   [+] Core packages installed (step 2 done)
 echo(
 
 if /i "!INSTALL_RAG!"=="true" (
-    echo   [Step 3] Installing RAG dependencies (sentence-transformers, ChromaDB)...
+    echo   [Step 3] Installing RAG dependencies ^(sentence-transformers, ChromaDB^)...
     echo   This adds ~500 MB. Download progress shown below:
     if exist "%SCRIPT_DIR%requirements-rag.txt" (
         pip install -r "%SCRIPT_DIR%requirements-rag.txt"
@@ -241,7 +259,7 @@ echo   ..................................................
 
 if exist "%FRONTEND_DIR%\package.json" (
     pushd "%FRONTEND_DIR%"
-    echo   Running npm install (may take 1-3 minutes)...
+    echo   Running npm install ^(may take 1-3 minutes^)...
     call npm install
     if errorlevel 1 (
         echo(
@@ -254,7 +272,7 @@ if exist "%FRONTEND_DIR%\package.json" (
     echo(
     echo [5/5] Building frontend...
     echo   ..................................................
-    echo   Running npm run build (may take 30-60 sec)...
+    echo   Running npm run build ^(may take 30-60 sec^)...
     call npm run build
     if errorlevel 1 (
         echo(
