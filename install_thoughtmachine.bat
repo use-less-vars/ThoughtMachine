@@ -62,66 +62,101 @@ REM -- 1. Check prerequisites -------------------------------------------------
 echo.
 echo [1/5] Checking prerequisites...
 echo.
+echo   --- Python ---
 
-REM Check Python
 set PYTHON_CMD=
+set PYTHON_VER=
+set PYTHON_OK=0
 for %%c in (python3.12 python3.11 python3 python py) do (
     where %%c >nul 2>nul
     if not errorlevel 1 (
         for /f "tokens=2 delims= " %%v in ('%%c --version 2^>nul') do set PYTHON_VER=%%v
         if defined PYTHON_VER (
             for /f "tokens=1,2 delims=." %%a in ("!PYTHON_VER!") do (
-                if %%a==3 if %%b GEQ 11 (
+                if %%a==3 if %%b GEQ 11 if %%b LEQ 13 (
                     set PYTHON_CMD=%%c
-                    goto :python_found
+                    set PYTHON_OK=1
                 )
             )
         )
     )
 )
 
-echo   [x] Python 3.11 or 3.12 is required but was not found.
-echo.
-echo       Download and install it from:
-echo         https://www.python.org/downloads/
-echo.
-echo       Make sure to check "Add Python to PATH" during installation.
-echo       Python 3.12 is recommended (3.14+ may lack package wheels).
-echo.
-pause
-exit /b 1
+if !PYTHON_OK!==1 (
+    echo   [+] %PYTHON_CMD% (Python %PYTHON_VER%)
+) else (
+    if defined PYTHON_VER (
+        echo   [x] Python !PYTHON_VER! found but not supported.
+        echo       Need Python 3.11, 3.12, or 3.13.
+        echo       !PYTHON_VER! is too new (lacks package wheels).
+    ) else (
+        echo   [x] Python not found.
+    )
+)
 
-:python_found
-echo   [+] %PYTHON_CMD% (Python %PYTHON_VER%)
+echo.
+echo   --- Node.js ---
 
-REM Check Node.js
+set NODE_OK=0
 where node >nul 2>nul
-if errorlevel 1 (
+if not errorlevel 1 (
+    for /f "tokens=1 delims=v" %%v in ('node --version') do set NODE_VER=%%v
+    echo   [+] Node.js (v!NODE_VER!)
+    set NODE_OK=1
+) else (
+    echo   [x] Node.js not found. Install Node.js LTS from:
+    echo       https://nodejs.org/
+    echo       Then close this window and open a NEW one.
+)
+
+echo.
+echo   --- npm ---
+
+set NPM_OK=0
+if !NODE_OK!==1 (
+    where npm >nul 2>nul
+    if not errorlevel 1 (
+        for /f %%v in ('npm --version') do set NPM_VER=%%v
+        echo   [+] npm (v!NPM_VER!)
+        set NPM_OK=1
+    ) else (
+        echo   [x] npm not found (should come with Node.js).
+        echo       Reinstall Node.js and select "npm package manager".
+    )
+) else (
+    echo   [ ] (skipped - Node.js missing)
+)
+
+echo.
+echo   --- Summary ---
+
+set ALL_OK=1
+if !PYTHON_OK!==0 (
+    set ALL_OK=0
+    echo   [FAIL] Python 3.11-3.13 required - install or upgrade
+)
+if !NODE_OK!==0 (
+    set ALL_OK=0
+    echo   [FAIL] Node.js LTS required - install from https://nodejs.org/
+)
+if !NPM_OK!==0 (
+    set ALL_OK=0
+    echo   [FAIL] npm required - reinstall Node.js with npm
+)
+
+if !ALL_OK!==1 (
+    echo   [PASS] All prerequisites met.
     echo.
-    echo   [x] Node.js is required but was not found.
+    echo   Starting install...
     echo.
-    echo       Download and install it from:
-    echo         https://nodejs.org/  (LTS version)
+) else (
     echo.
+    echo   Fix the issues above, then run this script again.
+    echo   Note: You may need to close this window and open a
+    echo   NEW Command Prompt after installing.
     pause
     exit /b 1
 )
-
-for /f "tokens=1 delims=v" %%v in ('node --version') do set NODE_VER=%%v
-echo   [+] Node.js (v%NODE_VER%)
-
-REM Check npm
-where npm >nul 2>nul
-if errorlevel 1 (
-    echo   [x] npm was not found (it should come with Node.js).
-    pause
-    exit /b 1
-)
-for /f %%v in ('npm --version') do set NPM_VER=%%v
-echo   [+] npm (v%NPM_VER%)
-echo.
-echo   All prerequisites met. Starting install...
-echo.
 
 REM -- 2. Create venv ---------------------------------------------------------
 echo [2/5] Creating Python virtual environment...
