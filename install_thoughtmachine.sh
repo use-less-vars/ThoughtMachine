@@ -46,7 +46,7 @@ if $IS_WINDOWS; then
                 version=$("$cmd" --version 2>&1)
                 major=$(echo "$version" | awk '{print $2}' | cut -d. -f1)
                 minor=$(echo "$version" | awk '{print $2}' | cut -d. -f2)
-                if [[ -n "$major" && -n "$minor" && "$major" -eq 3 && "$minor" -ge 11 && "$minor" -lt 14 ]]; then
+                if [[ -n "$major" && -n "$minor" && "$major" -eq 3 && "$minor" -ge 11 ]]; then
                     PYTHON="$cmd"
                 fi
                 break
@@ -59,7 +59,7 @@ if $IS_WINDOWS; then
                 if command -v "$cmd" &>/dev/null; then
                     version=$("$cmd" --version 2>&1)
                     minor=$(echo "$version" | awk '{print $2}' | cut -d. -f2)
-                    if [[ -n "$minor" && "$minor" -ge 11 && "$minor" -lt 14 ]]; then
+                    if [[ -n "$minor" && "$minor" -ge 11 ]]; then
                         PYTHON="$cmd"
                     fi
                     break
@@ -67,8 +67,8 @@ if $IS_WINDOWS; then
             done
         fi
         if [[ -z "$PYTHON" ]]; then
-            echo "  ✗ Could not auto-install a compatible Python via winget."
-            echo "    Install Python 3.11 or 3.12 manually from https://www.python.org/downloads/"
+            echo "  ✗ Could not auto-install Python via winget."
+            echo "    Install Python 3.11+ manually from https://www.python.org/downloads/"
             echo "    Then re-run this script."
             exit 1
         fi
@@ -113,20 +113,23 @@ for cmd in python3.12 python3.11 python3 python; do
         # Parse major.minor — works with "Python 3.12.0" or "Python 3.11"
         major=$(echo "$version" | awk '{print $2}' | cut -d. -f1)
         minor=$(echo "$version" | awk '{print $2}' | cut -d. -f2)
-        # Require >=3.11, <3.14 (3.14 is too new — packages like torch lack wheels)
-        if [[ -n "$major" && -n "$minor" && "$major" -eq 3 && "$minor" -ge 11 && "$minor" -lt 14 ]]; then
+        # Accept 3.11+. Warn about very new versions (3.14+) but let them try.
+        if [[ -n "$major" && -n "$minor" && "$major" -eq 3 && "$minor" -ge 11 ]]; then
             PYTHON="$cmd"
             echo "  ✓ Found $PYTHON ($version)"
+            if [[ "$minor" -ge 14 ]]; then
+                echo "  ⚠  Python $major.$minor is very new — some packages may lack wheels."
+                echo "     If pip install fails, try Python 3.11 or 3.12."
+            fi
             break
         fi
     fi
 done
 
 if [[ -z "$PYTHON" ]]; then
-    echo "  ✗ Python 3.11–3.13 not found."
+    echo "  ✗ Python >=3.11 not found."
     echo "    Detected version: $($cmd --version 2>&1 2>/dev/null || echo 'none')"
-    echo "    Install Python 3.11 or 3.12 from https://www.python.org/downloads/"
-    echo "    (Python 3.14+ is not yet supported — packages like torch lack wheels.)"
+    echo "    Install Python 3.11+ from https://www.python.org/downloads/"
     exit 1
 fi
 
@@ -193,11 +196,12 @@ for attempt in $(seq 1 $MAX_RETRIES); do
     if [[ $pip_exit -eq 0 ]]; then
         break
     elif [[ $attempt -lt $MAX_RETRIES ]]; then
-        echo "  → Connection issue? Retrying in ${RETRY_DELAY}s (attempt $((attempt+1))/${MAX_RETRIES})..."
+        echo "  → Network issue? Retrying in ${RETRY_DELAY}s (attempt $((attempt+1))/${MAX_RETRIES})..."
         sleep $RETRY_DELAY
     else
         echo "  ✗ pip install failed after ${MAX_RETRIES} attempts — see output above"
-        echo "    Retry with: pip install -r requirements.txt"
+        echo "    Try: pip install --pre -r requirements.txt"
+        echo "    (--pre allows pre-release wheels for newer Python versions)"
         exit 1
     fi
 done
