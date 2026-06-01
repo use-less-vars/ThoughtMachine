@@ -20,7 +20,7 @@ import sys
 
 
 class ToolBase(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
     """
     All tools must inherit from this class.
     They must define a 'tool' field with a Literal of their unique name.

@@ -232,7 +232,14 @@ class ToolExecutor:
             try:
                 tool_class.model_validate(tool_args)
             except ValidationError as e:
-                return {'result': f'Invalid arguments: {e}', 'tool_type': 'normal'}
+                # Provide LLM-friendly error with valid field names
+                try:
+                    infra_fields = {"workspace_path", "token_limit", "is_docker", "container_workspace_path", "tool"}
+                    valid_fields = [f for f in tool_class.model_fields.keys() if f not in infra_fields]
+                    valid_fields_str = ', '.join(valid_fields)
+                    return {'result': f'Invalid arguments: {e}\n\nValid fields: {valid_fields_str}', 'tool_type': 'normal'}
+                except Exception:
+                    return {'result': f'Invalid arguments: {e}', 'tool_type': 'normal'}
             # Now inject infrastructure fields (safe because validation passed)
             if self.config.workspace_path:
                 tool_args['workspace_path'] = self.config.workspace_path
