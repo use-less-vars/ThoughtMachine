@@ -29,10 +29,8 @@ thoughtmachine = [
     "resources/default_system_prompt.txt",
     "resources/default_providers.json",
     "resources/default_security_policy.json",
-    "resources/global_kb/.version",
-    "resources/global_kb/handbook.md",
-    "resources/global_kb/faq.md",
-    "resources/global_kb/troubleshooting.md",
+    "resources/global_kb/*",
+    "resources/worker_templates/*",
 ]
 
 [tool.setuptools.dynamic]
