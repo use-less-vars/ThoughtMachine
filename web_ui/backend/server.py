@@ -86,7 +86,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from agent.logging import log
 from contextlib import asynccontextmanager
@@ -969,15 +969,8 @@ async def root():
             "or use <code>--serve-frontend</code> to auto-build.</p></body></html>",
             status_code=503,
         )
-    return {
-        "name": "ThoughtMachine Web UI",
-        "version": "0.1.0",
-        "endpoints": {
-            "ws": "/ws — WebSocket for agent interaction",
-            "health": "/health — Health check",
-            "browse": "/api/browse?path=… — Directory listing for workspace browser",
-        },
-    }
+    # Dev mode — backend only serves API. Frontend is on the Vite dev server.
+    return RedirectResponse(url="http://localhost:5173")
 
 
 
