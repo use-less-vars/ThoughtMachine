@@ -157,8 +157,9 @@ class WebAgentBridge:
 
     def _build_global_agent_config(self) -> AgentConfig:
         """
-        Build an AgentConfig from the global config file (agent_config.json)
-        via ConfigService, mirroring what the PyQt GUI does in
+        Build an AgentConfig from the global config file
+        (~/.thoughtmachine/agent_config.json) via ConfigService,
+        mirroring what the PyQt GUI does in
         SessionTab.create_new_session() -> state_bridge.create_agent_config().
 
         This removes the dependency on presets for config defaults.
@@ -181,7 +182,7 @@ class WebAgentBridge:
         Start a new agent session.
 
         Configuration is built from three layers (each overriding the previous):
-          1. Global config (from agent_config.json via ConfigService)
+          1. Global config (from ~/.thoughtmachine/agent_config.json via ConfigService)
           2. Session config overrides (from a loaded session's metadata)
           3. Frontend config_dict (the caller's runtime overrides)
 
@@ -195,7 +196,7 @@ class WebAgentBridge:
             config_dict: Frontend configuration overrides (see AgentConfig fields).
                          Applied on top of global config + loaded session config.
         """
-        # ── Layer 1: global config from agent_config.json ──────────────────
+        # ── Layer 1: global config from ~/.thoughtmachine/agent_config.json ──
         global_config = self._build_global_agent_config()
         merged_config = global_config.model_dump(exclude={'api_key'}, exclude_none=True)
 
@@ -969,7 +970,7 @@ class WebAgentBridge:
                     "messages": self._normalize_for_frontend(self._session.user_history),
                 })
 
-        elif event_type in ("user_query", "turn", "tool_call", "tool_result", "final"):
+        elif event_type in ("user_query", "turn", "tool_call", "tool_result"):
             # Session has been updated by the agent; sync to frontend.
             if self._session is not None:
                 self._history_version = self._session.conversation_version

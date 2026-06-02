@@ -1424,56 +1424,27 @@ Plain list assignment to `session.user_history` (e.g., in session_lifecycle.py's
 ### Overvi...
 
 ## Dual-Stream Bridge (Agent State → GUI Wiring)
+## Dual-Stream Bridge (Agent State → GUI Wiring)
 
 ### Overview
 The "Dual-Stream Bridge" refers to two parallel event delivery paths from AgentController to the GUI/presenter:
 
-**Path A — Qt pyqtSignal (event_occurred):**
-- `AgentController.event_occurred` is a `pyqtSignal(dict)`
-- Connected in `RefactoredAgentPresenter._connect_signals()`: `self.controller.event_occurred.connect(self._handle_controller_event)`
-- Forwards to `EventProcessor.process_event()` which dispatches by event type
-- `GUIIntegration` provides 7 signals: state_changed, tokens_updated, context_updated, status_message, error_occurred, config_changed, conversation_changed
-- Captured in `RefactoredAgentPresenter` and re-emitted to consumers
-- Requires QApplication event loop (thread-safe due to Qt's queued connections)
+**Path A — Event Queue + Callbacks (primary):**
+- `AgentController._emit_event()` puts events into `self.event_queue` and calls plain Python callbacks registered via `set_event_callback()`
+- The event processor (`event_processor.py`) consumes events from the queue and dispatches them to the GUI via `gui_integration` signals (state_changed, conversation_changed, etc.)
+- This path works without Qt — used by Web UI bridge
+- No Qt signals are used in AgentController itself
 
-**Path B — Plain Python Callbacks (_event_callbacks):**
-- `AgentController._event_callbacks: List[Callable]`
-- Registered via `set_event_callback(callback)` 
-- Works without Qt event loop — for Web UI, CLI, etc.
-- Both paths fire in `_emit_event()` which:
-  1. Puts event on `event_queue` (for polling)
-  2. Emits via `event_occurred.emit(event)` (Path A)
-  3. Iterates `_event_callbacks` (Path B)
+**Path B — Event Queue (direct consumption):**
+- The WebSocket bridge (`ws_bridge.py`) polls `controller.event_queue` to forward events to WebSocket clients
+- Each event gets `session_id` injected before being queued
 
 ### Event Flow
 1. Agent background thread (`_run()`) calls `agent.process_query(query)` which yields events
 2. Each event goes through `_emit_event(event)` 
 3. `session_id` is injected into each event
-4. Content events (turn, tool_call, tool_result, final, etc.) also emit `conversation_updated` signal
-
-### Token Warning System (demonstrated live)
-- `AgentState.update_token_state(total_tokens)` transitions: LOW → WARNING → CRITICAL
-- Thresholds from config: `token_monitor_warning_threshold` and `token_monitor_critical_threshold`
-- At WARNING: emits `token_warning` event, but restrictions not active yet
-- At CRITICAL: sets `restrictions_active=True`, filters tools to SummarizeTool/Final/FinalReport
-- The `ToolFilter` in main agent loop uses `AgentState.is_tool_allowed()` to enforce restrictions
-- Turn warnings (at max_turns-3) also activate restrictions
-
-### Component Hierarchy
-```
-AgentController (background thread)
-  └─ _emit_event()
-      ├─ event_queue.put(event)        [queue for polling]
-      ├─ event_occurred.emit(event)    [Path A: Qt signal]
-      └─ _event_callbacks callbacks    [Path B: plain Python]
-           │
-RefactoredAgentPresenter (main thread)
-  ├─ StateBridge          [config & session state]
-  ├─ GUIIntegration       [Qt signals for GUI]
-  ├─ SessionLifecycle     [start/stop/pause/save/load]
-  └─ EventProcessor       [routes events to state updates]
-       └─ GUIIntegration emit methods → QML/PyQt GUI
-
+4. Event is placed in the event queue and dispatched to all registered plain callbacks
+5. Presenter's event processor reads from the queue and triggers `gui_integration` signals for UI updates
 
 ## 2026-05-21 — System Notification Injection Points & Dual-Stream Convergence
 
@@ -2025,3 +1996,29 @@ The old `'user_interaction_requested'` was properly removed (replaced by `Respon
 ### Verified
 - All model construction, coercion, serialization, and translation pipeline works end-to-end
 - Tested with both default and custom permission values
+
+## 2026-06-02 — **Repository**: `git@github.com:use-less-vars/ThoughtMachine...
+
+**Repository**: `git@github.com:use-less-vars/ThoughtMachine.git`
+
+## 2026-06-03 — **Config System Report (2025-07-16)**: Completed a comprehen...
+
+**Config System Report (2025-07-16)**: Completed a comprehensive analysis of the entire configuration system. Key findings documented in downloadable report. See notes on: AgentConfig model (35+ fields, FIELD_CATEGORIES), loader.py (self-healing load/save, legacy field migration, atomic writes), config paths (project-root global + ~/.thoughtmachine/ user), hot-swap vs restart logic, session persistence bridge, frontend-backend translation layer, and bootstrap setup.
+
+## 2026-06-03 — **2025-07-17**: Removed all Qt dependencies from `AgentContr...
+
+**2025-07-17**: Removed all Qt dependencies from `AgentController` class:
+- Removed `QObject` base class, `pyqtSignal` declarations (`event_occurred`, `conversation_updated`), and `super().__init__()` 
+- Removed the PyQt6 fallback dummy classes (`_DummySignal`, dummy `QObject`, `pyqtSignal` function)
+- All signal emits replaced by event queue + plain callback mechanism only
+- The `gui_integration.py` retains its own Qt signals (state_changed, tokens_updated, etc.) for the GUI layer
+- Event flow: Agent thread → `_emit_event()` → event_queue + plain callbacks (no Qt signal path)
+
+## 2026-06-03 — **2025-07-17**: Event type unification — direct-answer path ...
+
+**2025-07-17**: Event type unification — direct-answer path now yields `agent_responded` instead of `final`:
+- Changed `agent/core/agent.py` line 1188: `{'type': 'final', ...}` → `{'type': 'agent_responded', 'response_type': 'answer', ...}`
+- Removed all `'final'` event-type handling from `event_processor.py` (MESSAGE_EVENT_TYPES, state_event_types, conditionals)
+- Removed `'final'` from bridge.py event-type sync group
+- All terminal agent responses (Respond tool + direct answer) now produce identical `agent_responded` events
+- `FINAL = 'final'` enum value kept in `events.py` for backward compat mapping only

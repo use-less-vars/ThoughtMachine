@@ -12,34 +12,7 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 from agent.logging import log
 from agent.core.message import Message
-try:
-    from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
-except ImportError:
-    # Dummy Qt objects for non-Qt environments
-    class QObject:
-        """Stand-in when PyQt6 is not installed."""
-        pass
 
-    class _DummySignal:
-        """Stand-in for pyqtSignal when PyQt6 is not installed."""
-        def __init__(self, *args, **kwargs):
-            pass
-        def emit(self, *args, **kwargs):
-            pass
-        def connect(self, *args, **kwargs):
-            pass
-        def disconnect(self, *args, **kwargs):
-            pass
-
-    def pyqtSignal(*args, **kwargs):
-        """Return a dummy signal object when PyQt6 is not available."""
-        return _DummySignal()
-
-    def pyqtSlot(*args, **kwargs):
-        """No-op decorator when PyQt6 is not available."""
-        def decorator(func):
-            return func
-        return decorator
 from agent.controller import AgentController
 from agent.config import AgentConfig, load_default_config
 from tools import SIMPLIFIED_TOOL_CLASSES
@@ -51,21 +24,13 @@ from .gui_integration import GUIIntegration
 from .session_lifecycle import SessionLifecycle
 from .event_processor import EventProcessor
 
-class RefactoredAgentPresenter(QObject):
+class RefactoredAgentPresenter:
     """
     Refactored presenter using modular architecture.
     
     Delegates responsibilities to specialized modules while maintaining
     the same public API as the original AgentPresenter.
     """
-    state_changed = pyqtSignal(ExecutionState)
-    tokens_updated = pyqtSignal(int, int)
-    context_updated = pyqtSignal(int)
-    status_message = pyqtSignal(str)
-    error_occurred = pyqtSignal(str, str)
-    config_changed = pyqtSignal(dict)
-    conversation_changed = pyqtSignal()
-
     def __init__(self):
         """Initialize refactored presenter with modular architecture."""
         super().__init__()
@@ -75,20 +40,7 @@ class RefactoredAgentPresenter(QObject):
         self.session_lifecycle = SessionLifecycle(self.state_bridge, self.controller)
         self.session_lifecycle._session_callback = self._on_session_state_change
         self.event_processor = EventProcessor(self.state_bridge, self.session_lifecycle, self.gui_integration)
-        self._connect_signals()
         log('DEBUG', 'ui.presenter', f'Initialized with modular architecture')
-
-    def _connect_signals(self):
-        """Connect module signals to presenter signals."""
-        self.gui_integration.state_changed.connect(self.state_changed)
-        self.gui_integration.tokens_updated.connect(self.tokens_updated)
-        self.gui_integration.context_updated.connect(self.context_updated)
-        self.gui_integration.status_message.connect(self.status_message)
-        self.gui_integration.error_occurred.connect(self.error_occurred)
-        self.gui_integration.config_changed.connect(self.config_changed)
-        self.gui_integration.conversation_changed.connect(self.conversation_changed)
-        self.controller.event_occurred.connect(self._handle_controller_event)
-        self.controller.conversation_updated.connect(self._on_conversation_change)
 
     @property
     def state(self) -> ExecutionState:
@@ -109,7 +61,6 @@ class RefactoredAgentPresenter(QObject):
         """Forward controller events to event processor."""
         self.event_processor.process_event(event)
 
-    @pyqtSlot(str, result='QVariant')
     def load_config(self, path: str='') -> Optional[Dict[str, Any]]:
         """Load configuration from file path."""
         if path:
@@ -117,7 +68,6 @@ class RefactoredAgentPresenter(QObject):
         else:
             return self.state_bridge.get_config()
 
-    @pyqtSlot(dict, str, result=bool)
     def save_config(self, config: Dict[str, Any], path: str='') -> bool:
         """Save configuration to file path."""
         if path:
@@ -125,17 +75,6 @@ class RefactoredAgentPresenter(QObject):
         else:
             return self.state_bridge.save_config(config)
 
-    @pyqtSlot(dict, result=bool)
-    def save_user_config(self, config: Optional[Dict[str, Any]]=None) -> bool:
-        """Save configuration to user config file."""
-        return self.state_bridge.save_user_config(config)
-
-    @pyqtSlot(result='QVariant')
-    def load_user_config(self) -> Optional[Dict[str, Any]]:
-        """Load configuration from user config file."""
-        return self.state_bridge.load_user_config()
-
-    @pyqtSlot(dict)
     def update_config_from_gui(self, config_dict: Dict[str, Any]):
         """Update configuration from GUI dictionary."""
         updated_config = self.state_bridge.update_config(config_dict)
@@ -209,7 +148,6 @@ class RefactoredAgentPresenter(QObject):
             if hasattr(self.gui_integration, 'emit_error_occurred'):
                 self.gui_integration.emit_error_occurred('Session Error', error_msg)
 
-    @pyqtSlot(str)
     def on_user_input(self, text: str):
         """
         Handle user input from GUI (QML interface).
@@ -474,6 +412,5 @@ class RefactoredAgentPresenter(QObject):
             self.gui_integration.error_occurred.disconnect()
             self.gui_integration.config_changed.disconnect()
             self.gui_integration.conversation_changed.disconnect()
-            self.controller.event_occurred.disconnect()
         except Exception:
             pass
