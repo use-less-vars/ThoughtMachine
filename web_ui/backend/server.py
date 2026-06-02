@@ -950,15 +950,36 @@ async def root():
             "or use <code>--serve-frontend</code> to auto-build.</p></body></html>",
             status_code=503,
         )
-    return {
-        "name": "ThoughtMachine Web UI",
-        "version": "0.1.0",
-        "endpoints": {
-            "ws": "/ws — WebSocket for agent interaction",
-            "health": "/health — Health check",
-            "browse": "/api/browse?path=… — Directory listing for workspace browser",
-        },
-    }
+    # Dev mode — backend only serves API. Frontend is on the Vite dev server.
+    return HTMLResponse(
+        """<html><head><style>
+        body { font-family: sans-serif; background: #1e1e2e; color: #cdd6f4;
+               display: flex; justify-content: center; align-items: center;
+               height: 100vh; margin: 0; }
+        .card { background: #313244; padding: 2rem; border-radius: 12px;
+                text-align: center; max-width: 500px; }
+        h1 { color: #89b4fa; margin-top: 0; }
+        a { color: #89b4fa; }
+        .url { background: #45475a; padding: 0.5rem 1rem; border-radius: 6px;
+               font-family: monospace; font-size: 1.2rem; display: inline-block;
+               margin: 0.5rem 0; color: #a6e3a1; }
+        .note { font-size: 0.85rem; color: #a6adc8; margin-top: 1rem; }
+        .api { margin-top: 1.5rem; font-size: 0.9rem; color: #a6adc8; }
+    </style></head><body>
+    <div class="card">
+        <h1>ThoughtMachine</h1>
+        <p style=\"color: #a6e3a1;\">Backend running - frontend on Vite dev server</p>
+        <p>Open the UI at:</p>
+        <div class=\"url\"><a href=\"http://localhost:5173\">http://localhost:5173</a></div>
+        <p class=\"note\">Hot-reload enabled - changes appear instantly</p>
+        <div class=\"api\">
+            API docs at <a href=\"/docs\">/docs</a> |
+            Health at <a href=\"/health\">/health</a>
+        </div>
+    </div>
+    </body></html>
+        """,
+    )
 
 
 
