@@ -180,15 +180,16 @@ echo "  → Using: $PYTHON"
 
 VENV_DIR="$PROJECT_DIR/.venv"
 if [[ -d "$VENV_DIR" ]]; then
-    echo "  → Venv already exists at $VENV_DIR"
+    echo "  → Removing existing venv at $VENV_DIR"
+    rm -rf "$VENV_DIR"
+    echo "  ✓ Old venv removed"
+fi
+echo "  → Running: $PYTHON -m venv .venv"
+if "$PYTHON" -m venv "$VENV_DIR"; then
+    echo "  ✓ Created venv at $VENV_DIR"
 else
-    echo "  → Running: $PYTHON -m venv .venv"
-    if "$PYTHON" -m venv "$VENV_DIR"; then
-        echo "  ✓ Created venv at $VENV_DIR"
-    else
-        echo "  ✗ Failed to create venv. Try: apt install python3-venv"
-        exit 1
-    fi
+    echo "  ✗ Failed to create venv. Try: apt install python3-venv"
+    exit 1
 fi
 
 # Activate — handle both Linux (bin/) and Windows (Scripts/)
