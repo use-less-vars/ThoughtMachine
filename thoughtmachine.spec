@@ -78,6 +78,7 @@ HIDDEN_IMPORTS = [
     "tools.utils",
 
     # ── Agent sub-packages (lazy-loaded in server.py) ────────────────────
+    "agent.startup_health_check",
     "agent.controller",
     "agent.config",
     "agent.config.loader",
