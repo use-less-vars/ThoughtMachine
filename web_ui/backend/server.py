@@ -934,6 +934,25 @@ async def browse_directory(path: str = ""):
         return {"success": False, "error": str(exc), "entries": []}
 
 
+@app.post("/api/browse/create")
+async def create_directory(body: dict):
+    """Create a new directory for the workspace path browser."""
+    try:
+        parent_path = body.get("parent_path", "")
+        dir_name = body.get("name", "")
+        if not dir_name:
+            return {"success": False, "error": "Directory name is required"}
+        new_path = os.path.join(parent_path, dir_name)
+        if os.path.exists(new_path):
+            return {"success": False, "error": f"Already exists: {dir_name}"}
+        os.makedirs(new_path, exist_ok=True)
+        return {"success": True, "path": os.path.abspath(new_path)}
+    except (OSError, PermissionError) as exc:
+        return {"success": False, "error": str(exc)}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "thoughtmachine-web-ui"}

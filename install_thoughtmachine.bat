@@ -296,7 +296,13 @@ echo   Next steps:
 echo(
 echo     1. Double-click: start_thoughtmachine.bat
 echo(
-echo     2. Open http://127.0.0.1:8000 in your browser
+echo     2. Or for production mode (serves from dist/):
+echo        start_thoughtmachine.bat --prod
+echo(
+echo     3. Open http://127.0.0.1:8000 in your browser
+echo(
+echo     In dev mode, the frontend runs on http://127.0.0.1:5173
+echo     (hot-reload) and the backend API on http://127.0.0.1:8000.
 echo(
 echo   Config is created automatically on first run at:
 echo     %%USERPROFILE%%\.thoughtmachine\agent_config.json

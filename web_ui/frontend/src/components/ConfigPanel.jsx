@@ -24,6 +24,34 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
     }
   }, [setLoading, setEntries, setError]);
 
+  const [newFolderName, setNewFolderName] = useState('');
+  const [creating, setCreating] = useState(false);
+
+  const createFolder = useCallback(async () => {
+    const name = newFolderName.trim();
+    if (!name) return;
+    setCreating(true);
+    try {
+      const url = `http://${window.location.hostname}:8000/api/browse/create`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parent_path: path, name }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setNewFolderName('');
+        fetchDir(path);
+      } else {
+        setError(data.error || 'Failed to create directory');
+      }
+    } catch (err) {
+      setError('Network error: ' + err.message);
+    } finally {
+      setCreating(false);
+    }
+  }, [newFolderName, path, fetchDir, setError]);
+
   useEffect(() => {
     fetchDir(path);
   }, [path, fetchDir]);
@@ -73,13 +101,35 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
-      <div style={{ marginTop: '0.1rem', marginBottom: '0.4rem', display: 'flex', gap: '0.3rem' }}>
+      <div style={{ marginTop: '0.1rem', marginBottom: '0.4rem', display: 'flex', gap: '0.3rem', flexWrap: 'wrap' }}>
         {path && path !== '/' && (
           <button onClick={goUp} style={{
             background: '#45475a', color: '#cdd6f4', border: '1px solid #585b70',
             borderRadius: '4px', padding: '0.2rem 0.5rem', cursor: 'pointer', fontSize: '0.75rem'
           }}>↑ Parent</button>
         )}
+        <div style={{ display: 'flex', gap: '0.3rem', alignItems: 'center' }}>
+          <input
+            type="text"
+            value={newFolderName}
+            onChange={(e) => setNewFolderName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') createFolder(); }}
+            placeholder="new folder"
+            style={{
+              background: '#1e1e2e', color: '#cdd6f4', border: '1px solid #585b70',
+              borderRadius: '4px', padding: '0.2rem 0.4rem', fontSize: '0.75rem',
+              width: '90px', outline: 'none',
+            }}
+          />
+          <button onClick={createFolder} disabled={creating || !newFolderName.trim()} style={{
+            background: creating ? '#585b70' : '#45475a',
+            color: creating || !newFolderName.trim() ? '#6c7086' : '#a6e3a1',
+            border: '1px solid #585b70',
+            borderRadius: '4px', padding: '0.2rem 0.4rem',
+            cursor: creating || !newFolderName.trim() ? 'not-allowed' : 'pointer',
+            fontSize: '0.75rem', whiteSpace: 'nowrap',
+          }}>{creating ? '…' : '+ Folder'}</button>
+        </div>
         <button onClick={() => onSelect(path)} style={{
           background: '#89b4fa', color: '#1e1e2e', border: 'none',
           borderRadius: '4px', padding: '0.2rem 0.5rem', cursor: 'pointer', fontWeight: 600, fontSize: '0.75rem',

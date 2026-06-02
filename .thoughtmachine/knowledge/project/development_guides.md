@@ -464,3 +464,20 @@ Split `requirements.txt` into core + optional RAG to reduce venv bloat:
 
 Removed from core: `PyQt6` (legacy GUI, not needed for web UI), `sentence-transformers`, `chromadb`, `langchain`, `langchain-community`.
 
+
+## 2026-06-01 — ## 2026-06-03 — New User Onboarding System (Created)
+
+### Wh...
+
+## 2026-06-03 — New User Onboarding System (Created)
+
+### What was done
+1. **Created `user/onboarding_guide.md` in global KB** — A friendly, non-technical guide for new ThoughtMachine users. Explains concepts in plain language (workspace, session, KB). Gives suggested "first things to say." Doesn't assume prior knowledge. Warm, guided tone.
+
+2. **Added Rule 14 to system prompt** — Both `system_prompt.txt` (root, actually loaded) and `resources/default_system_prompt.txt` (template) now contain:
+   > *"When interacting with someone who seems new to ThoughtMachine, offer a guided, friendly experience. Do not assume prior knowledge — explain concepts like workspaces, sessions, and the knowledge base in plain language. Check the global KB's `user/onboarding_guide.md` for a ready-to-use friendly introduction. Suggest clear next steps. Invite questions."*
+
+### Still open / not implemented
+- **No first-time user detection mechanism** — The agent needs some way to know it's talking to a new user. Options: check for a marker in global KB (e.g., `user/user_profile.md`), or simply run onboarding when the user seems confused.
+- **The "View Artifact" tool** — Previously brainstormed idea. Could pair well with onboarding (agent generates a welcome page and presents it visually).
+
