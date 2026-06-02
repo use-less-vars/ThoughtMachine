@@ -3,7 +3,7 @@ Configuration models for the ThoughtMachine agent.
 """
 from typing import ClassVar, Optional, Callable, List, Any, Dict, Literal
 from pathlib import Path
-from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
+from pydantic import BaseModel, Field, field_validator, model_validator, model_serializer, ConfigDict
 from agent.logging import log
 from tools import SIMPLIFIED_TOOL_CLASSES
 from thoughtmachine.security import SessionPermissions
@@ -67,7 +67,7 @@ class AgentConfig(BaseModel):
     model_override: Optional[str] = Field(default=None, description='Override model from the profile (leaves provider_id intact)')
     temperature: float = 0.2
     max_turns: int = 100
-    stop_check: Optional[Callable[[], bool]] = None
+    stop_check: Optional[Callable[[], bool]] = Field(default=None, description='Runtime stop-check callback. Called periodically during agent execution to check if processing should be aborted. Return True to signal stop. Not serialised to/from JSON config.')
     system_prompt: Optional[str] = None
     token_monitor_warning_threshold: int = Field(default=35000, description='Token count threshold for warning (user)')
     token_monitor_critical_threshold: int = Field(default=50000, description='Token count threshold for critical warning (user)')
@@ -139,6 +139,13 @@ class AgentConfig(BaseModel):
             if filtered != self.enabled_tools:
                 object.__setattr__(self, 'enabled_tools', filtered)
         return self
+
+    @model_serializer(mode='wrap')
+    def _serialize_stop_check(self, handler):
+        """Exclude stop_check from serialization — it's a runtime-only callable."""
+        d = handler(self)
+        d.pop('stop_check', None)
+        return d
 
     def get_filtered_tool_classes(self, enabled_tools=None):
         """Get tool classes filtered based on rag_enabled and enabled_tools.

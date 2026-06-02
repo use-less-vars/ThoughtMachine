@@ -4,10 +4,70 @@ Handles loading, saving, and validation of agent configurations.
 """
 import os
 import json
+import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Set
 from agent.logging import log
 from .models import AgentConfig
+
+# ── Backup safety ───────────────────────────────────────────────────────────
+BACKUP_DIR_NAME = '.config_backups'
+
+
+def _ensure_backup_dir() -> str:
+    """Return path to config backup directory, creating it if needed."""
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    backup_dir = os.path.join(project_root, BACKUP_DIR_NAME)
+    os.makedirs(backup_dir, exist_ok=True)
+    return backup_dir
+
+
+def _backup_config(config_path: str) -> Optional[str]:
+    """Create a timestamped backup of an existing config file before overwriting.
+
+    Returns the backup path, or None if no existing file or backup failed.
+    """
+    if not os.path.exists(config_path):
+        return None
+    try:
+        backup_dir = _ensure_backup_dir()
+        base = os.path.basename(config_path)
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_name = f'{base}.{ts}.bak'
+        backup_path = os.path.join(backup_dir, backup_name)
+        shutil.copy2(config_path, backup_path)
+        log('INFO', 'config.loader', f'Backed up config to {backup_path}')
+        return backup_path
+    except Exception as e:
+        log('WARNING', 'config.loader', f'Failed to back up config {config_path}: {e}')
+        return None
+
+
+def _sanitize_config_for_serialization(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip any non-serializable values (callables, etc.) from a config dict.
+
+    This is a safety net so that a leaked ``stop_check`` or similar callable
+    never reaches ``json.dump()`` and causes a hard crash.
+    """
+    cleaned = {}
+    for k, v in config.items():
+        if callable(v):
+            log('WARNING', 'config.loader',
+                f'Found callable in config key {k!r} — stripping it from serialization')
+            continue
+        if isinstance(v, dict):
+            cleaned[k] = _sanitize_config_for_serialization(v)
+        elif isinstance(v, list):
+            cleaned[k] = [
+                _sanitize_config_for_serialization(item) if isinstance(item, dict) else item
+                for item in v
+                if not callable(item)
+            ]
+        else:
+            cleaned[k] = v
+    return cleaned
+
 
 def _map_legacy_fields(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     """Map legacy field names to new field names for backward compatibility."""
@@ -39,15 +99,21 @@ def load_default_config() -> Dict[str, Any]:
     but uses AgentConfig for validation.
     """
     config = AgentConfig()
-    config_dict = config.dict()
+    config_dict = config.model_dump()
     return config_dict
 
 def load_config(config_path: str) -> Dict[str, Any]:
-    """Load configuration from file and merge with defaults.
-    
+    """Load configuration from file and merge with defaults (self-healing).
+
+    Gracefully handles:
+      - Missing file → returns defaults
+      - Corrupted JSON → logs warning, returns defaults
+      - Legacy field names → auto-migrated via ``_map_legacy_fields``
+      - Null fields → backfilled from model defaults via ``_backfill_nulls``
+
     Args:
         config_path: Path to configuration file (JSON)
-        
+
     Returns:
         Configuration dictionary with defaults for missing keys
     """
@@ -57,8 +123,17 @@ def load_config(config_path: str) -> Dict[str, Any]:
         return default_config
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
-            saved_config = json.load(f)
+            raw_content = f.read()
+        if not raw_content.strip():
+            log('WARNING', 'config.loader', f'Config file {config_path} is empty, using defaults')
+            return default_config
+        saved_config = json.loads(raw_content)
+        if not isinstance(saved_config, dict):
+            log('WARNING', 'config.loader',
+                f'Config file {config_path} does not contain a JSON object, using defaults')
+            return default_config
         saved_config = _map_legacy_fields(saved_config)
+        saved_config = _sanitize_config_for_serialization(saved_config)
         merged_config = default_config.copy()
         for key, value in saved_config.items():
             if key in merged_config:
@@ -68,10 +143,13 @@ def load_config(config_path: str) -> Dict[str, Any]:
         log('DEBUG', 'config.loader', f'Loaded config from {config_path}')
         merged_config = _backfill_nulls(merged_config)
         return merged_config
+    except json.JSONDecodeError as e:
+        log('WARNING', 'config.loader',
+            f'Corrupted config file {config_path}: {e}. Falling back to defaults.')
+        return default_config
     except Exception as e:
         log('WARNING', 'config.loader', f'Error loading config from {config_path}: {e}')
         return default_config
-
 def _get_valid_field_names() -> Set[str]:
     """Return the set of valid field names for AgentConfig."""
     return set(AgentConfig.model_fields.keys())
@@ -108,26 +186,59 @@ def _backfill_nulls(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
-def save_config(config: Dict[str, Any], config_path: str) -> bool:
-    """Save configuration to file.
-    
+def save_config(config: Dict[str, Any], config_path: str, backup: bool = True) -> bool:
+    """Save configuration to file with self-healing safeguards.
+
+    Steps:
+      1. Warn about stray keys (keys not in AgentConfig schema).
+      2. Sanitize — strip any callables / non-serializable values.
+      3. Create a timestamped backup of the previous file (if *backup* = True).
+      4. Write atomically via a temp file + rename.
+
     Args:
         config: Configuration dictionary
         config_path: Path to save configuration file
-        
+        backup: Whether to create a timestamped backup before overwriting
+
     Returns:
         True if successful, False otherwise
     """
     try:
         _warn_stray_keys(config)
+        config = _sanitize_config_for_serialization(config)
+
+        if backup:
+            _backup_config(config_path)
+
         os.makedirs(os.path.dirname(os.path.abspath(config_path)), exist_ok=True)
-        with open(config_path, 'w', encoding='utf-8') as f:
+
+        # Atomic write via temp file to prevent partial writes
+        tmp_path = config_path + '.tmp'
+        with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2)
+        os.replace(tmp_path, config_path)
+
         log('DEBUG', 'config.loader', f'Saved config to {config_path}')
         return True
     except Exception as e:
         log('ERROR', 'config.loader', f'Error saving config to {config_path}: {e}')
         return False
+def migrate_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Upgrade a config dict to the latest schema version.
+
+    Currently handled migrations:
+      - Legacy field name remapping (delegates to ``_map_legacy_fields``)
+      - Null backfill (delegates to ``_backfill_nulls``)
+      - Sanitization (removes callables)
+
+    Returns a new dict (the original is not mutated).
+    """
+    migrated = config_dict.copy()
+    migrated = _map_legacy_fields(migrated)
+    migrated = _sanitize_config_for_serialization(migrated)
+    migrated = _backfill_nulls(migrated)
+    return migrated
+
 
 def validate_config(config_dict: Dict[str, Any]) -> Optional[AgentConfig]:
     """Validate configuration dictionary and return AgentConfig instance.
