@@ -163,8 +163,8 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
 }
 
 
-function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected }) {
-  const [defaultSaved, setDefaultSaved] = useState(false);
+function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, defaultConfigSaveMessage, onClearDefaultSaveStatus }) {
+  const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error'
   const [showManageProviders, setShowManageProviders] = useState(false);
   const getSafeDraft = (cfg) => ({
     temperature: cfg?.temperature ?? 0.7,
@@ -206,6 +206,22 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
     setBrowserPath(newPath);
     setBrowserError('');
   }, []);
+
+  // ── Sync defaultConfigSaveStatus from backend into local UI state ────
+  useEffect(() => {
+    if (defaultConfigSaveStatus === 'ok') {
+      setDefaultSaved(true);
+      const t = setTimeout(() => setDefaultSaved(false), 2500);
+      return () => clearTimeout(t);
+    } else if (defaultConfigSaveStatus === 'error') {
+      setDefaultSaved('error');
+      const t = setTimeout(() => {
+        setDefaultSaved(false);
+        onClearDefaultSaveStatus?.();
+      }, 4000);
+      return () => clearTimeout(t);
+    }
+  }, [defaultConfigSaveStatus, onClearDefaultSaveStatus]);
 
   useEffect(() => {
     setDraft(getSafeDraft(config));
@@ -322,12 +338,11 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
           className="btn btn-accent"
           style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem' }}
           onClick={() => {
-            sendCommand('set_default_config');
-            setDefaultSaved(true);
-            setTimeout(() => setDefaultSaved(false), 2500);
+            sendCommand('set_default_config', { config: draft });
+            setDefaultSaved('pending');
           }}
         >
-          {defaultSaved ? '✓ Default saved!' : '💾 Save as Default'}
+          {defaultSaved === 'pending' ? '💾 Saving…' : defaultSaved === 'error' ? '✗ Save failed' : defaultSaved === true ? '✓ Default saved!' : '💾 Save as Default'}
         </button>
       </div>
 

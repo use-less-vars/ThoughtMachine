@@ -80,7 +80,9 @@ import json
 import os
 import subprocess
 import sys
+import shutil
 import tempfile
+import time
 import traceback
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -426,29 +428,39 @@ async def websocket_endpoint(ws: WebSocket):
                         })
 
                 elif command == "set_default_config":
-                    """Save the current session config as the global default."""
-                    if bridge is None or bridge._config is None:
-                        await ws.send_json({
-                            "type": "default_config_saved",
-                            "status": "error",
-                            "message": "No active session config available",
-                        })
-                        continue
+                    """Save config as the global default.
+
+                    Accepts an optional ``config`` payload (frontend format) so the
+                    frontend can send the user's draft directly.  Falls back to
+                    ``bridge.get_config()`` when no payload is provided.
+                    """
                     try:
+                        config_dict = msg.get("config")
+                        if config_dict:
+                            # Frontend sent the draft — translate to backend format
+                            cfg_dict = _translate_frontend_config(config_dict)
+                        elif bridge is not None:
+                            # Fallback: use bridge's currently applied config
+                            cfg_dict = bridge.get_config().model_dump(exclude={'api_key', 'stop_check'}, exclude_none=True)
+                        else:
+                            await ws.send_json({
+                                "type": "default_config_saved",
+                                "status": "error",
+                                "message": "No config provided and no active session",
+                            })
+                            continue
+
                         config_dir = Path.home() / '.thoughtmachine'
                         config_dir.mkdir(parents=True, exist_ok=True)
                         config_path = config_dir / 'agent_config.json'
-                        # Dump current config to dict (backend format — matches _load_global_defaults expectations)
-                        cfg_dict = bridge.get_config().model_dump(exclude={'api_key'}, exclude_none=True)
-                        with tempfile.NamedTemporaryFile(
-                            mode='w', delete=False,
-                            dir=str(config_dir),
-                            suffix='.tmp',
-                            prefix='agent_config_'
-                        ) as tmp:
-                            json.dump(cfg_dict, tmp, indent=2, default=str)
-                            tmp.flush()
-                            os.replace(tmp.name, str(config_path))
+
+                        # Windows-safe atomic write with retry
+                        _atomic_replace(
+                            data=cfg_dict,
+                            dst=str(config_path),
+                            work_dir=str(config_dir),
+                        )
+
                         log('INFO', 'server.config', f"Default config saved to {config_path}")
                         await ws.send_json({
                             "type": "default_config_saved",
@@ -1181,6 +1193,50 @@ def _config_to_dict(cfg) -> Dict[str, Any]:
     if hasattr(cfg, "dict"):
         return cfg.dict()
     return {k: str(v) for k, v in vars(cfg).items() if not k.startswith("_")}
+
+
+def _atomic_replace(data: dict, dst: str, work_dir: str, retries: int = 3) -> None:
+    """Atomically write *data* as JSON to *dst*, with Windows-safe retries.
+
+    Writes to a temporary file in *work_dir*, then replaces the destination.
+    Retries up to *retries* times on OSError (covers Windows sharing
+    violations from antivirus / file locks).  Falls back to ``shutil.move``
+    if ``os.replace`` fails after all retries.
+    """
+    for attempt in range(1, retries + 2):
+        with tempfile.NamedTemporaryFile(
+            mode='w', delete=False,
+            dir=work_dir,
+            suffix='.tmp',
+            prefix='agent_config_',
+        ) as tmp:
+            json.dump(data, tmp, indent=2, default=str)
+            tmp.flush()
+            tmp_path = tmp.name
+
+        try:
+            os.replace(tmp_path, dst)
+            return  # success
+        except OSError:
+            # Clean up orphaned temp file
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+            if attempt > retries:
+                # Final fallback: try shutil.move (more resilient on Windows)
+                try:
+                    shutil.move(tmp_path, dst)
+                    log('WARNING', 'server.config',
+                        f'_atomic_replace: os.replace failed after {retries} retries, '
+                        f'used shutil.move as fallback')
+                    return
+                except OSError as exc:
+                    raise exc
+
+            # Back off before retrying
+            time.sleep(0.2 * attempt)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -57,6 +57,8 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
   const pendingCommandsRef = useRef([])  // queued commands for retry
   const connectSessionWsRef = useRef(null)  // ref to avoid circular deps in sendCommand
   const [wsConnected, setWsConnected] = useState(false)
+  const [defaultConfigSaveStatus, setDefaultConfigSaveStatus] = useState(null) // null | 'ok' | 'error'
+  const [defaultConfigSaveMessage, setDefaultConfigSaveMessage] = useState('')
 
   // ── Config panel resize state (persisted per tab) ──────────────────
   const [configPanelWidth, setConfigPanelWidth] = useState(() => {
@@ -332,6 +334,11 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
         setAvailableTools(msg.tools || [])
         break
 
+      case 'default_config_saved':
+        setDefaultConfigSaveStatus(msg.status)
+        setDefaultConfigSaveMessage(msg.message || '')
+        break
+
       case 'session_saved':
         onSessionSaved?.()
         break
@@ -378,6 +385,12 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
           availableTools={availableTools}
           panelWidth={configPanelWidth}
           wsConnected={wsConnected}
+          defaultConfigSaveStatus={defaultConfigSaveStatus}
+          defaultConfigSaveMessage={defaultConfigSaveMessage}
+          onClearDefaultSaveStatus={() => {
+            setDefaultConfigSaveStatus(null)
+            setDefaultConfigSaveMessage('')
+          }}
         />
         <div
           className="resize-handle"
