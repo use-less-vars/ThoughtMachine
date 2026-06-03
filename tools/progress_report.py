@@ -1,5 +1,5 @@
 from pydantic import Field
-from typing import Optional, Literal
+from typing import ClassVar, List, Optional, Literal
 from datetime import datetime
 import os
 from pathlib import Path
@@ -7,6 +7,7 @@ from .base import ToolBase
 
 
 class ProgressReport(ToolBase):
+    required_categories: ClassVar[List[str]] = ["filesystem:write"]
     """Write a timestamped progress report without stopping agent execution.
     
     Use this tool to document intermediate progress, milestones, or status updates

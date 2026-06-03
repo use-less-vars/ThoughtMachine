@@ -7,7 +7,7 @@ Supports both single-server and multi-server configurations.
 import json
 import os
 import logging
-from typing import Dict, Any, List, Optional, Union, Literal
+from typing import ClassVar, Dict, Any, List, Optional, Union, Literal
 from pathlib import Path
 from pydantic import Field
 
@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class MCPValidator(ToolBase):
+    required_categories: ClassVar[List[str]] = ["filesystem:read"]
     """Validate MCP server configurations and test connectivity."""
     
     tool: Literal["MCPValidator"] = "MCPValidator"

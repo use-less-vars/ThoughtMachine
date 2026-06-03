@@ -4,7 +4,7 @@ import os
 import time
 import datetime
 import uuid
-from typing import Literal, Optional, Dict, Any
+from typing import ClassVar, List, Literal, Optional, Dict, Any
 from pydantic import Field, field_validator, model_validator
 from .base import ToolBase
 
@@ -28,6 +28,7 @@ except ImportError:
 
 
 class DockerCodeRunner(ToolBase):
+    required_categories: ClassVar[List[str]] = ["filesystem:write"]
     """Execute code, scripts, and shell commands in a secure Docker container.
     
     Primary uses:

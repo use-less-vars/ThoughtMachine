@@ -5,7 +5,7 @@ Uses LibCST for structural analysis.
 import libcst as cst
 import libcst.matchers as m
 import libcst.metadata
-from typing import Dict, List, Optional, Set, Tuple, Any, Union, Literal
+from typing import ClassVar, Dict, List, Optional, Set, Tuple, Any, Union, Literal
 from pydantic import Field
 from .base import ToolBase
 from agent.logging import log
@@ -211,6 +211,7 @@ class PydanticModelVisitor(cst.CSTVisitor):
         return None
 
 class FieldViewer(ToolBase):
+    required_categories: ClassVar[List[str]] = ["filesystem:read"]
     """
     Parse Python files, locate Pydantic model definitions, and display their fields
     with types, docstrings, and line numbers.

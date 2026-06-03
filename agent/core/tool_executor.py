@@ -248,7 +248,7 @@ class ToolExecutor:
             # Check permission categories before executing
             session_perms = self.config.session_permissions
             error = _check_permissions(
-                tool_class.required_categories,
+                tool_class.get_required_categories(arguments),
                 session_perms.to_dict() if session_perms is not None else None,
             )
             if error is not None:

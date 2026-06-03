@@ -1,8 +1,9 @@
-from typing import ClassVar, Literal
+from typing import ClassVar, List, Literal
 from pydantic import Field
 from .base import ToolBase
 
 class SummarizeTool(ToolBase):
+    required_categories: ClassVar[List[str]] = ["filesystem:read"]
     """Summarize Tool: Write a summary of the conversation and specify how many most recent turns to keep.
     The agent will replace older turns with the summary, preserving the specified number of recent turns."""
     tool: Literal["SummarizeTool"] = "SummarizeTool"

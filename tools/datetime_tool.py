@@ -1,9 +1,10 @@
-from typing import Literal, Optional
+from typing import ClassVar, List, Literal, Optional
 from pydantic import Field
 from datetime import datetime, date, time, timedelta
 from .base import ToolBase
 
 class DateTimeTool(ToolBase):
+    required_categories: ClassVar[List[str]] = ["filesystem:read"]
     """Access date and time information and perform datetime operations."""
     tool: Literal["DateTimeTool"] = "DateTimeTool"
     

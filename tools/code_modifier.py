@@ -2,7 +2,7 @@
 High-level code modification tool using LibCST.
 Supports operations: add_function, add_method, add_import, add_class, replace_function_body, modify_function.
 """
-from typing import Optional, Literal, Dict, Any, List
+from typing import ClassVar, Optional, Literal, Dict, Any, List
 from pydantic import Field, model_validator
 import libcst as cst
 import warnings
@@ -19,6 +19,7 @@ from pathlib import Path
 
 
 class CodeModifier(ToolBase):
+    required_categories: ClassVar[List[str]] = ["filesystem:write"]
     """
     Modify Python code at a structural level.
      Currently supports: add_function, add_method, add_import, add_class, replace_function_body, modify_function.

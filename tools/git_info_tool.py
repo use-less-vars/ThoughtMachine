@@ -1,5 +1,5 @@
 # tools/git_info_tool.py
-from typing import Literal, Optional, List
+from typing import ClassVar, Literal, Optional, List
 from pydantic import Field
 import subprocess
 import os
@@ -8,6 +8,7 @@ from .base import ToolBase
 
 
 class GitInfoTool(ToolBase):
+    required_categories: ClassVar[List[str]] = ["filesystem:read"]
     """
     Read-only Git repository information tool.
     Provides access to git status, diff, log, branch, show, remote, blame, and config.

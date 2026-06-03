@@ -1,11 +1,12 @@
 """Unified agent-to-user response tool. Replaces Final, FinalReport, and RequestUserInteraction."""
 
-from typing import ClassVar, Literal, Optional
+from typing import ClassVar, List, Literal, Optional
 from pydantic import Field
 from .base import ToolBase
 
 
 class Respond(ToolBase):
+    required_categories: ClassVar[List[str]] = ["filesystem:write"]
     """Unified agent-to-user response tool. Replaces Final, FinalReport, and RequestUserInteraction.
 
     The `content` field MUST contain the complete message to display to the user — this is

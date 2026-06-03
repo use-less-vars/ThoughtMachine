@@ -8,6 +8,7 @@ from pydantic import Field
 from typing import List, Optional, ClassVar, Literal
 
 class FileSearchTool(ToolBase):
+    required_categories: ClassVar[List[str]] = ["filesystem:read"]
     """Search for patterns across multiple files or directories with regex, multiline, context lines, and line numbers.
     Supports regex (with (?s) flag for dot-matches-newline) and plain text multi-line searches.
     Use file_pattern glob to limit files, or directory/filenames."""

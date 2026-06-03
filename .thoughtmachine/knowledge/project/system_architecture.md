@@ -11,6 +11,20 @@ Key architectural decisions, component relationships, and data flow patterns.
 ## Components
 (To be populated)
 
+## 2026-06-03 — ## Permission Categories (required_categories) — 2026-07-10
+...
+
+## Permission Categories (required_categories) — 2026-07-10
+
+Every tool now declares a `required_categories` ClassVar (e.g. `["filesystem:read"]`, `["filesystem:write"]`), which specifies what session permissions the tool needs to run.
+
+- Base class: `ToolBase.required_categories` defaults to `[]` (no special permissions).
+- `ToolBase.get_required_categories(params)` classmethod returns the static list by default.
+- Subclasses can override `get_required_categories()` for operation-level granularity (e.g., FileEditor returns `["filesystem:read"]` for read ops, `["filesystem:write"]` for write/delete ops).
+- `tool_executor.py` calls `tool_class.get_required_categories(arguments)` before execution, passing the result to `_check_permissions()`.
+- `_check_permissions()` uses `DEFAULT_SESSION_PERMISSIONS` (container=false, network=false, filesystem=read, security=read, execution=banned) as fallback when `session_permissions` is None.
+- All 23 tool subclasses now have `required_categories` defined or `get_required_categories` overridden.
+
 ## Data Flow
 (To be populated)
 

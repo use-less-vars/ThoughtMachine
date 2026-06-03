@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import ClassVar, List, Literal
 from pathlib import Path
 from .base import ToolBase
 import os
@@ -6,6 +6,7 @@ from pydantic import Field
 
 class DirectoryCreator(ToolBase):
     """Create directories"""
+    required_categories: ClassVar[List[str]] = ["filesystem:write"]
     tool: Literal["DirectoryCreator"] = "DirectoryCreator"
 
     directory_path: str = Field(description="Directory path to create")

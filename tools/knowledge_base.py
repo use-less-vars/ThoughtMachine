@@ -106,6 +106,7 @@ DOMAIN_TEMPLATES: Dict[str, str] = {
 
 
 class KnowledgeBaseTool(ToolBase):
+    required_categories: ClassVar[List[str]] = ["filesystem:write"]
     """
     PROJECT NOTEBOOK — Persistent, domain-organized knowledge base.
 
