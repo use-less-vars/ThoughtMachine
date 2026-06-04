@@ -1,0 +1,3 @@
+# Test commit marker
+# This file was committed directly via GitInfoTool.commit to verify the new operation works.
+# Timestamp: 2026-06-04
