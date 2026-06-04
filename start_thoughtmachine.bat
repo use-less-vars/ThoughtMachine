@@ -39,24 +39,31 @@ echo ============================================
 echo(
 
 if "%PROD_MODE%"=="true" (
-    REM -- Production mode (serve from dist/) ---------------------------------
-    echo   Mode:    PRODUCTION (serving pre-built dist/ files)
+    REM -- Production mode (auto-build fresh, then serve) --------------------
+    echo   Mode:    PRODUCTION (fresh build from source)
     echo   Server:  http://127.0.0.1:8000
     echo   Stop:    Ctrl+C
-    echo   Note:    Rebuild frontend after changes:
-    echo            cd web_ui\frontend ^&^& npm run build
     echo(
     python -m web_ui.backend.server --serve-frontend
 ) else (
     REM -- Development mode (hot-reload via Vite) -----------------------------
     echo   Mode:    DEVELOPMENT (hot-reload enabled)
     echo(
-    echo   Frontend: http://127.0.0.1:5173
-    echo   Backend:  http://127.0.0.1:8000
+    echo   Frontend: http://127.0.0.1:5173  ^<-^< USE THIS URL
+    echo   Backend:  http://127.0.0.1:8000   ^(API only, not the app^)
     echo   Stop:    Ctrl+C
     echo(
 
     set "FRONTEND_DIR=%SCRIPT_DIR%web_ui\frontend"
+
+    REM Verify npm is available before starting Vite
+    where npm >nul 2>&1
+    if errorlevel 1 (
+        echo [ERROR] npm not found. Make sure Node.js is installed and on your PATH.
+        echo        Download from: https://nodejs.org/
+        pause
+        exit /b 1
+    )
 
     REM Start Vite dev server in a new window
     echo   Starting Vite dev server ^(port 5173^)...
@@ -64,8 +71,27 @@ if "%PROD_MODE%"=="true" (
     start "ThoughtMachine Vite" cmd /c "npm run dev"
     popd
 
-    REM Small pause to let Vite start before backend starts
-    timeout /t 2 /nobreak >nul
+    REM Wait for Vite to start listening on port 5173 (up to 15 seconds)
+    echo   Waiting for Vite to be ready...
+    set "VITE_READY="
+    for /l %%i in (1,1,15) do (
+        timeout /t 1 /nobreak >nul
+        netstat -an 2^>nul | findstr ":5173 " >nul 2>&1
+        if not errorlevel 1 (
+            set "VITE_READY=1"
+            goto :vite_ready
+        )
+    )
+    :vite_ready
+    if not defined VITE_READY (
+        echo(
+        echo [WARNING] Vite dev server may not have started.
+        echo           Check the "ThoughtMachine Vite" window for errors.
+        echo           Try browsing to http://127.0.0.1:5173 manually.
+        echo(
+    ) else (
+        echo   Vite is ready on http://127.0.0.1:5173
+    )
 
     REM Start backend (CORS already allows Vite dev server on any port)
     python -m web_ui.backend.server
@@ -81,7 +107,7 @@ goto :eof
 :show_help
 echo Usage: %~nx0 [--prod]
 echo(
-echo   --prod    Production mode (serves pre-built dist/ files)
+echo   --prod    Production mode (fresh build from source, then serve)
 echo            Default is development mode with hot-reload.
 echo   --help    Show this help
 pause

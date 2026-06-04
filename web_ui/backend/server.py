@@ -1333,13 +1333,13 @@ def _setup_frontend_serving() -> bool:
     global _SERVE_FRONTEND
     _SERVE_FRONTEND = True
 
-    # Auto-build if dist doesn't exist yet
+    # Always rebuild to prevent stale dist/ from serving old code
+    # Vite/Rollup use incremental caching, so subsequent builds are fast.
     dist = _FRONTEND_DIST
-    if not dist.exists() or not (dist / "index.html").exists():
-        if not _build_frontend():
-            log('WARNING', 'server',
-                'Frontend build failed — will show build-error page on /')
-            return False
+    if not _build_frontend():
+        log('WARNING', 'server',
+            'Frontend build failed — will show build-error page on /')
+        return False
 
     # Mount static files — this catches all non-API paths for assets
     # FastAPI routes are checked before mounts, so API routes still work.

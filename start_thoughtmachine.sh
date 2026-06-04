@@ -57,24 +57,28 @@ echo "============================================"
 echo ""
 
 if $PROD_MODE; then
-    # ── Production mode (serve from dist/) ─────────────────────────────
-    echo "  Mode:    PRODUCTION (serving pre-built dist/ files)"
+    # ── Production mode (auto-build fresh, then serve) ────────────────
+    echo "  Mode:    PRODUCTION (fresh build from source)"
     echo "  Server:  http://127.0.0.1:8000"
     echo "  Stop:    Ctrl+C"
-    echo "  Note:    Rebuild frontend after changes:"
-    echo "           cd web_ui/frontend && npm run build"
     echo ""
     python -m web_ui.backend.server --serve-frontend
 else
     # ── Development mode (hot-reload via Vite) ─────────────────────────
     echo "  Mode:    DEVELOPMENT (hot-reload enabled)"
     echo ""
-    echo "  Frontend: http://127.0.0.1:5173"
-    echo "  Backend:  http://127.0.0.1:8000"
+    echo "  Frontend: http://127.0.0.1:5173  <-- USE THIS URL"
+    echo "  Backend:  http://127.0.0.1:8000   (API only, not the app)"
     echo "  Stop:    Ctrl+C"
     echo ""
 
     FRONTEND_DIR="$PROJECT_DIR/web_ui/frontend"
+
+    # Verify npm is available
+    if ! command -v npm &>/dev/null; then
+        echo "[ERROR] npm not found. Install Node.js from https://nodejs.org/"
+        exit 1
+    fi
 
     # Start Vite dev server in background
     echo "  → Starting Vite dev server (port 5173)..."
@@ -82,6 +86,27 @@ else
     npm run dev &
     VITE_PID=$!
     cd "$PROJECT_DIR"
+
+    # Wait for Vite to start listening on port 5173 (up to 15 seconds)
+    echo "  → Waiting for Vite to be ready..."
+    VITE_READY=false
+    for i in $(seq 1 15); do
+        sleep 1
+        if ss -tlnp 2>/dev/null | grep -q :5173 || \
+           lsof -i :5173 2>/dev/null | grep -q LISTEN; then
+            VITE_READY=true
+            break
+        fi
+    done
+    if [ "$VITE_READY" = false ]; then
+        echo ""
+        echo "  [WARNING] Vite dev server may not have started."
+        echo "            Check the terminal output above for errors."
+        echo "            Try browsing to http://127.0.0.1:5173 manually."
+        echo ""
+    else
+        echo "  → Vite is ready on http://127.0.0.1:5173"
+    fi
 
     # Kill Vite when script exits
     cleanup() {
