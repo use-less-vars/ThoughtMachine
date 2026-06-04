@@ -1097,7 +1097,7 @@ class Agent:
                 self._add_conversation_data_to_event(turn_event)
                 yield turn_event
                 if tool_calls:
-                    executed_tools, final_detected, respond_result, summary_text, summary_keep_recent_turns = self.tool_executor.execute_tool_calls(tool_calls, add_to_conversation_func=self._add_to_conversation, agent_id=0, turn_transaction=turn_transaction)
+                    executed_tools, final_detected, respond_result, summary_text, summary_keep_recent_turns = self.tool_executor.execute_tool_calls(tool_calls, add_to_conversation_func=self._add_to_conversation, agent_id=0, session_id=self.session_id, turn_transaction=turn_transaction)
                     processed_tools = []
                     for tool_info in executed_tools:
                         result = tool_info.get('result', '')
