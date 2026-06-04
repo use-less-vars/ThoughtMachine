@@ -28,7 +28,7 @@ except ImportError:
 
 
 class DockerCodeRunner(ToolBase):
-    required_categories: ClassVar[List[str]] = ["filesystem:write"]
+    required_categories: ClassVar[List[str]] = ["filesystem:write", "container:true"]
     """Execute code, scripts, and shell commands in a secure Docker container.
     
     Primary uses:

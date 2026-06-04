@@ -94,10 +94,9 @@ class AgentConfig(BaseModel):
     tool_output_token_limit: int = Field(default=10000, description='Maximum token limit for tool outputs (default 10,000 tokens)')
     detail: Literal['minimal', 'normal', 'verbose'] = Field(default='normal', description='Detail level for event display')
     enabled_tools: List[str] = Field(default_factory=lambda: [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES], description='List of enabled tool class names')
-    session_permissions: Optional[SessionPermissions] = Field(
-        default=None,
-        description='Session permissions profile controlling tool access categories. '
-                    'None = use DEFAULT_SESSION_PERMISSIONS from tool_executor.',
+    session_permissions: SessionPermissions = Field(
+        default_factory=SessionPermissions,
+        description='Session permissions profile controlling tool access categories.',
     )
 
     @field_validator('system_prompt')

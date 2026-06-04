@@ -6,7 +6,6 @@ from .base import ToolBase
 
 
 class Respond(ToolBase):
-    required_categories: ClassVar[List[str]] = ["filesystem:write"]
     """Unified agent-to-user response tool. Replaces Final, FinalReport, and RequestUserInteraction.
 
     The `content` field MUST contain the complete message to display to the user — this is
@@ -34,6 +33,13 @@ class Respond(ToolBase):
         None,
         description="Title for the report file (only used if report_body is provided)"
     )
+
+    @classmethod
+    def get_required_categories(cls, params: dict | None = None) -> list[str]:
+        """Return filesystem:write only when report_body is provided (requires file writing)."""
+        if params and params.get("report_body"):
+            return ["filesystem:write"]
+        return []
 
     def execute(self) -> str:
         """Execute the Respond tool."""

@@ -2036,3 +2036,26 @@ The old `'user_interaction_requested'` was properly removed (replaced by `Respon
 - Removed `'final'` from bridge.py event-type sync group
 - All terminal agent responses (Respond tool + direct answer) now produce identical `agent_responded` events
 - `FINAL = 'final'` enum value kept in `events.py` for backward compat mapping only
+
+## Permission Categories — Design Notes
+
+## 2026-06-04 — Permission Categories — Design Notes
+
+Permission Categories — Design Notes
+
+
+## 2026-06-04 — **2025-03-25** — Security model three-layer design (from pro...
+
+**2025-03-25** — Security model three-layer design (from product owner):
+1. **Workspace** (Spec 3 — not started): Per-project sandbox container with `capabilities.json` defining the maximum ceiling (allowed domains, git permissions, installed packages). Owner defines this.
+2. **Session** (current): User toggles further restrict from the workspace ceiling (e.g., "no internet", "read-only filesystem"). These are the `session_permissions` in `AgentConfig`.
+3. **Tools**: Each tool declares its required categories via `required_categories: ClassVar` or `get_required_categories()`. The permission gate (`_check_permissions` in `tool_executor.py`) enforces at execution time.
+
+Priority order (P0 = highest):
+1. **Fix config panel sync** (P0) — root cause: shallow merge in config persistence pipeline wiped partial updates (e.g. just sending `{"session_permissions": {"filesystem": "read"}}` nuked other fields). `deep_merge` utility exists and is used in `apply_config`/`load_session` but was never integration-tested. **Now tested** — see `tests/test_bridge_permissions_sync.py`.
+2. **Verify tool permissions** (P0) — raw evidence collected in separate audit (R1-R11).
+3. **Manual GUI verification** (30m) — toggle permissions, close/reopen session, confirm GUI matches gate.
+4. **Workspace container** (Spec 3) — depends on sync being solid.
+5. **Multi-agent** (Spec 4) — depends on container.
+
+Key principle: "The machine must never exceed what you see on the Permissions tab."

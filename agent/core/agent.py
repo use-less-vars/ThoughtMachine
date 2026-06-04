@@ -77,7 +77,7 @@ class Agent:
             except ImportError:
                 pass
             try:
-                from thoughtmachine.security import CapabilityRegistry, set_logger as security_set_logger
+                from thoughtmachine.security import set_logger as security_set_logger
                 self.security_available = True
                 security_set_logger(self.logger)
             except ImportError:

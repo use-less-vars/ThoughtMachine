@@ -275,6 +275,7 @@ async def websocket_endpoint(ws: WebSocket):
                         bridge.stop()
                     controller = AgentController()
                     bridge = WebAgentBridge(event_callback=event_callback)
+                    bridge.register()
                     bridge.set_controller(controller)
 
                     try:
@@ -679,6 +680,7 @@ async def websocket_endpoint(ws: WebSocket):
                         from agent.controller import AgentController
                         controller = AgentController()
                         bridge = WebAgentBridge(event_callback=event_callback)
+                        bridge.register()
                         bridge.set_controller(controller)
                         bridge.load_session(session_id)
                         await ws.send_json({
@@ -766,6 +768,11 @@ async def websocket_endpoint(ws: WebSocket):
                                 "new_name": new_name,
                             })
                             log("INFO", "server.config", f"Renamed session {session_id} → {new_name}")
+                        # Broadcast the new name to ALL open tabs that have this session loaded.
+                        # This ensures every bridge's in-memory state stays in sync with disk,
+                        # preventing save_session() from reverting the name on the next auto-save.
+                        from web_ui.backend.bridge import _broadcast_rename
+                        _broadcast_rename(session_id, new_name)
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
@@ -836,6 +843,7 @@ async def websocket_endpoint(ws: WebSocket):
                     from agent.controller import AgentController
                     controller = AgentController()
                     bridge = WebAgentBridge(event_callback=event_callback)
+                    bridge.register()
                     bridge.set_controller(controller)
 
                     # Create a new empty session
@@ -907,6 +915,7 @@ async def websocket_endpoint(ws: WebSocket):
                 bridge.save_open_session()
             except Exception:
                 pass
+            bridge.unregister()
             bridge.stop()
 
 

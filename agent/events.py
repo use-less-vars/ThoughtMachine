@@ -396,4 +396,27 @@ def convert_from_legacy_format(legacy_dict: Dict[str, Any]) -> BaseEvent:
         if 'history' not in cleaned_dict:
             cleaned_dict['history'] = []
     return BaseEvent.from_dict(cleaned_dict)
+
+
+class NullEventBus:
+    """
+    No-op EventBus stub for testing or when pub/sub is disabled.
+
+    Provides the same interface as ``EventBus`` but silently discards all
+    publishes and accepts (but ignores) subscribes.
+    """
+
+    def subscribe(self, event_type=None, callback=None):
+        """No-op subscribe — does nothing."""
+        pass
+
+    def publish(self, event):
+        """No-op publish — silently discards the event."""
+        pass
+
+    def unsubscribe(self, event_type=None, callback=None):
+        """No-op unsubscribe — does nothing."""
+        pass
+
+
 global_event_bus = EventBus()

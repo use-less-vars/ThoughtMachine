@@ -18,11 +18,19 @@ logger = logging.getLogger(__name__)
 
 
 class MCPValidator(ToolBase):
-    required_categories: ClassVar[List[str]] = ["filesystem:read"]
     """Validate MCP server configurations and test connectivity."""
-    
-    tool: Literal["MCPValidator"] = "MCPValidator"
-    
+
+    @classmethod
+    def get_required_categories(cls, params: dict | None = None) -> list[str]:
+        """Return network:outbound when testing HTTP/SSE connections."""
+        if params:
+            transport = params.get("transport", "")
+            test_connection = params.get("test_connection", True)
+            if transport in ("http", "sse") and test_connection:
+                return ["network:outbound", "filesystem:read"]
+        return ["filesystem:read"]
+
+    tool: Literal["MCPValidator"] = "MCPValidator"    
     config_path: Optional[str] = Field(
         default=None,
         description="Path to MCP configuration JSON file (optional)"

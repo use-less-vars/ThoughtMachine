@@ -11,7 +11,7 @@ from enum import Enum
 from pydantic import BaseModel, Field, create_model, model_validator
 import logging
 
-from .mcp_client import create_mcp_client, MCPClientBase
+from .mcp_client import create_mcp_client, MCPClientBase, HTTPMCPClient, SSEMCPClient
 from .base import ToolBase
 
 logger = logging.getLogger(__name__)
@@ -219,12 +219,18 @@ def create_tool_class(
             return f"Error calling MCP tool {tool_name}: {str(e)}"
     
     ToolModel.execute = execute
-    
+
+    # Add get_required_categories — HTTP/SSE clients need network:outbound
+    if isinstance(client, (HTTPMCPClient, SSEMCPClient)):
+        @classmethod
+        def get_required_categories(cls, params: dict | None = None) -> list[str]:
+            return ["network:outbound"]
+        ToolModel.get_required_categories = get_required_categories
+
     # Add docstring
     ToolModel.__doc__ = description
-    
-    return ToolModel
 
+    return ToolModel
 
 class MCPServerManager:
     """Manager for MCP server lifecycle and tool registration.

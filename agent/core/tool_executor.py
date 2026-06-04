@@ -15,7 +15,7 @@ from tools.summarize_tool import SummarizeTool
 
 
 # ---------------------------------------------------------------------------
-# Default session permissions profile (five categories)
+# Default session permissions profile (six categories)
 # ---------------------------------------------------------------------------
 # Fallback used when no live SessionPermissions model is available on config.
 DEFAULT_SESSION_PERMISSIONS = {
@@ -23,6 +23,7 @@ DEFAULT_SESSION_PERMISSIONS = {
     "network": False,
     "filesystem": "read",
     "security": "read",
+    "git": "read",
     "execution": "banned",
 }
 
@@ -58,7 +59,7 @@ def _value_satisfies(required: str, allowed: object) -> bool:
 
 
 def _check_permissions(
-    required_categories: list, session_permissions: dict | None = None
+    required_categories: list, session_permissions: dict
 ) -> str | None:
     """
     Check whether *all* required categories are satisfied by the session profile.
@@ -66,14 +67,11 @@ def _check_permissions(
     Args:
         required_categories: List of strings like ["container:true", "filesystem:write"].
         session_permissions: Dict of category → value (bool or str level).
-                            Falls back to DEFAULT_SESSION_PERMISSIONS.
 
     Returns:
         None if all checks pass.
         Error message string if any check fails.
     """
-    if session_permissions is None:
-        session_permissions = DEFAULT_SESSION_PERMISSIONS
 
     for req in required_categories:
         if ":" not in req:
@@ -247,9 +245,13 @@ class ToolExecutor:
                 tool_args['token_limit'] = self.config.tool_output_token_limit
             # Check permission categories before executing
             session_perms = self.config.session_permissions
+            if session_perms is None:
+                session_perms_dict = DEFAULT_SESSION_PERMISSIONS
+            else:
+                session_perms_dict = session_perms.to_dict()
             error = _check_permissions(
                 tool_class.get_required_categories(arguments),
-                session_perms.to_dict() if session_perms is not None else None,
+                session_perms_dict,
             )
             if error is not None:
                 return {'result': error, 'tool_type': 'normal'}

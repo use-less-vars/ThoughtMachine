@@ -61,6 +61,22 @@ from session.store import FileSystemSessionStore
 #  Bridge class
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Global registry of active tab bridges — used to broadcast session renames
+# across all open tabs holding the same session.
+_active_tab_bridges: set = set()
+
+def _broadcast_rename(session_id: str, new_name: str) -> None:
+    """Update in-memory session name on every bridge that has this session loaded."""
+    for b in list(_active_tab_bridges):
+        try:
+            if b._loaded_session and b._loaded_session.session_id == session_id:
+                b._loaded_session.metadata['name'] = new_name
+            if b._session and b._session.session_id == session_id:
+                b._session.metadata['name'] = new_name
+        except Exception:
+            pass
+
+
 class WebAgentBridge:
     """
     Thread‑safe bridge that runs one Agent session and emits events through
@@ -102,6 +118,23 @@ class WebAgentBridge:
         self._session_store = FileSystemSessionStore()
         self._session: Optional[Session] = None
         self._loaded_session: Optional[Session] = None
+
+
+    # ── Global tab registry ──────────────────────────────────────────────────
+
+    def register(self) -> None:
+        """Register this bridge in the global active-tab set."""
+        _active_tab_bridges.add(self)
+
+    def unregister(self) -> None:
+        """Remove this bridge from the global active-tab set."""
+        _active_tab_bridges.discard(self)
+
+    @staticmethod
+    def broadcast_rename(session_id: str, new_name: str) -> None:
+        """Update in-memory state on all bridges holding this session."""
+        _broadcast_rename(session_id, new_name)
+
 
     # ── Public API ──────────────────────────────────────────────────────────
 
@@ -408,9 +441,9 @@ class WebAgentBridge:
         else:
             base = {}
 
-        # Step 3: Merge incoming on top (shallow merge)
-        merged = dict(base)
-        merged.update(config_dict)
+        # Step 3: Merge incoming on top (deep merge — preserves nested dicts)
+        from agent.utils import deep_merge
+        merged = deep_merge(base, config_dict)
 
         # Step 4: Validate the merged dict
         validated = validate_config(merged)
@@ -677,8 +710,8 @@ class WebAgentBridge:
                         base = self._config.model_dump(exclude={'api_key'}, exclude_none=True)
                     else:
                         base = {}
-                    merged = dict(base)
-                    merged.update(agent_config_raw)
+                    from agent.utils import deep_merge
+                    merged = deep_merge(base, agent_config_raw)
                     # Ensure enabled_tools is always present — merge from global config if missing
                     if 'enabled_tools' not in merged:
                         try:
@@ -835,12 +868,17 @@ class WebAgentBridge:
             self._loaded_session.session_id if self._loaded_session else None
         )
         log('INFO', 'server.bridge', f"Closing session: {sid or '(no id)'}")
-        # Save current state
+        # STOP the bridge FIRST — let the agent thread finish and flush
+        # final messages into user_history before we snapshot.
+        self.stop()
+        # Wait for agent thread to fully exit (controller.stop() already
+        # joins the controller thread with a 5s timeout in shutdown()).
+        if self._controller is None and self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=60)
+        # NOW save — all final messages are captured
         if sid:
             self.save_session()
             self.remove_open_session(sid)
-        # Stop the bridge
-        self.stop()
         # Reset state
         self._session = None
         self._loaded_session = None
