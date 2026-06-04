@@ -1,5 +1,3 @@
-[![Ask](https://img.shields.io/badge/ask-write%2Ffull-F5A97F)](https://github.com/your-repo)
-
 
 # ThoughtMachine
 
