@@ -145,38 +145,19 @@ class TestCheckPermissionsAsk:
         assert "Permission denied" in result_container[0]
         assert "user denied" in result_container[0].lower()
 
-    def test_git_read_with_ask_profile_also_asks(self):
+    def test_git_read_with_ask_profile_does_not_ask(self):
         """
-        Even 'read' level requires user approval when session is 'ask'.
+        When session is 'ask', 'read' level access is treated as a no-op.
+        Only 'write'/'full' triggers the security prompt.
         """
-        result_container = []
-
-        def run_check():
-            result = _check_permissions(
-                ["git:read"],
-                self.PROFILE_GIT_ASK,
-                tool_name="GitReadTool",
-                agent_id=42,
-            )
-            result_container.append(result)
-
-        t = threading.Thread(target=run_check, daemon=True)
-        t.start()
-
-        import time
-        time.sleep(0.1)
-
-        with _pending_requests_lock:
-            request_ids = list(_pending_security_requests.keys())
-
-        assert len(request_ids) > 0
-        request_id = request_ids[0]
-        resolve_security_prompt(request_id, approved=True)
-
-        t.join(timeout=5)
-
-        assert len(result_container) == 1
-        assert result_container[0] is None  # approved
+        # git:read with git='ask' should pass immediately — no prompt needed
+        result = _check_permissions(
+            ["git:read"],
+            self.PROFILE_GIT_ASK,
+            tool_name="GitReadTool",
+            agent_id=42,
+        )
+        assert result is None  # granted without asking
 
     def test_git_ask_does_not_prompt_for_banned(self):
         """
@@ -316,39 +297,24 @@ class TestToolExecutorAskPermission:
         assert "Permission denied" in result_container[0]["result"]
         assert result_container[0]["tool_type"] == "normal"
 
-    def test_git_read_tool_with_git_ask(self):
+    def test_git_read_tool_with_git_ask_bypasses_prompt(self):
         """
-        Even git:read goes through the ask flow when session has git='ask'.
+        When session has git='ask', a tool requiring git:read executes
+        directly without triggering the security prompt (read is a no-op).
         """
         perms = SessionPermissions(git="ask")
         executor = self._make_executor([GitReadTool], permissions=perms)
 
-        result_container = []
+        # Should execute immediately — no background thread needed
+        result = executor._execute_single_tool(
+            GitReadTool, {}, "GitReadTool", 0,
+            lambda: False, lambda: None, lambda: 0
+        )
+        assert result["result"] == "Git read OK"
 
-        def run_executor():
-            r = executor._execute_single_tool(
-                GitReadTool, {}, "GitReadTool", 0,
-                lambda: False, lambda: None, lambda: 0
-            )
-            result_container.append(r)
-
-        t = threading.Thread(target=run_executor, daemon=True)
-        t.start()
-
-        import time
-        time.sleep(0.2)
-
+        # Verify no pending security requests were created
         with _pending_requests_lock:
-            request_ids = list(_pending_security_requests.keys())
-
-        assert len(request_ids) > 0
-        request_id = request_ids[0]
-        resolve_security_prompt(request_id, approved=True)
-
-        t.join(timeout=5)
-
-        assert len(result_container) == 1
-        assert result_container[0]["result"] == "Git read OK"
+            assert len(list(_pending_security_requests.keys())) == 0
 
     def test_git_full_bypasses_ask(self):
         """
