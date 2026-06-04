@@ -292,6 +292,10 @@ class Session:
                 raise ValueError(f'Unknown runtime parameter: {key}')
         self.updated_at = datetime.now()
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Alias for to_persistable_dict — convenience for test usage."""
+        return self.to_persistable_dict()
+
     def to_persistable_dict(self) -> Dict[str, Any]:
         """
         Convert session to a dictionary suitable for JSON serialization.
@@ -299,6 +303,11 @@ class Session:
         """
         data = {'session_id': self.session_id, 'created_at': self.created_at.isoformat(), 'updated_at': datetime.now().isoformat(), 'user_history': list(self.user_history), 'containers': [c.to_dict() for c in self.containers], 'preset_name': self.preset_name, 'metadata': self.metadata, 'security_config': self.security_config, 'version': self.version, 'summary': self.summary, 'total_input_tokens': self.total_input_tokens, 'total_output_tokens': self.total_output_tokens, 'context_length': self.context_length}
         return data
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Session':
+        """Alias for from_persistable_dict — convenience for test usage."""
+        return cls.from_persistable_dict(data)
 
     @classmethod
     def from_persistable_dict(cls, data: Dict[str, Any]) -> 'Session':
