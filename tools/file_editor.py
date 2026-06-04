@@ -38,7 +38,13 @@ class FileEditor(ToolBase):
     )
     line_numbers: Optional[Union[int, List[int], str]] = Field(
         default=None,
-        description="Line number(s) for read/delete: int, list, 'all', or range."
+        description="Line number(s) for read/delete. Accepted formats:\n"
+        "  - int: single line (e.g., 5)\n"
+        "  - list: [start, end] range (e.g., [3, 10]) or [l1, l2, ...]\n"
+        "  - str with hyphen: range like '3-10' (MUST be quoted in JSON)\n"
+        "  - 'all': all lines\n"
+        "IMPORTANT: When passing a range string like '3-10', it MUST be quoted (a string),\n"
+        "NOT written as 3-10 without quotes (that would be invalid JSON)."
     )
     replacements: Optional[Dict[int, str]] = Field(
         default=None,
@@ -56,6 +62,19 @@ class FileEditor(ToolBase):
         default=None,
         description="Pattern for grep operation (only for grep operation)"
     )
+
+    @model_validator(mode='before')
+    @classmethod
+    def normalize_line_numbers(cls, values: dict) -> dict:
+        """Normalize common LLM mistakes for the line_numbers field before validation."""
+        ln = values.get('line_numbers')
+        if ln is not None and not isinstance(ln, (int, list, str)):
+            # LLM sometimes passes a float or other type
+            try:
+                values['line_numbers'] = int(ln)
+            except (TypeError, ValueError):
+                values['line_numbers'] = str(ln)
+        return values
 
     @model_validator(mode='after')
     def validate_operation(self):
