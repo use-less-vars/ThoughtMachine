@@ -110,7 +110,8 @@ def _value_satisfies(required: str, allowed: object) -> bool | str:
 
 def _check_permissions(
     required_categories: list, session_permissions: dict,
-    tool_name: str = "", agent_id: int = 0
+    tool_name: str = "", agent_id: int = 0,
+    session_id: str = ""
 ) -> str | None:
     """
     Check whether *all* required categories are satisfied by the session profile.
@@ -166,7 +167,7 @@ def _check_permissions(
                         'tool_name': tool_name,
                         'capabilities': [str(required_value)],
                         'arguments': {req: required_value},
-                        'session_id': '',
+                        'session_id': session_id,
                     }
                 )
                 global_event_bus.publish(event)
@@ -231,7 +232,7 @@ class ToolExecutor:
         self.security_available = security_available
         self.agent = agent
 
-    def execute_tool_calls(self, tool_calls: List[Dict[str, Any]], add_to_conversation_func, update_token_func=None, agent_id: int = 0, turn_transaction: Optional[TurnTransaction]=None) -> Tuple[List[Dict[str, Any]], bool, Optional[Dict[str, Any]], Optional[str], Optional[int]]:
+    def execute_tool_calls(self, tool_calls: List[Dict[str, Any]], add_to_conversation_func, update_token_func=None, agent_id: int = 0, session_id: str = "", turn_transaction: Optional[TurnTransaction]=None) -> Tuple[List[Dict[str, Any]], bool, Optional[Dict[str, Any]], Optional[str], Optional[int]]:
         """
         Execute multiple tool calls from an assistant message.
         
@@ -301,7 +302,7 @@ class ToolExecutor:
                 tool_execution_result = {'result': tool_result, 'tool_type': 'normal'}
                 tool_type = 'normal'
             else:
-                tool_execution_result = self._execute_single_tool(tool_class, arguments, tool_name, agent_id, lambda: summary_requested, lambda: summary_text, lambda: summary_keep_recent_turns)
+                tool_execution_result = self._execute_single_tool(tool_class, arguments, tool_name, agent_id, lambda: summary_requested, lambda: summary_text, lambda: summary_keep_recent_turns, session_id=session_id)
                 tool_result = tool_execution_result['result']
                 tool_type = tool_execution_result.get('tool_type', 'normal')
                 if tool_type == 'respond':
@@ -328,7 +329,7 @@ class ToolExecutor:
             executed_tools.append({'name': tool_name, 'arguments': arguments, 'result': tool_result})
         return (executed_tools, final_detected, respond_result, summary_text if summary_requested else None, summary_keep_recent_turns if summary_requested else None)
 
-    def _execute_single_tool(self, tool_class, arguments: Dict[str, Any], tool_name: str, agent_id: int, get_summary_requested, get_summary_text, get_summary_keep_recent_turns) -> Dict[str, Any]:
+    def _execute_single_tool(self, tool_class, arguments: Dict[str, Any], tool_name: str, agent_id: int, get_summary_requested, get_summary_text, get_summary_keep_recent_turns, session_id: str = "") -> Dict[str, Any]:
         """
         Execute a single tool instance.
 
@@ -348,13 +349,23 @@ class ToolExecutor:
             # own input (e.g., empty {}) rather than the injected fields like
             # {'workspace_path': '/home/...', 'token_limit': 10000} which makes it
             # look like a system bug.
+            #
+            # First, strip any keys that aren't valid model fields.
+            # The JSON repair library (fast_json_repair) can create bogus fields like
+            # "Number" when the LLM passes malformed JSON (e.g., line_numbers="229-245"
+            # written without quotes as 229-245, which isn't valid JSON).
+            # These ghost fields trigger "Extra inputs not permitted" errors from Pydantic.
+            valid_field_names = set(tool_class.model_fields.keys())
+            for extra_key in list(tool_args.keys()):
+                if extra_key not in valid_field_names:
+                    tool_args.pop(extra_key)
             try:
                 tool_class.model_validate(tool_args)
             except ValidationError as e:
                 # Provide LLM-friendly error with valid field names
                 try:
                     infra_fields = {"workspace_path", "token_limit", "is_docker", "container_workspace_path", "tool"}
-                    valid_fields = [f for f in tool_class.model_fields.keys() if f not in infra_fields]
+                    valid_fields = [f for f in valid_field_names if f not in infra_fields]
                     valid_fields_str = ', '.join(valid_fields)
                     return {'result': f'Invalid arguments: {e}\n\nValid fields: {valid_fields_str}', 'tool_type': 'normal'}
                 except Exception:
@@ -377,6 +388,7 @@ class ToolExecutor:
                 session_perms_dict,
                 tool_name=tool_name,
                 agent_id=agent_id,
+                session_id=session_id,
             )
             if error is not None:
                 return {'result': error, 'tool_type': 'normal'}
