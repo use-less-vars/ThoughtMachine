@@ -4,7 +4,7 @@ from datetime import datetime, date, time, timedelta
 from .base import ToolBase
 
 class DateTimeTool(ToolBase):
-    required_categories: ClassVar[List[str]] = ["filesystem:read"]
+    required_categories: ClassVar[List[str]] = []
     """Access date and time information and perform datetime operations."""
     tool: Literal["DateTimeTool"] = "DateTimeTool"
     

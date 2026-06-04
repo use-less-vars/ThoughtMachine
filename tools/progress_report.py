@@ -7,12 +7,17 @@ from .base import ToolBase
 
 
 class ProgressReport(ToolBase):
-    required_categories: ClassVar[List[str]] = ["filesystem:write"]
     """Write a timestamped progress report without stopping agent execution.
-    
+
     Use this tool to document intermediate progress, milestones, or status updates
     during long-running batch jobs. The agent continues executing after writing the report.
     """
+
+    @classmethod
+    def get_required_categories(cls, params: dict | None = None) -> list[str]:
+        """Return filesystem:write — this tool always writes a file."""
+        return ["filesystem:write"]
+
     tool: Literal["ProgressReport"] = "ProgressReport"
     report_body: str = Field(description="The body/content of the progress report")
     report_title: Optional[str] = Field(
