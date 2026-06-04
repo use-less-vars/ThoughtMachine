@@ -109,9 +109,9 @@ class TestValueSatisfies:
         """When allowed='ask' and required is 'write', return "ASK" sentinel."""
         assert _value_satisfies("write", "ask") == "ASK"
 
-    def test_ask_read_returns_ask_sentinel(self):
-        """When allowed='ask' and required is 'read', return "ASK" sentinel."""
-        assert _value_satisfies("read", "ask") == "ASK"
+    def test_ask_read_returns_true(self):
+        """When allowed='ask' and required is 'read', allow silently (no prompt)."""
+        assert _value_satisfies("read", "ask") is True
 
     def test_ask_full_returns_ask_sentinel(self):
         """When allowed='ask' and required is 'full', return "ASK" sentinel."""

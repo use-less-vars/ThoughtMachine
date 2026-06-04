@@ -79,14 +79,14 @@ def _value_satisfies(required: str, allowed: object) -> bool | str:
     # --- Handle 'ask' session value ---
     allowed_str = str(allowed).lower() if not isinstance(allowed, bool) else ""
     if allowed_str == "ask":
-        # 'ask' means: ask the user for anything that isn't banned-equivalent
+        # 'ask' means: ask only for write-level access or higher
         if isinstance(required_val, str):
             req_lower = required_val.lower()
             if req_lower in ("false", "no", "banned"):
                 return True  # asking for banned is always fine
-            if req_lower == "ask":
-                return True  # no-op
-            return sentinel_ask  # needs user approval
+            if req_lower in ("ask", "read"):
+                return True  # read and ask are no-ops — only write/full prompt
+            return sentinel_ask  # 'write' or 'full' needs user approval
         if isinstance(required_val, bool):
             return True  # bool required with ask — allow (no formal hierarchy)
         return sentinel_ask  # fallback: ask
