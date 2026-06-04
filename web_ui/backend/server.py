@@ -1300,9 +1300,10 @@ def _build_frontend() -> bool:
         return False
 
     log('INFO', 'server', f'Building frontend in {frontend_dir}...')
+    npm_cmd = os.environ.get('TM_NPM_CMD') or 'npm'
     try:
         result = subprocess.run(
-            ["npm", "run", "build"],
+            [npm_cmd, "run", "build"],
             cwd=str(frontend_dir),
             capture_output=True,
             text=True,

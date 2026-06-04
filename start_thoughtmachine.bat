@@ -44,7 +44,12 @@ if "%PROD_MODE%"=="true" (
     echo   Server:  http://127.0.0.1:8000
     echo   Stop:    Ctrl+C
     echo(
-    start "" /B /WAIT python -m web_ui.backend.server --serve-frontend
+    REM Check npm and capture its path so Python can use it
+    where npm >nul 2>&1
+    if not errorlevel 1 (
+        for /f "tokens=*" %%p in ('where npm') do set "TM_NPM_CMD=%%p"
+    )
+    powershell -Command "$p = Start-Process python -ArgumentList '-m web_ui.backend.server --serve-frontend' -NoNewWindow -PassThru; $p.WaitForExit(); exit $p.ExitCode"
 ) else (
     REM -- Development mode (hot-reload via Vite) -----------------------------
     echo   Mode:    DEVELOPMENT (hot-reload enabled)
@@ -64,6 +69,8 @@ if "%PROD_MODE%"=="true" (
         pause
         exit /b 1
     )
+    REM Capture npm full path so Python can find it too
+    for /f "tokens=*" %%p in ('where npm') do set "TM_NPM_CMD=%%p"
 
     REM Start Vite dev server in a new window
     echo   Starting Vite dev server ^(port 5173^)...
@@ -94,7 +101,7 @@ if "%PROD_MODE%"=="true" (
     )
 
     REM Start backend (CORS already allows Vite dev server on any port)
-    start "" /B /WAIT python -m web_ui.backend.server
+    powershell -Command "$p = Start-Process python -ArgumentList '-m web_ui.backend.server' -NoNewWindow -PassThru; $p.WaitForExit(); exit $p.ExitCode"
 
     REM When backend stops, also stop Vite
     echo(
