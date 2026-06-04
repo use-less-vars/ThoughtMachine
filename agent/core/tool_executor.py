@@ -37,6 +37,10 @@ except ImportError:
     _pending_security_requests = None
     _pending_requests_lock = None
 
+# Flag set by _check_permissions when the user approves via security dialog
+# The caller (ToolExecutor) reads and resets this to inform the AI
+_last_check_user_approved: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Default session permissions profile (six categories)
@@ -174,6 +178,8 @@ def _check_permissions(
             try:
                 response = response_queue.get(timeout=PROMPT_TIMEOUT)
                 if response.get('approved'):
+                    global _last_check_user_approved
+                    _last_check_user_approved = True
                     log('INFO', 'core.security',
                         f'User APPROVED {category}:{required_value} '
                         f'for tool {tool_name} (request_id={request_id})')
@@ -364,6 +370,8 @@ class ToolExecutor:
                 session_perms_dict = DEFAULT_SESSION_PERMISSIONS
             else:
                 session_perms_dict = session_perms.to_dict()
+            global _last_check_user_approved
+            _last_check_user_approved = False  # reset before check
             error = _check_permissions(
                 tool_class.get_required_categories(arguments),
                 session_perms_dict,
@@ -385,6 +393,14 @@ class ToolExecutor:
             log('DEBUG', 'core.pause', f'TOOL EXECUTE START [{tool_name}]')
             tool_result = tool_instance.execute()
             log('DEBUG', 'core.pause', f'TOOL EXECUTE END [{tool_name}]')
+            # If the user approved this action via the security dialog, annotate the result
+            if _last_check_user_approved:
+                _last_check_user_approved = False
+                if isinstance(tool_result, dict):
+                    note = ('[User approved via security dialog]'
+                            if not tool_result.get('result')
+                            else f"[User approved via security dialog] {tool_result.get('result', '')}")
+                    tool_result['result'] = note
             # Apply framework-level output truncation unless tool opts out
             if not tool_instance.skip_output_truncation:
                 tool_result = tool_instance._truncate_output(tool_result)
