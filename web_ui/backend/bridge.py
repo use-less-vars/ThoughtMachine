@@ -155,6 +155,13 @@ class WebAgentBridge:
                 log('DEBUG', 'server.bridge', 'No event callback — dropping security prompt')
                 return
             data = event.data or {}
+            # Filter: only handle events for this bridge's session
+            if data.get('session_id') != self._session_id:
+                log('DEBUG', 'server.bridge',
+                    f'Ignoring security prompt for different session '
+                    f'(event session_id={data.get("session_id")}, '
+                    f'bridge session_id={self._session_id})')
+                return
             try:
                 self._event_callback({
                     'type': 'security_prompt',
@@ -163,6 +170,7 @@ class WebAgentBridge:
                     'tool_name': data.get('tool_name', ''),
                     'capabilities': data.get('capabilities', []),
                     'arguments': data.get('arguments', {}),
+                    'session_id': data.get('session_id', self._session_id),
                     'description': (
                         f"Tool '{data.get('tool_name', '?')}' requires: "
                         f"{', '.join(data.get('capabilities', []))}"
