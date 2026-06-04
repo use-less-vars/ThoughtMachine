@@ -242,14 +242,19 @@ def migrate_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
 
 def validate_config(config_dict: Dict[str, Any]) -> Optional[AgentConfig]:
     """Validate configuration dictionary and return AgentConfig instance.
-    
+
     Args:
         config_dict: Configuration dictionary
-        
+
     Returns:
         AgentConfig instance if valid, None otherwise
     """
     try:
+        # Strip runtime-only callable fields that may have been serialised
+        # as strings in old sessions (pre-f33bb6a).  stop_check is a live
+        # callback set by the controller and must never be persisted to JSON.
+        config_dict = {k: v for k, v in config_dict.items()
+                       if not (k == 'stop_check' and isinstance(v, str))}
         return AgentConfig(**config_dict)
     except Exception as e:
         log('ERROR', 'config.loader', f'Configuration validation failed: {e}')

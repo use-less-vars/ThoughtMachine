@@ -590,10 +590,11 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
               <option value="full" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Full</option>
               <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
               <option value="read" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Read</option>
+              <option value="ask" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Ask</option>
               <option value="banned" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Banned</option>
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
-              Read/write access to the workspace filesystem.
+              Read/write access to the workspace filesystem. "Ask" prompts for approval on each write.
             </small>
           </div>
 

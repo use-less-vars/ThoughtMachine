@@ -72,10 +72,10 @@ class SessionPermissions(BaseModel):
 
     - **container**:  Boolean — may the tool spawn containers?
     - **network**:    Boolean — may the tool access the network?
-    - **filesystem**: ``'banned' | 'read' | 'write' | 'full'``
-    - **security**:   ``'banned' | 'read' | 'write' | 'full'``
+    - **filesystem**: ``'banned' | 'read' | 'write' | 'full' | 'ask'``
+    - **security**:   ``'banned' | 'read' | 'write' | 'full' | 'ask'``
     - **git**:        ``'banned' | 'read' | 'write' | 'full' | 'ask'``
-    - **execution**:  ``'banned' | 'read' | 'write' | 'full'``
+    - **execution**:  ``'banned' | 'read' | 'write' | 'full' | 'ask'``
     """
 
     container: bool = Field(
@@ -86,11 +86,11 @@ class SessionPermissions(BaseModel):
         default=False,
         description='May the tool access the network?',
     )
-    filesystem: Literal['banned', 'read', 'write', 'full'] = Field(
+    filesystem: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
         default='read',
         description='Filesystem access level for the session.',
     )
-    security: Literal['banned', 'read', 'write', 'full'] = Field(
+    security: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
         default='read',
         description='Security-related operations access level.',
     )
@@ -98,7 +98,7 @@ class SessionPermissions(BaseModel):
         default='read',
         description='Git operations access level for the session.',
     )
-    execution: Literal['banned', 'read', 'write', 'full'] = Field(
+    execution: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
         default='banned',
         description='Code execution access level for the session.',
     )
