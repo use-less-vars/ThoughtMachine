@@ -122,6 +122,18 @@ def ensure_global_kb(version_file: Optional[Path] = None) -> list[str]:
             except OSError as exc:
                 logger.warning("Failed to copy %s: %s", resource_name.name, exc)
 
+        # Remove stale files that no longer exist in the shipped resources
+        existing_system_files = {f.name for f in SYSTEM_DIR.glob("*.md")}
+        shipped_files = {f.name for f in src_dir.glob("*.md")}
+        for stale_name in existing_system_files - shipped_files:
+            stale_path = SYSTEM_DIR / stale_name
+            try:
+                stale_path.unlink()
+                touched.append(str(stale_path))
+                logger.debug("Removed stale %s", stale_path)
+            except OSError as exc:
+                logger.warning("Failed to remove stale %s: %s", stale_path, exc)
+
         # Write the current version marker
         try:
             version_marker.parent.mkdir(parents=True, exist_ok=True)

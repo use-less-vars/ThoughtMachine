@@ -42,6 +42,24 @@ class ToolBase(BaseModel):
     # Use this for tools whose output must always be complete (e.g., Respond, SummarizeTool).
     skip_output_truncation: ClassVar[bool] = False
 
+    @classmethod
+    def get_required_categories(cls, params: dict | None = None) -> list[str]:
+        """
+        Return the permission categories required for this tool given params.
+
+        Default implementation returns the static ``required_categories`` ClassVar.
+        Subclasses can override to provide operation-level granularity
+        (e.g., FileEditor returns ``["filesystem:read"]`` for read ops,
+        ``["filesystem:write"]`` for write/delete ops).
+
+        Args:
+            params: The tool call arguments dict (may be None for static checks).
+
+        Returns:
+            List of category strings, e.g. ``["filesystem:write"]``.
+        """
+        return cls.required_categories
+
     # Logger instance for tool debugging
     _logger: Optional[logging.Logger] = None
     _agent_logger: Optional[Any] = None

@@ -67,14 +67,15 @@ class SessionPermissions(BaseModel):
     """
     Session-level permissions profile controlling tool access categories.
 
-    Maps to the five-category permission system used by
+    Maps to the permission system used by
     ``tool_executor._check_permissions()``:
 
     - **container**:  Boolean — may the tool spawn containers?
     - **network**:    Boolean — may the tool access the network?
-    - **filesystem**: ``'banned' | 'read' | 'write' | 'full'``
-    - **security**:   ``'banned' | 'read' | 'write' | 'full'``
-    - **execution**:  ``'banned' | 'read' | 'write' | 'full'``
+    - **filesystem**: ``'banned' | 'read' | 'write' | 'full' | 'ask'``
+    - **security**:   ``'banned' | 'read' | 'write' | 'full' | 'ask'``
+    - **git**:        ``'banned' | 'read' | 'write' | 'full' | 'ask'``
+    - **execution**:  ``'banned' | 'read' | 'write' | 'full' | 'ask'``
     """
 
     container: bool = Field(
@@ -85,15 +86,19 @@ class SessionPermissions(BaseModel):
         default=False,
         description='May the tool access the network?',
     )
-    filesystem: Literal['banned', 'read', 'write', 'full'] = Field(
+    filesystem: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
         default='read',
         description='Filesystem access level for the session.',
     )
-    security: Literal['banned', 'read', 'write', 'full'] = Field(
+    security: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
         default='read',
         description='Security-related operations access level.',
     )
-    execution: Literal['banned', 'read', 'write', 'full'] = Field(
+    git: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
+        default='read',
+        description='Git operations access level for the session.',
+    )
+    execution: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
         default='banned',
         description='Code execution access level for the session.',
     )
@@ -103,6 +108,21 @@ class SessionPermissions(BaseModel):
         return self.model_dump()
 
     model_config = ConfigDict()
+
+
+def resolve_security_prompt(request_id: str, approved: bool, remember: bool = False) -> None:
+    """Resolve a pending security prompt with the user's decision.
+
+    Args:
+        request_id: The request ID returned by the security prompt event.
+        approved: Whether the user approved the action.
+        remember: Whether to remember this decision for future prompts.
+    """
+    global _pending_security_requests
+    with _pending_requests_lock:
+        q = _pending_security_requests.pop(request_id, None)
+    if q is not None:
+        q.put({'approved': approved, 'remember': remember})
 
 
 def set_logger(logger: Optional[Any]) -> None:
@@ -386,119 +406,25 @@ def _log_docker_sandbox_event(
 
 
 # ============================================================================
-# Capability Registry
+# Capability Resolution (replaces deprecated CapabilityRegistry)
 # ============================================================================
 
-class CapabilityRegistry:
-    """
-    Registry for tool capabilities.
-    Maps tool names to the list of capabilities they require.
-    Currently uses hardcoded mappings for all tools.
-    """
-    
-    # Hardcoded capability requirements for each tool (fallback)
-    # Format: tool_class_name -> list of capability strings
-    _HARDCODED_REQUIRED = {
-        # File operations
-        "FileEditor": ["fs:read", "fs:write"],  # depends on operation, but requires both potentially
-        "FilePreviewTool": ["fs:read"],
-        "FileSearchTool": ["fs:read"],
-        "DirectoryTreeTool": ["fs:read"],
-        "FileMover": ["fs:read", "fs:write"],
-        "FileSummaryTool": ["fs:read"],
-        "FieldViewer": ["fs:read"],
-        
-        # Git operations
-        "GitInfoTool": ["fs:read", "git:access"],
-        
-        # Docker operations
-        "DockerCodeRunner": ["container:exec", "fs:read", "fs:write"],
-        
-        # Agent control
-        "Final": [],
-        "RequestUserInteraction": [],
-        "SummarizeTool": ["conversation:modify"],
-        
-        # Utilities
-        "DateTimeTool": [],
-        "GlobTool": ["fs:read"],
-        "PaginateTool": [],
-        "ProgressReport": [],
-        "FinalReport": [],
-        "Thought": [],
-        "RefactorTool": ["fs:read", "fs:write"],
-        "ApplyEdits": ["fs:read", "fs:write"],
-        "CodeModifier": ["fs:read", "fs:write"],
-        "DirectoryCreator": ["fs:write"],
-        
-        # MCP tools (when available)
-        "MCPValidator": ["mcp:access"],
-        "McpechoEcho": ["mcp:access"],
-        "McpechoAdd": ["mcp:access"],
-    }
-    
-    _discovered_required: Optional[Dict[str, List[str]]] = None
-    
-    @classmethod
-    def _build_capability_map(cls) -> Dict[str, List[str]]:
-        """Build capability map by discovering tool classes and their requires_capabilities."""
-        if cls._discovered_required is not None:
-            return cls._discovered_required
-            
-        discovered = {}
-        
-        try:
-            # Import tools module to get SIMPLIFIED_TOOL_CLASSES
-            from tools import SIMPLIFIED_TOOL_CLASSES
-            
-            for tool_cls in SIMPLIFIED_TOOL_CLASSES:
-                tool_name = tool_cls.__name__
-                # Get requires_capabilities class variable (default empty list)
-                required = getattr(tool_cls, 'requires_capabilities', [])
-                # Only include non-empty capability lists (allows tools to override hardcoded)
-                if required:
-                    discovered[tool_name] = required
-                
-        except ImportError as e:
-            # If tools module not available, fall back to hardcoded
-            discovered = cls._HARDCODED_REQUIRED.copy()
-        
-        cls._discovered_required = discovered
-        return discovered
-    
-    @classmethod
-    def get_required_map(cls) -> Dict[str, List[str]]:
-        """Get the complete capability requirement map."""
-        # Start with hardcoded as base (ensures all tools have at least something)
-        combined = cls._HARDCODED_REQUIRED.copy()
-        # Update with discovered values (may override hardcoded)
-        discovered = cls._build_capability_map()
-        combined.update(discovered)
-        return combined
-    
-    @classmethod
-    def check(cls, agent_id: str, tool_name: str, security_config: Optional[Dict[str, Any]] = None, **kwargs) -> bool:
-        """
-        Check if the agent is allowed to execute the given tool.
-        Uses security configuration and policy evaluation.
-        
-        Args:
-            agent_id: Identifier for the agent
-            tool_name: Name of the tool class (e.g., "FileEditor")
-            security_config: Security configuration dict (optional)
-            **kwargs: Additional context (e.g., operation, path)
-        
-        Returns:
-            True if allowed, False otherwise.
-        """
-        # Delegate to is_allowed function
-        return is_allowed(agent_id, tool_name, security_config, **kwargs)
-    
-    @classmethod
-    def get_required_capabilities(cls, tool_name: str) -> List[str]:
-        """Get the list of required capabilities for a tool."""
-        return cls.get_required_map().get(tool_name, [])
 
+def _get_tool_capabilities(tool_name: str) -> List[str]:
+    """
+    Resolve required capabilities for a tool by inspecting its class.
+
+    Falls back to an empty list if the tool class cannot be found.
+    This function replaces the deprecated ``CapabilityRegistry`` class.
+    """
+    try:
+        from tools import SIMPLIFIED_TOOL_CLASSES
+        for tool_cls in SIMPLIFIED_TOOL_CLASSES:
+            if tool_cls.__name__ == tool_name:
+                return getattr(tool_cls, 'requires_capabilities', [])
+    except ImportError:
+        pass
+    return []
 
 def _log_capability_check(
     agent_id: str,
@@ -725,7 +651,7 @@ def is_allowed(
         security_config = get_default_security_config()
     
     # Get required capabilities for the tool
-    required_caps = CapabilityRegistry.get_required_capabilities(tool_name)
+    required_caps = _get_tool_capabilities(tool_name)
     
     # Check session read-only restriction
     session_policy = security_config.get("session_policy", {})

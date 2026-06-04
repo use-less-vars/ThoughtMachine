@@ -180,15 +180,16 @@ echo "  → Using: $PYTHON"
 
 VENV_DIR="$PROJECT_DIR/.venv"
 if [[ -d "$VENV_DIR" ]]; then
-    echo "  → Venv already exists at $VENV_DIR"
+    echo "  → Removing existing venv at $VENV_DIR"
+    rm -rf "$VENV_DIR"
+    echo "  ✓ Old venv removed"
+fi
+echo "  → Running: $PYTHON -m venv .venv"
+if "$PYTHON" -m venv "$VENV_DIR"; then
+    echo "  ✓ Created venv at $VENV_DIR"
 else
-    echo "  → Running: $PYTHON -m venv .venv"
-    if "$PYTHON" -m venv "$VENV_DIR"; then
-        echo "  ✓ Created venv at $VENV_DIR"
-    else
-        echo "  ✗ Failed to create venv. Try: apt install python3-venv"
-        exit 1
-    fi
+    echo "  ✗ Failed to create venv. Try: apt install python3-venv"
+    exit 1
 fi
 
 # Activate — handle both Linux (bin/) and Windows (Scripts/)
@@ -301,15 +302,24 @@ echo ""
 echo "  Next steps:"
 if $IS_WINDOWS; then
     echo "    1. Double-click: start_thoughtmachine.bat"
+    echo ""
+    echo "    2. Or for production mode (serves from dist/):"
+    echo "       start_thoughtmachine.bat --prod"
 else
     echo "    1. Activate the virtual environment:"
     echo "       source .venv/bin/activate"
     echo ""
-    echo "    2. Start ThoughtMachine:"
+    echo "    2. Start ThoughtMachine (default: dev mode with hot-reload):"
     echo "       ./start_thoughtmachine.sh"
+    echo ""
+    echo "    3. Or for production mode (serves from dist/):"
+    echo "       ./start_thoughtmachine.sh --prod"
 fi
 echo ""
-echo "    3. Open http://127.0.0.1:8000 in your browser"
+echo "    4. Open http://127.0.0.1:8000 in your browser"
+echo ""
+echo "  In dev mode, the frontend runs on http://127.0.0.1:5173"
+echo "  (hot-reload) and the backend API on http://127.0.0.1:8000."
 echo ""
 echo "  Your config file will be created automatically"
 echo "  at ~/.thoughtmachine/agent_config.json on first run."

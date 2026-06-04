@@ -3,12 +3,13 @@ import ast
 import os
 import pathlib
 from pydantic import Field
-from typing import Optional, List, Dict, Any, Literal
+from typing import ClassVar, Optional, List, Dict, Any, Literal
 import logging
 
 logger = logging.getLogger(__name__)
 
 class FileSummaryTool(ToolBase):
+    required_categories: ClassVar[List[str]] = ["filesystem:read"]
     """Extract structural elements from code files using AST parsing."""
     tool: Literal["FileSummaryTool"] = "FileSummaryTool"
     

@@ -212,3 +212,27 @@ A new agent tool (e.g. `ShowFileToUser`) that:
 - Allows the user to view, scroll, and maybe copy content
 - The panel could be a dedicated "viewer" tab separate from the chat
 - Useful for the agent to show results without blowing up the context with file content
+
+## 2026-06-03 — ## Session Gossip Protocol (Idea)
+
+**Origin**: Config audit ...
+
+## Session Gossip Protocol (Idea)
+
+**Origin**: Config audit discussion, 2025
+
+**Concept**: Enable sessions (agent working threads) to "gossip" with each other — sharing relevant information autonomously without requiring the user to manually bridge them.
+
+**Proposed workflow**:
+1. User puts the system into a "safe position" (checkpoint)
+2. Agents gossip/shared relevant context across sessions
+3. Each agent can only continue work after the user reviews what it plans to do next
+
+**Known challenges**:
+- Security and access control (which sessions can talk to which?)
+- Information leakage prevention
+- User consent/permission at each step
+- Serialization of partial work state
+- Consensus/voting mechanisms if sessions disagree
+
+**Status**: Idea only — no implementation planned yet. Requires careful security design before any prototyping.

@@ -24,6 +24,34 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
     }
   }, [setLoading, setEntries, setError]);
 
+  const [newFolderName, setNewFolderName] = useState('');
+  const [creating, setCreating] = useState(false);
+
+  const createFolder = useCallback(async () => {
+    const name = newFolderName.trim();
+    if (!name) return;
+    setCreating(true);
+    try {
+      const url = `http://${window.location.hostname}:8000/api/browse/create`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parent_path: path, name }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setNewFolderName('');
+        fetchDir(path);
+      } else {
+        setError(data.error || 'Failed to create directory');
+      }
+    } catch (err) {
+      setError('Network error: ' + err.message);
+    } finally {
+      setCreating(false);
+    }
+  }, [newFolderName, path, fetchDir, setError]);
+
   useEffect(() => {
     fetchDir(path);
   }, [path, fetchDir]);
@@ -73,13 +101,35 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
-      <div style={{ marginTop: '0.1rem', marginBottom: '0.4rem', display: 'flex', gap: '0.3rem' }}>
+      <div style={{ marginTop: '0.1rem', marginBottom: '0.4rem', display: 'flex', gap: '0.3rem', flexWrap: 'wrap' }}>
         {path && path !== '/' && (
           <button onClick={goUp} style={{
             background: '#45475a', color: '#cdd6f4', border: '1px solid #585b70',
             borderRadius: '4px', padding: '0.2rem 0.5rem', cursor: 'pointer', fontSize: '0.75rem'
           }}>↑ Parent</button>
         )}
+        <div style={{ display: 'flex', gap: '0.3rem', alignItems: 'center' }}>
+          <input
+            type="text"
+            value={newFolderName}
+            onChange={(e) => setNewFolderName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') createFolder(); }}
+            placeholder="new folder"
+            style={{
+              background: '#1e1e2e', color: '#cdd6f4', border: '1px solid #585b70',
+              borderRadius: '4px', padding: '0.2rem 0.4rem', fontSize: '0.75rem',
+              width: '90px', outline: 'none',
+            }}
+          />
+          <button onClick={createFolder} disabled={creating || !newFolderName.trim()} style={{
+            background: creating ? '#585b70' : '#45475a',
+            color: creating || !newFolderName.trim() ? '#6c7086' : '#a6e3a1',
+            border: '1px solid #585b70',
+            borderRadius: '4px', padding: '0.2rem 0.4rem',
+            cursor: creating || !newFolderName.trim() ? 'not-allowed' : 'pointer',
+            fontSize: '0.75rem', whiteSpace: 'nowrap',
+          }}>{creating ? '…' : '+ Folder'}</button>
+        </div>
         <button onClick={() => onSelect(path)} style={{
           background: '#89b4fa', color: '#1e1e2e', border: 'none',
           borderRadius: '4px', padding: '0.2rem 0.5rem', cursor: 'pointer', fontWeight: 600, fontSize: '0.75rem',
@@ -113,8 +163,8 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
 }
 
 
-function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected }) {
-  const [defaultSaved, setDefaultSaved] = useState(false);
+function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, defaultConfigSaveMessage, onClearDefaultSaveStatus }) {
+  const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error'
   const [showManageProviders, setShowManageProviders] = useState(false);
   const getSafeDraft = (cfg) => ({
     temperature: cfg?.temperature ?? 0.7,
@@ -128,7 +178,9 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
       filesystem: 'write',
       network: true,
       container: true,
+      security: 'read',
       git: 'write',
+      execution: 'banned',
       system: true,
     },
 
@@ -156,6 +208,22 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
     setBrowserPath(newPath);
     setBrowserError('');
   }, []);
+
+  // ── Sync defaultConfigSaveStatus from backend into local UI state ────
+  useEffect(() => {
+    if (defaultConfigSaveStatus === 'ok') {
+      setDefaultSaved(true);
+      const t = setTimeout(() => setDefaultSaved(false), 2500);
+      return () => clearTimeout(t);
+    } else if (defaultConfigSaveStatus === 'error') {
+      setDefaultSaved('error');
+      const t = setTimeout(() => {
+        setDefaultSaved(false);
+        onClearDefaultSaveStatus?.();
+      }, 4000);
+      return () => clearTimeout(t);
+    }
+  }, [defaultConfigSaveStatus, onClearDefaultSaveStatus]);
 
   useEffect(() => {
     setDraft(getSafeDraft(config));
@@ -272,12 +340,11 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
           className="btn btn-accent"
           style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem' }}
           onClick={() => {
-            sendCommand('set_default_config');
-            setDefaultSaved(true);
-            setTimeout(() => setDefaultSaved(false), 2500);
+            sendCommand('set_default_config', { config: draft });
+            setDefaultSaved('pending');
           }}
         >
-          {defaultSaved ? '✓ Default saved!' : '💾 Save as Default'}
+          {defaultSaved === 'pending' ? '💾 Saving…' : defaultSaved === 'error' ? '✗ Save failed' : defaultSaved === true ? '✓ Default saved!' : '💾 Save as Default'}
         </button>
       </div>
 
@@ -520,12 +587,14 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
               })}
               style={inputStyle}
             >
+              <option value="full" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Full</option>
               <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
               <option value="read" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Read</option>
-              <option value="none" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>None</option>
+              <option value="ask" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Ask</option>
+              <option value="banned" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Banned</option>
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
-              Read/write access to the workspace filesystem.
+              Read/write access to the workspace filesystem. "Ask" prompts for approval on each write.
             </small>
           </div>
 
@@ -585,12 +654,14 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
               })}
               style={inputStyle}
             >
+              <option value="full" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Full</option>
               <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
               <option value="read" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Read</option>
-              <option value="none" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>None</option>
+              <option value="banned" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Banned</option>
+              <option value="ask" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Ask</option>
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
-              Access level for Git operations.
+              Access level for Git operations. "Ask" prompts for approval on each operation.
             </small>
           </div>
 

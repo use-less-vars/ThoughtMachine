@@ -4,7 +4,8 @@
  * Top tab bar that displays open session tabs (like browser tabs).
  * Each tab shows the session name and a close (✕) button.
  * A "+" button creates a new tab.
- * A ⚙️ cogwheel opens the Session Actions panel.
+ * A ⚙️ cogwheel opens the Session Actions slide-in panel (name + delete)
+ * when a tab is active, or toggles the sessions sidebar when no tabs are open.
  *
  * Props:
  *   tabs            — array of { id, name }

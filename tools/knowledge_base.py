@@ -7,6 +7,7 @@ learned, and task management.
 """
 
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, ClassVar, List, Dict, Optional, Tuple
@@ -16,6 +17,21 @@ import re as _re
 from pydantic import Field
 
 from .base import ToolBase
+
+# ---------------------------------------------------------------------------
+# File-lock infrastructure for thread-safe writes
+# ---------------------------------------------------------------------------
+_file_locks: Dict[str, threading.Lock] = {}
+_file_locks_lock = threading.Lock()
+
+
+def _get_file_lock(file_path: str) -> threading.Lock:
+    """Return a per-file reentrant lock, creating it if needed."""
+    with _file_locks_lock:
+        if file_path not in _file_locks:
+            _file_locks[file_path] = threading.Lock()
+        return _file_locks[file_path]
+
 
 # Lazy import for global KB (avoids circular import at module level)
 def _get_ensure_global_kb():
@@ -134,6 +150,15 @@ class KnowledgeBaseTool(ToolBase):
       - **create_domain**: Create a new domain file
       - **summary**: Return a lightweight section index of a domain file
     """
+
+    @classmethod
+    def get_required_categories(cls, params: dict | None = None) -> list[str]:
+        """Return filesystem:write only for write modes (append, update, create_domain)."""
+        if params:
+            mode = params.get("mode", "")
+            if mode in ("append", "update", "create_domain"):
+                return ["filesystem:write"]
+        return []
 
     tool: Literal["KnowledgeBase"] = "KnowledgeBase"
 
@@ -661,12 +686,14 @@ class KnowledgeBaseTool(ToolBase):
             f"(To be populated)\n"
         )
 
-        try:
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            file_path.write_text(template, encoding="utf-8")
-        except OSError as e:
-            self._log_tool_error(f"Could not create domain file {rel_path}: {e}")
-            return f"Error creating domain file '{rel_path}': {e}. Check permissions."
+        lock = _get_file_lock(str(file_path))
+        with lock:
+            try:
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text(template, encoding="utf-8")
+            except OSError as e:
+                self._log_tool_error(f"Could not create domain file {rel_path}: {e}")
+                return f"Error creating domain file '{rel_path}': {e}. Check permissions."
 
         self._log_debug(f"Created new domain '{domain_name}' at {rel_path}")
         return (
@@ -915,41 +942,43 @@ class KnowledgeBaseTool(ToolBase):
         entry_summary = self.summary if self.summary else (self.entry[:60] + "..." if len(self.entry) > 60 else self.entry)
         entry_block = f"\n## {today} — {entry_summary}\n\n{self.entry}\n"
 
-        try:
-            if self.append_section:
-                # Section-aware append: insert under a named ## heading
-                self._log_debug(f"append_section='{self.append_section}', inserting under that heading")
-                content = file_path.read_text(encoding="utf-8")
-                clean_section = self.append_section.lstrip("#").strip()
-                pattern = _re.compile(rf"^## {_re.escape(clean_section)}\s*$", _re.MULTILINE)
-                match = pattern.search(content)
+        lock = _get_file_lock(str(file_path))
+        with lock:
+            try:
+                if self.append_section:
+                    # Section-aware append: insert under a named ## heading
+                    self._log_debug(f"append_section='{self.append_section}', inserting under that heading")
+                    content = file_path.read_text(encoding="utf-8")
+                    clean_section = self.append_section.lstrip("#").strip()
+                    pattern = _re.compile(rf"^## {_re.escape(clean_section)}\s*$", _re.MULTILINE)
+                    match = pattern.search(content)
 
-                if match:
-                    # Heading found — find the next ## heading after it (or EOF)
-                    after_heading = match.end()
-                    next_section = content.find("\n## ", after_heading)
-                    if next_section == -1:
-                        # No next section — append at end
-                        updated = content + entry_block
+                    if match:
+                        # Heading found — find the next ## heading after it (or EOF)
+                        after_heading = match.end()
+                        next_section = content.find("\n## ", after_heading)
+                        if next_section == -1:
+                            # No next section — append at end
+                            updated = content + entry_block
+                        else:
+                            # Insert before the next heading
+                            updated = content[:next_section] + entry_block + content[next_section:]
                     else:
-                        # Insert before the next heading
-                        updated = content[:next_section] + entry_block + content[next_section:]
-                else:
-                    # Section not found — create it at the end
-                    section_header = f"## {clean_section}"
-                    updated = content.rstrip() + f"\n\n{section_header}\n{entry_block}\n"
+                        # Section not found — create it at the end
+                        section_header = f"## {clean_section}"
+                        updated = content.rstrip() + f"\n\n{section_header}\n{entry_block}\n"
 
-                file_path.write_text(updated, encoding="utf-8")
-            else:
-                # Simple append to end of file (existing behavior)
-                with open(file_path, "a", encoding="utf-8") as f:
-                    f.write(entry_block)
-        except PermissionError:
-            self._log_tool_warning(f"Permission denied appending to {file_path}")
-            return f"Error: Permission denied writing to '{rel_path}'. Check file permissions."
-        except OSError as e:
-            self._log_tool_error(f"Error appending to {file_path}: {e}")
-            return f"Error appending to '{rel_path}': {e}"
+                    file_path.write_text(updated, encoding="utf-8")
+                else:
+                    # Simple append to end of file (existing behavior)
+                    with open(file_path, "a", encoding="utf-8") as f:
+                        f.write(entry_block)
+            except PermissionError:
+                self._log_tool_warning(f"Permission denied appending to {file_path}")
+                return f"Error: Permission denied writing to '{rel_path}'. Check file permissions."
+            except OSError as e:
+                self._log_tool_error(f"Error appending to {file_path}: {e}")
+                return f"Error appending to '{rel_path}': {e}"
 
         # --- Size warning ---
         APPEND_SIZE_WARNING_TOKENS = 25000
@@ -987,49 +1016,51 @@ class KnowledgeBaseTool(ToolBase):
         if not file_path.exists():
             return f"File not found for domain '{domain_name}'. Try `mode=list` to see available domains."
 
-        try:
-            content = file_path.read_text(encoding="utf-8")
-        except PermissionError:
-            self._log_tool_warning(f"Permission denied reading {file_path} for update")
-            return f"Error: Permission denied reading '{rel_path}'. Check file permissions."
-        except OSError as e:
-            self._log_tool_error(f"Error reading {file_path} for update: {e}")
-            return f"Error reading '{rel_path}': {e}"
+        lock = _get_file_lock(str(file_path))
+        with lock:
+            try:
+                content = file_path.read_text(encoding="utf-8")
+            except PermissionError:
+                self._log_tool_warning(f"Permission denied reading {file_path} for update")
+                return f"Error: Permission denied reading '{rel_path}'. Check file permissions."
+            except OSError as e:
+                self._log_tool_error(f"Error reading {file_path} for update: {e}")
+                return f"Error reading '{rel_path}': {e}"
 
-        # Normalize section name: strip leading '#' and whitespace
-        clean_section = self.section.lstrip('#').strip()
+            # Normalize section name: strip leading '#' and whitespace
+            clean_section = self.section.lstrip('#').strip()
 
-        # Locate the section header using regex anchored to line start
-        section_header_re = _re.compile(rf"^## {_re.escape(clean_section)}\s*$", _re.MULTILINE)
-        match = section_header_re.search(content)
+            # Locate the section header using regex anchored to line start
+            section_header_re = _re.compile(rf"^## {_re.escape(clean_section)}\s*$", _re.MULTILINE)
+            match = section_header_re.search(content)
 
-        if not match:
-            # Section not found — append it at the end
-            section_header = f"## {clean_section}"
-            updated_content = content.rstrip() + f"\n\n{section_header}\n{self.new_content}\n"
-            self._log_debug(f"Section '{clean_section}' not found, appending to end of {rel_path}")
-            found = False
-        else:
-            # Section found — delete from header to next "## " or EOF, then insert new header + content
-            section_start = match.start()
-            # Find the next "## " header after the current one
-            next_section = content.find("\n## ", match.end())
-            if next_section == -1:
-                # No next section, delete until EOF
-                updated_content = content[:section_start] + f"## {clean_section}\n{self.new_content}\n"
+            if not match:
+                # Section not found — append it at the end
+                section_header = f"## {clean_section}"
+                updated_content = content.rstrip() + f"\n\n{section_header}\n{self.new_content}\n"
+                self._log_debug(f"Section '{clean_section}' not found, appending to end of {rel_path}")
+                found = False
             else:
-                # Delete until next section
-                updated_content = content[:section_start] + f"## {clean_section}\n{self.new_content}\n" + content[next_section:]
-            found = True
+                # Section found — delete from header to next "## " or EOF, then insert new header + content
+                section_start = match.start()
+                # Find the next "## " header after the current one
+                next_section = content.find("\n## ", match.end())
+                if next_section == -1:
+                    # No next section, delete until EOF
+                    updated_content = content[:section_start] + f"## {clean_section}\n{self.new_content}\n"
+                else:
+                    # Delete until next section
+                    updated_content = content[:section_start] + f"## {clean_section}\n{self.new_content}\n" + content[next_section:]
+                found = True
 
-        try:
-            file_path.write_text(updated_content, encoding="utf-8")
-        except PermissionError:
-            self._log_tool_warning(f"Permission denied writing {file_path} for update")
-            return f"Error: Permission denied writing to '{rel_path}'. Check file permissions."
-        except OSError as e:
-            self._log_tool_error(f"Error writing {file_path} for update: {e}")
-            return f"Error writing to '{rel_path}': {e}"
+            try:
+                file_path.write_text(updated_content, encoding="utf-8")
+            except PermissionError:
+                self._log_tool_warning(f"Permission denied writing {file_path} for update")
+                return f"Error: Permission denied writing to '{rel_path}'. Check file permissions."
+            except OSError as e:
+                self._log_tool_error(f"Error writing {file_path} for update: {e}")
+                return f"Error writing to '{rel_path}': {e}"
 
         if found:
             self._log_debug(f"Updated section '{self.section}' in {rel_path}")

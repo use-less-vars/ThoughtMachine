@@ -154,6 +154,7 @@ if [ "$BUILD_MODE" = "1" ]; then
         --hidden-import "tools.mcp_client" \
         --hidden-import "tools.mcp_client_new" \
         --hidden-import "tools.mcp_manager" \
+        --hidden-import "agent.startup_health_check" \
         --hidden-import "agent.controller" \
         --hidden-import "agent.config" \
         --hidden-import "agent.config.loader" \

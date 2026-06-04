@@ -23,6 +23,7 @@ import ChatPanel from './ChatPanel'
 import QueryBar from './QueryBar'
 import StatusBar from './StatusBar'
 import ConfigPanel from './ConfigPanel'
+import SecurityDialog from './SecurityDialog'
 
 const CONFIG_PANEL_MIN_WIDTH = 200
 const CONFIG_PANEL_MAX_WIDTH = 500
@@ -57,6 +58,9 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
   const pendingCommandsRef = useRef([])  // queued commands for retry
   const connectSessionWsRef = useRef(null)  // ref to avoid circular deps in sendCommand
   const [wsConnected, setWsConnected] = useState(false)
+  const [defaultConfigSaveStatus, setDefaultConfigSaveStatus] = useState(null) // null | 'ok' | 'error'
+  const [defaultConfigSaveMessage, setDefaultConfigSaveMessage] = useState('')
+  const [securityPrompt, setSecurityPrompt] = useState(null) // null | { request_id, tool_name, capabilities, ... }
 
   // ── Config panel resize state (persisted per tab) ──────────────────
   const [configPanelWidth, setConfigPanelWidth] = useState(() => {
@@ -332,6 +336,11 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
         setAvailableTools(msg.tools || [])
         break
 
+      case 'default_config_saved':
+        setDefaultConfigSaveStatus(msg.status)
+        setDefaultConfigSaveMessage(msg.message || '')
+        break
+
       case 'session_saved':
         onSessionSaved?.()
         break
@@ -352,6 +361,18 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
       case 'session_deleted':
         // Session was deleted from the store — close the tab
         onClose?.()
+        break
+
+      case 'security_prompt':
+        // Show the security approval dialog (tool permission request)
+        console.log('[SessionTab] security_prompt:', msg)
+        setSecurityPrompt({
+          request_id: msg.request_id,
+          tool_name: msg.tool_name,
+          capabilities: msg.capabilities || [],
+          arguments: msg.arguments || {},
+          description: msg.description || `Tool '${msg.tool_name || 'unknown'}' requires your approval.`,
+        })
         break
 
       default:
@@ -378,6 +399,12 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
           availableTools={availableTools}
           panelWidth={configPanelWidth}
           wsConnected={wsConnected}
+          defaultConfigSaveStatus={defaultConfigSaveStatus}
+          defaultConfigSaveMessage={defaultConfigSaveMessage}
+          onClearDefaultSaveStatus={() => {
+            setDefaultConfigSaveStatus(null)
+            setDefaultConfigSaveMessage('')
+          }}
         />
         <div
           className="resize-handle"
@@ -385,6 +412,13 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
           title="Drag to resize"
         />
         <div className="app-center">
+          {securityPrompt && (
+            <SecurityDialog
+              prompt={securityPrompt}
+              sendCommand={sendCommand}
+              onDismiss={() => setSecurityPrompt(null)}
+            />
+          )}
           <ChatPanel messages={state.history} />
           <QueryBar
             sendCommand={sendCommand}

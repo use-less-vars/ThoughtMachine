@@ -276,10 +276,17 @@ export default function App() {
     loadTab(sessionId)
   }, [loadTab])
 
-  // ── Session sidebar toggle (shown/hidden via ⚙️ cogwheel) ───────────────
-  const handleToggleSessionsSidebar = useCallback(() => {
-    setShowSessions((prev) => !prev)
-  }, [])
+  // ── Session actions panel toggle (shown/hidden via ⚙️ cogwheel) ────────
+  // When a tab is active, opens the slide-in SessionActionsPanel with
+  // Save As… (to name the current session) and Delete Session.
+  // When no tabs are open, toggles the SessionList sidebar instead.
+  const handleCogwheelClick = useCallback(() => {
+    if (tabs.length > 0 && activeTabId) {
+      setSessionPanelOpen((prev) => !prev)
+    } else {
+      setShowSessions((prev) => !prev)
+    }
+  }, [tabs.length, activeTabId])
 
   const handleOpenSessionFromPanel = useCallback((sessionId) => {
     loadTab(sessionId)
@@ -393,7 +400,7 @@ export default function App() {
         onCloseTab={initiateCloseTab}
         onNewTab={handleNewTab}
         runningStates={tabRunningStates}
-        onCogwheelClick={handleToggleSessionsSidebar}
+        onCogwheelClick={handleCogwheelClick}
       />
 
       <div className="app-main">

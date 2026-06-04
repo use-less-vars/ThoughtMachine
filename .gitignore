@@ -27,7 +27,6 @@ debug.log
 # Temporary files
 temp/
 tmp/
-test_*.py
 test_*.json
 *test*.json
 sess_*.json

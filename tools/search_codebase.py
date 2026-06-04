@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 class SearchCodebaseTool(ToolBase):
+    required_categories: ClassVar[List[str]] = ["filesystem:read"]
     """
     SEMANTIC CODEBASE SEARCH - Understands natural language queries about your code.
     

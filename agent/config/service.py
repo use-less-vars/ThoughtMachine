@@ -98,8 +98,11 @@ class ConfigService:
                 log('DEBUG', 'config.service_debug', f'_do_save config copied, thread {thread_id}')
             log('DEBUG', 'config.service_debug', f'_do_save lock released, thread {thread_id}')
             os.makedirs(os.path.dirname(os.path.abspath(self.config_path)), exist_ok=True)
-            with open(self.config_path, 'w') as f:
+            # Atomic write via temp file + rename to prevent partial writes
+            tmp_path = self.config_path + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(config_to_save, f, indent=2)
+            os.replace(tmp_path, self.config_path)
             log('INFO', 'config.service', f'Saved config to {self.config_path}')
             log('DEBUG', 'config.service_debug', f'_do_save completed, thread {thread_id}')
             return True
@@ -257,7 +260,7 @@ class ConfigService:
             except:
                 pass
 
-def create_agent_config_service(config_path: str='agent_config.json') -> ConfigService:
+def create_agent_config_service(config_path: str = None) -> ConfigService:
     """
     Create a ConfigService with default agent configuration.
     
@@ -272,6 +275,9 @@ def create_agent_config_service(config_path: str='agent_config.json') -> ConfigS
     Returns:
         ConfigService instance with agent defaults
     """
+    if config_path is None:
+        config_path = os.path.expanduser('~/.thoughtmachine/agent_config.json')
+
     from agent.config import AgentConfig
     default_agent_config = AgentConfig()
     default_config = default_agent_config.model_dump(exclude={'api_key'}, exclude_none=True)

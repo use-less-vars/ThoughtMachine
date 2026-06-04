@@ -22,7 +22,15 @@
   ],
   "max_file_size_mb": 10,
   "max_backup_files": 5,
-  "workspace_path": null,
+  "workspace_path": "",
+  "session_permissions": {
+    "container": false,
+    "network": true,
+    "filesystem": "write",
+    "security": "read",
+    "git": "read",
+    "execution": "banned"
+  },
   "rag_enabled": false,
   "rag_embedding_model": "BAAI/bge-small-en-v1.5",
   "rag_chunk_size": 1500,

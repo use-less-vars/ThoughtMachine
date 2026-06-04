@@ -1,5 +1,5 @@
 # tools/git_info_tool.py
-from typing import Literal, Optional, List
+from typing import ClassVar, Literal, Optional, List
 from pydantic import Field
 import subprocess
 import os
@@ -13,11 +13,26 @@ class GitInfoTool(ToolBase):
     Provides access to git status, diff, log, branch, show, remote, blame, and config.
     All operations are read-only and cannot modify the repository.
     """
+
+    @classmethod
+    def get_required_categories(cls, params: dict | None = None) -> list[str]:
+        """Return dynamic permission categories based on the git operation."""
+        if params:
+            op = params.get("operation", "")
+            if op in ("remote",):
+                return ["git:read", "network:outbound"]
+            if op in ("commit",):
+                return ["git:write"]
+            if op in ("push", "pull", "fetch", "merge", "rebase"):
+                return ["git:write", "network:outbound"]
+        # All other operations (status, diff, log, branch, show, blame, config) are read-only
+        return ["git:read"]
+
     tool: Literal["GitInfoTool"] = "GitInfoTool"
 
     
-    operation: Literal["status", "diff", "log", "branch", "show", "remote", "blame", "config"] = Field(
-        description="Git operation to perform: status, diff, log, branch, show, remote, blame, config"
+    operation: Literal["status", "diff", "log", "branch", "show", "remote", "blame", "config", "commit"] = Field(
+        description="Git operation to perform: status, diff, log, branch, show, remote, blame, config, commit"
     )
     
     # Common parameters
@@ -88,6 +103,12 @@ class GitInfoTool(ToolBase):
         description="End line number for blame operation"
     )
     
+    # Commit parameters
+    message: Optional[str] = Field(
+        default=None,
+        description="Commit message for commit operation"
+    )
+    
     # Config parameters
     config_name: Optional[str] = Field(
         default=None,
@@ -145,6 +166,8 @@ class GitInfoTool(ToolBase):
                 return self._git_blame(repo_root)
             elif self.operation == "config":
                 return self._git_config(repo_root)
+            elif self.operation == "commit":
+                return self._git_commit(repo_root)
             else:
                 return self._truncate_output(f"Unknown operation: {self.operation}")
         
@@ -282,5 +305,36 @@ class GitInfoTool(ToolBase):
         args = ["config", "--list"]
         if self.config_name:
             args = ["config", "--get", self.config_name]
+        output = self._run_git(repo_root, args)
+        return self._truncate_output(output)
+
+    def _git_add(self, repo_root: Path) -> str:
+        """Run git add."""
+        args = ["add"]
+        if self.file_path:
+            # Validate file path is within workspace
+            try:
+                file_abs = (repo_root / self.file_path).resolve()
+                validated_abs = self._validate_path(str(file_abs))
+                file_rel = Path(validated_abs).relative_to(repo_root)
+                args.append(str(file_rel))
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+        else:
+            args.append("-A")  # Stage all changes
+        output = self._run_git(repo_root, args)
+        return self._truncate_output(output)
+
+    def _git_commit(self, repo_root: Path) -> str:
+        """Run git commit."""
+        # First, stage changes
+        add_result = self._git_add(repo_root)
+        if add_result.startswith("Git command failed") or add_result.startswith("Error"):
+            return add_result
+
+        # Then commit
+        if not self.message:
+            return "Error: message is required for commit operation"
+        args = ["commit", "-m", self.message]
         output = self._run_git(repo_root, args)
         return self._truncate_output(output)

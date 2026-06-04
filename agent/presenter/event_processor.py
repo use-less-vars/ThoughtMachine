@@ -13,7 +13,7 @@ from agent import events as ev
 
 class EventProcessor:
     """Processes events from controller and updates state."""
-    MESSAGE_EVENT_TYPES = {'turn', 'tool_call', 'tool_result', 'final', 'user_query', 'llm_request', 'llm_response', 'raw_response'}
+    MESSAGE_EVENT_TYPES = {'turn', 'tool_call', 'tool_result', 'user_query', 'llm_request', 'llm_response', 'raw_response'}
 
     def __init__(self, state_bridge, session_lifecycle, gui_integration=None):
         """
@@ -40,7 +40,7 @@ class EventProcessor:
         event_type = typed_event.type.value
         log('DEBUG', 'core.signal', f"event: type={event_type}")
         log('DEBUG', 'presenter.event_processor', f'Processing event: {event_type}')
-        state_event_types = ['error', 'paused', 'stopped', 'thread_finished', 'final', 'max_turns', 'user_interaction_requested', 'rate_limit_warning', 'token_warning', 'turn_warning', 'user_query']
+        state_event_types = ['error', 'paused', 'stopped', 'thread_finished', 'max_turns', 'user_interaction_requested', 'rate_limit_warning', 'token_warning', 'turn_warning', 'user_query']
         if event_type not in state_event_types:
             event_session_id = event.get('session_id')
             if event_session_id is not None:
@@ -62,7 +62,7 @@ class EventProcessor:
             self._process_turn_event(event)
         elif event_type == 'token_update':
             self._process_token_update_event(event)
-        elif event_type in ('agent_responded', 'final'):
+        elif event_type == 'agent_responded':
             self._process_terminal_event(event, event_type)
         elif event_type == 'user_interaction_requested':
             self._process_user_interaction_event(event)
@@ -159,7 +159,7 @@ class EventProcessor:
     def _process_terminal_event(self, event: Dict[str, Any], event_type: str) -> None:
         """Process terminal event (final, stopped, max_turns, thread_finished)."""
         log('DEBUG', 'presenter.event_processor', f'_process_terminal_event: type={event_type}, turn={event.get("turn")}')
-        if event_type in ('final', 'agent_responded'):
+        if event_type == 'agent_responded':
             self.session_lifecycle.state = ExecutionState.READY
             if self.gui_integration:
                 self.gui_integration.emit_status_message('Completed successfully')
@@ -216,7 +216,7 @@ class EventProcessor:
             # (e.g., grace turn committed just before pause) since the ObservableList
             # callback uses QTimer.singleShot from the worker thread, which may not
             # reliably deliver on all platforms. This runs on the main thread via
-            # the queued signal connection from controller.event_occurred.
+            # the event queue from controller.
             self.gui_integration.emit_conversation_changed()
         self.session_lifecycle.auto_save_current_session()
 

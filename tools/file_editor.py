@@ -1,5 +1,5 @@
 # tools/file_editor.py
-from typing import List, Optional, Union, Dict, Literal
+from typing import ClassVar, List, Optional, Union, Dict, Literal
 import os
 from pathlib import Path
 from pydantic import Field, model_validator
@@ -9,6 +9,13 @@ from .base import ToolBase
 class FileEditor(ToolBase):
     """Unified file editor supporting read, write, insert, append, replace, and delete operations.
     Supports single file operations or batch operations across multiple files."""
+    required_categories: ClassVar[List[str]] = ["filesystem:write"]
+
+    @classmethod
+    def get_required_categories(cls, params: dict | None = None) -> list[str]:
+        if params and params.get("operation") in ("read", "grep"):
+            return ["filesystem:read"]
+        return ["filesystem:write"]
     tool: Literal["FileEditor"] = "FileEditor"
     operation: Literal["read", "write", "insert", "append", "replace", "delete", "grep"] = Field(
         description="Operation: read, write, insert, append, replace, delete, or grep."

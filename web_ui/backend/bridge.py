@@ -53,6 +53,16 @@ from agent.config.service import create_agent_config_service
 from agent.controller import AgentController
 from agent.logging import log
 
+# Import event system for security prompt forwarding
+try:
+    from agent.events import global_event_bus, EventType, SecurityPromptEvent
+    EVENT_SYSTEM_AVAILABLE = True
+except ImportError:
+    global_event_bus = None
+    EventType = None
+    SecurityPromptEvent = None
+    EVENT_SYSTEM_AVAILABLE = False
+
 from session.models import Session
 from session.store import FileSystemSessionStore
 
@@ -60,6 +70,22 @@ from session.store import FileSystemSessionStore
 # ══════════════════════════════════════════════════════════════════════════════
 #  Bridge class
 # ══════════════════════════════════════════════════════════════════════════════
+
+# Global registry of active tab bridges — used to broadcast session renames
+# across all open tabs holding the same session.
+_active_tab_bridges: set = set()
+
+def _broadcast_rename(session_id: str, new_name: str) -> None:
+    """Update in-memory session name on every bridge that has this session loaded."""
+    for b in list(_active_tab_bridges):
+        try:
+            if b._loaded_session and b._loaded_session.session_id == session_id:
+                b._loaded_session.metadata['name'] = new_name
+            if b._session and b._session.session_id == session_id:
+                b._session.metadata['name'] = new_name
+        except Exception:
+            pass
+
 
 class WebAgentBridge:
     """
@@ -102,6 +128,82 @@ class WebAgentBridge:
         self._session_store = FileSystemSessionStore()
         self._session: Optional[Session] = None
         self._loaded_session: Optional[Session] = None
+
+        # Subscribe to global event bus for security prompt events
+        self._security_subscription = None
+        self._subscribe_to_security_events()
+
+
+    # ── Security event subscription ───────────────────────────────────────────
+
+    def _subscribe_to_security_events(self) -> None:
+        """
+        Subscribe to SECURITY_PROMPT events from the global event bus.
+
+        When the tool executor publishes a SecurityPromptEvent (because a
+        tool requires a permission set to ``ask``), this handler forwards
+        it to the frontend via the WebSocket event callback so the user
+        can see a dialog and approve or deny.
+        """
+        if not EVENT_SYSTEM_AVAILABLE or global_event_bus is None:
+            log('WARNING', 'server.bridge', 'Event system unavailable — security prompts not forwarded')
+            return
+
+        def _security_prompt_handler(event: SecurityPromptEvent) -> None:
+            """Forward a SecurityPromptEvent to the frontend."""
+            if self._event_callback is None:
+                log('DEBUG', 'server.bridge', 'No event callback — dropping security prompt')
+                return
+            data = event.data or {}
+            try:
+                self._event_callback({
+                    'type': 'security_prompt',
+                    'request_id': data.get('request_id', ''),
+                    'agent_id': data.get('agent_id', ''),
+                    'tool_name': data.get('tool_name', ''),
+                    'capabilities': data.get('capabilities', []),
+                    'arguments': data.get('arguments', {}),
+                    'description': (
+                        f"Tool '{data.get('tool_name', '?')}' requires: "
+                        f"{', '.join(data.get('capabilities', []))}"
+                    ),
+                })
+            except Exception as exc:
+                log('ERROR', 'server.bridge',
+                    f'Failed to forward security prompt: {exc}')
+
+        self._security_subscription = global_event_bus.subscribe(
+            EventType.SECURITY_PROMPT, _security_prompt_handler
+        )
+        log('INFO', 'server.bridge', 'Subscribed to SECURITY_PROMPT events')
+
+    def _unsubscribe_security_events(self) -> None:
+        """Unsubscribe from security events."""
+        if self._security_subscription is not None:
+            try:
+                # The subscription might be a registration handle;
+                # try to remove it if the bus provides that API.
+                if hasattr(global_event_bus, 'unsubscribe'):
+                    global_event_bus.unsubscribe(self._security_subscription)
+            except Exception:
+                pass
+            self._security_subscription = None
+
+    # ── Global tab registry ──────────────────────────────────────────────────
+
+    def register(self) -> None:
+        """Register this bridge in the global active-tab set."""
+        _active_tab_bridges.add(self)
+
+    def unregister(self) -> None:
+        """Remove this bridge from the global active-tab set."""
+        _active_tab_bridges.discard(self)
+
+    @staticmethod
+    def broadcast_rename(session_id: str, new_name: str) -> None:
+        """Update in-memory state on all bridges holding this session."""
+        _broadcast_rename(session_id, new_name)
+
 
     # ── Public API ──────────────────────────────────────────────────────────
 
@@ -157,8 +259,9 @@ class WebAgentBridge:
 
     def _build_global_agent_config(self) -> AgentConfig:
         """
-        Build an AgentConfig from the global config file (agent_config.json)
-        via ConfigService, mirroring what the PyQt GUI does in
+        Build an AgentConfig from the global config file
+        (~/.thoughtmachine/agent_config.json) via ConfigService,
+        mirroring what the PyQt GUI does in
         SessionTab.create_new_session() -> state_bridge.create_agent_config().
 
         This removes the dependency on presets for config defaults.
@@ -181,7 +284,7 @@ class WebAgentBridge:
         Start a new agent session.
 
         Configuration is built from three layers (each overriding the previous):
-          1. Global config (from agent_config.json via ConfigService)
+          1. Global config (from ~/.thoughtmachine/agent_config.json via ConfigService)
           2. Session config overrides (from a loaded session's metadata)
           3. Frontend config_dict (the caller's runtime overrides)
 
@@ -195,7 +298,7 @@ class WebAgentBridge:
             config_dict: Frontend configuration overrides (see AgentConfig fields).
                          Applied on top of global config + loaded session config.
         """
-        # ── Layer 1: global config from agent_config.json ──────────────────
+        # ── Layer 1: global config from ~/.thoughtmachine/agent_config.json ──
         global_config = self._build_global_agent_config()
         merged_config = global_config.model_dump(exclude={'api_key'}, exclude_none=True)
 
@@ -318,6 +421,7 @@ class WebAgentBridge:
 
     def stop(self) -> None:
         """Request the agent to stop (finishes current operation then exits)."""
+        self._unsubscribe_security_events()
         if self._controller is not None:
             self._controller.stop()
             return
@@ -407,9 +511,9 @@ class WebAgentBridge:
         else:
             base = {}
 
-        # Step 3: Merge incoming on top (shallow merge)
-        merged = dict(base)
-        merged.update(config_dict)
+        # Step 3: Merge incoming on top (deep merge — preserves nested dicts)
+        from agent.utils import deep_merge
+        merged = deep_merge(base, config_dict)
 
         # Step 4: Validate the merged dict
         validated = validate_config(merged)
@@ -676,8 +780,8 @@ class WebAgentBridge:
                         base = self._config.model_dump(exclude={'api_key'}, exclude_none=True)
                     else:
                         base = {}
-                    merged = dict(base)
-                    merged.update(agent_config_raw)
+                    from agent.utils import deep_merge
+                    merged = deep_merge(base, agent_config_raw)
                     # Ensure enabled_tools is always present — merge from global config if missing
                     if 'enabled_tools' not in merged:
                         try:
@@ -834,12 +938,17 @@ class WebAgentBridge:
             self._loaded_session.session_id if self._loaded_session else None
         )
         log('INFO', 'server.bridge', f"Closing session: {sid or '(no id)'}")
-        # Save current state
+        # STOP the bridge FIRST — let the agent thread finish and flush
+        # final messages into user_history before we snapshot.
+        self.stop()
+        # Wait for agent thread to fully exit (controller.stop() already
+        # joins the controller thread with a 5s timeout in shutdown()).
+        if self._controller is None and self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=60)
+        # NOW save — all final messages are captured
         if sid:
             self.save_session()
             self.remove_open_session(sid)
-        # Stop the bridge
-        self.stop()
         # Reset state
         self._session = None
         self._loaded_session = None
@@ -969,7 +1078,7 @@ class WebAgentBridge:
                     "messages": self._normalize_for_frontend(self._session.user_history),
                 })
 
-        elif event_type in ("user_query", "turn", "tool_call", "tool_result", "final"):
+        elif event_type in ("user_query", "turn", "tool_call", "tool_result"):
             # Session has been updated by the agent; sync to frontend.
             if self._session is not None:
                 self._history_version = self._session.conversation_version

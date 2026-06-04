@@ -7,6 +7,7 @@ from typing import Optional, List, Dict, Any, Tuple, ClassVar, Literal
 import time
 
 class DirectoryTreeTool(ToolBase):
+    required_categories: ClassVar[List[str]] = ["filesystem:read"]
     """Show directory structure with tree visualization or flat file listing. Supports recursion limits, hidden file filtering, pattern matching, and output truncation.
     
     Key improvements to reduce token usage:

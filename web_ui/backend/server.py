@@ -51,6 +51,7 @@ Client → Server (JSON):
     { "command": "get_open_sessions" }
     { "command": "close_session",          "session_id": "..." (optional) }
     { "command": "new_session" }
+    { "command": "security_response",  "request_id": "...", "approved": true/false, "remember": false }
 
 Server → Client (JSON):
     state_changed       { "type": "state_changed",       "state": "IDLE|RUNNING|PAUSED|WAITING_FOR_USER", "is_running": bool }
@@ -71,6 +72,7 @@ Server → Client (JSON):
     provider_saved      { "type": "provider_saved",      "provider": {...} }
     provider_deleted    { "type": "provider_deleted",    "provider_id": "..." }
     tools_list          { "type": "tools_list",          "tools": [...] }
+    security_prompt     { "type": "security_prompt",     "request_id": "...", "tool_name": "...", "capabilities": [...], "description": "..." }
 """
 
 from __future__ import annotations
@@ -80,13 +82,15 @@ import json
 import os
 import subprocess
 import sys
+import shutil
 import tempfile
+import time
 import traceback
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from agent.logging import log
 from contextlib import asynccontextmanager
@@ -273,6 +277,7 @@ async def websocket_endpoint(ws: WebSocket):
                         bridge.stop()
                     controller = AgentController()
                     bridge = WebAgentBridge(event_callback=event_callback)
+                    bridge.register()
                     bridge.set_controller(controller)
 
                     try:
@@ -426,29 +431,39 @@ async def websocket_endpoint(ws: WebSocket):
                         })
 
                 elif command == "set_default_config":
-                    """Save the current session config as the global default."""
-                    if bridge is None or bridge._config is None:
-                        await ws.send_json({
-                            "type": "default_config_saved",
-                            "status": "error",
-                            "message": "No active session config available",
-                        })
-                        continue
+                    """Save config as the global default.
+
+                    Accepts an optional ``config`` payload (frontend format) so the
+                    frontend can send the user's draft directly.  Falls back to
+                    ``bridge.get_config()`` when no payload is provided.
+                    """
                     try:
+                        config_dict = msg.get("config")
+                        if config_dict:
+                            # Frontend sent the draft — translate to backend format
+                            cfg_dict = _translate_frontend_config(config_dict)
+                        elif bridge is not None:
+                            # Fallback: use bridge's currently applied config
+                            cfg_dict = bridge.get_config().model_dump(exclude={'api_key', 'stop_check'}, exclude_none=True)
+                        else:
+                            await ws.send_json({
+                                "type": "default_config_saved",
+                                "status": "error",
+                                "message": "No config provided and no active session",
+                            })
+                            continue
+
                         config_dir = Path.home() / '.thoughtmachine'
                         config_dir.mkdir(parents=True, exist_ok=True)
                         config_path = config_dir / 'agent_config.json'
-                        # Dump current config to dict (backend format — matches _load_global_defaults expectations)
-                        cfg_dict = bridge.get_config().model_dump(exclude={'api_key'}, exclude_none=True)
-                        with tempfile.NamedTemporaryFile(
-                            mode='w', delete=False,
-                            dir=str(config_dir),
-                            suffix='.tmp',
-                            prefix='agent_config_'
-                        ) as tmp:
-                            json.dump(cfg_dict, tmp, indent=2, default=str)
-                            tmp.flush()
-                            os.replace(tmp.name, str(config_path))
+
+                        # Windows-safe atomic write with retry
+                        _atomic_replace(
+                            data=cfg_dict,
+                            dst=str(config_path),
+                            work_dir=str(config_dir),
+                        )
+
                         log('INFO', 'server.config', f"Default config saved to {config_path}")
                         await ws.send_json({
                             "type": "default_config_saved",
@@ -667,6 +682,7 @@ async def websocket_endpoint(ws: WebSocket):
                         from agent.controller import AgentController
                         controller = AgentController()
                         bridge = WebAgentBridge(event_callback=event_callback)
+                        bridge.register()
                         bridge.set_controller(controller)
                         bridge.load_session(session_id)
                         await ws.send_json({
@@ -754,6 +770,11 @@ async def websocket_endpoint(ws: WebSocket):
                                 "new_name": new_name,
                             })
                             log("INFO", "server.config", f"Renamed session {session_id} → {new_name}")
+                        # Broadcast the new name to ALL open tabs that have this session loaded.
+                        # This ensures every bridge's in-memory state stays in sync with disk,
+                        # preventing save_session() from reverting the name on the next auto-save.
+                        from web_ui.backend.bridge import _broadcast_rename
+                        _broadcast_rename(session_id, new_name)
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
@@ -824,6 +845,7 @@ async def websocket_endpoint(ws: WebSocket):
                     from agent.controller import AgentController
                     controller = AgentController()
                     bridge = WebAgentBridge(event_callback=event_callback)
+                    bridge.register()
                     bridge.set_controller(controller)
 
                     # Create a new empty session
@@ -866,6 +888,40 @@ async def websocket_endpoint(ws: WebSocket):
                     })
                     await ws.send_json({"type": "status_message", "text": "Ready. Type a query to start."})
 
+                elif command == "security_response":
+                    """Handle user response to a security prompt."""
+                    request_id = msg.get("request_id", "")
+                    approved = msg.get("approved", False)
+                    remember = msg.get("remember", False)
+
+                    if not request_id:
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": "⚠ security_response: request_id is required",
+                        })
+                        continue
+
+                    try:
+                        from thoughtmachine.security import resolve_security_prompt
+                        resolve_security_prompt(request_id, approved, remember)
+                        log('INFO', 'server.ws',
+                            f'Security prompt resolved: request_id={request_id} '
+                            f'approved={approved} remember={remember}')
+                    except ImportError:
+                        log('ERROR', 'server.ws',
+                            'security module not available — cannot resolve prompt')
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": "⚠ Security module not loaded",
+                        })
+                    except Exception as exc:
+                        log('ERROR', 'server.ws',
+                            f'Failed to resolve security prompt: {exc}')
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": f"⚠ Failed to resolve: {exc}",
+                        })
+
                 else:
                     await ws.send_json({
                         "type": "status_message",
@@ -895,6 +951,7 @@ async def websocket_endpoint(ws: WebSocket):
                 bridge.save_open_session()
             except Exception:
                 pass
+            bridge.unregister()
             bridge.stop()
 
 
@@ -934,6 +991,25 @@ async def browse_directory(path: str = ""):
         return {"success": False, "error": str(exc), "entries": []}
 
 
+@app.post("/api/browse/create")
+async def create_directory(body: dict):
+    """Create a new directory for the workspace path browser."""
+    try:
+        parent_path = body.get("parent_path", "")
+        dir_name = body.get("name", "")
+        if not dir_name:
+            return {"success": False, "error": "Directory name is required"}
+        new_path = os.path.join(parent_path, dir_name)
+        if os.path.exists(new_path):
+            return {"success": False, "error": f"Already exists: {dir_name}"}
+        os.makedirs(new_path, exist_ok=True)
+        return {"success": True, "path": os.path.abspath(new_path)}
+    except (OSError, PermissionError) as exc:
+        return {"success": False, "error": str(exc)}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "thoughtmachine-web-ui"}
@@ -951,35 +1027,7 @@ async def root():
             status_code=503,
         )
     # Dev mode — backend only serves API. Frontend is on the Vite dev server.
-    return HTMLResponse(
-        """<html><head><style>
-        body { font-family: sans-serif; background: #1e1e2e; color: #cdd6f4;
-               display: flex; justify-content: center; align-items: center;
-               height: 100vh; margin: 0; }
-        .card { background: #313244; padding: 2rem; border-radius: 12px;
-                text-align: center; max-width: 500px; }
-        h1 { color: #89b4fa; margin-top: 0; }
-        a { color: #89b4fa; }
-        .url { background: #45475a; padding: 0.5rem 1rem; border-radius: 6px;
-               font-family: monospace; font-size: 1.2rem; display: inline-block;
-               margin: 0.5rem 0; color: #a6e3a1; }
-        .note { font-size: 0.85rem; color: #a6adc8; margin-top: 1rem; }
-        .api { margin-top: 1.5rem; font-size: 0.9rem; color: #a6adc8; }
-    </style></head><body>
-    <div class="card">
-        <h1>ThoughtMachine</h1>
-        <p style=\"color: #a6e3a1;\">Backend running - frontend on Vite dev server</p>
-        <p>Open the UI at:</p>
-        <div class=\"url\"><a href=\"http://localhost:5173\">http://localhost:5173</a></div>
-        <p class=\"note\">Hot-reload enabled - changes appear instantly</p>
-        <div class=\"api\">
-            API docs at <a href=\"/docs\">/docs</a> |
-            Health at <a href=\"/health\">/health</a>
-        </div>
-    </div>
-    </body></html>
-        """,
-    )
+    return RedirectResponse(url="http://localhost:5173")
 
 
 
@@ -1100,6 +1148,7 @@ _FALLBACK_FRONTEND_CONFIG = {
         "network": False,
         "filesystem": "read",
         "security": "read",
+        "git": "read",
         "execution": "banned",
     },
     "enabled_tools": [
@@ -1192,6 +1241,50 @@ def _config_to_dict(cfg) -> Dict[str, Any]:
     return {k: str(v) for k, v in vars(cfg).items() if not k.startswith("_")}
 
 
+def _atomic_replace(data: dict, dst: str, work_dir: str, retries: int = 3) -> None:
+    """Atomically write *data* as JSON to *dst*, with Windows-safe retries.
+
+    Writes to a temporary file in *work_dir*, then replaces the destination.
+    Retries up to *retries* times on OSError (covers Windows sharing
+    violations from antivirus / file locks).  Falls back to ``shutil.move``
+    if ``os.replace`` fails after all retries.
+    """
+    for attempt in range(1, retries + 2):
+        with tempfile.NamedTemporaryFile(
+            mode='w', delete=False,
+            dir=work_dir,
+            suffix='.tmp',
+            prefix='agent_config_',
+        ) as tmp:
+            json.dump(data, tmp, indent=2, default=str)
+            tmp.flush()
+            tmp_path = tmp.name
+
+        try:
+            os.replace(tmp_path, dst)
+            return  # success
+        except OSError:
+            # Clean up orphaned temp file
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+            if attempt > retries:
+                # Final fallback: try shutil.move (more resilient on Windows)
+                try:
+                    shutil.move(tmp_path, dst)
+                    log('WARNING', 'server.config',
+                        f'_atomic_replace: os.replace failed after {retries} retries, '
+                        f'used shutil.move as fallback')
+                    return
+                except OSError as exc:
+                    raise exc
+
+            # Back off before retrying
+            time.sleep(0.2 * attempt)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Direct execution
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1207,9 +1300,10 @@ def _build_frontend() -> bool:
         return False
 
     log('INFO', 'server', f'Building frontend in {frontend_dir}...')
+    npm_cmd = os.environ.get('TM_NPM_CMD') or 'npm'
     try:
         result = subprocess.run(
-            ["npm", "run", "build"],
+            [npm_cmd, "run", "build"],
             cwd=str(frontend_dir),
             capture_output=True,
             text=True,
@@ -1240,13 +1334,13 @@ def _setup_frontend_serving() -> bool:
     global _SERVE_FRONTEND
     _SERVE_FRONTEND = True
 
-    # Auto-build if dist doesn't exist yet
+    # Always rebuild to prevent stale dist/ from serving old code
+    # Vite/Rollup use incremental caching, so subsequent builds are fast.
     dist = _FRONTEND_DIST
-    if not dist.exists() or not (dist / "index.html").exists():
-        if not _build_frontend():
-            log('WARNING', 'server',
-                'Frontend build failed — will show build-error page on /')
-            return False
+    if not _build_frontend():
+        log('WARNING', 'server',
+            'Frontend build failed — will show build-error page on /')
+        return False
 
     # Mount static files — this catches all non-API paths for assets
     # FastAPI routes are checked before mounts, so API routes still work.

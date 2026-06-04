@@ -1,4 +1,4 @@
-from typing import List, Optional, Literal
+from typing import ClassVar, List, Optional, Literal
 from pathlib import Path
 from .base import ToolBase
 import shutil
@@ -7,6 +7,7 @@ import os
 from pydantic import Field, model_validator
 
 class FileMover(ToolBase):
+    required_categories: ClassVar[List[str]] = ["filesystem:write"]
     """Move files and directories. Supports single file, batch moves via list, and glob patterns.
     
     Examples:

@@ -5,10 +5,11 @@ This meta-tool wraps another tool's execution and adds pagination to large resul
 It's designed to work with tools that return newline-delimited or list-based output.
 """
 from .base import ToolBase
-from typing import List, Any, Literal
+from typing import ClassVar, List, Any, Literal
 from pydantic import Field
 
 class PaginateTool(ToolBase):
+    required_categories: ClassVar[List[str]] = ["filesystem:read"]
     """Wrap another tool's execution with pagination.
 
     Use this to page through large results from any file listing or search tool.
