@@ -62,6 +62,7 @@ if $PROD_MODE; then
     echo "  Server:  http://127.0.0.1:8000"
     echo "  Stop:    Ctrl+C"
     echo ""
+    export TM_NPM_CMD="$(command -v npm)"
     python -m web_ui.backend.server --serve-frontend
 else
     # ── Development mode (hot-reload via Vite) ─────────────────────────
@@ -79,6 +80,7 @@ else
         echo "[ERROR] npm not found. Install Node.js from https://nodejs.org/"
         exit 1
     fi
+    export TM_NPM_CMD="$(command -v npm)"
 
     # Start Vite dev server in background
     echo "  → Starting Vite dev server (port 5173)..."
