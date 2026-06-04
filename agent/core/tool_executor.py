@@ -4,6 +4,9 @@ Tool execution and dispatch logic.
 Extracted from agent.py to separate tool execution concerns.
 """
 import json
+import uuid
+import queue
+import threading
 from typing import List, Dict, Any, Optional, Tuple
 import tiktoken
 from pydantic import ValidationError
@@ -12,6 +15,27 @@ from fast_json_repair import loads as repair_loads
 from agent.core.turn_transaction import TurnTransaction
 from tools.respond import Respond
 from tools.summarize_tool import SummarizeTool
+
+# Try to import event system for security prompts
+try:
+    from agent.events import global_event_bus, EventType, create_event, SecurityPromptEvent
+    EVENT_SYSTEM_AVAILABLE = True
+except ImportError:
+    EVENT_SYSTEM_AVAILABLE = False
+    global_event_bus = None
+    EventType = None
+    create_event = None
+    SecurityPromptEvent = None
+
+# Try to import security module for resolve_security_prompt
+try:
+    from thoughtmachine.security import resolve_security_prompt, _pending_security_requests, _pending_requests_lock
+    SECURITY_MODULE_AVAILABLE = True
+except ImportError:
+    SECURITY_MODULE_AVAILABLE = False
+    resolve_security_prompt = None
+    _pending_security_requests = None
+    _pending_requests_lock = None
 
 
 # ---------------------------------------------------------------------------
@@ -28,22 +52,44 @@ DEFAULT_SESSION_PERMISSIONS = {
 }
 
 
-def _value_satisfies(required: str, allowed: object) -> bool:
+def _value_satisfies(required: str, allowed: object) -> bool | str:
     """
     Check whether a single required value is satisfied by the allowed setting.
 
+    Returns:
+        - ``True`` if permission is granted.
+        - ``False`` if permission is denied.
+        - ``"ASK"`` if the session value is ``'ask'`` for this category
+          and the requested access is non-trivial (user approval needed).
+
     Supports boolean and string levels:
       - Boolean required 'true' / 'false' matches the allowed bool directly.
-      - String levels: 'banned' < 'read' < 'write' < 'full'.
+      - String levels: 'banned' < 'ask' < 'read' < 'write' < 'full'.
       - Exact string match also works.
     """
     # Normalise required value
+    sentinel_ask = "ASK"
     if required.lower() in ("true", "yes"):
         required_val = True
     elif required.lower() in ("false", "no"):
         required_val = False
     else:
         required_val = required  # keep as string (e.g. "read", "write")
+
+    # --- Handle 'ask' session value ---
+    allowed_str = str(allowed).lower() if not isinstance(allowed, bool) else ""
+    if allowed_str == "ask":
+        # 'ask' means: ask the user for anything that isn't banned-equivalent
+        if isinstance(required_val, str):
+            req_lower = required_val.lower()
+            if req_lower in ("false", "no", "banned"):
+                return True  # asking for banned is always fine
+            if req_lower == "ask":
+                return True  # no-op
+            return sentinel_ask  # needs user approval
+        if isinstance(required_val, bool):
+            return True  # bool required with ask — allow (no formal hierarchy)
+        return sentinel_ask  # fallback: ask
 
     if isinstance(allowed, bool):
         if isinstance(required_val, bool):
@@ -52,26 +98,35 @@ def _value_satisfies(required: str, allowed: object) -> bool:
         return allowed is True
 
     # Both are strings – compare by hierarchy
-    _level_map = {"banned": 0, "read": 1, "write": 2, "full": 3}
+    _level_map = {"banned": 0, "ask": 1, "read": 2, "write": 3, "full": 4}
     req_level = _level_map.get(str(required_val).lower(), 0)
     all_level = _level_map.get(str(allowed).lower(), 0)
     return all_level >= req_level
 
 
 def _check_permissions(
-    required_categories: list, session_permissions: dict
+    required_categories: list, session_permissions: dict,
+    tool_name: str = "", agent_id: int = 0
 ) -> str | None:
     """
     Check whether *all* required categories are satisfied by the session profile.
 
+    If a category's value is ``'ask'`` we publish a ``SECURITY_PROMPT`` event
+    and wait for the user to approve or deny (via a queue that is populated by
+    a call to ``resolve_security_prompt()``).
+
     Args:
         required_categories: List of strings like ["container:true", "filesystem:write"].
         session_permissions: Dict of category → value (bool or str level).
+        tool_name: Name of the tool being checked (for prompt context).
+        agent_id: ID of the agent (for prompt context).
 
     Returns:
         None if all checks pass.
         Error message string if any check fails.
     """
+
+    PROMPT_TIMEOUT = 120.0  # seconds to wait for user response
 
     for req in required_categories:
         if ":" not in req:
@@ -80,7 +135,67 @@ def _check_permissions(
         allowed = session_permissions.get(category)
         if allowed is None:
             return f"Permission denied: Unknown category '{category}' required by tool"
-        if not _value_satisfies(required_value, allowed):
+
+        result = _value_satisfies(required_value, allowed)
+        if result == "ASK":
+            # --- Publish security prompt and wait for user approval ---
+            request_id = str(uuid.uuid4())
+            response_queue = queue.Queue()
+
+            # Register the queue so resolve_security_prompt can find it
+            if _pending_security_requests is not None and _pending_requests_lock is not None:
+                with _pending_requests_lock:
+                    _pending_security_requests[request_id] = response_queue
+
+            # Build the prompt description
+            prompt_description = (
+                f"Tool '{tool_name}' requires {category}:{required_value} "
+                f"(session allows {category}:ask)."
+            )
+
+            # Publish SECURITY_PROMPT event if event system is available
+            if EVENT_SYSTEM_AVAILABLE and global_event_bus is not None:
+                event = SecurityPromptEvent(
+                    data={
+                        'request_id': request_id,
+                        'agent_id': str(agent_id),
+                        'tool_name': tool_name,
+                        'capabilities': [str(required_value)],
+                        'arguments': {req: required_value},
+                        'session_id': '',
+                    }
+                )
+                global_event_bus.publish(event)
+                log('INFO', 'core.security',
+                    f'SECURITY_PROMPT published: {prompt_description} '
+                    f'(request_id={request_id})')
+
+            # Wait for response (with timeout)
+            try:
+                response = response_queue.get(timeout=PROMPT_TIMEOUT)
+                if response.get('approved'):
+                    log('INFO', 'core.security',
+                        f'User APPROVED {category}:{required_value} '
+                        f'for tool {tool_name} (request_id={request_id})')
+                    continue  # approved — skip to next category
+                else:
+                    reason = response.get('reason', 'User denied the request')
+                    log('INFO', 'core.security',
+                        f'User DENIED {category}:{required_value} '
+                        f'for tool {tool_name}: {reason}')
+                    return (
+                        f"Permission denied: {category}:{required_value} required by '"
+                        f"{tool_name}' — user denied the request."
+                    )
+            except queue.Empty:
+                log('WARNING', 'core.security',
+                    f'Security prompt timed out after {PROMPT_TIMEOUT}s '
+                    f'(request_id={request_id})')
+                return (
+                    f"Permission denied: {category}:{required_value} required by '"
+                    f"{tool_name}' — security prompt timed out."
+                )
+        elif not result:
             return (
                 f"Permission denied: Tool requires {category}:{required_value} "
                 f"but session allows {category}:{allowed}"
@@ -252,6 +367,8 @@ class ToolExecutor:
             error = _check_permissions(
                 tool_class.get_required_categories(arguments),
                 session_perms_dict,
+                tool_name=tool_name,
+                agent_id=agent_id,
             )
             if error is not None:
                 return {'result': error, 'tool_type': 'normal'}

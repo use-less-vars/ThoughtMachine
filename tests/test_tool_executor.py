@@ -101,6 +101,38 @@ class TestValueSatisfies:
         # banned required vs read allowed — read is higher, so it satisfies
         assert _value_satisfies("banned", "read") is True
 
+    # ------------------------------------------------------------------
+    # 'ask' sentinel tests
+    # ------------------------------------------------------------------
+
+    def test_ask_write_returns_ask_sentinel(self):
+        """When allowed='ask' and required is 'write', return "ASK" sentinel."""
+        assert _value_satisfies("write", "ask") == "ASK"
+
+    def test_ask_read_returns_ask_sentinel(self):
+        """When allowed='ask' and required is 'read', return "ASK" sentinel."""
+        assert _value_satisfies("read", "ask") == "ASK"
+
+    def test_ask_full_returns_ask_sentinel(self):
+        """When allowed='ask' and required is 'full', return "ASK" sentinel."""
+        assert _value_satisfies("full", "ask") == "ASK"
+
+    def test_ask_banned_returns_true(self):
+        """When allowed='ask' and required is 'banned', it's always fine."""
+        assert _value_satisfies("banned", "ask") is True
+
+    def test_ask_false_returns_true(self):
+        """When allowed='ask' and required boolean false, it's fine."""
+        assert _value_satisfies("false", "ask") is True
+
+    def test_ask_true_returns_true(self):
+        """When allowed='ask' and required boolean true, it's fine."""
+        assert _value_satisfies("true", "ask") is True
+
+    def test_ask_ask_returns_true(self):
+        """When allowed='ask' and required is also 'ask', it's a no-op."""
+        assert _value_satisfies("ask", "ask") is True
+
 
 # ---------------------------------------------------------------------------
 # _check_permissions

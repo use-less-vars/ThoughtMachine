@@ -53,6 +53,16 @@ from agent.config.service import create_agent_config_service
 from agent.controller import AgentController
 from agent.logging import log
 
+# Import event system for security prompt forwarding
+try:
+    from agent.events import global_event_bus, EventType, SecurityPromptEvent
+    EVENT_SYSTEM_AVAILABLE = True
+except ImportError:
+    global_event_bus = None
+    EventType = None
+    SecurityPromptEvent = None
+    EVENT_SYSTEM_AVAILABLE = False
+
 from session.models import Session
 from session.store import FileSystemSessionStore
 
@@ -119,6 +129,65 @@ class WebAgentBridge:
         self._session: Optional[Session] = None
         self._loaded_session: Optional[Session] = None
 
+        # Subscribe to global event bus for security prompt events
+        self._security_subscription = None
+        self._subscribe_to_security_events()
+
+
+    # ── Security event subscription ───────────────────────────────────────────
+
+    def _subscribe_to_security_events(self) -> None:
+        """
+        Subscribe to SECURITY_PROMPT events from the global event bus.
+
+        When the tool executor publishes a SecurityPromptEvent (because a
+        tool requires a permission set to ``ask``), this handler forwards
+        it to the frontend via the WebSocket event callback so the user
+        can see a dialog and approve or deny.
+        """
+        if not EVENT_SYSTEM_AVAILABLE or global_event_bus is None:
+            log('WARNING', 'server.bridge', 'Event system unavailable — security prompts not forwarded')
+            return
+
+        def _security_prompt_handler(event: SecurityPromptEvent) -> None:
+            """Forward a SecurityPromptEvent to the frontend."""
+            if self._event_callback is None:
+                log('DEBUG', 'server.bridge', 'No event callback — dropping security prompt')
+                return
+            data = event.data or {}
+            try:
+                self._event_callback({
+                    'type': 'security_prompt',
+                    'request_id': data.get('request_id', ''),
+                    'agent_id': data.get('agent_id', ''),
+                    'tool_name': data.get('tool_name', ''),
+                    'capabilities': data.get('capabilities', []),
+                    'arguments': data.get('arguments', {}),
+                    'description': (
+                        f"Tool '{data.get('tool_name', '?')}' requires: "
+                        f"{', '.join(data.get('capabilities', []))}"
+                    ),
+                })
+            except Exception as exc:
+                log('ERROR', 'server.bridge',
+                    f'Failed to forward security prompt: {exc}')
+
+        self._security_subscription = global_event_bus.subscribe(
+            EventType.SECURITY_PROMPT, _security_prompt_handler
+        )
+        log('INFO', 'server.bridge', 'Subscribed to SECURITY_PROMPT events')
+
+    def _unsubscribe_security_events(self) -> None:
+        """Unsubscribe from security events."""
+        if self._security_subscription is not None:
+            try:
+                # The subscription might be a registration handle;
+                # try to remove it if the bus provides that API.
+                if hasattr(global_event_bus, 'unsubscribe'):
+                    global_event_bus.unsubscribe(self._security_subscription)
+            except Exception:
+                pass
+            self._security_subscription = None
 
     # ── Global tab registry ──────────────────────────────────────────────────
 
@@ -352,6 +421,7 @@ class WebAgentBridge:
 
     def stop(self) -> None:
         """Request the agent to stop (finishes current operation then exits)."""
+        self._unsubscribe_security_events()
         if self._controller is not None:
             self._controller.stop()
             return

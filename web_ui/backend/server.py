@@ -51,6 +51,7 @@ Client → Server (JSON):
     { "command": "get_open_sessions" }
     { "command": "close_session",          "session_id": "..." (optional) }
     { "command": "new_session" }
+    { "command": "security_response",  "request_id": "...", "approved": true/false, "remember": false }
 
 Server → Client (JSON):
     state_changed       { "type": "state_changed",       "state": "IDLE|RUNNING|PAUSED|WAITING_FOR_USER", "is_running": bool }
@@ -71,6 +72,7 @@ Server → Client (JSON):
     provider_saved      { "type": "provider_saved",      "provider": {...} }
     provider_deleted    { "type": "provider_deleted",    "provider_id": "..." }
     tools_list          { "type": "tools_list",          "tools": [...] }
+    security_prompt     { "type": "security_prompt",     "request_id": "...", "tool_name": "...", "capabilities": [...], "description": "..." }
 """
 
 from __future__ import annotations
@@ -886,6 +888,40 @@ async def websocket_endpoint(ws: WebSocket):
                     })
                     await ws.send_json({"type": "status_message", "text": "Ready. Type a query to start."})
 
+                elif command == "security_response":
+                    """Handle user response to a security prompt."""
+                    request_id = msg.get("request_id", "")
+                    approved = msg.get("approved", False)
+                    remember = msg.get("remember", False)
+
+                    if not request_id:
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": "⚠ security_response: request_id is required",
+                        })
+                        continue
+
+                    try:
+                        from thoughtmachine.security import resolve_security_prompt
+                        resolve_security_prompt(request_id, approved, remember)
+                        log('INFO', 'server.ws',
+                            f'Security prompt resolved: request_id={request_id} '
+                            f'approved={approved} remember={remember}')
+                    except ImportError:
+                        log('ERROR', 'server.ws',
+                            'security module not available — cannot resolve prompt')
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": "⚠ Security module not loaded",
+                        })
+                    except Exception as exc:
+                        log('ERROR', 'server.ws',
+                            f'Failed to resolve security prompt: {exc}')
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": f"⚠ Failed to resolve: {exc}",
+                        })
+
                 else:
                     await ws.send_json({
                         "type": "status_message",
@@ -1112,6 +1148,7 @@ _FALLBACK_FRONTEND_CONFIG = {
         "network": False,
         "filesystem": "read",
         "security": "read",
+        "git": "read",
         "execution": "banned",
     },
     "enabled_tools": [

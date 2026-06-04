@@ -178,7 +178,9 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
       filesystem: 'write',
       network: true,
       container: true,
+      security: 'read',
       git: 'write',
+      execution: 'banned',
       system: true,
     },
 
@@ -585,9 +587,10 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
               })}
               style={inputStyle}
             >
+              <option value="full" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Full</option>
               <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
               <option value="read" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Read</option>
-              <option value="none" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>None</option>
+              <option value="banned" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Banned</option>
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
               Read/write access to the workspace filesystem.
@@ -650,12 +653,14 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
               })}
               style={inputStyle}
             >
+              <option value="full" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Full</option>
               <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
               <option value="read" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Read</option>
-              <option value="none" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>None</option>
+              <option value="banned" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Banned</option>
+              <option value="ask" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Ask</option>
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
-              Access level for Git operations.
+              Access level for Git operations. "Ask" prompts for approval on each operation.
             </small>
           </div>
 

@@ -23,6 +23,7 @@ import ChatPanel from './ChatPanel'
 import QueryBar from './QueryBar'
 import StatusBar from './StatusBar'
 import ConfigPanel from './ConfigPanel'
+import SecurityDialog from './SecurityDialog'
 
 const CONFIG_PANEL_MIN_WIDTH = 200
 const CONFIG_PANEL_MAX_WIDTH = 500
@@ -59,6 +60,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
   const [wsConnected, setWsConnected] = useState(false)
   const [defaultConfigSaveStatus, setDefaultConfigSaveStatus] = useState(null) // null | 'ok' | 'error'
   const [defaultConfigSaveMessage, setDefaultConfigSaveMessage] = useState('')
+  const [securityPrompt, setSecurityPrompt] = useState(null) // null | { request_id, tool_name, capabilities, ... }
 
   // ── Config panel resize state (persisted per tab) ──────────────────
   const [configPanelWidth, setConfigPanelWidth] = useState(() => {
@@ -361,6 +363,18 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
         onClose?.()
         break
 
+      case 'security_prompt':
+        // Show the security approval dialog (tool permission request)
+        console.log('[SessionTab] security_prompt:', msg)
+        setSecurityPrompt({
+          request_id: msg.request_id,
+          tool_name: msg.tool_name,
+          capabilities: msg.capabilities || [],
+          arguments: msg.arguments || {},
+          description: msg.description || `Tool '${msg.tool_name || 'unknown'}' requires your approval.`,
+        })
+        break
+
       default:
         console.warn('[SessionTab] Unknown event type:', msg.type)
     }
@@ -398,6 +412,13 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
           title="Drag to resize"
         />
         <div className="app-center">
+          {securityPrompt && (
+            <SecurityDialog
+              prompt={securityPrompt}
+              sendCommand={sendCommand}
+              onDismiss={() => setSecurityPrompt(null)}
+            />
+          )}
           <ChatPanel messages={state.history} />
           <QueryBar
             sendCommand={sendCommand}

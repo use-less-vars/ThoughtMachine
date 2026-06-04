@@ -74,7 +74,7 @@ class SessionPermissions(BaseModel):
     - **network**:    Boolean — may the tool access the network?
     - **filesystem**: ``'banned' | 'read' | 'write' | 'full'``
     - **security**:   ``'banned' | 'read' | 'write' | 'full'``
-    - **git**:        ``'banned' | 'read' | 'write' | 'full'``
+    - **git**:        ``'banned' | 'read' | 'write' | 'full' | 'ask'``
     - **execution**:  ``'banned' | 'read' | 'write' | 'full'``
     """
 
@@ -94,7 +94,7 @@ class SessionPermissions(BaseModel):
         default='read',
         description='Security-related operations access level.',
     )
-    git: Literal['banned', 'read', 'write', 'full'] = Field(
+    git: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
         default='read',
         description='Git operations access level for the session.',
     )
@@ -108,6 +108,21 @@ class SessionPermissions(BaseModel):
         return self.model_dump()
 
     model_config = ConfigDict()
+
+
+def resolve_security_prompt(request_id: str, approved: bool, remember: bool = False) -> None:
+    """Resolve a pending security prompt with the user's decision.
+
+    Args:
+        request_id: The request ID returned by the security prompt event.
+        approved: Whether the user approved the action.
+        remember: Whether to remember this decision for future prompts.
+    """
+    global _pending_security_requests
+    with _pending_requests_lock:
+        q = _pending_security_requests.pop(request_id, None)
+    if q is not None:
+        q.put({'approved': approved, 'remember': remember})
 
 
 def set_logger(logger: Optional[Any]) -> None:
