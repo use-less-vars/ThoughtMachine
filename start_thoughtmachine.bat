@@ -44,7 +44,7 @@ if "%PROD_MODE%"=="true" (
     echo   Server:  http://127.0.0.1:8000
     echo   Stop:    Ctrl+C
     echo(
-    python -m web_ui.backend.server --serve-frontend
+    start "" /B /WAIT python -m web_ui.backend.server --serve-frontend
 ) else (
     REM -- Development mode (hot-reload via Vite) -----------------------------
     echo   Mode:    DEVELOPMENT (hot-reload enabled)
@@ -94,7 +94,7 @@ if "%PROD_MODE%"=="true" (
     )
 
     REM Start backend (CORS already allows Vite dev server on any port)
-    python -m web_ui.backend.server
+    start "" /B /WAIT python -m web_ui.backend.server
 
     REM When backend stops, also stop Vite
     echo(
