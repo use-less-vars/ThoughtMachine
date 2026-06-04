@@ -148,6 +148,11 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
 
   // ── WebSocket lifecycle with auto-reconnect ────────────────────────────
   const reconnectTimeoutRef = useRef(null)
+  const sessionIdRef = useRef(sessionId)
+  sessionIdRef.current = sessionId
+  const onRegisterRef = useRef(onRegister)
+  onRegisterRef.current = onRegister
+
   const connectSessionWs = useCallback(() => {
     // Guard: prevent duplicate connections from StrictMode double-mount
     if (tabConnectingRef.current) {
@@ -184,15 +189,16 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
       }
 
       // Register sendCommand with parent (use ref to avoid stale closure)
-      onRegister?.({ sendCommand: sendCommandRef.current, getSessionId: () => currentSessionId })
+      onRegisterRef.current?.({ sendCommand: sendCommandRef.current, getSessionId: () => currentSessionId })
 
       // If we have a sessionId, load it immediately; otherwise create a new session
-      if (sessionId) {
+      const sid = sessionIdRef.current
+      if (sid) {
         ws.send(JSON.stringify({
           command: 'load_session',
-          session_id: sessionId
+          session_id: sid
         }))
-        console.log(`[SessionTab ${sessionId}] Sent load_session`)
+        console.log(`[SessionTab ${sid}] Sent load_session`)
       } else {
         ws.send(JSON.stringify({ command: 'new_session' }))
       }
@@ -217,7 +223,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
       // 1001 = normal close (component unmounting), don't reconnect
       if (e.code !== 1001 && !closedRef.current) {
         const delay = 1000 + Math.random() * 3000  // 1–4s jitter
-        console.log(`[SessionTab ${sessionId || '?'}] disconnected, reconnecting in ${Math.round(delay)}ms...`)
+        console.log(`[SessionTab ${sessionIdRef.current || '?'}] disconnected, reconnecting in ${Math.round(delay)}ms...`)
         reconnectTimeoutRef.current = setTimeout(connectSessionWs, delay)
       }
     }
@@ -225,15 +231,17 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
     ws.onerror = () => {
       // onclose fires right after onerror, so we let onclose handle reconnection
     }
-  }, [sessionId, onRegister])  // no sendCommand dep needed — accessed via ref
+  }, [])  // all external values via refs — no cascade on sessionId/onRegister change
   connectSessionWsRef.current = connectSessionWs
 
   // Connect only after hub is ready, with optional stagger delay
+  // NOTE: deps = [hubReady] only — connectSessionWs is read via ref to avoid
+  // reconnect cascades when sessionId/onRegister change at the parent.
   useEffect(() => {
     if (!hubReady) return
 
     const timer = setTimeout(() => {
-      connectSessionWs()
+      connectSessionWsRef.current()
     }, staggerMs)
 
     return () => {
@@ -248,7 +256,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
         // ignore — WebSocket may still be in CONNECTING state
       }
     }
-  }, [hubReady, staggerMs, connectSessionWs])
+  }, [hubReady])
 
   // ── Event router ─────────────────────────────────────────────────────────
   function handleEvent(msg) {

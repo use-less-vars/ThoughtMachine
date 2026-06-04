@@ -7,6 +7,7 @@ that stores each session as a JSON file in a configured directory.
 import json
 import os
 import re
+import shutil
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -260,7 +261,7 @@ class FileSystemSessionStore(SessionStore):
             # Ensure we don't overwrite another session's file (should not happen due to unique short ID)
             if new_path.exists():
                 logger.warning(f"[SessionStore] Target file {new_path} already exists, overwriting")
-            old_path.rename(new_path)
+            shutil.move(str(old_path), str(new_path))
         
         # Write the session data atomically via temp file
         temp_path = new_path.with_suffix('.tmp')

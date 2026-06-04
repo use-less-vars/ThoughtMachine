@@ -133,6 +133,10 @@ class WebAgentBridge:
         self._security_subscription = None
         self._subscribe_to_security_events()
 
+        # Track whether close_session() was called cleanly — used by server.py
+        # to avoid re-saving on abrupt disconnect (data loss guard).
+        self._cleanly_closed = False
+
 
     # ── Security event subscription ───────────────────────────────────────────
 
@@ -318,11 +322,10 @@ class WebAgentBridge:
 
         provider_id = merged_config.get('provider_id')
         if provider_id:
-            try:
-                manager = ProviderManager()
-                merged_config = manager.resolve_config(merged_config)
-            except Exception:
-                pass
+            # Let any ProviderManager / resolve_config errors propagate — the
+            # caller (server.py) catches them and reports to the frontend.
+            manager = ProviderManager()
+            merged_config = manager.resolve_config(merged_config)
 
         if not merged_config.get('api_key'):
             log('DEBUG', 'server.bridge', 'No API key resolved from provider profile; Agent will check env vars')
@@ -969,6 +972,7 @@ class WebAgentBridge:
             "state": "IDLE",
             "is_running": False,
         })
+        self._cleanly_closed = True
         log('INFO', 'server.bridge', f"Session closed: {sid or '(no id)'}")
 
     def clear_loaded_session(self) -> None:

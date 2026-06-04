@@ -946,11 +946,15 @@ async def websocket_endpoint(ws: WebSocket):
         # Mark closed so pending send_event calls are silently dropped
         ws._closed = True
         # Cleanup: auto-save open session + stop bridge
+        # Guard: if close_session() was called cleanly, the session was
+        # already saved — don't re-save to avoid data loss on abrupt
+        # disconnect where save_session() could overwrite clean data.
         if bridge is not None:
-            try:
-                bridge.save_open_session()
-            except Exception:
-                pass
+            if not bridge._cleanly_closed:
+                try:
+                    bridge.save_open_session()
+                except Exception:
+                    pass
             bridge.unregister()
             bridge.stop()
 

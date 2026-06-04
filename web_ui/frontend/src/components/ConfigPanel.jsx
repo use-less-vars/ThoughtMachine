@@ -25,6 +25,7 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
   }, [setLoading, setEntries, setError]);
 
   const [newFolderName, setNewFolderName] = useState('');
+  const [hoveredFolder, setHoveredFolder] = useState(null);
   const [creating, setCreating] = useState(false);
 
   const createFolder = useCallback(async () => {
@@ -72,7 +73,7 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
     minHeight: 0,
   };
 
-  const itemStyle = (isDir) => ({
+  const itemStyle = (isDir, isHovered) => ({
     padding: '0.3rem 0.5rem',
     cursor: isDir ? 'pointer' : 'default',
     borderRadius: '4px',
@@ -81,6 +82,8 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
     gap: '0.4rem',
     fontSize: '0.85rem',
     color: isDir ? '#89b4fa' : '#cdd6f4',
+    background: isHovered ? '#45475a' : 'transparent',
+    transition: 'background 0.15s',
   });
 
   if (loading) {
@@ -145,13 +148,13 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
         {entries.filter(e => e.is_dir).map((entry) => (
           <li
             key={entry.name}
-            style={itemStyle(true)}
             onClick={() => {
               const newPath = path.replace(/\\/g, '/').replace(/\/$/, '') + '/' + entry.name;
               onNavigate(newPath);
             }}
-            onMouseEnter={(e) => { e.target.style.background = '#45475a'; }}
-            onMouseLeave={(e) => { e.target.style.background = 'transparent'; }}
+            onMouseEnter={() => setHoveredFolder(entry.name)}
+            onMouseLeave={() => setHoveredFolder(null)}
+            style={itemStyle(true, hoveredFolder === entry.name)}
           >
             <span>📁</span>
             <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.name}</span>
@@ -213,7 +216,10 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
   useEffect(() => {
     if (defaultConfigSaveStatus === 'ok') {
       setDefaultSaved(true);
-      const t = setTimeout(() => setDefaultSaved(false), 2500);
+      const t = setTimeout(() => {
+        setDefaultSaved(false);
+        onClearDefaultSaveStatus?.();
+      }, 2500);
       return () => clearTimeout(t);
     } else if (defaultConfigSaveStatus === 'error') {
       setDefaultSaved('error');

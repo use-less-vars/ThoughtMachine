@@ -250,3 +250,13 @@ A new agent tool (e.g. `ShowFileToUser`) that:
 **Use case**: Users often need to toggle debug logging for specific components (bridge, agent, websocket, etc.) during troubleshooting without restarting. Also useful for development and diagnostics.
 
 **Status**: FUTURE — not started.
+
+## 2026-06-04 — **Hot-swappable system prompts** (feature idea):
+- ConfigPan...
+
+**Hot-swappable system prompts** (feature idea):
+- ConfigPanel.jsx already has a sysprompt field but it's currently a dummy/placeholder
+- Need: ability to browse files from `~/.thoughtmachine/`, load a chosen prompt file
+- Need: core function to swap the active system prompt at runtime
+- Don't implement yet, just record the idea
+- See also: DirectoryBrowser component in ConfigPanel.jsx (the file browsing pattern already exists)
