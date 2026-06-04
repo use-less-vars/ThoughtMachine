@@ -1,5 +1,5 @@
 # tools/git_info_tool.py
-from typing import ClassVar, Literal, Optional, List
+from typing import ClassVar, Literal, Optional, List, Union
 from pydantic import Field
 import subprocess
 import os
@@ -9,9 +9,9 @@ from .base import ToolBase
 
 class GitInfoTool(ToolBase):
     """
-    Read-only Git repository information tool.
-    Provides access to git status, diff, log, branch, show, remote, blame, and config.
-    All operations are read-only and cannot modify the repository.
+    Git repository tool with read-only operations (status, diff, log, branch, show,
+    remote, blame, config) and write operations (commit, init, clone).
+    Write operations are subject to the agent's ask policy.
     """
 
     @classmethod
@@ -21,8 +21,10 @@ class GitInfoTool(ToolBase):
             op = params.get("operation", "")
             if op in ("remote",):
                 return ["git:read", "network:outbound"]
-            if op in ("commit",):
+            if op in ("commit", "init"):
                 return ["git:write"]
+            if op in ("clone",):
+                return ["git:write", "network:outbound"]
             if op in ("push", "pull", "fetch", "merge", "rebase"):
                 return ["git:write", "network:outbound"]
         # All other operations (status, diff, log, branch, show, blame, config) are read-only
@@ -31,8 +33,8 @@ class GitInfoTool(ToolBase):
     tool: Literal["GitInfoTool"] = "GitInfoTool"
 
     
-    operation: Literal["status", "diff", "log", "branch", "show", "remote", "blame", "config", "commit"] = Field(
-        description="Git operation to perform: status, diff, log, branch, show, remote, blame, config, commit"
+    operation: Literal["status", "diff", "log", "branch", "show", "remote", "blame", "config", "commit", "init", "clone"] = Field(
+        description="Git operation to perform: status, diff, log, branch, show, remote, blame, config, commit, init, clone"
     )
     
     # Common parameters
@@ -50,9 +52,9 @@ class GitInfoTool(ToolBase):
         default=None,
         description="Second commit reference for diff operation (default: working tree)"
     )
-    file_path: Optional[str] = Field(
+    file_path: Optional[Union[str, List[str]]] = Field(
         default=None,
-        description="File path for diff, log, or blame operations"
+        description="File path(s) for diff, log, blame, or commit operations. Accepts a single path (string) or multiple paths (list of strings)."
     )
     
     # Log parameters
@@ -108,7 +110,17 @@ class GitInfoTool(ToolBase):
         default=None,
         description="Commit message for commit operation"
     )
-    
+
+    # Clone parameters
+    clone_url: Optional[str] = Field(
+        default=None,
+        description="Remote URL to clone from (required for clone operation)"
+    )
+    clone_target: Optional[str] = Field(
+        default=None,
+        description="Target directory for clone operation (default: derived from URL)"
+    )
+
     # Config parameters
     config_name: Optional[str] = Field(
         default=None,
@@ -131,6 +143,12 @@ class GitInfoTool(ToolBase):
             else:
                 repo_root = Path.cwd()
             
+            # Handle operations that don't require an existing repo
+            if self.operation == "init":
+                return self._git_init(repo_root)
+            elif self.operation == "clone":
+                return self._git_clone(repo_root)
+
             # Validate git repository
             git_dir = repo_root / ".git"
             if not git_dir.exists() and not git_dir.is_dir():
@@ -309,17 +327,19 @@ class GitInfoTool(ToolBase):
         return self._truncate_output(output)
 
     def _git_add(self, repo_root: Path) -> str:
-        """Run git add."""
+        """Run git add. Accepts single file path (str) or multiple (list)."""
         args = ["add"]
         if self.file_path:
-            # Validate file path is within workspace
-            try:
-                file_abs = (repo_root / self.file_path).resolve()
-                validated_abs = self._validate_path(str(file_abs))
-                file_rel = Path(validated_abs).relative_to(repo_root)
-                args.append(str(file_rel))
-            except ValueError as e:
-                return self._truncate_output(f"Error: {e}")
+            # Normalize to list for uniform handling
+            paths = self.file_path if isinstance(self.file_path, list) else [self.file_path]
+            for path in paths:
+                try:
+                    file_abs = (repo_root / path).resolve()
+                    validated_abs = self._validate_path(str(file_abs))
+                    file_rel = Path(validated_abs).relative_to(repo_root)
+                    args.append(str(file_rel))
+                except ValueError as e:
+                    return self._truncate_output(f"Error: {e}")
         else:
             args.append("-A")  # Stage all changes
         output = self._run_git(repo_root, args)
@@ -336,5 +356,31 @@ class GitInfoTool(ToolBase):
         if not self.message:
             return "Error: message is required for commit operation"
         args = ["commit", "-m", self.message]
+        output = self._run_git(repo_root, args)
+        return self._truncate_output(output)
+
+    def _git_init(self, repo_root: Path) -> str:
+        """Initialize a new git repository in the target directory."""
+        # Ensure the directory exists
+        repo_root.mkdir(parents=True, exist_ok=True)
+        args = ["init"]
+        output = self._run_git(repo_root, args)
+        return self._truncate_output(output)
+
+    def _git_clone(self, repo_root: Path) -> str:
+        """Clone a remote git repository into the workspace."""
+        if not self.clone_url:
+            return "Error: clone_url is required for clone operation"
+
+        args = ["clone", self.clone_url]
+        if self.clone_target:
+            # Validate target path is within workspace
+            try:
+                target_abs = (repo_root / self.clone_target).resolve()
+                validated_target = self._validate_path(str(target_abs))
+                args.append(validated_target)
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+
         output = self._run_git(repo_root, args)
         return self._truncate_output(output)

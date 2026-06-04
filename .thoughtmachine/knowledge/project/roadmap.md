@@ -236,3 +236,17 @@ A new agent tool (e.g. `ShowFileToUser`) that:
 - Consensus/voting mechanisms if sessions disagree
 
 **Status**: Idea only — no implementation planned yet. Requires careful security design before any prototyping.
+
+## 2026-06-04 — ## Future: Logging flags available in GUI with hot-switch to...
+
+## Future: Logging flags available in GUI with hot-switch toggling (2026-06-04)
+
+**Priority**: Medium (enhancement)
+
+**Description**: Currently logging configuration (verbosity levels, enabled loggers, etc.) is configured statically. We need to:
+1. Expose logging flags (debug levels, component-specific logging toggles, etc.) in the GUI
+2. Allow hot-switching — changes take effect immediately without restarting the server or agent
+
+**Use case**: Users often need to toggle debug logging for specific components (bridge, agent, websocket, etc.) during troubleshooting without restarting. Also useful for development and diagnostics.
+
+**Status**: FUTURE — not started.
