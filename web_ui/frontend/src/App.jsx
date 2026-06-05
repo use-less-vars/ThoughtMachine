@@ -168,7 +168,8 @@ export default function App() {
         store.setSessions(msg.sessions ?? [])
         break
       case 'session_saved':
-        wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
+        // session_saved is never sent to the hub WS (only to tab WSes).
+        // Tab WS triggers refresh via onSessionSaved callback → hubSend('list_sessions').
         break
       case 'session_deleted':
         wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
@@ -178,9 +179,13 @@ export default function App() {
         break
       case 'open_sessions':
         console.log('[Hub WS] open_sessions received:', msg.sessions)
+        // Restore previously active tab (by session ID) instead of defaulting
+        // to the last-loaded tab.  Tab IDs are ephemeral (regenerated on every
+        // page load), so we persist the session ID instead.
+        const savedSessionId = localStorage.getItem('activeSessionId')
         if (msg.sessions && msg.sessions.length > 0) {
           msg.sessions.forEach(s => {
-            loadTab(s.session_id)
+            loadTab(s.session_id, savedSessionId)
           })
         }
         // hubReady is set to true in onmessage after handleHubEvent returns
@@ -222,17 +227,24 @@ export default function App() {
   }, [])
 
   // Open a tab for an existing session (auto-load from hub WS or sidebar)
-  const loadTab = useCallback((sessionId) => {
-    // Don't create duplicate tabs for the same session.
+  // preferredSessionId — if set, only make this tab active if its sessionId matches.
+  const loadTab = useCallback((sessionId, preferredSessionId) => {
+      // Don't create duplicate tabs for the same session.
     // Use functional updater to avoid stale closure on `tabs`.
     setTabs((prev) => {
       const existing = prev.find((t) => t.sessionId === sessionId)
       if (existing) {
-        setActiveTabId(existing.tabId)
+        // Only switch to this tab if it's the preferred one (or no preference)
+        if (!preferredSessionId || existing.sessionId === preferredSessionId) {
+          setActiveTabId(existing.tabId)
+        }
         return prev
       }
       const tabId = `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-      setActiveTabId(tabId)
+      // Only switch to this tab if it's the preferred one (or no preference)
+      if (!preferredSessionId || sessionId === preferredSessionId) {
+        setActiveTabId(tabId)
+      }
       return [...prev, { tabId, sessionId }]
     })
   }, [])
@@ -367,13 +379,6 @@ export default function App() {
     setSessionPanelOpen(false)
   }, [handleDelete])
 
-  // ── Persist activeTabId in localStorage ────────────────────────────
-  useEffect(() => {
-    if (activeTabId) {
-      localStorage.setItem('activeTabId', activeTabId)
-    }
-  }, [activeTabId])
-
   // ── Derive tab names from sessions list ─────────────────────────────────
   const sessions = useStore((s) => s.sessions)
   const sessionMap = {}
@@ -389,6 +394,15 @@ export default function App() {
   const activeTab = tabs.find((t) => t.tabId === activeTabId)
   const activeSessionId = activeTab?.sessionId
   const activeSessionName = activeSessionId ? (sessionMap[activeSessionId] || 'Untitled') : 'New Session'
+
+  // ── Persist active session ID in localStorage (stable across page loads) ─
+  useEffect(() => {
+    if (activeSessionId) {
+      localStorage.setItem('activeSessionId', activeSessionId)
+    }
+    // Don't clear on unmount/mount — the old key must survive page reload
+    // so the open_sessions handler can read it before any tab is active.
+  }, [activeSessionId])
 
   // ── Render ──────────────────────────────────────────────────────────────
   return (

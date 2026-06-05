@@ -159,6 +159,7 @@ class Session:
     next_seq: int = 0
     summary: Optional[Dict[str, Any]] = field(default=None, compare=False, repr=False)
     agent_instance: Optional[Any] = field(default=None, compare=False, repr=False)
+    workspace_id: Optional[str] = field(default=None, compare=False)
     metadata: Dict[str, Any] = field(default_factory=dict)
     security_config: Dict[str, Any] = field(default_factory=get_default_security_config)
     _conversation_changed_callbacks: List[Any] = field(default_factory=list, compare=False, repr=False)
@@ -301,7 +302,7 @@ class Session:
         Convert session to a dictionary suitable for JSON serialization.
         Excludes non-persistable fields like agent_context (derived) and objects.
         """
-        data = {'session_id': self.session_id, 'created_at': self.created_at.isoformat(), 'updated_at': datetime.now().isoformat(), 'user_history': list(self.user_history), 'containers': [c.to_dict() for c in self.containers], 'preset_name': self.preset_name, 'metadata': self.metadata, 'security_config': self.security_config, 'version': self.version, 'summary': self.summary, 'total_input_tokens': self.total_input_tokens, 'total_output_tokens': self.total_output_tokens, 'context_length': self.context_length}
+        data = {'session_id': self.session_id, 'created_at': self.created_at.isoformat(), 'updated_at': datetime.now().isoformat(), 'user_history': list(self.user_history), 'containers': [c.to_dict() for c in self.containers], 'preset_name': self.preset_name, 'workspace_id': self.workspace_id, 'metadata': self.metadata, 'security_config': self.security_config, 'version': self.version, 'summary': self.summary, 'total_input_tokens': self.total_input_tokens, 'total_output_tokens': self.total_output_tokens, 'context_length': self.context_length}
         return data
 
     @classmethod
@@ -349,7 +350,7 @@ class Session:
         security_config_data = data.get('security_config', {})
         security_config = merge_security_config(security_config_data)
         version = data.get('version', 1)
-        session = cls(session_id=str(data.get('session_id', str(uuid.uuid4()))), created_at=created_at, updated_at=updated_at, runtime_params=runtime_params, user_history=user_history, containers=containers, preset_name=data.get('preset_name'), metadata=metadata, security_config=security_config, version=version, summary=data.get('summary'), total_input_tokens=data.get('total_input_tokens', 0), total_output_tokens=data.get('total_output_tokens', 0), next_seq=next_seq_value, context_length=data.get('context_length', 0))
+        session = cls(session_id=str(data.get('session_id', str(uuid.uuid4()))), created_at=created_at, updated_at=updated_at, runtime_params=runtime_params, user_history=user_history, containers=containers, preset_name=data.get('preset_name'), workspace_id=data.get('workspace_id'), metadata=metadata, security_config=security_config, version=version, summary=data.get('summary'), total_input_tokens=data.get('total_input_tokens', 0), total_output_tokens=data.get('total_output_tokens', 0), next_seq=next_seq_value, context_length=data.get('context_length', 0))
         return session
 
     def update_from_persistable_dict(self, data: Dict[str, Any]) -> None:
@@ -400,6 +401,7 @@ class Session:
         old_history.extend(user_history)
         self.containers = containers
         self.preset_name = data.get('preset_name')
+        self.workspace_id = data.get('workspace_id')
         self.metadata = metadata
         self.security_config = security_config
         self.version = version

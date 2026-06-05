@@ -979,8 +979,19 @@ class Agent:
                         log('WARNING', 'core.agent', 'Token limit exceeded – emergency retry',
                             {'attempt': self._emergency_retries})
                         continue  # jumps back to the top of the turn loop, which rebuilds messages
-                    # For any other LLMError, re-raise to be caught by the generic handler below
-                    raise
+                    # For any other LLMError, yield a detailed error event (same pattern as line 1002)
+                    error_type = e.error_type.upper()
+                    if self.logger:
+                        self.logger.log_error(error_type, str(e))
+                        self.logger.log_system_resources()
+                        self.logger.log_agent_end('provider_error', f'Provider error: {e}')
+                        self.logger.close()
+                    if self.session is not None:
+                        self._add_to_conversation(Message(role='user', content=f'[SYSTEM NOTIFICATION] Error: {error_type}: {e}', is_system_notification=True))
+                    event_dict = {'type': 'error', 'error_type': error_type, 'message': str(e), 'stop_reason': 'error', 'traceback': traceback.format_exc(), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                    self._add_conversation_data_to_event(event_dict)
+                    yield event_dict
+                    return
                 except RateLimitExceeded as e:
                     self.rate_limit_count += 1
                     self.rate_limit_active = True

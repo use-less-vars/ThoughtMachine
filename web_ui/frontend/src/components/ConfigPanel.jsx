@@ -169,6 +169,7 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
 function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, defaultConfigSaveMessage, onClearDefaultSaveStatus }) {
   const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error'
   const [showManageProviders, setShowManageProviders] = useState(false);
+  const [providerVersion, setProviderVersion] = useState(0);  // incremented when a provider is saved
   const getSafeDraft = (cfg) => ({
     temperature: cfg?.temperature ?? 0.7,
     max_turns: cfg?.max_turns ?? 10,
@@ -515,6 +516,7 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
               providers={providers}
               sendCommand={sendCommand}
               onClose={() => setShowManageProviders(false)}
+              onProviderSaved={() => setProviderVersion(v => v + 1)}
             />
           )}
         </div>
@@ -789,17 +791,18 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
           onClick={() => {
             setIsApplying(true);
             setApplyError(null);
+            setProviderVersion(0);
             sendCommand('apply_config', { config: draft });
           }}
-          disabled={!wsConnected || !isDirty || isApplying}
+          disabled={!wsConnected || isApplying}
           style={{
-            background: !wsConnected ? '#585b70' : isApplying ? '#585b70' : isDirty ? '#89b4fa' : '#45475a',
-            color: !wsConnected || (!isDirty && !isApplying) ? '#6c7086' : '#1e1e2e',
+            background: !wsConnected ? '#585b70' : isApplying ? '#585b70' : (isDirty || providerVersion > 0) ? '#89b4fa' : '#45475a',
+            color: !wsConnected || (!isDirty && !isApplying && providerVersion === 0) ? '#6c7086' : '#1e1e2e',
             border: 'none',
             borderRadius: '4px',
             padding: '0.5rem 1.5rem',
             fontWeight: 600,
-            cursor: !wsConnected || !isDirty || isApplying ? 'not-allowed' : 'pointer',
+            cursor: !wsConnected || isApplying ? 'not-allowed' : 'pointer',
             width: '100%',
             display: 'flex',
             alignItems: 'center',
@@ -815,9 +818,9 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
             ⚠ Reconnecting...
           </span>
         )}
-        {isDirty && !isApplying && wsConnected && (
+        {(isDirty || providerVersion > 0) && !isApplying && wsConnected && (
           <span style={{ color: '#f9e2af', fontSize: '0.75rem', fontStyle: 'italic' }}>
-            Unsaved changes
+            {isDirty ? 'Unsaved changes' : 'Provider credentials updated'}
           </span>
         )}
         {applyError && (

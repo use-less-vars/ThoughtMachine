@@ -50,7 +50,7 @@ const TABLE_CELL_STYLE = {
   verticalAlign: 'middle',
 };
 
-function ManageProvidersModal({ providers, sendCommand, onClose }) {
+function ManageProvidersModal({ providers, sendCommand, onClose, onProviderSaved }) {
   const [editProvider, setEditProvider] = useState(null);  // null = list view, object = editing
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
 
@@ -65,7 +65,8 @@ function ManageProvidersModal({ providers, sendCommand, onClose }) {
   const handleSave = useCallback((providerData) => {
     sendCommand('save_provider', { provider: providerData });
     setEditProvider(null);
-  }, [sendCommand]);
+    onProviderSaved?.();
+  }, [sendCommand, onProviderSaved]);
 
   const handleCancelEdit = useCallback(() => {
     setEditProvider(null);
@@ -79,8 +80,9 @@ function ManageProvidersModal({ providers, sendCommand, onClose }) {
     if (confirmDeleteId) {
       sendCommand('delete_provider', { provider_id: confirmDeleteId });
       setConfirmDeleteId(null);
+      onProviderSaved?.();
     }
-  }, [confirmDeleteId, sendCommand]);
+  }, [confirmDeleteId, sendCommand, onProviderSaved]);
 
   const handleCancelDelete = useCallback(() => {
     setConfirmDeleteId(null);

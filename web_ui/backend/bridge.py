@@ -128,6 +128,7 @@ class WebAgentBridge:
         self._session_store = FileSystemSessionStore()
         self._session: Optional[Session] = None
         self._loaded_session: Optional[Session] = None
+        self._workspace_id: Optional[str] = None
 
         # Subscribe to global event bus for security prompt events
         self._security_subscription = None
@@ -223,6 +224,11 @@ class WebAgentBridge:
     def session(self) -> Optional[Session]:
         """Get the active session, falling back to the loaded session."""
         return self._session or self._loaded_session
+
+    @property
+    def workspace_id(self) -> Optional[str]:
+        """Get the workspace ID for this bridge instance."""
+        return self._workspace_id
 
     @property
     def agent_is_running(self) -> bool:
@@ -361,6 +367,9 @@ class WebAgentBridge:
         else:
             session = Session()
             session.metadata['source'] = 'web_ui'
+        # Apply workspace_id from bridge if session doesn't already have one
+        if self._workspace_id and not session.workspace_id:
+            session.workspace_id = self._workspace_id
         self._session = session
         self._agent = Agent(config, session=session)
         self._session_id = session.session_id
@@ -432,6 +441,7 @@ class WebAgentBridge:
 
     def stop(self) -> None:
         """Request the agent to stop (finishes current operation then exits)."""
+        self.unregister()
         self._unsubscribe_security_events()
         if self._controller is not None:
             self._controller.stop()
@@ -600,6 +610,7 @@ class WebAgentBridge:
                 session = Session(
                     session_id=session_id,
                     user_history=list(self._session.user_history) if self._session else [],
+                    workspace_id=self._workspace_id,
                     metadata={
                         'agent_config': self._config.model_dump(exclude={'api_key'}, exclude_none=True) if self._config else {},
                         'source': 'web_ui',
@@ -762,6 +773,7 @@ class WebAgentBridge:
                 return False
             self._session = session
             self._history_version = session.conversation_version
+            self._workspace_id = session.workspace_id
 
             # ── Repair: restore corrupted roles ─────────────────────────────
             # Sessions previously saved via a buggy bridge version may have

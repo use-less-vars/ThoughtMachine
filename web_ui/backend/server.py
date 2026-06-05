@@ -52,6 +52,8 @@ Client → Server (JSON):
     { "command": "close_session",          "session_id": "..." (optional) }
     { "command": "new_session" }
     { "command": "security_response",  "request_id": "...", "approved": true/false, "remember": false }
+    { "command": "get_workspace_capabilities", "workspace_id": "..." }
+    { "command": "bootstrap_workspace",       "workspace_id": "..." }
 
 Server → Client (JSON):
     state_changed       { "type": "state_changed",       "state": "IDLE|RUNNING|PAUSED|WAITING_FOR_USER", "is_running": bool }
@@ -491,6 +493,7 @@ async def websocket_endpoint(ws: WebSocket):
                                 "label": p.label,
                                 "provider_type": p.provider_type,
                                 "base_url": p.base_url,
+                                "api_key": p.api_key,
                                 "default_model": p.default_model,
                                 "models": list(p.models) if p.models else [],
                                 "timeout": p.timeout,
@@ -519,6 +522,13 @@ async def websocket_endpoint(ws: WebSocket):
                             })
                         else:
                             manager = ProviderManager()
+                            # Preserve existing api_key if incoming value is empty
+                            # (prevents accidental overwrite when frontend field is blank)
+                            if not provider_data.get('api_key'):
+                                existing = manager.get_profile(provider_data['id'])
+                                if existing and existing.api_key:
+                                    provider_data = dict(provider_data)
+                                    provider_data['api_key'] = existing.api_key
                             profile = ProviderProfile(**provider_data)
                             manager.add_profile(profile)
                             if manager.save():
@@ -532,6 +542,7 @@ async def websocket_endpoint(ws: WebSocket):
                                         "label": p.label,
                                         "provider_type": p.provider_type,
                                         "base_url": p.base_url,
+                                        "api_key": p.api_key,
                                         "default_model": p.default_model,
                                         "models": list(p.models) if p.models else [],
                                         "timeout": p.timeout,
@@ -581,6 +592,7 @@ async def websocket_endpoint(ws: WebSocket):
                                         "label": p.label,
                                         "provider_type": p.provider_type,
                                         "base_url": p.base_url,
+                                        "api_key": p.api_key,
                                         "default_model": p.default_model,
                                         "models": list(p.models) if p.models else [],
                                         "timeout": p.timeout,
@@ -749,6 +761,11 @@ async def websocket_endpoint(ws: WebSocket):
                         # state (_session, _loaded_session) stays in sync with
                         # the renamed session on disk. Fall back to direct store
                         # access when no bridge is active.
+                        # Broadcast the new name to ALL open bridges BEFORE responding,
+                        # so no auto-save on another tab can race us and persist the old name.
+                        from web_ui.backend.bridge import _broadcast_rename
+                        _broadcast_rename(session_id, new_name)
+
                         if bridge is not None and bridge.rename_session(session_id, new_name):
                             await ws.send_json({
                                 "type": "session_renamed",
@@ -770,11 +787,6 @@ async def websocket_endpoint(ws: WebSocket):
                                 "new_name": new_name,
                             })
                             log("INFO", "server.config", f"Renamed session {session_id} → {new_name}")
-                        # Broadcast the new name to ALL open tabs that have this session loaded.
-                        # This ensures every bridge's in-memory state stays in sync with disk,
-                        # preventing save_session() from reverting the name on the next auto-save.
-                        from web_ui.backend.bridge import _broadcast_rename
-                        _broadcast_rename(session_id, new_name)
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
@@ -848,10 +860,17 @@ async def websocket_endpoint(ws: WebSocket):
                     bridge.register()
                     bridge.set_controller(controller)
 
+                    # Extract optional workspace_id from the request
+                    workspace_id = msg.get("workspace_id") or None
+                    if workspace_id:
+                        bridge._workspace_id = workspace_id
+
                     # Create a new empty session
                     from session.models import Session
                     new_session = Session()
                     new_session.metadata['source'] = 'web_ui'
+                    if workspace_id:
+                        new_session.workspace_id = workspace_id
                     new_session.ensure_name()
 
                     # Store as the loaded session so continue_session picks it up
@@ -920,6 +939,56 @@ async def websocket_endpoint(ws: WebSocket):
                         await ws.send_json({
                             "type": "status_message",
                             "text": f"⚠ Failed to resolve: {exc}",
+                        })
+
+                elif command == "get_workspace_capabilities":
+                    workspace_id = msg.get("workspace_id", "")
+                    if not workspace_id:
+                        await ws.send_json({"type": "status_message", "text": "⚠ workspace_id is required."})
+                        continue
+                    try:
+                        from thoughtmachine.workspace_capabilities import (
+                            load_workspace_capabilities,
+                        )
+                        caps = load_workspace_capabilities(workspace_id)
+                        if caps is None:
+                            # Return unrestricted defaults when no capabilities file exists
+                            from thoughtmachine.workspace_capabilities import (
+                                WorkspaceCapabilities,
+                            )
+                            caps = WorkspaceCapabilities.default()
+                        await ws.send_json({
+                            "type": "workspace_capabilities",
+                            "workspace_id": workspace_id,
+                            "capabilities": caps.to_dict(),
+                        })
+                    except Exception as exc:
+                        log("ERROR", "server.ws", f"get_workspace_capabilities failed: {exc}")
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": f"⚠ Failed to load capabilities: {exc}",
+                        })
+
+                elif command == "bootstrap_workspace":
+                    workspace_id = msg.get("workspace_id", "")
+                    if not workspace_id:
+                        await ws.send_json({"type": "status_message", "text": "⚠ workspace_id is required."})
+                        continue
+                    try:
+                        from thoughtmachine.workspace_capabilities import (
+                            ensure_workspace_dirs,
+                        )
+                        created = ensure_workspace_dirs(workspace_id)
+                        await ws.send_json({
+                            "type": "workspace_bootstrapped",
+                            "workspace_id": workspace_id,
+                            "paths_created": created,
+                        })
+                    except Exception as exc:
+                        log("ERROR", "server.ws", f"bootstrap_workspace failed: {exc}")
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": f"⚠ Failed to bootstrap workspace: {exc}",
                         })
 
                 else:

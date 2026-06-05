@@ -260,3 +260,77 @@ A new agent tool (e.g. `ShowFileToUser`) that:
 - Need: core function to swap the active system prompt at runtime
 - Don't implement yet, just record the idea
 - See also: DirectoryBrowser component in ConfigPanel.jsx (the file browsing pattern already exists)
+
+## 2026-06-04 — ## 2026-06-05 — Ask-prompts need more expressiveness
+
+The pe...
+
+## 2026-06-05 — Ask-prompts need more expressiveness
+
+The permission/security ask-prompts (shown when a tool requires user approval) are currently too terse. Users need clearer explanations of what the tool will do, what data it accesses, and what the implications are.
+
+**Planned action:** Revamp the security prompt UI (SecurityDialog.jsx) and the underlying prompt construction to be more descriptive and user-friendly.
+
+**Status:** TODO — planned for near-term work.
+
+
+## 2026-06-05 — ## 2026-06-05 — **ThoughtHub — The ThoughtMachine Network** ...
+
+## 2026-06-05 — **ThoughtHub — The ThoughtMachine Network** (Major New Direction — design phase)
+
+### Vision
+A web server ("ThoughtHub") that allows multiple ThoughtMachine instances to communicate securely. Users host their own hubs (personal, team, or public). Each TM instance gets an **identifier** and can exchange messages with other TMs via a hub.
+
+### Core Architecture
+- **ThoughtHub server**: A lightweight, secure message relay with authentication, rate-limiting, trust scoring, and message queuing (like a TM-focused mail server).
+- **TM Tool: `send_tm_message`**: A new agent tool that lets TM send/receive messages to/from hubs.
+- **TM Tool: `receive_tm_messages`**: Poll a hub for incoming messages, TM processes them (spam/malicious filter, triage, respond).
+- **Message envelopes**: Every message is signed (ed25519?) with the sender's TM identity.
+
+### Trust & Reputation System (Key Innovation)
+- Each TM starts with **low trust**: limited messages per day, messages are queued for review.
+- **Good behaviour is rewarded**: Legit bug reports, useful contributions → trust score rises → higher message limits, direct commit access, etc.
+- The "hub owner's TM" reviews incoming mail triaged by priority and trust level — spam/low-trust goes to sandbox, known reporters get through.
+- Identities gain reputation that can be shared across hubs (like a web of trust).
+
+### Security Principles
+- All communication over TLS.
+- Message signing + optional encryption (content hidden from hub, only visible to recipient TM).
+- Hubs run in restricted environments — configurable policies per sender identity.
+- Sandboxed message processing: TM never executes code from messages without explicit user review.
+- Rate limiting per identity, per hub.
+- DDoS protection at hub level.
+- The hub itself has minimal attack surface — it's a relay, not an execution engine.
+
+### Use Cases (in order of ambition)
+
+1. **Bug Report Mailbox**: Friends run TM → send bug report to hub → your TM reviews, triages, possibly auto-fixes, replies with a download link or patch. Trust grows over time.
+
+2. **Team Project Hub**: Team members host a shared hub. Policy: "all machines here are friends." Shared git access, cross-TM task assignment, collaborative debugging.
+
+3. **Open Source Contribution Gateway**: Strangers can file issues/suggestions via TM→hub→your TM. Low trust initially, but good contributions unlock faster response, direct PR ability, etc.
+
+4. **The ThoughtMachine Network**: Multiple hubs federated. TMs can discover each other, share tools, share prompts, share lessons learned across a decentralized network.
+
+### Implementation Phases (Suggested)
+
+| Phase | What | Scope |
+|---|---|---|
+| **P0** | Prototype hub: basic relay, one identity, no trust system | ~1 week |
+| **P1** | Identity system + message signing | +1 week |
+| **P2** | Trust scoring + rate limiting | +1 week |
+| **P3** | `send_tm_message` + `receive_tm_messages` tools | +1 week |
+| **P4** | Hub federation (TMs discover each other across hubs) | +2 weeks |
+| **P5** | Web UI for hub management | +1 week |
+
+### Open Questions (for later design)
+- Should the hub store messages at all, or just route? (Store-and-forward seems right for async.)
+- How do we handle identity revocation? (Lost key = lost identity? Key rotation?)
+- Should the hub be a new standalone binary or a plugin to the existing TM server?
+- How to handle "merge requests" — can a remote TM propose code changes via hub?
+- What's the trust bootstrap for a new identity? (Proof-of-work? Reputation delegation from a known identity?)
+
+### Status
+🟡 DESIGN — Rough vision written down. Not started.
+
+
