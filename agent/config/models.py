@@ -187,17 +187,16 @@ class AgentConfig(BaseModel):
         if profile is None:
             return self.model_copy(deep=True)
 
-        updates = {}
-        if not self.base_url or self.base_url == 'https://api.deepseek.com':
-            updates['base_url'] = profile.base_url
-        if not self.api_key:
-            updates['api_key'] = profile.api_key
-        if self.provider_type == 'openai_compatible' or not self.provider_type:
-            updates['provider_type'] = profile.provider_type
-        if self.model_override:
-            updates['model'] = self.model_override
-        elif not self.model or self.model == 'deepseek-reasoner':
-            updates['model'] = profile.default_model
+        # When provider_id is explicitly set, the profile is the
+        # authoritative source for provider-specific fields.  Always
+        # overwrite — see resolve_config() in provider_profile.py for the
+        # same fix (the runtime code path).
+        updates = {
+            'base_url':       profile.base_url,
+            'api_key':        profile.api_key,
+            'provider_type':  profile.provider_type,
+            'model':          self.model_override or profile.default_model,
+        }
 
         return self.model_copy(update=updates)
 

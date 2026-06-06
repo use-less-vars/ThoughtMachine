@@ -125,9 +125,17 @@ class ProviderManager:
         """Resolve provider fields from the active profile into a config dict.
 
         If *config_dict* contains a ``provider_id``, the matching profile is
-        loaded and its ``provider_type``, ``base_url``, ``api_key``, and
-        ``model`` (respecting ``model_override``) are filled into the returned
-        dict.  Values already present in *config_dict* take precedence.
+        the authoritative source for ``provider_type``, ``base_url``, and
+        ``api_key`` — they always overwrite whatever is in *config_dict*.
+        For ``model``, ``model_override`` (if set) takes precedence over the
+        profile's ``default_model``.
+
+        .. note::
+
+            Before 2025-07 the code used ``setdefault``, which left stale
+            values from a previous provider in place, breaking provider
+            switching.  See the fix in
+            :meth:`ProviderManager.resolve_config`.
         """
         profile_id = config_dict.get('provider_id')
 
@@ -140,16 +148,19 @@ class ProviderManager:
 
         result = dict(config_dict)
 
-        # Only fill fields that aren't already explicitly set
-        result.setdefault('provider_type', profile.provider_type)
-        result.setdefault('base_url', profile.base_url)
-        result.setdefault('api_key', profile.api_key)
+        # When provider_id is explicitly set, the profile is the
+        # authoritative source for provider-specific fields.  Always
+        # overwrite — otherwise switching providers leaves stale values
+        # (e.g. base_url from a previous provider) in place.
+        result['provider_type'] = profile.provider_type
+        result['base_url']       = profile.base_url
+        result['api_key']        = profile.api_key
 
         # model: use model_override if set, else profile.default_model
-        if 'model_override' in config_dict and config_dict['model_override']:
-            result['model'] = config_dict['model_override']
-        elif not result.get('model') or result['model'] in profile.models:
-            # Only override model if current value is not a custom model
-            result.setdefault('model', profile.default_model)
+        model_override = config_dict.get('model_override')
+        if model_override:
+            result['model'] = model_override
+        else:
+            result['model'] = profile.default_model
 
         return result
