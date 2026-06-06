@@ -247,6 +247,8 @@ export default function App() {
         // Only switch to this tab if it's the preferred one (or no preference)
         if (!preferredSessionId || existing.sessionId === preferredSessionId) {
           setActiveTabId(existing.tabId)
+          // Mark for deferred load — this tab may not have been loaded yet
+          tabLoadTriggeredRef.current[existing.tabId] = true
         }
         return prev
       }
@@ -254,6 +256,10 @@ export default function App() {
       // Only switch to this tab if it's the preferred one (or no preference)
       if (!preferredSessionId || sessionId === preferredSessionId) {
         setActiveTabId(tabId)
+        // Mark this tab so handleRegisterTab will trigger deferred load
+        // once the SessionTab WS connects. Without this, new tabs created
+        // via "+" would get stuck in deferred mode (empty placeholder).
+        tabLoadTriggeredRef.current[tabId] = true
       }
       return [...prev, { tabId, sessionId }]
     })
@@ -473,7 +479,7 @@ export default function App() {
                   tabId={tab.tabId}
                   hubReady={hubReady}
                   staggerMs={index * 200}
-                  loadOnConnect={tab.sessionId === startupActiveSessionId}
+                  loadOnConnect={tab.sessionId === startupActiveSessionId || tab.tabId === activeTabId}
                   onClose={() => removeTab(tab.tabId)}
                   onNewSession={handleNewSessionCreated}
                   onSessionSaved={handleSessionSaved}

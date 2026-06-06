@@ -63,6 +63,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const [securityPrompt, setSecurityPrompt] = useState(null) // null | { request_id, tool_name, capabilities, ... }
   const [isDeferred, setIsDeferred] = useState(false) // true = load skipped; waiting for activation
   const loadSentRef = useRef(false) // true once load_session has been sent (by any path)
+  const dataReceivedRef = useRef(false) // true once we've received a response to our load
 
   // ── Config panel resize state (persisted per tab) ──────────────────
   const [configPanelWidth, setConfigPanelWidth] = useState(() => {
@@ -109,13 +110,15 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     document.addEventListener('mouseup', handleMouseUp)
   }, [configPanelWidth])
 
-  // ── Clear deferred state when data arrives from a triggered load ──────
+  // ── Clear deferred state when a response arrives from a triggered load ──
+  // Exits deferred on ANY conversation_changed or session_loaded response,
+  // even if the session is empty (history.length === 0).
   useEffect(() => {
-    if (isDeferred && state.history.length > 0) {
+    if (isDeferred && dataReceivedRef.current) {
       setIsDeferred(false)
       loadSentRef.current = true
     }
-  }, [state.history, isDeferred])
+  }, [isDeferred, state.history])
 
   // ── Derived helpers ─────────────────────────────────────────────────────
   const update = useCallback((patch) => {
@@ -312,6 +315,9 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
 
       case 'conversation_changed':
         console.log('conversation_changed RAW:', msg)
+        // Mark that we've received a response (even if empty) so deferred
+        // tabs can exit their placeholder state.
+        dataReceivedRef.current = true;
         // Trust the server's is_system_notification flag — no index-based
         // fallback that could leak the flag to wrong messages (Bug 2 & 3).
         const serverMessages = msg.messages ?? [];
@@ -341,6 +347,9 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         break
 
       case 'session_loaded':
+        // Mark that we've received a response (data may arrive before or
+        // instead of conversation_changed).
+        dataReceivedRef.current = true;
         // Track the session ID so subsequent continue_session calls use it
         if (msg.session_id) {
           setCurrentSessionId(msg.session_id)
