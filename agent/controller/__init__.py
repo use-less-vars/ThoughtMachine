@@ -9,6 +9,7 @@ from agent import Agent
 from typing import Optional, Callable, List, Dict, Any
 from agent.logging import log
 from agent.core.state import ExecutionState
+from thoughtmachine.security import cancel_pending_prompts
 
 class AgentController:
     """
@@ -301,6 +302,7 @@ class AgentController:
         Sets _keep_alive = False, signals the thread to stop via '[STOP]' sentinel,
         and waits up to 5 seconds for graceful exit.
         """
+        cancel_pending_prompts()
         log('DEBUG', 'core.controller', 'shutdown() called')
         self._keep_alive = False
         self.query_queue.put('[STOP]')
@@ -466,6 +468,7 @@ class AgentController:
 
     def pause(self):
         """Pause the agent before the next turn (finishes current turn first)."""
+        cancel_pending_prompts()
         log('DEBUG', 'core.pause', f'PAUSE REQUESTED by user')
         log('DEBUG', 'core.controller', f'pause() called, clearing pause_event, setting _pause_requested=True')
         self.pause_event.clear()

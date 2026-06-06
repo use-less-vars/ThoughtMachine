@@ -590,3 +590,107 @@ class TestSessionConfigDoesNotBridgeToToolExecution:
         # to_dict is unaffected
         d = session.to_dict()
         assert d["security_config"]["session_policy"]["default_policy"] == "deny"
+
+
+# =========================================================================
+# Test 6: Interruptible prompt queue — cancel_pending_prompts
+# =========================================================================
+
+import threading
+import queue
+
+from thoughtmachine.security import (
+    cancel_pending_prompts,
+    _prompt_cancelled,
+    _pending_security_requests,
+    _pending_requests_lock,
+)
+
+
+class TestCancelPendingPrompts:
+    """Validate cancel_pending_prompts() cancels in-flight prompts."""
+
+    def test_cancel_sets_event(self):
+        """cancel_pending_prompts sets the _prompt_cancelled event."""
+        _prompt_cancelled.clear()
+        assert not _prompt_cancelled.is_set()
+        cancel_pending_prompts()
+        assert _prompt_cancelled.is_set()
+        # Cleanup for other tests
+        _prompt_cancelled.clear()
+
+    def test_cancel_clears_pending_requests(self):
+        """cancel_pending_prompts drains and clears all pending queues."""
+        q1 = queue.Queue()
+        q2 = queue.Queue()
+        q1.put((True, False))  # Simulate a response that was never consumed
+
+        with _pending_requests_lock:
+            _pending_security_requests["req-1"] = q1
+            _pending_security_requests["req-2"] = q2
+
+        cancel_pending_prompts()
+
+        with _pending_requests_lock:
+            assert len(_pending_security_requests) == 0
+
+        _prompt_cancelled.clear()
+
+    def test_cancel_twice_is_idempotent(self):
+        """Calling cancel_pending_prompts twice is safe."""
+        _prompt_cancelled.clear()
+        cancel_pending_prompts()
+        cancel_pending_prompts()  # second call should not raise
+        assert _prompt_cancelled.is_set()
+        _prompt_cancelled.clear()
+
+    def test_thread_exits_with_denial_on_cancel(self):
+        """A thread blocked in _request_security_prompt exits with denial
+        when cancel_pending_prompts is called from another thread."""
+        import time
+        from thoughtmachine.security import _request_security_prompt
+
+        _prompt_cancelled.clear()
+        result = {"approved": None}
+
+        def waiter():
+            # We pass a config that triggers an "ask" policy
+            config = {
+                "session_policy": {
+                    "tool_overrides": {"TestTool": "ask"},
+                    "default_policy": "allow",
+                    "capability_requirements": {},
+                }
+            }
+            try:
+                approved = _request_security_prompt(
+                    agent_id="test-agent",
+                    tool_name="TestTool",
+                    required_capabilities=[],
+                    arguments={},
+                    security_config=config,
+                    policy_type="tool_override",
+                    policy_target="TestTool",
+                )
+                result["approved"] = approved
+            except Exception as e:
+                result["exception"] = e
+
+        t = threading.Thread(target=waiter, daemon=True)
+        t.start()
+
+        # Give the thread time to reach the blocking get
+        time.sleep(0.2)
+
+        # Cancel from main thread
+        cancel_pending_prompts()
+
+        t.join(timeout=5.0)
+        assert not t.is_alive(), "Waiter thread did not exit"
+        assert result["approved"] is False, (
+            f"Expected denial (False) on cancel, got {result}"
+        )
+
+        _prompt_cancelled.clear()
+        with _pending_requests_lock:
+            _pending_security_requests.clear()

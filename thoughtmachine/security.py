@@ -44,6 +44,7 @@ _logger: Optional[Any] = None
 # Security prompt management
 _pending_security_requests: Dict[str, queue.Queue] = {}
 _pending_requests_lock = threading.Lock()
+_prompt_cancelled = threading.Event()
 
 # Security exceptions
 class SecurityError(Exception):
@@ -516,6 +517,9 @@ def _request_security_prompt(
         )
         return True
     
+    # Reset cancellation flag for this new prompt
+    _prompt_cancelled.clear()
+
     # Ensure response handler is registered
     _ensure_security_response_handler()
     
@@ -560,9 +564,28 @@ def _request_security_prompt(
         )
         return True
     
-    # Wait for response (blocking)
+    # Wait for response (blocking, but interruptible via _prompt_cancelled)
     try:
-        approved, remember = response_queue.get(timeout=300)  # 5 minute timeout
+        approved, remember = None, None
+        while not _prompt_cancelled.is_set():
+            try:
+                approved, remember = response_queue.get(timeout=1.0)
+                break
+            except queue.Empty:
+                continue
+        if _prompt_cancelled.is_set():
+            # Cancellation requested — treat as deny
+            with _pending_requests_lock:
+                _pending_security_requests.pop(request_id, None)
+            _log_capability_check(
+                agent_id=agent_id,
+                tool_name=tool_name,
+                required_capabilities=required_capabilities,
+                granted=False,
+                reason=f"{policy_type}_ask_cancelled",
+                data=arguments
+            )
+            return False
     except queue.Empty:
         # Timeout - fallback to deny for safety
         with _pending_requests_lock:
@@ -965,3 +988,24 @@ def sanitize_path_for_log(path: str, workspace_path: str) -> str:
     """
     # Optionally, replace home directory with ~ or remove username prefixes
     return path
+
+
+def cancel_pending_prompts() -> None:
+    """
+    Cancel all pending security prompts immediately.
+
+    Sets the cancellation event (``_prompt_cancelled``) so any thread currently
+    waiting in :func:`_request_security_prompt` will bail out (denying the pending
+    request). Also drains and removes all entries from the pending-requests
+    dictionary so that no stale queues are left behind.
+    """
+    _prompt_cancelled.set()
+
+    with _pending_requests_lock:
+        for request_id, q in _pending_security_requests.items():
+            try:
+                while True:
+                    q.get_nowait()
+            except queue.Empty:
+                pass
+        _pending_security_requests.clear()
