@@ -334,3 +334,17 @@ A web server ("ThoughtHub") that allows multiple ThoughtMachine instances to com
 🟡 DESIGN — Rough vision written down. Not started.
 
 
+
+## 2026-06-05 — ## 2026-06-06 — Workspace Panel (Feature Idea)
+
+A slide-in p...
+
+## 2026-06-06 — Workspace Panel (Feature Idea)
+
+A slide-in panel (similar to VS Code's sidebar) that gives the user full visibility into the workspace they're operating in:
+
+- **Workers** — list of worker processes running in the workspace, their status, lifecycle controls
+- **Container privileges** — a dashboard showing what permissions/access the current container has (filesystem, network, docker socket, etc.)
+- **Knowledge Base browser** — a browsable view of the knowledge base, laid out like a "book" with sections, chapters, and search — letting the user flip through architecture docs, bug logs, lessons learned, etc. in a readable, non-linear way
+- **Session context** — current session metadata, token usage, attached files, active config
+- **Environment info** — OS, runtime versions, environment variables

@@ -2059,3 +2059,31 @@ Priority order (P0 = highest):
 5. **Multi-agent** (Spec 4) — depends on container.
 
 Key principle: "The machine must never exceed what you see on the Permissions tab."
+
+## 2026-06-06 — ## Security Architecture Verification (2025-06-05)
+
+Verified...
+
+## Security Architecture Verification (2025-06-05)
+## Security Architecture Verification (2025-06-05) — CORRECTED
+
+**IMPORTANT**: Earlier verification (2025-06-05) claimed discrepancies that were FALSE NEGATIVES from FileSearchTool missing results across large directory trees. Corrected findings below:
+
+All engineer's claims are VERIFIED CORRECT:
+
+1. ✅ **`get_required_categories()` EXISTS** on ToolBase (tools/base.py:46) returning `cls.required_categories` default, and is OVERRIDDEN on:
+   - FileEditor (tools/file_editor.py:15) — returns `filesystem:read`/`filesystem:write` based on operation
+   - GitInfoTool (tools/git_info_tool.py:18) — returns dynamic permissions based on git operation
+   - KnowledgeBase (tools/knowledge_base.py:155) — returns `filesystem:write` for write modes
+   - MCPManager (tools/mcp_manager.py:226) — dynamic permissions for HTTP/SSE MCP clients
+   - MCPValidator (tools/mcp_validator.py:24) — returns `network:outbound` for HTTP/SSE connections
+   - ProgressReport (tools/progress_report.py:17) — always returns `filesystem:write`
+   - Respond (tools/respond.py:38) — returns `filesystem:write` only when report_body provided
+
+2. ✅ **`_translate_frontend_config()` EXISTS** in web_ui/backend/server.py:1113, with tests in web_ui/backend/tests/test_config_pipeline.py. Also `_backend_to_frontend_config()` at line 1280.
+
+3. ✅ **SecurityPromptEvent IS published** from tool_executor.py:161-173 — a `SecurityPromptEvent` is created and published when tool requires user permission.
+
+4. ✅ **`required_categories: ClassVar[List[str]]` IS defined** on ToolBase (line 39) and used across 15+ tool classes.
+
+**Key Lesson**: FileSearchTool can produce false negatives when searching broad directory trees. Always narrow searches to specific subdirectories to verify negative findings.

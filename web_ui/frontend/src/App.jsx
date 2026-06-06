@@ -25,7 +25,7 @@
  * App manages a tabs array: [ { tabId, sessionId }, ... ]
  */
 
-import React, { useEffect, useRef, useCallback, useState } from 'react'
+import React, { useEffect, useRef, useCallback, useState, useMemo } from 'react'
 import useStore from './store/useStore'
 import SessionTab from './components/SessionTab'
 import SessionList from './components/SessionList'
@@ -48,7 +48,17 @@ export default function App() {
   const [hubReady, setHubReady] = useState(false)
   const [sessionPanelOpen, setSessionPanelOpen] = useState(false)
 
-  const tabActionsRef = useRef({})   // tabId -> { sendCommand, getSessionId }
+  const tabActionsRef = useRef({})
+  const tabLoadTriggeredRef = useRef({})   // track which deferred tabs have had load triggered
+  const deferredLoadSentRef = useRef({})   // track whether load_session was actually sent via sendCommand
+  const tabsRef = useRef(tabs)
+  tabsRef.current = tabs
+
+  // Snapshot which session ID was active at startup (from localStorage),
+  // so we know which tabs should load on WS connect vs defer.
+  const startupActiveSessionId = useMemo(() => {
+    return localStorage.getItem('activeSessionId')
+  }, [])   // tabId -> { sendCommand, getSessionId }
 
   // ── Hub WebSocket (sessions list only) with auto-reconnect ────────────
   const reconnectTimeoutRef = useRef(null)
@@ -333,9 +343,36 @@ export default function App() {
     }
   }, [])
 
+  // ── Tab selection handler with deferred-load trigger ─────────────────
+  const handleSelectTab = useCallback((tabId) => {
+    setActiveTabId(tabId)
+    // If this tab was deferred (didn't load on WS connect), trigger its load now
+    if (!tabLoadTriggeredRef.current[tabId]) {
+      tabLoadTriggeredRef.current[tabId] = true
+      const tab = tabsRef.current.find((t) => t.tabId === tabId)
+      if (tab?.sessionId) {
+        const actions = tabActionsRef.current[tabId]
+        if (actions?.sendCommand) {
+          actions.sendCommand('load_session', { session_id: tab.sessionId })
+          deferredLoadSentRef.current[tabId] = true
+          console.log(`[App] Triggered deferred load for tab ${tabId}, session ${tab.sessionId}`)
+        }
+      }
+    }
+  }, [])
+
   // ── Tab action registry (for save from SessionList) ───────────────────
   const handleRegisterTab = useCallback((tabId, actions) => {
     tabActionsRef.current[tabId] = actions
+    // If this tab was selected before its actions were registered, trigger deferred load now
+    if (tabLoadTriggeredRef.current[tabId] && !deferredLoadSentRef.current[tabId]) {
+      const tab = tabsRef.current.find((t) => t.tabId === tabId)
+      if (tab?.sessionId) {
+        actions.sendCommand('load_session', { session_id: tab.sessionId })
+        deferredLoadSentRef.current[tabId] = true
+        console.log(`[App] Triggered deferred load for tab ${tabId} (via delayed registration)`)
+      }
+    }
   }, [])
 
   // ── Reliable rename via per-tab WS (Task 2) ──────────────────────────
@@ -410,7 +447,7 @@ export default function App() {
       <TabBar
         tabs={tabItems}
         activeTabId={activeTabId}
-        onSelectTab={setActiveTabId}
+        onSelectTab={handleSelectTab}
         onCloseTab={initiateCloseTab}
         onNewTab={handleNewTab}
         runningStates={tabRunningStates}
@@ -436,6 +473,7 @@ export default function App() {
                   tabId={tab.tabId}
                   hubReady={hubReady}
                   staggerMs={index * 200}
+                  loadOnConnect={tab.sessionId === startupActiveSessionId}
                   onClose={() => removeTab(tab.tabId)}
                   onNewSession={handleNewSessionCreated}
                   onSessionSaved={handleSessionSaved}

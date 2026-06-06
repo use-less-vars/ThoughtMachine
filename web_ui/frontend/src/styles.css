@@ -957,6 +957,7 @@ body {
   overflow: hidden;
 }
 
+/* Lazy-load placeholder for inactive/deferred tabs */
 .empty-state {
   display: flex;
   align-items: center;
@@ -970,6 +971,36 @@ body {
   max-width: 300px;
   text-align: center;
   line-height: 1.6;
+}
+
+/* ── Deferred tab placeholder (lazy-loading) ──────────────── */
+.session-tab-deferred {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.deferred-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  color: var(--text-secondary);
+  font-style: italic;
+  font-size: 0.95rem;
+  opacity: 0.7;
+}
+
+.deferred-placeholder-message {
+  padding: 2rem;
+  border: 1px dashed var(--border-color, #555);
+  border-radius: 8px;
+  background: var(--bg-secondary, #2a2a2a);
+}
+
+.deferred-placeholder-message:hover {
+  opacity: 1;
+  border-color: var(--accent-color, #888);
 }
 
 

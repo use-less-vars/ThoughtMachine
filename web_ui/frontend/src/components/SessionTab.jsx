@@ -47,7 +47,7 @@ const INITIAL_STATE = {
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
-function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewSession, onSessionSaved, onRegister, onRunningChange, onSessionRenamed }) {
+function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, onClose, onNewSession, onSessionSaved, onRegister, onRunningChange, onSessionRenamed }) {
   const [state, setState] = useState(INITIAL_STATE)
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
   const [providers, setProviders] = useState([])
@@ -61,6 +61,8 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
   const [defaultConfigSaveStatus, setDefaultConfigSaveStatus] = useState(null) // null | 'ok' | 'error'
   const [defaultConfigSaveMessage, setDefaultConfigSaveMessage] = useState('')
   const [securityPrompt, setSecurityPrompt] = useState(null) // null | { request_id, tool_name, capabilities, ... }
+  const [isDeferred, setIsDeferred] = useState(false) // true = load skipped; waiting for activation
+  const loadSentRef = useRef(false) // true once load_session has been sent (by any path)
 
   // ── Config panel resize state (persisted per tab) ──────────────────
   const [configPanelWidth, setConfigPanelWidth] = useState(() => {
@@ -107,6 +109,14 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
     document.addEventListener('mouseup', handleMouseUp)
   }, [configPanelWidth])
 
+  // ── Clear deferred state when data arrives from a triggered load ──────
+  useEffect(() => {
+    if (isDeferred && state.history.length > 0) {
+      setIsDeferred(false)
+      loadSentRef.current = true
+    }
+  }, [state.history, isDeferred])
+
   // ── Derived helpers ─────────────────────────────────────────────────────
   const update = useCallback((patch) => {
     setState((prev) => ({ ...prev, ...patch }))
@@ -152,6 +162,8 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
   sessionIdRef.current = sessionId
   const onRegisterRef = useRef(onRegister)
   onRegisterRef.current = onRegister
+  const loadOnConnectRef = useRef(loadOnConnect)
+  loadOnConnectRef.current = loadOnConnect
 
   const connectSessionWs = useCallback(() => {
     // Guard: prevent duplicate connections from StrictMode double-mount
@@ -191,14 +203,25 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
       // Register sendCommand with parent (use ref to avoid stale closure)
       onRegisterRef.current?.({ sendCommand: sendCommandRef.current, getSessionId: () => currentSessionId })
 
-      // If we have a sessionId, load it immediately; otherwise create a new session
+      // If we have a sessionId, load it immediately (active tab) or defer (inactive tab)
       const sid = sessionIdRef.current
       if (sid) {
-        ws.send(JSON.stringify({
-          command: 'load_session',
-          session_id: sid
-        }))
-        console.log(`[SessionTab ${sid}] Sent load_session`)
+        if (loadOnConnectRef.current) {
+          ws.send(JSON.stringify({
+            command: 'load_session',
+            session_id: sid
+          }))
+          console.log(`[SessionTab ${sid}] Sent load_session (active tab)`)
+        } else {
+          // Check if load_session was already queued by App trigger (user clicked tab before WS connected)
+          const hasQueuedLoad = pending.some(cmd => cmd.command === 'load_session')
+          if (!hasQueuedLoad) {
+            setIsDeferred(true)
+            console.log(`[SessionTab ${sid}] Deferred load (inactive tab)`)
+          } else {
+            console.log(`[SessionTab ${sid}] Load already queued, skipping deferred placeholder`)
+          }
+        }
       } else {
         ws.send(JSON.stringify({ command: 'new_session' }))
       }
@@ -390,6 +413,17 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
 
 
   // ── Render ───────────────────────────────────────────────────────────────
+  // When deferred, show a placeholder instead of the full tab UI
+  if (isDeferred) {
+    return (
+      <div className="session-tab-content session-tab-deferred">
+        <div className="deferred-placeholder">
+          <div className="deferred-placeholder-message">Click tab to load conversation</div>
+        </div>
+      </div>
+    )
+  }
+
   // Pass per-tab state to children as props
   return (
     <div className="session-tab-content">
@@ -449,6 +483,7 @@ export default React.memo(SessionTab, (prevProps, nextProps) => {
   return (
     prevProps.sessionId === nextProps.sessionId &&
     prevProps.hubReady === nextProps.hubReady &&
-    prevProps.staggerMs === nextProps.staggerMs
+    prevProps.staggerMs === nextProps.staggerMs &&
+    prevProps.loadOnConnect === nextProps.loadOnConnect
   )
 })

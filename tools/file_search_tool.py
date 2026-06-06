@@ -91,6 +91,12 @@ class FileSearchTool(ToolBase):
                     dirs[:] = [d for d in dirs if not self._should_exclude_dir(d)]
                     for file in files:
                         full_path = os.path.join(root, file)
+                        # Apply file_pattern filter if set (same logic as file_pattern-only branch)
+                        if self.file_pattern:
+                            pattern = self.file_pattern
+                            rel_path = os.path.relpath(full_path, str(validated_dir))
+                            if not fnmatch.fnmatch(file, pattern) and not Path(rel_path).match(pattern):
+                                continue
                         # Validate each subfile (should be within workspace since root is)
                         try:
                             validated_sub = self._validate_path(full_path)
