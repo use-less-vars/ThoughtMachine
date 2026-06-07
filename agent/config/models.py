@@ -3,9 +3,10 @@ Configuration models for the ThoughtMachine agent.
 """
 from typing import ClassVar, Optional, Callable, List, Any, Dict, Literal
 from pathlib import Path
-from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
+from pydantic import BaseModel, Field, field_validator, model_validator, model_serializer, ConfigDict
 from agent.logging import log
 from tools import SIMPLIFIED_TOOL_CLASSES
+from thoughtmachine.security import SessionPermissions
 
 # Category constants for AgentConfig fields
 RESTART_REQUIRED = "restart_required"
@@ -24,12 +25,10 @@ class AgentConfig(BaseModel):
         'api_key': RESTART_REQUIRED,
         'base_url': RESTART_REQUIRED,
         'temperature': HOT_SWAPPABLE,
-        'max_tokens': HOT_SWAPPABLE,
         'stop_check': RESTART_REQUIRED,
         'provider_config': RESTART_REQUIRED,
         'max_turns': HOT_SWAPPABLE,
         'system_prompt': RESTART_REQUIRED,
-        'token_monitor_enabled': HOT_SWAPPABLE,
         'token_monitor_warning_threshold': HOT_SWAPPABLE,
         'token_monitor_critical_threshold': HOT_SWAPPABLE,
         'turn_monitor_enabled': HOT_SWAPPABLE,
@@ -37,7 +36,6 @@ class AgentConfig(BaseModel):
         'log_dir': GLOBAL_STATIC,
         'log_level': GLOBAL_STATIC,
         'enable_file_logging': GLOBAL_STATIC,
-        'enable_console_logging': GLOBAL_STATIC,
         'jsonl_format': GLOBAL_STATIC,
         'log_categories': GLOBAL_STATIC,
         'max_file_size_mb': GLOBAL_STATIC,
@@ -57,6 +55,7 @@ class AgentConfig(BaseModel):
         'enabled_tools': HOT_SWAPPABLE,
         'provider_id': RESTART_REQUIRED,
         'model_override': RESTART_REQUIRED,
+        'session_permissions': HOT_SWAPPABLE,
     }
 
     api_key: str = Field(default='', exclude=True)
@@ -68,10 +67,8 @@ class AgentConfig(BaseModel):
     model_override: Optional[str] = Field(default=None, description='Override model from the profile (leaves provider_id intact)')
     temperature: float = 0.2
     max_turns: int = 100
-    stop_check: Optional[Callable[[], bool]] = None
-    max_tokens: Optional[int] = None
+    stop_check: Optional[Callable[[], bool]] = Field(default=None, description='Runtime stop-check callback. Called periodically during agent execution to check if processing should be aborted. Return True to signal stop. Not serialised to/from JSON config.')
     system_prompt: Optional[str] = None
-    token_monitor_enabled: bool = Field(default=True, description='Enable automatic token usage warnings')
     token_monitor_warning_threshold: int = Field(default=35000, description='Token count threshold for warning (user)')
     token_monitor_critical_threshold: int = Field(default=50000, description='Token count threshold for critical warning (user)')
     turn_monitor_enabled: bool = Field(default=True, description='Enable automatic turn limit warnings')
@@ -80,7 +77,6 @@ class AgentConfig(BaseModel):
     log_dir: str = Field(default='./logs', description='Directory for log files')
     log_level: str = Field(default='INFO', description='Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)')
     enable_file_logging: bool = Field(default=True, description='Write logs to files')
-    enable_console_logging: bool = Field(default=False, description='Print logs to console')
     jsonl_format: bool = Field(default=True, description='Use JSONL format for log files')
     log_categories: List[str] = Field(default_factory=lambda: ['SESSION', 'LLM', 'TOOLS'], description='List of log categories to enable (SESSION, UI, LLM, TOOLS, SECURITY, PERFORMANCE). Can be overridden by AGENT_LOG_CATEGORIES environment variable.')
     max_file_size_mb: int = Field(default=10, description='Maximum log file size in MB before rotation')
@@ -98,6 +94,23 @@ class AgentConfig(BaseModel):
     tool_output_token_limit: int = Field(default=10000, description='Maximum token limit for tool outputs (default 10,000 tokens)')
     detail: Literal['minimal', 'normal', 'verbose'] = Field(default='normal', description='Detail level for event display')
     enabled_tools: List[str] = Field(default_factory=lambda: [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES], description='List of enabled tool class names')
+    session_permissions: SessionPermissions = Field(
+        default_factory=SessionPermissions,
+        description='Session permissions profile controlling tool access categories.',
+    )
+
+    @field_validator('system_prompt')
+    def load_default_system_prompt(cls, v):
+        """Load the default system prompt from file when None or empty."""
+        from pathlib import Path
+        if v is None or (isinstance(v, str) and v.strip() == ''):
+            prompt_path = Path(__file__).resolve().parent.parent.parent / 'resources' / 'default_system_prompt.txt'
+            try:
+                return prompt_path.read_text(encoding='utf-8')
+            except (FileNotFoundError, IOError) as exc:
+                log.warning('Could not load default system prompt from %s: %s', prompt_path, exc)
+                return 'You are ThoughtMachine, an AI agent.'
+        return v
 
     @field_validator('enabled_tools')
     def filter_search_codebase_tool(cls, v, info):
@@ -125,6 +138,13 @@ class AgentConfig(BaseModel):
             if filtered != self.enabled_tools:
                 object.__setattr__(self, 'enabled_tools', filtered)
         return self
+
+    @model_serializer(mode='wrap')
+    def _serialize_stop_check(self, handler):
+        """Exclude stop_check from serialization — it's a runtime-only callable."""
+        d = handler(self)
+        d.pop('stop_check', None)
+        return d
 
     def get_filtered_tool_classes(self, enabled_tools=None):
         """Get tool classes filtered based on rag_enabled and enabled_tools.

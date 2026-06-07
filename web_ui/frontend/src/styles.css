@@ -80,6 +80,9 @@ body {
 .status-running {
   color: var(--success);
 }
+.status-pausing {
+  color: var(--warning);
+}
 .status-paused {
   color: var(--warning);
 }
@@ -156,6 +159,12 @@ body {
 /* ──────────────────────────────────────────────────────────────────────────
    ChatPanel
    ────────────────────────────────────────────────────────────────────────── */
+.chat-panel-wrapper {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  display: flex;
+}
 .chat-panel {
   flex: 1;
   overflow-y: auto;
@@ -172,6 +181,38 @@ body {
   height: 100%;
   color: var(--text-secondary);
   font-style: italic;
+}
+
+/* ── Scroll-navigation buttons (previous query + bottom) ──── */
+.scroll-nav-group {
+  position: absolute;
+  bottom: 1rem;
+  right: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  z-index: 10;
+}
+.scroll-bottom-btn,
+.scroll-prev-btn {
+  width: 2.2rem;
+  height: 2.2rem;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: 0.8rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+  transition: opacity 0.2s, transform 0.2s;
+}
+.scroll-bottom-btn:hover,
+.scroll-prev-btn:hover {
+  background: var(--bg-hover);
+  transform: scale(1.1);
 }
 
 /* ── Message bubbles ─────────────────────────────────────────────────────── */
@@ -192,6 +233,36 @@ body {
   letter-spacing: 0.04em;
   margin-bottom: 0.2rem;
   opacity: 0.7;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.copy-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 0.75rem;
+  padding: 0 0.2rem;
+  opacity: 0.4;
+  transition: opacity 0.15s;
+  line-height: 1;
+}
+.copy-btn:hover {
+  opacity: 1;
+}
+
+.reasoning-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.reasoning-summary .copy-btn {
+  margin-left: auto;
+  opacity: 0.3;
+}
+.reasoning-summary .copy-btn:hover {
+  opacity: 1;
 }
 
 /* User messages align right */
@@ -234,6 +305,164 @@ body {
   font-family: var(--font-mono);
   font-size: 0.85rem;
   border-left: 3px solid var(--success);
+}
+
+/* Final tool results (purple-blue bubble, full markdown, no truncation) */
+.message-final {
+  align-self: flex-start;
+  background: #2d1f4e;
+  border-left: 3px solid #b4befe;
+  border-bottom-left-radius: 2px;
+}
+
+.message-final .final-markdown p {
+  margin: 0.4em 0;
+}
+
+.message-final .final-markdown p:first-child {
+  margin-top: 0;
+}
+
+.message-final .final-markdown p:last-child {
+  margin-bottom: 0;
+}
+
+.message-final .final-markdown code {
+  background: rgba(180, 190, 254, 0.15);
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+
+.message-final .final-markdown pre {
+  background: rgba(0, 0, 0, 0.3);
+  padding: 0.75rem;
+  border-radius: 6px;
+  overflow-x: auto;
+}
+
+/* Question tool results (lighter purple bubble, full markdown, no truncation) */
+.message-question {
+  align-self: flex-start;
+  background: #4e3a72;
+  border-left: 3px solid #dce0ff;
+  border-bottom-left-radius: 2px;
+}
+
+.message-question .final-markdown p {
+  margin: 0.4em 0;
+}
+
+.message-question .final-markdown p:first-child {
+  margin-top: 0;
+}
+
+.message-question .final-markdown p:last-child {
+  margin-bottom: 0;
+}
+
+.message-question .final-markdown code {
+  background: rgba(200, 208, 255, 0.12);
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+
+.message-question .final-markdown pre {
+  background: rgba(0, 0, 0, 0.25);
+  padding: 0.75rem;
+  border-radius: 6px;
+  overflow-x: auto;
+}
+
+/* Summary tool results (dark golden bubble, full markdown, no truncation) */
+.message-summary {
+  align-self: flex-start;
+  background: #332a1a;
+  border-left: 3px solid #d4a017;
+  border-bottom-left-radius: 2px;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+.message-summary .summary-markdown p {
+  margin: 0.4em 0;
+}
+
+.message-summary .summary-markdown p:first-child {
+  margin-top: 0;
+}
+
+.message-summary .summary-markdown p:last-child {
+  margin-bottom: 0;
+}
+
+.message-summary .summary-markdown code {
+  background: rgba(212, 160, 23, 0.15);
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+
+.message-summary .summary-markdown pre {
+  background: rgba(0, 0, 0, 0.3);
+  padding: 0.75rem 1rem;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin: 0.6em 0;
+}
+
+.message-summary .summary-markdown pre code {
+  background: none;
+  padding: 0;
+  font-size: 0.85rem;
+}
+
+.message-summary .summary-markdown ul,
+.message-summary .summary-markdown ol {
+  margin: 0.4em 0;
+  padding-left: 1.5rem;
+}
+
+.message-summary .summary-markdown li {
+  margin: 0.2em 0;
+}
+
+.message-summary .summary-markdown blockquote {
+  border-left: 3px solid #d4a017;
+  padding-left: 0.75rem;
+  margin: 0.6em 0;
+  color: var(--text-secondary, #a0a0b0);
+}
+
+.message-summary .summary-markdown h1,
+.message-summary .summary-markdown h2,
+.message-summary .summary-markdown h3,
+.message-summary .summary-markdown h4 {
+  margin: 0.8em 0 0.4em;
+  line-height: 1.3;
+}
+
+.message-summary .summary-markdown h1 { font-size: 1.2rem; }
+.message-summary .summary-markdown h2 { font-size: 1.1rem; }
+.message-summary .summary-markdown h3 { font-size: 1.0rem; }
+
+.message-summary .summary-markdown table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.6em 0;
+}
+
+.message-summary .summary-markdown th,
+.message-summary .summary-markdown td {
+  border: 1px solid rgba(212, 160, 23, 0.3);
+  padding: 0.4rem 0.6rem;
+  text-align: left;
+}
+
+.message-summary .summary-markdown th {
+  background: rgba(212, 160, 23, 0.1);
+  font-weight: 600;
 }
 
 /* System messages (centered, dimmed) */
@@ -355,6 +584,7 @@ body {
 .session-list-panel {
   width: 320px;
   min-width: 260px;
+  height: 100%;
   padding: 1rem;
   background: var(--bg-secondary);
   border-left: 1px solid var(--border);
@@ -373,14 +603,6 @@ body {
   display: flex;
   flex-direction: column;
   gap: 0.4rem;
-}
-
-.btn-save {
-  background: var(--success);
-  color: var(--bg-primary);
-}
-.btn-save:hover:not(:disabled) {
-  filter: brightness(1.1);
 }
 
 .btn-new {
@@ -498,11 +720,63 @@ body {
   outline: none;
 }
 
+/* ── Delete confirmation overlay ───────────────────────────────────── */
+.delete-confirm-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.delete-confirm-dialog {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+  max-width: 360px;
+  width: 100%;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+}
+
+.delete-confirm-dialog p {
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+  color: var(--text-primary);
+  line-height: 1.5;
+}
+
+.delete-confirm-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.btn-delete-confirm {
+  background: var(--danger);
+  color: #fff;
+  border: none;
+}
+
+.btn-delete-confirm:hover {
+  filter: brightness(1.1);
+}
+
+.btn-deleting {
+  opacity: 0.5;
+}
+
 /* ──────────────────────────────────────────────────────────────────────────
-   Session sidebar (hidden by default, slides in with toggle)
+   Session sidebar (hidden by default, shown/hidden via ⚙️ cogwheel)
    ────────────────────────────────────────────────────────────────────────── */
 
 .session-sidebar {
+  height: 100%;
   overflow: hidden;
   width: 0;
   transition: width 0.2s ease;
@@ -513,30 +787,6 @@ body {
   width: 320px;
 }
 
-.session-toggle {
-  position: fixed;
-  right: 10px;
-  top: 10px;
-  z-index: 101;
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  color: var(--text-primary);
-  font-size: 1.2rem;
-  padding: 4px 10px;
-  border-radius: var(--radius);
-  cursor: pointer;
-  transition: right 0.2s ease, background 0.15s;
-  line-height: 1;
-}
-
-.session-sidebar.open ~ .session-toggle,
-.session-toggle.shifted {
-  right: 330px;
-}
-
-.session-toggle:hover {
-  background: var(--border);
-}
 
 /* ──────────────────────────────────────────────────────────────────────────
    Scrollbar (Webkit)
@@ -553,6 +803,23 @@ body {
 }
 ::-webkit-scrollbar-thumb:hover {
   background: var(--text-secondary);
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Resize handle (ConfigPanel drag)
+   ────────────────────────────────────────────────────────────────────────── */
+.resize-handle {
+  width: 5px;
+  cursor: col-resize;
+  background: transparent;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 10;
+  transition: background 0.15s;
+}
+
+.resize-handle:hover {
+  background: var(--accent);
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -611,8 +878,12 @@ body {
   border-bottom: 3px solid #4caf50;
 }
 
+.tab-item.pausing {
+  border-bottom: 3px solid #f1c40f;
+}
+
 .tab-item.idle {
-  border-bottom: 3px solid #888;
+  border-bottom: 3px solid #3498db;
 }
 
 .tab-label {
@@ -659,7 +930,6 @@ body {
   color: var(--bg-primary);
   border-color: var(--accent);
 }
-
 
 /* ──────────────────────────────────────────────────────────────────────────
    Multi-tab additions
@@ -936,3 +1206,263 @@ body {
 .message-tool-call .tool-call-args {
   font-family: var(--font-mono, 'SF Mono', 'Fira Code', monospace);
 }
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Session Actions Panel (slide-in from right)
+   ────────────────────────────────────────────────────────────────────────── */
+
+.session-actions-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.4);
+  z-index: 200;
+}
+
+.session-actions-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 300px;
+  background: var(--bg-surface);
+  border-left: 1px solid var(--border);
+  box-shadow: -4px 0 20px rgba(0, 0, 0, 0.3);
+  z-index: 201;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: session-actions-slide-in 0.2s ease-out;
+}
+
+@keyframes session-actions-slide-in {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+.session-actions-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.session-actions-header h3 {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.session-actions-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 1rem;
+  color: var(--text-secondary);
+  padding: 0.2rem 0.4rem;
+  border-radius: 4px;
+  transition: background 0.15s, color 0.15s;
+  line-height: 1;
+}
+
+.session-actions-close:hover {
+  background: var(--danger);
+  color: #fff;
+}
+
+.session-actions-section {
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.session-actions-section h4 {
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+  color: var(--text-secondary);
+}
+
+.session-actions-section-grow {
+  flex: 1;
+  overflow-y: auto;
+  border-bottom: none;
+}
+
+.session-actions-save-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.session-actions-input {
+  padding: 0.4rem 0.6rem;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 0.85rem;
+  outline: none;
+}
+
+.session-actions-input:focus {
+  border-color: var(--accent);
+}
+
+.session-actions-save-form-buttons {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.session-actions-delete-confirm p {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  margin-bottom: 0.5rem;
+  line-height: 1.4;
+}
+
+.session-actions-delete-confirm-buttons {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.session-actions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.session-actions-empty {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  font-style: italic;
+  text-align: center;
+  padding: 1rem 0;
+}
+
+.session-actions-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.4rem 0.6rem;
+  background: var(--bg-primary);
+  border-radius: 4px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.session-actions-item:hover {
+  border-color: var(--border);
+  background: var(--bg-secondary);
+}
+
+.session-actions-item-active {
+  border-color: var(--accent) !important;
+}
+
+.session-actions-item-name {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-actions-item-date {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+}
+
+/* ── Button variants for panel ──────────────────────────── */
+.btn-accent {
+  background: var(--accent);
+  color: var(--bg-primary);
+}
+
+.btn-accent:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.btn-danger {
+  background: var(--danger);
+  color: #fff;
+}
+
+.btn-danger:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+
+/* ── Spinner ──────────────────────────────────── */
+@keyframes config-spin {
+  to { transform: rotate(360deg); }
+}
+
+.config-spinner {
+  display: inline-block;
+  width: 1em;
+  height: 1em;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: config-spin 0.6s linear infinite;
+}
+
+
+/* ── Toggle Switch (Permissions tab) ──────────────────────────────── */
+.toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 40px;
+  height: 22px;
+  flex-shrink: 0;
+}
+
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: #585b70;
+  transition: 0.3s;
+  border-radius: 22px;
+}
+
+.toggle-slider::before {
+  position: absolute;
+  content: '';
+  height: 16px;
+  width: 16px;
+  left: 3px;
+  bottom: 3px;
+  background-color: #cdd6f4;
+  transition: 0.3s;
+  border-radius: 50%;
+}
+
+.toggle-switch input:checked + .toggle-slider {
+  background-color: var(--accent, #89b4fa);
+}
+
+.toggle-switch input:checked + .toggle-slider::before {
+  transform: translateX(18px);
+}
+
+.toggle-switch input:focus + .toggle-slider {
+  box-shadow: 0 0 1px var(--accent, #89b4fa);
+}
+

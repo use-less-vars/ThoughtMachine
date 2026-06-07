@@ -48,13 +48,14 @@ def group_messages_into_turns(messages: List[Dict[str, Any]]) -> List[List[Dict[
         role = msg.get('role')
         content = msg.get('content', '')
 
-        # Skip system messages (but keep system notifications — they go inside turns)
+        # Skip system messages
         if role == 'system':
             continue
 
         # Start a new turn on user messages or assistant messages with tool_calls
         if role == 'user':
-            if msg.get('is_system_notification') is True:
+            is_sys_notif = msg.get('is_system_notification')
+            if is_sys_notif:
                 # System notification: append to current turn, don't start a new one
                 if current_turn:
                     current_turn.append(msg)
@@ -138,12 +139,13 @@ def group_messages_into_turns_with_indices(
     for i, msg in enumerate(messages):
         role = msg.get('role')
 
-        # Skip system messages (but keep system notifications — they go inside turns)
+        # Skip system messages
         if role == 'system':
             continue
 
         if role == 'user':
-            if msg.get('is_system_notification') is True:
+            is_sys_notif = msg.get('is_system_notification')
+            if is_sys_notif:
                 # System notification: append to current turn, don't start a new one
                 if current_turn:
                     current_turn.append(msg)

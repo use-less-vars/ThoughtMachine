@@ -14,6 +14,8 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + '/../')
 
+from agent.core.message import Message
+
 logger = logging.getLogger(__name__)
 # Lazy import to avoid circular dependency
 _log_real = None
@@ -209,6 +211,7 @@ class SummaryBuilder(ContextBuilder):
     def __init__(self, default_keep_turns: int=5):
         """Initialize with default number of turns to keep when no summary exists."""
         self.default_keep_turns = default_keep_turns
+        self.emergency_mode = False
 
     def build(self, user_history: List[Dict[str, Any]], max_tokens: Optional[int]=None) -> List[Dict[str, Any]]:
         """
@@ -220,6 +223,7 @@ class SummaryBuilder(ContextBuilder):
         When no summary exists: includes all messages, with token truncation
         removing oldest messages first.
         """
+        log('DEBUG', 'core.context_builder', f'SummaryBuilder.build: {len(user_history)} history messages, max_tokens={max_tokens}')
         if os.environ.get('DEBUG_CONTEXT'):
             logger.debug(f'[DEBUG_CONTEXT] SummaryBuilder.build called with {len(user_history)} history messages')
             if user_history:
@@ -269,6 +273,12 @@ class SummaryBuilder(ContextBuilder):
         # [CTXBUILD] AFTER FILTER
         log('DEBUG', 'ctxbuild', f"AFTER FILTER: non_system={len(non_system)} msgs, system_warnings={len(system_warnings)} msgs")
         
+        # Emergency mode: skip oldest 20% of non-system messages since last summary
+        if self.emergency_mode and non_system:
+            skip_count = max(1, int(len(non_system) * 0.2))
+            log('INFO', 'core.context', f'[EMERGENCY] Skipping oldest {skip_count}/{len(non_system)} non-system messages in SummaryBuilder')
+            non_system = non_system[skip_count:]
+        
         if os.environ.get('DEBUG_CONTEXT'):
             logger.debug(f'[DEBUG_CONTEXT] Collected {len(system_warnings)} system warnings:')
             for i, warn in enumerate(system_warnings):
@@ -276,6 +286,13 @@ class SummaryBuilder(ContextBuilder):
                 logger.debug(f'  [{i}] {content_preview}')
         turns = self._group_messages_into_turns(non_system)
         log('DEBUG', 'session.summary_builder', f'SummaryBuilder.build: grouped {len(non_system)} non-system messages into {len(turns)} turns')
+        # Compute turn starting indices within non_system list
+        turn_offsets = []
+        offset = 0
+        for turn in turns:
+            turn_offsets.append(offset)
+            offset += len(turn)
+        log('DEBUG', 'core.context', f"turns grouped: {len(turns)} turns from {len(non_system)} messages, first indices: {turn_offsets[:10]}")
         # [CTXBUILD] AFTER GROUP
         log('DEBUG', 'ctxbuild', f"AFTER GROUP: {len(turns)} turns")
         for ti, turn in enumerate(turns):
@@ -300,8 +317,12 @@ class SummaryBuilder(ContextBuilder):
                 role = msg.get('role')
                 content_preview = str(msg.get('content', ''))[:80].replace('\\n', ' ')
                 logger.debug(f'  [{i}] role={role}: {content_preview}')
+        before_trunc_count = len(context)
         if max_tokens is not None:
-            context = self._truncate_to_max_tokens(context, max_tokens, preserve_system=True, remove_from_end=summary_msg is not None)
+            context = self._truncate_to_max_tokens(context, max_tokens, preserve_system=True, remove_from_end=False)
+        truncated_count = before_trunc_count - len(context)
+        if truncated_count > 0:
+            log('INFO', 'core.context', f"truncation: removed={truncated_count}, tokens_before={before_trunc_count}_msgs, tokens_after={len(context)}_msgs")
         if os.environ.get('DEBUG_CONTEXT'):
             logger.debug(f'[DEBUG_CONTEXT] Context after truncation ({len(context)} messages):')
             for i, msg in enumerate(context):
@@ -309,6 +330,13 @@ class SummaryBuilder(ContextBuilder):
                 content_preview = str(msg.get('content', ''))[:80].replace('\\n', ' ')
                 logger.debug(f'  [{i}] role={role}: {content_preview}')
         context = self._cleanup_orphaned_tool_messages(context)
+        # Indices for final context: find positions of key messages
+        final_indices = {}
+        for i, msg in enumerate(context):
+            role = msg.get('role', 'unknown')
+            if role not in final_indices:
+                final_indices[role] = i
+        log('INFO', 'core.context', f"final context: {len(context)} messages, indices={final_indices}, est_tokens=N/A")
         log('DEBUG', 'session.summary_builder', f'SummaryBuilder.build: final context length {len(context)} messages')
         # Phase 3 logging: LLM context built
         try:
@@ -344,7 +372,7 @@ class SummaryBuilder(ContextBuilder):
         log('DEBUG', 'debug.emergency', f'====== EMERGENCY TRACE: context_builder.build() returning {len(context)} msgs ======')
         for i, msg in enumerate(context):
             role = msg.get('role', 'unknown')
-            content = msg.get('content', '')
+            content = msg.get('content', '') or ''
             preview = content[:80].replace('\n', '\\n')
             log('DEBUG', 'debug.emergency', f'  CTX[{i}] role={role}: {preview}')
         return context
@@ -357,6 +385,7 @@ class SummaryBuilder(ContextBuilder):
             (main_prompt, summary_index, summary_message)
             summary_index is -1 if no summary found
         """
+        log('DEBUG', 'core.context_builder', f'_find_main_prompt_and_summary: scanning {len(user_history)} history messages')
         main_prompt = None
         summary_idx = -1
         summary_msg = None
@@ -378,6 +407,7 @@ class SummaryBuilder(ContextBuilder):
         if summaries_found:
             summaries_found.sort(key=lambda x: x[0], reverse=True)
             summary_idx, summary_msg = summaries_found[0]
+            log('DEBUG', 'core.context_builder', f'_find_main_prompt_and_summary: found summary at idx={summary_idx}')
             if os.environ.get('DEBUG_CONTEXT'):
                 logger.debug(f"[DEBUG_CONTEXT] Using latest summary at index {summary_idx} with pruning_keep_recent_turns={summary_msg.get('pruning_keep_recent_turns')}")
                 for key, value in summary_msg.items():
@@ -386,6 +416,7 @@ class SummaryBuilder(ContextBuilder):
         else:
             summary_idx = -1
             summary_msg = None
+            log('DEBUG', 'core.context_builder', '_find_main_prompt_and_summary: no summary found')
         return (main_prompt, summary_idx, summary_msg)
 
     def _group_messages_into_turns(self, messages: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
@@ -454,10 +485,10 @@ class SummaryBuilder(ContextBuilder):
             log('DEBUG', 'session.context_builder', f'Truncating: {len(messages)} messages, removing {removed_count} to stay under {max_tokens} tokens')
             log('DEBUG', 'session.context_builder', f'Truncated: removed {removed_count} messages, now {len(messages)} messages at ~{total} tokens')
             # Append a system notification to inform the LLM that truncation occurred
-            notification = {
-                'role': 'user',
-                'content': f'[SYSTEM NOTIFICATION] Context truncated: {removed_count} older message(s) were removed to stay within token limits ({total} tokens ≈ {max_tokens} max).',
-                'is_system_notification': True
-            }
+            notification = Message(
+                role='user',
+                content=f'[SYSTEM NOTIFICATION] Context truncated: {removed_count} older message(s) were removed to stay within token limits ({total} tokens ≈ {max_tokens} max).',
+                is_system_notification=True,
+            )
             messages.append(notification)
         return messages

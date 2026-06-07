@@ -13,7 +13,7 @@ from agent import events as ev
 
 class EventProcessor:
     """Processes events from controller and updates state."""
-    MESSAGE_EVENT_TYPES = {'turn', 'tool_call', 'tool_result', 'final', 'user_query', 'llm_request', 'llm_response', 'raw_response'}
+    MESSAGE_EVENT_TYPES = {'turn', 'tool_call', 'tool_result', 'user_query', 'llm_request', 'llm_response', 'raw_response'}
 
     def __init__(self, state_bridge, session_lifecycle, gui_integration=None):
         """
@@ -38,8 +38,9 @@ class EventProcessor:
         """
         typed_event = ev.convert_from_legacy_format(event)
         event_type = typed_event.type.value
+        log('DEBUG', 'core.signal', f"event: type={event_type}")
         log('DEBUG', 'presenter.event_processor', f'Processing event: {event_type}')
-        state_event_types = ['error', 'paused', 'stopped', 'thread_finished', 'final', 'max_turns', 'user_interaction_requested', 'rate_limit_warning', 'token_warning', 'turn_warning', 'user_query']
+        state_event_types = ['error', 'paused', 'stopped', 'thread_finished', 'max_turns', 'user_interaction_requested', 'rate_limit_warning', 'token_warning', 'turn_warning', 'user_query']
         if event_type not in state_event_types:
             event_session_id = event.get('session_id')
             if event_session_id is not None:
@@ -51,7 +52,8 @@ class EventProcessor:
         if self.gui_integration:
             log('DEBUG', 'presenter.event_processor', f'GUI integration available, checking emission for {event_type}')
             if event_type != 'token_update':
-                log('DEBUG', 'presenter.event_processor', f'Would emit event to GUI (skipped due to ObservableList transition): {event_type}')
+                log('DEBUG', 'core.signal', 'Path A: emit_conversation_changed()')
+                self.gui_integration.emit_conversation_changed()
             else:
                 log('DEBUG', 'presenter.event_processor', f'Skipping token_update event (handled separately)')
         else:
@@ -60,6 +62,8 @@ class EventProcessor:
             self._process_turn_event(event)
         elif event_type == 'token_update':
             self._process_token_update_event(event)
+        elif event_type == 'agent_responded':
+            self._process_terminal_event(event, event_type)
         elif event_type == 'user_interaction_requested':
             self._process_user_interaction_event(event)
         elif event_type == 'user_query':
@@ -68,7 +72,7 @@ class EventProcessor:
             self._process_paused_event(event)
         elif event_type == 'stop_reason':
             self._process_stop_reason_event(event)
-        elif event_type in ['final', 'stopped', 'max_turns', 'thread_finished']:
+        elif event_type in ['stopped', 'max_turns', 'thread_finished']:
             self._process_terminal_event(event, event_type)
         elif event_type == 'error':
             self._process_error_event(event)
@@ -78,6 +82,10 @@ class EventProcessor:
             self._process_execution_state_change_event(event)
         elif event_type == 'session_state_change':
             self._process_session_state_change_event(event)
+        elif event_type in ('tool_call', 'tool_result'):
+            self._process_tool_event(event, event_type)
+        elif event_type == 'rate_limit_warning':
+            self._process_rate_limit_warning_event(event)
         elif event_type == 'token_warning':
             self._process_token_warning_event(event)
         elif event_type == 'turn_warning':
@@ -87,6 +95,7 @@ class EventProcessor:
 
     def _process_turn_event(self, event: Dict[str, Any]) -> None:
         """Process a turn event."""
+        log('DEBUG', 'presenter.event_processor', f'_process_turn_event: turn={event.get("turn")}')
         input_tokens, output_tokens = self._extract_token_counts(event)
         if input_tokens is not None and output_tokens is not None:
             self.state_bridge.update_token_totals(input_tokens, output_tokens)
@@ -100,6 +109,7 @@ class EventProcessor:
 
     def _process_token_update_event(self, event: Dict[str, Any]) -> None:
         """Process a token update event."""
+        log('DEBUG', 'presenter.event_processor', f'_process_token_update_event: context_length={event.get("context_length")}')
         input_tokens, output_tokens = self._extract_token_counts(event)
         if input_tokens is not None and output_tokens is not None:
             self.state_bridge.update_token_totals(input_tokens, output_tokens)
@@ -130,6 +140,7 @@ class EventProcessor:
         to 'Ready'. The session_stop event (which follows 'paused') handles
         the PAUSING→READY transition naturally.
         """
+        log('DEBUG', 'presenter.event_processor', f'_process_paused_event: stop_reason={event.get("stop_reason","unknown")}')
         if self.gui_integration:
             self.gui_integration.emit_status_message('Paused')
 
@@ -147,7 +158,8 @@ class EventProcessor:
 
     def _process_terminal_event(self, event: Dict[str, Any], event_type: str) -> None:
         """Process terminal event (final, stopped, max_turns, thread_finished)."""
-        if event_type == 'final':
+        log('DEBUG', 'presenter.event_processor', f'_process_terminal_event: type={event_type}, turn={event.get("turn")}')
+        if event_type == 'agent_responded':
             self.session_lifecycle.state = ExecutionState.READY
             if self.gui_integration:
                 self.gui_integration.emit_status_message('Completed successfully')
@@ -181,12 +193,17 @@ class EventProcessor:
 
     def _process_error_event(self, event: Dict[str, Any]) -> None:
         """Process error event."""
+        log('DEBUG', 'presenter.event_processor', f'_process_error_event: error_type={event.get("error_type","unknown")}')
         self.session_lifecycle.state = ExecutionState.READY
         error_msg = event.get('message', 'Unknown error')
         traceback_text = event.get('traceback', '')
         if self.gui_integration:
             self.gui_integration.emit_error_occurred(error_msg, traceback_text)
             self.gui_integration.emit_status_message(f'Error: {error_msg}')
+            # Emit conversation_changed to trigger GUI display of any new messages
+            # (e.g., system notifications injected by agent before yielding error).
+            # Without this, the error notification is invisible until manual refresh.
+            self.gui_integration.emit_conversation_changed()
         self.session_lifecycle.auto_save_current_session()
 
     def _process_session_stop_event(self, event: Dict[str, Any]) -> None:
@@ -199,7 +216,7 @@ class EventProcessor:
             # (e.g., grace turn committed just before pause) since the ObservableList
             # callback uses QTimer.singleShot from the worker thread, which may not
             # reliably deliver on all platforms. This runs on the main thread via
-            # the queued signal connection from controller.event_occurred.
+            # the event queue from controller.
             self.gui_integration.emit_conversation_changed()
         self.session_lifecycle.auto_save_current_session()
 
@@ -240,6 +257,23 @@ class EventProcessor:
             self.gui_integration.emit_status_message(f'Turn warning: {warning_message}')
             if hasattr(self.gui_integration, 'emit_warning'):
                 self.gui_integration.emit_warning(f'Turn limit warning: {turn_count} turns')
+
+    def _process_tool_event(self, event: Dict[str, Any], event_type: str) -> None:
+        """Process tool_call or tool_result event."""
+        tool_name = event.get('tool_name', 'unknown')
+        success = event.get('success', True)
+        if self.gui_integration:
+            status = 'succeeded' if success else 'failed'
+            self.gui_integration.emit_status_message(f'Tool {event_type}: {tool_name} {status}')
+
+    def _process_rate_limit_warning_event(self, event: Dict[str, Any]) -> None:
+        """Process rate limit warning event."""
+        message = event.get('message', 'Rate limit warning')
+        wait_time = event.get('wait_time', 0)
+        if self.gui_integration:
+            self.gui_integration.emit_status_message(f'Rate limit: {message}')
+            if hasattr(self.gui_integration, 'emit_warning'):
+                self.gui_integration.emit_warning(f'Rate limit exceeded, waiting {wait_time}s')
 
 
     def _extract_token_counts(self, event: Dict[str, Any]) -> tuple[Optional[int], Optional[int]]:

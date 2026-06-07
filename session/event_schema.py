@@ -33,6 +33,7 @@ EventType = Literal[
     "paused",
     "stopped",
     "final",
+    "agent_responded",
     "error",
     "token_warning",
     "rate_limit_warning",

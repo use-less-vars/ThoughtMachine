@@ -20,7 +20,7 @@ import sys
 
 
 class ToolBase(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
     """
     All tools must inherit from this class.
     They must define a 'tool' field with a Literal of their unique name.
@@ -33,6 +33,32 @@ class ToolBase(BaseModel):
 
     # Security capabilities required by this tool
     requires_capabilities: ClassVar[List[str]] = []
+
+    # Permission categories required by this tool (e.g., ['container:true'])
+    # Empty list means no special permissions needed.
+    required_categories: ClassVar[List[str]] = []
+
+    # If True, framework-level output truncation is skipped for this tool.
+    # Use this for tools whose output must always be complete (e.g., Respond, SummarizeTool).
+    skip_output_truncation: ClassVar[bool] = False
+
+    @classmethod
+    def get_required_categories(cls, params: dict | None = None) -> list[str]:
+        """
+        Return the permission categories required for this tool given params.
+
+        Default implementation returns the static ``required_categories`` ClassVar.
+        Subclasses can override to provide operation-level granularity
+        (e.g., FileEditor returns ``["filesystem:read"]`` for read ops,
+        ``["filesystem:write"]`` for write/delete ops).
+
+        Args:
+            params: The tool call arguments dict (may be None for static checks).
+
+        Returns:
+            List of category strings, e.g. ``["filesystem:write"]``.
+        """
+        return cls.required_categories
 
     # Logger instance for tool debugging
     _logger: Optional[logging.Logger] = None
@@ -191,6 +217,8 @@ class ToolBase(BaseModel):
     
     def _truncate_output(self, output: str, limit: Optional[int] = None) -> str:
         """Truncate output to token limit if specified."""
+        if self.skip_output_truncation:
+            return output
         if limit is None:
             limit = self.token_limit
         if limit is None or limit <= 0:
@@ -246,7 +274,7 @@ class ToolBase(BaseModel):
                 raise
         else:
             # Fallback to original implementation
-            if self.workspace_path is None:
+            if not self.workspace_path:
                 # No restrictions
                 return os.path.abspath(path)
 

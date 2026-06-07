@@ -143,17 +143,7 @@ try:
 except ImportError as e:
     logger.warning(f"Failed to import FileSummaryTool: {e}")
 
-try:
-    from .final import Final
-    TOOL_CLASSES.append(Final)
-except ImportError as e:
-    logger.warning(f"Failed to import Final: {e}")
-
-try:
-    from .final_report import FinalReport
-    TOOL_CLASSES.append(FinalReport)
-except ImportError as e:
-    logger.warning(f"Failed to import FinalReport: {e}")
+# Final/FinalReport removed in Phase B — use Respond instead
 
 try:
     from .git_info_tool import GitInfoTool
@@ -185,11 +175,13 @@ try:
 except ImportError as e:
     logger.warning(f"Failed to import ProgressReport: {e}")
 
+# RequestUserInteraction removed in Phase B — use Respond instead
 try:
-    from .request_user_interaction import RequestUserInteraction
-    TOOL_CLASSES.append(RequestUserInteraction)
+    from .respond import Respond
+    TOOL_CLASSES.append(Respond)
 except ImportError as e:
-    logger.warning(f"Failed to import RequestUserInteraction: {e}")
+    logger.warning(f"Failed to import Respond: {e}")
+
 
 try:
     from .summarize_tool import SummarizeTool

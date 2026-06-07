@@ -77,7 +77,9 @@ class HistoryProvider:
         """Return messages suitable for LLM context (pruned view)."""
         log('DEBUG', 'session.history_provider', f'get_context_for_llm called: cached_context is None={self._cached_context is None}')
         if self._cached_context is not None:
+            log('DEBUG', 'core.cache', f"cache hit: {len(self._cached_context)} messages")
             return self._cached_context
+        log('DEBUG', 'core.cache', 'cache miss — rebuilding')
         context = self.context_builder.build(self.session.user_history, max_tokens=self.token_limit)
         if DEBUG_CONTEXT:
             log('DEBUG', 'session.history_provider', f'get_context_for_llm: {len(self.session.user_history)} history → {len(context)} context')
@@ -171,32 +173,8 @@ class HistoryProvider:
 
     def clear_cache(self) -> None:
         """Explicitly clear the cached context."""
+        log('DEBUG', 'core.cache', 'cache cleared: reason=explicit')
         self._cached_context = None
-
-    def check_token_limit(self) -> Tuple[bool, Optional[str]]:
-        """
-        Check if token limit is approaching or exceeded.
-        
-        Returns:
-            (needs_pruning, warning_message)
-            - needs_pruning: True if pruning should be triggered
-            - warning_message: Optional warning to display to user
-        """
-        if self.token_limit is None:
-            return (False, None)
-        context = self.get_context_for_llm()
-        token_count = self._estimate_context_tokens(context)
-        log('DEBUG', 'core.pruning', f'Token count: {token_count}/{self.token_limit}')
-        warning_threshold = self.token_limit * 0.8
-        prune_threshold = self.token_limit * 0.95
-        if token_count >= prune_threshold:
-            warning = f'Token limit almost reached ({token_count}/{self.token_limit}). Pruning recommended.'
-            return (True, warning)
-        elif token_count >= warning_threshold:
-            warning = f'Token usage high ({token_count}/{self.token_limit}). Consider pruning.'
-            return (False, warning)
-        else:
-            return (False, None)
 
     def create_summary(self, summary_text: str, keep_recent_turns: int) -> Dict[str, Any]:
         """
@@ -209,6 +187,7 @@ class HistoryProvider:
         Returns:
             The summary message dict
         """
+        log('DEBUG', 'core.history_provider', f'create_summary: text_len={len(summary_text)}, keep_recent_turns={keep_recent_turns}')
         summary_msg = {'role': 'system', 'content': f'Summary of previous conversation: {summary_text}', 'pruning_keep_recent_turns': keep_recent_turns, 'pruning_insertion_idx': len(self.session.user_history), 'timestamp': datetime.now().isoformat()}
         self.add_message(summary_msg)
         self.session.summary = summary_msg

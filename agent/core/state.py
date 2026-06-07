@@ -71,9 +71,6 @@ class AgentState:
         """
         self.current_conversation_tokens = total_tokens
         log('DEBUG', 'core.token_state', f'total_tokens={total_tokens}, warning_threshold={self.config.token_monitor_warning_threshold}, critical_threshold={self.config.token_monitor_critical_threshold}')
-        if not self.config.token_monitor_enabled:
-            self.token_state = TokenState.LOW
-            return []
         if total_tokens < self.config.token_monitor_warning_threshold:
             new_state = TokenState.LOW
         elif total_tokens < self.config.token_monitor_critical_threshold:
@@ -92,11 +89,13 @@ class AgentState:
                     f'**Token usage warning: Conversation is nearing context window limits** ({formatted} tokens). '
                     f'Critical threshold is at {critical_formatted} tokens. '
                     f'This is not a problem: simply use SummarizeTool to summarize the session and keep a number of recent turns. '
-                    f'The summary will free up the context window and you can continue working smoothly.'
+                    f'The summary will free up the context window and you can continue working smoothly. '
+                    f'Tip: For long-running tasks, store intermediate results and subtask status in KnowledgeBase '
+                    f'to avoid losing context when summarizing.'
                 )
             else:
                 formatted = self._format_tokens(total_tokens)
-                warning = f'Token usage is at the critical threshold ({formatted} tokens). Please summarize to reduce context size or complete work. Only SummarizeTool, Final, and FinalReport will be available.'
+                warning = f'Token usage is at the critical threshold ({formatted} tokens). Please summarize to reduce context size or complete work. Only Respond and SummarizeTool are available.'
             self.last_token_warning = warning
             self.last_token_warning_count = total_tokens
             self.last_token_warning_state = new_state
@@ -144,7 +143,7 @@ class AgentState:
                 f'**Turn limit warning**: You are running out of turns ({current_turn}/{max_turns}). '
                 f'You must wait for the user to re-enable your session. Please provide a final answer now '
                 f'so the user can decide if they want to send you further queries or if they are happy '
-                f'with the result you have so far. Only Final and FinalReport are available.'
+                f'with the result you have so far. Only Respond is available.'
             )
             self.last_turn_warning = warning
             self.last_turn_warning_count = current_turn
@@ -208,10 +207,10 @@ class AgentState:
     def get_allowed_tools(self) -> List[str]:
         """Get list of allowed tool names based on current states.
 
-        When restrictions_active is True, only Final, FinalReport, and SummarizeTool are allowed.
+        When restrictions_active is True, only Respond and SummarizeTool are allowed.
         """
         if self.restrictions_active:
-            return ['Final', 'FinalReport', 'SummarizeTool']
+            return ['Respond', 'SummarizeTool']
         return []
 
     def is_tool_allowed(self, tool_name: str) -> bool:

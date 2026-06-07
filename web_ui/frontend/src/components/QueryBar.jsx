@@ -4,112 +4,120 @@
  * Text input + contextual action buttons.
  *
  * Button logic:
- *   status     Run | Pause | Resume | Stop       Command sent
- *   ──────────────────────────────────────────────────────────
- *   IDLE       ✓   |       |        |            start_session (fresh) /
- *                                                  continue_session (if isRunning)
- *   RUNNING        | ✓    |        | ✓          pause_session / stop_session
- *   PAUSED         |       | ✓     | ✓          continue_session(query) / stop_session
- *   WAITING... ✓   |       |        | ✓          continue_session(query)
+ *   status     Run | Pause | Stop         Command sent
+ *   ────────────────────────────────────────────────────
+ *   IDLE       ✓   |       |              start_session (fresh) /
+ *                                            continue_session (if isRunning)
+ *   RUNNING        | ✓    | ✓            pause_session / stop_session
+ *   PAUSING    ⛔  |      |              single disabled Pause button
+ *   PAUSED     ✓   |       | ✓            continue_session(query) / stop_session
+ *   WAITING... ✓   |       | ✓            continue_session(query)
  *
  * Props:
  *   sendCommand(command, payload)
  *   status, isRunning, config
  */
 
-import React, { useState } from 'react'
+import React, { useState, useRef } from 'react'
 
-export default function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
+function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
   const [query, setQuery] = useState('')
+  const textareaRef = useRef(null)
 
   const isIdle = status === 'IDLE'
   const isBusy = status === 'RUNNING'
   const isPaused = status === 'PAUSED'
+  const isPausing = status === 'PAUSING'
   const isWaiting = status === 'WAITING_FOR_USER'
 
   const handleRun = () => {
     if (!query.trim()) return
     if (sessionId) {
-      // Loaded session — continue with existing context
-      sendCommand('continue_session', { query: query.trim(), session_id: sessionId })
+      // Loaded session — continue with existing context, passing config
+      sendCommand('continue_session', {
+        query: query.trim(),
+        session_id: sessionId,
+        config: config ?? {}
+      })
     } else {
       // Fresh start — create new agent session
-      sendCommand('start_session', { query: query.trim(), config })
+      sendCommand('start_session', { query: query.trim(), config: config ?? {} })
+    }
+    setQuery('')  // Clear input after sending
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto'
     }
   }
 
-  const handlePause = () => {
-    sendCommand('pause_session', {})
-  }
-
-  const handleContinue = () => {
-    sendCommand('continue_session', { query: query.trim() })
-  }
-
-  const handleStop = () => {
-    sendCommand('stop_session', {})
+  const handleToggle = () => {
+    if (isBusy) {
+      sendCommand('pause_session', {})
+    } else if (isPaused) {
+      sendCommand('continue_session', { query: query.trim() })
+      setQuery('')
+      if (textareaRef.current) {
+        textareaRef.current.style.height = 'auto'
+      }
+    } else {
+      handleRun()
+    }
   }
 
   const handleKeyDown = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey && (isIdle || isWaiting)) {
+    if (e.key === 'Enter' && !e.shiftKey && (isIdle || isWaiting || isPaused)) {
       e.preventDefault()
-      handleRun()
+      handleToggle()
     }
-    // Enter while paused → resume + continue
-    if (e.key === 'Enter' && !e.shiftKey && isPaused) {
-      e.preventDefault()
-      handleRun()
-    }
+  }
+
+  // Debounced auto-resize using requestAnimationFrame to avoid layout thrashing
+  const resizeRafRef = useRef(null)
+  const handleResize = (e) => {
+    if (resizeRafRef.current) return  // coalesce multiple events into one frame
+    resizeRafRef.current = requestAnimationFrame(() => {
+      resizeRafRef.current = null
+      const el = textareaRef.current
+      if (!el) return
+      el.style.height = 'auto'
+      el.style.height = Math.min(el.scrollHeight, 200) + 'px'
+    })
   }
 
   return (
     <div className="query-bar">
       <textarea
+        ref={textareaRef}
         className="query-input"
         placeholder="Enter your query…"
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         onKeyDown={handleKeyDown}
-        onInput={(e) => {
-          e.target.style.height = 'auto';
-          e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px';
-        }}
-        disabled={isBusy || isPaused}
+        onInput={handleResize}
+        disabled={false}  /* Always writable — buttons control what's allowed */
         rows={1}
       />
       <div className="query-buttons">
-        {/* Run — visible when IDLE or WAITING_FOR_USER */}
-        {(isIdle || isWaiting) && (
-          <button
-            className="btn btn-run"
-            onClick={handleRun}
-            disabled={!query.trim()}
-          >
-            ▶ Run
-          </button>
-        )}
-
-        {/* Pause — visible when RUNNING */}
-        {isBusy && (
-          <button className="btn btn-pause" onClick={handlePause}>
+        {/* Toggle Run/Pause — always visible. No Resume button. */}
+        {isBusy ? (
+          <button className="btn btn-pause" onClick={handleToggle}>
             ⏸ Pause
           </button>
-        )}
-
-        {/* Continue/Resume — visible when PAUSED */}
-        {isPaused && (
-          <button className="btn btn-pause" onClick={handleContinue}>
-            ▶ Resume
-          </button>
-        )}
-
-        {/* Stop — visible when RUNNING, PAUSED, or WAITING_FOR_USER */}
-        {(isBusy || isPaused || isWaiting) && (
-          <button className="btn btn-stop" onClick={handleStop}>
-            ⏹ Stop
+        ) : isPausing ? (
+            <button className="btn btn-pause" disabled>
+              ⏸ Pausing…
+            </button>
+        ) : (
+          <button
+            className="btn btn-run"
+            onClick={handleToggle}
+            disabled={!query.trim() && isIdle}
+          >
+            ▶ Run
           </button>
         )}
       </div>
     </div>
   )
 }
+
+export default React.memo(QueryBar)

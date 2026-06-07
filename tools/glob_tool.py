@@ -13,10 +13,11 @@ import sys
 import glob
 import fnmatch
 from pathlib import Path
-from typing import List, Optional, Literal
+from typing import ClassVar, List, Optional, Literal
 from pydantic import Field
 
 class GlobTool(ToolBase):
+    required_categories: ClassVar[List[str]] = ["filesystem:read"]
     """Find files and directories using glob patterns.
 
     Features:

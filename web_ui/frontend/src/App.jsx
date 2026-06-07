@@ -30,6 +30,7 @@ import useStore from './store/useStore'
 import SessionTab from './components/SessionTab'
 import SessionList from './components/SessionList'
 import TabBar from './components/TabBar'
+import SessionActionsPanel from './components/SessionActionsPanel'
 import './styles.css'
 
 const WS_URL = `ws://${window.location.hostname}:8000/ws`
@@ -45,10 +46,14 @@ export default function App() {
   const [hubWs, setHubWs] = useState(null)
   const hubHasConnectedOnceRef = useRef(false)   // persist past StrictMode double-mount
   const [hubReady, setHubReady] = useState(false)
-  const tabActionsRef = useRef({})   // tabId -> { sendCommand }
+  const [sessionPanelOpen, setSessionPanelOpen] = useState(false)
+
+  const tabActionsRef = useRef({})   // tabId -> { sendCommand, getSessionId }
 
   // ── Hub WebSocket (sessions list only) with auto-reconnect ────────────
   const reconnectTimeoutRef = useRef(null)
+  const reconnectAttemptsRef = useRef(0)
+  const MAX_RECONNECT_ATTEMPTS = 5
   const connectHub = useCallback(() => {
     // Guard: prevent duplicate connections (StrictMode double-mount)
     if (hubHasConnectedOnceRef.current) {
@@ -71,6 +76,8 @@ export default function App() {
       console.log("[Hub WS] onopen")
       // Already set at connectHub entry; this is just a sanity double-set
       hubHasConnectedOnceRef.current = true
+      // Reset reconnect counter on successful connection
+      reconnectAttemptsRef.current = 0
       setHubWs(ws)
       ws.send(JSON.stringify({ command: 'list_sessions' }))
     }
@@ -92,11 +99,16 @@ export default function App() {
     ws.onclose = (e) => {
       setHubWs(null)
       setHubReady(false)
-      // 1001 = normal close (component unmounting), keep flag, don't reconnect
+      // 1001 = normal close (component unmounting / page unload), keep flag, don't reconnect
       if (e.code !== 1001) {
+        reconnectAttemptsRef.current += 1
+        if (reconnectAttemptsRef.current > MAX_RECONNECT_ATTEMPTS) {
+          console.warn(`[Hub WS] Reconnect limit (${MAX_RECONNECT_ATTEMPTS}) reached after ${reconnectAttemptsRef.current} attempts — giving up`)
+          return
+        }
         hubHasConnectedOnceRef.current = false  // allow reconnection on real errors
         const delay = 1000 + Math.random() * 3000  // 1–4s jitter
-        console.log(`[Hub WS] disconnected, reconnecting in ${Math.round(delay)}ms...`)
+        console.log(`[Hub WS] disconnected (attempt ${reconnectAttemptsRef.current}/${MAX_RECONNECT_ATTEMPTS}), reconnecting in ${Math.round(delay)}ms...`)
         reconnectTimeoutRef.current = setTimeout(connectHub, delay)
       }
     }
@@ -108,9 +120,31 @@ export default function App() {
     return ws
   }, [])
 
+  // ── WebSocket lifecycle + clean close on page unload ──────────────
   useEffect(() => {
     const ws = connectHub()
+
+    const handleBeforeUnload = () => {
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current)
+        reconnectTimeoutRef.current = null
+      }
+      // Close with code 1001 (going away) — the reconnect logic skips 1001,
+      // so stale/old pages won't keep reconnecting on refresh/close.
+      try {
+        const current = wsRef.current
+        if (current && (current.readyState === WebSocket.OPEN || current.readyState === WebSocket.CONNECTING)) {
+          current.close(1001, 'page unload')
+        }
+      } catch {
+        // ignore — WebSocket may already be closed
+      }
+    }
+
+    window.addEventListener('beforeunload', handleBeforeUnload)
+
     return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload)
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current)
       }
@@ -151,6 +185,16 @@ export default function App() {
         }
         // hubReady is set to true in onmessage after handleHubEvent returns
         break
+      case 'session_loaded':
+        // New session created via hub WS — open a tab with the real sessionId
+        if (msg.session_id) {
+          console.log('[Hub WS] session_loaded, opening tab for', msg.session_id)
+          loadTab(msg.session_id)
+          // Refresh sessions list so the new session appears in the sidebar
+          wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
+        }
+        break
+
       default:
         // Other events (state_changed, conversation_changed, etc.)
         // are handled by individual SessionTab WebSockets.
@@ -164,6 +208,11 @@ export default function App() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return
     ws.send(JSON.stringify({ command, ...payload }))
   }, [])
+
+  // ── Handle session renamed (triggered by SessionTab via callback) ───────
+  const handleSessionRenamed = useCallback((sessionId, newName) => {
+    hubSend('list_sessions')
+  }, [hubSend])
 
   // ── Tab management ──────────────────────────────────────────────────────
   const addTab = useCallback((sessionId = null) => {
@@ -217,16 +266,35 @@ export default function App() {
   }, [activeTabId])
 
   const handleNewTab = useCallback(() => {
-    addTab(null) // null sessionId = fresh session
-  }, [addTab])
+    // Send new_session via hub WS — the hub WS handler will respond
+    // with session_loaded, which creates the tab with a real sessionId.
+    hubSend('new_session')
+  }, [hubSend])
 
   // Open an existing session in a tab (called from SessionList sidebar)
   const handleOpenTab = useCallback((sessionId) => {
     loadTab(sessionId)
   }, [loadTab])
 
-  const handleRunningChange = useCallback((tabId, isRunning) => {
-    setTabRunningStates((prev) => ({ ...prev, [tabId]: isRunning }))
+  // ── Session actions panel toggle (shown/hidden via ⚙️ cogwheel) ────────
+  // When a tab is active, opens the slide-in SessionActionsPanel with
+  // Save As… (to name the current session) and Delete Session.
+  // When no tabs are open, toggles the SessionList sidebar instead.
+  const handleCogwheelClick = useCallback(() => {
+    if (tabs.length > 0 && activeTabId) {
+      setSessionPanelOpen((prev) => !prev)
+    } else {
+      setShowSessions((prev) => !prev)
+    }
+  }, [tabs.length, activeTabId])
+
+  const handleOpenSessionFromPanel = useCallback((sessionId) => {
+    loadTab(sessionId)
+    setSessionPanelOpen(false)
+  }, [loadTab])
+
+  const handleRunningChange = useCallback((tabId, status) => {
+    setTabRunningStates((prev) => ({ ...prev, [tabId]: status }))
   }, [])
 
   const handleSessionSaved = useCallback((sessionId) => {
@@ -234,11 +302,23 @@ export default function App() {
     hubSend('list_sessions')
   }, [hubSend])
 
-  const handleNewSessionCreated = useCallback((sessionId) => {
+  const handleNewSessionCreated = useCallback((sessionId, sessionName) => {
     // Update the tab that created this session with its new sessionId
     setTabs((prev) =>
       prev.map((t) => (t.sessionId === null ? { ...t, sessionId } : t))
     )
+    // If we got a session name, immediately add/update it in the sessions store
+    // so the tab label shows a human-readable name instead of a UUID truncation.
+    if (sessionName) {
+      const store = useStore.getState()
+      const existing = store.sessions.find((s) => s.session_id === sessionId)
+      if (!existing) {
+        store.setSessions([
+          ...store.sessions,
+          { session_id: sessionId, name: sessionName },
+        ])
+      }
+    }
   }, [])
 
   // ── Tab action registry (for save from SessionList) ───────────────────
@@ -246,10 +326,51 @@ export default function App() {
     tabActionsRef.current[tabId] = actions
   }, [])
 
-  const handleSaveActiveTab = useCallback(() => {
-    const actions = tabActionsRef.current[activeTabId]
-    if (actions?.sendCommand) {
-      actions.sendCommand('save_session')
+  // ── Reliable rename via per-tab WS (Task 2) ──────────────────────────
+  const handleRename = useCallback((sessionId, newName) => {
+    // Find a tab that owns this session
+    const tabEntry = tabs.find((t) => t.sessionId === sessionId)
+    if (tabEntry) {
+      const actions = tabActionsRef.current[tabEntry.tabId]
+      if (actions?.sendCommand) {
+        actions.sendCommand('rename_session', { session_id: sessionId, new_name: newName })
+        return
+      }
+    }
+    // Fallback: use hub WS if no tab is open for this session
+    hubSend('rename_session', { session_id: sessionId, new_name: newName })
+  }, [tabs, hubSend])
+
+  // ── Reliable delete via per-tab WS (Task 3) ──────────────────────────
+  const handleDelete = useCallback((sessionId) => {
+    // Find a tab that owns this session
+    const tabEntry = tabs.find((t) => t.sessionId === sessionId)
+    if (tabEntry) {
+      const actions = tabActionsRef.current[tabEntry.tabId]
+      if (actions?.sendCommand) {
+        // Close the tab first, then delete
+        initiateCloseTab(tabEntry.tabId)
+        actions.sendCommand('delete_session', { session_id: sessionId })
+        // Refresh sessions list immediately so the sidebar updates
+        hubSend('list_sessions')
+        return
+      }
+    }
+    // Fallback: use hub WS if no tab is open for this session
+    hubSend('delete_session', { session_id: sessionId })
+    hubSend('list_sessions')
+  }, [tabs, hubSend, initiateCloseTab])
+
+  // After delete from panel, close the panel
+  const handleDeleteFromPanel = useCallback((sessionId) => {
+    handleDelete(sessionId)
+    setSessionPanelOpen(false)
+  }, [handleDelete])
+
+  // ── Persist activeTabId in localStorage ────────────────────────────
+  useEffect(() => {
+    if (activeTabId) {
+      localStorage.setItem('activeTabId', activeTabId)
     }
   }, [activeTabId])
 
@@ -266,6 +387,8 @@ export default function App() {
   }))
 
   const activeTab = tabs.find((t) => t.tabId === activeTabId)
+  const activeSessionId = activeTab?.sessionId
+  const activeSessionName = activeSessionId ? (sessionMap[activeSessionId] || 'Untitled') : 'New Session'
 
   // ── Render ──────────────────────────────────────────────────────────────
   return (
@@ -277,6 +400,7 @@ export default function App() {
         onCloseTab={initiateCloseTab}
         onNewTab={handleNewTab}
         runningStates={tabRunningStates}
+        onCogwheelClick={handleCogwheelClick}
       />
 
       <div className="app-main">
@@ -303,44 +427,47 @@ export default function App() {
                   onSessionSaved={handleSessionSaved}
                   onRegister={(actions) => handleRegisterTab(tab.tabId, actions)}
                   onRunningChange={handleRunningChange}
+                  onSessionRenamed={handleSessionRenamed}
                 />
               </div>
             ))
           )}
         </div>
 
-        {/* Sessions sidebar — hidden by default, toggle with ☰ */}
-        <div className={`session-sidebar ${showSessions ? 'open' : ''}`}>
+        {/* Sessions sidebar — always visible when no tabs are open, toggle via ⚙️ cogwheel */}
+        <div className={`session-sidebar ${(showSessions || tabs.length === 0) ? 'open' : ''}`}>
           <SessionList
             sessions={sessions}
-            onSave={handleSaveActiveTab}
-            saveEnabled={activeTabId != null}
             onNew={handleNewTab}
             onOpenTab={handleOpenTab}
-            onDelete={(sessionId) => hubSend('delete_session', { session_id: sessionId })}
-            onRename={(sessionId, newName) =>
-              hubSend('rename_session', { session_id: sessionId, new_name: newName })
-            }
+            onDelete={handleDelete}
+            onRename={handleRename}
           />
         </div>
 
-        {/* Toggle button for sessions sidebar */}
-        <button
-          className="session-toggle"
-          onClick={() => {
-            console.time('toggleSessions')
-            setShowSessions((s) => {
-              const next = !s
-              // Profile after state update — timeEnd on next frame
-              requestAnimationFrame(() => console.timeEnd('toggleSessions'))
-              return next
-            })
-          }}
-          title="Toggle sessions list"
-        >
-          ☰
-        </button>
       </div>
+
+      {/* Session Actions Panel */}
+      {sessionPanelOpen && activeTab && (
+        <SessionActionsPanel
+          sessionId={activeSessionId}
+          sessionName={activeSessionName}
+          onClose={() => setSessionPanelOpen(false)}
+          onRename={(id, name) => {
+            handleRename(id, name)
+            // Also send save_session to persist name immediately
+            const tabEntry = tabs.find((t) => t.sessionId === id)
+            if (tabEntry) {
+              const actions = tabActionsRef.current[tabEntry.tabId]
+              actions?.sendCommand?.('save_session')
+            }
+            setSessionPanelOpen(false)
+          }}
+          onDelete={handleDeleteFromPanel}
+          sessionsList={sessions}
+          onOpenSession={handleOpenSessionFromPanel}
+        />
+      )}
     </div>
   )
 }

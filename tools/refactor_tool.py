@@ -4,7 +4,7 @@ Combines the structural understanding of CodeModifier with the multi‑file capa
 """
 from pathlib import Path
 from pydantic import Field
-from typing import List, Dict, Any, Optional, Literal
+from typing import ClassVar, List, Dict, Any, Optional, Literal
 import difflib
 import tempfile
 import shutil
@@ -63,6 +63,7 @@ def _commit_changes_atomically(modified_contents):
 
 
 class RefactorTool(ToolBase):
+    required_categories: ClassVar[List[str]] = ["filesystem:write"]
     """
     Apply CodeModifier operations to all files matching a glob pattern.
     Supports preview mode and atomic application (all files succeed or none are written).

@@ -15,60 +15,106 @@ Coding conventions, setup instructions, and development workflows.
 (To be populated)
 
 ## Logging API Reference
-## Logging API Reference
 
-*(Migrated from docs/logging_manual.md — Last validated: 2026-05-05)*
+*(Migrated from docs/logging_manual.md — Last validated: 2026-05-22)*
 
 ### Adding a Log Statement
 ```python
 from agent.logging import log
 
-log(level: str, tag: str, message: str, data: dict = None)
+log(level: str | LogLevel, tag: str, message: str, data: dict = None)
 ```
 
 | Parameter | Description | Example |
 |-----------|-------------|---------|
-| `level` | "DEBUG", "INFO", "WARNING", "ERROR" | `"DEBUG"` |
+| `level` | `"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"` | `"DEBUG"` |
 | `tag` | Hierarchical component name (area.component) | `"tools.file_editor"` |
 | `message` | Human-readable description | `"Writing file"` |
-| `data` | Optional dict (auto-truncated) | `{"path": p, "size": n}` |
+| `data` | Optional dict (auto‑truncated) | `{"path": p, "size": n}` |
 
 Example:
 ```python
 log("DEBUG", "core.pruning", "Pruning context", {"kept": 5, "removed": 2})
 ```
 
+### Console Output Format
+Every console line includes an `[HH:MM:SS]` timestamp:
+```
+[14:23:01] DEBUG    [core.pruning] Pruning context | {"kept": 5, "removed": 2}
+[14:23:02] INFO     [server.config] Config loaded
+[14:23:05] WARNING  [llm.stepfun] Rate limit approaching
+```
+
 ### Tag Naming Convention
-Use `area.component` format:
-- **core** — agent core, session, pruning, config
-- **tools** — file_editor, docker, search
-- **llm** — anthropic, openai, stepfun
-- **ui** — presenter, output_panel, events
-- **session** — history_provider, context_builder
+Use `area.component`. Components are organized as:
+
+| Area | Components |
+|------|------------|
+| `core` | session, pruning, config, controller, context_builder, turn_transaction, token_counter |
+| `tools` | file_editor, docker_code_runner, docker_executor (container, policy, build), search |
+| `llm` | anthropic, openai, stepfun |
+| `server` | config, bridge |
+| `ui` | presenter, output_panel, events |
+| `session` | history_provider, context_builder |
 
 ### Console Output Control
 | Variable | Effect | Default |
 |----------|--------|---------|
-| `TM_LOG_LEVEL` | Minimum console level | WARNING |
-| `TM_LOG_TAGS` | Comma-separated tags to show at DEBUG/INFO | (empty) |
+| `TM_LOG_LEVEL` | Minimum console level | `INFO` |
+| `TM_LOG_TAGS` | Comma‑separated tags to show (empty = only WARNING+) | _(empty)_ |
 | `DEBUG_<COMP>` | Legacy flag for a single component | – |
-| `THOUGHTMACHINE_DEBUG=1` | Firehose (all debug) | – |
+| `THOUGHTMACHINE_DEBUG=1` | Firehose (all debug) – use sparingly | – |
 
-Examples:
+**Filtering logic:**
+1. If `TM_LOG_TAGS` is empty → only WARNING, ERROR, CRITICAL shown
+2. If `TM_LOG_TAGS` is set → matching tags shown at `>= TM_LOG_LEVEL`
+3. Wildcard: `server.*` matches `server.config`, `server.bridge`, etc.
+4. Per‑component `DEBUG_*` env vars override everything
+5. Runtime `set_log_tags()` / `set_log_level()` override env vars at runtime
+
+**Workflow examples:**
 ```bash
-# Debug only pruning and all tools
-export TM_LOG_LEVEL=DEBUG
-export TM_LOG_TAGS=core.pruning,tools.*
+# See everything in the server layer (INFO + DEBUG)
+export TM_LOG_TAGS=server.*
 
-# Quick single-component debug
+# Focus: only server config + bridge + controller lifecycle
+export TM_LOG_TAGS=server.*,core.controller
+
+# Firehose: everything at DEBUG (warning: very verbose!)
+export THOUGHTMACHINE_DEBUG=1
+
+# Quick single-component debug (legacy)
 export DEBUG_EVENTBUS=1
 
-# Back to quiet (default)
-unset TM_LOG_LEVEL TM_LOG_TAGS DEBUG_EVENTBUS
+# Back to quiet
+unset TM_LOG_LEVEL TM_LOG_TAGS THOUGHTMACHINE_DEBUG
+```
+
+### Runtime API
+These functions change filtering at runtime without restarting:
+
+```python
+from agent.logging import set_log_level, set_log_tags, show_log_config
+
+set_log_level("DEBUG")                              # string form
+set_log_level("INFO")                                # back to normal
+
+set_log_tags("core.*,tools.file_editor")             # string (comma-separated)
+set_log_tags(["core.session", "llm.stepfun"])         # list
+set_log_tags("*")                                     # firehose (all tags)
+set_log_tags("")                                      # back to default (WARNING+ only)
+
+config = show_log_config()   # returns dict: log_level, log_tags, truncation, env_vars
 ```
 
 ### File Logging (JSONL)
-`TM_LOG_FILE_LEVEL` controls minimum level written to JSONL file (default: DEBUG). All logs go to `logs/agent_<session_id>.jsonl`. Rotation: 10 MB, 5 backups.
+| Variable | Effect | Default |
+|----------|--------|---------|
+| `TM_LOG_FILE_LEVEL` | Minimum level written to JSONL file | `DEBUG` |
+| `TM_LOG_DIR_MAX_MB` | Hard limit on total log directory size (0 = unlimited) | `50` |
+
+All logs written to `logs/agent_<session_id>.jsonl`. Rotation: 10 MB, 5 backups.
+Total directory size capped at `TM_LOG_DIR_MAX_MB` — oldest files deleted when exceeded.
 
 ### Truncation (Prevents Bloat)
 | Variable | Default | Applies To |
@@ -81,11 +127,15 @@ unset TM_LOG_LEVEL TM_LOG_TAGS DEBUG_EVENTBUS
 | `TM_CONVERSATION_CONTENT_TRUNCATE` | 10000 | Conversation messages in JSONL |
 | `TM_DOCKER_OUTPUT_TRUNCATE` | 10000 | Docker sandbox output |
 
+> **Note:** JSONL files receive data truncated once by type‑specific limits; console applies an additional truncation pass for readability.
+
 ### Best Practices
-- Use **DEBUG** for temporary instrumentation (won't spam unless explicitly enabled)
-- Use **INFO** for normal noteworthy events
-- Choose a **specific tag** (e.g., `"tools.my_new_tool"`)
-- Provide a **data dict** even for minimal context
+- Use **DEBUG** for temporary instrumentation – it won't spam unless explicitly enabled.
+- Use **INFO** for normal noteworthy events.
+- Choose a **specific tag** (e.g., `"tools.my_new_tool"`).
+- Provide a **data dict** even for minimal context.
+- Use `set_log_tags()` and `set_log_level()` during development to toggle filters.
+- Use `show_log_config()` in diagnostic output or `/debug` endpoints.
 
 ## DockerCodeRunner Usage
 ## DockerCodeRunner Usage
@@ -329,3 +379,105 @@ Added debug logging to `web_ui/backend/bridge.py`:
    - Includes full event dict and keys list
 
 3. **Truncation** — Both `log()` calls use default `truncate_hint=None`, which means `_truncate_data` passes data through unchanged, preserving full diagnostic data in JSONL file logs. Console output may still truncate the display line per `TM_DEBUG_TRUNCATE_LENGTH`.
+
+## 2026-05-30 — ## Feature: `--serve-frontend` CLI flag (2026-06-02)
+
+Added ...
+
+## Feature: `--serve-frontend` CLI flag (2026-06-02)
+
+Added `--serve-frontend` flag to `web_ui/backend/server.py` main() so the backend can build and serve the React frontend directly, eliminating the need for a separate Vite dev server.
+
+**How it works:**
+1. `python -m web_ui.backend.server --serve-frontend` auto-builds the frontend via `npm run build` (if `dist/` doesn't exist)
+2. Mounts `web_ui/frontend/dist/` as `StaticFiles(html=True)` at `/`
+3. Root `/` serves `index.html` instead of the JSON info response
+4. SPA catch-all route `/{path:path}` serves `index.html` for client-side routing paths
+5. API routes (`/health`, `/api/browse`, `/ws`) still work unaffected
+6. Supports `--host`, `--port`, `--reload` flags and env var overrides (`HOST`, `PORT`, `RELOAD`)
+
+**Edge cases handled:**
+- Missing Node.js/npm → graceful error message
+- Build failure → warns but still starts (shows build-error page)
+- Missing `dist/` → triggers auto-build
+- API paths under catch-all → returns 404 (not SPA fallback)
+
+## 2026-05-30 — ## Install & Run Scripts (created 2026-05-30)
+
+Two scripts w...
+
+## Install & Run Scripts (created 2026-05-30)
+
+Two scripts were added to the project root:
+
+- **`install_thoughtmachine.sh`** — Full install: checks Python >=3.11 & Node.js, creates `.venv`, pip installs requirements, npm installs & builds frontend.
+- **`start_thoughtmachine.sh`** — Activates `.venv` and starts server with `--serve-frontend` on `127.0.0.1:8000` (override via `HOST`/`PORT` env vars).
+
+Usage: `./install_thoughtmachine.sh && ./start_thoughtmachine.sh`
+
+## Pre-Release Fixes Applied
+
+## 2026-05-31 — **2026-06-02 — Three pre-release fixes applied:**
+
+1. **Fixe...
+
+**2026-06-02 — Three pre-release fixes applied:**
+
+1. **Fixed hardcoded workspace path** (`resources/default_config.json`): Changed `workspace_path` from `"/home/jojo/PycharmProjects/ThoughtMachine-dev"` to `""` — new users no longer get a broken path copied to their config.
+
+2. **Cleaned stale tool names** (`resources/default_config.json`): Removed `"Final"`, `"FinalReport"`, `"RequestUserInteraction"` from `enabled_tools` — these were consolidated into `"Respond"` and no longer exist as tools.
+
+3. **Install script polish** (`install_thoughtmachine.sh`):
+   - Added `chmod +x` for both `start_thoughtmachine.sh` and `install_thoughtmachine.sh` at end of install
+   - Improved completion message: numbered next-steps, mentions auto-config creation, shows URL
+
+4. **Handbook correction** (`resources/global_kb/handbook.md`): Updated "First Run" section to reflect that config is auto-created by the server bootstrap, not manually.
+
+**Files changed:** resources/default_config.json, install_thoughtmachine.sh, resources/global_kb/handbook.md
+
+## Build Scripts
+
+## 2026-05-31 — ## Build Scripts
+
+**2025-07-14**: Created two build scripts ...
+
+## Build Scripts
+
+**2025-07-14**: Created two build scripts for PyInstaller packaging:
+
+- **`build_thoughtmachine_exe.sh`** (Linux/macOS) — Bash script, 5 steps: (1) build React frontend, (2-4) check/install Python deps, (5) run PyInstaller in one-folder (default via `thoughtmachine.spec`) or one-file mode (`ONE_FILE=1`).
+- **`build_thoughtmachine_exe.bat`** (Windows) — Batch script equivalent with same 5 steps. Uses `set ONE_FILE=1` for one-file mode. Uses Windows path separators throughout. Helpers: `:info`, `:ok`, `:warn`, `:err` subroutines.
+
+## Requirements
+
+## 2026-05-31 — ## Requirements Split (2025-07-14)
+
+Split `requirements.txt`...
+
+## Requirements Split (2025-07-14)
+
+Split `requirements.txt` into core + optional RAG to reduce venv bloat:
+
+- **`requirements.txt`** — Core dependencies only (FastAPI, uvicorn, pydantic, openai, anthropic, tiktoken, docker, etc.). ~200 MB venv.
+- **`requirements-rag.txt`** — Optional RAG stack (CPU-only PyTorch via `--index-url`, sentence-transformers, chromadb, langchain). ~500 MB extra.
+- **`install_thoughtmachine.sh`** — Now accepts `--with-rag` flag to install RAG deps.
+
+Removed from core: `PyQt6` (legacy GUI, not needed for web UI), `sentence-transformers`, `chromadb`, `langchain`, `langchain-community`.
+
+
+## 2026-06-01 — ## 2026-06-03 — New User Onboarding System (Created)
+
+### Wh...
+
+## 2026-06-03 — New User Onboarding System (Created)
+
+### What was done
+1. **Created `user/onboarding_guide.md` in global KB** — A friendly, non-technical guide for new ThoughtMachine users. Explains concepts in plain language (workspace, session, KB). Gives suggested "first things to say." Doesn't assume prior knowledge. Warm, guided tone.
+
+2. **Added Rule 14 to system prompt** — Both `system_prompt.txt` (root, actually loaded) and `resources/default_system_prompt.txt` (template) now contain:
+   > *"When interacting with someone who seems new to ThoughtMachine, offer a guided, friendly experience. Do not assume prior knowledge — explain concepts like workspaces, sessions, and the knowledge base in plain language. Check the global KB's `user/onboarding_guide.md` for a ready-to-use friendly introduction. Suggest clear next steps. Invite questions."*
+
+### Still open / not implemented
+- **No first-time user detection mechanism** — The agent needs some way to know it's talking to a new user. Options: check for a marker in global KB (e.g., `user/user_profile.md`), or simply run onboarding when the user seems confused.
+- **The "View Artifact" tool** — Previously brainstormed idea. Could pair well with onboarding (agent generates a welcome page and presents it visually).
+

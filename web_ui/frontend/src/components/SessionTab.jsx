@@ -23,6 +23,11 @@ import ChatPanel from './ChatPanel'
 import QueryBar from './QueryBar'
 import StatusBar from './StatusBar'
 import ConfigPanel from './ConfigPanel'
+import SecurityDialog from './SecurityDialog'
+
+const CONFIG_PANEL_MIN_WIDTH = 200
+const CONFIG_PANEL_MAX_WIDTH = 500
+const CONFIG_PANEL_DEFAULT_WIDTH = 280
 
 const WS_URL = `ws://${window.location.hostname}:8000/ws`
 
@@ -36,26 +41,71 @@ const INITIAL_STATE = {
   tokensOut: 0,
   contextLength: 0,
   isRunning: false,
-  config: {
-    temperature: 0.7,
-    max_turns: 20,
-    provider: 'openai',
-    tools: [
-      { name: 'bash', enabled: true },
-      { name: 'file_read', enabled: false },
-    ],
-  },
+  config: null,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
-function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewSession, onSessionSaved, onRegister, onRunningChange }) {
+function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewSession, onSessionSaved, onRegister, onRunningChange, onSessionRenamed }) {
   const [state, setState] = useState(INITIAL_STATE)
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
+  const [providers, setProviders] = useState([])
+  const [availableTools, setAvailableTools] = useState([])
   const wsRef = useRef(null)
   const closedRef = useRef(false)  // prevent double-close
   const tabConnectingRef = useRef(false)  // prevent StrictMode duplicate
+  const pendingCommandsRef = useRef([])  // queued commands for retry
+  const connectSessionWsRef = useRef(null)  // ref to avoid circular deps in sendCommand
+  const [wsConnected, setWsConnected] = useState(false)
+  const [defaultConfigSaveStatus, setDefaultConfigSaveStatus] = useState(null) // null | 'ok' | 'error'
+  const [defaultConfigSaveMessage, setDefaultConfigSaveMessage] = useState('')
+  const [securityPrompt, setSecurityPrompt] = useState(null) // null | { request_id, tool_name, capabilities, ... }
+
+  // ── Config panel resize state (persisted per tab) ──────────────────
+  const [configPanelWidth, setConfigPanelWidth] = useState(() => {
+    if (tabId) {
+      const saved = localStorage.getItem(`config-panel-width:${tabId}`)
+      if (saved) return Math.max(CONFIG_PANEL_MIN_WIDTH, Math.min(CONFIG_PANEL_MAX_WIDTH, Number(saved)))
+    }
+    return CONFIG_PANEL_DEFAULT_WIDTH
+  })
+  const dragRef = useRef(null) // { startX, startWidth }
+
+  // Persist width changes
+  const handleWidthChange = useCallback((newWidth) => {
+    setConfigPanelWidth(newWidth)
+    if (tabId) {
+      localStorage.setItem(`config-panel-width:${tabId}`, String(newWidth))
+    }
+  }, [tabId])
+
+  const handleResizeStart = useCallback((e) => {
+    e.preventDefault()
+    dragRef.current = { startX: e.clientX, startWidth: configPanelWidth }
+
+    // Set cursor on body during drag
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+
+    const handleMouseMove = (e) => {
+      if (!dragRef.current) return
+      const delta = e.clientX - dragRef.current.startX
+      const newWidth = Math.max(CONFIG_PANEL_MIN_WIDTH, Math.min(CONFIG_PANEL_MAX_WIDTH, dragRef.current.startWidth + delta))
+      handleWidthChange(newWidth)
+    }
+
+    const handleMouseUp = () => {
+      dragRef.current = null
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+      document.removeEventListener('mousemove', handleMouseMove)
+      document.removeEventListener('mouseup', handleMouseUp)
+    }
+
+    document.addEventListener('mousemove', handleMouseMove)
+    document.addEventListener('mouseup', handleMouseUp)
+  }, [configPanelWidth])
 
   // ── Derived helpers ─────────────────────────────────────────────────────
   const update = useCallback((patch) => {
@@ -64,8 +114,8 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
 
   // ── Notify parent when running state changes (for tab color) ────────
   useEffect(() => {
-    onRunningChange?.(tabId, state.isRunning)
-  }, [state.isRunning, tabId, onRunningChange])
+    onRunningChange?.(tabId, state.status)
+  }, [state.status, tabId, onRunningChange])
 
   // ── Debug: log whenever history changes ─────────────────────────────
   useEffect(() => {
@@ -74,12 +124,21 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
       'last role:', state.history[state.history.length - 1]?.role)
   }, [state.history])
 
-  // ── sendCommand — sends over this tab's WebSocket ──────────────────────
+  // ── sendCommand — sends over this tab's WebSocket with auto-queue ───
+  // If the WS is not OPEN, the command is queued and resent once the
+  // connection is re-established.
   const sendCommandRef = useRef(null)
   const sendCommand = useCallback((command, payload = {}) => {
     const ws = wsRef.current
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      console.warn('[SessionTab] Cannot send — WS not connected')
+      console.warn('[SessionTab] WebSocket not connected. Command queued for retry.')
+      pendingCommandsRef.current.push({ command, payload })
+      // Attempt immediate reconnect
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current)
+        reconnectTimeoutRef.current = null
+      }
+      connectSessionWsRef.current?.()
       return
     }
     console.log(`[SessionTab] Sending command: ${command}`, JSON.stringify({ command, ...payload }))
@@ -114,6 +173,15 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
     ws.onopen = () => {
       console.log(`[SessionTab ${sessionId || 'new'}] WS onopen`)
       tabConnectingRef.current = false
+      setWsConnected(true)
+
+      // Drain any commands that were queued while disconnected
+      const pending = pendingCommandsRef.current
+      pendingCommandsRef.current = []
+      for (const cmd of pending) {
+        console.log(`[SessionTab] Sending queued command: ${cmd.command}`)
+        ws.send(JSON.stringify({ command: cmd.command, ...cmd.payload }))
+      }
 
       // Register sendCommand with parent (use ref to avoid stale closure)
       onRegister?.({ sendCommand: sendCommandRef.current, getSessionId: () => currentSessionId })
@@ -128,6 +196,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
       } else {
         ws.send(JSON.stringify({ command: 'new_session' }))
       }
+
+      // Fetch providers and tools list for this session
+      sendCommand('get_providers')
+      sendCommand('get_available_tools')
     }
 
     ws.onmessage = (event) => {
@@ -141,6 +213,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
 
     ws.onclose = (e) => {
       tabConnectingRef.current = false
+      setWsConnected(false)
       // 1001 = normal close (component unmounting), don't reconnect
       if (e.code !== 1001 && !closedRef.current) {
         const delay = 1000 + Math.random() * 3000  // 1–4s jitter
@@ -153,6 +226,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
       // onclose fires right after onerror, so we let onclose handle reconnection
     }
   }, [sessionId, onRegister])  // no sendCommand dep needed — accessed via ref
+  connectSessionWsRef.current = connectSessionWs
 
   // Connect only after hub is ready, with optional stagger delay
   useEffect(() => {
@@ -206,22 +280,31 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
         break
 
       case 'conversation_changed':
-        update({ history: msg.messages ?? [] })
+        console.log('conversation_changed RAW:', msg)
+        // Trust the server's is_system_notification flag — no index-based
+        // fallback that could leak the flag to wrong messages (Bug 2 & 3).
+        const serverMessages = msg.messages ?? [];
+        const mergedMessages = serverMessages.map((m) => ({
+          ...m,
+          is_system_notification: m.is_system_notification || false,
+        }));
+        const notes = mergedMessages.filter(m => m.is_system_notification);
+        if (notes.length > 0) console.log('🔔 SYSTEM NOTIFICATIONS:', notes);
+        update({ history: mergedMessages })
         break
 
       case 'config_changed':
-        // Merge received config with existing defaults so missing fields
-        // (like tools, provider) don't get nuked into undefined
-        update((prev) => ({
-          config: { ...prev.config, ...msg.config }
-        }))
+        // Replace config entirely with what the backend sends.
+        // The backend is now the single source of truth; it always sends
+        // a complete frontend-format config (including tools, provider, etc.).
+        update({ config: msg.config })
         break
 
       case 'status_message':
         update((prev) => ({
           history: [
             ...prev.history,
-            { role: 'system', content: msg.text ?? '' },
+            { role: 'system', content: msg.text ?? '', is_system_notification: true },
           ],
         }))
         break
@@ -233,17 +316,63 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
         }
         // If this is a new session (tab had no sessionId), notify parent
         if (msg.session_id && !sessionId) {
-          onNewSession?.(msg.session_id)
+          onNewSession?.(msg.session_id, msg.session_name)
         }
+        break
+
+      case 'providers_list':
+        setProviders(msg.providers || [])
+        break
+
+      case 'provider_saved':
+        console.log('[SessionTab] Provider saved:', msg.provider?.id)
+        break
+
+      case 'provider_deleted':
+        console.log('[SessionTab] Provider deleted:', msg.provider_id)
+        break
+
+      case 'tools_list':
+        setAvailableTools(msg.tools || [])
+        break
+
+      case 'default_config_saved':
+        setDefaultConfigSaveStatus(msg.status)
+        setDefaultConfigSaveMessage(msg.message || '')
         break
 
       case 'session_saved':
         onSessionSaved?.()
         break
 
+      case 'session_renamed':
+        // The session was renamed; update our currentSessionId if needed
+        if (msg.session_id) {
+          setCurrentSessionId(msg.session_id)
+        }
+        onSessionRenamed?.(msg.session_id, msg.new_name)
+        break
+
       case 'session_closed':
         closedRef.current = true
         onClose?.()
+        break
+
+      case 'session_deleted':
+        // Session was deleted from the store — close the tab
+        onClose?.()
+        break
+
+      case 'security_prompt':
+        // Show the security approval dialog (tool permission request)
+        console.log('[SessionTab] security_prompt:', msg)
+        setSecurityPrompt({
+          request_id: msg.request_id,
+          tool_name: msg.tool_name,
+          capabilities: msg.capabilities || [],
+          arguments: msg.arguments || {},
+          description: msg.description || `Tool '${msg.tool_name || 'unknown'}' requires your approval.`,
+        })
         break
 
       default:
@@ -263,8 +392,33 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, onClose, onNewS
         contextLength={state.contextLength}
       />
       <div className="app-main">
-        <ConfigPanel config={state.config} sendCommand={sendCommand} />
+        <ConfigPanel
+          config={state.config}
+          sendCommand={sendCommand}
+          providers={providers}
+          availableTools={availableTools}
+          panelWidth={configPanelWidth}
+          wsConnected={wsConnected}
+          defaultConfigSaveStatus={defaultConfigSaveStatus}
+          defaultConfigSaveMessage={defaultConfigSaveMessage}
+          onClearDefaultSaveStatus={() => {
+            setDefaultConfigSaveStatus(null)
+            setDefaultConfigSaveMessage('')
+          }}
+        />
+        <div
+          className="resize-handle"
+          onMouseDown={handleResizeStart}
+          title="Drag to resize"
+        />
         <div className="app-center">
+          {securityPrompt && (
+            <SecurityDialog
+              prompt={securityPrompt}
+              sendCommand={sendCommand}
+              onDismiss={() => setSecurityPrompt(null)}
+            />
+          )}
           <ChatPanel messages={state.history} />
           <QueryBar
             sendCommand={sendCommand}

@@ -3,15 +3,18 @@
 Project milestones, planned features, and long-term goals.
 
 ## Current Status
-## Current Status
-- **Phase 1 (Core State Machine):** ✅ Complete (1.1–1.14)
-- **Phase 2 (Event Pipeline + Token Restrictions):** ✅ Complete (1.15–1.18, plus event fixes)
-- **Phase 2.5 (Multi‑Session Tab Support & Full Session Restore):** 🟢 **Now** — being planned
-- **Phase 3 (GUI Adaptation & Grace-Turn Preservation):** 📋 Queued (after 2.5)
-- **Phase 4 (System Message Injection Audit):** 📋 Planned
-- **Phase 5 (Token Counting & Output Truncation Audit):** 📋 Planned
+
+**All previously planned phases 1–5 are ✅ COMPLETE.** See `task_tracker.md` for full completion details.
+
+### Remaining Future Work (No Immediate Priority)
 - **Phase 6 (Streaming LLM Support):** 📋 Planned
 - **Phase 7 (Standalone Agent Extraction):** 📋 Planned
+- **Security Layer GUI handler:** SECURITY_PROMPT events published but no dialog listens
+- **WebSocket reconnection robustness:** Needs comprehensive testing
+- **Docker container pooling image-ID verification:** Pattern documented, needs tests
+- **DeepSeek Reasoner tool calling:** XML tool call parsing for non-function-calling models
+- **Automatic RAG re-indexing:** No staleness detection; manual update-index only
+- **Performance I/O audit:** Session store caching added, full audit pending
 
 ## Upcoming Milestones (Ordered by Priority)
 
@@ -143,3 +146,93 @@ Project milestones, planned features, and long-term goals.
 - Would require modifying `unified.py` to read from a mutable source (settings object or polling env vars) instead of import-time constants
 
 **Why it wasn't done yet**: This is a cross-cutting change to the logging facade itself. The import-time env var approach is simple and works for restart-driven development. A proper GUI toggle needs careful design to avoid perf overhead from polling or callback registration.
+
+## 2026-05-25 — ## 2026-05-25 — Non-Urgent Items (Parked by Engineering Team...
+
+## 2026-05-25 — Non-Urgent Items (Parked by Engineering Team)
+
+Items with one-line dispositions so they don't clutter active thinking:
+
+| Item | Disposition |
+|------|-------------|
+| **F17 — Session management bugs** (naming, restore, third-query issue) | Real bugs. Session engineer to investigate with current code, not old assumptions. |
+| **F18 — Provider config + defaults for new installs** | Essential before public release. GUI engineer's next task after security prompts. |
+| **F19 — Installation (venv, Electron, one-click)** | Defer until provider config works. Then package. |
+| **F20 — Drag-and-drop file import** | See detailed design below (appended). GUI engineer side task. Pure frontend + one backend endpoint. |
+| **F21 — Scroll-to-latest button when user is scrolled up** | GUI engineer side task. |
+| **F22 — Config changes → system messages to LLM** | Core engineer. Tricky — the LLM might overreact. Needs a design doc. |
+| **F23 — Test other providers (not just DeepSeek)** | Do during provider config work (F18). |
+| **F24 — Delta message updates (not full snapshot each turn)** | GUI engineer optimization. After security prompts. |
+| **F25 — Docker: long-running tasks, Dockerfile view in GUI, "ask user" for env changes** | Part of the workspace-centric security model. |
+| **F26 — KB: semantic search, central "meta KB" vs workspace KB distinction** | KB engineer. After notebook panel. |
+
+*(Items already in roadmap — not duplicated: live logging toggle F15, streaming Phase 6, sysprompt library F7, async multi-agent F13)*
+
+## 2026-05-25 — F20 Design Detail: Drag-and-Drop File Import
+
+**Implementation sketch:**
+
+1. **Frontend:**
+   - Add `onDrop` / `onDragOver` handlers to the chat area (or a dedicated drop zone).
+   - Extract `File` objects from the drop event, create `FormData`, `POST` to a new backend endpoint.
+   
+2. **Backend:**
+   - `POST /api/workspace/upload` — receives the file, sanitises the filename (no path traversal), writes to the current session's workspace folder.
+   - Emit `workspace_changed` so the file browser refreshes.
+
+3. **Security:**
+   - Same‑origin check, token validation, file size cap (e.g. 50 MB).
+
+4. **UX:**
+   - Dashed border / highlight appears when a file is dragged over the agent area.
+
+## 2026-05-28 — ## Feature Ideas (Rough — added 2026-05-28)
+
+### 1. GUI-swit...
+
+## Feature Ideas (Rough — added 2026-05-28)
+
+### 1. GUI-switchable logging with tag selection
+Add a panel in the web UI that lets users:
+- Enable/disable logging in real time
+- Select which specific logging tags/levels are active (e.g., debug, info, tool_calls, sessions, errors)
+- Ideally backed by a dynamic log-filtering mechanism on the Python side so the agent can also toggle it
+
+### 2. Workspace size viewer / bloat monitor
+A small panel or status-bar widget that shows:
+- Total workspace directory size
+- File count and size breakdown by category (e.g., `.py`, logs, temp files, `.git`)
+- A warning indicator when something grows unexpectedly (bloat creeping in)
+- Maybe a "largest files" listing
+
+### 3. ShowFileToUser tool → dedicated GUI panel
+A new agent tool (e.g. `ShowFileToUser`) that:
+- Takes a file path
+- Opens/displays the file content in a special GUI panel in the web UI
+- Allows the user to view, scroll, and maybe copy content
+- The panel could be a dedicated "viewer" tab separate from the chat
+- Useful for the agent to show results without blowing up the context with file content
+
+## 2026-06-03 — ## Session Gossip Protocol (Idea)
+
+**Origin**: Config audit ...
+
+## Session Gossip Protocol (Idea)
+
+**Origin**: Config audit discussion, 2025
+
+**Concept**: Enable sessions (agent working threads) to "gossip" with each other — sharing relevant information autonomously without requiring the user to manually bridge them.
+
+**Proposed workflow**:
+1. User puts the system into a "safe position" (checkpoint)
+2. Agents gossip/shared relevant context across sessions
+3. Each agent can only continue work after the user reviews what it plans to do next
+
+**Known challenges**:
+- Security and access control (which sessions can talk to which?)
+- Information leakage prevention
+- User consent/permission at each step
+- Serialization of partial work state
+- Consensus/voting mechanisms if sessions disagree
+
+**Status**: Idea only — no implementation planned yet. Requires careful security design before any prototyping.

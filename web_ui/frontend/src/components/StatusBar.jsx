@@ -14,6 +14,8 @@ function statusDisplay(status) {
       return { className: 'status-idle', label: '● Idle' }
     case 'RUNNING':
       return { className: 'status-running', label: '● Running' }
+    case 'PAUSING':
+      return { className: 'status-pausing', label: '⏸ Pausing…' }
     case 'PAUSED':
       return { className: 'status-paused', label: '⏸ Paused' }
     case 'WAITING_FOR_USER':
@@ -23,7 +25,7 @@ function statusDisplay(status) {
   }
 }
 
-export default function StatusBar({ status, tokensIn, tokensOut, contextLength }) {
+function StatusBar({ status, tokensIn, tokensOut, contextLength }) {
   const { className, label } = statusDisplay(status)
 
   return (
@@ -36,3 +38,5 @@ export default function StatusBar({ status, tokensIn, tokensOut, contextLength }
     </div>
   )
 }
+
+export default React.memo(StatusBar)

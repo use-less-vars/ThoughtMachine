@@ -34,6 +34,7 @@ class TurnTransaction:
         self._assistant_message: Optional[Dict[str, Any]] = None
         self._tool_calls_buffer: List[Dict[str, Any]] = []
         self._committed = False
+        self._assistant_committed: bool = False
 
     def add_assistant_message(self, message: Dict[str, Any]) -> None:
         """
@@ -69,38 +70,76 @@ class TurnTransaction:
             raise ValueError("Tool result must have role='tool'")
         self._tool_calls_buffer.append(tool_result.copy())
 
+    def commit_assistant_only(self) -> List[Dict[str, Any]]:
+        """
+        Commit just the assistant message immediately, before tool execution.
+        
+        The transaction remains open to buffer tool results, which can be
+        committed via a subsequent commit() call. This enables the assistant's
+        response to be visible in user_history before tool execution completes,
+        preventing message loss on pause/interrupt.
+        
+        Returns:
+            List containing just the committed assistant message
+        """
+        if self._committed:
+            raise RuntimeError('Transaction already committed')
+        if not self._assistant_message:
+            raise RuntimeError('No assistant message to commit')
+        commit_messages = [self._assistant_message]
+        if self.session:
+            log('DEBUG', 'core.turn_transaction', f'[TurnTransaction] Extending user_history with assistant message (immediate commit)')
+            self.session.user_history.extend(commit_messages)
+            self.session.updated_at = datetime.now()
+        elif self.conversation is not None:
+            log('DEBUG', 'core.turn_transaction', f'[TurnTransaction] Extending fallback conversation with assistant message (immediate commit)')
+            self.conversation.extend(commit_messages)
+        if self.context_builder and hasattr(self.context_builder, 'clear_cache'):
+            self.context_builder.clear_cache()
+        self._assistant_committed = True
+        log('DEBUG', 'core.turn_transaction', 'TurnTransaction committed assistant message immediately (transaction still open for tool results)')
+        return commit_messages
+
     def commit(self) -> List[Dict[str, Any]]:
         """
         Commit all buffered messages atomically to session.user_history.
+        
+        If commit_assistant_only() was already called, only tool results
+        are committed. Otherwise, everything is committed atomically.
         
         Returns:
             List of committed messages in order of addition
         """
         if self._committed:
             raise RuntimeError('Transaction already committed')
-        if not self._assistant_message:
-            raise RuntimeError('No assistant message to commit')
-        commit_messages = []
-        commit_messages.append(self._assistant_message)
-        tool_calls = self._assistant_message.get('tool_calls', [])
-        for tc in tool_calls:
-            if tc.get('name') in ('Final', 'FinalReport', 'RequestUserInteraction'):
-                log('DEBUG', 'core.turn_transaction', f"TurnTransaction committing {tc['name']} tool call with result in commit_messages")
-                break
-        commit_messages.extend(self._tool_calls_buffer)
-        if self.session:
-            log('DEBUG', 'core.turn_transaction', f'[TurnTransaction] Extending user_history with {len(commit_messages)} messages')
-            log('DEBUG', 'core.turn_transaction', f'[TurnTransaction] user_history type: {type(self.session.user_history).__name__}, is ObservableList: {isinstance(self.session.user_history, ObservableList)}')
-            log('DEBUG', 'core.turn_transaction', f'[TurnTransaction] user_history id: {id(self.session.user_history)}')
-            self.session.user_history.extend(commit_messages)
-            self.session.updated_at = datetime.now()
-        elif self.conversation is not None:
-            log('DEBUG', 'core.turn_transaction', f'[TurnTransaction] Extending fallback conversation with {len(commit_messages)} messages (session=None)')
-            self.conversation.extend(commit_messages)
+        if self._assistant_committed:
+            # Assistant already committed; only tool results remain
+            commit_messages = list(self._tool_calls_buffer)
+        else:
+            if not self._assistant_message:
+                raise RuntimeError('No assistant message to commit')
+            commit_messages = []
+            commit_messages.append(self._assistant_message)
+            tool_calls = self._assistant_message.get('tool_calls', [])
+            for tc in tool_calls:
+                if tc.get('name') == 'Respond':
+                    log('DEBUG', 'core.turn_transaction', f"TurnTransaction committing {tc['name']} tool call with result in commit_messages")
+                    break
+            commit_messages.extend(self._tool_calls_buffer)
+        if commit_messages:
+            if self.session:
+                log('DEBUG', 'core.turn_transaction', f'[TurnTransaction] Extending user_history with {len(commit_messages)} messages')
+                log('DEBUG', 'core.turn_transaction', f'[TurnTransaction] user_history type: {type(self.session.user_history).__name__}, is ObservableList: {isinstance(self.session.user_history, ObservableList)}')
+                log('DEBUG', 'core.turn_transaction', f'[TurnTransaction] user_history id: {id(self.session.user_history)}')
+                self.session.user_history.extend(commit_messages)
+                self.session.updated_at = datetime.now()
+            elif self.conversation is not None:
+                log('DEBUG', 'core.turn_transaction', f'[TurnTransaction] Extending fallback conversation with {len(commit_messages)} messages (session=None)')
+                self.conversation.extend(commit_messages)
         if self.context_builder and hasattr(self.context_builder, 'clear_cache'):
             self.context_builder.clear_cache()
         self._committed = True
-        log('DEBUG', 'core.turn_transaction', f'TurnTransaction committed {len(commit_messages)} messages atomically')
+        log('DEBUG', 'core.turn_transaction', f'TurnTransaction committed {len(commit_messages)} messages')
         return commit_messages
 
     def rollback(self) -> None:

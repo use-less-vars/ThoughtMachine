@@ -18,6 +18,7 @@ from session.models import Session
 from session.store import FileSystemSessionStore
 from session.context_builder import SummaryBuilder
 from .state_bridge import StateBridge
+from session.context_builder import ContextBuilder
 
 class SessionLifecycle:
     """Manages session lifecycle operations."""
@@ -57,7 +58,7 @@ class SessionLifecycle:
                 try:
                     self._session_callback(old_state, new_state)
                 except Exception as e:
-                    log('DEBUG', 'presenter.lifecycle', f'Error in state callback: {e}')
+                    log('ERROR', 'presenter.lifecycle', f'Error in state callback: {e}')
 
     def mark_clean(self) -> None:
         """Mark session as clean (no unsaved changes). Dummy method after removing dirty tracking."""
@@ -125,6 +126,7 @@ class SessionLifecycle:
         Args:
             name: Optional name for the new session. If None, session will be unnamed.
         """
+        log('DEBUG', 'presenter.lifecycle', f'new_session called: name={name}')
         log('DEBUG', 'presenter.lifecycle', f'Auto-saving current session before starting new session')
         self.auto_save_current_session()
         if self.controller.is_running:
@@ -165,6 +167,7 @@ class SessionLifecycle:
 
     def pause_session(self):
         """Request pause of current session."""
+        log('DEBUG', 'presenter.lifecycle', f'pause_session called, state={self.state}')
         if self.state == ExecutionState.RUNNING:
             self.controller.request_pause()
             self.state = ExecutionState.PAUSING
@@ -273,6 +276,12 @@ class SessionLifecycle:
                 session = Session.from_persistable_dict(session_dict)
                 session.ensure_name()
                 self._register_session_callbacks(session)
+            # Clean up orphaned tool messages that may have been persisted
+            original_len = len(session.user_history)
+            cleaned = ContextBuilder._cleanup_orphaned_tool_messages(session.user_history)
+            session.user_history[:] = cleaned
+            if original_len != len(session.user_history):
+                log('WARNING', 'presenter.lifecycle', f'Cleaned {original_len - len(session.user_history)} orphaned tool messages on session load')
             self.state_bridge.bind_session(session)
             self.state_bridge.update_external_file_path(filepath)
             if not self.state_bridge.session_name:
@@ -306,6 +315,12 @@ class SessionLifecycle:
             session = loaded_session
             session.ensure_name()
             self._register_session_callbacks(session)
+        # Clean up orphaned tool messages that may have been persisted
+        original_len = len(session.user_history)
+        cleaned = ContextBuilder._cleanup_orphaned_tool_messages(session.user_history)
+        session.user_history[:] = cleaned
+        if original_len != len(session.user_history):
+            log('WARNING', 'presenter.lifecycle', f'Cleaned {original_len - len(session.user_history)} orphaned tool messages on session load')
         self.state_bridge.current_session = session
         self.state_bridge.current_session_id = str(session.session_id)
         self.state_bridge.bind_session(session)

@@ -261,8 +261,6 @@ class OpenAICompatibleProvider(LLMProvider):
             completion_kwargs.update(kwargs)
             if 'temperature' not in completion_kwargs:
                 completion_kwargs['temperature'] = self.config.temperature
-            if 'max_tokens' not in completion_kwargs and self.config.max_tokens is not None:
-                completion_kwargs['max_tokens'] = self.config.max_tokens
             if 'top_p' not in completion_kwargs and getattr(self.config, 'top_p', None) is not None:
                 completion_kwargs['top_p'] = self.config.top_p
             if tools:

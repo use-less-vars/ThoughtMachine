@@ -4,13 +4,14 @@ MCP Manager - Integrates Model Context Protocol servers as agent tools.
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union, Type, get_type_hints, Literal
 from enum import Enum
 from pydantic import BaseModel, Field, create_model, model_validator
 import logging
 
-from .mcp_client import create_mcp_client, MCPClientBase
+from .mcp_client import create_mcp_client, MCPClientBase, HTTPMCPClient, SSEMCPClient
 from .base import ToolBase
 
 logger = logging.getLogger(__name__)
@@ -218,12 +219,18 @@ def create_tool_class(
             return f"Error calling MCP tool {tool_name}: {str(e)}"
     
     ToolModel.execute = execute
-    
+
+    # Add get_required_categories — HTTP/SSE clients need network:outbound
+    if isinstance(client, (HTTPMCPClient, SSEMCPClient)):
+        @classmethod
+        def get_required_categories(cls, params: dict | None = None) -> list[str]:
+            return ["network:outbound"]
+        ToolModel.get_required_categories = get_required_categories
+
     # Add docstring
     ToolModel.__doc__ = description
-    
-    return ToolModel
 
+    return ToolModel
 
 class MCPServerManager:
     """Manager for MCP server lifecycle and tool registration.
@@ -327,43 +334,42 @@ def get_mcp_manager() -> MCPServerManager:
 
 def register_mcp_tools(timeout: float = 5.0) -> None:
     """Register MCP-generated tool classes with the global TOOL_CLASSES.
-    
+
+    NON-BLOCKING: This function returns immediately and runs MCP server
+    startup in a background daemon thread. If no MCP config file exists,
+    it returns instantly with no thread spawned.
+
     Called lazily from agent initialization (not during module import)
-    to avoid hangs when MCP servers are unavailable. Uses a thread-based
-    timeout to protect against misconfigured or unreachable servers.
-    
+    to avoid hangs when MCP servers are unavailable.
+
     Args:
-        timeout: Maximum seconds to wait for MCP servers to start.
-                 Default 5.0 seconds. Set to 0 to skip entirely.
+        timeout: Ignored in non-blocking mode. Kept for API compatibility.
     """
-    if timeout <= 0:
-        logger.warning("register_mcp_tools: timeout <= 0, skipping MCP tool registration")
+    # Fast path: check if config file exists before doing anything
+    config_path = os.environ.get("MCP_CONFIG_PATH", "mcp_config.json")
+    if not Path(config_path).exists():
+        logger.debug("No MCP config file found, skipping MCP tool registration")
         return
-    
-    import concurrent.futures
-    
+
+    logger.info("MCP config found, starting background registration...")
+
     def _do_register():
-        """Perform actual MCP tool registration."""
-        manager = get_mcp_manager()
-        from . import TOOL_CLASSES
-        tool_classes = manager.get_tool_classes()
-        count = 0
-        for cls in tool_classes:
-            if cls not in TOOL_CLASSES:
-                TOOL_CLASSES.append(cls)
-                count += 1
-        return count
-    
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(_do_register)
-    try:
-        count = future.result(timeout=timeout)
-        logger.info(f"Registered {count} MCP tool(s)")
-    except concurrent.futures.TimeoutError:
-        logger.warning(f"MCP tool registration timed out after {timeout}s "
-                      "- MCP servers may be unavailable")
-    except Exception as e:
-        logger.warning(f"MCP tool registration failed: {e}")
-    finally:
-        # Shutdown without waiting for hung worker
-        executor.shutdown(wait=False)
+        """Perform actual MCP tool registration in background."""
+        try:
+            manager = get_mcp_manager()
+            from . import TOOL_CLASSES
+            tool_classes = manager.get_tool_classes()
+            count = 0
+            for cls in tool_classes:
+                if cls not in TOOL_CLASSES:
+                    TOOL_CLASSES.append(cls)
+                    count += 1
+            from . import _update_simplified_toolset
+            _update_simplified_toolset()
+            logger.info(f"Registered {count} MCP tool(s) in background")
+        except Exception as e:
+            logger.warning(f"Background MCP tool registration failed: {e}")
+
+    thread = threading.Thread(target=_do_register, daemon=True)
+    thread.start()
+    logger.info("MCP registration running in background (app start is not blocked)")

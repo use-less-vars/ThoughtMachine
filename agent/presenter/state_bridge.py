@@ -21,9 +21,8 @@ from session.models import Session, RuntimeParams, ObservableList
 class StateBridge:
     """Bridge between configuration, session state, and token tracking."""
 
-    def __init__(self, config_path: str='agent_config.json'):
-        self.config_path = config_path
-        self.user_config_path = str(Path.home() / '.thoughtmachine' / 'config.json')
+    def __init__(self, config_path: Optional[str]=None):
+        self.config_path = config_path or str(Path.home() / '.thoughtmachine' / 'agent_config.json')
         default_dict = load_default_config()
         self.current_config = AgentConfig(**default_dict)
         self.total_input = 0
@@ -34,14 +33,12 @@ class StateBridge:
         self.session_name: Optional[str] = None
         self._external_file_path: Optional[str] = None
         self._pending_user_history: List[Dict[str, Any]] = []
-        if os.path.exists(self.user_config_path):
-            config_dict = load_config(self.user_config_path)
-            self.current_config = AgentConfig(**config_dict)
-            log('DEBUG', 'core.config', f'[CONFIG_TRACE] StateBridge loaded from user_config_path={self.user_config_path}')
-        else:
+        if os.path.exists(self.config_path):
             config_dict = load_config(self.config_path)
             self.current_config = AgentConfig(**config_dict)
             log('DEBUG', 'core.config', f'[CONFIG_TRACE] StateBridge loaded from config_path={self.config_path}')
+        else:
+            log('DEBUG', 'core.config', f'[CONFIG_TRACE] StateBridge using defaults (no config found at {self.config_path})')
 
     def get_config(self) -> dict:
         """Return current configuration dictionary."""
@@ -84,21 +81,10 @@ class StateBridge:
         save_path = path or self.config_path
         return save_config(config_to_save, save_path)
 
-    def save_user_config(self, config: Optional[dict]=None) -> bool:
-        """Save configuration to user config file."""
-        config_to_save = config or self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
-        return save_config(config_to_save, self.user_config_path)
-
     def load_config(self, path: Optional[str]=None) -> dict:
         """Load configuration from file."""
         load_path = path or self.config_path
         config_dict = load_config(load_path)
-        self.current_config = AgentConfig(**config_dict)
-        return self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
-
-    def load_user_config(self) -> dict:
-        """Load configuration from user config file."""
-        config_dict = load_config(self.user_config_path)
         self.current_config = AgentConfig(**config_dict)
         return self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
 
@@ -139,7 +125,7 @@ class StateBridge:
                 tool_classes.append(tool_cls)
         agent_kwargs = {}
         agent_kwargs['api_key'] = api_key
-        direct_mappings = [('model', 'model'), ('provider_type', 'provider_type'), ('provider_config', 'provider_config'), ('temperature', 'temperature'), ('max_turns', 'max_turns'), ('workspace_path', 'workspace_path'), ('detail', 'detail'), ('token_monitor_enabled', 'token_monitor_enabled'), ('enabled_tools', 'enabled_tools'), ('turn_monitor_enabled', 'turn_monitor_enabled'), ('system_prompt', 'system_prompt'), ('provider_id', 'provider_id'), ('model_override', 'model_override')]
+        direct_mappings = [('model', 'model'), ('provider_type', 'provider_type'), ('provider_config', 'provider_config'), ('temperature', 'temperature'), ('max_turns', 'max_turns'), ('workspace_path', 'workspace_path'), ('detail', 'detail'), ('enabled_tools', 'enabled_tools'), ('turn_monitor_enabled', 'turn_monitor_enabled'), ('system_prompt', 'system_prompt'), ('provider_id', 'provider_id'), ('model_override', 'model_override')]
         for config_key, agent_key in direct_mappings:
             if config_key in config:
                 agent_kwargs[agent_key] = config[config_key]

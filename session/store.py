@@ -160,6 +160,10 @@ class FileSystemSessionStore(SessionStore):
         """Get the file path for a session ID."""
         return self.sessions_dir / f"{session_id}.json"
 
+    def _get_meta_path(self, session_id: str) -> Path:
+        """Get the file path for a session's lightweight metadata file."""
+        return self.sessions_dir / f"_meta_{session_id}.json"
+
     def _find_session_path(self, session_id: str) -> Optional[Path]:
         """Find the actual file path for a session ID by scanning JSON files.
         Uses an in-memory cache (TTL: 5s) that is invalidated on save/delete.
@@ -171,6 +175,9 @@ class FileSystemSessionStore(SessionStore):
                 return self._cached_paths[session_id]
         # Scan files
         for file_path in self.sessions_dir.glob("*.json"):
+            # Skip metadata files (used for fast listing)
+            if file_path.name.startswith("_meta_"):
+                continue
             try:
                 with open(file_path, 'r') as f:
                     data = json.load(f)
@@ -189,6 +196,34 @@ class FileSystemSessionStore(SessionStore):
         name = session.metadata.get('name', 'Untitled Session')
         filename = _generate_friendly_filename(session.session_id, name)
         return self.sessions_dir / filename
+
+    def _save_session_metadata(self, session: Session) -> None:
+        """Write a lightweight metadata file for fast session listing.
+
+        The metadata file contains only the fields needed for the sidebar,
+        avoiding the need to parse the full session JSON (which can be
+        hundreds of messages) just to build the session list.
+        """
+        meta_path = self._get_meta_path(session.session_id)
+        user_history = session.user_history or []
+        preview = self._extract_preview(user_history)
+        meta = {
+            'session_id': session.session_id,
+            'name': session.metadata.get('name', 'Untitled Session'),
+            'created_at': session.created_at.isoformat() if hasattr(session.created_at, 'isoformat') else session.created_at,
+            'updated_at': session.updated_at.isoformat() if hasattr(session.updated_at, 'isoformat') else session.updated_at,
+            'preview': preview,
+        }
+        temp_path = meta_path.with_suffix('.tmp')
+        try:
+            os.makedirs(os.path.dirname(temp_path), exist_ok=True)
+            with open(temp_path, 'w') as f:
+                json.dump(meta, f)
+            temp_path.replace(meta_path)
+        except Exception:
+            if temp_path.exists():
+                temp_path.unlink()
+            raise
 
     def save_session(self, session: Session) -> None:
         """Save a session to a JSON file."""
@@ -231,6 +266,7 @@ class FileSystemSessionStore(SessionStore):
         temp_path = new_path.with_suffix('.tmp')
         logger.debug(f"[SessionStore] Writing to {temp_path} (atomic)")
         try:
+            os.makedirs(os.path.dirname(temp_path), exist_ok=True)
             with open(temp_path, 'w') as f:
                 json.dump(data, f, indent=2, default=str)  # default=str handles datetime
             temp_path.replace(new_path)
@@ -238,6 +274,8 @@ class FileSystemSessionStore(SessionStore):
             # Invalidate path cache so subsequent _find_session_path re-scans
             self._cached_paths.pop(session.session_id, None)
             self._cached_paths_ts.pop(session.session_id, None)
+            # Write/update the lightweight metadata file for fast listing
+            self._save_session_metadata(session)
         except Exception:
             # Clean up temp file on failure
             if temp_path.exists():
@@ -261,6 +299,97 @@ class FileSystemSessionStore(SessionStore):
             logger.error(f"[SessionStore] Error loading session {session_id}: {e}")
             return None
 
+    def load_session_metadata(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Lightweight metadata load — reads the session JSON file directly and
+        extracts only the fields needed for listing, avoiding the expensive
+        Session.from_persistable_dict() deserialization (which creates thousands
+        of Message objects).
+
+        Uses a directory scan to find the session file in a single pass rather
+        than calling _find_session_path (which also scans but for a different
+        purpose), avoiding double-reads of large JSON files.
+
+        Returns a dict with keys:
+            session_id, name, updated_at, message_count
+        or None if the session file is not found.
+        """
+        try:
+            for file_path in self.sessions_dir.glob("*.json"):
+                # Skip metadata files
+                if file_path.name.startswith("_meta_"):
+                    continue
+                try:
+                    with open(file_path, 'r') as f:
+                        data = json.load(f)
+                    if not isinstance(data, dict):
+                        continue
+                    if data.get('session_id') == session_id:
+                        name = data.get('metadata', {}).get('name', 'Untitled Session')
+                        updated_at = data.get('updated_at')
+                        user_history = data.get('user_history', [])
+                        message_count = len(user_history) if isinstance(user_history, list) else 0
+                        return {
+                            'session_id': session_id,
+                            'name': name,
+                            'updated_at': updated_at,
+                            'message_count': message_count,
+                        }
+                except Exception:
+                    continue
+            return None
+        except Exception as e:
+            logger.error(f"[SessionStore] Error loading session metadata for {session_id}: {e}")
+            return None
+
+    def load_sessions_metadata_batch(self, session_ids: List[str]) -> Dict[str, Optional[Dict[str, Any]]]:
+        """
+        Batch metadata load — reads ALL session JSON files in a single directory
+        scan and returns metadata for all requested session IDs.
+
+        This is far more efficient than calling load_session_metadata() in a loop
+        because each file is read only once, regardless of how many session IDs
+        are requested.
+
+        Returns a dict mapping session_id -> metadata dict (or None if not found)
+        with metadata keys: session_id, name, updated_at, message_count
+        """
+        wanted = set(session_ids)
+        if not wanted:
+            return {}
+        results: Dict[str, Optional[Dict[str, Any]]] = {sid: None for sid in session_ids}
+        try:
+            for file_path in self.sessions_dir.glob("*.json"):
+                # Skip metadata files
+                if file_path.name.startswith("_meta_"):
+                    continue
+                try:
+                    with open(file_path, 'r') as f:
+                        data = json.load(f)
+                    if not isinstance(data, dict):
+                        continue
+                    sid = data.get('session_id')
+                    if sid is not None and sid in wanted:
+                        name = data.get('metadata', {}).get('name', 'Untitled Session')
+                        updated_at = data.get('updated_at')
+                        user_history = data.get('user_history', [])
+                        message_count = len(user_history) if isinstance(user_history, list) else 0
+                        results[sid] = {
+                            'session_id': sid,
+                            'name': name,
+                            'updated_at': updated_at,
+                            'message_count': message_count,
+                        }
+                except Exception:
+                    continue
+                # Early exit: all wanted sessions found
+                if all(v is not None for v in results.values()):
+                    break
+            return results
+        except Exception as e:
+            logger.error(f"[SessionStore] Error in batch metadata load: {e}")
+            return results
+
     def list_sessions(self) -> List[Dict[str, Any]]:
         """
         List all saved sessions with basic metadata.
@@ -273,17 +402,35 @@ class FileSystemSessionStore(SessionStore):
             if now - ts < self._cache_ttl:
                 return cached
         sessions = []
+        seen_ids = set()
+
+        # Fast path: read lightweight metadata files
+        for meta_path in sorted(self.sessions_dir.glob("_meta_*.json")):
+            try:
+                with open(meta_path, 'r') as f:
+                    meta = json.load(f)
+                if isinstance(meta, dict) and meta.get('session_id'):
+                    sessions.append(meta)
+                    seen_ids.add(meta['session_id'])
+            except Exception:
+                continue
+
+        # Fallback for sessions without metadata files (migration period)
         for file_path in self.sessions_dir.glob("*.json"):
+            # Skip metadata files and already-processed sessions
+            if file_path.name.startswith("_meta_"):
+                continue
             try:
                 with open(file_path, 'r') as f:
                     data = json.load(f)
-                # Skip files that aren't session objects (e.g. open_sessions.json is a list)
                 if not isinstance(data, dict):
                     logger.debug(f"[SessionStore] Skipping {file_path.name}: not a session object")
                     continue
-                # Extract minimal metadata for listing
+                sid = data.get('session_id')
+                if sid is None or sid in seen_ids:
+                    continue
                 session_info = {
-                    'session_id': data.get('session_id'),
+                    'session_id': sid,
                     'name': data.get('metadata', {}).get('name', 'Untitled Session'),
                     'created_at': data.get('created_at'),
                     'updated_at': data.get('updated_at'),
@@ -317,10 +464,14 @@ class FileSystemSessionStore(SessionStore):
         self._cached_paths_ts.pop(session_id, None)
         self._cached_list = None
         path = self._find_session_path(session_id)
-        if path is not None and path.exists():
+        found = path is not None and path.exists()
+        if found:
             path.unlink()
-            return True
-        return False
+        # Also delete the metadata file if it exists
+        meta_path = self._get_meta_path(session_id)
+        if meta_path.exists():
+            meta_path.unlink()
+        return found
 
     def get_session_path(self, session_id: str) -> Path:
         """Get the file path for a given session ID."""
@@ -363,6 +514,7 @@ class FileSystemSessionStore(SessionStore):
         try:
             # Atomic write via temp file
             temp_path = path.with_suffix('.tmp')
+            os.makedirs(os.path.dirname(temp_path), exist_ok=True)
             with open(temp_path, 'w') as f:
                 json.dump(session_ids, f)
             temp_path.replace(path)
@@ -417,6 +569,7 @@ class FileSystemSessionStore(SessionStore):
                     logger.info(f"[SessionStore] Migrating .current_session from {old_marker} to {marker}")
                     # Atomic write to new location
                     temp_path = marker.with_suffix('.tmp')
+                    os.makedirs(os.path.dirname(temp_path), exist_ok=True)
                     temp_path.write_text(content)
                     temp_path.replace(marker)
                     # Remove old marker
@@ -446,6 +599,7 @@ class FileSystemSessionStore(SessionStore):
             # Atomic write via temp file
             temp_path = marker.with_suffix('.tmp')
             try:
+                os.makedirs(os.path.dirname(temp_path), exist_ok=True)
                 temp_path.write_text(session_id)
                 temp_path.replace(marker)
                 logger.info(f"[SessionStore] Wrote marker file with session_id: {session_id}")

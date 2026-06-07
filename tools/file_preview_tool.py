@@ -5,6 +5,7 @@ from pydantic import Field
 from typing import Optional, ClassVar, Literal, Union, List
 
 class FilePreviewTool(ToolBase):
+    required_categories: ClassVar[List[str]] = ["filesystem:read"]
     """Show beginning and end of file with line numbers."""
     tool: Literal["FilePreviewTool"] = "FilePreviewTool"
     

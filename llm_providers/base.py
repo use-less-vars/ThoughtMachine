@@ -31,7 +31,6 @@ class ProviderConfig:
     base_url: Optional[str] = None
     model: str = ""
     temperature: float = 0.7
-    max_tokens: Optional[int] = None
     top_p: Optional[float] = None
     timeout: int = 120
     max_retries: int = 3

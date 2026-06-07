@@ -4,18 +4,35 @@
  * Top tab bar that displays open session tabs (like browser tabs).
  * Each tab shows the session name and a close (✕) button.
  * A "+" button creates a new tab.
+ * A ⚙️ cogwheel opens the Session Actions slide-in panel (name + delete)
+ * when a tab is active, or toggles the sessions sidebar when no tabs are open.
  *
  * Props:
- *   tabs        — array of { id, name }
- *   activeTabId — currently active tab id
- *   onSelectTab — called with (tabId)
- *   onCloseTab  — called with (tabId)
- *   onNewTab    — called with ()
+ *   tabs            — array of { id, name }
+ *   activeTabId     — currently active tab id
+ *   onSelectTab     — called with (tabId)
+ *   onCloseTab      — called with (tabId)
+ *   onNewTab        — called with ()
+ *   onCogwheelClick — called with () when cogwheel is clicked
+ *   runningStates   — { [tabId]: status }
  */
 
 import React from 'react'
 
-export default function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onNewTab, runningStates = {} }) {
+function _tabStatusClass(status) {
+  switch (status) {
+    case 'RUNNING':
+      return 'running'
+    case 'PAUSED':
+      return 'pausing'
+    case 'WAITING_FOR_USER':
+      return 'running'
+    default:
+      return 'idle'
+  }
+}
+
+export default function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onNewTab, onCogwheelClick, runningStates = {} }) {
   if (tabs.length === 0) {
     return null
   }
@@ -26,7 +43,7 @@ export default function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onN
         {tabs.map((tab) => (
           <div
             key={tab.id}
-            className={`tab-item ${activeTabId === tab.id ? 'tab-active' : ''} ${runningStates[tab.id] ? 'running' : 'idle'}`}
+            className={`tab-item ${activeTabId === tab.id ? 'tab-active' : ''} ${_tabStatusClass(runningStates[tab.id])}`}
             onClick={() => onSelectTab(tab.id)}
             title={tab.name}
           >
@@ -47,6 +64,9 @@ export default function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onN
           +
         </button>
       </div>
+      <button className="tab-cogwheel-btn" onClick={onCogwheelClick} title="Session actions">
+        ⚙️
+      </button>
     </div>
   )
 }

@@ -84,17 +84,16 @@ class _AgentLogger:
     Thread-safe for use in the agent's background thread.
     """
 
-    def __init__(self, config: 'AgentConfig', log_dir: str='./logs', log_level: Union[str, LogLevel]=LogLevel.INFO, file_log_level: Union[str, LogLevel]=LogLevel.DEBUG, enable_file_logging: bool=True, enable_console_logging: bool=False, jsonl_format: bool=True, max_file_size_mb: int=10, session_id: Optional[str]=None):
+    def __init__(self, config: 'AgentConfig', log_dir: str='./logs', log_level: Union[str, LogLevel]=LogLevel.INFO, file_log_level: Union[str, LogLevel]=LogLevel.DEBUG, enable_file_logging: bool=True, jsonl_format: bool=True, max_file_size_mb: int=10, session_id: Optional[str]=None):
         """
         Initialize the logger.
-        
+
         Args:
             config: AgentConfig instance
             log_dir: Directory to store log files
             log_level: Minimum log level to record
             file_log_level: Minimum log level for file logging (default: DEBUG)
             enable_file_logging: Whether to write logs to file
-            enable_console_logging: Whether to print logs to console
             jsonl_format: Whether to use JSONL format for file logging
             max_file_size_mb: Maximum log file size in MB before rotation
             session_id: Unique identifier for this agent session (auto-generated if None)
@@ -114,7 +113,6 @@ class _AgentLogger:
             file_log_level = config.file_log_level
         self.file_log_level = LogLevel(file_log_level) if isinstance(file_log_level, str) else file_log_level
         self.enable_file_logging = enable_file_logging
-        self.enable_console_logging = enable_console_logging
         self.jsonl_format = jsonl_format
         self.max_file_size_bytes = max_file_size_mb * 1024 * 1024
         debug_length = os.getenv('DEBUG_TRUNCATE_LENGTH')
@@ -163,11 +161,6 @@ class _AgentLogger:
     def _initialize_logging(self):
         """Initialize logging handlers."""
         self.py_logger.handlers.clear()
-        if self.enable_console_logging:
-            console_handler = python_logging.StreamHandler()
-            console_formatter = python_logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            console_handler.setFormatter(console_formatter)
-            self.py_logger.addHandler(console_handler)
         if self.enable_file_logging:
             try:
                 self._file_handle = open(self.log_file_path, 'a', encoding='utf-8')
@@ -272,15 +265,6 @@ class _AgentLogger:
         event = {'type': event_type.value, 'level': level.value, 'message': message, 'data': data or {}, 'turn': turn if turn is not None else self.current_turn, 'total_input_tokens': self.total_input_tokens, 'total_output_tokens': self.total_output_tokens}
         if self.enable_file_logging and self.jsonl_format and self._should_log_to_file(level):
             self._write_jsonl(event)
-        if self.enable_console_logging:
-            log_method = getattr(self.py_logger, level.value.lower())
-            log_msg = f'[{event_type.value}] {message}'
-            if data:
-                data_str = self._truncate_string(str(data), self.console_data_truncate)
-                if '... [truncated]' in data_str:
-                    data_str = data_str.replace('... [truncated]', '...')
-                log_msg += f' | Data: {data_str}'
-            log_method(log_msg)
 
     def log_agent_start(self, query: str, config_data: Dict[str, Any]):
         """Log agent startup."""
@@ -711,7 +695,6 @@ def create_logger(config: 'AgentConfig') -> Optional[_AgentLogger]:
             log_level=getattr(config, 'log_level', LogLevel.INFO),
             file_log_level=file_log_level,
             enable_file_logging=getattr(config, 'enable_file_logging', True),
-            enable_console_logging=getattr(config, 'enable_console_logging', False),
             jsonl_format=getattr(config, 'jsonl_format', True),
             max_file_size_mb=getattr(config, 'max_file_size_mb', 10),
             session_id=getattr(config, 'session_id', None)

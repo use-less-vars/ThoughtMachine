@@ -8,9 +8,28 @@
  * Props: messages — array of { role, content, reasoning_content? } objects
  */
 
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useRef, useCallback } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+
+/* ── Copy-to-clipboard button ── */
+function CopyButton({ text, label }) {
+  const [copied, setCopied] = useState(false)
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch (e) {
+      console.warn('Copy failed:', e)
+    }
+  }
+  return (
+    <button className="copy-btn" onClick={handleCopy} title="Copy to clipboard">
+      {copied ? '✅' : label || '📋'}
+    </button>
+  )
+}
 
 const TRUNCATE_LENGTH = 500
 
@@ -19,6 +38,9 @@ const ROLE_STYLE = {
   assistant:   { className: 'message-assistant',       label: 'Assistant' },
   tool_call:   { className: 'message-tool-call',       label: 'Tool Call' },
   tool_result: { className: 'message-tool-result',     label: 'Tool Result' },
+  summary:     { className: 'message-summary',           label: '📝 Summary' },
+  final:       { className: 'message-final',            label: '🎯 Final' },
+  question:    { className: 'message-question',          label: '❓ Question' },
   system:      { className: 'message-system-as-user',  label: 'System' },
 }
 
@@ -41,7 +63,19 @@ function TruncatableContent({ text }) {
 }
 
 /* ── Tool call display ── */
+/* ── Summary tool result (dark golden, full markdown, no truncation) ── */
+function SummaryContent({ content }) {
+  return (
+    <div className="summary-markdown">
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+        {content}
+      </ReactMarkdown>
+    </div>
+  )
+}
+
 function ToolCallContent({ content }) {
+  const MAX_LINES = 5
   let parsed = null
   try {
     parsed = JSON.parse(content)
@@ -49,14 +83,29 @@ function ToolCallContent({ content }) {
     return <pre className="tool-call-raw">{content}</pre>
   }
   const { name, arguments: args } = parsed
+
+  /* Pretty-print args and limit to MAX_LINES lines */
+  let argsText = ''
+  let truncated = false
+  if (args) {
+    const full = JSON.stringify(args, null, 2)
+    const lines = full.split('\n')
+    if (lines.length > MAX_LINES) {
+      argsText = lines.slice(0, MAX_LINES).join('\n') + '\n...'
+      truncated = true
+    } else {
+      argsText = full
+    }
+  }
+
   return (
-    <details className="tool-call-details">
+    <details className="tool-call-details" open>
       <summary className="tool-call-summary">
         🛠️ Tool Call: <strong>{name}</strong>
       </summary>
       <div className="tool-call-body">
         {args ? (
-          <pre className="tool-call-args">{JSON.stringify(args, null, 2)}</pre>
+          <pre className="tool-call-args">{argsText}</pre>
         ) : (
           <em>No arguments</em>
         )}
@@ -70,8 +119,11 @@ function AssistantContent({ msg }) {
   return (
     <>
       {msg.reasoning_content && (
-        <details className="reasoning-block">
-          <summary className="reasoning-summary">💭 Thinking</summary>
+        <details className="reasoning-block" open>
+          <summary className="reasoning-summary">
+            💭 Thinking
+            <CopyButton text={msg.reasoning_content} label="📋" />
+          </summary>
           <div className="reasoning-content">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>
               {msg.reasoning_content}
@@ -90,6 +142,21 @@ function AssistantContent({ msg }) {
 
 /* ── Route content based on role ── */
 function MessageContent({ msg }) {
+  /* Summary results: dark golden, full markdown, no truncation */
+  if (msg.is_summary) {
+    return <SummaryContent content={msg.content} />
+  }
+
+  /* Final results render as full markdown (blueish, no truncation) */
+  if (msg.is_final) {
+    return (
+      <div className="final-markdown">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+          {msg.content}
+        </ReactMarkdown>
+      </div>
+    )
+  }
   switch (msg.role) {
     case 'assistant':
       return <AssistantContent msg={msg} />
@@ -109,35 +176,108 @@ function MessageContent({ msg }) {
 }
 
 /* ── Single bubble ── */
-function MessageBubble({ msg, index }) {
+const MessageBubble = React.memo(
+  function MessageBubble({ msg, index }) {
   /* ── System notifications are stored as 'user' role with is_system_notification flag ── */
-  const effectiveRole = msg.is_system_notification ? 'system' : msg.role
+  const effectiveRole = msg.is_final
+    ? (msg.response_type === 'question' ? 'question' : 'final')
+    : (msg.is_summary ? 'summary' : (msg.is_system_notification ? 'system' : msg.role))
   const style = ROLE_STYLE[effectiveRole] || ROLE_STYLE.system
+  const copyText = msg.reasoning_content
+    ? `${msg.reasoning_content}\n\n---\n\n${msg.content}`
+    : msg.content
   return (
     <div className={`message ${style.className}`} key={index}>
-      <div className="message-sender">{style.label}</div>
+      <div className="message-sender">
+        {style.label}
+        <CopyButton text={copyText} label="📋" />
+      </div>
       <MessageContent msg={msg} />
     </div>
   )
-}
+  },
+  (prev, next) =>
+    prev.index === next.index &&
+    prev.msg.content === next.msg.content &&
+    prev.msg.role === next.msg.role &&
+    prev.msg.reasoning_content === next.msg.reasoning_content &&
+    prev.msg.is_system_notification === next.msg.is_system_notification &&
+    prev.msg.is_final === next.msg.is_final &&
+    prev.msg.is_summary === next.msg.is_summary &&
+    prev.msg.response_type === next.msg.response_type
+)
 
 /* ── Main panel ── */
-export default function ChatPanel({ messages }) {
-  const bottomRef = useRef(null)
+function ChatPanel({ messages }) {
+  const chatRef = useRef(null)
+  const [shouldAutoScroll, setShouldAutoScroll] = useState(true)
 
+  // On scroll, determine if user is at bottom
+  const handleScroll = useCallback(() => {
+    const el = chatRef.current
+    if (!el) return
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 20
+    setShouldAutoScroll(atBottom)
+  }, [])
+
+  // After messages update, scroll if we were at bottom
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+    if (shouldAutoScroll && chatRef.current) {
+      chatRef.current.scrollTop = chatRef.current.scrollHeight
+    }
+  }, [messages, shouldAutoScroll])
+
+  const scrollToBottom = () => {
+    if (chatRef.current) {
+      chatRef.current.scrollTop = chatRef.current.scrollHeight
+      setShouldAutoScroll(true)
+    }
+  }
+
+  // Scroll to the previous user query above the current viewport
+  const jumpToPrevQuery = () => {
+    const el = chatRef.current
+    if (!el) return
+    const userMessages = Array.from(el.querySelectorAll('.message-user'))
+    // Walk backwards from the last user message
+    for (let i = userMessages.length - 1; i >= 0; i--) {
+      const msgEl = userMessages[i]
+      if (msgEl.offsetTop + msgEl.offsetHeight < el.scrollTop + 10) {
+        // This user message is above the current viewport — scroll to it
+        el.scrollTop = msgEl.offsetTop - 20
+        setShouldAutoScroll(false)
+        return
+      }
+    }
+    // No user message above viewport, go to the first one (top of chat)
+    if (userMessages.length > 0) {
+      el.scrollTop = userMessages[0].offsetTop - 20
+      setShouldAutoScroll(false)
+    }
+  }
 
   return (
-    <div className="chat-panel">
-      {(!messages || messages.length === 0) && (
-        <div className="chat-empty">Send a message to start.</div>
+    <div className="chat-panel-wrapper">
+      <div className="chat-panel" ref={chatRef} onScroll={handleScroll}>
+        {(!messages || messages.length === 0) && (
+          <div className="chat-empty">Send a message to start.</div>
+        )}
+        {messages && messages.map((msg, i) => (
+          <MessageBubble key={i} msg={msg} index={i} />
+        ))}
+      </div>
+      {!shouldAutoScroll && (
+        <div className="scroll-nav-group">
+          <button className="scroll-prev-btn" onClick={jumpToPrevQuery} title="Jump to previous query">
+            ↑
+          </button>
+          <button className="scroll-bottom-btn" onClick={scrollToBottom} title="Scroll to bottom">
+            ↓
+          </button>
+        </div>
       )}
-      {messages && messages.map((msg, i) => (
-        <MessageBubble key={i} msg={msg} index={i} />
-      ))}
-      <div ref={bottomRef} />
     </div>
   )
 }
+
+export default React.memo(ChatPanel)
