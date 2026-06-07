@@ -1087,6 +1087,26 @@ async def create_directory(body: dict):
 async def health():
     return {"status": "ok", "service": "thoughtmachine-web-ui"}
 
+@app.get("/api/container/status")
+async def container_status(workspace: str = ""):
+    """Return status of the Docker container for the given workspace path."""
+    if not workspace:
+        return {"status": "error", "capabilities": {}, "build_log": "Missing workspace parameter"}
+
+    # Import lazily to avoid circular imports at module level
+    from docker_executor import get_container_status
+
+    try:
+        result = get_container_status(workspace)
+        return result
+    except Exception as exc:
+        log("ERROR", "server.container_status", f"Container status failed: {exc}")
+        return {"status": "error", "capabilities": {}, "build_log": str(exc)}
+
+
+
+
+
 @app.get("/")
 async def root():
     if _SERVE_FRONTEND:

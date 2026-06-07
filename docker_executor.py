@@ -1,6 +1,7 @@
 from agent.logging import log
 import docker
 import hashlib
+import io
 import os
 import time
 import threading
@@ -8,6 +9,13 @@ import queue
 import json
 import fnmatch
 import sys
+
+# ── Build log cache (thread-safe) ────────────────────────────────────────────
+# Populated by _build_image() during Docker image builds; consumed by
+# get_container_status() to return build logs to the frontend.
+_build_log_cache: dict[str, str] = {}
+_build_log_cache_lock = threading.Lock()
+_build_in_progress: bool = False
 log("DEBUG", "tools.docker_executor", "Module loaded", {"__file__": __file__})
 
 def _load_policy(workspace_path: str) -> dict:
@@ -348,33 +356,33 @@ class DockerExecutor:
             pass
         image, _ = self._build_image(verbose_build=verbose_build)
         return image
-    
+
     def _build_image(self, verbose_build=False, nocache=False):
         """Build Docker image from docker/executor.Dockerfile.
-        
+
         Args:
             verbose_build: If True, log build output summary on success.
-        
+            nocache: If True, force rebuild without Docker layer cache.
+
         Returns:
             Tuple of (image, log_lines) where log_lines is a list of build output lines.
-        
+            The log_lines are also stored in the module-level ``_build_log_cache``.
+
         Raises:
             RuntimeError: If build fails, with concatenated build logs in the message.
         """
+        global _build_in_progress
+        _build_in_progress = True
+
         dockerfile_dir = self.workspace_path
         dockerfile_path = os.path.join(dockerfile_dir, "docker", "executor.Dockerfile")
         if not os.path.exists(dockerfile_path):
+            _build_in_progress = False
             raise RuntimeError(f"Dockerfile not found at {dockerfile_path}")
 
         log('DEBUG', 'tools.docker_executor.build', f"Building Docker image {self.image} from {dockerfile_path}")
-        log('DEBUG', 'tools.docker_executor.build', f"Build context directory: {dockerfile_dir}")
-        log('DEBUG', 'tools.docker_executor.build', f"Absolute path: {os.path.abspath(dockerfile_dir)}")
-        log('DEBUG', 'tools.docker_executor.build', f"Requirements.txt exists: {os.path.exists(os.path.join(dockerfile_dir, 'requirements.txt'))}")
-        log('DEBUG', 'tools.docker_executor.build', f"Files in build context:")
-        for f in os.listdir(dockerfile_dir):
-            log('DEBUG', 'tools.docker_executor.build', f"  {f}")
 
-        log_lines = []
+        log_lines: list[str] = []
         try:
             image, build_logs = self.client.images.build(
                 path=dockerfile_dir,
@@ -382,11 +390,8 @@ class DockerExecutor:
                 tag=self.image,
                 rm=True,
                 pull=True,
-                nocache=nocache  # Only nocache=True when force_rebuild
+                nocache=nocache,
             )
-            # Generator iteration must be inside try/except block because
-            # Docker SDK raises BuildError from within the generator,
-            # not from build() itself.
             for chunk in build_logs:
                 if "stream" in chunk:
                     line = chunk["stream"].strip()
@@ -394,16 +399,157 @@ class DockerExecutor:
                         log_lines.append(line)
                         log('DEBUG', 'tools.docker_executor.build', f"Build: {line}")
         except docker.errors.BuildError as e:
-            # BuildError already has build_log; include it in the error message
             build_log_str = "\n".join(str(line) for line in (e.build_log or []))
+            log_lines.extend(str(line) for line in (e.build_log or []))
+            _build_in_progress = False
+            with _build_log_cache_lock:
+                _build_log_cache[self.workspace_path] = "\n".join(log_lines)
             raise RuntimeError(
                 f"Docker build failed: {e}\n"
                 f"Build logs:\n{build_log_str}"
             ) from e
         except Exception as e:
+            _build_in_progress = False
+            log_lines.append(str(e))
+            with _build_log_cache_lock:
+                _build_log_cache[self.workspace_path] = "\n".join(log_lines)
             raise RuntimeError(f"Docker build failed: {e}") from e
 
         if verbose_build and log_lines:
             log('INFO', 'tools.docker_executor.build', f"Build complete for {self.image}:\n" + "\n".join(log_lines))
 
+        # ── Store build log in shared cache ────────────────────────────────────
+        with _build_log_cache_lock:
+            _build_log_cache[self.workspace_path] = "\n".join(log_lines)
+
+        _build_in_progress = False
         return image, log_lines
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Container status helper (used by Flask endpoint)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def get_container_status(workspace_path: str) -> dict:
+    """
+    Return the status of the Docker container for *workspace_path*.
+
+    The returned dict has the following keys:
+
+    - **status** — ``"running"``, ``"stopped"``, ``"building"``, or ``"error"``
+    - **capabilities** — workspace capability flags (see below)
+    - **build_log** — full build log from the most recent ``_build_image()`` call
+
+    Capabilities (fallback to fully-permissive defaults when no workspace
+    capabilities file is found):
+
+    .. code-block:: python
+
+        {
+            "allow_network": bool,
+            "allow_docker": bool,
+            "allowed_file_extensions": list[str],
+            "max_file_size_bytes": int,
+            "allowed_workspace_dirs": list[str],
+        }
+    """
+    global _build_in_progress
+
+    # ── 1. Normalise path ───────────────────────────────────────────────────
+    normalised = os.path.abspath(workspace_path).replace("\\", "/")
+
+    # ── 2. Compute container name ──────────────────────────────────────────
+    digest = hashlib.sha256(normalised.encode()).hexdigest()[:12]
+    container_name = f"agent-exec-{digest}"
+
+    # ── 3. Check build-in-progress ──────────────────────────────────────────
+    with _build_log_cache_lock:
+        is_building = _build_in_progress
+
+    if is_building:
+        # Load capabilities anyway before returning early
+        caps = _load_capabilities(normalised)
+        return {
+            "status": "building",
+            "capabilities": caps,
+            "build_log": "Build in progress...",
+        }
+
+    # ── 4. Query Docker for container status ────────────────────────────────
+    status = "stopped"
+    try:
+        client = docker.from_env()
+        try:
+            container = client.containers.get(container_name)
+            container.reload()
+            if container.status == "running":
+                status = "running"
+            else:
+                status = "stopped"
+        except docker.errors.NotFound:
+            status = "stopped"
+    except docker.errors.DockerException as exc:
+        status = "error"
+        # Retrieve any existing build log; append the error
+        with _build_log_cache_lock:
+            log_text = _build_log_cache.get(container_name, "")
+        log_text += f"\nDocker query error: {exc}"
+        caps = _load_capabilities(normalised)
+        return {
+            "status": status,
+            "capabilities": caps,
+            "build_log": log_text.strip(),
+        }
+
+    # ── 5. Load capabilities ────────────────────────────────────────────────
+    caps = _load_capabilities(normalised)
+
+    # ── 6. Retrieve build log ───────────────────────────────────────────────
+    with _build_log_cache_lock:
+        build_log = _build_log_cache.get(container_name, "")
+
+    # ── 7. Return ───────────────────────────────────────────────────────────
+    return {
+        "status": status,
+        "capabilities": caps,
+        "build_log": build_log,
+    }
+
+
+def _load_capabilities(workspace_path: str) -> dict:
+    """Load workspace capabilities, falling back to fully-permissive defaults."""
+    try:
+        from thoughtmachine.workspace_capabilities import (
+            load_workspace_capabilities,
+            resolve_workspace_id,
+        )
+
+        workspace_id = resolve_workspace_id(workspace_path)
+        if workspace_id is None:
+            return _default_capabilities()
+
+        caps = load_workspace_capabilities(workspace_id)
+        if caps is None:
+            return _default_capabilities()
+
+        return {
+            "allow_network": caps.allow_network,
+            "allow_docker": caps.allow_docker,
+            "allowed_file_extensions": list(caps.allowed_file_extensions),
+            "max_file_size_bytes": caps.max_file_size_bytes,
+            "allowed_workspace_dirs": list(caps.allowed_workspace_dirs),
+        }
+    except Exception:
+        return _default_capabilities()
+
+
+def _default_capabilities() -> dict:
+    """Return fully-permissive capability defaults."""
+    return {
+        "allow_network": True,
+        "allow_docker": True,
+        "allowed_file_extensions": ["*"],
+        "max_file_size_bytes": 0,
+        "allowed_workspace_dirs": ["."],
+    }
+

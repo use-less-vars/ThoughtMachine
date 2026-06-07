@@ -166,6 +166,40 @@ def save_workspace_capabilities(
     )
 
 
+def resolve_workspace_id(workspace_path: str) -> Optional[str]:
+    """
+    Resolve a workspace filesystem path to its workspace ID.
+
+    Iterates over ``~/.thoughtmachine/workspaces/<id>/config.json`` files,
+    compares the ``root`` field (normalised) to *workspace_path*, and returns
+    the matching ID.  Returns ``None`` if no match is found.
+    """
+    base = USER_DIR / "workspaces"
+    if not base.is_dir():
+        return None
+
+    normalised_input = os.path.abspath(workspace_path).replace("\\", "/").rstrip("/")
+
+    for entry in sorted(base.iterdir()):
+        if not entry.is_dir():
+            continue
+        config_file = entry / "config.json"
+        if not config_file.is_file():
+            continue
+        try:
+            data = json.loads(config_file.read_text(encoding="utf-8"))
+            root = data.get("root", "")
+            if not root:
+                continue
+            normalised_root = os.path.abspath(root).replace("\\", "/").rstrip("/")
+            if normalised_root == normalised_input:
+                return entry.name
+        except (json.JSONDecodeError, OSError):
+            continue
+
+    return None
+
+
 def ensure_workspace_dirs(workspace_id: str) -> List[str]:
     """
     Bootstrap a workspace's subdirectory structure.
