@@ -2087,3 +2087,12 @@ All engineer's claims are VERIFIED CORRECT:
 4. ✅ **`required_categories: ClassVar[List[str]]` IS defined** on ToolBase (line 39) and used across 15+ tool classes.
 
 **Key Lesson**: FileSearchTool can produce false negatives when searching broad directory trees. Always narrow searches to specific subdirectories to verify negative findings.
+
+## 2026-06-07 — ## Interruptible Prompt Queue
+**Status**: Fully implemented ...
+
+## Interruptible Prompt Queue
+**Status**: Fully implemented and tested.
+**Location**: `thoughtmachine/security.py` — `_prompt_cancelled` Event (line 47), timeout loop (lines 570-575), `cancel_pending_prompts()` (lines 993-1011).
+**Integration**: `agent/controller/__init__.py` — called from `pause()` (line 471) and `shutdown()` (line 305).
+**Tests**: 4 tests in `TestCancelPendingPrompts` class, `tests/test_permissions_roundtrip.py` (lines 610-696).

@@ -128,7 +128,9 @@ class ProviderManager:
         the authoritative source for ``provider_type``, ``base_url``, and
         ``api_key`` — they always overwrite whatever is in *config_dict*.
         For ``model``, ``model_override`` (if set) takes precedence over the
-        profile's ``default_model``.
+        profile's ``default_model``.  If ``model`` is explicitly provided in
+        *config_dict* it is preserved; the profile's ``default_model`` is only
+        used as a fallback when no model is specified.
 
         .. note::
 
@@ -156,10 +158,14 @@ class ProviderManager:
         result['base_url']       = profile.base_url
         result['api_key']        = profile.api_key
 
-        # model: use model_override if set, else profile.default_model
+        # model: use model_override if set, else respect model from
+        # config_dict if explicitly provided, else profile.default_model
         model_override = config_dict.get('model_override')
         if model_override:
             result['model'] = model_override
+        elif config_dict.get('model'):
+            # User explicitly set a model — preserve it
+            pass
         else:
             result['model'] = profile.default_model
 

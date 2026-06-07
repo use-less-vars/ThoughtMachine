@@ -320,11 +320,13 @@ class WebAgentBridge:
         global_config = self._build_global_agent_config()
         merged_config = global_config.model_dump(exclude={'api_key'}, exclude_none=True)
 
-        # ── Layer 2: frontend config_dict ─────────────────────────────────
+        # ── Layer 2: frontend config_dict (deep merge for nested dicts) ──
         if config_dict:
-            for k, v in config_dict.items():
-                if k not in ('session_id', 'created_at', 'updated_at'):
-                    merged_config[k] = v
+            from agent.utils import deep_merge
+            # Filter out session metadata keys before merging
+            filtered = {k: v for k, v in config_dict.items()
+                        if k not in ('session_id', 'created_at', 'updated_at')}
+            merged_config = deep_merge(merged_config, filtered)
 
         provider_id = merged_config.get('provider_id')
         if provider_id:

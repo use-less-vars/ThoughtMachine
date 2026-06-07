@@ -176,7 +176,9 @@ class AgentConfig(BaseModel):
         ``model`` accordingly.
 
         The ``model_override`` field, if set, takes precedence over the
-        profile's ``default_model``.
+        profile's ``default_model``.  If ``model`` is explicitly set on this
+        config it is preserved; the profile's ``default_model`` is only used
+        as a fallback when neither ``model_override`` nor ``model`` is set.
 
         Returns a *new* ``AgentConfig`` instance (this object is unchanged).
         """
@@ -195,7 +197,7 @@ class AgentConfig(BaseModel):
             'base_url':       profile.base_url,
             'api_key':        profile.api_key,
             'provider_type':  profile.provider_type,
-            'model':          self.model_override or profile.default_model,
+            'model':          self.model_override or self.model or profile.default_model,
         }
 
         return self.model_copy(update=updates)
