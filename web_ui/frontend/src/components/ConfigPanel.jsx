@@ -732,7 +732,7 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
 
       {/* ── Container Tab ─────────────────────────────────────────────── */}
       {activeTab === 'container' && (
-        <ContainerPanelContent />
+        <ContainerPanelContent workspacePath={config?.workspace_path || ''} />
       )}
 
       {/* ── System Prompt Tab ──────────────────────────────────────────── */}

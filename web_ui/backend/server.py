@@ -1091,7 +1091,7 @@ async def health():
 async def container_status(workspace: str = ""):
     """Return status of the Docker container for the given workspace path."""
     if not workspace:
-        return {"status": "error", "capabilities": {}, "build_log": "Missing workspace parameter"}
+        return {"status": "unavailable", "capabilities": {}, "build_log": ""}
 
     # Import lazily to avoid circular imports at module level
     from docker_executor import get_container_status
@@ -1223,8 +1223,8 @@ _FALLBACK_FRONTEND_CONFIG = {
     "log_categories": ["SESSION", "LLM", "TOOLS"],
     "max_file_size_mb": 10,
     "max_backup_files": 5,
-    "workspace_path": "",
-    # The actual workspace is auto-detected from the project directory at startup
+    "workspace_path": _project_root,
+    # Auto-detected from server.py location at module load time (see line 102)
     "rag_enabled": False,
     "rag_embedding_model": "BAAI/bge-small-en-v1.5",
     "rag_vector_store_path": None,
@@ -1314,6 +1314,13 @@ def _backend_to_frontend_config(backend: Dict[str, Any]) -> Dict[str, Any]:
     if "enabled_tools" in cfg:
         enabled = cfg.pop("enabled_tools")
         cfg["tools"] = [{"name": t, "enabled": True} for t in enabled]
+    # Ensure workspace_path is always present.
+    # The bridge config may have workspace_path=None (default), and
+    # _config_to_dict uses exclude_none=True which strips it. Without
+    # this fallback the frontend never receives workspace_path, the
+    # ContainerPanel sends an empty workspace param, and the backend
+    # returns "Container status unavailable".
+    cfg.setdefault("workspace_path", _project_root)
     return cfg
 
 

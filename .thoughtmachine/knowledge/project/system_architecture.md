@@ -2096,3 +2096,24 @@ All engineer's claims are VERIFIED CORRECT:
 **Location**: `thoughtmachine/security.py` — `_prompt_cancelled` Event (line 47), timeout loop (lines 570-575), `cancel_pending_prompts()` (lines 993-1011).
 **Integration**: `agent/controller/__init__.py` — called from `pause()` (line 471) and `shutdown()` (line 305).
 **Tests**: 4 tests in `TestCancelPendingPrompts` class, `tests/test_permissions_roundtrip.py` (lines 610-696).
+
+## security_permissions
+
+## 2026-06-08 — ## Security / Permissions System — Architecture Documentatio...
+
+## Security / Permissions System — Architecture Documentation
+
+Completed a comprehensive investigation of the entire security/permissions system. Documented in detail in the report file `security_permissions_architecture_report.md`.
+
+**Architecture Summary:**
+- Two-tier model: SessionPermissions (coarse booleans, hot-swappable) + security config (fine-grained rules with per-target overrides, in-memory only)
+- Permission categories: `"domain:action"` strings declared by each tool via `required_categories` or `get_required_categories(params)`
+- Check order: Session permissions → Security config → Ask dialog
+- WebSocket protocol: `security_prompt` (backend→frontend) + `security_response` (frontend→backend)
+- Frontend: SecurityDialog.jsx (modal), ConfigPanel.jsx (permissions toggles), SessionTab.jsx (event handler)
+
+**Key files:** thoughtmachine/security.py, tools/base.py, agent/core/tool_executor.py, agent/events.py, web_ui/backend/bridge.py, web_ui/backend/server.py, web_ui/frontend/src/components/{SecurityDialog,SessionTab,ConfigPanel}.jsx
+
+**Suggested improvements documented in report.**
+
+

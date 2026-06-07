@@ -8,14 +8,16 @@ const STATUS_CONFIG = {
   unavailable: { color: '#6c7086', label: 'Container status unavailable' },
 };
 
-const ContainerPanelContent = () => {
+const ContainerPanelContent = ({ workspacePath = '' }) => {
   const [status, setStatus] = useState('unavailable');
   const [capabilities, setCapabilities] = useState(null);
   const [buildLog, setBuildLog] = useState('');
 
   const fetchStatus = useCallback(async () => {
     try {
-      const res = await fetch('/api/container/status');
+      const params = new URLSearchParams();
+      if (workspacePath) params.set('workspace', workspacePath);
+      const res = await fetch(`/api/container/status?${params}`);
       if (!res.ok) throw new Error('not available');
       const data = await res.json();
       setStatus(data.status || 'unknown');
@@ -26,7 +28,7 @@ const ContainerPanelContent = () => {
       setCapabilities(null);
       setBuildLog('');
     }
-  }, []);
+  }, [workspacePath]);
 
   useEffect(() => {
     fetchStatus();
