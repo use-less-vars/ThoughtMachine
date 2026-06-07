@@ -126,7 +126,8 @@ class ProviderManager:
 
         If *config_dict* contains a ``provider_id``, the matching profile is
         the authoritative source for ``provider_type``, ``base_url``, and
-        ``api_key`` — they always overwrite whatever is in *config_dict*.
+        ``api_key`` — they overwrite *config_dict* when non-empty (empty
+        profile values leave the config's values intact).
         For ``model``, ``model_override`` (if set) takes precedence over the
         profile's ``default_model``.  If ``model`` is explicitly provided in
         *config_dict* it is preserved; the profile's ``default_model`` is only
@@ -150,23 +151,27 @@ class ProviderManager:
 
         result = dict(config_dict)
 
-        # When provider_id is explicitly set, the profile is the
-        # authoritative source for provider-specific fields.  Always
-        # overwrite — otherwise switching providers leaves stale values
-        # (e.g. base_url from a previous provider) in place.
-        result['provider_type'] = profile.provider_type
-        result['base_url']       = profile.base_url
-        result['api_key']        = profile.api_key
+        # Provider fields: overwrite from profile when non-empty.
+        # When switching providers, non-empty profile values clear stale
+        # values (e.g. base_url, api_key from the previous provider).
+        # Empty profile values leave the config's values intact — this
+        # prevents blanking out valid config values when the profile
+        # has empty optional fields.
+        if profile.provider_type:
+            result['provider_type'] = profile.provider_type
+        if profile.base_url:
+            result['base_url']       = profile.base_url
+        if profile.api_key:
+            result['api_key']        = profile.api_key
 
-        # model: use model_override if set, else respect model from
-        # config_dict if explicitly provided, else profile.default_model
+        # Model: model_override > explicit user model > profile.default_model
         model_override = config_dict.get('model_override')
         if model_override:
             result['model'] = model_override
-        elif config_dict.get('model'):
-            # User explicitly set a model — preserve it
+        elif config_dict.get('model') and config_dict['model'] != 'deepseek-reasoner':
+            # User explicitly set a non-default model — preserve it
             pass
         else:
-            result['model'] = profile.default_model
+            result['model'] = profile.default_model if profile.default_model else result.get('model', '')
 
         return result

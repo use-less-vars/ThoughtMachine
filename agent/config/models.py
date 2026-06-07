@@ -189,16 +189,28 @@ class AgentConfig(BaseModel):
         if profile is None:
             return self.model_copy(deep=True)
 
-        # When provider_id is explicitly set, the profile is the
-        # authoritative source for provider-specific fields.  Always
-        # overwrite — see resolve_config() in provider_profile.py for the
-        # same fix (the runtime code path).
-        updates = {
-            'base_url':       profile.base_url,
-            'api_key':        profile.api_key,
-            'provider_type':  profile.provider_type,
-            'model':          self.model_override or self.model or profile.default_model,
-        }
+        # Provider fields: overwrite from profile when non-empty.
+        # When switching providers, non-empty profile values clear stale
+        # values (e.g. base_url, api_key from the previous provider).
+        # Empty profile values leave the config's values intact — this
+        # prevents blanking out valid config values when the profile
+        # has empty optional fields.
+        updates = {}
+        if profile.provider_type:
+            updates['provider_type'] = profile.provider_type
+        if profile.base_url:
+            updates['base_url'] = profile.base_url
+        if profile.api_key:
+            updates['api_key'] = profile.api_key
+
+        # Model: model_override > explicit user model > profile.default_model
+        if self.model_override:
+            updates['model'] = self.model_override
+        elif self.model and self.model != 'deepseek-reasoner':
+            # User explicitly set a non-default model — preserve it
+            pass
+        elif profile.default_model:
+            updates['model'] = profile.default_model
 
         return self.model_copy(update=updates)
 
