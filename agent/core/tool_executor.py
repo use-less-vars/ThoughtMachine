@@ -48,7 +48,7 @@ _last_check_user_approved: bool = False
 # Fallback used when no live SessionPermissions model is available on config.
 DEFAULT_SESSION_PERMISSIONS = {
     "container": False,
-    "network": False,
+    "network": "banned",
     "filesystem": "read",
     "security": "read",
     "git": "read",
@@ -63,37 +63,39 @@ def _value_satisfies(required: str, allowed: object) -> bool | str:
     Returns:
         - ``True`` if permission is granted.
         - ``False`` if permission is denied.
-        - ``"ASK"`` if the session value is ``'ask'`` for this category
-          and the requested access is non-trivial (user approval needed).
+        - ``"ASK"`` if the session value is ``'ask'`` and the requested access
+          is write-level or otherwise requires user approval.
 
-    Supports boolean and string levels:
-      - Boolean required 'true' / 'false' matches the allowed bool directly.
-      - String levels: 'banned' < 'ask' < 'read' < 'write' < 'full'.
-      - Exact string match also works.
+    Supports both legacy boolean permissions and string levels.  Legacy tool
+    requirements such as ``network:true`` and newer requirements such as
+    ``network:outbound`` are treated as write-level access when compared against
+    string permission profiles.
     """
-    # Normalise required value
     sentinel_ask = "ASK"
-    if required.lower() in ("true", "yes"):
+    required_lower = str(required).lower()
+
+    if required_lower in ("false", "no", "banned"):
+        required_val: object = False if required_lower in ("false", "no") else "banned"
+        required_level = 0
+    elif required_lower in ("true", "yes", "outbound"):
         required_val = True
-    elif required.lower() in ("false", "no"):
-        required_val = False
+        required_level = 3  # legacy bool/network outbound means write-level access
     else:
-        required_val = required  # keep as string (e.g. "read", "write")
+        required_val = required_lower
+        _aliases = {"deny": "banned", "denied": "banned", "all": "full"}
+        required_level_name = _aliases.get(required_lower, required_lower)
+        _level_map = {"banned": 0, "ask": 1, "read": 2, "write": 3, "full": 4}
+        required_level = _level_map.get(required_level_name)
 
     # --- Handle 'ask' session value ---
     allowed_str = str(allowed).lower() if not isinstance(allowed, bool) else ""
     if allowed_str == "ask":
-        # 'ask' means: ask only for write-level access or higher
-        if isinstance(required_val, str):
-            req_lower = required_val.lower()
-            if req_lower in ("false", "no", "banned"):
-                return True  # asking for banned is always fine
-            if req_lower in ("ask", "read"):
-                return True  # read and ask are no-ops — only write/full prompt
-            return sentinel_ask  # 'write' or 'full' needs user approval
-        if isinstance(required_val, bool):
-            return True  # bool required with ask — allow (no formal hierarchy)
-        return sentinel_ask  # fallback: ask
+        if required_level is None:
+            # Unknown named capabilities are not automatically safe.
+            return sentinel_ask
+        if required_level <= 2:
+            return True  # banned/read-level requirements do not need approval
+        return sentinel_ask
 
     if isinstance(allowed, bool):
         if isinstance(required_val, bool):
@@ -101,11 +103,17 @@ def _value_satisfies(required: str, allowed: object) -> bool | str:
         # String required vs bool allowed – True satisfies all, False satisfies nothing
         return allowed is True
 
-    # Both are strings – compare by hierarchy
+    # String permission profile.  Compare known levels safely; unknown required
+    # values must match exactly rather than silently mapping to banned.
+    _aliases = {"deny": "banned", "denied": "banned", "all": "full"}
     _level_map = {"banned": 0, "ask": 1, "read": 2, "write": 3, "full": 4}
-    req_level = _level_map.get(str(required_val).lower(), 0)
-    all_level = _level_map.get(str(allowed).lower(), 0)
-    return all_level >= req_level
+    allowed_level_name = _aliases.get(str(allowed).lower(), str(allowed).lower())
+    allowed_level = _level_map.get(allowed_level_name)
+
+    if required_level is None or allowed_level is None:
+        return str(allowed).lower() == str(required_val).lower()
+
+    return allowed_level >= required_level
 
 
 def _check_permissions(

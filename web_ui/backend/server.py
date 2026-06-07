@@ -1218,7 +1218,7 @@ _FALLBACK_FRONTEND_CONFIG = {
     "detail": "normal",
     "session_permissions": {
         "container": False,
-        "network": False,
+        "network": "banned",
         "filesystem": "read",
         "security": "read",
         "git": "read",

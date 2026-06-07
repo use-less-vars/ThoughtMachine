@@ -16,7 +16,7 @@ import threading
 import queue
 import uuid
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 # Try to import the logging facade and types
 try:
@@ -72,7 +72,7 @@ class SessionPermissions(BaseModel):
     ``tool_executor._check_permissions()``:
 
     - **container**:  Boolean — may the tool spawn containers?
-    - **network**:    Boolean — may the tool access the network?
+    - **network**:    ``'banned' | 'ask' | 'write'`` (legacy booleans are accepted)
     - **filesystem**: ``'banned' | 'read' | 'write' | 'full' | 'ask'``
     - **security**:   ``'banned' | 'read' | 'write' | 'full' | 'ask'``
     - **git**:        ``'banned' | 'read' | 'write' | 'full' | 'ask'``
@@ -83,9 +83,9 @@ class SessionPermissions(BaseModel):
         default=False,
         description='May the tool spawn containers?',
     )
-    network: bool = Field(
-        default=False,
-        description='May the tool access the network?',
+    network: Literal['banned', 'ask', 'write'] = Field(
+        default='write',
+        description='Network access level for the session.',
     )
     filesystem: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
         default='read',
@@ -103,6 +103,19 @@ class SessionPermissions(BaseModel):
         default='banned',
         description='Code execution access level for the session.',
     )
+
+    @field_validator('network', mode='before')
+    @classmethod
+    def coerce_legacy_network_permission(cls, value: Any) -> Any:
+        """Accept legacy bool configs while storing network as an access level.
+
+        Older sessions/default configs persisted ``network`` as ``true``/``false``.
+        The UI now exposes network as ``write``/``ask``/``banned``.  Without this
+        migration, loading old configs fails AgentConfig validation.
+        """
+        if isinstance(value, bool):
+            return 'write' if value else 'banned'
+        return value
 
     def to_dict(self) -> Dict[str, Any]:
         """Return permissions as a plain dict (for JSON serialization)."""

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import ManageProvidersModal from './ManageProvidersModal';
+import ContainerPanelContent from './ContainerPanel';
 
 // ── Directory Browser sub-component ──────────────────────────────────────
 function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect, setLoading, setEntries, setError }) {
@@ -170,6 +171,26 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
   const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error'
   const [showManageProviders, setShowManageProviders] = useState(false);
   const [providerVersion, setProviderVersion] = useState(0);  // incremented when a provider is saved
+  const normalizeSessionPermissions = (permissions) => {
+    const normalized = {
+      filesystem: 'write',
+      network: 'write',
+      container: true,
+      security: 'read',
+      git: 'write',
+      execution: 'banned',
+      system: true,
+      ...(permissions ?? {}),
+    };
+
+    // Backward compatibility: old configs/sessions stored network as boolean.
+    if (typeof normalized.network === 'boolean') {
+      normalized.network = normalized.network ? 'write' : 'banned';
+    }
+
+    return normalized;
+  };
+
   const getSafeDraft = (cfg) => ({
     temperature: cfg?.temperature ?? 0.7,
     max_turns: cfg?.max_turns ?? 10,
@@ -178,15 +199,7 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
     model: cfg?.model,
     system_prompt: cfg?.system_prompt ?? '',
     tools: cfg?.tools ?? [],
-    session_permissions: cfg?.session_permissions ?? {
-      filesystem: 'write',
-      network: true,
-      container: true,
-      security: 'read',
-      git: 'write',
-      execution: 'banned',
-      system: true,
-    },
+    session_permissions: normalizeSessionPermissions(cfg?.session_permissions),
 
     token_monitor_warning_threshold: cfg?.token_monitor_warning_threshold ?? 35000,
     token_monitor_critical_threshold: cfg?.token_monitor_critical_threshold ?? 50000,
@@ -336,8 +349,8 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
     color: '#a6adc8',
   };
 
-  const TAB_KEYS = ['general', 'model', 'tools', 'permissions', 'system_prompt', 'advanced'];
-  const TAB_LABELS = { general: 'General', model: 'Model', tools: 'Tools', permissions: 'Permissions', system_prompt: 'Prompt', advanced: 'Advanced' };
+  const TAB_KEYS = ['general', 'model', 'tools', 'permissions', 'container', 'system_prompt', 'advanced'];  // container tab placeholder
+  const TAB_LABELS = { general: 'General', model: 'Model', tools: 'Tools', permissions: 'Permissions', container: 'Container', system_prompt: 'Prompt', advanced: 'Advanced' };
 
   return (
     <div style={{ padding: '1rem', fontFamily: 'sans-serif', background: '#313244', color: '#cdd6f4', width: panelWidth || 280, minWidth: 200, maxWidth: 500, flexShrink: 0, overflowY: 'auto', height: '100%' }}>
@@ -608,22 +621,18 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
 
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>Network</strong></label>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginTop: '0.3rem' }}>
-              <label className="toggle-switch">
-                <input
-                  type="checkbox"
-                  checked={draft.session_permissions?.network ?? true}
-                  onChange={(e) => setDraft({
-                    ...draft,
-                    session_permissions: { ...draft.session_permissions, network: e.target.checked }
-                  })}
-                />
-                <span className="toggle-slider"></span>
-              </label>
-              <span style={{ fontSize: '0.85rem', color: draft.session_permissions?.network ? '#a6e3a1' : '#f38ba8' }}>
-                {draft.session_permissions?.network ? 'Enabled' : 'Disabled'}
-              </span>
-            </div>
+            <select
+              value={draft.session_permissions?.network ?? 'write'}
+              onChange={(e) => setDraft({
+                ...draft,
+                session_permissions: { ...draft.session_permissions, network: e.target.value }
+              })}
+              style={inputStyle}
+            >
+              <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
+              <option value="ask" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Ask</option>
+              <option value="banned" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Banned</option>
+            </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
               Allow the agent to make network requests.
             </small>
@@ -696,10 +705,34 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
             </small>
           </div>
 
+          <div style={{ marginBottom: '1rem' }}>
+            <label style={labelStyle}><strong>Execution</strong></label>
+            <select
+              value={draft.session_permissions?.execution ?? 'banned'}
+              onChange={(e) => setDraft({
+                ...draft,
+                session_permissions: { ...draft.session_permissions, execution: e.target.value }
+              })}
+              style={inputStyle}
+            >
+              <option value="banned" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Banned</option>
+              <option value="ask" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Ask</option>
+              <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
+            </select>
+            <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
+              Allow the agent to run commands and code in the sandbox.
+            </small>
+          </div>
+
           <p style={{ color: '#6c7086', fontSize: '0.8rem', fontStyle: 'italic', borderTop: '1px solid #45475a', paddingTop: '0.75rem' }}>
             Changes take effect on the next tool call. No restart required.
           </p>
         </div>
+      )}
+
+      {/* ── Container Tab ─────────────────────────────────────────────── */}
+      {activeTab === 'container' && (
+        <ContainerPanelContent />
       )}
 
       {/* ── System Prompt Tab ──────────────────────────────────────────── */}

@@ -481,3 +481,164 @@ Removed from core: `PyQt6` (legacy GUI, not needed for web UI), `sentence-transf
 - **No first-time user detection mechanism** — The agent needs some way to know it's talking to a new user. Options: check for a marker in global KB (e.g., `user/user_profile.md`), or simply run onboarding when the user seems confused.
 - **The "View Artifact" tool** — Previously brainstormed idea. Could pair well with onboarding (agent generates a welcome page and presents it visually).
 
+
+## 2026-06-07 — # 🕵️ The Case of the Missing Panel — Full Investigation Repo...
+
+# 🕵️ The Case of the Missing Panel — Full Investigation Report
+
+**To**: GUI Engineer  
+**From**: ThoughtMachine AI  
+**Date**: 2026-06-07  
+**Subject**: Complete investigation log — ConfigPanel sidebar + Docker panel feature request
+
+---
+
+## 1. How It Started
+
+The user (jojo) reported: *"my Config panel sidebar was once there but not currently."* Meaning: the gray sidebar on the left side of the session view (the one with config tabs like General, Model, Tools, Permissions, etc.) that they remember seeing before, is now absent from the screen.
+
+At this point, we had uncommitted changes in the workspace:
+- `agent/config/models.py` — modified
+- `agent/config/provider_profile.py` — modified
+(These are the "overwrite when non-empty" fix for provider profile resolution.)
+
+## 2. Investigation Phase 1 — Is ConfigPanel Rendering?
+
+We checked the code path:
+
+- **SessionTab.jsx:446** — ConfigPanel IS rendered unconditionally:
+  ```jsx
+  <ConfigPanel
+    config={state.config}
+    sendCommand={sendCommand}
+    providers={providers}
+    ...
+  />
+  ```
+  No `if` guard, no `isDeferred` check. If the tab is loaded, ConfigPanel renders.
+
+- **ConfigPanel.jsx:169** — The component signature:
+  ```jsx
+  function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected, ... })
+  ```
+
+- **ConfigPanel.jsx:302-306** — The only conditional is the loading state:
+  ```jsx
+  if (!config) {
+    return <div style={{ padding: '1rem', ..., width: panelWidth || 280, ... }}>
+      Loading config...
+    </div>;
+  }
+  ```
+
+- **ConfigPanel.jsx:342-343** — The real render:
+  ```jsx
+  return (
+    <div style={{ padding: '1rem', fontFamily: 'sans-serif', background: '#313244',
+                  color: '#cdd6f4', width: panelWidth || 280, minWidth: 200, maxWidth: 500,
+                  flexShrink: 0, overflowY: 'auto', height: '100%' }}>
+  ```
+
+### Key findings:
+- ConfigPanel uses **inline styles entirely** — no CSS class like `.config-panel` on the outer div (the `.config-panel` class in `styles.css:100` is unused vestigial CSS)
+- The resize handle (`.resize-handle`) sits between ConfigPanel and the chat panel — uses `width: 5px` CSS class
+- ConfigPanel is resizable via drag, persisted per tab in `localStorage` key `config-panel-width:{tabId}`
+
+## 3. Investigation Phase 2 — Is ConfigPanel in the DOM?
+
+The user couldn't access browser DevTools (no Elements/Inspector tab available in their Firefox). We worked around this:
+
+- Confirmed via WS message count (907 messages received) that **the tab IS loaded and active**
+- The backend sends `config_changed` events after `load_session` (server.py:721-726) — so config should arrive
+- No React errors in browser console
+- The user eventually found CSS via browser inspection that **exactly matches** ConfigPanel's inline styles:
+  ```
+  padding: 1rem;
+  font-family: sans-serif;
+  background: rgb(49, 50, 68);  /* = #313244 */
+  color: rgb(205, 214, 244);    /* = #cdd6f4 */
+  width: 280px;                  /* = panelWidth || 280 */
+  min-width: 200px;
+  max-width: 500px;
+  flex-shrink: 0;
+  overflow-y: auto;
+  height: 100%;
+  ```
+  **Verdict: ConfigPanel IS in the DOM with correct styles.**
+
+## 4. Investigation Phase 3 — Why Is It Not Visible?
+
+This is where it gets tricky. ConfigPanel exists in HTML but the user says it's not visible on screen. Possible causes (not fully resolved):
+
+| Cause | Likelihood | Notes |
+|---|---|---|
+| **User is looking at deferred tab** | Medium | 4 of 5 tabs are deferred ("Click tab to load conversation") — possible user was on wrong tab |
+| **CSS layout clipping** | Low | Parent `.app-main` has `overflow: hidden` but ConfigPanel has `flex-shrink: 0` and fixed width |
+| **Browser zoom/scroll** | Low | Could be off-screen to the right |
+| **ConfigPanel is there but user didn't notice** | Low | Unlikely given user's certainty |
+
+## 5. Plot Twist — It's Not ConfigPanel!
+
+After the investigation, the user revealed: **"we are looking for the container panel, the docker thing"**
+
+So the entire investigation was a misunderstanding! The user was NOT looking for the Config sidebar. They were looking for a **Docker containers panel** — a UI component that:
+
+- **Does not exist** in the codebase
+- Was never built
+- Has no placeholder, no route, no component file
+- Only Docker-related code is the `DockerCodeRunner` tool listing and a "Container" permission toggle in ConfigPanel's Permissions tab (lines 633-653)
+
+## 6. Current State
+
+### Uncommitted changes (the provider profile fix):
+```
+ M agent/config/models.py
+ M agent/config/provider_profile.py
+```
+
+### Branch situation:
+- Currently on **detached HEAD** at `4b3dde3`
+- Branch `master` exists
+- User plans to create a new branch (likely named `docker-panel`), commit the changes, then build the Docker panel from scratch
+
+### The user's plan:
+1. ✅ Commit current changes to new branch
+2. ❓ Provide full instructions for building the Docker panel UI
+3. ❓ Build the Docker panel component
+
+## 7. Technical Notes for the GUI Engineer
+
+### Frontend architecture (relevant parts):
+- **Stack**: React (Vite), vanilla CSS (inline styles + some CSS classes in `styles.css`)
+- **State management**: Per-tab state via `useState`/`useCallback` in SessionTab — no Redux/Zustand
+- **Backend communication**: WebSocket (`sendCommand()` / event listeners)
+- **Tab system**: Up to 5 tabs, lazy-loaded (deferred pattern), state persisted per tab
+- **Config delivery**: Backend sends `config_changed` event after `load_session`
+- **Styling**: Catppuccin Mocha palette (`--bg-primary: #1e1e2e`, `--bg-surface: #313244`, etc.)
+
+### ConfigPanel inline style pattern (for reference when building new panels):
+```jsx
+<div style={{
+  padding: '1rem',
+  fontFamily: 'sans-serif',
+  background: '#313244',
+  color: '#cdd6f4',
+  width: panelWidth || 280,
+  minWidth: 200,
+  maxWidth: 500,
+  flexShrink: 0,
+  overflowY: 'auto',
+  height: '100%'
+}}>
+```
+
+### The `sendCommand` interface:
+```jsx
+sendCommand('command_name', { payload })
+```
+Available commands are handled in `bridge.py` and `server.py`.
+
+---
+
+**End of report.** Ready for Docker panel feature design.
+
