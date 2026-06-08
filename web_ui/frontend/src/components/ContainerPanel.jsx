@@ -12,6 +12,7 @@ const ContainerPanelContent = ({ workspacePath = '' }) => {
   const [status, setStatus] = useState('unavailable');
   const [capabilities, setCapabilities] = useState(null);
   const [buildLog, setBuildLog] = useState('');
+  const [rebuilding, setRebuilding] = useState(false);
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -35,6 +36,32 @@ const ContainerPanelContent = ({ workspacePath = '' }) => {
     const interval = setInterval(fetchStatus, 5000);
     return () => clearInterval(interval);
   }, [fetchStatus]);
+
+  const handleRebuild = useCallback(async () => {
+    setRebuilding(true);
+    setBuildLog('');
+    setStatus('building');
+    try {
+      const params = new URLSearchParams();
+      if (workspacePath) params.set('workspace', workspacePath);
+      const res = await fetch('/api/container/rebuild', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString(),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setBuildLog(data.build_log || '');
+      setStatus(data.status === 'ok' ? 'stopped' : data.status);
+      // Refresh full status after rebuild completes
+      fetchStatus();
+    } catch (err) {
+      setBuildLog(`Rebuild failed: ${err.message}`);
+      setStatus('error');
+    } finally {
+      setRebuilding(false);
+    }
+  }, [workspacePath, fetchStatus]);
 
   const cfg = STATUS_CONFIG[status] || STATUS_CONFIG.unavailable;
 
@@ -76,8 +103,13 @@ const ContainerPanelContent = ({ workspacePath = '' }) => {
 
       {/* Rebuild button */}
       <div className="config-field">
-        <button className="btn" disabled title="Rebuild available in Phase 2">
-          Rebuild Container
+        <button
+          className="btn"
+          onClick={handleRebuild}
+          disabled={rebuilding || status === 'building'}
+          title={rebuilding ? 'Rebuilding...' : status === 'unavailable' ? 'Workspace not set' : 'Rebuild Docker image from Dockerfile with --no-cache'}
+        >
+          {rebuilding || status === 'building' ? 'Rebuilding…' : 'Rebuild Container'}
         </button>
       </div>
     </div>

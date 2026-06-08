@@ -91,7 +91,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from agent.logging import log
@@ -1104,7 +1104,20 @@ async def container_status(workspace: str = ""):
         return {"status": "error", "capabilities": {}, "build_log": str(exc)}
 
 
+@app.post("/api/container/rebuild")
+async def container_rebuild(workspace: str = Form("")):
+    """Rebuild the Docker image for the given workspace path."""
+    if not workspace:
+        return {"status": "error", "build_log": "No workspace path provided."}
 
+    from docker_executor import rebuild_container
+
+    try:
+        result = rebuild_container(workspace)
+        return result
+    except Exception as exc:
+        log("ERROR", "server.container_rebuild", f"Container rebuild failed: {exc}")
+        return {"status": "error", "build_log": str(exc)}
 
 
 @app.get("/")

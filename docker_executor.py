@@ -430,6 +430,59 @@ class DockerExecutor:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+# ── Container rebuild helper ─────────────────────────────────────────────
+
+
+def rebuild_container(workspace_path: str) -> dict:
+    """
+    Rebuild the Docker image for *workspace_path* with --no-cache.
+
+    Returns:
+        A dict with:
+        - **status** -- ``"building"``, ``"ok"``, or ``"error"``
+        - **build_log** -- full build log from the build attempt
+    """
+    global _build_in_progress
+
+    normalised = os.path.abspath(workspace_path).replace("\\", "/")
+
+    if _build_in_progress:
+        with _build_log_cache_lock:
+            log_text = _build_log_cache.get(normalised, "")
+        return {
+            "status": "building",
+            "build_log": log_text or "Build already in progress...",
+        }
+
+    try:
+        # Use DockerExecutor to perform the rebuild
+        executor = DockerExecutor(
+            workspace_path=normalised,
+            force_rebuild=True,   # triggers nocache build
+            idle_timeout=0,       # ephemeral, no pooling needed
+        )
+        executor.close()  # ensure any old container is gone
+        image, log_lines = executor._build_image(verbose_build=True, nocache=True)
+        return {
+            "status": "ok",
+            "build_log": "\n".join(log_lines) if log_lines else "Build completed successfully.",
+        }
+    except RuntimeError as exc:
+        return {
+            "status": "error",
+            "build_log": str(exc),
+        }
+    except Exception as exc:
+        log("ERROR", "tools.docker_executor.rebuild", f"Unexpected rebuild error: {exc}")
+        return {
+            "status": "error",
+            "build_log": f"Unexpected error: {exc}",
+        }
+
+
+
+
+
 def get_container_status(workspace_path: str) -> dict:
     """
     Return the status of the Docker container for *workspace_path*.
