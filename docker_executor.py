@@ -472,6 +472,31 @@ class DockerExecutor:
 
 # ── Container rebuild helper ─────────────────────────────────────────────
 
+
+def _remove_container_by_workspace(workspace_path: str) -> None:
+    """Stop and remove the Docker container for the given workspace, if it exists.
+
+    Uses the same deterministic naming scheme as :class:`DockerExecutor`
+    (SHA-256 of the normalised absolute path, first 12 hex digits prefixed by
+    ``agent-exec-``).  This is safe to call even when no container exists.
+    """
+    normalised = os.path.abspath(workspace_path).replace("\\", "/")
+    digest = hashlib.sha256(normalised.encode()).hexdigest()[:12]
+    container_name = f"agent-exec-{digest}"
+    try:
+        client = docker.from_env()
+        container = client.containers.get(container_name)
+        container.stop()
+        container.remove()
+        log("INFO", "tools.docker_executor.rebuild",
+            f"Removed old container {container_name} after rebuild")
+    except docker.errors.NotFound:
+        pass  # container didn't exist — nothing to do
+    except docker.errors.DockerException as exc:
+        log("WARNING", "tools.docker_executor.rebuild",
+            f"Could not remove container {container_name}: {exc}")
+
+
 # Background build results cache — populated by rebuild_container background
 # thread, consumed by get_container_status() to surface build results.
 _background_build_results: dict[str, dict] = {}
@@ -515,6 +540,12 @@ def rebuild_container(workspace_path: str) -> dict:
             )
             executor.close()  # ensure any old container is gone
             image, log_lines = executor._build_image(verbose_build=True, nocache=True)
+
+            # ── Remove the old container so the next execution creates a fresh one ──
+            # The rebuild only builds the image; the old container with the previous
+            # image continues to run unless we explicitly tear it down.
+            _remove_container_by_workspace(normalised)
+
             result = {
                 "status": "ok",
                 "build_log": "\n".join(log_lines) if log_lines else "Build completed successfully.",
