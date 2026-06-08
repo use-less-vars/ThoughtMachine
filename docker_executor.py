@@ -84,12 +84,23 @@ def _load_policy(workspace_path: str) -> dict:
     log("DEBUG", "tools.docker_executor.policy", "No pattern match, using default", result)
     return result
 
+
+def _compute_image_tag(workspace_path: str) -> str:
+    """Derive a deterministic Docker image tag from the workspace path.
+
+    Different workspaces (e.g., worktrees) get different tags so they
+    never share or conflict on one tag like `agent-executor:latest`.
+    """
+    path_hash = hashlib.sha256(workspace_path.encode()).hexdigest()[:16]
+    return f"agent-executor-{path_hash}"
+
+
 class DockerExecutor:
-    def __init__(self, workspace_path, image="agent-executor",
+    def __init__(self, workspace_path, image=None,
                   network="none", mem_limit="512m", cpu_quota=50000, force_rebuild=False, idle_timeout=600):
         # Normalize path: absolute, no trailing slash — ensures deterministic container naming
         self.workspace_path = os.path.abspath(workspace_path).rstrip('/')
-        self.image = image
+        self.image = image or _compute_image_tag(self.workspace_path)
         self.network = network
         self.mem_limit = mem_limit
         self.cpu_quota = cpu_quota
