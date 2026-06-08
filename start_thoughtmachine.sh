@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Ensure clean startup by killing any leftover processes
+"$(dirname "$0")/kill_thoughtmachine.sh"
 set -euo pipefail
 
 # ──────────────────────────────────────────────────────────────────────────────
