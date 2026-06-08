@@ -13,6 +13,7 @@ const ContainerPanelContent = ({ workspacePath = '' }) => {
   const [capabilities, setCapabilities] = useState(null);
   const [buildLog, setBuildLog] = useState('');
   const [rebuilding, setRebuilding] = useState(false);
+  const [imageTag, setImageTag] = useState('');
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -24,10 +25,12 @@ const ContainerPanelContent = ({ workspacePath = '' }) => {
       setStatus(data.status || 'unknown');
       setCapabilities(data.capabilities || null);
       setBuildLog(data.build_log || '');
+      setImageTag(data.image || '');
     } catch {
       setStatus('unavailable');
       setCapabilities(null);
       setBuildLog('');
+      setImageTag('');
     }
   }, [workspacePath]);
 
@@ -76,6 +79,14 @@ const ContainerPanelContent = ({ workspacePath = '' }) => {
           backgroundColor: cfg.color, flexShrink: 0
         }} />
         <span>{cfg.label}</span>
+      </div>
+
+      {/* Image tag */}
+      <div className="config-field">
+        <label>Image</label>
+        <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)', fontFamily: 'monospace' }}>
+          {imageTag || <em>Not available</em>}
+        </span>
       </div>
 
       {/* Capabilities */}

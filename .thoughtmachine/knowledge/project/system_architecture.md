@@ -2117,3 +2117,16 @@ Completed a comprehensive investigation of the entire security/permissions syste
 **Suggested improvements documented in report.**
 
 
+
+## 2026-06-08 — ## Container rebuild background thread (2026-06-08)
+
+`rebuil...
+
+## Container rebuild background thread (2026-06-08)
+
+`rebuild_container()` in `docker_executor.py` now runs the Docker build in a **background daemon thread** and returns immediately with `{"status": "building", ...}` instead of blocking.
+
+- Results are stored in `_background_build_results` (keyed by normalised path)
+- `get_container_status()` merges those results into its return (step 7)
+- The `image` field (`_compute_image_tag(normalised)`) was added to all 3 return sites of `get_container_status()` plus shown in ContainerPanel.jsx
+- Server endpoints `/api/container/status` and `/api/container/rebuild` changed from `async def` to `def` (FastAPI runs sync routes in thread pool, avoids blocking event loop)

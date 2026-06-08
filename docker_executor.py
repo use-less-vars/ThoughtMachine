@@ -385,6 +385,11 @@ class DockerExecutor:
         global _build_in_progress
         _build_in_progress = True
 
+        # Compute container_name for cache key alignment with get_container_status
+        normalised = self.workspace_path.replace("\\", "/")
+        digest = hashlib.sha256(normalised.encode()).hexdigest()[:12]
+        _container_name = f"agent-exec-{digest}"
+
         dockerfile_dir = self.workspace_path
         dockerfile_path = os.path.join(dockerfile_dir, "docker", "executor.Dockerfile")
         if not os.path.exists(dockerfile_path):
@@ -394,14 +399,21 @@ class DockerExecutor:
         log('DEBUG', 'tools.docker_executor.build', f"Building Docker image {self.image} from {dockerfile_path}")
 
         log_lines: list[str] = []
+        image_id: str | None = None
         try:
-            image, build_logs = self.client.images.build(
+            # Use the low-level API directly — the high-level images.build()
+            # consumes the response generator internally to find the image ID,
+            # which prevents live streaming.  The low-level api.build() returns
+            # an unconsumed generator; we decode each JSON chunk and extract
+            # the image ID from the final "aux" message ourselves.
+            build_logs = self.client.api.build(
                 path=dockerfile_dir,
                 dockerfile="docker/executor.Dockerfile",
                 tag=self.image,
                 rm=True,
                 pull=True,
                 nocache=nocache,
+                decode=True,
             )
             for chunk in build_logs:
                 if "stream" in chunk:
@@ -409,12 +421,25 @@ class DockerExecutor:
                     if line:
                         log_lines.append(line)
                         log('DEBUG', 'tools.docker_executor.build', f"Build: {line}")
+                        # Live-stream to the shared cache so the frontend polling
+                        # loop sees each line as it arrives
+                        with _build_log_cache_lock:
+                            _build_log_cache[normalised] = '\n'.join(log_lines)
+                        sys.stdout.write(line + '\n')
+                        sys.stdout.flush()
+                elif "aux" in chunk and "ID" in chunk["aux"]:
+                    image_id = chunk["aux"]["ID"]
+            if image_id is None:
+                raise RuntimeError("Docker build completed but no image ID was returned")
+            image = image_id
         except docker.errors.BuildError as e:
             build_log_str = "\n".join(str(line) for line in (e.build_log or []))
             log_lines.extend(str(line) for line in (e.build_log or []))
             _build_in_progress = False
             with _build_log_cache_lock:
-                _build_log_cache[self.workspace_path] = "\n".join(log_lines)
+                cache_value = "\n".join(log_lines)
+                _build_log_cache[self.workspace_path] = cache_value
+                _build_log_cache[_container_name] = cache_value
             raise RuntimeError(
                 f"Docker build failed: {e}\n"
                 f"Build logs:\n{build_log_str}"
@@ -423,7 +448,9 @@ class DockerExecutor:
             _build_in_progress = False
             log_lines.append(str(e))
             with _build_log_cache_lock:
-                _build_log_cache[self.workspace_path] = "\n".join(log_lines)
+                cache_value = "\n".join(log_lines)
+                _build_log_cache[self.workspace_path] = cache_value
+                _build_log_cache[_container_name] = cache_value
             raise RuntimeError(f"Docker build failed: {e}") from e
 
         if verbose_build and log_lines:
@@ -431,7 +458,9 @@ class DockerExecutor:
 
         # ── Store build log in shared cache ────────────────────────────────────
         with _build_log_cache_lock:
-            _build_log_cache[self.workspace_path] = "\n".join(log_lines)
+            cache_value = "\n".join(log_lines)
+            _build_log_cache[self.workspace_path] = cache_value
+            _build_log_cache[_container_name] = cache_value
 
         _build_in_progress = False
         return image, log_lines
@@ -443,10 +472,20 @@ class DockerExecutor:
 
 # ── Container rebuild helper ─────────────────────────────────────────────
 
+# Background build results cache — populated by rebuild_container background
+# thread, consumed by get_container_status() to surface build results.
+_background_build_results: dict[str, dict] = {}
+_background_build_results_lock = threading.Lock()
+
 
 def rebuild_container(workspace_path: str) -> dict:
     """
-    Rebuild the Docker image for *workspace_path* with --no-cache.
+    Start a **background** rebuild of the Docker image for *workspace_path*
+    with --no-cache and return immediately.
+
+    The background thread stores its result in ``_background_build_results``;
+    ``get_container_status()`` merges that result into its return value so the
+    frontend can pick it up via its polling loop.
 
     Returns:
         A dict with:
@@ -458,37 +497,46 @@ def rebuild_container(workspace_path: str) -> dict:
     normalised = os.path.abspath(workspace_path).replace("\\", "/")
 
     if _build_in_progress:
-        with _build_log_cache_lock:
-            log_text = _build_log_cache.get(normalised, "")
-        return {
+        with _background_build_results_lock:
+            result = _background_build_results.get(normalised, {})
+        return result or {
             "status": "building",
-            "build_log": log_text or "Build already in progress...",
+            "build_log": "Build already in progress...",
         }
 
-    try:
-        # Use DockerExecutor to perform the rebuild
-        executor = DockerExecutor(
-            workspace_path=normalised,
-            force_rebuild=True,   # triggers nocache build
-            idle_timeout=0,       # ephemeral, no pooling needed
-        )
-        executor.close()  # ensure any old container is gone
-        image, log_lines = executor._build_image(verbose_build=True, nocache=True)
-        return {
-            "status": "ok",
-            "build_log": "\n".join(log_lines) if log_lines else "Build completed successfully.",
-        }
-    except RuntimeError as exc:
-        return {
-            "status": "error",
-            "build_log": str(exc),
-        }
-    except Exception as exc:
-        log("ERROR", "tools.docker_executor.rebuild", f"Unexpected rebuild error: {exc}")
-        return {
-            "status": "error",
-            "build_log": f"Unexpected error: {exc}",
-        }
+    def _run_build():
+        global _build_in_progress
+        _build_in_progress = True
+        try:
+            executor = DockerExecutor(
+                workspace_path=normalised,
+                force_rebuild=True,   # triggers nocache build
+                idle_timeout=0,       # ephemeral, no pooling needed
+            )
+            executor.close()  # ensure any old container is gone
+            image, log_lines = executor._build_image(verbose_build=True, nocache=True)
+            result = {
+                "status": "ok",
+                "build_log": "\n".join(log_lines) if log_lines else "Build completed successfully.",
+            }
+        except RuntimeError as exc:
+            result = {"status": "error", "build_log": str(exc)}
+        except Exception as exc:
+            log("ERROR", "tools.docker_executor.rebuild", f"Unexpected rebuild error: {exc}")
+            result = {"status": "error", "build_log": f"Unexpected error: {exc}"}
+        finally:
+            _build_in_progress = False
+
+        with _background_build_results_lock:
+            _background_build_results[normalised] = result
+
+    thread = threading.Thread(target=_run_build, daemon=True)
+    thread.start()
+
+    return {
+        "status": "building",
+        "build_log": "Build started in background...",
+    }
 
 
 
@@ -531,12 +579,14 @@ def get_container_status(workspace_path: str) -> dict:
         is_building = _build_in_progress
 
     if is_building:
-        # Load capabilities anyway before returning early
         caps = _load_capabilities(normalised)
+        with _build_log_cache_lock:
+            live_log = _build_log_cache.get(normalised, "")
         return {
             "status": "building",
             "capabilities": caps,
-            "build_log": "Build in progress...",
+            "image": _compute_image_tag(normalised),
+            "build_log": live_log or "Build started...",
         }
 
     # ── 4. Query Docker for container status ────────────────────────────────
@@ -562,6 +612,7 @@ def get_container_status(workspace_path: str) -> dict:
         return {
             "status": status,
             "capabilities": caps,
+            "image": _compute_image_tag(normalised),
             "build_log": log_text.strip(),
         }
 
@@ -572,10 +623,19 @@ def get_container_status(workspace_path: str) -> dict:
     with _build_log_cache_lock:
         build_log = _build_log_cache.get(container_name, "")
 
-    # ── 7. Return ───────────────────────────────────────────────────────────
+    # ── 7. Check background rebuild result ───────────────────────────────────
+    with _background_build_results_lock:
+        bg_result = _background_build_results.get(normalised)
+    if bg_result and bg_result.get("status") in ("ok", "error"):
+        # A background rebuild finished — surface its log as the primary one
+        build_log = bg_result.get("build_log", build_log)
+        status = bg_result["status"] if bg_result["status"] == "error" else status
+
+    # ── 8. Return ───────────────────────────────────────────────────────────
     return {
         "status": status,
         "capabilities": caps,
+        "image": _compute_image_tag(normalised),
         "build_log": build_log,
     }
 

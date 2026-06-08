@@ -1088,7 +1088,7 @@ async def health():
     return {"status": "ok", "service": "thoughtmachine-web-ui"}
 
 @app.get("/api/container/status")
-async def container_status(workspace: str = ""):
+def container_status(workspace: str = ""):
     """Return status of the Docker container for the given workspace path."""
     if not workspace:
         return {"status": "unavailable", "capabilities": {}, "build_log": ""}
@@ -1105,7 +1105,7 @@ async def container_status(workspace: str = ""):
 
 
 @app.post("/api/container/rebuild")
-async def container_rebuild(workspace: str = Form("")):
+def container_rebuild(workspace: str = Form("")):
     """Rebuild the Docker image for the given workspace path."""
     if not workspace:
         return {"status": "error", "build_log": "No workspace path provided."}
