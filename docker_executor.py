@@ -242,7 +242,7 @@ class DockerExecutor:
         self.container = self.client.containers.run(
             image=self.image,
             name=container_name,
-            volumes={self.workspace_path: {"bind": "/workspace", "mode": "rw"}},
+            volumes={self.workspace_path: {"bind": "/workspace", "mode": "ro"}},
             tmpfs=tmpfs,
             network=network_mode,
             cap_drop=["ALL"],
@@ -610,7 +610,7 @@ def get_container_status(workspace_path: str) -> dict:
         is_building = _build_in_progress
 
     if is_building:
-        caps = _load_capabilities(normalised)
+        caps = _compute_effective_capabilities(normalised)
         with _build_log_cache_lock:
             live_log = _build_log_cache.get(normalised, "")
         return {
@@ -639,7 +639,7 @@ def get_container_status(workspace_path: str) -> dict:
         with _build_log_cache_lock:
             log_text = _build_log_cache.get(container_name, "")
         log_text += f"\nDocker query error: {exc}"
-        caps = _load_capabilities(normalised)
+        caps = _compute_effective_capabilities(normalised)
         return {
             "status": status,
             "capabilities": caps,
@@ -647,8 +647,8 @@ def get_container_status(workspace_path: str) -> dict:
             "build_log": log_text.strip(),
         }
 
-    # ── 5. Load capabilities ────────────────────────────────────────────────
-    caps = _load_capabilities(normalised)
+    # ── 5. Load effective capabilities (caps × policy) ──────────────────────
+    caps = _compute_effective_capabilities(normalised)
 
     # ── 6. Retrieve build log ───────────────────────────────────────────────
     with _build_log_cache_lock:
@@ -696,6 +696,60 @@ def _load_capabilities(workspace_path: str) -> dict:
         }
     except Exception:
         return _default_capabilities()
+
+
+def _compute_effective_capabilities(workspace_path: str) -> dict:
+    """Merge workspace capabilities with the Docker security policy.
+
+    The effective capability for each field is the minimum (most restrictive)
+    of the two sources.  If the policy has no opinion on a given field it is
+    treated as permissive (no restriction added).
+    """
+    caps = _load_capabilities(workspace_path)
+    policy = _load_policy(workspace_path)
+
+    # ── Booleans: True only if both sources allow it ──────────────────────
+    allow_network = caps["allow_network"] and policy.get("docker_network_allowed", True)
+    # Policy has no docker-execution key — treat as permissive
+    allow_docker = caps["allow_docker"]
+
+    # ── File extensions: intersect, with wildcard passthrough ──────────────
+    ext_a = caps["allowed_file_extensions"]
+    ext_b = policy.get("allowed_file_extensions", ["*"])
+    if "*" in ext_a:
+        allowed_file_extensions = list(ext_b)
+    elif "*" in ext_b:
+        allowed_file_extensions = list(ext_a)
+    else:
+        allowed_file_extensions = sorted(set(ext_a) & set(ext_b))
+
+    # ── Max file size: 0 = unlimited, otherwise min ───────────────────────
+    size_a = caps["max_file_size_bytes"]
+    size_b = policy.get("max_file_size_bytes", 0)
+    if size_a == 0:
+        max_file_size_bytes = size_b
+    elif size_b == 0:
+        max_file_size_bytes = size_a
+    else:
+        max_file_size_bytes = min(size_a, size_b)
+
+    # ── Workspace dirs: intersect, with full-workspace passthrough ────────
+    dir_a = caps["allowed_workspace_dirs"]
+    dir_b = policy.get("allowed_workspace_dirs", ["."])
+    if "." in dir_a:
+        allowed_workspace_dirs = list(dir_b)
+    elif "." in dir_b:
+        allowed_workspace_dirs = list(dir_a)
+    else:
+        allowed_workspace_dirs = sorted(set(dir_a) & set(dir_b))
+
+    return {
+        "allow_network": allow_network,
+        "allow_docker": allow_docker,
+        "allowed_file_extensions": allowed_file_extensions,
+        "max_file_size_bytes": max_file_size_bytes,
+        "allowed_workspace_dirs": allowed_workspace_dirs,
+    }
 
 
 def _default_capabilities() -> dict:
