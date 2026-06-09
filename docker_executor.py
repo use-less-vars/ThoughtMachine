@@ -261,14 +261,38 @@ class DockerExecutor:
             except docker.errors.NotFound:
                 pass
 
-        # Create new container with current policy
-        policy = _load_policy(self.workspace_path)
-        network_mode = "bridge" if policy.get("docker_network_allowed", False) else "none"
+        # ── Unified security gate ─────────────────────────────────────────
+        network_mode = "none"
+        filesystem_mode = "read"
+
+        if self.workspace_id and self.session_permissions is not None:
+            try:
+                from security.security_gate import (
+                    get_workspace_capabilities,
+                    get_effective_permissions,
+                )
+                caps = get_workspace_capabilities(self.workspace_id)
+                eff = get_effective_permissions(self.session_permissions, caps)
+
+                if eff.get("network") is True:
+                    network_mode = "bridge"
+                else:
+                    network_mode = "none"
+
+                filesystem_mode = eff.get("filesystem", "read")
+            except Exception as e:
+                log("WARN", "docker.security_gate",
+                    f"Gate lookup failed, using safe defaults: {e}")
+                network_mode = "none"
+                filesystem_mode = "read"
+
         with open("/tmp/container_audit.log", "a") as _f:
-            _f.write(f"{time.time()} | NETWORK_DECISION | network_mode={network_mode} policy_docker_network_allowed={policy.get('docker_network_allowed', 'KEY_MISSING')}\n")
-        tmpfs = {"/tmp": "rw,noexec,nosuid,size=64m"}
-        if policy.get("writable_home", False):
-            tmpfs["/home/agent"] = "rw,exec,size=256M,uid=1000,gid=1000"
+            _f.write(f"{time.time()} | NETWORK_DECISION | network_mode={network_mode}\n")
+
+        tmpfs = {
+            "/tmp": "rw,noexec,nosuid,size=64m",
+            "/home/agent": "rw,exec,size=256M,uid=1000,gid=1000",
+        }
 
         log('INFO', 'tools.docker_executor.container',
             f"AUDIT: Creating container with network={network_mode}, tmpfs={tmpfs}")
@@ -278,7 +302,7 @@ class DockerExecutor:
         self.container = self.client.containers.run(
             image=self.image,
             name=container_name,
-            volumes={self.workspace_path: {"bind": "/workspace", "mode": "ro"}},
+            volumes={self.workspace_path: {"bind": "/workspace", "mode": "rw" if filesystem_mode == "write" else "ro"}},
             tmpfs=tmpfs,
             network=network_mode,
             cap_drop=["ALL"],
