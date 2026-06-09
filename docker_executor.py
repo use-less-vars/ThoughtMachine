@@ -7,7 +7,6 @@ import time
 import threading
 import queue
 import json
-import fnmatch
 import sys
 
 # ── Audit log for network_mode debugging ───────────────────────────────────
@@ -22,81 +21,6 @@ _build_log_cache: dict[str, str] = {}
 _build_log_cache_lock = threading.Lock()
 _build_in_progress: bool = False
 log("DEBUG", "tools.docker_executor", "Module loaded", {"__file__": __file__})
-
-def _load_policy(workspace_path: str) -> dict:
-    """Load security policy from security_policy.json.
-    Checks in order:
-    1. Same directory as this file (project root)
-    2. ~/.thoughtmachine/security_policy.json
-    Returns dict with keys 'docker_network_allowed' and 'writable_home'.
-    """
-    from pathlib import Path
-
-    # Determine the directory where this file lives
-    this_dir = Path(__file__).parent.resolve()
-    candidate_paths = [
-        this_dir / "security_policy.json",          # project root
-        Path.home() / ".thoughtmachine" / "security_policy.json",  # home dir
-    ]
-
-    config_path = None
-    for candidate in candidate_paths:
-        if candidate.exists():
-            config_path = candidate
-            break
-
-    log("DEBUG", "tools.docker_executor.policy",
-        "Looking for security policy",
-        {"workspace_path": workspace_path, "candidates": [str(p) for p in candidate_paths], "found": str(config_path)})
-
-    if config_path is None:
-        log("DEBUG", "tools.docker_executor.policy", "No policy file found, using defaults",
-            {"docker_network_allowed": False, "writable_home": False})
-        with open("/tmp/container_audit.log", "a") as _f:
-            _f.write(f"{time.time()} | LOAD_POLICY | workspace={workspace_path} policy={{'docker_network_allowed': False, 'writable_home': False}} source=no_file\n")
-        return {"docker_network_allowed": False, "writable_home": False}
-
-    try:
-        with open(config_path) as f:
-            config = json.load(f)
-    except (json.JSONDecodeError, IOError) as e:
-        log("WARNING", "tools.docker_executor.policy", f"Error loading policy file: {e}",
-            {"config_path": str(config_path)})
-        with open("/tmp/container_audit.log", "a") as _f:
-            _f.write(f"{time.time()} | LOAD_POLICY | workspace={workspace_path} policy={{'docker_network_allowed': False, 'writable_home': False}} source=load_error\n")
-        return {"docker_network_allowed": False, "writable_home": False}
-
-    log("DEBUG", "tools.docker_executor.policy", "Policy config loaded",
-        {"config_path": str(config_path), "patterns": list(config.keys())})
-
-    # Find matching workspace pattern (exact or glob)
-    for pattern, policy in config.items():
-        if pattern == "default":
-            continue
-        match_result = fnmatch.fnmatch(workspace_path, pattern)
-        log("DEBUG", "tools.docker_executor.policy",
-            f"Matching pattern {pattern!r} against {workspace_path!r}: {match_result}",
-            {"pattern": pattern, "workspace_path": workspace_path, "match": match_result})
-        if match_result:
-            result = {
-                "docker_network_allowed": policy.get("docker_network_allowed", False),
-                "writable_home": policy.get("writable_home", False),
-            }
-            log("DEBUG", "tools.docker_executor.policy", "Policy matched, returning", result)
-            with open("/tmp/container_audit.log", "a") as _f:
-                _f.write(f"{time.time()} | LOAD_POLICY | workspace={workspace_path} policy={result} source=pattern_match\n")
-            return result
-    # Fallback to default
-    default = config.get("default", {})
-    result = {
-        "docker_network_allowed": default.get("docker_network_allowed", False),
-        "writable_home": default.get("writable_home", False),
-    }
-    log("DEBUG", "tools.docker_executor.policy", "No pattern match, using default", result)
-    with open("/tmp/container_audit.log", "a") as _f:
-        _f.write(f"{time.time()} | LOAD_POLICY | workspace={workspace_path} policy={result} source=default\n")
-    return result
-
 
 def _compute_image_tag(workspace_path: str) -> str:
     """Derive a deterministic Docker image tag from the workspace path.
@@ -143,127 +67,19 @@ class DockerExecutor:
             except Exception:
                 self.workspace_id = None
 
-    def _ensure_container(self):
-        # Ensure the Docker image exists
-        self._ensure_image()
+    def _compute_container_config(self):
+        """Compute desired network_mode and workspace mount mode from session permissions.
 
-        log("DEBUG", "tools.docker_executor.container",
-            "_ensure_container called",
-            {"workspace_path": self.workspace_path, "image": self.image,
-             "has_container": self.container is not None,
-             "force_rebuild": self.force_rebuild})
+        Always runs the unified security gate — never falls through to a
+        separate code path that bypasses permissions.
 
-        if self.container:
-            try:
-                self.container.reload()
-                if self.container.status == "running":
-                    log("DEBUG", "tools.docker_executor.container", "Reusing running container",
-                        {"container_id": self.container.id, "name": self.container.name})
-                    return
-            except docker.errors.NotFound:
-                self.container = None
-        # Deterministic container name based on workspace path
-        safe_name = hashlib.sha256(self.workspace_path.encode()).hexdigest()[:12]
-        container_name = f"agent-exec-{safe_name}"
-
-        # When force_rebuild is True, skip container reuse: close old container
-        # by name and create a fresh one from the newly built image.
-        if self.force_rebuild:
-            try:
-                existing = self.client.containers.get(container_name)
-                existing.reload()
-                try:
-                    existing.stop()
-                    existing.remove()
-                except docker.errors.NotFound:
-                    pass
-            except docker.errors.NotFound:
-                pass
-            existing = None
-        else:
-            # Try to get existing container and check against current policy
-            try:
-                existing = self.client.containers.get(container_name)
-                existing.reload()
-
-                # Check if existing container's config matches current policy
-                policy = _load_policy(self.workspace_path)
-                desired_network = "bridge" if policy.get("docker_network_allowed") else "none"
-                current_network = existing.attrs['HostConfig']['NetworkMode']
-
-                # Check if /home/agent tmpfs is mounted
-                # Docker stores tmpfs in HostConfig.Tmpfs (dict), NOT in Mounts array
-                tmpfs_mounts = existing.attrs.get('HostConfig', {}).get('Tmpfs', {})
-                has_home_tmpfs = '/home/agent' in tmpfs_mounts
-                needs_writable_home = policy.get("writable_home", False)
-
-                if (current_network != desired_network) or (needs_writable_home != has_home_tmpfs):
-                    # Config mismatch — remove and recreate
-                    try:
-                        existing.stop()
-                        existing.remove()
-                    except docker.errors.NotFound:
-                        pass
-                    existing = None
-
-                if existing is not None:
-                    # Check if the container's image matches the currently tagged image.
-                    # After a Dockerfile rebuild, the image ID changes even if the tag
-                    # stays the same, and container pooling would otherwise reuse the
-                    # stale container with the old image.
-                    try:
-                        # Container's Image attribute stores the SHA256 of the image
-                        # used at creation time.
-                        container_image_id = existing.attrs.get('Image', '')
-                        current_image = self.client.images.get(self.image)
-                        current_image_id = current_image.id
-                        if container_image_id and current_image_id and container_image_id != current_image_id:
-                            log("INFO", "tools.docker_executor.container",
-                                "Container built from stale image, recreating",
-                                {"container_id": existing.id,
-                                 "container_image": container_image_id[:19] + "...",
-                                 "current_image": current_image_id[:19] + "..."})
-                            try:
-                                existing.stop()
-                                existing.remove()
-                            except docker.errors.NotFound:
-                                pass
-                            existing = None
-                    except docker.errors.ImageNotFound:
-                        # If the image can't be found for comparison, recreate to be safe
-                        log("WARNING", "tools.docker_executor.container",
-                            "Could not compare image IDs (image not found), recreating container",
-                            {"container_id": existing.id})
-                        try:
-                            existing.stop()
-                            existing.remove()
-                        except docker.errors.NotFound:
-                            pass
-                        existing = None
-
-                if existing is not None:
-                    self.container = existing
-                    # Handle non-running container states
-                    if self.container.status == "dead":
-                        self.container.remove()
-                        self.container = None
-                        raise docker.errors.NotFound(f"Container {container_name} was dead and removed")
-                    elif self.container.status != "running":
-                        try:
-                            self.container.start()
-                        except docker.errors.APIError:
-                            self.container.remove()
-                            self.container = None
-                            raise docker.errors.NotFound(f"Container {container_name} failed to start and was removed")
-                    self.last_used = time.time()
-                    return
-
-            except docker.errors.NotFound:
-                pass
-
-        # ── Unified security gate ─────────────────────────────────────────
+        Returns:
+            Tuple of (network_mode: str, workspace_mode: str)
+            where network_mode is "bridge" or "none"
+            and workspace_mode is "rw" or "ro".
+        """
         network_mode = "none"
-        filesystem_mode = "read"
+        workspace_mode = "ro"
 
         if self.workspace_id and self.session_permissions is not None:
             try:
@@ -281,20 +97,13 @@ class DockerExecutor:
                     network_mode = "none"
 
                 fs = eff.get("filesystem", "read")
-                if fs in ("write", "full"):
-                    filesystem_mode = "write"
-                else:
-                    filesystem_mode = "read"
+                workspace_mode = "rw" if fs in ("write", "full") else "ro"
             except Exception as e:
                 log("WARN", "docker.security_gate",
                     f"Gate lookup failed, using safe defaults: {e}")
                 network_mode = "none"
-                filesystem_mode = "read"
+                workspace_mode = "ro"
         elif self.session_permissions is not None:
-            # No workspace_id available — check whether the workspace
-            # *should* have had a capabilities file but resolution failed.
-            # If so, fall back to maximum restriction rather than trusting
-            # session_permissions blindly (defense in depth).
             workspace_path_exists = os.path.isdir(self.workspace_path)
             cap_module_available = True
             try:
@@ -303,22 +112,17 @@ class DockerExecutor:
                 cap_module_available = False
 
             if workspace_path_exists and cap_module_available:
-                # Resolution failed despite having a real workspace and
-                # the capabilities module — force safe defaults.
                 log("WARNING", "docker.security_gate",
                     f"workspace_id resolution failed for {self.workspace_path}; "
                     f"forcing restricted container.")
                 network_mode = "none"
-                filesystem_mode = "read"
+                workspace_mode = "ro"
                 with open("/tmp/container_audit.log", "a") as _f:
                     _f.write(f"{time.time()} | FALLBACK_NETWORK_RESTRICTION | "
                              f"workspace={self.workspace_path} "
                              f"workspace_id=None forced_network=none forced_fs=ro\n")
             else:
-                # Workspace path doesn't exist or capabilities module is
-                # unavailable — use session_permissions directly.
                 sp = self.session_permissions
-                # session_permissions is a dict from ToolExecutor injection
                 net = sp.get("network", "banned")
                 if net == "write":
                     network_mode = "bridge"
@@ -326,19 +130,157 @@ class DockerExecutor:
                     network_mode = "none"
 
                 fs = sp.get("filesystem", "read")
-                if fs in ("write", "full"):
-                    filesystem_mode = "write"
-                else:
-                    filesystem_mode = "read"
+                workspace_mode = "rw" if fs in ("write", "full") else "ro"
 
         with open("/tmp/container_audit.log", "a") as _f:
             _f.write(f"{time.time()} | NETWORK_DECISION | network_mode={network_mode}\n")
 
+        return network_mode, workspace_mode
+
+    def _ensure_container(self):
+        # Ensure the Docker image exists
+        self._ensure_image()
+
+        log("DEBUG", "tools.docker_executor.container",
+            "_ensure_container called",
+            {"workspace_path": self.workspace_path, "image": self.image,
+             "has_container": self.container is not None,
+             "force_rebuild": self.force_rebuild})
+
+        # ── Fast path: self.container already exists and is running ──
+        if self.container:
+            try:
+                self.container.reload()
+                if self.container.status == "running":
+                    log("DEBUG", "tools.docker_executor.container",
+                        "Reusing running container (fast path)",
+                        {"container_id": self.container.id, "name": self.container.name})
+                    with open("/tmp/container_audit.log", "a") as _f:
+                        _f.write(f"{time.time()} | CONTAINER_REUSE_OK | "
+                                 f"workspace={self.workspace_path} container={self.container.id[:12]} source=live_object\n")
+                    return
+            except docker.errors.NotFound:
+                self.container = None
+
+        # ── Always compute desired config via unified gate ──
+        network_mode, workspace_mode = self._compute_container_config()
+
+        # ── Deterministic container name based on workspace path ──
+        safe_name = hashlib.sha256(self.workspace_path.encode()).hexdigest()[:12]
+        container_name = f"agent-exec-{safe_name}"
+
+        # ── Try to find existing container by name ──
+        existing = None
+        try:
+            existing = self.client.containers.get(container_name)
+            existing.reload()
+        except docker.errors.NotFound:
+            pass
+
+        # ── Force rebuild: always remove existing ──
+        if self.force_rebuild and existing:
+            try:
+                existing.stop()
+                existing.remove()
+            except docker.errors.NotFound:
+                pass
+            existing = None
+            with open("/tmp/container_audit.log", "a") as _f:
+                _f.write(f"{time.time()} | CONTAINER_RECREATE | "
+                         f"workspace={self.workspace_path} reason=force_rebuild\n")
+
+        # ── Check if existing container matches desired config ──
+        if existing is not None:
+            current_network = existing.attrs['HostConfig']['NetworkMode']
+            current_mounts = existing.attrs.get('Mounts', [])
+            current_workspace_mode = "ro"
+            for m in current_mounts:
+                if m.get('Destination') == '/workspace':
+                    current_workspace_mode = m.get('Mode', 'ro')
+                    break
+
+            config_mismatch = (
+                current_network != network_mode or
+                current_workspace_mode != workspace_mode
+            )
+
+            if config_mismatch:
+                log("INFO", "tools.docker_executor.container",
+                    "Container config mismatch, recreating",
+                    {"container_id": existing.id[:12],
+                     "current_network": current_network, "desired_network": network_mode,
+                     "current_mode": current_workspace_mode, "desired_mode": workspace_mode})
+                with open("/tmp/container_audit.log", "a") as _f:
+                    _f.write(f"{time.time()} | CONTAINER_RECREATE_MISMATCH | "
+                             f"workspace={self.workspace_path} container={existing.id[:12]} "
+                             f"network={current_network}->{network_mode} "
+                             f"mode={current_workspace_mode}->{workspace_mode}\n")
+                try:
+                    existing.stop()
+                    existing.remove()
+                except docker.errors.NotFound:
+                    pass
+                existing = None
+            else:
+                try:
+                    container_image_id = existing.attrs.get('Image', '')
+                    current_image = self.client.images.get(self.image)
+                    current_image_id = current_image.id
+                    if container_image_id and current_image_id and container_image_id != current_image_id:
+                        log("INFO", "tools.docker_executor.container",
+                            "Container built from stale image, recreating",
+                            {"container_id": existing.id[:12],
+                             "container_image": container_image_id[:19] + "...",
+                             "current_image": current_image_id[:19] + "..."})
+                        with open("/tmp/container_audit.log", "a") as _f:
+                            _f.write(f"{time.time()} | CONTAINER_RECREATE_MISMATCH | "
+                                     f"workspace={self.workspace_path} container={existing.id[:12]} reason=stale_image\n")
+                        try:
+                            existing.stop()
+                            existing.remove()
+                        except docker.errors.NotFound:
+                            pass
+                        existing = None
+                    else:
+                        log("DEBUG", "tools.docker_executor.container",
+                            "Reusing existing container (config + image match)",
+                            {"container_id": existing.id[:12], "name": container_name})
+                        with open("/tmp/container_audit.log", "a") as _f:
+                            _f.write(f"{time.time()} | CONTAINER_REUSE_OK | "
+                                     f"workspace={self.workspace_path} container={existing.id[:12]} source=name_match\n")
+                except docker.errors.ImageNotFound:
+                    log("WARNING", "tools.docker_executor.container",
+                        "Could not compare image IDs (image not found), recreating container",
+                        {"container_id": existing.id[:12]})
+                    try:
+                        existing.stop()
+                        existing.remove()
+                    except docker.errors.NotFound:
+                        pass
+                    existing = None
+
+        # ── Reuse existing if still valid ──
+        if existing is not None:
+            self.container = existing
+            if self.container.status == "dead":
+                self.container.remove()
+                self.container = None
+                raise docker.errors.NotFound(f"Container {container_name} was dead and removed")
+            elif self.container.status != "running":
+                try:
+                    self.container.start()
+                except docker.errors.APIError:
+                    self.container.remove()
+                    self.container = None
+                    raise docker.errors.NotFound(f"Container {container_name} failed to start and was removed")
+            self.last_used = time.time()
+            return
+
+        # ── Create new container ──
         tmpfs = {
             "/tmp": "rw,noexec,nosuid,size=64m",
             "/home/agent": "rw,exec,size=256M,uid=1000,gid=1000",
         }
-        # Mask .git only if it's a directory (worktrees have .git as a file)
         git_path = os.path.join(self.workspace_path, ".git")
         if os.path.isdir(git_path):
             tmpfs["/workspace/.git"] = ""
@@ -347,14 +289,15 @@ class DockerExecutor:
                 f".git is not a directory ({'file' if os.path.isfile(git_path) else 'absent'}), skipping tmpfs mask")
 
         log('INFO', 'tools.docker_executor.container',
-            f"AUDIT: Creating container with network={network_mode}, tmpfs={tmpfs}")
+            f"AUDIT: Creating container with network={network_mode}, mode={workspace_mode}, tmpfs={tmpfs}")
 
         with open("/tmp/container_audit.log", "a") as _f:
-            _f.write(f"{time.time()} | CONTAINER_RUN | image={self.image} network={network_mode} name={container_name}\n")
+            _f.write(f"{time.time()} | CONTAINER_CREATE | "
+                     f"image={self.image} network={network_mode} name={container_name}\n")
         self.container = self.client.containers.run(
             image=self.image,
             name=container_name,
-            volumes={self.workspace_path: {"bind": "/workspace", "mode": "rw" if filesystem_mode == "write" else "ro"}},
+            volumes={self.workspace_path: {"bind": "/workspace", "mode": workspace_mode}},
             tmpfs=tmpfs,
             network=network_mode,
             cap_drop=["ALL"],
@@ -370,6 +313,7 @@ class DockerExecutor:
         )
         # Workspace bind mount already has correct UID (matches host)
         self.last_used = time.time()
+
     def execute(self, command, timeout=30, workdir="/workspace", environment=None):
         # Check idle timeout and close container if expired
         if self.container and (time.time() - self.last_used) > self.idle_timeout:
@@ -811,57 +755,15 @@ def _load_capabilities(workspace_path: str) -> dict:
 
 
 def _compute_effective_capabilities(workspace_path: str) -> dict:
-    """Merge workspace capabilities with the Docker security policy.
+    """Return workspace capabilities directly — no policy merging.
 
-    The effective capability for each field is the minimum (most restrictive)
-    of the two sources.  If the policy has no opinion on a given field it is
-    treated as permissive (no restriction added).
+    The old security_policy.json merging layer has been removed as part
+    of Phase 1 of the security refactor.  Workspace capabilities are now
+    the sole source of truth for what a workspace is allowed to do.
+    Container-level enforcement is handled by _compute_container_config()
+    via the security gate.
     """
-    caps = _load_capabilities(workspace_path)
-    policy = _load_policy(workspace_path)
-
-    # ── Booleans: True only if both sources allow it ──────────────────────
-    allow_network = caps["allow_network"] and policy.get("docker_network_allowed", True)
-    # Policy has no docker-execution key — treat as permissive
-    allow_docker = caps["allow_docker"]
-
-    # ── File extensions: intersect, with wildcard passthrough ──────────────
-    ext_a = caps["allowed_file_extensions"]
-    ext_b = policy.get("allowed_file_extensions", ["*"])
-    if "*" in ext_a:
-        allowed_file_extensions = list(ext_b)
-    elif "*" in ext_b:
-        allowed_file_extensions = list(ext_a)
-    else:
-        allowed_file_extensions = sorted(set(ext_a) & set(ext_b))
-
-    # ── Max file size: 0 = unlimited, otherwise min ───────────────────────
-    size_a = caps["max_file_size_bytes"]
-    size_b = policy.get("max_file_size_bytes", 0)
-    if size_a == 0:
-        max_file_size_bytes = size_b
-    elif size_b == 0:
-        max_file_size_bytes = size_a
-    else:
-        max_file_size_bytes = min(size_a, size_b)
-
-    # ── Workspace dirs: intersect, with full-workspace passthrough ────────
-    dir_a = caps["allowed_workspace_dirs"]
-    dir_b = policy.get("allowed_workspace_dirs", ["."])
-    if "." in dir_a:
-        allowed_workspace_dirs = list(dir_b)
-    elif "." in dir_b:
-        allowed_workspace_dirs = list(dir_a)
-    else:
-        allowed_workspace_dirs = sorted(set(dir_a) & set(dir_b))
-
-    return {
-        "allow_network": allow_network,
-        "allow_docker": allow_docker,
-        "allowed_file_extensions": allowed_file_extensions,
-        "max_file_size_bytes": max_file_size_bytes,
-        "allowed_workspace_dirs": allowed_workspace_dirs,
-    }
+    return _load_capabilities(workspace_path)
 
 
 def _default_capabilities() -> dict:
