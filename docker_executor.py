@@ -109,8 +109,18 @@ def _compute_image_tag(workspace_path: str) -> str:
 
 
 class DockerExecutor:
-    def __init__(self, workspace_path, image=None,
-                  network="none", mem_limit="512m", cpu_quota=50000, force_rebuild=False, idle_timeout=600):
+    def __init__(
+        self,
+        workspace_path: str,
+        image: str = "agent-executor",
+        network: str = "none",
+        mem_limit: str = "1g",
+        cpu_quota: int = 100000,
+        force_rebuild: bool = False,
+        idle_timeout: int = 600,
+        session_permissions=None,
+        workspace_id: str = None,
+    ):
         # Normalize path: absolute, no trailing slash — ensures deterministic container naming
         self.workspace_path = os.path.abspath(workspace_path).rstrip('/')
         self.image = image or _compute_image_tag(self.workspace_path)
@@ -119,10 +129,19 @@ class DockerExecutor:
         self.cpu_quota = cpu_quota
         self.force_rebuild = force_rebuild
         self.idle_timeout = idle_timeout
+        self.session_permissions = session_permissions
+        self.workspace_id = workspace_id
         self.client = docker.from_env()
         self.container = None
         self.last_used = time.time()
         self._timeout_warning_printed = False
+
+        if self.workspace_id is None:
+            try:
+                from thoughtmachine.workspace_capabilities import resolve_workspace_id
+                self.workspace_id = resolve_workspace_id(self.workspace_path)
+            except Exception:
+                self.workspace_id = None
 
     def _ensure_container(self):
         # Ensure the Docker image exists
