@@ -2130,3 +2130,12 @@ Completed a comprehensive investigation of the entire security/permissions syste
 - `get_container_status()` merges those results into its return (step 7)
 - The `image` field (`_compute_image_tag(normalised)`) was added to all 3 return sites of `get_container_status()` plus shown in ContainerPanel.jsx
 - Server endpoints `/api/container/status` and `/api/container/rebuild` changed from `async def` to `def` (FastAPI runs sync routes in thread pool, avoids blocking event loop)
+
+## 2026-06-09 — ## Policy-aware capabilities & read-only mounts (2026-07-10)...
+
+## Policy-aware capabilities & read-only mounts (2026-07-10)
+
+Committed in `58bc025`:
+- Workspace volume is now mounted **read-only** (`ro`) in containers — containers can no longer modify host files via the volume.
+- Added `_compute_effective_capabilities()` which merges workspace capabilities with a Docker security policy, taking the most restrictive value per field.
+- `get_container_status()` now uses `_compute_effective_capabilities()` instead of raw `_load_capabilities()`.
