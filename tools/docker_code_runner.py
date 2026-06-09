@@ -332,6 +332,19 @@ chmod +x "{script_path}"
                 duration=duration
             ))
 
+        # Resolve workspace ID for the security gate
+        workspace_id = None
+        try:
+            from thoughtmachine.workspace_capabilities import resolve_workspace_id
+            workspace_id = resolve_workspace_id(workspace)
+        except Exception:
+            pass
+
+        # Grab session permissions from config (set by tool_executor before execute())
+        session_permissions = None
+        if hasattr(self, 'config') and self.config is not None:
+            session_permissions = getattr(self.config, 'session_permissions', None)
+
         try:
             if SECURITY_AVAILABLE:
                 executor = security_setup_docker(
@@ -343,6 +356,10 @@ chmod +x "{script_path}"
                     force_rebuild=self.build,
                     idle_timeout=self.idle_timeout
                 )
+                # Pass session permissions and workspace ID to the executor
+                # so the unified security gate can make real decisions.
+                executor.session_permissions = session_permissions
+                executor.workspace_id = workspace_id
             else:
                 # Fallback to direct DockerExecutor instantiation
                 executor = DockerExecutor(
@@ -352,7 +369,9 @@ chmod +x "{script_path}"
                     mem_limit=self.mem_limit,
                     cpu_quota=self.cpu_quota,
                     force_rebuild=self.build,
-                    idle_timeout=self.idle_timeout
+                    idle_timeout=self.idle_timeout,
+                    session_permissions=session_permissions,
+                    workspace_id=workspace_id,
                 )
 
             with open("/tmp/container_audit.log", "a") as _f:
