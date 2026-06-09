@@ -280,7 +280,11 @@ class DockerExecutor:
                 else:
                     network_mode = "none"
 
-                filesystem_mode = eff.get("filesystem", "read")
+                fs = eff.get("filesystem", "read")
+                if fs in ("write", "full"):
+                    filesystem_mode = "write"
+                else:
+                    filesystem_mode = "read"
             except Exception as e:
                 log("WARN", "docker.security_gate",
                     f"Gate lookup failed, using safe defaults: {e}")
@@ -308,6 +312,7 @@ class DockerExecutor:
         tmpfs = {
             "/tmp": "rw,noexec,nosuid,size=64m",
             "/home/agent": "rw,exec,size=256M,uid=1000,gid=1000",
+            "/workspace/.git": "",
         }
 
         log('INFO', 'tools.docker_executor.container',
