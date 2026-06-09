@@ -340,10 +340,8 @@ chmod +x "{script_path}"
         except Exception:
             pass
 
-        # Grab session permissions from config (set by tool_executor before execute())
-        session_permissions = None
-        if hasattr(self, 'config') and self.config is not None:
-            session_permissions = getattr(self.config, 'session_permissions', None)
+        # Session permissions injected by ToolExecutor as a dict
+        session_permissions = getattr(self, 'session_permissions', None)
 
         try:
             if SECURITY_AVAILABLE:

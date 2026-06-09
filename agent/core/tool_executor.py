@@ -400,6 +400,10 @@ class ToolExecutor:
             )
             if error is not None:
                 return {'result': error, 'tool_type': 'normal'}
+            # Inject session permissions dict so the tool can apply
+            # fine-grained security (e.g., DockerCodeRunner uses it
+            # to decide container network/filesystem modes).
+            tool_args['session_permissions'] = session_perms_dict
             tool_instance = tool_class(**tool_args)
             if self.logger:
                 if hasattr(self.logger, 'py_logger'):

@@ -31,6 +31,13 @@ class ToolBase(BaseModel):
     is_docker: bool = Field(default=False, description="Whether the tool is executing in a Docker container")
     container_workspace_path: Optional[str] = Field(default=None, description="Workspace path as seen from inside the container (e.g., /workspace)")
 
+    # Session permissions profile injected by ToolExecutor before execute()
+    # Controls container network, filesystem mode, etc.
+    session_permissions: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description='Session permissions dict injected by ToolExecutor.',
+    )
+
     # Security capabilities required by this tool
     requires_capabilities: ClassVar[List[str]] = []
 
