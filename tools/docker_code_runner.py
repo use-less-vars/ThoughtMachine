@@ -355,6 +355,8 @@ chmod +x "{script_path}"
                     idle_timeout=self.idle_timeout
                 )
 
+            with open("/tmp/container_audit.log", "a") as _f:
+                _f.write(f"{time.time()} | CODERUNNER_EXECUTE | workspace={workspace} network_passed=none via_security={SECURITY_AVAILABLE}\n")
             # Execute command with optional environment and working directory
             stdout, stderr, exit_code = executor.execute(
                 command=actual_command,

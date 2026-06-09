@@ -10,6 +10,11 @@ import json
 import fnmatch
 import sys
 
+# ── Audit log for network_mode debugging ───────────────────────────────────
+with open("/tmp/container_audit.log", "a") as _f:
+    _f.write(f"{time.time()} | MODULE_LOAD | file={__file__} pid={os.getpid()}\n")
+
+
 # ── Build log cache (thread-safe) ────────────────────────────────────────────
 # Populated by _build_image() during Docker image builds; consumed by
 # get_container_status() to return build logs to the frontend.
@@ -47,6 +52,8 @@ def _load_policy(workspace_path: str) -> dict:
     if config_path is None:
         log("DEBUG", "tools.docker_executor.policy", "No policy file found, using defaults",
             {"docker_network_allowed": False, "writable_home": False})
+        with open("/tmp/container_audit.log", "a") as _f:
+            _f.write(f"{time.time()} | LOAD_POLICY | workspace={workspace_path} policy={{'docker_network_allowed': False, 'writable_home': False}} source=no_file\n")
         return {"docker_network_allowed": False, "writable_home": False}
 
     try:
@@ -55,6 +62,8 @@ def _load_policy(workspace_path: str) -> dict:
     except (json.JSONDecodeError, IOError) as e:
         log("WARNING", "tools.docker_executor.policy", f"Error loading policy file: {e}",
             {"config_path": str(config_path)})
+        with open("/tmp/container_audit.log", "a") as _f:
+            _f.write(f"{time.time()} | LOAD_POLICY | workspace={workspace_path} policy={{'docker_network_allowed': False, 'writable_home': False}} source=load_error\n")
         return {"docker_network_allowed": False, "writable_home": False}
 
     log("DEBUG", "tools.docker_executor.policy", "Policy config loaded",
@@ -74,6 +83,8 @@ def _load_policy(workspace_path: str) -> dict:
                 "writable_home": policy.get("writable_home", False),
             }
             log("DEBUG", "tools.docker_executor.policy", "Policy matched, returning", result)
+            with open("/tmp/container_audit.log", "a") as _f:
+                _f.write(f"{time.time()} | LOAD_POLICY | workspace={workspace_path} policy={result} source=pattern_match\n")
             return result
     # Fallback to default
     default = config.get("default", {})
@@ -82,6 +93,8 @@ def _load_policy(workspace_path: str) -> dict:
         "writable_home": default.get("writable_home", False),
     }
     log("DEBUG", "tools.docker_executor.policy", "No pattern match, using default", result)
+    with open("/tmp/container_audit.log", "a") as _f:
+        _f.write(f"{time.time()} | LOAD_POLICY | workspace={workspace_path} policy={result} source=default\n")
     return result
 
 
@@ -232,6 +245,8 @@ class DockerExecutor:
         # Create new container with current policy
         policy = _load_policy(self.workspace_path)
         network_mode = "bridge" if policy.get("docker_network_allowed", False) else "none"
+        with open("/tmp/container_audit.log", "a") as _f:
+            _f.write(f"{time.time()} | NETWORK_DECISION | network_mode={network_mode} policy_docker_network_allowed={policy.get('docker_network_allowed', 'KEY_MISSING')}\n")
         tmpfs = {"/tmp": "rw,noexec,nosuid,size=64m"}
         if policy.get("writable_home", False):
             tmpfs["/home/agent"] = "rw,exec,size=256M,uid=1000,gid=1000"
@@ -239,6 +254,8 @@ class DockerExecutor:
         log('DEBUG', 'tools.docker_executor.container',
             f"Creating container with network={network_mode}, tmpfs={tmpfs}")
 
+        with open("/tmp/container_audit.log", "a") as _f:
+            _f.write(f"{time.time()} | CONTAINER_RUN | image={self.image} network={network_mode} name={container_name}\n")
         self.container = self.client.containers.run(
             image=self.image,
             name=container_name,

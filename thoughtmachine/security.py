@@ -326,6 +326,8 @@ def setup_docker_sandbox(
             force_rebuild=force_rebuild,
             idle_timeout=idle_timeout
         )
+        with open("/tmp/container_audit.log", "a") as _f:
+            _f.write(f"{time.time()} | SECURITY_SETUP_DOCKER | workspace={workspace_path} network_passed={network}\n")
         _log_docker_sandbox_event(
             container_id="<lazy>",
             container_name=f"agent-exec-{hashlib.sha256(workspace_path.encode()).hexdigest()[:12]}",
