@@ -85,7 +85,7 @@ class SessionPermissions(BaseModel):
         description='May the tool spawn containers?',
     )
     network: Literal['banned', 'ask', 'write'] = Field(
-        default='write',
+        default='banned',
         description='Network access level for the session.',
     )
     filesystem: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(

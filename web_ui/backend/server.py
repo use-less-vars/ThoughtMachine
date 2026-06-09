@@ -1181,6 +1181,46 @@ def _translate_frontend_config(fe_config: Dict[str, Any]) -> Dict[str, Any]:
     # Remove any keys that start with _
     cfg = {k: v for k, v in cfg.items() if not k.startswith("_")}
 
+    # ── Whitelist validation for session_permissions ────────────────────
+    # The frontend sends permission toggles that land in SessionPermissions.
+    # We reject any unknown category or invalid level to prevent a compromised
+    # (or malformed) WebSocket message from injecting dangerous values such as
+    # filesystem="full", container=True, network="write".
+    VALID_PERMISSION_LEVELS = ("banned", "ask", "read", "write")
+    # "full" is intentionally excluded — it is not a valid mode for
+    # the Docker security gate and should not be settable from the UI.
+    PERMISSION_SCHEMA = {
+        "network":   ("banned", "ask", "write"),
+        "filesystem": VALID_PERMISSION_LEVELS,   # banned, ask, read, write (no "full")
+        "container":  (True, False),
+        "execution":  ("banned", "ask", "read", "write"),
+        "git":        VALID_PERMISSION_LEVELS,
+        "system":     VALID_PERMISSION_LEVELS,
+    }
+    SAFE_DEFAULTS = {
+        "container": False,
+        "execution": "banned",
+        "filesystem": "read",
+        "git": "read",
+        "network": "banned",
+        "security": "read",
+    }
+
+    raw_perms = cfg.get("session_permissions", {})
+    if isinstance(raw_perms, dict):
+        cleaned: Dict[str, Any] = {}
+        for key, valid_values in PERMISSION_SCHEMA.items():
+            value = raw_perms.get(key)
+            if value in valid_values:
+                cleaned[key] = value
+            else:
+                # Coerce invalid / missing to safe default
+                cleaned[key] = SAFE_DEFAULTS.get(key, value)
+        cfg["session_permissions"] = cleaned
+    elif raw_perms is not None:
+        # session_permissions exists but is not a dict — discard
+        cfg["session_permissions"] = dict(SAFE_DEFAULTS)
+
     # ── Translate diagnostic log ──────────────────────────────────────
     log('INFO', 'server.config',
         f"[TRANSLATE] frontend config: provider={fe_config.get('provider')}, "

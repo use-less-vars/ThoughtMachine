@@ -291,20 +291,45 @@ class DockerExecutor:
                 network_mode = "none"
                 filesystem_mode = "read"
         elif self.session_permissions is not None:
-            # No workspace_id available — use session_permissions directly.
-            sp = self.session_permissions
-            # session_permissions is a dict from ToolExecutor injection
-            net = sp.get("network", "banned")
-            if net == "write":
-                network_mode = "bridge"
-            else:
-                network_mode = "none"
+            # No workspace_id available — check whether the workspace
+            # *should* have had a capabilities file but resolution failed.
+            # If so, fall back to maximum restriction rather than trusting
+            # session_permissions blindly (defense in depth).
+            workspace_path_exists = os.path.isdir(self.workspace_path)
+            cap_module_available = True
+            try:
+                import thoughtmachine.workspace_capabilities
+            except ImportError:
+                cap_module_available = False
 
-            fs = sp.get("filesystem", "read")
-            if fs in ("write", "full"):
-                filesystem_mode = "write"
-            else:
+            if workspace_path_exists and cap_module_available:
+                # Resolution failed despite having a real workspace and
+                # the capabilities module — force safe defaults.
+                log("WARNING", "docker.security_gate",
+                    f"workspace_id resolution failed for {self.workspace_path}; "
+                    f"forcing restricted container.")
+                network_mode = "none"
                 filesystem_mode = "read"
+                with open("/tmp/container_audit.log", "a") as _f:
+                    _f.write(f"{time.time()} | FALLBACK_NETWORK_RESTRICTION | "
+                             f"workspace={self.workspace_path} "
+                             f"workspace_id=None forced_network=none forced_fs=ro\n")
+            else:
+                # Workspace path doesn't exist or capabilities module is
+                # unavailable — use session_permissions directly.
+                sp = self.session_permissions
+                # session_permissions is a dict from ToolExecutor injection
+                net = sp.get("network", "banned")
+                if net == "write":
+                    network_mode = "bridge"
+                else:
+                    network_mode = "none"
+
+                fs = sp.get("filesystem", "read")
+                if fs in ("write", "full"):
+                    filesystem_mode = "write"
+                else:
+                    filesystem_mode = "read"
 
         with open("/tmp/container_audit.log", "a") as _f:
             _f.write(f"{time.time()} | NETWORK_DECISION | network_mode={network_mode}\n")
