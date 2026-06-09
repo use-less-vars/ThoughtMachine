@@ -348,7 +348,7 @@ chmod +x "{script_path}"
                 executor = security_setup_docker(
                     workspace_path=workspace,
                     image=self.image,
-                    network="none",     #self.network, <-- Disable network for security
+                    network="none",     # Harmless default; the security gate in docker_executor.py makes the final decision
                     mem_limit=self.mem_limit,
                     cpu_quota=self.cpu_quota,
                     force_rebuild=self.build,
@@ -363,7 +363,7 @@ chmod +x "{script_path}"
                 executor = DockerExecutor(
                     workspace_path=workspace,
                     image=self.image,
-                    network="none",     #self.network, <-- Disable network for security
+                    network="none",     # Harmless default; the security gate in docker_executor.py makes the final decision
                     mem_limit=self.mem_limit,
                     cpu_quota=self.cpu_quota,
                     force_rebuild=self.build,
@@ -373,7 +373,7 @@ chmod +x "{script_path}"
                 )
 
             with open("/tmp/container_audit.log", "a") as _f:
-                _f.write(f"{time.time()} | CODERUNNER_EXECUTE | workspace={workspace} network_passed=none via_security={SECURITY_AVAILABLE}\n")
+                _f.write(f"{time.time()} | CODERUNNER_EXECUTE | workspace={workspace} via_security={SECURITY_AVAILABLE}\n")
             # Execute command with optional environment and working directory
             stdout, stderr, exit_code = executor.execute(
                 command=actual_command,

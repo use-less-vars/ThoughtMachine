@@ -312,8 +312,14 @@ class DockerExecutor:
         tmpfs = {
             "/tmp": "rw,noexec,nosuid,size=64m",
             "/home/agent": "rw,exec,size=256M,uid=1000,gid=1000",
-            "/workspace/.git": "",
         }
+        # Mask .git only if it's a directory (worktrees have .git as a file)
+        git_path = os.path.join(self.workspace_path, ".git")
+        if os.path.isdir(git_path):
+            tmpfs["/workspace/.git"] = ""
+        else:
+            log("DEBUG", "docker.filesystem",
+                f".git is not a directory ({'file' if os.path.isfile(git_path) else 'absent'}), skipping tmpfs mask")
 
         log('INFO', 'tools.docker_executor.container',
             f"AUDIT: Creating container with network={network_mode}, tmpfs={tmpfs}")
