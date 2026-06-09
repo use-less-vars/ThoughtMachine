@@ -271,8 +271,9 @@ class DockerExecutor:
                     get_workspace_capabilities,
                     get_effective_permissions,
                 )
+                from thoughtmachine.security import SessionPermissions
                 caps = get_workspace_capabilities(self.workspace_id)
-                eff = get_effective_permissions(self.session_permissions, caps)
+                eff = get_effective_permissions(SessionPermissions(**self.session_permissions), caps)
 
                 if eff.get("network") is True:
                     network_mode = "bridge"
@@ -288,12 +289,15 @@ class DockerExecutor:
         elif self.session_permissions is not None:
             # No workspace_id available — use session_permissions directly.
             sp = self.session_permissions
-            if sp.network == "write":
+            # session_permissions is a dict from ToolExecutor injection
+            net = sp.get("network", "banned")
+            if net == "write":
                 network_mode = "bridge"
             else:
                 network_mode = "none"
 
-            if sp.filesystem in ("write", "full"):
+            fs = sp.get("filesystem", "read")
+            if fs in ("write", "full"):
                 filesystem_mode = "write"
             else:
                 filesystem_mode = "read"
