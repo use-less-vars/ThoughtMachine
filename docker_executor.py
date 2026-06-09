@@ -251,8 +251,8 @@ class DockerExecutor:
         if policy.get("writable_home", False):
             tmpfs["/home/agent"] = "rw,exec,size=256M,uid=1000,gid=1000"
 
-        log('DEBUG', 'tools.docker_executor.container',
-            f"Creating container with network={network_mode}, tmpfs={tmpfs}")
+        log('INFO', 'tools.docker_executor.container',
+            f"AUDIT: Creating container with network={network_mode}, tmpfs={tmpfs}")
 
         with open("/tmp/container_audit.log", "a") as _f:
             _f.write(f"{time.time()} | CONTAINER_RUN | image={self.image} network={network_mode} name={container_name}\n")
