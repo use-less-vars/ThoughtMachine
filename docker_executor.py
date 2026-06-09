@@ -285,6 +285,18 @@ class DockerExecutor:
                     f"Gate lookup failed, using safe defaults: {e}")
                 network_mode = "none"
                 filesystem_mode = "read"
+        elif self.session_permissions is not None:
+            # No workspace_id available — use session_permissions directly.
+            sp = self.session_permissions
+            if sp.network == "write":
+                network_mode = "bridge"
+            else:
+                network_mode = "none"
+
+            if sp.filesystem in ("write", "full"):
+                filesystem_mode = "write"
+            else:
+                filesystem_mode = "read"
 
         with open("/tmp/container_audit.log", "a") as _f:
             _f.write(f"{time.time()} | NETWORK_DECISION | network_mode={network_mode}\n")
