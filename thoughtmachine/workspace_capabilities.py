@@ -16,7 +16,9 @@ from typing import Any, Dict, List, Optional
 
 # ── Default user data directory ───────────────────────────────────────────────
 
-USER_DIR = Path.home() / ".thoughtmachine"
+def _user_dir() -> Path:
+    """Return the user data directory (lazily, so tests can patch ``Path.home``)."""
+    return Path.home() / ".thoughtmachine"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -131,7 +133,7 @@ class WorkspaceCapabilities:
 
 def _workspace_dir(workspace_id: str) -> Path:
     """Return the filesystem path for a given workspace ID."""
-    return USER_DIR / "workspaces" / workspace_id
+    return _user_dir() / "workspaces" / workspace_id
 
 
 def _capabilities_path(workspace_id: str) -> Path:
@@ -184,7 +186,7 @@ def resolve_workspace_id(workspace_path: str) -> Optional[str]:
     compares the ``root`` field (normalised) to *workspace_path*, and returns
     the matching ID.  Returns ``None`` if no match is found.
     """
-    base = USER_DIR / "workspaces"
+    base = _user_dir() / "workspaces"
     if not base.is_dir():
         return None
 

@@ -13,14 +13,14 @@ Design
    against that merged dict and, if needed, fires a ``SecurityPromptEvent``
    and waits for the user to approve or deny.
 
-Module-level flag ``USE_UNIFIED_GATE`` tells the tool executor whether to use
-this module (``True``) or keep the old path (``False``).
+This module is always active — there is no fallback path.
 """
 
 from __future__ import annotations
 
 import queue
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from thoughtmachine.workspace_capabilities import (
@@ -87,9 +87,9 @@ def get_effective_permissions(
     """
     Merge the session's permission profile with the workspace's capabilities.
 
-    Returns a flat dict with keys matching the five permission categories::
+    Returns a flat dict with keys matching the six permission categories::
 
-        {"filesystem": ..., "network": ..., "container": ..., "git": ..., "system": ...}
+        {"filesystem": ..., "network": ..., "container": ..., "git": ..., "system": ..., "execution": ...}
 
     Each value is either a boolean (``True`` / ``False``) for hard allow/deny,
     a string level (``"write"``, ``"read"``, ``"none"``, ``"banned"``, ``"ask"``),
@@ -120,6 +120,81 @@ def get_effective_permissions(
         "container": container,
         "git": git,
         "system": system,
+        "execution": session.execution,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Container config resolver
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def get_expected_container_config(
+    session_permissions: Dict[str, Any],
+    workspace_caps: Optional[WorkspaceCapabilities] = None,
+) -> Dict[str, Any]:
+    """
+    Compute the expected Docker container config from session permissions.
+
+    Uses ``get_effective_permissions()`` to merge session permissions with
+    workspace capabilities, then translates the merged result into container
+    configuration values that match what ``DockerExecutor._compute_container_config()``
+    would produce.
+
+    This is the canonical reference for container config — all callers
+    (``_compute_container_config``, ``_compute_desired_config``,
+    ``verify_container_integrity``) derive their config through the same logic.
+
+    Args:
+        session_permissions:
+            Dict with keys like ``"network"``, ``"filesystem"``, ``"container"``
+            (the same dict that ``SessionPermissions`` accepts).
+        workspace_caps:
+            ``WorkspaceCapabilities`` instance. When ``None``, a fully-permissive
+            default is used (all capabilities ``True``).
+
+    Returns:
+        Dict with keys:
+
+        - **network_mode** (``"bridge"`` or ``"none"``):
+          ``"bridge"`` when effective network is ``True`` or ``"write"``.
+        - **workspace_mode** (``"rw"`` or ``"ro"``):
+          ``"rw"`` when effective filesystem is ``"write"`` or ``"full"``.
+        - **effective** (dict):
+          The full effective permissions dict from ``get_effective_permissions()``.
+    """
+    from thoughtmachine.security import SessionPermissions
+
+    if workspace_caps is None:
+        workspace_caps = WorkspaceCapabilities()
+
+    # Attempt to construct SessionPermissions; fall back to safe defaults if
+    # the dict contains values that Pydantic rejects (e.g. unknown literals).
+    # This mirrors the try/except in _compute_container_config and
+    # _compute_desired_config.
+    try:
+        session = SessionPermissions(**session_permissions)
+        eff = get_effective_permissions(session, workspace_caps)
+    except Exception:
+        # Validation or merge failure → safe defaults
+        return {
+            "network_mode": "none",
+            "workspace_mode": "ro",
+            "effective": {},
+        }
+
+    # Network mode
+    net = eff.get("network")
+    network_mode = "bridge" if (net is True or net == "write") else "none"
+
+    # Workspace mount mode
+    fs = eff.get("filesystem", "read")
+    workspace_mode = "rw" if fs in ("write", "full") else "ro"
+
+    return {
+        "network_mode": network_mode,
+        "workspace_mode": workspace_mode,
+        "effective": eff,
     }
 
 

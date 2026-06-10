@@ -2234,3 +2234,7 @@ Audited the "How to add a new permission toggle" guide against the actual codeba
 
 **Files changed**: `ChatPanel.jsx`, `SessionTab.jsx`
 
+
+## 2026-06-10 — **2025-07-16:** Added `execution` permission to the unified ...
+
+**2025-07-16:** Added `execution` permission to the unified security gate (`security/security_gate.py`). `get_effective_permissions()` now returns 6 keys: filesystem, network, container, git, system, execution. Execution is session-level only (no workspace merge needed). Also cleaned up stale `USE_UNIFIED_GATE` docstring reference.
