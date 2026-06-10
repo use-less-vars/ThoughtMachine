@@ -142,7 +142,7 @@ except ImportError:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan handler — no global state needed (state is per‑connection)."""
+    """Lifespan handler — registers signal handlers for graceful shutdown."""
     log('INFO', 'server', 'ThoughtMachine Web UI server starting ...')
     # Ensure user ~/.thoughtmachine/ defaults exist before any connection
     try:
@@ -187,6 +187,83 @@ async def lifespan(app: FastAPI):
 
     yield
     log('INFO', 'server', 'Server shutting down.')
+
+
+# ── Graceful shutdown: save open sessions on Ctrl+C / SIGTERM ───────────────
+# When the server terminates (Ctrl+C / SIGINT / SIGTERM), we need to ensure
+# open sessions are saved before the process exits.
+#
+# Approach:
+# 1. _active_bridges — tracks all currently-active bridge instances.
+# 2. _shutdown_save() — iterates _active_bridges and saves each one.
+# 3. atexit — ensures _shutdown_save runs when the Python process exits
+#    normally (including after uvicorn's Ctrl+C handling).
+# 4. asyncio.Event — the WebSocket handler checks this event between
+#    messages and exits promptly, letting its ``finally`` block run.
+#
+# Note: atexit handlers do *not* run on SIGKILL or hard crashes, but they
+# do run on normal Ctrl+C (SIGINT -> KeyboardInterrupt -> sys.exit).
+
+import signal
+import atexit
+
+_active_bridges: list = []
+_shutdown_event: Any = None  # asyncio.Event, set lazily
+
+
+def _get_shutdown_event() -> Any:
+    """Return the global shutdown asyncio.Event, creating it if needed."""
+    global _shutdown_event
+    if _shutdown_event is None:
+        import asyncio
+        _shutdown_event = asyncio.Event()
+    return _shutdown_event
+
+
+def _shutdown_save() -> None:
+    """Save all active bridges' open sessions and stop them.
+
+    Called via atexit — runs after uvicorn's event loop exits.
+    """
+    log('INFO', 'server', f'Shutdown save: {len(_active_bridges)} active bridge(s)')
+    for bridge in list(_active_bridges):
+        try:
+            if not bridge._cleanly_closed:
+                bridge.save_open_session()
+                bridge._cleanly_closed = True
+        except Exception:
+            pass
+        try:
+            bridge.stop()
+        except Exception:
+            pass
+    _active_bridges.clear()
+
+
+def _trigger_shutdown() -> None:
+    """Called by the signal handler — sets the shutdown event."""
+    event = _get_shutdown_event()
+    try:
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+            if loop.is_running():
+                loop.call_soon_threadsafe(event.set)
+                return
+        except RuntimeError:
+            pass
+        event.set()
+    except Exception:
+        pass
+    log('INFO', 'server', 'Shutdown signal received — finishing in-flight work...')
+
+
+# Register atexit handler to save sessions on normal exit (Ctrl+C etc.)
+atexit.register(_shutdown_save)
+# Signal handlers (also set the asyncio event so the WS loop can detect shutdown)
+_orig_sigint = signal.signal(signal.SIGINT, lambda sig, frame: _trigger_shutdown())
+_orig_sigterm = signal.signal(signal.SIGTERM, lambda sig, frame: _trigger_shutdown())
+
 
 app = FastAPI(
     title="ThoughtMachine Web UI",
@@ -281,6 +358,10 @@ async def websocket_endpoint(ws: WebSocket):
 
     try:
         while True:
+            # Check for shutdown signal between messages
+            if _get_shutdown_event().is_set():
+                log('INFO', 'server.ws', 'Shutdown event detected — closing WebSocket')
+                break
             raw = await ws.receive_text()
             try:
                 msg = json.loads(raw)
@@ -313,6 +394,7 @@ async def websocket_endpoint(ws: WebSocket):
                     bridge = WebAgentBridge(event_callback=event_callback)
                     bridge.register()
                     bridge.set_controller(controller)
+                    _active_bridges.append(bridge)
 
                     try:
                         bridge.start(query, config_dict)
@@ -403,31 +485,6 @@ async def websocket_endpoint(ws: WebSocket):
                                 "type": "conversation_changed",
                                 "messages": conv,
                             })
-
-                elif command == "update_config":
-                    # Config update — stored for next session start
-                    field = msg.get("field", "")
-                    value = msg.get("value")
-                    # If bridge exists, apply update to live config
-                    if bridge is not None and bridge._config is not None:
-                        cfg = bridge._config
-                        try:
-                            if field == "temperature":
-                                cfg.temperature = float(value)
-                            elif field == "max_turns":
-                                cfg.max_turns = int(value)
-                            elif field.startswith("tools."):
-                                pass  # tool toggle handled at session start
-                            elif field == "provider":
-                                cfg.provider_type = value
-                            else:
-                                pass
-                        except (ValueError, TypeError):
-                            pass
-                    await ws.send_json({
-                        "type": "config_changed",
-                        "config": _frontend_config_from_bridge(bridge) if bridge else _default_frontend_config(),
-                    })
 
                 elif command == "apply_config":
                     # Receive full config from frontend, validate, merge, persist
@@ -1057,6 +1114,10 @@ async def websocket_endpoint(ws: WebSocket):
                 except Exception:
                     pass
             bridge.unregister()
+            try:
+                _active_bridges.remove(bridge)
+            except ValueError:
+                pass
             bridge.stop()
 
 
@@ -1118,6 +1179,54 @@ async def create_directory(body: dict):
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "thoughtmachine-web-ui"}
+
+@app.get("/api/container/integrity")
+def container_integrity(workspace: str = "", permissions: str = ""):
+    """Return container integrity status for the given workspace.
+
+    Calls ``get_integrity_status()`` which wraps ``verify_container_integrity()``
+    to check the existing container against the expected security config.
+    If permissions have been tightened since the container was created,
+    it is removed so it will be recreated with the new settings.
+
+    Query params:
+        workspace: Absolute path to the workspace.
+        permissions: Optional JSON-encoded session_permissions dict.
+            When omitted, the most restrictive defaults are used.
+
+    Returns:
+        dict with keys:
+        - status (str): "ok", "mismatch", "removed", or "error"
+        - container_name (str | None)
+        - desired (dict): {"network": ..., "mode": ...}
+        - actual (dict | None): {"network": ..., "mode": ...}
+        - mismatch_reason (str | None)
+    """
+    if not workspace:
+        return {"status": "error", "container_name": None,
+                "desired": {}, "actual": None,
+                "mismatch_reason": "No workspace path provided."}
+
+    from docker_executor import get_integrity_status
+
+    sp = None
+    if permissions:
+        try:
+            import json
+            sp = json.loads(permissions)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    try:
+        result = get_integrity_status(workspace, sp)
+        return result
+    except Exception as exc:
+        log("ERROR", "server.container_integrity",
+            f"Integrity check failed: {exc}")
+        return {"status": "error", "container_name": None,
+                "desired": {}, "actual": None,
+                "mismatch_reason": str(exc)}
+
 
 @app.get("/api/container/status")
 def container_status(workspace: str = ""):
@@ -1214,44 +1323,14 @@ def _translate_frontend_config(fe_config: Dict[str, Any]) -> Dict[str, Any]:
     cfg = {k: v for k, v in cfg.items() if not k.startswith("_")}
 
     # ── Whitelist validation for session_permissions ────────────────────
-    # The frontend sends permission toggles that land in SessionPermissions.
-    # We reject any unknown category or invalid level to prevent a compromised
-    # (or malformed) WebSocket message from injecting dangerous values such as
-    # filesystem="full", container=True, network="write".
-    VALID_PERMISSION_LEVELS = ("banned", "ask", "read", "write")
-    # "full" is intentionally excluded — it is not a valid mode for
-    # the Docker security gate and should not be settable from the UI.
-    PERMISSION_SCHEMA = {
-        "network":   ("banned", "ask", "write"),
-        "filesystem": VALID_PERMISSION_LEVELS,   # banned, ask, read, write (no "full")
-        "container":  (True, False),
-        "execution":  ("banned", "ask", "read", "write"),
-        "git":        VALID_PERMISSION_LEVELS,
-        "system":     VALID_PERMISSION_LEVELS,
-    }
-    SAFE_DEFAULTS = {
-        "container": False,
-        "execution": "banned",
-        "filesystem": "read",
-        "git": "read",
-        "network": "banned",
-        "system": "read",
-    }
-
-    raw_perms = cfg.get("session_permissions", {})
-    if isinstance(raw_perms, dict):
-        cleaned: Dict[str, Any] = {}
-        for key, valid_values in PERMISSION_SCHEMA.items():
-            value = raw_perms.get(key)
-            if value in valid_values:
-                cleaned[key] = value
-            else:
-                # Coerce invalid / missing to safe default
-                cleaned[key] = SAFE_DEFAULTS.get(key, value)
-        cfg["session_permissions"] = cleaned
-    elif raw_perms is not None:
-        # session_permissions exists but is not a dict — discard
-        cfg["session_permissions"] = dict(SAFE_DEFAULTS)
+    # Delegated to coerce_session_permissions() in thoughtmachine/security.py
+    # which rejects any unknown category or invalid level to prevent a
+    # compromised (or malformed) WebSocket message from injecting dangerous
+    # values such as filesystem="full", container=True, network="write".
+    from thoughtmachine.security import coerce_session_permissions
+    cfg["session_permissions"] = coerce_session_permissions(
+        cfg.get("session_permissions", {}),
+    )
 
     # ── Translate diagnostic log ──────────────────────────────────────
     log('INFO', 'server.config',
