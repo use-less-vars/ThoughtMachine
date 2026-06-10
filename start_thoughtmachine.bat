@@ -21,6 +21,7 @@ call "%~dp0kill_thoughtmachine.bat" 2>nul
 
 set "SCRIPT_DIR=%~dp0"
 set "VENV_DIR=%SCRIPT_DIR%.venv"
+set "TM_PYTHON=%VENV_DIR%\Scripts\python.exe"
 
 REM -- Parse flags -------------------------------------------------------------
 set PROD_MODE=false
@@ -39,7 +40,7 @@ if not exist "%VENV_DIR%\Scripts\activate.bat" (
     exit /b 1
 )
 
-REM Activate venv — python now resolves to venv python
+REM Activate venv — also sets VIRTUAL_ENV, PROMPT etc.
 call "%VENV_DIR%\Scripts\activate.bat"
 
 echo ============================================
@@ -74,7 +75,7 @@ for /f "tokens=*" %%p in ('where npm') do set "TM_NPM_CMD=%%p"
 REM ── Start backend in background (same window) ──────────────────────────────
 echo   ^> Starting backend server ^(port 8000^)...
 cd /d "%SCRIPT_DIR%"
-start /b "" python -m web_ui.backend.server
+start /b "" "%TM_PYTHON%" -m web_ui.backend.server
 
 REM ── Wait for port 8000 (up to 15 s) ────────────────────────────────────────
 echo   ^> Waiting for backend to be ready...
@@ -124,7 +125,7 @@ if not errorlevel 1 (
     for /f "tokens=*" %%p in ('where npm') do set "TM_NPM_CMD=%%p"
 )
 cd /d "%SCRIPT_DIR%"
-python -m web_ui.backend.server --serve-frontend
+"%TM_PYTHON%" -m web_ui.backend.server --serve-frontend
 pause
 exit /b %ERRORLEVEL%
 
