@@ -6,7 +6,6 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
 import time
-from agent.logging import log
 
 @dataclass
 class LLMResponse:

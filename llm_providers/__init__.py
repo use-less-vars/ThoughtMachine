@@ -16,12 +16,11 @@ from .exceptions import (
     ProviderError,
 )
 
-from .openai_compatible import OpenAICompatibleProvider
-# Note: AnthropicProvider will be imported when implemented in Phase 2
+# OpenAICompatibleProvider is available via ProviderFactory or lazy import below
 
 __all__ = [
     "LLMProvider",
-    "LLMResponse", 
+    "LLMResponse",
     "ProviderConfig",
     "ProviderFactory",
     "ProviderNotFoundError",
@@ -29,3 +28,11 @@ __all__ = [
     "ProviderError",
     "OpenAICompatibleProvider",
 ]
+
+
+def __getattr__(name):
+    """Lazy-import submodules to avoid circular dependencies."""
+    if name == "OpenAICompatibleProvider":
+        from .openai_compatible import OpenAICompatibleProvider
+        return OpenAICompatibleProvider
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
