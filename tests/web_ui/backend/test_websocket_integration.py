@@ -14,7 +14,15 @@ import os
 import tempfile
 import pathlib
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+
+# Module-level single-threaded executor for WebSocket reads.
+# NOT wrapped in a ``with`` block — the executor lives for the full
+# process lifetime so that a timed-out ``ws.receive_text()`` thread
+# doesn't block cleanup.
+_receive_pool = ThreadPoolExecutor(max_workers=1)
 from unittest.mock import patch
 
 import pytest
@@ -81,15 +89,20 @@ def pathed_server():
 def recv_n(ws, n: int, timeout: float = 5.0) -> list:
     """
     Receive exactly *n* text messages from the WebSocket.
-    Each call to ``receive_text`` is blocking, but we set a wall-clock deadline
-    to avoid hanging forever if the server sends fewer messages than expected.
+    Uses a thread pool to enforce a real wall-clock timeout.
     """
     messages = []
     deadline = time.monotonic() + timeout
     for _ in range(n):
-        if time.monotonic() > deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             break
-        raw = ws.receive_text()
+        future = _receive_pool.submit(ws.receive_text)
+        try:
+            raw = future.result(timeout=remaining)
+        except TimeoutError:
+            future.cancel()
+            break
         messages.append(json.loads(raw))
     return messages
 
@@ -97,12 +110,18 @@ def recv_n(ws, n: int, timeout: float = 5.0) -> list:
 def poll_for_type(ws, expected_type: str, timeout: float = 5.0) -> list:
     """
     Receive messages until one of type ``expected_type`` is found.
-    Returns all messages received.  Uses a wall-clock deadline.
+    Uses a thread pool to enforce a real wall-clock timeout.
     """
     messages = []
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        raw = ws.receive_text()
+        remaining = deadline - time.monotonic()
+        future = _receive_pool.submit(ws.receive_text)
+        try:
+            raw = future.result(timeout=remaining)
+        except TimeoutError:
+            future.cancel()
+            break
         msg = json.loads(raw)
         messages.append(msg)
         if msg.get("type") == expected_type:
