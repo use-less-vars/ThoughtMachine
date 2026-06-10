@@ -18,6 +18,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from .models import Session
+from .lock import FileLock
 
 
 def _sanitize_filename(name: str, max_length: int = 100) -> str:
@@ -227,7 +228,10 @@ class FileSystemSessionStore(SessionStore):
             raise
 
     def save_session(self, session: Session) -> None:
-        """Save a session to a JSON file."""
+        """Save a session to a JSON file.
+
+        Acquires an exclusive file lock to prevent concurrent writes.
+        """
         # Invalidate caches
         self._cached_paths.pop(session.session_id, None)
         self._cached_paths_ts.pop(session.session_id, None)
@@ -267,10 +271,11 @@ class FileSystemSessionStore(SessionStore):
         temp_path = new_path.with_suffix('.tmp')
         logger.debug(f"[SessionStore] Writing to {temp_path} (atomic)")
         try:
-            os.makedirs(os.path.dirname(temp_path), exist_ok=True)
-            with open(temp_path, 'w') as f:
-                json.dump(data, f, indent=2, default=str)  # default=str handles datetime
-            temp_path.replace(new_path)
+            with FileLock(str(new_path)):
+                os.makedirs(os.path.dirname(temp_path), exist_ok=True)
+                with open(temp_path, 'w') as f:
+                    json.dump(data, f, indent=2, default=str)
+                temp_path.replace(new_path)
             logger.debug(f"[SessionStore] Session {session.session_id} saved to {new_path}")
             # Invalidate path cache so subsequent _find_session_path re-scans
             self._cached_paths.pop(session.session_id, None)
@@ -284,13 +289,17 @@ class FileSystemSessionStore(SessionStore):
             raise
 
     def load_session(self, session_id: str) -> Optional[Session]:
-        """Load a session from a JSON file."""
+        """Load a session from a JSON file.
+
+        Acquires a file lock to prevent reading a partially-written file.
+        """
         path = self._find_session_path(session_id)
         if path is None or not path.exists():
             return None
         try:
-            with open(path, 'r') as f:
-                data = json.load(f)
+            with FileLock(str(path)):
+                with open(path, 'r') as f:
+                    data = json.load(f)
             # Remove external_file_path from metadata if present (legacy concept)
             if 'metadata' in data and 'external_file_path' in data['metadata']:
                 del data['metadata']['external_file_path']
