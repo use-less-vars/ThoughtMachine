@@ -27,7 +27,7 @@
     "container": false,
     "network": true,
     "filesystem": "write",
-    "security": "read",
+    "system": "read",
     "git": "read",
     "execution": "banned"
   },

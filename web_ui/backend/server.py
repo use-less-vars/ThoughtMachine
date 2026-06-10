@@ -1235,7 +1235,7 @@ def _translate_frontend_config(fe_config: Dict[str, Any]) -> Dict[str, Any]:
         "filesystem": "read",
         "git": "read",
         "network": "banned",
-        "security": "read",
+        "system": "read",
     }
 
     raw_perms = cfg.get("session_permissions", {})
@@ -1325,7 +1325,7 @@ _FALLBACK_FRONTEND_CONFIG = {
         "container": False,
         "network": "banned",
         "filesystem": "read",
-        "security": "read",
+        "system": "read",
         "git": "read",
         "execution": "banned",
     },

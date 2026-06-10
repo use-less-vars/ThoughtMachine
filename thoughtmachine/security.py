@@ -92,9 +92,9 @@ class SessionPermissions(BaseModel):
         default='read',
         description='Filesystem access level for the session.',
     )
-    security: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
+    system: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
         default='read',
-        description='Security-related operations access level.',
+        description='System operations access level.',
     )
     git: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
         default='read',
