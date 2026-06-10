@@ -80,12 +80,50 @@ else
 
     FRONTEND_DIR="$PROJECT_DIR/web_ui/frontend"
 
+    # ── Pre-flight checks for Vite ──────────────────────────────────────
+    if [ ! -d "$FRONTEND_DIR" ]; then
+        echo "[ERROR] Frontend directory not found at:"
+        echo "  $FRONTEND_DIR"
+        echo ""
+        echo "  Make sure you ran install_thoughtmachine.sh first."
+        exit 1
+    fi
+    if [ ! -f "$FRONTEND_DIR/package.json" ]; then
+        echo "[ERROR] package.json not found in frontend directory:"
+        echo "  $FRONTEND_DIR"
+        echo ""
+        echo "  The installation appears incomplete. Run install_thoughtmachine.sh again."
+        exit 1
+    fi
+    if [ ! -d "$FRONTEND_DIR/node_modules" ]; then
+        echo "[WARNING] node_modules not found — installing dependencies..."
+        echo ""
+        (cd "$FRONTEND_DIR" && npm install)
+        if [ $? -ne 0 ]; then
+            echo ""
+            echo "[FAIL] npm install failed. Try running manually:"
+            echo "  cd $FRONTEND_DIR"
+            echo "  npm install"
+            exit 1
+        fi
+        echo "  [+] npm packages installed"
+        echo ""
+    fi
+
     # Verify npm is available
     if ! command -v npm &>/dev/null; then
         echo "[ERROR] npm not found. Install Node.js from https://nodejs.org/"
         exit 1
     fi
     export TM_NPM_CMD="$(command -v npm)"
+
+    # Verify Vite binary exists
+    if [ ! -f "$FRONTEND_DIR/node_modules/.bin/vite" ]; then
+        echo "[ERROR] Vite binary not found in node_modules."
+        echo "  The npm install may have failed or was interrupted."
+        echo "  Try: cd $FRONTEND_DIR && npm install"
+        exit 1
+    fi
 
     # Start backend FIRST so Vite's proxy never hits ECONNREFUSED
     echo "  → Starting backend server (port 8000)..."

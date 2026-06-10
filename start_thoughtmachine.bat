@@ -74,6 +74,44 @@ echo(
 
 set "FRONTEND_DIR=%SCRIPT_DIR%web_ui\frontend"
 
+REM ── Pre-flight checks for Vite ────────────────────────────────────────
+if not exist "%FRONTEND_DIR%\" (
+    echo [ERROR] Frontend directory not found at:
+    echo   %FRONTEND_DIR%
+    echo(
+    echo   Make sure you ran install_thoughtmachine.bat first.
+    echo   If the directory exists elsewhere, edit FRONTEND_DIR in this script.
+    pause
+    exit /b 1
+)
+if not exist "%FRONTEND_DIR%\package.json" (
+    echo [ERROR] package.json not found in frontend directory:
+    echo   %FRONTEND_DIR%
+    echo(
+    echo   The installation appears incomplete. Run install_thoughtmachine.bat again.
+    pause
+    exit /b 1
+)
+if not exist "%FRONTEND_DIR%\node_modules\" (
+    echo [WARNING] node_modules not found — frontend dependencies not installed.
+    echo   Running npm install for you...
+    echo(
+    pushd "%FRONTEND_DIR%"
+    call npm install
+    if errorlevel 1 (
+        popd
+        echo(
+        echo [FAIL] npm install failed. Try running manually:
+        echo   cd /d "%FRONTEND_DIR%"
+        echo   npm install
+        pause
+        exit /b 1
+    )
+    popd
+    echo   [+] npm packages installed
+    echo(
+)
+
 REM Check npm
 where npm >nul 2>&1
 if errorlevel 1 (
@@ -82,6 +120,17 @@ if errorlevel 1 (
     exit /b 1
 )
 for /f "tokens=*" %%p in ('where npm') do set "TM_NPM_CMD=%%p"
+
+REM ── Verify Vite is installed in node_modules ───────────────────────────
+if not exist "%FRONTEND_DIR%\node_modules\.bin\vite.cmd" (
+    if not exist "%FRONTEND_DIR%\node_modules\vite\bin\vite.js" (
+        echo [ERROR] Vite binary not found in node_modules.
+        echo   The npm install may have failed or was interrupted.
+        echo   Try:  cd /d "%FRONTEND_DIR%" ^&^& npm install
+        pause
+        exit /b 1
+    )
+)
 
 REM ── Start backend in background (same window) ──────────────────────────────
 echo   ^> Starting backend server ^(port 8000^)...
@@ -111,6 +160,32 @@ if not defined BACKEND_READY (
 REM ── Start Vite in a separate window ────────────────────────────────────────
 echo   ^> Starting Vite dev server ^(port 5173^)...
 start "Vite Dev Server" /d "%FRONTEND_DIR%" npm run dev
+
+REM ── Wait for port 5173 (up to 10 s) ────────────────────────────────────────
+echo   ^> Waiting for Vite to start...
+set VITE_READY=
+for /l %%i in (1,1,10) do (
+    timeout /t 1 /nobreak >nul
+    netstat -an 2^>nul | findstr ":5173 " >nul 2>&1
+    if not errorlevel 1 (
+        set VITE_READY=1
+        goto :vite_ready
+    )
+)
+:vite_ready
+if defined VITE_READY (
+    echo   ^> Vite is ready on http://127.0.0.1:5173
+) else (
+    echo(
+    echo  [WARNING] Vite may not have started in time.
+    echo   Check the "Vite Dev Server" window for errors.
+    echo   If it flashed and closed, try manually:
+    echo     cd /d "%FRONTEND_DIR%"
+    echo     npm run dev
+    echo(
+)
+echo   ^> Press Ctrl+C to stop all servers.
+echo(
 
 REM ── Cleanup ────────────────────────────────────────────────────────────────
 echo(
