@@ -56,7 +56,8 @@ if "%PROD_MODE%"=="true" (
     if not errorlevel 1 (
         for /f "tokens=*" %%p in ('where npm') do set "TM_NPM_CMD=%%p"
     )
-    start "ThoughtMachine Backend" /wait python -m web_ui.backend.server --serve-frontend
+    cd /d "%SCRIPT_DIR%"
+    start "ThoughtMachine Backend" /wait cmd /c "python -m web_ui.backend.server --serve-frontend || (echo. & echo [ERROR] Backend exited with error. Press any key to close. & pause >nul)"
     exit /b %ERRORLEVEL%
 ) else (
     REM -- Development mode (hot-reload via Vite) -----------------------------
@@ -82,7 +83,8 @@ if "%PROD_MODE%"=="true" (
 
     REM Start backend FIRST so Vite's proxy never hits ECONNREFUSED
     echo   Starting backend server ^(port 8000^)...
-    start "ThoughtMachine Backend" python -m web_ui.backend.server
+    cd /d "%SCRIPT_DIR%"
+    start "ThoughtMachine Backend" cmd /c "python -m web_ui.backend.server || (echo. & echo [ERROR] Backend exited with error. Press any key to close. & pause >nul)"
 
     REM Wait for backend to start listening on port 8000 (up to 15 seconds)
     echo   Waiting for backend to be ready...
@@ -107,7 +109,7 @@ if "%PROD_MODE%"=="true" (
 
     REM Start Vite dev server in foreground (blocks until Vite exits)
     pushd "!FRONTEND_DIR!"
-    start "ThoughtMachine Vite" /wait cmd /c "npm run dev"
+    start "ThoughtMachine Vite" /wait cmd /c "npm run dev || (echo. & echo [ERROR] Vite exited with error. Press any key to close. & pause >nul)"
     popd
 
     REM When Vite stops (Ctrl+C), also stop backend
