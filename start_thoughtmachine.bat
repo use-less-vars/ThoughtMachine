@@ -48,6 +48,17 @@ echo   ThoughtMachine — Starting Web UI
 echo ============================================
 echo(
 
+REM ── Diagnostic: verify Python & fastapi ────────────────────────────
+echo   Python:    "%TM_PYTHON%"
+"%TM_PYTHON%" -c "import fastapi; print('  fastapi OK: v' + fastapi.__version__)" 2>&1
+if errorlevel 1 (
+    echo   [!!] fastapi NOT found in this venv!
+    echo   Run:  "%TM_PYTHON%" -m pip install -r "%SCRIPT_DIR%requirements.txt"
+    pause
+    exit /b 1
+)
+echo(
+
 if "%PROD_MODE%"=="true" goto :prod_mode
 
 REM ═══════════════════════════════════════════════════════════════════════════
