@@ -153,6 +153,38 @@ async def lifespan(app: FastAPI):
         log('INFO', 'server', f'ThoughtMachine version {get_version()}')
     except Exception as exc:
         log('WARNING', 'server', f'Could not initialise user defaults: {exc}')
+
+    # ── Startup container integrity check ─────────────────────────────────
+    # Scan for any existing agent-exec-* containers and verify they match
+    # the current restrictive defaults.  Stale containers from a previous
+    # run with permissive settings are stopped and removed.
+    try:
+        import docker
+        from docker_executor import verify_container_integrity
+        client = docker.from_env()
+        # List all containers with names starting with agent-exec-
+        all_containers = client.containers.list(all=True, filters={"name": "agent-exec-"})
+        for c in all_containers:
+            mounts = c.attrs.get("Mounts", [])
+            ws_path = None
+            for m in mounts:
+                if m.get("Destination") == "/workspace":
+                    ws_path = m.get("Source")
+                    break
+            if ws_path:
+                result = verify_container_integrity(ws_path, session_permissions=None)
+                if result.get("action_taken") == "removed":
+                    log('INFO', 'server',
+                        f'Startup integrity: removed stale container '
+                        f'{result["container_name"]} for workspace {ws_path}',
+                        {"mismatch": result.get("mismatch_reason")})
+                elif result.get("action_taken") == "error":
+                    log('WARNING', 'server',
+                        f'Startup integrity: error checking container '
+                        f'{result["container_name"]}: {result.get("mismatch_reason")}')
+    except Exception as exc:
+        log('DEBUG', 'server', f'Startup container scan skipped: {exc}')
+
     yield
     log('INFO', 'server', 'Server shutting down.')
 

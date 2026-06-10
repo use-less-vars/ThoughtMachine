@@ -19,13 +19,40 @@ from agent.knowledge.global_kb import ensure_global_kb
 
 USER_DIR = Path.home() / ".thoughtmachine"
 
-RESOURCE_MAP: dict[str, str] = {
-    # resource_name → user_filename
-    "default_config.json": "agent_config.json",
-    "default_system_prompt.txt": "system_prompt.txt",
-    "default_providers.json": "providers.json",
-    "default_security_policy.json": "security_policy.json",
-}
+# ── Manifest ────────────────────────────────────────────────────────────────
+
+
+def _load_manifest() -> dict:
+    """Load the resource deployment manifest from ``resources/MANIFEST.json``.
+
+    Returns the parsed manifest dict.
+    """
+    manifest_path = _resources_dir() / "MANIFEST.json"
+    try:
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError(
+            f"Cannot load resource manifest at {manifest_path}: {exc}"
+        ) from exc
+
+
+def get_manifest() -> dict:
+    """Public accessor for the resource deployment manifest.
+
+    Returns the full manifest dict (files, directories, notes).
+    Useful for introspection by the agent or UI.
+    """
+    return _load_manifest()
+
+
+def _resolve_source(source_name: str) -> Path:
+    """Resolve a manifest source name to an absolute path."""
+    return _resources_dir() / source_name
+
+
+def _resolve_dest(dest_name: str) -> Path:
+    """Resolve a manifest dest name under the user directory."""
+    return USER_DIR / dest_name
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -91,26 +118,37 @@ def ensure_user_defaults(overwrite_existing: bool = False) -> list[str]:
     (USER_DIR / "knowledge").mkdir(parents=True, exist_ok=True)
     (USER_DIR / "worker_templates").mkdir(parents=True, exist_ok=True)
 
-    resources = _resources_dir()
+    manifest = _load_manifest()
     touched: list[str] = []
 
-    for resource_name, user_filename in RESOURCE_MAP.items():
-        dst = USER_DIR / user_filename
+    # ── Deploy individual files from manifest ────────────────────────────
+    for entry in manifest.get("files", []):
+        if entry.get("internal"):
+            continue  # skip internal files (e.g., .version)
+        dst = _resolve_dest(entry["dest"])
         if dst.exists() and not overwrite_existing:
             continue
-
-        src = resources / resource_name
+        src = _resolve_source(entry["source"])
         shutil.copy2(str(src), str(dst))
         touched.append(str(dst))
 
-    # ── Copy shipped worker_templates if destination is empty ────────────
-    worker_templates_src = resources / "worker_templates"
-    worker_templates_dst = USER_DIR / "worker_templates"
-    if worker_templates_src.is_dir() and not any(worker_templates_dst.iterdir()):
-        for src_file in worker_templates_src.iterdir():
+    # ── Deploy directories from manifest ─────────────────────────────────
+    for entry in manifest.get("directories", []):
+        src_dir = _resolve_source(entry["source"])
+        dst_dir = _resolve_dest(entry["dest"])
+        condition = entry.get("condition", "")
+
+        if condition == "dest_empty" and any(dst_dir.iterdir()):
+            continue  # only deploy if destination is empty
+
+        if not src_dir.is_dir():
+            continue
+
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for src_file in src_dir.iterdir():
             if src_file.is_file():
-                shutil.copy2(str(src_file), str(worker_templates_dst / src_file.name))
-                touched.append(str(worker_templates_dst / src_file.name))
+                shutil.copy2(str(src_file), str(dst_dir / src_file.name))
+                touched.append(str(dst_dir / src_file.name))
 
     # ── Ensure the global knowledge base (system/ + user/ + .version) ─────
     touched.extend(ensure_global_kb())

@@ -173,9 +173,9 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
   const [providerVersion, setProviderVersion] = useState(0);  // incremented when a provider is saved
   const normalizeSessionPermissions = (permissions) => {
     const normalized = {
-      filesystem: 'write',
-      network: 'write',
-      container: true,
+      filesystem: 'read',
+      network: 'banned',
+      container: false,
       security: 'read',
       git: 'write',
       execution: 'banned',
@@ -601,7 +601,7 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>Filesystem</strong></label>
             <select
-              value={draft.session_permissions?.filesystem ?? 'write'}
+              value={draft.session_permissions?.filesystem ?? 'read'}
               onChange={(e) => setDraft({
                 ...draft,
                 session_permissions: { ...draft.session_permissions, filesystem: e.target.value }
@@ -622,7 +622,7 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>Network</strong></label>
             <select
-              value={draft.session_permissions?.network ?? 'write'}
+              value={draft.session_permissions?.network ?? 'banned'}
               onChange={(e) => setDraft({
                 ...draft,
                 session_permissions: { ...draft.session_permissions, network: e.target.value }
@@ -644,7 +644,7 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
               <label className="toggle-switch">
                 <input
                   type="checkbox"
-                  checked={draft.session_permissions?.container ?? true}
+                  checked={draft.session_permissions?.container ?? false}
                   onChange={(e) => setDraft({
                     ...draft,
                     session_permissions: { ...draft.session_permissions, container: e.target.checked }

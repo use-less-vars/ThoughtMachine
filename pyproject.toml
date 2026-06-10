@@ -28,6 +28,7 @@ thoughtmachine = [
     "resources/default_config.json",
     "resources/default_system_prompt.txt",
     "resources/default_providers.json",
+    "resources/MANIFEST.json",
     "resources/global_kb/*",
     "resources/worker_templates/*",
 ]

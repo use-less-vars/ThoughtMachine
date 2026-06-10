@@ -2139,3 +2139,52 @@ Committed in `58bc025`:
 - Workspace volume is now mounted **read-only** (`ro`) in containers — containers can no longer modify host files via the volume.
 - Added `_compute_effective_capabilities()` which merges workspace capabilities with a Docker security policy, taking the most restrictive value per field.
 - `get_container_status()` now uses `_compute_effective_capabilities()` instead of raw `_load_capabilities()`.
+
+## Resource Deployment Map
+
+## 2026-06-10 — ## Resource Deployment Map — `resources/` → User Config (202...
+
+## Resource Deployment Map — `resources/` → User Config (2026-06-09)
+
+The `resources/` directory in the ThoughtMachine repo is the **source of truth / blueprint** for all user-level configuration. When the agent debugs config issues, it should look in `resources/` first — these files are what get deployed to `~/.thoughtmachine/` on first run.
+
+### Explicit RESOURCE_MAP (defined in `thoughtmachine/bootstrap.py`)
+
+| Repo Source (`resources/`) | Deployed To (`~/.thoughtmachine/`) | Description |
+|---|---|---|
+| `default_config.json` | `agent_config.json` | Agent configuration (model, provider, keys, tool settings) |
+| `default_system_prompt.txt` | `system_prompt.txt` | System prompt for the agent |
+| `default_providers.json` | `providers.json` | Provider profile definitions |
+
+### Additional Deployed Resources
+
+| Source | Destination | Trigger |
+|---|---|---|
+| `resources/worker_templates/*.json` | `~/.thoughtmachine/worker_templates/` | Copied if destination dir is empty (first run) |
+| `resources/global_kb/*.md` | `~/.thoughtmachine/knowledge/system/` | Synced on version mismatch via `ensure_global_kb()` |
+| `resources/global_kb/.version` | `~/.thoughtmachine/knowledge/.version` | Version marker for sync detection |
+
+### How First-Run Deployment Works
+
+1. **`bootstrap.py::ensure_user_defaults()`** is called at server startup (`server.py` lifespan)
+2. Creates `~/.thoughtmachine/` + subdirs (`sessions/`, `state/`, `knowledge/`, `worker_templates/`)
+3. For each entry in `RESOURCE_MAP`, copies source→destination **only if** destination doesn't exist (unless `overwrite_existing=True`)
+4. Copies `worker_templates/` only if destination is empty
+5. Calls `ensure_global_kb()` which copies `global_kb/*.md` → `knowledge/system/` if version changed
+
+### Config Loading Flow (at runtime)
+
+1. **`agent/config/loader.py::load_config()`** merges defaults (from `AgentConfig()` pydantic model) with user's `~/.thoughtmachine/agent_config.json`
+2. Defaults come from `AgentConfig()` pydantic model — NOT from `default_config.json` at this point
+3. `default_config.json` is only used on **first run bootstrap** — after that, the user's file is authoritative
+
+### Why This Matters for Debugging
+
+When investigating config-related bugs:
+- **Can't find a config field?** → Check `resources/default_config.json` — it's the blueprint
+- **User's `agent_config.json` has weird values?** → Check if `resources/default_config.json` changed between versions
+- **Fake model/provider appearing?** → Check `resources/default_config.json` first (this is where `deepseek-v4-flash` came from)
+- **Missing provider profiles?** → Check `resources/default_providers.json`
+- **Stale system prompt?** → Check `resources/default_system_prompt.txt`
+
+

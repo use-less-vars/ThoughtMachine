@@ -32,6 +32,206 @@ def _compute_image_tag(workspace_path: str) -> str:
     return f"agent-executor-{path_hash}"
 
 
+def _resolve_workspace_id(workspace_path: str):
+    """Resolve workspace ID from a workspace path, returning None on failure."""
+    try:
+        from thoughtmachine.workspace_capabilities import resolve_workspace_id
+        return resolve_workspace_id(workspace_path)
+    except Exception:
+        return None
+
+
+def _compute_desired_config(workspace_path: str, workspace_id, session_permissions):
+    """Standalone version of DockerExecutor._compute_container_config().
+
+    Computes the desired (network_mode, workspace_mode) tuple from
+    session permissions, matching the same unified-gate logic that
+    _ensure_container() uses at container creation time.
+    """
+    network_mode = "none"
+    workspace_mode = "ro"
+
+    if workspace_id and session_permissions is not None:
+        try:
+            from security.security_gate import (
+                get_workspace_capabilities,
+                get_effective_permissions,
+            )
+            from thoughtmachine.security import SessionPermissions
+            caps = get_workspace_capabilities(workspace_id)
+            eff = get_effective_permissions(SessionPermissions(**session_permissions), caps)
+
+            if eff.get("network") is True or eff.get("network") == "write":
+                network_mode = "bridge"
+            else:
+                network_mode = "none"
+
+            fs = eff.get("filesystem", "read")
+            workspace_mode = "rw" if fs in ("write", "full") else "ro"
+        except Exception as e:
+            log("WARN", "docker.security_gate",
+                f"Gate lookup failed (verify), using safe defaults: {e}")
+            network_mode = "none"
+            workspace_mode = "ro"
+    elif session_permissions is not None:
+        # Fallback: derive directly from session_permissions dict
+        net = session_permissions.get("network", "banned")
+        network_mode = "bridge" if net == "write" else "none"
+        fs = session_permissions.get("filesystem", "read")
+        workspace_mode = "rw" if fs in ("write", "full") else "ro"
+
+    return network_mode, workspace_mode
+
+
+def verify_container_integrity(
+    workspace_path: str,
+    session_permissions: dict = None,
+) -> dict:
+    """Check an existing container against the expected security config.
+
+    If permissions have been tightened since the container was created, the
+    container is stopped and removed so it will be recreated with the new
+    settings on next use.
+
+    This is called during:
+      - Server startup (lifespan) to catch stale containers from previous runs
+      - Session load to catch containers whose permissions have changed
+        since the session was last active
+
+    Args:
+        workspace_path: Absolute path to the workspace.
+        session_permissions: The session permissions dict (e.g. from a loaded
+            session's config).  If None, the most restrictive defaults are used.
+
+    Returns:
+        dict with keys:
+            - container_exists (bool | None): None if Docker unavailable
+            - container_name (str | None)
+            - matches_config (bool | None): None if no container
+            - desired (dict): {"network": ..., "mode": ...}
+            - actual (dict | None): {"network": ..., "mode": ...}
+            - action_taken (str): "none", "removed", or "error"
+            - mismatch_reason (str | None)
+    """
+    import hashlib
+    import os
+
+    workspace_path = os.path.abspath(workspace_path).rstrip("/")
+    safe_name = hashlib.sha256(workspace_path.encode()).hexdigest()[:12]
+    container_name = f"agent-exec-{safe_name}"
+
+    # Resolve workspace_id for config computation
+    workspace_id = _resolve_workspace_id(workspace_path)
+
+    # Compute desired config (mirrors _ensure_container logic)
+    desired_network, desired_mode = _compute_desired_config(
+        workspace_path, workspace_id, session_permissions
+    )
+
+    # Connect to Docker
+    try:
+        import docker
+        client = docker.from_env()
+    except Exception as exc:
+        log("WARNING", "docker.verify_integrity",
+            f"Cannot connect to Docker: {exc}")
+        return {
+            "container_exists": None,
+            "container_name": container_name,
+            "matches_config": None,
+            "desired": {"network": desired_network, "mode": desired_mode},
+            "actual": None,
+            "action_taken": "error",
+            "mismatch_reason": f"Docker unavailable: {exc}",
+        }
+
+    # Look up container
+    try:
+        container = client.containers.get(container_name)
+        container.reload()
+    except docker.errors.NotFound:
+        log("DEBUG", "docker.verify_integrity",
+            f"No existing container for {workspace_path}",
+            {"container_name": container_name})
+        return {
+            "container_exists": False,
+            "container_name": container_name,
+            "matches_config": None,
+            "desired": {"network": desired_network, "mode": desired_mode},
+            "actual": None,
+            "action_taken": "none",
+            "mismatch_reason": None,
+        }
+
+    # Get actual config from running container
+    actual_network = container.attrs["HostConfig"]["NetworkMode"]
+    actual_mounts = container.attrs.get("Mounts", [])
+    actual_mode = "ro"
+    for m in actual_mounts:
+        if m.get("Destination") == "/workspace":
+            actual_mode = m.get("Mode", "ro")
+            break
+
+    # Compare
+    if actual_network == desired_network and actual_mode == desired_mode:
+        log("INFO", "docker.verify_integrity",
+            f"Container {container.id[:12]} matches expected config",
+            {"container_name": container_name,
+             "network": actual_network, "mode": actual_mode})
+        return {
+            "container_exists": True,
+            "container_name": container_name,
+            "matches_config": True,
+            "desired": {"network": desired_network, "mode": desired_mode},
+            "actual": {"network": actual_network, "mode": actual_mode},
+            "action_taken": "none",
+            "mismatch_reason": None,
+        }
+
+    # Mismatch — log warning, stop, and remove
+    mismatch_reason = (
+        f"network={actual_network}->{desired_network}, "
+        f"mode={actual_mode}->{desired_mode}"
+    )
+    log("WARNING", "docker.verify_integrity",
+        f"Container {container.id[:12]} config mismatch — removing",
+        {"container_name": container_name,
+         "actual_network": actual_network, "desired_network": desired_network,
+         "actual_mode": actual_mode, "desired_mode": desired_mode})
+
+    with open("/tmp/container_audit.log", "a") as _f:
+        _f.write(f"{time.time()} | VERIFY_RECREATE | "
+                 f"workspace={workspace_path} container={container.id[:12]} "
+                 f"network={actual_network}->{desired_network} "
+                 f"mode={actual_mode}->{desired_mode}\n")
+
+    try:
+        container.stop(timeout=5)
+        container.remove()
+    except Exception as exc:
+        log("ERROR", "docker.verify_integrity",
+            f"Failed to remove mismatched container: {exc}")
+        return {
+            "container_exists": True,
+            "container_name": container_name,
+            "matches_config": False,
+            "desired": {"network": desired_network, "mode": desired_mode},
+            "actual": {"network": actual_network, "mode": actual_mode},
+            "action_taken": "error",
+            "mismatch_reason": mismatch_reason,
+        }
+
+    return {
+        "container_exists": True,
+        "container_name": container_name,
+        "matches_config": False,
+        "desired": {"network": desired_network, "mode": desired_mode},
+        "actual": {"network": actual_network, "mode": actual_mode},
+        "action_taken": "removed",
+        "mismatch_reason": mismatch_reason,
+    }
+
+
 class DockerExecutor:
     def __init__(
         self,
@@ -91,7 +291,7 @@ class DockerExecutor:
                 caps = get_workspace_capabilities(self.workspace_id)
                 eff = get_effective_permissions(SessionPermissions(**self.session_permissions), caps)
 
-                if eff.get("network") is True:
+                if eff.get("network") is True or eff.get("network") == "write":
                     network_mode = "bridge"
                 else:
                     network_mode = "none"
@@ -112,15 +312,23 @@ class DockerExecutor:
                 cap_module_available = False
 
             if workspace_path_exists and cap_module_available:
+                # workspace_id resolution failed — fall back to session permissions
+                # (they have already been vetted by ToolExecutor.check_required_categories).
+                sp = self.session_permissions
+                net = sp.get("network", "banned")
+                if net == "write":
+                    network_mode = "bridge"
+                else:
+                    network_mode = "none"
+                fs = sp.get("filesystem", "read")
+                workspace_mode = "rw" if fs in ("write", "full") else "ro"
                 log("WARNING", "docker.security_gate",
                     f"workspace_id resolution failed for {self.workspace_path}; "
-                    f"forcing restricted container.")
-                network_mode = "none"
-                workspace_mode = "ro"
+                    f"falling back to session_permissions (network={net}, fs={fs}).")
                 with open("/tmp/container_audit.log", "a") as _f:
                     _f.write(f"{time.time()} | FALLBACK_NETWORK_RESTRICTION | "
                              f"workspace={self.workspace_path} "
-                             f"workspace_id=None forced_network=none forced_fs=ro\n")
+                             f"workspace_id=None session_network={net} session_fs={fs}\n")
             else:
                 sp = self.session_permissions
                 net = sp.get("network", "banned")
@@ -152,13 +360,44 @@ class DockerExecutor:
             try:
                 self.container.reload()
                 if self.container.status == "running":
-                    log("DEBUG", "tools.docker_executor.container",
-                        "Reusing running container (fast path)",
-                        {"container_id": self.container.id, "name": self.container.name})
-                    with open("/tmp/container_audit.log", "a") as _f:
-                        _f.write(f"{time.time()} | CONTAINER_REUSE_OK | "
-                                 f"workspace={self.workspace_path} container={self.container.id[:12]} source=live_object\n")
-                    return
+                    # ── Compute desired config via unified gate ──
+                    desired_network, desired_workspace_mode = self._compute_container_config()
+
+                    # ── Read actual config from container ──
+                    actual_network = self.container.attrs['HostConfig']['NetworkMode']
+                    actual_mounts = self.container.attrs.get('Mounts', [])
+                    actual_workspace_mode = "ro"
+                    for m in actual_mounts:
+                        if m.get('Destination') == '/workspace':
+                            actual_workspace_mode = m.get('Mode', 'ro')
+                            break
+
+                    # ── Compare desired vs actual ──
+                    if actual_network != desired_network or actual_workspace_mode != desired_workspace_mode:
+                        log("INFO", "tools.docker_executor.container",
+                            "Cached container config mismatch, recreating",
+                            {"container_id": self.container.id[:12],
+                             "actual_network": actual_network, "desired_network": desired_network,
+                             "actual_mode": actual_workspace_mode, "desired_mode": desired_workspace_mode})
+                        with open("/tmp/container_audit.log", "a") as _f:
+                            _f.write(f"{time.time()} | CONTAINER_RECREATE_MISMATCH | "
+                                     f"workspace={self.workspace_path} container={self.container.id[:12]} "
+                                     f"network={actual_network}->{desired_network} "
+                                     f"mode={actual_workspace_mode}->{desired_workspace_mode} source=live_object\n")
+                        try:
+                            self.container.stop()
+                            self.container.remove()
+                        except docker.errors.NotFound:
+                            pass
+                        self.container = None
+                    else:
+                        log("DEBUG", "tools.docker_executor.container",
+                            "Reusing running container (fast path — config match)",
+                            {"container_id": self.container.id, "name": self.container.name})
+                        with open("/tmp/container_audit.log", "a") as _f:
+                            _f.write(f"{time.time()} | CONTAINER_REUSE_OK | "
+                                     f"workspace={self.workspace_path} container={self.container.id[:12]} source=live_object\n")
+                        return
             except docker.errors.NotFound:
                 self.container = None
 

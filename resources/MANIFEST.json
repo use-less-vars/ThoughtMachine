@@ -1,0 +1,40 @@
+{
+  "version": "1",
+  "description": "Resource deployment manifest for ThoughtMachine — documents every file that bootstrap.py deploys from resources/ to the user's ~/.thoughtmachine/ directory.",
+  "files": [
+    {
+      "source": "default_config.json",
+      "dest": "agent_config.json",
+      "description": "Agent configuration (model, provider, tool settings, API keys)"
+    },
+    {
+      "source": "default_system_prompt.txt",
+      "dest": "system_prompt.txt",
+      "description": "Default system prompt for the agent"
+    },
+    {
+      "source": "default_providers.json",
+      "dest": "providers.json",
+      "description": "LLM provider profile definitions"
+    },
+    {
+      "source": ".version",
+      "dest": ".version",
+      "description": "ThoughtMachine version string",
+      "internal": true
+    }
+  ],
+  "directories": [
+    {
+      "source": "worker_templates",
+      "dest": "worker_templates",
+      "description": "Worker role templates (coder, researcher, reviewer)",
+      "condition": "dest_empty"
+    }
+  ],
+  "notes": [
+    "Global knowledge base (resources/global_kb/*.md → ~/.thoughtmachine/knowledge/system/) is handled separately by agent/knowledge/global_kb.py::ensure_global_kb()",
+    "User subdirectory structure (~/.thoughtmachine/sessions/, state/, knowledge/) is created by bootstrap.py::ensure_user_defaults()",
+    "This manifest is the single source of truth for resource deployment. The RESOURCE_MAP dict in bootstrap.py is derived from this file."
+  ]
+}

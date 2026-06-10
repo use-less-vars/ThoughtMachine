@@ -287,6 +287,27 @@ class SessionLifecycle:
             if not self.state_bridge.session_name:
                 self.state_bridge.session_name = os.path.basename(filepath)
             log('DEBUG', 'presenter.lifecycle', f'Session loaded from {filepath}: {len(session.user_history)} messages')
+
+            # ── Verify container integrity on session load ──────────────
+            # If a container exists with stale permissions (e.g. from before
+            # the security refactor), remove it so it gets recreated.
+            try:
+                from docker_executor import verify_container_integrity
+                ws_path = (
+                    session.metadata.get('workspace_path')
+                    or getattr(self.state_bridge.current_config, 'workspace_path', None)
+                )
+                if ws_path:
+                    sp = getattr(self.state_bridge.current_config, 'session_permissions', None)
+                    sp_dict = sp.model_dump() if hasattr(sp, 'model_dump') else None
+                    result = verify_container_integrity(ws_path, sp_dict)
+                    if result.get('action_taken') == 'removed':
+                        log('INFO', 'presenter.lifecycle',
+                            f'Session load integrity: removed stale container '
+                            f'{result["container_name"]} ({result.get("mismatch_reason")})')
+            except Exception:
+                pass  # Non‑critical — container will be verified on next use
+
             return True
         except Exception as e:
             import traceback
@@ -324,6 +345,25 @@ class SessionLifecycle:
         self.state_bridge.current_session = session
         self.state_bridge.current_session_id = str(session.session_id)
         self.state_bridge.bind_session(session)
+
+        # ── Verify container integrity on session load ──────────────
+        try:
+            from docker_executor import verify_container_integrity
+            ws_path = (
+                session.metadata.get('workspace_path')
+                or getattr(self.state_bridge.current_config, 'workspace_path', None)
+            )
+            if ws_path:
+                sp = getattr(self.state_bridge.current_config, 'session_permissions', None)
+                sp_dict = sp.model_dump() if hasattr(sp, 'model_dump') else None
+                result = verify_container_integrity(ws_path, sp_dict)
+                if result.get('action_taken') == 'removed':
+                    log('INFO', 'presenter.lifecycle',
+                        f'Session load integrity: removed stale container '
+                        f'{result["container_name"]} ({result.get("mismatch_reason")})')
+        except Exception:
+            pass  # Non‑critical — container will be verified on next use
+
         external_file_path = session.metadata.get('external_file_path')
         if external_file_path:
             external_file_path = os.path.abspath(external_file_path)
