@@ -18,8 +18,8 @@ from web_ui.backend.server import _translate_frontend_config
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _find_session_files(sessions_dir: Path) -> list:
-    """Return all .json session files in the given directory sorted by name."""
-    return sorted(sessions_dir.glob("*.json"))
+    """Return all .json session files (excluding _meta files) in the given directory sorted by name."""
+    return sorted(f for f in sessions_dir.glob("*.json") if not f.name.startswith("_meta"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

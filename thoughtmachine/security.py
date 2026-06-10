@@ -125,6 +125,69 @@ class SessionPermissions(BaseModel):
     model_config = ConfigDict()
 
 
+# ── Permission coercion ─────────────────────────────────────────────────────
+# Coerce raw permission dicts into safe values, rejecting invalid keys
+# and levels.  Used at session load and config translation boundaries.
+
+VALID_PERMISSION_LEVELS = ("banned", "ask", "read", "write")
+# "full" is intentionally excluded — it is not a valid mode for
+# the Docker security gate and should not be settable from the UI.
+PERMISSION_SCHEMA: Dict[str, tuple] = {
+    "network":   ("banned", "ask", "write"),
+    "filesystem": VALID_PERMISSION_LEVELS,   # banned, ask, read, write (no "full")
+    "container":  (True, False),
+    "execution":  ("banned", "ask", "read", "write"),
+    "git":        VALID_PERMISSION_LEVELS,
+    "system":     VALID_PERMISSION_LEVELS,
+}
+SAFE_DEFAULTS: Dict[str, Any] = {
+    "container": False,
+    "execution": "banned",
+    "filesystem": "read",
+    "git": "read",
+    "network": "banned",
+    "system": "read",
+}
+
+
+def coerce_session_permissions(
+    raw_perms: Any,
+    schema: Optional[Dict[str, tuple]] = None,
+    defaults: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Validate and coerce a raw session permissions dict.
+
+    Any unknown key or invalid value is replaced with its safe default.
+    If ``raw_perms`` is not a dict, returns a copy of ``defaults``.
+
+    Args:
+        raw_perms: The raw permissions dict (e.g. from a WebSocket message
+                   or a persisted session file).
+        schema: Allowed values per key.  Defaults to ``PERMISSION_SCHEMA``.
+        defaults: Fallback values.  Defaults to ``SAFE_DEFAULTS``.
+
+    Returns:
+        A cleaned dict safe for use as ``SessionPermissions`` fields.
+    """
+    if schema is None:
+        schema = PERMISSION_SCHEMA
+    if defaults is None:
+        defaults = SAFE_DEFAULTS
+
+    if not isinstance(raw_perms, dict):
+        return dict(defaults)
+
+    cleaned: Dict[str, Any] = {}
+    for key, valid_values in schema.items():
+        value = raw_perms.get(key)
+        if value in valid_values:
+            cleaned[key] = value
+        else:
+            cleaned[key] = defaults.get(key, value)
+    return cleaned
+
+
 def resolve_security_prompt(request_id: str, approved: bool, remember: bool = False) -> None:
     """Resolve a pending security prompt with the user's decision.
 

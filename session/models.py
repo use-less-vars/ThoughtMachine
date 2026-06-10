@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 import uuid, hashlib, json, os, threading
 from typing import Any
-from thoughtmachine.security import merge_security_config, get_default_security_config
+from thoughtmachine.security import merge_security_config, get_default_security_config, coerce_session_permissions
 from agent.logging import log
 from agent.core.message import Message
 
@@ -321,6 +321,14 @@ class Session:
         if config_data and 'agent_config' not in metadata:
             if isinstance(config_data, dict):
                 metadata['agent_config'] = config_data
+
+        # Coerce session_permissions on load to reject stale / tampered values
+        agent_cfg = metadata.get('agent_config', {})
+        if 'session_permissions' in agent_cfg:
+            agent_cfg['session_permissions'] = coerce_session_permissions(
+                agent_cfg['session_permissions'],
+            )
+
         # Derive runtime params from metadata.agent_config (sole source of truth)
         agent_cfg = metadata.get('agent_config', {})
         runtime_params = RuntimeParams(
@@ -349,6 +357,14 @@ class Session:
         containers = [ContainerMetadata.from_dict(c) for c in containers_data]
         security_config_data = data.get('security_config', {})
         security_config = merge_security_config(security_config_data)
+
+        # Coerce session_permissions embedded in security_config
+        session_policy = security_config.get('session_policy', {})
+        if 'session_permissions' in session_policy:
+            session_policy['session_permissions'] = coerce_session_permissions(
+                session_policy['session_permissions'],
+            )
+
         version = data.get('version', 1)
         session = cls(session_id=str(data.get('session_id', str(uuid.uuid4()))), created_at=created_at, updated_at=updated_at, runtime_params=runtime_params, user_history=user_history, containers=containers, preset_name=data.get('preset_name'), workspace_id=data.get('workspace_id'), metadata=metadata, security_config=security_config, version=version, summary=data.get('summary'), total_input_tokens=data.get('total_input_tokens', 0), total_output_tokens=data.get('total_output_tokens', 0), next_seq=next_seq_value, context_length=data.get('context_length', 0))
         return session
@@ -364,6 +380,12 @@ class Session:
         if config_data and 'agent_config' not in metadata:
             if isinstance(config_data, dict):
                 metadata['agent_config'] = config_data
+        # Coerce session_permissions on load to reject stale / tampered values
+        agent_cfg = metadata.get('agent_config', {})
+        if 'session_permissions' in agent_cfg:
+            agent_cfg['session_permissions'] = coerce_session_permissions(
+                agent_cfg['session_permissions'],
+            )
         # Derive runtime params from metadata.agent_config (sole source of truth)
         agent_cfg = metadata.get('agent_config', {})
         runtime_params = RuntimeParams(
@@ -392,6 +414,14 @@ class Session:
         containers = [ContainerMetadata.from_dict(c) for c in containers_data]
         security_config_data = data.get('security_config', {})
         security_config = merge_security_config(security_config_data)
+
+        # Coerce session_permissions embedded in security_config
+        session_policy = security_config.get('session_policy', {})
+        if 'session_permissions' in session_policy:
+            session_policy['session_permissions'] = coerce_session_permissions(
+                session_policy['session_permissions'],
+            )
+
         version = data.get('version', 1)
         self.session_id = str(data.get('session_id', str(uuid.uuid4())))
         self.created_at = created_at
