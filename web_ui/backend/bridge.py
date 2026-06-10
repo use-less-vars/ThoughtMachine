@@ -504,6 +504,41 @@ class WebAgentBridge:
 
         log('INFO', 'server.bridge', '_restart_controller: controller restarted')
 
+    # ── Container integrity re-sync ───────────────────────────────────────────
+    # Called by apply_config() when session_permissions change.
+
+    def _maybe_re_sync_container(self, config: 'AgentConfig') -> None:
+        """Verify container integrity after a config change that may affect permissions.
+
+        If the config includes ``session_permissions`` and a ``workspace_path``,
+        this calls ``verify_container_integrity`` so any existing container whose
+        network/volume mode no longer matches the new permissions is stopped and
+        removed.  The container will be recreated with the correct settings the
+        next time the agent needs it.
+
+        This is a no-op when Docker is unavailable or no workspace path is known.
+        """
+        sp = getattr(config, 'session_permissions', None)
+        ws = getattr(config, 'workspace_path', None)
+        if sp is None or not ws:
+            return
+
+        sp_dict = sp.model_dump() if hasattr(sp, 'model_dump') else sp
+        try:
+            from docker_executor import verify_container_integrity
+            result = verify_container_integrity(ws, sp_dict)
+            if result.get('action_taken') == 'removed':
+                log('INFO', 'server.bridge',
+                    f'Container re-synced after config change: '
+                    f'{result.get("container_name")} removed '
+                    f'(reason: {result.get("mismatch_reason")})')
+            elif result.get('action_taken') == 'error':
+                log('WARNING', 'server.bridge',
+                    f'Container re-sync error: {result.get("mismatch_reason")}')
+        except Exception as exc:
+            log('WARNING', 'server.bridge',
+                f'Container re-sync skipped: {exc}')
+
     def apply_config(self, config_dict: Dict[str, Any]) -> Dict[str, Any]:
         """
         Apply a full config dict to the session, merging with existing config.
@@ -574,10 +609,13 @@ class WebAgentBridge:
                 self._controller._config = validated
                 self._controller.request_config_update(validated)
 
-        # Step 7: Persist to session
+        # Step 7: Re-sync container integrity if session_permissions changed
+        self._maybe_re_sync_container(self._config)
+
+        # Step 8: Persist to session
         self.save_session()
 
-        # Step 8: Notify frontend — the server handler sends config_changed
+        # Step 9: Notify frontend — the server handler sends config_changed
         # in frontend format after this method returns, so no explicit emit needed here.
 
         log('INFO', 'server.bridge', 'Config applied and persisted via apply_config')

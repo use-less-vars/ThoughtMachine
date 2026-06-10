@@ -958,6 +958,48 @@ def get_container_status(workspace_path: str) -> dict:
     }
 
 
+def get_integrity_status(
+    workspace_path: str,
+    session_permissions: dict = None,
+) -> dict:
+    """Return a lightweight integrity-check result for the given workspace.
+
+    Wraps ``verify_container_integrity()`` into a dict suitable for the
+    frontend API.  The returned dict always includes at least:
+
+    - **status** -- ``"ok"``, ``"mismatch"``, ``"removed"``, or ``"error"``
+    - **container_name** -- the expected container name (str)
+    - **desired** -- ``{"network": ..., "mode": ...}``
+    - **actual** -- ``{"network": ..., "mode": ...}`` or ``None`` if not found
+
+    When a mismatch was detected and the container was removed, ``status``
+    is ``"removed"`` and ``mismatch_reason`` explains why.
+
+    Args:
+        workspace_path: Absolute path to the workspace.
+        session_permissions: Session permissions dict, or None for
+            restrictive defaults.
+
+    Returns:
+        dict with ``status``, ``container_name``, ``desired``, ``actual``,
+        and optionally ``mismatch_reason``.
+    """
+    result = verify_container_integrity(workspace_path, session_permissions)
+    # Map action_taken to frontend-friendly status
+    action_map = {
+        "none": "ok" if result.get("matches_config") in (True, None) else "mismatch",
+        "removed": "removed",
+        "error": "error",
+    }
+    return {
+        "status": action_map.get(result["action_taken"], "error"),
+        "container_name": result["container_name"],
+        "desired": result["desired"],
+        "actual": result["actual"],
+        "mismatch_reason": result.get("mismatch_reason"),
+    }
+
+
 def _load_capabilities(workspace_path: str) -> dict:
     """Load workspace capabilities, falling back to fully-permissive defaults."""
     try:

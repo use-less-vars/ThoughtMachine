@@ -215,3 +215,116 @@ class TestFilesystemToggle:
         vol_cfg = kwargs.get("volumes", {})
         mode = vol_cfg.get("/tmp/test-workspace", {}).get("mode", "?")
         assert mode == "rw", f"New container volume mode: expected 'rw', got {mode!r}"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Real-Docker variant (skipped if Docker unavailable)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _docker_available() -> bool:
+    """Return True if a real Docker daemon is reachable."""
+    try:
+        import docker
+        client = docker.from_env()
+        client.ping()
+        return True
+    except Exception:
+        return False
+
+
+_has_docker = _docker_available()
+
+
+@pytest.mark.skipif(not _has_docker, reason="Real Docker daemon not available")
+def test_real_docker_toggle_write_to_banned():
+    """
+    Real Docker variant: write → banned toggle on a real daemon.
+
+    This test:
+      1. Creates a real Docker container using DockerExecutor.
+      2. Verifies the container is running with expected config.
+      3. Changes permissions and verifies the container is re-created.
+
+    The test uses a minimal busybox-like image and cleans up after itself.
+    """
+    import time
+    import docker as docker_sdk
+    from docker_executor import DockerExecutor
+    from docker.errors import NotFound
+
+    real_client = docker_sdk.from_env()
+    container_name = None
+
+    try:
+        # Override _compute_container_config to avoid gate dependency
+        executor = DockerExecutor(
+            workspace_path="/tmp/test-real-toggle",
+            image="alpine:latest",
+            network="none",
+            mem_limit="64m",
+            cpu_quota=50000,
+            force_rebuild=False,
+            idle_timeout=30,
+            session_permissions={"network": "write", "filesystem": "write", "container": True},
+            workspace_id="test-real-toggle",
+        )
+
+        with patch.object(
+            executor.__class__, "_compute_container_config",
+            side_effect=[("bridge", "rw"), ("none", "ro"), ("none", "ro")],
+        ):
+            # First call → creates container with bridge
+            executor._ensure_container()
+            container_name = executor._container_name
+
+            # Verify container exists and is running
+            c = real_client.containers.get(container_name)
+            assert c.status == "running", f"Expected running, got {c.status}"
+            assert c.attrs["HostConfig"]["NetworkMode"] == "bridge"
+
+            # Change permissions
+            executor.session_permissions = {
+                "network": "banned", "filesystem": "read", "container": True,
+            }
+
+            # Second call → should replace container
+            executor._ensure_container()
+
+            # Wait briefly for the old container to stop
+            time.sleep(1)
+
+            # Old container should be gone or stopped
+            try:
+                old = real_client.containers.get(container_name)
+                assert old.status in ("exited", "removed"), (
+                    f"Old container should be stopped, got {old.status}"
+                )
+            except NotFound:
+                pass  # Container already removed — good
+
+            # New container should have network=none
+            new_container_name = executor._container_name
+            assert new_container_name != container_name, "Container name should have changed"
+            new_c = real_client.containers.get(new_container_name)
+            actual_network = new_c.attrs["HostConfig"]["NetworkMode"]
+            assert actual_network == "none", (
+                f"Expected network=none, got {actual_network!r}"
+            )
+
+            # Cleanup
+            try:
+                new_c.stop(timeout=5)
+                new_c.remove(force=True)
+            except Exception:
+                pass
+
+    finally:
+        # Ensure cleanup of any stale containers
+        if container_name:
+            try:
+                c = real_client.containers.get(container_name)
+                c.stop(timeout=5)
+                c.remove(force=True)
+            except (NotFound, Exception):
+                pass
