@@ -241,21 +241,35 @@ def _shutdown_save() -> None:
 
 
 def _trigger_shutdown() -> None:
-    """Called by the signal handler — sets the shutdown event."""
+    """Called by the signal handler — sets the shutdown event.
+
+    If an asyncio loop is running (uvicorn), sets the event for graceful
+    shutdown.  Otherwise, raises ``KeyboardInterrupt`` so the process
+    actually stops even outside an event loop (e.g. during tests).
+    """
     event = _get_shutdown_event()
+    no_loop = False
     try:
         import asyncio
         try:
             loop = asyncio.get_running_loop()
             if loop.is_running():
                 loop.call_soon_threadsafe(event.set)
+                log('INFO', 'server', 'Shutdown signal received — finishing in-flight work...')
                 return
         except RuntimeError:
             pass
         event.set()
+        no_loop = True
     except Exception:
         pass
+
     log('INFO', 'server', 'Shutdown signal received — finishing in-flight work...')
+    if no_loop:
+        # No asyncio loop — likely running outside uvicorn (e.g. tests).
+        # The event set above won't be checked by anyone, so we need to
+        # actually stop execution.
+        raise KeyboardInterrupt()
 
 
 # Register atexit handler to save sessions on normal exit (Ctrl+C etc.)
