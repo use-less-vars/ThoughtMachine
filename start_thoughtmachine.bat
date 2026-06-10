@@ -57,7 +57,7 @@ if "%PROD_MODE%"=="true" (
         for /f "tokens=*" %%p in ('where npm') do set "TM_NPM_CMD=%%p"
     )
     cd /d "%SCRIPT_DIR%"
-    start "ThoughtMachine Backend" /wait cmd /c "python -m web_ui.backend.server --serve-frontend || pause"
+    start "ThoughtMachine Backend" /wait cmd /c "\"%VENV_DIR%\Scripts\python.exe\" -m web_ui.backend.server --serve-frontend || pause"
     exit /b %ERRORLEVEL%
 ) else (
     REM -- Development mode (hot-reload via Vite) -----------------------------
@@ -84,7 +84,7 @@ if "%PROD_MODE%"=="true" (
     REM Start backend FIRST so Vite's proxy never hits ECONNREFUSED
     echo   Starting backend server ^(port 8000^)...
     cd /d "%SCRIPT_DIR%"
-    start "ThoughtMachine Backend" cmd /c "python -m web_ui.backend.server || pause"
+    start "ThoughtMachine Backend" cmd /c "\"%VENV_DIR%\Scripts\python.exe\" -m web_ui.backend.server || pause"
 
     REM Wait for backend to start listening on port 8000 (up to 15 seconds)
     echo   Waiting for backend to be ready...
