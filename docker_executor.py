@@ -10,8 +10,10 @@ import json
 import sys
 
 # ── Audit log for network_mode debugging ───────────────────────────────────
-with open("/tmp/container_audit.log", "a") as _f:
-    _f.write(f"{time.time()} | MODULE_LOAD | file={__file__} pid={os.getpid()}\n")
+from thoughtmachine.audit_logger import audit_event
+
+_audit = lambda e, d: audit_event(e, d)  # module-level convenience
+_audit("MODULE_LOAD", f"file={__file__} pid={os.getpid()}")
 
 
 # ── Build log cache (thread-safe) ────────────────────────────────────────────
@@ -199,11 +201,10 @@ def verify_container_integrity(
          "actual_network": actual_network, "desired_network": desired_network,
          "actual_mode": actual_mode, "desired_mode": desired_mode})
 
-    with open("/tmp/container_audit.log", "a") as _f:
-        _f.write(f"{time.time()} | VERIFY_RECREATE | "
-                 f"workspace={workspace_path} container={container.id[:12]} "
-                 f"network={actual_network}->{desired_network} "
-                 f"mode={actual_mode}->{desired_mode}\n")
+    audit_event("VERIFY_RECREATE",
+               f"workspace={workspace_path} container={container.id[:12]} "
+               f"network={actual_network}->{desired_network} "
+               f"mode={actual_mode}->{desired_mode}")
 
     try:
         container.stop(timeout=5)
@@ -325,10 +326,9 @@ class DockerExecutor:
                 log("WARNING", "docker.security_gate",
                     f"workspace_id resolution failed for {self.workspace_path}; "
                     f"falling back to session_permissions (network={net}, fs={fs}).")
-                with open("/tmp/container_audit.log", "a") as _f:
-                    _f.write(f"{time.time()} | FALLBACK_NETWORK_RESTRICTION | "
-                             f"workspace={self.workspace_path} "
-                             f"workspace_id=None session_network={net} session_fs={fs}\n")
+                audit_event("FALLBACK_NETWORK_RESTRICTION",
+                           f"workspace={self.workspace_path} "
+                           f"workspace_id=None session_network={net} session_fs={fs}")
             else:
                 sp = self.session_permissions
                 net = sp.get("network", "banned")
@@ -340,8 +340,7 @@ class DockerExecutor:
                 fs = sp.get("filesystem", "read")
                 workspace_mode = "rw" if fs in ("write", "full") else "ro"
 
-        with open("/tmp/container_audit.log", "a") as _f:
-            _f.write(f"{time.time()} | NETWORK_DECISION | network_mode={network_mode}\n")
+        audit_event("NETWORK_DECISION", f"network_mode={network_mode}")
 
         return network_mode, workspace_mode
 
@@ -379,11 +378,10 @@ class DockerExecutor:
                             {"container_id": self.container.id[:12],
                              "actual_network": actual_network, "desired_network": desired_network,
                              "actual_mode": actual_workspace_mode, "desired_mode": desired_workspace_mode})
-                        with open("/tmp/container_audit.log", "a") as _f:
-                            _f.write(f"{time.time()} | CONTAINER_RECREATE_MISMATCH | "
-                                     f"workspace={self.workspace_path} container={self.container.id[:12]} "
-                                     f"network={actual_network}->{desired_network} "
-                                     f"mode={actual_workspace_mode}->{desired_workspace_mode} source=live_object\n")
+                        audit_event("CONTAINER_RECREATE_MISMATCH",
+                                   f"workspace={self.workspace_path} container={self.container.id[:12]} "
+                                   f"network={actual_network}->{desired_network} "
+                                   f"mode={actual_workspace_mode}->{desired_workspace_mode} source=live_object")
                         try:
                             self.container.stop()
                             self.container.remove()
@@ -394,9 +392,8 @@ class DockerExecutor:
                         log("DEBUG", "tools.docker_executor.container",
                             "Reusing running container (fast path — config match)",
                             {"container_id": self.container.id, "name": self.container.name})
-                        with open("/tmp/container_audit.log", "a") as _f:
-                            _f.write(f"{time.time()} | CONTAINER_REUSE_OK | "
-                                     f"workspace={self.workspace_path} container={self.container.id[:12]} source=live_object\n")
+                        audit_event("CONTAINER_REUSE_OK",
+                                   f"workspace={self.workspace_path} container={self.container.id[:12]} source=live_object")
                         return
             except docker.errors.NotFound:
                 self.container = None
@@ -424,9 +421,8 @@ class DockerExecutor:
             except docker.errors.NotFound:
                 pass
             existing = None
-            with open("/tmp/container_audit.log", "a") as _f:
-                _f.write(f"{time.time()} | CONTAINER_RECREATE | "
-                         f"workspace={self.workspace_path} reason=force_rebuild\n")
+            audit_event("CONTAINER_RECREATE",
+                       f"workspace={self.workspace_path} reason=force_rebuild")
 
         # ── Check if existing container matches desired config ──
         if existing is not None:
@@ -449,11 +445,10 @@ class DockerExecutor:
                     {"container_id": existing.id[:12],
                      "current_network": current_network, "desired_network": network_mode,
                      "current_mode": current_workspace_mode, "desired_mode": workspace_mode})
-                with open("/tmp/container_audit.log", "a") as _f:
-                    _f.write(f"{time.time()} | CONTAINER_RECREATE_MISMATCH | "
-                             f"workspace={self.workspace_path} container={existing.id[:12]} "
-                             f"network={current_network}->{network_mode} "
-                             f"mode={current_workspace_mode}->{workspace_mode}\n")
+                audit_event("CONTAINER_RECREATE_MISMATCH",
+                           f"workspace={self.workspace_path} container={existing.id[:12]} "
+                           f"network={current_network}->{network_mode} "
+                           f"mode={current_workspace_mode}->{workspace_mode}")
                 try:
                     existing.stop()
                     existing.remove()
@@ -471,9 +466,8 @@ class DockerExecutor:
                             {"container_id": existing.id[:12],
                              "container_image": container_image_id[:19] + "...",
                              "current_image": current_image_id[:19] + "..."})
-                        with open("/tmp/container_audit.log", "a") as _f:
-                            _f.write(f"{time.time()} | CONTAINER_RECREATE_MISMATCH | "
-                                     f"workspace={self.workspace_path} container={existing.id[:12]} reason=stale_image\n")
+                        audit_event("CONTAINER_RECREATE_MISMATCH",
+                                   f"workspace={self.workspace_path} container={existing.id[:12]} reason=stale_image")
                         try:
                             existing.stop()
                             existing.remove()
@@ -484,9 +478,8 @@ class DockerExecutor:
                         log("DEBUG", "tools.docker_executor.container",
                             "Reusing existing container (config + image match)",
                             {"container_id": existing.id[:12], "name": container_name})
-                        with open("/tmp/container_audit.log", "a") as _f:
-                            _f.write(f"{time.time()} | CONTAINER_REUSE_OK | "
-                                     f"workspace={self.workspace_path} container={existing.id[:12]} source=name_match\n")
+                        audit_event("CONTAINER_REUSE_OK",
+                                   f"workspace={self.workspace_path} container={existing.id[:12]} source=name_match")
                 except docker.errors.ImageNotFound:
                     log("WARNING", "tools.docker_executor.container",
                         "Could not compare image IDs (image not found), recreating container",
@@ -530,9 +523,8 @@ class DockerExecutor:
         log('INFO', 'tools.docker_executor.container',
             f"AUDIT: Creating container with network={network_mode}, mode={workspace_mode}, tmpfs={tmpfs}")
 
-        with open("/tmp/container_audit.log", "a") as _f:
-            _f.write(f"{time.time()} | CONTAINER_CREATE | "
-                     f"image={self.image} network={network_mode} name={container_name}\n")
+        audit_event("CONTAINER_CREATE",
+                   f"image={self.image} network={network_mode} name={container_name}")
         self.container = self.client.containers.run(
             image=self.image,
             name=container_name,
