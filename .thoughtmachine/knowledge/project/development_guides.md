@@ -642,3 +642,49 @@ Available commands are handled in `bridge.py` and `server.py`.
 
 **End of report.** Ready for Docker panel feature design.
 
+## How to add a new permission toggle
+
+## 2026-06-10 — ## How to add a new permission toggle
+
+Every new trust domai...
+
+## How to add a new permission toggle
+
+Every new trust domain — email, private space, database access, whatever — is just a new resource category. The architecture makes adding one straightforward. Here's the recipe.
+
+**Key principle:** The gate doesn't care what the resource is. It only cares about the level. Adding a new toggle is adding a new key to a dictionary, with the same values as everything else. No archaeology, no hidden files, no new decision points.
+
+### Four places to touch
+
+#### 1. Define the category in the permission model
+
+In `thoughtmachine/security.py`, add the new field to `SessionPermissions`. Give it the same type as the others — `Literal["banned", "ask", "read", "write", "full"]` if it has read/write distinction, or `bool` if it's on/off. Safe default is always the most restrictive.
+
+```python
+email: Literal["banned", "ask", "read", "write"] = "banned"
+```
+
+#### 2. Add it to the gate's level ordering
+
+In `security/security_gate.py`, the `_value_satisfies` function (or equivalent) has an ordered mapping of levels. Add the new category to that same hierarchy: `banned < ask < read < write < full`. No other gate changes needed — `get_effective_permissions()` and `check_required_categories()` handle new categories automatically.
+
+#### 3. Tools declare they need it
+
+Any tool that reads the resource adds `"<category>:read"` to its `get_required_categories()`. Any tool that writes adds `"<category>:write"`. The gate enforces it. MCP tools declare it in their manifest. No tool executor changes needed.
+
+#### 4. Add the dropdown in the GUI
+
+In `ConfigPanel.jsx`, add a new row in the Permissions tab — a dropdown with the same options as filesystem/git. It binds to the new field. The existing `apply_config` flow sends it to the backend. The backend already validates against the `SessionPermissions` model, so the new field is automatically accepted and enforced.
+
+### If the new resource needs workspace-level control too
+
+If workspaces should have a ceiling on access (e.g., "this workspace can only read email, never send"), add the field to `WorkspaceCapabilities` in `thoughtmachine/workspace_capabilities.py`. The gate's `min(session, workspace)` merge automatically applies it. The Workspace Panel (Spec 3) will expose it for editing.
+
+### If containers need to enforce it
+
+Some resources — like network — are enforced at the container level. For email, you might not need container enforcement (email access is gated at the tool level). But if you did, the Docker executor would read `eff["<category>"]` from the gate and configure something accordingly. That's a per-resource design decision.
+
+### Testing
+
+Add a row to the merge table in the existing gate contract tests (`tests/docker/test_gate_contract.py`). The parametrized tests cover all combinations automatically.
+

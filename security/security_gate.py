@@ -19,52 +19,22 @@ this module (``True``) or keep the old path (``False``).
 
 from __future__ import annotations
 
-import json
 import queue
 import uuid
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from pydantic import BaseModel, Field
-
-# ── Imports from the existing codebase ───────────────────────────────────
-
-from thoughtmachine.security import SessionPermissions
+from thoughtmachine.workspace_capabilities import (
+    WorkspaceCapabilities,
+    load_workspace_capabilities,
+)
+from thoughtmachine.security import SessionPermissions, _pending_security_requests, _pending_requests_lock, resolve_security_prompt
 from agent.events import SecurityPromptEvent, EventType
-
-# ── Sentinel ─────────────────────────────────────────────────────────────
-
-USE_UNIFIED_GATE: bool = True
 
 # ── Pending-prompt registry ──────────────────────────────────────────────
 
-_pending_prompts: Dict[str, queue.Queue] = {}
-
-# ══════════════════════════════════════════════════════════════════════════
-#  WorkspaceCapabilities (gate-specific model)
-# ══════════════════════════════════════════════════════════════════════════
+# Uses shared _pending_security_requests from thoughtmachine.security
 
 
-class WorkspaceCapabilities(BaseModel):
-    """
-    Lightweight capability flags for a workspace, used by the unified gate.
-
-    These are a subset of the full ``thoughtmachine.workspace_capabilities.WorkspaceCapabilities``
-    dataclass — we only care about the booleans that cap what a session is
-    allowed to do.
-    """
-
-    network: bool = False
-    """May the agent make outbound network requests?"""
-
-    filesystem_write: bool = True
-    """May the agent write to the filesystem?"""
-
-    git_available: bool = True
-    """Is git available in this workspace?"""
-
-    container_available: bool = True
-    """May the agent spawn Docker containers?"""
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -74,26 +44,15 @@ class WorkspaceCapabilities(BaseModel):
 
 def get_workspace_capabilities(workspace_id: str) -> WorkspaceCapabilities:
     """
-    Load workspace capabilities from ``~/.thoughtmachine/workspaces/{id}/capabilities.json``.
+    Load workspace capabilities via the canonical loader.
 
-    Returns a default (fully-permissive) ``WorkspaceCapabilities`` when the file
-    does not exist or cannot be parsed.
+    Returns a default (fully-permissive) ``WorkspaceCapabilities`` when the
+    file does not exist or cannot be parsed.
     """
-    path = Path.home() / ".thoughtmachine" / "workspaces" / workspace_id / "capabilities.json"
-    if not path.exists():
+    caps = load_workspace_capabilities(workspace_id)
+    if caps is None:
         return WorkspaceCapabilities()
-
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        # Map from the dataclass serialisation format to our boolean flags.
-        return WorkspaceCapabilities(
-            network=raw.get("allow_network", True),
-            filesystem_write=raw.get("filesystem_write", True),
-            git_available=raw.get("git_available", True),
-            container_available=raw.get("allow_docker", True),
-        )
-    except (json.JSONDecodeError, OSError, TypeError):
-        return WorkspaceCapabilities()
+    return caps
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -144,16 +103,16 @@ def get_effective_permissions(
     # (read / none / banned / ask pass through unchanged)
 
     # ── Network ─────────────────────────────────────────────────────────
-    net: Any = _min_permission(session.network, workspace.network)
+    net: Any = _min_permission(session.network, workspace.allow_network)
 
     # ── Container ───────────────────────────────────────────────────────
-    container: Any = session.container and workspace.container_available
+    container: Any = session.container and workspace.allow_docker
 
     # ── Git ─────────────────────────────────────────────────────────────
     git: Any = _min_permission(session.git, workspace.git_available)
 
     # ── System ──────────────────────────────────────────────────────────
-    system: Any = session.security  # no workspace cap yet
+    system: Any = session.system  # no workspace cap yet
 
     return {
         "filesystem": fs,
@@ -297,7 +256,9 @@ def check_required_categories(
     # ── Prompt the user for approval ────────────────────────────────────
     request_id = str(uuid.uuid4())
     response_queue: queue.Queue = queue.Queue()
-    _pending_prompts[request_id] = response_queue
+    if _pending_requests_lock is not None:
+        with _pending_requests_lock:
+            _pending_security_requests[request_id] = response_queue
 
     # Publish SecurityPromptEvent
     event = SecurityPromptEvent(
@@ -332,19 +293,28 @@ def check_required_categories(
             f"'{tool_name}' — security prompt timed out."
         )
     finally:
-        _pending_prompts.pop(request_id, None)
+        if _pending_requests_lock is not None:
+            with _pending_requests_lock:
+                _pending_security_requests.pop(request_id, None)
 
 
 def resolve_prompt(request_id: str, approved: bool, remember: bool = False) -> bool:
     """
     Resolve a pending security prompt.
 
-    Called by the UI / event handler when the user clicks approve or deny.
+    Delegates to ``resolve_security_prompt`` from ``thoughtmachine.security``
+    which uses the shared ``_pending_security_requests`` registry.
 
     Returns ``True`` if the prompt was found and resolved, ``False`` otherwise.
     """
-    q = _pending_prompts.get(request_id)
-    if q is None:
-        return False
-    q.put({"approved": approved, "remember": remember})
-    return True
+    # Check if the request exists before delegating
+    found = False
+    if _pending_requests_lock is not None:
+        with _pending_requests_lock:
+            found = request_id in _pending_security_requests
+    else:
+        found = request_id in _pending_security_requests
+
+    if found:
+        resolve_security_prompt(request_id, approved, remember)
+    return found

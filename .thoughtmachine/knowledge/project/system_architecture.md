@@ -2188,3 +2188,49 @@ When investigating config-related bugs:
 - **Stale system prompt?** → Check `resources/default_system_prompt.txt`
 
 
+
+## 2026-06-10 — ## Permission Toggle Guide Audit (2025-03-25)
+
+Audited the "...
+
+## Permission Toggle Guide Audit (2025-03-25)
+
+Audited the "How to add a new permission toggle" guide against the actual codebase. Key findings:
+
+**What the guide gets right:**
+- SessionPermissions model structure (thoughtmachine/security.py) — matches reality
+- Tools declare via get_required_categories() — matches reality
+- get_effective_permissions() merges workspace caps + session permissions — matches reality
+- _value_satisfies() handles level ordering automatically — matches reality
+- GUI dropdowns in ConfigPanel.jsx — match reality for filesystem, network, container, git, execution
+
+**Issues found (guide is incomplete/misleading):**
+
+1. **`security` ↔ `system` mismatch**: SessionPermissions has `security: Literal["banned","read","write","full","ask"]` but the GUI has `system: bool`. The gate's `get_effective_permissions()` maps `session.security` → key `"system"`. A multi-level permission is collapsed to a boolean toggle.
+
+2. **`execution` not in gate**: The `execution` field exists in SessionPermissions and has a GUI dropdown, but `get_effective_permissions()` doesn't include it. It's ONLY checked by the old `_check_permissions` path in tool_executor.py, not the new gate path.
+
+3. **Guide says "automatically" for gate merge logic**: This is misleading. Adding a field to SessionPermissions does NOT automatically make the gate handle it. You must add explicit merge logic in `get_effective_permissions()`.
+
+4. **Dual permission paths exist**: The old `_check_permissions` path (agent/core/tool_executor.py) still runs alongside the new gate path. The guide doesn't mention this.
+
+5. **WorkspaceCapabilities for new resources**: The guide says it's automatic via the gate's `min()`, but this only works after you've added merge logic to get_effective_permissions().
+
+## Frontend UX Patterns
+
+## 2026-06-10 — ## Auto-focus query bar on keystroke (2026-06-10)
+
+**Problem...
+
+## Auto-focus query bar on keystroke (2026-06-10)
+
+**Problem**: Clicking a copy button (📋) on a message steals focus from the query bar. User has to manually click back to the textarea before typing their next message. Also, clicking blank space or any non-form element leaves focus in limbo.
+
+**Solution** — two-layer approach:
+
+1. **`CopyButton` (ChatPanel.jsx)**: `onMouseDown={(e) => e.preventDefault()}` prevents the browser's default focus-on-click for `<button>` elements. This keeps focus wherever it was before the click — usually the query bar.
+
+2. **Global keydown listener (SessionTab.jsx)**: Capture-phase `keydown` listener on `document` that redirects printable-character keystrokes to `.query-input` when no form field (`<input>`, `<textarea>`, `<select>`, `contentEditable`) has focus. Keyboard shortcuts (Ctrl/Cmd/Alt) and non-printable keys (arrows, Tab, Enter, Escape) pass through unmodified.
+
+**Files changed**: `ChatPanel.jsx`, `SessionTab.jsx`
+

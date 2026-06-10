@@ -56,6 +56,10 @@ class WorkspaceCapabilities:
         Whether the workspace's agent may make outbound HTTP requests.
     allow_docker:
         Whether the workspace's agent may spawn Docker containers.
+    filesystem_write:
+        Whether the workspace's agent may write to the filesystem.
+    git_available:
+        Whether git is available in this workspace.
     allowed_workspace_dirs:
         List of directory paths (relative to the workspace root) that tools
         may access.  Empty / ['.'] means the whole workspace.
@@ -72,6 +76,8 @@ class WorkspaceCapabilities:
     max_file_size_bytes: int = 0
     allow_network: bool = True
     allow_docker: bool = True
+    filesystem_write: bool = True
+    git_available: bool = True
     allowed_workspace_dirs: List[str] = field(default_factory=lambda: ["."])
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -89,6 +95,8 @@ class WorkspaceCapabilities:
             "max_file_size_bytes": self.max_file_size_bytes,
             "allow_network": self.allow_network,
             "allow_docker": self.allow_docker,
+            "filesystem_write": self.filesystem_write,
+            "git_available": self.git_available,
             "allowed_workspace_dirs": list(self.allowed_workspace_dirs),
             "extra": dict(self.extra),
         }
@@ -106,6 +114,8 @@ class WorkspaceCapabilities:
             max_file_size_bytes=data.get("max_file_size_bytes", 0),
             allow_network=data.get("allow_network", True),
             allow_docker=data.get("allow_docker", True),
+            filesystem_write=data.get("filesystem_write", True),
+            git_available=data.get("git_available", True),
             allowed_workspace_dirs=data.get("allowed_workspace_dirs", ["."]),
             extra=data.get("extra", {}),
         )

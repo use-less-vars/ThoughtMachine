@@ -4,8 +4,6 @@ Tool execution and dispatch logic.
 Extracted from agent.py to separate tool execution concerns.
 """
 import json
-import uuid
-import queue
 import threading
 from typing import List, Dict, Any, Optional, Tuple
 import tiktoken
@@ -18,29 +16,34 @@ from tools.summarize_tool import SummarizeTool
 
 # Try to import event system for security prompts
 try:
-    from agent.events import global_event_bus, EventType, create_event, SecurityPromptEvent
-    EVENT_SYSTEM_AVAILABLE = True
+    from agent.events import global_event_bus
+    _EVENT_SYSTEM_AVAILABLE = True
 except ImportError:
-    EVENT_SYSTEM_AVAILABLE = False
+    _EVENT_SYSTEM_AVAILABLE = False
     global_event_bus = None
-    EventType = None
-    create_event = None
-    SecurityPromptEvent = None
 
-# Try to import security module for resolve_security_prompt
+# Try to import security module
+from thoughtmachine.security import SessionPermissions
+
+# Import unified security gate (always available)
 try:
-    from thoughtmachine.security import resolve_security_prompt, _pending_security_requests, _pending_requests_lock
-    SECURITY_MODULE_AVAILABLE = True
+    from security.security_gate import (
+        get_workspace_capabilities,
+        get_effective_permissions,
+        check_required_categories,
+    )
+    from thoughtmachine.workspace_capabilities import (
+        WorkspaceCapabilities,
+        resolve_workspace_id,
+    )
+    GATE_AVAILABLE = True
 except ImportError:
-    SECURITY_MODULE_AVAILABLE = False
-    resolve_security_prompt = None
-    _pending_security_requests = None
-    _pending_requests_lock = None
-
-# Flag set by _check_permissions when the user approves via security dialog
-# The caller (ToolExecutor) reads and resets this to inform the AI
-_last_check_user_approved: bool = False
-
+    GATE_AVAILABLE = False
+    get_workspace_capabilities = None
+    get_effective_permissions = None
+    check_required_categories = None
+    WorkspaceCapabilities = None
+    resolve_workspace_id = None
 
 # ---------------------------------------------------------------------------
 # Default session permissions profile (six categories)
@@ -50,173 +53,10 @@ DEFAULT_SESSION_PERMISSIONS = {
     "container": False,
     "network": "banned",
     "filesystem": "read",
-    "security": "read",
+    "system": "read",
     "git": "read",
     "execution": "banned",
 }
-
-
-def _value_satisfies(required: str, allowed: object) -> bool | str:
-    """
-    Check whether a single required value is satisfied by the allowed setting.
-
-    Returns:
-        - ``True`` if permission is granted.
-        - ``False`` if permission is denied.
-        - ``"ASK"`` if the session value is ``'ask'`` and the requested access
-          is write-level or otherwise requires user approval.
-
-    Supports both legacy boolean permissions and string levels.  Legacy tool
-    requirements such as ``network:true`` and newer requirements such as
-    ``network:outbound`` are treated as write-level access when compared against
-    string permission profiles.
-    """
-    sentinel_ask = "ASK"
-    required_lower = str(required).lower()
-
-    if required_lower in ("false", "no", "banned"):
-        required_val: object = False if required_lower in ("false", "no") else "banned"
-        required_level = 0
-    elif required_lower in ("true", "yes", "outbound"):
-        required_val = True
-        required_level = 3  # legacy bool/network outbound means write-level access
-    else:
-        required_val = required_lower
-        _aliases = {"deny": "banned", "denied": "banned", "all": "full"}
-        required_level_name = _aliases.get(required_lower, required_lower)
-        _level_map = {"banned": 0, "ask": 1, "read": 2, "write": 3, "full": 4}
-        required_level = _level_map.get(required_level_name)
-
-    # --- Handle 'ask' session value ---
-    allowed_str = str(allowed).lower() if not isinstance(allowed, bool) else ""
-    if allowed_str == "ask":
-        if required_level is None:
-            # Unknown named capabilities are not automatically safe.
-            return sentinel_ask
-        if required_level <= 2:
-            return True  # banned/read-level requirements do not need approval
-        return sentinel_ask
-
-    if isinstance(allowed, bool):
-        if isinstance(required_val, bool):
-            return allowed == required_val or allowed is True  # True satisfies everything
-        # String required vs bool allowed – True satisfies all, False satisfies nothing
-        return allowed is True
-
-    # String permission profile.  Compare known levels safely; unknown required
-    # values must match exactly rather than silently mapping to banned.
-    _aliases = {"deny": "banned", "denied": "banned", "all": "full"}
-    _level_map = {"banned": 0, "ask": 1, "read": 2, "write": 3, "full": 4}
-    allowed_level_name = _aliases.get(str(allowed).lower(), str(allowed).lower())
-    allowed_level = _level_map.get(allowed_level_name)
-
-    if required_level is None or allowed_level is None:
-        return str(allowed).lower() == str(required_val).lower()
-
-    return allowed_level >= required_level
-
-
-def _check_permissions(
-    required_categories: list, session_permissions: dict,
-    tool_name: str = "", agent_id: int = 0,
-    session_id: str = ""
-) -> str | None:
-    """
-    Check whether *all* required categories are satisfied by the session profile.
-
-    If a category's value is ``'ask'`` we publish a ``SECURITY_PROMPT`` event
-    and wait for the user to approve or deny (via a queue that is populated by
-    a call to ``resolve_security_prompt()``).
-
-    Args:
-        required_categories: List of strings like ["container:true", "filesystem:write"].
-        session_permissions: Dict of category → value (bool or str level).
-        tool_name: Name of the tool being checked (for prompt context).
-        agent_id: ID of the agent (for prompt context).
-
-    Returns:
-        None if all checks pass.
-        Error message string if any check fails.
-    """
-
-    PROMPT_TIMEOUT = 120.0  # seconds to wait for user response
-
-    for req in required_categories:
-        if ":" not in req:
-            continue  # malformed, skip
-        category, required_value = req.split(":", 1)
-        allowed = session_permissions.get(category)
-        if allowed is None:
-            return f"Permission denied: Unknown category '{category}' required by tool"
-
-        result = _value_satisfies(required_value, allowed)
-        if result == "ASK":
-            # --- Publish security prompt and wait for user approval ---
-            request_id = str(uuid.uuid4())
-            response_queue = queue.Queue()
-
-            # Register the queue so resolve_security_prompt can find it
-            if _pending_security_requests is not None and _pending_requests_lock is not None:
-                with _pending_requests_lock:
-                    _pending_security_requests[request_id] = response_queue
-
-            # Build the prompt description
-            prompt_description = (
-                f"Tool '{tool_name}' requires {category}:{required_value} "
-                f"(session allows {category}:ask)."
-            )
-
-            # Publish SECURITY_PROMPT event if event system is available
-            if EVENT_SYSTEM_AVAILABLE and global_event_bus is not None:
-                event = SecurityPromptEvent(
-                    data={
-                        'request_id': request_id,
-                        'agent_id': str(agent_id),
-                        'tool_name': tool_name,
-                        'capabilities': [str(required_value)],
-                        'arguments': {req: required_value},
-                        'session_id': session_id,
-                    }
-                )
-                global_event_bus.publish(event)
-                log('INFO', 'core.security',
-                    f'SECURITY_PROMPT published: {prompt_description} '
-                    f'(request_id={request_id})')
-
-            # Wait for response (with timeout)
-            try:
-                response = response_queue.get(timeout=PROMPT_TIMEOUT)
-                if response.get('approved'):
-                    global _last_check_user_approved
-                    _last_check_user_approved = True
-                    log('INFO', 'core.security',
-                        f'User APPROVED {category}:{required_value} '
-                        f'for tool {tool_name} (request_id={request_id})')
-                    continue  # approved — skip to next category
-                else:
-                    reason = response.get('reason', 'User denied the request')
-                    log('INFO', 'core.security',
-                        f'User DENIED {category}:{required_value} '
-                        f'for tool {tool_name}: {reason}')
-                    return (
-                        f"Permission denied: {category}:{required_value} required by '"
-                        f"{tool_name}' — user denied the request."
-                    )
-            except queue.Empty:
-                log('WARNING', 'core.security',
-                    f'Security prompt timed out after {PROMPT_TIMEOUT}s '
-                    f'(request_id={request_id})')
-                return (
-                    f"Permission denied: {category}:{required_value} required by '"
-                    f"{tool_name}' — security prompt timed out."
-                )
-        elif not result:
-            return (
-                f"Permission denied: Tool requires {category}:{required_value} "
-                f"but session allows {category}:{allowed}"
-            )
-
-    return None
 
 class ToolExecutor:
     """Handles tool execution, JSON repair, and tool result processing."""
@@ -383,27 +223,37 @@ class ToolExecutor:
                 tool_args['workspace_path'] = self.config.workspace_path
             if self.config.tool_output_token_limit is not None:
                 tool_args['token_limit'] = self.config.tool_output_token_limit
-            # Check permission categories before executing
-            session_perms = self.config.session_permissions
-            if session_perms is None:
-                session_perms_dict = DEFAULT_SESSION_PERMISSIONS
-            else:
-                session_perms_dict = session_perms.to_dict()
-            global _last_check_user_approved
-            _last_check_user_approved = False  # reset before check
-            error = _check_permissions(
-                tool_class.get_required_categories(arguments),
-                session_perms_dict,
-                tool_name=tool_name,
-                agent_id=agent_id,
-                session_id=session_id,
-            )
-            if error is not None:
-                return {'result': error, 'tool_type': 'normal'}
+            # Check permission categories using the unified security gate
+            session_perms_obj = self.config.session_permissions
+            if session_perms_obj is None:
+                session_perms_obj = SessionPermissions() if SessionPermissions else None
+
+            if GATE_AVAILABLE and session_perms_obj is not None:
+                # Resolve workspace ID to load workspace capabilities
+                workspace_path = getattr(self.config, 'workspace_path', None)
+                ws_id = resolve_workspace_id(workspace_path) if (workspace_path and resolve_workspace_id) else None
+                caps = get_workspace_capabilities(ws_id) if ws_id else WorkspaceCapabilities()
+                effective = get_effective_permissions(session_perms_obj, caps)
+
+                ok, error_msg = check_required_categories(
+                    tool_class.get_required_categories(arguments),
+                    effective,
+                    tool_name=tool_name,
+                    tool_args=arguments,
+                    description=getattr(tool_class, 'describe_action', lambda a: '')(arguments),
+                    event_bus=global_event_bus,
+                    agent_id=str(agent_id),
+                    session_id=session_id,
+                )
+                if not ok:
+                    return {'result': error_msg, 'tool_type': 'normal'}
             # Inject session permissions dict so the tool can apply
             # fine-grained security (e.g., DockerCodeRunner uses it
             # to decide container network/filesystem modes).
-            tool_args['session_permissions'] = session_perms_dict
+            if session_perms_obj is not None:
+                tool_args['session_permissions'] = session_perms_obj.to_dict()
+            else:
+                tool_args['session_permissions'] = DEFAULT_SESSION_PERMISSIONS
             tool_instance = tool_class(**tool_args)
             if self.logger:
                 if hasattr(self.logger, 'py_logger'):
@@ -417,14 +267,6 @@ class ToolExecutor:
             log('DEBUG', 'core.pause', f'TOOL EXECUTE START [{tool_name}]')
             tool_result = tool_instance.execute()
             log('DEBUG', 'core.pause', f'TOOL EXECUTE END [{tool_name}]')
-            # If the user approved this action via the security dialog, annotate the result
-            if _last_check_user_approved:
-                _last_check_user_approved = False
-                if isinstance(tool_result, dict):
-                    note = ('[User approved via security dialog]'
-                            if not tool_result.get('result')
-                            else f"[User approved via security dialog] {tool_result.get('result', '')}")
-                    tool_result['result'] = note
             # Apply framework-level output truncation unless tool opts out
             if not tool_instance.skip_output_truncation:
                 tool_result = tool_instance._truncate_output(tool_result)
