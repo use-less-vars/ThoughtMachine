@@ -364,7 +364,7 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
             setDefaultSaved('pending');
           }}
         >
-          {defaultSaved === 'pending' ? '💾 Saving…' : defaultSaved === 'error' ? '✗ Save failed' : defaultSaved === true ? '✓ Default saved!' : '💾 Save as Default'}
+          {defaultSaved === 'pending' ? 'Saving…' : defaultSaved === 'error' ? '✗ Save failed' : defaultSaved === true ? '✓ Default saved!' : 'Save as Default'}
         </button>
       </div>
 

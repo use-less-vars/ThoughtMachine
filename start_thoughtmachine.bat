@@ -1,12 +1,19 @@
 @echo off
-REM ---------------------------------------------------------------------------
+REM==============================================================================
 REM start_thoughtmachine.bat
+REM
+REM  ⚠ SYNCED with start_thoughtmachine.sh — keep in agreement.
+REM  ⚠ If you edit the batch file, mirror the same change in the shell script.
+REM==============================================================================
 REM  Windows launcher for ThoughtMachine Web UI.
 REM
-REM Usage:
-REM   start_thoughtmachine.bat          Development mode (hot-reload via Vite)
-REM   start_thoughtmachine.bat --prod   Production mode (serves from dist/)
-REM ---------------------------------------------------------------------------
+REM  Usage:
+REM    start_thoughtmachine.bat          Development mode (hot-reload via Vite)
+REM    start_thoughtmachine.bat --prod   Production mode (serves from dist/)
+REM==============================================================================
+REM
+REM  Kill leftover processes before starting
+call "%~dp0kill_thoughtmachine.bat" 2>nul
 
 setlocal enabledelayedexpansion
 
@@ -49,7 +56,8 @@ if "%PROD_MODE%"=="true" (
     if not errorlevel 1 (
         for /f "tokens=*" %%p in ('where npm') do set "TM_NPM_CMD=%%p"
     )
-    powershell -Command "$p = Start-Process python -ArgumentList '-m web_ui.backend.server --serve-frontend' -NoNewWindow -PassThru; $p.WaitForExit(); exit $p.ExitCode"
+    start "ThoughtMachine Backend" /wait python -m web_ui.backend.server --serve-frontend
+    exit /b %ERRORLEVEL%
 ) else (
     REM -- Development mode (hot-reload via Vite) -----------------------------
     echo   Mode:    DEVELOPMENT (hot-reload enabled)
@@ -72,42 +80,42 @@ if "%PROD_MODE%"=="true" (
     REM Capture npm full path so Python can find it too
     for /f "tokens=*" %%p in ('where npm') do set "TM_NPM_CMD=%%p"
 
-    REM Start Vite dev server in a new window
-    echo   Starting Vite dev server ^(port 5173^)...
-    pushd "!FRONTEND_DIR!"
-    start "ThoughtMachine Vite" cmd /c "npm run dev"
-    popd
+    REM Start backend FIRST so Vite's proxy never hits ECONNREFUSED
+    echo   Starting backend server ^(port 8000^)...
+    start "ThoughtMachine Backend" python -m web_ui.backend.server
 
-    REM Wait for Vite to start listening on port 5173 (up to 15 seconds)
-    echo   Waiting for Vite to be ready...
-    set "VITE_READY="
+    REM Wait for backend to start listening on port 8000 (up to 15 seconds)
+    echo   Waiting for backend to be ready...
+    set "BACKEND_READY="
     for /l %%i in (1,1,15) do (
         timeout /t 1 /nobreak >nul
-        netstat -an 2^>nul | findstr ":5173 " >nul 2>&1
+        netstat -an 2^>nul | findstr ":8000 " >nul 2>&1
         if not errorlevel 1 (
-            set "VITE_READY=1"
-            goto :vite_ready
+            set "BACKEND_READY=1"
+            goto :backend_ready
         )
     )
-    :vite_ready
-    if not defined VITE_READY (
+    :backend_ready
+    if not defined BACKEND_READY (
         echo(
-        echo [WARNING] Vite dev server may not have started.
-        echo           Check the "ThoughtMachine Vite" window for errors.
-        echo           Try browsing to http://127.0.0.1:5173 manually.
+        echo [WARNING] Backend server may not have started.
+        echo           Check the "ThoughtMachine Backend" window for errors.
         echo(
     ) else (
-        echo   Vite is ready on http://127.0.0.1:5173
+        echo   Backend is ready on http://127.0.0.1:8000
     )
 
-    REM Start backend (CORS already allows Vite dev server on any port)
-    powershell -Command "$p = Start-Process python -ArgumentList '-m web_ui.backend.server' -NoNewWindow -PassThru; $p.WaitForExit(); exit $p.ExitCode"
+    REM Start Vite dev server in foreground (blocks until Vite exits)
+    pushd "!FRONTEND_DIR!"
+    start "ThoughtMachine Vite" /wait cmd /c "npm run dev"
+    popd
 
-    REM When backend stops, also stop Vite
+    REM When Vite stops (Ctrl+C), also stop backend
     echo(
-    echo   Shutting down Vite dev server...
-    taskkill /f /fi "WINDOWTITLE eq ThoughtMachine Vite" >nul 2>&1
+    echo   Shutting down backend server...
+    taskkill /f /fi "WINDOWTITLE eq ThoughtMachine Backend*" >nul 2>&1
 )
+exit /b %ERRORLEVEL%
 
 goto :eof
 

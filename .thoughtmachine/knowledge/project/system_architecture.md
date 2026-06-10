@@ -2238,3 +2238,55 @@ Audited the "How to add a new permission toggle" guide against the actual codeba
 ## 2026-06-10 — **2025-07-16:** Added `execution` permission to the unified ...
 
 **2025-07-16:** Added `execution` permission to the unified security gate (`security/security_gate.py`). `get_effective_permissions()` now returns 6 keys: filesystem, network, container, git, system, execution. Execution is session-level only (no workspace merge needed). Also cleaned up stale `USE_UNIFIED_GATE` docstring reference.
+
+## 2026-06-10 — ## Graceful Shutdown Handler (added 2026-06-10)
+
+**Location:...
+
+## Graceful Shutdown Handler (added 2026-06-10)
+
+**Location:** `web_ui/backend/server.py` lines 192-265
+
+**Purpose:** Save in-flight WebSocket sessions when the server receives Ctrl+C / SIGINT / SIGTERM.
+
+**Architecture:**
+- `_active_bridges: list` — global list tracking all active `WebAgentBridge` instances
+- `_shutdown_save()` — iterates `_active_bridges`, saves open sessions, stops bridges. Registered via `atexit`.
+- `_get_shutdown_event()` — returns a lazily-created `asyncio.Event` singleton
+- `_trigger_shutdown()` — signal handler (SIGINT/SIGTERM) that sets the asyncio event
+- **atexit** registration ensures save runs on normal exit (including after uvicorn's Ctrl+C handling)
+- **asyncio.Event** is checked in the WebSocket loop (`while True`) so the handler exits promptly and runs its `finally` block
+
+**Bridge lifecycle:**
+1. On `start_session`: `_active_bridges.append(bridge)` after bridge creation
+2. On disconnect/error in `finally`: `_active_bridges.remove(bridge)` with `ValueError` guard
+3. On server shutdown: `_shutdown_save()` iterates remaining bridges and saves/cleans them up
+
+## Container Integrity & Honesty
+
+## 2026-06-10 — ## Container Integrity & Honesty (2026-06-10)
+
+### Overview
+...
+
+## Container Integrity & Honesty (2026-06-10)
+
+### Overview
+A three-layer system ensuring Docker containers match their expected security configuration:
+
+1. **`docker_executor.py`** — `verify_container_integrity()` compares actual container config (network mode, mount mode) against expected config from security gate. Returns a dict with `action_taken`, `actual`, `mismatch_reason`. Also added `get_integrity_status()` for lightweight API consumption.
+
+2. **`web_ui/backend/bridge.py`** — `_maybe_re_sync_container()` method wraps `verify_container_integrity()` and updates container permissions if mismatch detected. Wired into `apply_config()` as step 7, so every config update triggers a re-sync.
+
+3. **`web_ui/backend/server.py`** — `/api/container/integrity` endpoint accepts `workspace` and optional `permissions` (JSON-encoded) query params. Returns `{"integrity": "ok"|"mismatch"|"removed"|"error", "details": {...}}`.
+
+4. **`ContainerPanel.jsx`** — Fetches integrity status every 5s alongside status. Shows green dot for "ok", red for any error state. Mismatch details expand when integrity === "mismatch".
+
+5. **Integration points**: Session-load integrity checks in `session_lifecycle.py` already exist (lines 291-309, 349-365). The `/integrity` endpoint and WebSocket `apply_config` handler (which calls `bridge.apply_config()`) provide the API pathways.
+
+### Design decisions
+- Integrity check is read-only for the API endpoint; writes happen via the re-sync path in `bridge.py`.
+- The endpoint can accept `permissions` as JSON to check an expected state without mutating the executor's state.
+- ContainerPanel polls both `/api/container/status` and `/api/container/integrity` on the same 5s interval.
+- Real-Docker test variant uses `pytest.mark.skipif` with Docker daemon ping to conditionally run.
+

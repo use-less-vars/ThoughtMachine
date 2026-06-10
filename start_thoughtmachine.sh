@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
-# Ensure clean startup by killing any leftover processes
-"$(dirname "$0")/kill_thoughtmachine.sh"
-set -euo pipefail
-
-# ──────────────────────────────────────────────────────────────────────────────
+#===============================================================================
 # start_thoughtmachine.sh
+#
+#  ⚠ SYNCED with start_thoughtmachine.bat — keep in agreement.
+#  ⚠ If you edit this file, mirror the same change in the batch file.
+#===============================================================================
 # Single-command launcher for ThoughtMachine Web UI.
 # Pre-requisite: run install_thoughtmachine.sh first.
 #
-# Usage
-# ─────
+# Usage:
 #   ./start_thoughtmachine.sh           # Development mode (hot-reload)
 #   ./start_thoughtmachine.sh --prod    # Production mode (serves from dist/)
-# ──────────────────────────────────────────────────────────────────────────────
+#===============================================================================
+
+# Ensure clean startup by killing any leftover processes
+"$(dirname "$0")/kill_thoughtmachine.sh"
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR"
@@ -84,43 +87,42 @@ else
     fi
     export TM_NPM_CMD="$(command -v npm)"
 
-    # Start Vite dev server in background
-    echo "  → Starting Vite dev server (port 5173)..."
-    cd "$FRONTEND_DIR"
-    npm run dev &
-    VITE_PID=$!
-    cd "$PROJECT_DIR"
+    # Start backend FIRST so Vite's proxy never hits ECONNREFUSED
+    echo "  → Starting backend server (port 8000)..."
+    python -m web_ui.backend.server &
+    BACKEND_PID=$!
 
-    # Wait for Vite to start listening on port 5173 (up to 15 seconds)
-    echo "  → Waiting for Vite to be ready..."
-    VITE_READY=false
+    # Wait for backend to start listening on port 8000 (up to 15 seconds)
+    echo "  → Waiting for backend to be ready..."
+    BACKEND_READY=false
     for i in $(seq 1 15); do
         sleep 1
-        if ss -tlnp 2>/dev/null | grep -q :5173 || \
-           lsof -i :5173 2>/dev/null | grep -q LISTEN; then
-            VITE_READY=true
+        if ss -tlnp 2>/dev/null | grep -q :8000 || \
+           lsof -i :8000 2>/dev/null | grep -q LISTEN; then
+            BACKEND_READY=true
             break
         fi
     done
-    if [ "$VITE_READY" = false ]; then
+    if [ "$BACKEND_READY" = false ]; then
         echo ""
-        echo "  [WARNING] Vite dev server may not have started."
-        echo "            Check the terminal output above for errors."
-        echo "            Try browsing to http://127.0.0.1:5173 manually."
+        echo "  [WARNING] Backend server may not have started."
         echo ""
     else
-        echo "  → Vite is ready on http://127.0.0.1:5173"
+        echo "  → Backend is ready on http://127.0.0.1:8000"
     fi
 
-    # Kill Vite when script exits
+    # Kill backend when script exits (Ctrl+C on Vite)
     cleanup() {
         echo ""
-        echo "  → Shutting down Vite dev server..."
-        kill $VITE_PID 2>/dev/null || true
-        wait $VITE_PID 2>/dev/null || true
+        echo "  → Shutting down backend server..."
+        kill $BACKEND_PID 2>/dev/null || true
+        wait $BACKEND_PID 2>/dev/null || true
     }
     trap cleanup EXIT
 
-    # Start backend (CORS already allows Vite dev server on any port)
-    python -m web_ui.backend.server
+    # Start Vite dev server in foreground (blocking)
+    echo "  → Starting Vite dev server (port 5173)..."
+    cd "$FRONTEND_DIR"
+    npm run dev
+    cd "$PROJECT_DIR"
 fi

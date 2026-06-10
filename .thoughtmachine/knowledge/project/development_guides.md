@@ -688,3 +688,19 @@ Some resources — like network — are enforced at the container level. For ema
 
 Add a row to the merge table in the existing gate contract tests (`tests/docker/test_gate_contract.py`). The parametrized tests cover all combinations automatically.
 
+
+## 2026-06-10 — ## Windows packaging: "Terminate batch job (Y/N)?" fix (2026...
+
+## Windows packaging: "Terminate batch job (Y/N)?" fix (2026-06-03)
+
+**Problem:** `start_thoughtmachine.bat` used `powershell Start-Process` to launch Python, but `cmd.exe` (the batch file's parent console) still owned the console. When the user pressed Ctrl+C, `cmd.exe` intercepted it and prompted "Terminate batch job (Y/N)?" before the batch could continue.
+
+**Root cause:** `cmd.exe` runs batch files synchronously. When Ctrl+C is pressed in the console, `cmd.exe`'s default handler prompts before executing the next batch line — including `exit /b`.
+
+**Fix:** Replaced `powershell -Command "Start-Process python ... -NoNewWindow -PassThru; $p.WaitForExit(); exit $p.ExitCode"` with `start "ThoughtMachine Backend" /wait python ...`. The `start` command launches Python in a new console window (its own process group), so Ctrl+C only reaches Python, not the parent `cmd.exe`. After Python exits, the new window closes, the batch continues to `exit /b`, and **no prompt appears**.
+
+**Key principles:**
+- `start "" /wait` creates a new process in its own console — Ctrl+C isolation
+- `start /b` (same-window) makes the app ignore Ctrl+C — NOT what we want
+- Vite was already launched in a separate window via `start "ThoughtMachine Vite" cmd /c "npm run dev"` — the backend now follows the same pattern
+- The `exit /b %ERRORLEVEL%` after `start /wait` propagates Python's exit code
