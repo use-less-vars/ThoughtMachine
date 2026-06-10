@@ -420,6 +420,36 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     }
   }
 
+  // ── Global keydown: auto-focus query input on keystroke ───────────────────
+  // Whenever the user presses a key and no form field (input/textarea/select)
+  // is focused, bounce focus to the query bar. This handles the common case
+  // where someone clicks a copy button (which doesn't steal focus thanks to
+  // the onMouseDown trick in CopyButton) or clicks on blank space, then just
+  // starts typing — the next keystroke lands in the prompt.
+  useEffect(() => {
+    const handler = (e) => {
+      // Never steal focus from active form fields
+      const tag = e.target?.tagName?.toLowerCase()
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') return
+      if (e.target?.isContentEditable) return
+
+      // Don't intercept keyboard shortcuts (Ctrl+C, Cmd+V, etc.)
+      if (e.ctrlKey || e.metaKey || e.altKey) return
+
+      // Only redirect printable-character keystrokes — arrow keys, Escape,
+      // Tab, Enter, etc. are left alone
+      if (e.key.length !== 1) return
+
+      const queryInput = document.querySelector('.query-input')
+      if (queryInput && document.activeElement !== queryInput) {
+        queryInput.focus()
+      }
+    }
+
+    document.addEventListener('keydown', handler, true)  // capture phase
+    return () => document.removeEventListener('keydown', handler, true)
+  }, [])
+
 
   // ── Render ───────────────────────────────────────────────────────────────
   // When deferred, show a placeholder instead of the full tab UI

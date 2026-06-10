@@ -12,7 +12,11 @@ import React, { useState, useEffect, useRef, useCallback } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 
-/* ── Copy-to-clipboard button ── */
+/* ── Copy-to-clipboard button ──
+ *
+ * Uses onMouseDown + preventDefault so clicking never steals focus
+ * from wherever the user is (the query bar, another field, etc.).
+ */
 function CopyButton({ text, label }) {
   const [copied, setCopied] = useState(false)
   const handleCopy = async () => {
@@ -25,7 +29,7 @@ function CopyButton({ text, label }) {
     }
   }
   return (
-    <button className="copy-btn" onClick={handleCopy} title="Copy to clipboard">
+    <button className="copy-btn" onMouseDown={(e) => e.preventDefault()} onClick={handleCopy} title="Copy to clipboard">
       {copied ? '✅' : label || '📋'}
     </button>
   )
