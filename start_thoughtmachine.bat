@@ -108,11 +108,9 @@ if not defined BACKEND_READY (
     echo   ^> Backend is ready on http://127.0.0.1:8000
 )
 
-REM ── Start Vite in foreground ───────────────────────────────────────────────
+REM ── Start Vite in a separate window ────────────────────────────────────────
 echo   ^> Starting Vite dev server ^(port 5173^)...
-pushd "%FRONTEND_DIR%"
-npm run dev
-popd
+start "Vite Dev Server" /d "%FRONTEND_DIR%" npm run dev
 
 REM ── Cleanup ────────────────────────────────────────────────────────────────
 echo(
