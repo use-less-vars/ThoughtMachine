@@ -43,6 +43,10 @@ Thumbs.db
 *.bak
 *.tmp
 
+# Node.js (not currently present, but defensive)
+node_modules/
+.npm/
+
 # Sessions (managed by app, not source control)
 ~/.thoughtmachine/
 sessions/
