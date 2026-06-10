@@ -301,10 +301,10 @@ class WebAgentBridge:
         """
         Start a new agent session.
 
-        Configuration is built from three layers (each overriding the previous):
-          1. Global config (from ~/.thoughtmachine/agent_config.json via ConfigService)
-          2. Session config overrides (from a loaded session's metadata)
-          3. Frontend config_dict (the caller's runtime overrides)
+        Configuration is built from these layers (each overriding the previous):
+          1. ``self._config`` (if already set by a prior ``apply_config`` call)
+             *or* global config from ``~/.thoughtmachine/agent_config.json``
+          2. Frontend ``config_dict`` (the caller's runtime overrides)
 
         If a session was previously loaded via load_session(), the loaded
         session's conversation is passed to the controller so the agent
@@ -314,11 +314,22 @@ class WebAgentBridge:
         Args:
             query: Initial user query string.
             config_dict: Frontend configuration overrides (see AgentConfig fields).
-                         Applied on top of global config + loaded session config.
+                         Applied on top of the existing (or global) config.
         """
-        # ── Layer 1: global config from ~/.thoughtmachine/agent_config.json ──
-        global_config = self._build_global_agent_config()
-        merged_config = global_config.model_dump(exclude={'api_key'}, exclude_none=True)
+        # ── Layer 1: existing config from apply_config, or global config ──
+        if self._config is not None:
+            # A prior apply_config() call already set a validated config.
+            # Use it as the base so that continue_session preserves it.
+            # NOTE: api_key has ``exclude=True`` on AgentConfig, so model_dump()
+            # already strips it. We re-add it explicitly below.
+            merged_config = self._config.model_dump(
+                exclude={'api_key'}, exclude_none=True)
+            merged_config['api_key'] = self._config.api_key
+        else:
+            global_config = self._build_global_agent_config()
+            merged_config = global_config.model_dump(
+                exclude={'api_key'}, exclude_none=True)
+            merged_config['api_key'] = global_config.api_key
 
         # ── Layer 2: frontend config_dict (deep merge for nested dicts) ──
         if config_dict:
