@@ -18,12 +18,32 @@ instances) must use the same mechanism.
 from __future__ import annotations
 
 import os
+import platform
 import sys
 import time
-import fcntl
 import logging
 from pathlib import Path
 from typing import Optional, Any
+
+
+# ── Platform-specific locking ────────────────────────────────────────────
+# ``fcntl.flock`` on Linux/Mac, ``msvcrt.locking`` on Windows.
+if platform.system() == 'Windows':
+    import msvcrt
+
+    def _platform_lock(fd: int, mode: int) -> None:
+        msvcrt.locking(fd, mode, 1)  # lock 1 byte at current pos
+
+    _LOCK_EX = msvcrt.LK_NBLCK   # non-blocking exclusive
+    _LOCK_UN = msvcrt.LK_UNLCK
+else:
+    import fcntl
+
+    def _platform_lock(fd: int, mode: int) -> None:
+        fcntl.flock(fd, mode)
+
+    _LOCK_EX = fcntl.LOCK_EX | fcntl.LOCK_NB
+    _LOCK_UN = fcntl.LOCK_UN
 
 logger = logging.getLogger(__name__)
 
@@ -99,12 +119,12 @@ class FileLock:
                 continue
 
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
+                _platform_lock(fd, _LOCK_EX)
+            except (BlockingIOError, PermissionError):
                 os.close(fd)
                 time.sleep(POLL_INTERVAL)
                 continue
-            except OSError as exc:
+            except (OSError, PermissionError) as exc:
                 os.close(fd)
                 last_exc = exc
                 time.sleep(POLL_INTERVAL)
@@ -136,8 +156,8 @@ class FileLock:
         fd = self._fd
         self._fd = None
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
+            _platform_lock(fd, _LOCK_UN)
+        except (OSError, PermissionError):
             pass
         try:
             os.close(fd)
