@@ -94,27 +94,28 @@ class TestComputeDesiredConfig:
         assert mode == "ro"
 
     def test_gate_lookup_failure_falls_back_to_restrictive(self):
-        """When ``security.security_gate`` import or gate lookup fails, the
-        function logs a warning and returns safe defaults."""
-        net, mode = _compute_desired_config(
-            "/tmp/ws", workspace_id="ws-1",
-            session_permissions={"network": "write", "filesystem": "write"}
-        )
+        """When ``get_workspace_capabilities`` raises, the function logs a
+        warning and returns safe defaults."""
+        with patch("security.security_gate.get_workspace_capabilities", side_effect=RuntimeError("gate down")):
+            net, mode = _compute_desired_config(
+                "/tmp/ws", workspace_id="ws-1",
+                session_permissions={"network": "write", "filesystem": "write"}
+            )
         # Falls back to restrictive defaults when gate is unreachable
         assert net == "none"
         assert mode == "ro"
 
     def test_gate_returns_limited_caps(self):
-        """When the security gate is unreachable, the function falls back to
-        restrictive defaults regardless of session permissions."""
-        # No patch needed: ``security.security_gate`` import fails in the
-        # test environment (``tests/security/`` shadows the real ``security/``
-        # package), which triggers the same fallback path.
-        net, mode = _compute_desired_config(
-            "/tmp/ws", workspace_id="ws-1",
-            session_permissions={"network": "write", "filesystem": "write"}
-        )
-
+        """When the gate returns limited capabilities (network denied), the
+        function honours those caps and uses restrictive Docker config."""
+        from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
+        limited = WorkspaceCapabilities(allow_network=False, filesystem_write=False)
+        with patch("security.security_gate.get_workspace_capabilities", return_value=limited):
+            net, mode = _compute_desired_config(
+                "/tmp/ws", workspace_id="ws-1",
+                session_permissions={"network": "write", "filesystem": "write"}
+            )
+        # Limited caps mean network=banned even though session says write
         assert net == "none"
         assert mode == "ro"
 
