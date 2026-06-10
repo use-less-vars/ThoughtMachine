@@ -36,24 +36,16 @@ from unittest.mock import MagicMock, PropertyMock, patch
 import pytest
 
 from security.security_gate import (
-    USE_UNIFIED_GATE,
-    WorkspaceCapabilities,
     check_required_categories,
     get_effective_permissions,
     get_workspace_capabilities,
     resolve_prompt,
 )
+from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
 from thoughtmachine.security import SessionPermissions
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  Module-level flag
-# ══════════════════════════════════════════════════════════════════════════
 
-
-class TestModuleFlag:
-    def test_use_unified_gate_is_true(self):
-        assert USE_UNIFIED_GATE is True
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -64,22 +56,22 @@ class TestModuleFlag:
 class TestWorkspaceCapabilitiesModel:
     def test_defaults(self):
         caps = WorkspaceCapabilities()
-        assert caps.network is False
+        assert caps.allow_network is True
+        assert caps.allow_docker is True
         assert caps.filesystem_write is True
         assert caps.git_available is True
-        assert caps.container_available is True
 
     def test_custom_values(self):
         caps = WorkspaceCapabilities(
-            network=True,
+            allow_network=True,
+            allow_docker=False,
             filesystem_write=False,
             git_available=False,
-            container_available=False,
         )
-        assert caps.network is True
+        assert caps.allow_network is True
+        assert caps.allow_docker is False
         assert caps.filesystem_write is False
         assert caps.git_available is False
-        assert caps.container_available is False
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -90,22 +82,16 @@ class TestWorkspaceCapabilitiesModel:
 class TestGetWorkspaceCapabilities:
     def test_default_when_file_missing(self):
         """When the capabilities file does not exist, return fully-permissive defaults."""
-        with patch.object(Path, "exists", return_value=False):
-            caps = get_workspace_capabilities("nonexistent_workspace")
-            assert caps.network is False  # default
-            assert caps.filesystem_write is True
-            assert caps.git_available is True
-            assert caps.container_available is True
-
-    def test_default_when_invalid_json(self):
-        """When the file contains invalid JSON, return defaults."""
-        with patch.object(Path, "exists", return_value=True):
-            with patch.object(Path, "read_text", return_value="not json"):
-                caps = get_workspace_capabilities("broken")
-                assert caps.filesystem_write is True
+        caps = get_workspace_capabilities("nonexistent_workspace")
+        assert caps.allow_network is True  # canonical default
+        assert caps.allow_docker is True
+        assert caps.filesystem_write is True
+        assert caps.git_available is True
 
     def test_loads_real_values(self):
         """Read values from a well-formed capabilities JSON."""
+        from pathlib import Path
+        from unittest.mock import patch
         fake_json = json.dumps(
             {
                 "allow_network": False,
@@ -117,22 +103,24 @@ class TestGetWorkspaceCapabilities:
         with patch.object(Path, "exists", return_value=True):
             with patch.object(Path, "read_text", return_value=fake_json):
                 caps = get_workspace_capabilities("restricted")
-                assert caps.network is False
+                assert caps.allow_network is False
                 assert caps.filesystem_write is False
                 assert caps.git_available is False
-                assert caps.container_available is False
+                assert caps.allow_docker is False
 
     def test_missing_keys_use_defaults(self):
-        """Missing keys in the JSON fall back to the Pydantic default."""
+        """Missing keys in the JSON fall back to the canonical default."""
+        from pathlib import Path
+        from unittest.mock import patch
         fake_json = json.dumps({"allow_network": True})  # only one key
         with patch.object(Path, "exists", return_value=True):
             with patch.object(Path, "read_text", return_value=fake_json):
                 caps = get_workspace_capabilities("partial")
-                assert caps.network is True
+                assert caps.allow_network is True
                 # defaults for the rest
                 assert caps.filesystem_write is True
                 assert caps.git_available is True
-                assert caps.container_available is True
+                assert caps.allow_docker is True
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -148,13 +136,13 @@ class TestEffectivePermissionsMerge:
             network="write",
             container=True,
             git="write",
-            security="full",
+            system="full",
         )
         workspace = WorkspaceCapabilities(
-            network=True,
+            allow_network=True,
+            allow_docker=True,
             filesystem_write=True,
             git_available=True,
-            container_available=True,
         )
         eff = get_effective_permissions(session, workspace)
         assert eff["filesystem"] == "write"
@@ -164,9 +152,9 @@ class TestEffectivePermissionsMerge:
         assert eff["system"] == "full"
 
     def test_network_workspace_denied(self):
-        """Workspace network=False → effective network=False."""
+        """Workspace allow_network=False → effective network=False."""
         session = SessionPermissions(network="write")
-        workspace = WorkspaceCapabilities(network=False)
+        workspace = WorkspaceCapabilities(allow_network=False)
         eff = get_effective_permissions(session, workspace)
         assert eff["network"] is False
 
@@ -213,22 +201,22 @@ class TestEffectivePermissionsMerge:
         assert eff["git"] is False
 
     def test_container_workspace_denied(self):
-        """Workspace container_available=False + session container=True → False."""
+        """Workspace allow_docker=False + session container=True → False."""
         session = SessionPermissions(container=True)
-        workspace = WorkspaceCapabilities(container_available=False)
+        workspace = WorkspaceCapabilities(allow_docker=False)
         eff = get_effective_permissions(session, workspace)
         assert eff["container"] is False
 
     def test_container_both_true(self):
         """Both session and workspace allow container → True."""
         session = SessionPermissions(container=True)
-        workspace = WorkspaceCapabilities(container_available=True)
+        workspace = WorkspaceCapabilities(allow_docker=True)
         eff = get_effective_permissions(session, workspace)
         assert eff["container"] is True
 
     def test_system_passthrough(self):
         """System permission passes through unchanged (no workspace cap)."""
-        session = SessionPermissions(security="read")
+        session = SessionPermissions(system="read")
         workspace = WorkspaceCapabilities()
         eff = get_effective_permissions(session, workspace)
         assert eff["system"] == "read"
@@ -407,12 +395,12 @@ class TestCheckRequiredCategoriesAsk:
         assert "network:true" in published.data["capabilities"]
 
     def test_prompt_cleanup_after_approval(self):
-        """_pending_prompts entry is removed after the prompt resolves."""
+        """_pending_security_requests entry is removed after the prompt resolves."""
         eff = {"network": "ask"}
 
-        from security.security_gate import _pending_prompts
+        from security.security_gate import _pending_security_requests
 
-        with patch("security.security_gate.queue.Queue") as mock_queue_cls:
+        with patch("queue.Queue") as mock_queue_cls:
             mock_q = MagicMock()
             mock_q.get.return_value = {"approved": True, "remember": False}
             mock_queue_cls.return_value = mock_q
@@ -427,7 +415,7 @@ class TestCheckRequiredCategoriesAsk:
             )
 
         # The entry should have been popped in the finally block
-        assert len(_pending_prompts) == 0
+        assert len(_pending_security_requests) == 0
 
     def test_ask_publishes_event_with_description(self):
         """The SecurityPromptEvent includes the description string."""
@@ -459,10 +447,10 @@ class TestCheckRequiredCategoriesAsk:
 
 class TestResolvePrompt:
     def test_resolve_existing(self):
-        from security.security_gate import _pending_prompts
+        from security.security_gate import _pending_security_requests
 
         q = queue.Queue()
-        _pending_prompts["req-1"] = q
+        _pending_security_requests["req-1"] = q
         assert resolve_prompt("req-1", True, remember=True) is True
         result = q.get_nowait()
         assert result == {"approved": True, "remember": True}
@@ -471,10 +459,10 @@ class TestResolvePrompt:
         assert resolve_prompt("no-such-request", True) is False
 
     def test_resolve_cleans_up(self):
-        from security.security_gate import _pending_prompts
+        from security.security_gate import _pending_security_requests
 
         q = queue.Queue()
-        _pending_prompts["req-2"] = q
+        _pending_security_requests["req-2"] = q
         resolve_prompt("req-2", True)
         # The check_required_categories function pops in its finally;
         # resolve_prompt itself does not remove from the dict because

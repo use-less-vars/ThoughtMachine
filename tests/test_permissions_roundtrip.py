@@ -27,7 +27,6 @@ from agent.config.loader import save_config, load_config
 from thoughtmachine.security import SessionPermissions, get_default_security_config, merge_security_config
 from session.models import Session, RuntimeParams
 from agent.core.tool_executor import (
-    _check_permissions,
     DEFAULT_SESSION_PERMISSIONS,
     ToolExecutor,
 )
@@ -93,7 +92,7 @@ class TestSessionPermissionsRoundTrip:
         assert sp2.container == sp1.container
         assert sp2.network == sp1.network
         assert sp2.filesystem == sp1.filesystem
-        assert sp2.security == sp1.security
+        assert sp2.system == sp1.system
         assert sp2.git == sp1.git
         assert sp2.execution == sp1.execution
 
@@ -104,7 +103,7 @@ class TestSessionPermissionsRoundTrip:
             container=True,
             network=True,
             filesystem="full",
-            security="write",
+            system="write",
             git="read",
             execution="banned",
         )
@@ -113,9 +112,9 @@ class TestSessionPermissionsRoundTrip:
 
         sp2 = cfg2.session_permissions
         assert sp2.container is True
-        assert sp2.network is True
+        assert sp2.network == "write"  # True coercees to 'write'
         assert sp2.filesystem == "full"
-        assert sp2.security == "write"
+        assert sp2.system == "write"
         assert sp2.git == "read"
         assert sp2.execution == "banned"
 
@@ -126,7 +125,7 @@ class TestSessionPermissionsRoundTrip:
             container=True,
             network=True,
             filesystem="full",
-            security="full",
+            system="full",
             git="full",
             execution="full",
         )
@@ -135,9 +134,9 @@ class TestSessionPermissionsRoundTrip:
 
         sp2 = cfg2.session_permissions
         assert sp2.container is True
-        assert sp2.network is True
+        assert sp2.network == "write"  # True coercees to 'write'
         assert sp2.filesystem == "full"
-        assert sp2.security == "full"
+        assert sp2.system == "full"
         assert sp2.git == "full"
         assert sp2.execution == "full"
 
@@ -148,7 +147,7 @@ class TestSessionPermissionsRoundTrip:
             container=False,
             network=False,
             filesystem="read",
-            security="banned",
+            system="banned",
             git="banned",
             execution="banned",
         )
@@ -157,9 +156,9 @@ class TestSessionPermissionsRoundTrip:
 
         sp2 = cfg2.session_permissions
         assert sp2.container is False
-        assert sp2.network is False
+        assert sp2.network == "banned"  # False coercees to 'banned'
         assert sp2.filesystem == "read"
-        assert sp2.security == "banned"
+        assert sp2.system == "banned"
         assert sp2.git == "banned"
         assert sp2.execution == "banned"
 
@@ -170,7 +169,7 @@ class TestSessionPermissionsRoundTrip:
             container=True,
             network=False,
             filesystem="write",
-            security="read",
+            system="read",
             git="full",
             execution="banned",
         )
@@ -225,7 +224,7 @@ class TestConfigFileRoundTrip:
         assert sp2.container == sp1.container
         assert sp2.network == sp1.network
         assert sp2.filesystem == sp1.filesystem
-        assert sp2.security == sp1.security
+        assert sp2.system == sp1.system
         assert sp2.git == sp1.git
         assert sp2.execution == sp1.execution
 
@@ -236,7 +235,7 @@ class TestConfigFileRoundTrip:
             container=True,
             network=True,
             filesystem="full",
-            security="write",
+            system="write",
             git="read",
             execution="banned",
         )
@@ -248,9 +247,9 @@ class TestConfigFileRoundTrip:
 
         sp2 = cfg2.session_permissions
         assert sp2.container is True
-        assert sp2.network is True
+        assert sp2.network == "write"  # True coercees to 'write'
         assert sp2.filesystem == "full"
-        assert sp2.security == "write"
+        assert sp2.system == "write"
         assert sp2.git == "read"
         assert sp2.execution == "banned"
 
@@ -270,9 +269,9 @@ class TestConfigFileRoundTrip:
 
         sp = raw["session_permissions"]
         assert sp["container"] is True
-        assert sp["network"] is False
+        assert sp["network"] == "banned"  # False coercees to 'banned'
         assert sp["filesystem"] == "write"
-        assert sp["security"] == "read"  # default
+        assert sp["system"] == "read"  # default
         assert sp["execution"] == "banned"  # default
 
     def test_missing_session_permissions_backfilled_from_defaults(self, temp_config_path):
@@ -288,7 +287,7 @@ class TestConfigFileRoundTrip:
         # Should have defaults
         sp = cfg2.session_permissions
         assert sp.container is False
-        assert sp.network is False
+        assert sp.network == "banned"  # default is 'banned'
         assert sp.filesystem == "read"
         assert sp.execution == "banned"
 
@@ -308,7 +307,7 @@ class TestConfigFileRoundTrip:
 
         sp = cfg.session_permissions
         assert sp.container is True       # from file
-        assert sp.network is False        # default
+        assert sp.network == "banned"     # default
         assert sp.filesystem == "read"    # default
         assert sp.execution == "banned"   # default
 
@@ -425,7 +424,7 @@ class TestToolExecutionAfterConfigCycle:
             container=True,
             network=True,
             filesystem="full",
-            security="full",
+            system="full",
             git="full",
             execution="full",
         )
@@ -450,7 +449,7 @@ class TestToolExecutionAfterConfigCycle:
             container=False,
             network=False,
             filesystem="read",  # <--- read only
-            security="read",
+            system="read",
             git="read",
             execution="banned",
         )
@@ -476,7 +475,7 @@ class TestToolExecutionAfterConfigCycle:
             container=True,
             network=True,
             filesystem="full",
-            security="full",
+            system="full",
             git="full",
             execution="full",
         )
@@ -501,7 +500,7 @@ class TestToolExecutionAfterConfigCycle:
             container=True,
             network=False,  # <--- missing
             filesystem="full",
-            security="full",
+            system="full",
             git="full",
             execution="full",
         )

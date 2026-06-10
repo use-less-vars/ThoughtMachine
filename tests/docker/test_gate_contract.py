@@ -18,9 +18,9 @@ from __future__ import annotations
 import pytest
 
 from security.security_gate import (
-    WorkspaceCapabilities,
     get_effective_permissions,
 )
+from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
 from thoughtmachine.security import SessionPermissions
 from docker_executor import _compute_desired_config
 
@@ -48,16 +48,16 @@ def _make_session(
 
 
 def _make_workspace(
-    network: bool = True,
+    allow_network: bool = True,
     filesystem_write: bool = True,
     git_available: bool = True,
-    container_available: bool = True,
+    allow_docker: bool = True,
 ) -> WorkspaceCapabilities:
     return WorkspaceCapabilities(
-        network=network,
+        allow_network=allow_network,
         filesystem_write=filesystem_write,
         git_available=git_available,
-        container_available=container_available,
+        allow_docker=allow_docker,
     )
 
 
@@ -103,7 +103,7 @@ class TestEffectivePermissions:
         expected_net,
     ):
         session = _make_session(network=session_net)
-        workspace = _make_workspace(network=ws_net)
+        workspace = _make_workspace(allow_network=ws_net)
         eff = get_effective_permissions(session, workspace)
         # The effective value is either a string (pass-through) or False (workspace denies)
         assert eff["network"] == expected_net, (
@@ -145,13 +145,13 @@ class TestEffectivePermissions:
     def test_container_defaults(self):
         """Container permission is a simple boolean AND."""
         session = _make_session(container=True)
-        workspace = _make_workspace(container_available=True)
+        workspace = _make_workspace(allow_docker=True)
         eff = get_effective_permissions(session, workspace)
         assert eff["container"] is True
 
     def test_container_denied_by_workspace(self):
         session = _make_session(container=True)
-        workspace = _make_workspace(container_available=False)
+        workspace = _make_workspace(allow_docker=False)
         eff = get_effective_permissions(session, workspace)
         assert eff["container"] is False
 
@@ -200,7 +200,7 @@ class TestContainerConfigContract:
     ):
         """Full chain: permission → effective → container config."""
         session = _make_session(network=session_net)
-        workspace = _make_workspace(network=ws_net)
+        workspace = _make_workspace(allow_network=ws_net)
         eff = get_effective_permissions(session, workspace)
         network_mode, _ = _expected_config(eff)
         assert network_mode == expected_network_mode, (

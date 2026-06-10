@@ -14,8 +14,6 @@ from typing import ClassVar, List
 import pytest
 
 from agent.core.tool_executor import (
-    _value_satisfies,
-    _check_permissions,
     DEFAULT_SESSION_PERMISSIONS,
     ToolExecutor,
 )
@@ -50,142 +48,18 @@ class GitWriteTool(ToolBase):
         return "Git write OK"
 
 
-# ---------------------------------------------------------------------------
-# Test: _check_permissions with 'ask' value (no event system — timed out)
-# ---------------------------------------------------------------------------
+# ══════════════════════════════════════════════════════════════════════════════
+# Fake session permission profile (shared by remaining tests)
+# ══════════════════════════════════════════════════════════════════════════════
 
-class TestCheckPermissionsAsk:
-    """Tests for _check_permissions when session value is 'ask'."""
-
-    PROFILE_GIT_ASK = {
-        "container": False,
-        "network": False,
-        "filesystem": "read",
-        "security": "read",
-        "git": "ask",
-        "execution": "banned",
-    }
-
-    def test_git_write_with_ask_profile_passes_when_approved(self):
-        """
-        When session git='ask', _check_permissions with git:write
-        should pass if resolve_security_prompt is called with approved=True.
-        """
-        result_container = []
-
-        def run_check():
-            result = _check_permissions(
-                ["git:write"],
-                self.PROFILE_GIT_ASK,
-                tool_name="GitWriteTool",
-                agent_id=42,
-            )
-            result_container.append(result)
-
-        # Start _check_permissions in a background thread
-        t = threading.Thread(target=run_check, daemon=True)
-        t.start()
-
-        # Wait a bit for the queue to be registered
-        import time
-        time.sleep(0.1)
-
-        # Find the pending request and approve it
-        with _pending_requests_lock:
-            request_ids = list(_pending_security_requests.keys())
-
-        # There should be at least one pending request
-        assert len(request_ids) > 0, (
-            "No pending security requests found — "
-            "the ask flow may not have registered one"
-        )
-
-        request_id = request_ids[0]
-        resolve_security_prompt(request_id, approved=True)
-
-        t.join(timeout=5)
-        assert t.is_alive() is False, "Thread did not finish in time"
-
-        assert len(result_container) == 1
-        assert result_container[0] is None  # None = all checks passed
-
-    def test_git_write_with_ask_profile_denied(self):
-        """
-        When session git='ask', _check_permissions with git:write
-        should fail if resolve_security_prompt is called with approved=False.
-        """
-        result_container = []
-
-        def run_check():
-            result = _check_permissions(
-                ["git:write"],
-                self.PROFILE_GIT_ASK,
-                tool_name="GitWriteTool",
-                agent_id=42,
-            )
-            result_container.append(result)
-
-        t = threading.Thread(target=run_check, daemon=True)
-        t.start()
-
-        import time
-        time.sleep(0.1)
-
-        with _pending_requests_lock:
-            request_ids = list(_pending_security_requests.keys())
-
-        assert len(request_ids) > 0
-        request_id = request_ids[0]
-        resolve_security_prompt(request_id, approved=False)
-
-        t.join(timeout=5)
-
-        assert len(result_container) == 1
-        assert result_container[0] is not None
-        assert "Permission denied" in result_container[0]
-        assert "user denied" in result_container[0].lower()
-
-    def test_git_read_with_ask_profile_does_not_ask(self):
-        """
-        When session is 'ask', 'read' level access is treated as a no-op.
-        Only 'write'/'full' triggers the security prompt.
-        """
-        # git:read with git='ask' should pass immediately — no prompt needed
-        result = _check_permissions(
-            ["git:read"],
-            self.PROFILE_GIT_ASK,
-            tool_name="GitReadTool",
-            agent_id=42,
-        )
-        assert result is None  # granted without asking
-
-    def test_git_ask_does_not_prompt_for_banned(self):
-        """
-        When session git='ask' and required is 'banned', no prompt needed.
-        """
-        result = _check_permissions(
-            ["git:banned"],
-            self.PROFILE_GIT_ASK,
-            tool_name="GitWriteTool",
-            agent_id=42,
-        )
-        assert result is None
-
-    def test_other_categories_still_work_with_ask_profile(self):
-        """
-        Non-git categories in an 'ask' profile should still use normal comparison.
-        """
-        profile = dict(self.PROFILE_GIT_ASK)
-        # git is ask, but container is False
-        result = _check_permissions(
-            ["container:true"],
-            profile,
-            tool_name="ContainerTool",
-            agent_id=42,
-        )
-        assert result is not None
-        assert "container:true" in result
-
+PROFILE_GIT_ASK = {
+    "container": False,
+    "network": False,
+    "filesystem": "read",
+    "system": "read",
+    "git": "ask",
+    "execution": "banned",
+}
 
 # ---------------------------------------------------------------------------
 # Test: ToolExecutor integration with SessionPermissions(git='ask')

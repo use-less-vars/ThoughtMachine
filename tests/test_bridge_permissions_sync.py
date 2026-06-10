@@ -26,7 +26,6 @@ from agent.config.models import AgentConfig
 from agent.config.loader import validate_config
 from agent.core.tool_executor import (
     ToolExecutor,
-    _check_permissions,
 )
 from agent.core.state import AgentState
 from tools.file_preview_tool import FilePreviewTool
@@ -141,16 +140,6 @@ class TestPermissionEnforcement:
         """FilePreviewTool (filesystem:read) is denied when filesystem=banned."""
         config, state, executor = executor_with_perms
 
-        # Direct permission check (unit level)
-        perms = config.session_permissions.to_dict()
-        error = _check_permissions(
-            FilePreviewTool.get_required_categories({}),
-            perms,
-        )
-        assert error is not None
-        assert "Permission denied" in error
-        assert "filesystem" in error
-
         # Via ToolExecutor._execute_single_tool (integration path)
         result = executor._execute_single_tool(
             FilePreviewTool,
@@ -175,14 +164,6 @@ class TestPermissionEnforcement:
 
         # Lift the restriction
         config.session_permissions = SessionPermissions(filesystem="read")
-        perms = config.session_permissions.to_dict()
-
-        # Direct permission check
-        error = _check_permissions(
-            FilePreviewTool.get_required_categories({}),
-            perms,
-        )
-        assert error is None, f"Expected no error, got: {error}"
 
         # Via ToolExecutor — note: filename points to a non‑existent file,
         # but the permission gate passes first; the tool will then attempt

@@ -1,9 +1,7 @@
 """
-Tests for the permission gate in tool_executor.py.
+Tests for tool_executor.py — permission gate integration tests.
 
 Covers:
-  - _value_satisfies helper (boolean and string levels)
-  - _check_permissions with default and custom profiles
   - Integration with ToolExecutor._execute_single_tool
   - Empty required_categories passes
   - Denied categories produce the right error message
@@ -11,8 +9,6 @@ Covers:
 
 from typing import ClassVar, List
 from agent.core.tool_executor import (
-    _value_satisfies,
-    _check_permissions,
     DEFAULT_SESSION_PERMISSIONS,
     ToolExecutor,
 )
@@ -48,158 +44,6 @@ class NetworkAndFilesystemTool(ToolBase):
 
     def execute(self) -> str:
         return "Network + FS OK"
-
-
-# ---------------------------------------------------------------------------
-# _value_satisfies
-# ---------------------------------------------------------------------------
-
-class TestValueSatisfies:
-    """Unit tests for the _value_satisfies helper."""
-
-    def test_boolean_true_allowed_true(self):
-        assert _value_satisfies("true", True) is True
-
-    def test_boolean_true_allowed_false(self):
-        assert _value_satisfies("true", False) is False
-
-    def test_boolean_false_allowed_false(self):
-        assert _value_satisfies("false", False) is True
-
-    def test_boolean_false_allowed_true(self):
-        # True satisfies everything
-        assert _value_satisfies("false", True) is True
-
-    def test_string_read_allowed_read(self):
-        assert _value_satisfies("read", "read") is True
-
-    def test_string_read_allowed_banned(self):
-        assert _value_satisfies("read", "banned") is False
-
-    def test_string_write_allowed_banned(self):
-        assert _value_satisfies("write", "banned") is False
-
-    def test_string_write_allowed_read(self):
-        assert _value_satisfies("write", "read") is False
-
-    def test_string_write_allowed_write(self):
-        assert _value_satisfies("write", "write") is True
-
-    def test_string_write_allowed_full(self):
-        assert _value_satisfies("write", "full") is True
-
-    def test_string_full_allowed_write(self):
-        assert _value_satisfies("full", "write") is False
-
-    def test_string_full_allowed_full(self):
-        assert _value_satisfies("full", "full") is True
-
-    def test_string_banned_allowed_banned(self):
-        assert _value_satisfies("banned", "banned") is True
-
-    def test_string_banned_allowed_read(self):
-        # banned required vs read allowed — read is higher, so it satisfies
-        assert _value_satisfies("banned", "read") is True
-
-    # ------------------------------------------------------------------
-    # 'ask' sentinel tests
-    # ------------------------------------------------------------------
-
-    def test_ask_write_returns_ask_sentinel(self):
-        """When allowed='ask' and required is 'write', return "ASK" sentinel."""
-        assert _value_satisfies("write", "ask") == "ASK"
-
-    def test_ask_read_returns_true(self):
-        """When allowed='ask' and required is 'read', allow silently (no prompt)."""
-        assert _value_satisfies("read", "ask") is True
-
-    def test_ask_full_returns_ask_sentinel(self):
-        """When allowed='ask' and required is 'full', return "ASK" sentinel."""
-        assert _value_satisfies("full", "ask") == "ASK"
-
-    def test_ask_banned_returns_true(self):
-        """When allowed='ask' and required is 'banned', it's always fine."""
-        assert _value_satisfies("banned", "ask") is True
-
-    def test_ask_false_returns_true(self):
-        """When allowed='ask' and required boolean false, it's fine."""
-        assert _value_satisfies("false", "ask") is True
-
-    def test_ask_true_returns_true(self):
-        """When allowed='ask' and required boolean true, it's fine."""
-        assert _value_satisfies("true", "ask") is True
-
-    def test_ask_ask_returns_true(self):
-        """When allowed='ask' and required is also 'ask', it's a no-op."""
-        assert _value_satisfies("ask", "ask") is True
-
-
-# ---------------------------------------------------------------------------
-# _check_permissions
-# ---------------------------------------------------------------------------
-
-class TestCheckPermissions:
-    """Tests for the _check_permissions function."""
-
-    def test_empty_categories_returns_none(self):
-        assert _check_permissions([], DEFAULT_SESSION_PERMISSIONS) is None
-
-    def test_empty_categories_with_custom_profile(self):
-        profile = {"container": False}
-        assert _check_permissions([], session_permissions=profile) is None
-
-    def test_container_true_denied_in_default(self):
-        error = _check_permissions(["container:true"], DEFAULT_SESSION_PERMISSIONS)
-        assert error is not None
-        assert "Permission denied" in error
-        assert "container:true" in error
-        assert "container:False" in error
-
-    def test_container_false_allowed_in_default(self):
-        assert _check_permissions(["container:false"], DEFAULT_SESSION_PERMISSIONS) is None
-
-    def test_network_true_denied_in_default(self):
-        error = _check_permissions(["network:true"], DEFAULT_SESSION_PERMISSIONS)
-        assert error is not None
-        assert "Permission denied" in error
-
-    def test_filesystem_read_allowed_in_default(self):
-        assert _check_permissions(["filesystem:read"], DEFAULT_SESSION_PERMISSIONS) is None
-
-    def test_filesystem_write_denied_in_default(self):
-        error = _check_permissions(["filesystem:write"], DEFAULT_SESSION_PERMISSIONS)
-        assert error is not None
-        assert "Permission denied" in error
-        assert "filesystem:write" in error
-
-    def test_execution_banned_allowed_in_default(self):
-        assert _check_permissions(["execution:banned"], DEFAULT_SESSION_PERMISSIONS) is None
-
-    def test_execution_read_denied_in_default(self):
-        error = _check_permissions(["execution:read"], DEFAULT_SESSION_PERMISSIONS)
-        assert error is not None
-        assert "execution:read" in error
-        assert "execution:banned" in error
-
-    def test_unknown_category(self):
-        error = _check_permissions(["nonexistent:true"], DEFAULT_SESSION_PERMISSIONS)
-        assert error is not None
-        assert "Unknown category" in error
-
-    def test_custom_profile_overrides_default(self):
-        custom = {"container": True, "network": False, "filesystem": "full", "security": "read", "execution": "banned"}
-        assert _check_permissions(["container:true"], session_permissions=custom) is None
-        assert _check_permissions(["network:true"], session_permissions=custom) is not None
-
-    def test_multiple_requirements_all_pass(self):
-        custom = {"container": True, "network": True, "filesystem": "write", "security": "read", "execution": "banned"}
-        assert _check_permissions(["container:true", "filesystem:write"], session_permissions=custom) is None
-
-    def test_multiple_requirements_one_fails(self):
-        custom = {"container": True, "network": False, "filesystem": "write", "security": "read", "execution": "banned"}
-        error = _check_permissions(["container:true", "network:true", "filesystem:write"], session_permissions=custom)
-        assert error is not None
-        assert "network:true" in error
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +260,7 @@ class TestToolExecutorCustomPermissions:
         """Everything allowed when SessionPermissions is maximally permissive."""
         perms = SessionPermissions(
             container=True, network=True,
-            filesystem="full", security="full", execution="full"
+            filesystem="full", system="full", execution="full"
         )
         executor = self._make_executor([NetworkAndFilesystemTool], permissions=perms)
         result = executor._execute_single_tool(
