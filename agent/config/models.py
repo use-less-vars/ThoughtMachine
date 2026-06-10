@@ -61,7 +61,11 @@ class AgentConfig(BaseModel):
     api_key: str = Field(default='', exclude=True)
     base_url: str = 'https://api.deepseek.com'
     model: str = 'deepseek-reasoner'
-    provider_type: Literal['openai_compatible', 'anthropic', 'openai'] = 'openai_compatible'
+    # NOTE: str (not Literal) so that provider plugins registered via
+    # ProviderFactory.register_provider() — e.g. ``mock`` during tests —
+    # are accepted by Pydantic validation.  Runtime validation happens
+    # inside ProviderFactory.create_provider().
+    provider_type: str = 'openai_compatible'
     provider_config: Dict[str, Any] = Field(default_factory=dict)
     provider_id: Optional[str] = Field(default=None, description='Active provider profile id from providers.json')
     model_override: Optional[str] = Field(default=None, description='Override model from the profile (leaves provider_id intact)')
