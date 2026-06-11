@@ -112,16 +112,7 @@ if not exist "%FRONTEND_DIR%\node_modules\" (
     echo(
 )
 
-REM Check npm
-where npm >nul 2>&1
-if errorlevel 1 (
-    echo [ERROR] npm not found.  Install Node.js from https://nodejs.org/
-    pause
-    exit /b 1
-)
-for /f "tokens=*" %%p in ('where npm') do set "TM_NPM_CMD=%%p"
-
-REM ── Verify Vite is installed in node_modules ───────────────────────────
+REM ── Verify Vite binary exists ──────────────────────────────────────────
 if not exist "%FRONTEND_DIR%\node_modules\.bin\vite.cmd" (
     if not exist "%FRONTEND_DIR%\node_modules\vite\bin\vite.js" (
         echo [ERROR] Vite binary not found in node_modules.
@@ -130,6 +121,34 @@ if not exist "%FRONTEND_DIR%\node_modules\.bin\vite.cmd" (
         pause
         exit /b 1
     )
+)
+
+REM ── Start Vite FIRST in its own window ─────────────────────────────────────
+echo   ^> Starting Vite dev server ^(port 5173^) in its own window...
+start "Vite Dev Server" /d "%FRONTEND_DIR%" cmd /k ""%FRONTEND_DIR%\node_modules\.bin\vite.cmd" --host 127.0.0.1"
+
+REM ── Wait for port 5173 (up to 15 s) ────────────────────────────────────────
+echo   ^> Waiting for Vite to start...
+set VITE_READY=
+for /l %%i in (1,1,15) do (
+    timeout /t 1 /nobreak >nul
+    netstat -an 2^>nul | findstr ":5173 " >nul 2>&1
+    if not errorlevel 1 (
+        set VITE_READY=1
+        goto :vite_ready
+    )
+)
+:vite_ready
+if defined VITE_READY (
+    echo   ^> Vite is ready on http://127.0.0.1:5173
+) else (
+    echo(
+    echo  [WARNING] Vite may not have started in time.
+    echo   Check the "Vite Dev Server" window for errors.
+    echo   If it closed, try manually:
+    echo     cd /d "%FRONTEND_DIR%"
+    echo     node_modules\.bin\vite.cmd
+    echo(
 )
 
 REM ── Start backend in background (same window) ──────────────────────────────
@@ -157,33 +176,6 @@ if not defined BACKEND_READY (
     echo   ^> Backend is ready on http://127.0.0.1:8000
 )
 
-REM ── Start Vite in same window (background) ──────────────────────────────────
-echo   ^> Starting Vite dev server ^(port 5173^)...
-start /b "" /d "%FRONTEND_DIR%" "%TM_NPM_CMD%" run dev
-
-REM ── Wait for port 5173 (up to 10 s) ────────────────────────────────────────
-echo   ^> Waiting for Vite to start...
-set VITE_READY=
-for /l %%i in (1,1,10) do (
-    timeout /t 1 /nobreak >nul
-    netstat -an 2^>nul | findstr ":5173 " >nul 2>&1
-    if not errorlevel 1 (
-        set VITE_READY=1
-        goto :vite_ready
-    )
-)
-:vite_ready
-if defined VITE_READY (
-    echo   ^> Vite is ready on http://127.0.0.1:5173
-) else (
-    echo(
-    echo  [WARNING] Vite may not have started in time.
-    echo   Check the "Vite Dev Server" window for errors.
-    echo   If it flashed and closed, try manually:
-    echo     cd /d "%FRONTEND_DIR%"
-    echo     npm run dev
-    echo(
-)
 echo   ^> Press Ctrl+C to stop all servers.
 echo(
 
@@ -204,10 +196,6 @@ echo   Server:  http://127.0.0.1:8000
 echo   Stop:    Ctrl+C
 echo(
 
-where npm >nul 2>&1
-if not errorlevel 1 (
-    for /f "tokens=*" %%p in ('where npm') do set "TM_NPM_CMD=%%p"
-)
 cd /d "%SCRIPT_DIR%"
 "%TM_PYTHON%" -m web_ui.backend.server --serve-frontend
 pause

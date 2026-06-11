@@ -211,7 +211,7 @@ echo [3/5] Installing Python dependencies...
 echo   ..................................................
 
 echo   [Step 1] Upgrading pip...
-python -m pip install --upgrade pip
+"%VENV_DIR%\Scripts\python.exe" -m pip install --upgrade pip
 if errorlevel 1 (
     echo   [x] pip upgrade failed
     echo   Check %LOG% for details
@@ -223,7 +223,7 @@ echo(
 
 echo   [Step 2] Installing core Python packages...
 echo   This can take 2-5 minutes. Download progress shown below:
-pip install -r "%SCRIPT_DIR%requirements.txt"
+"%VENV_DIR%\Scripts\python.exe" -m pip install -r "%SCRIPT_DIR%requirements.txt"
 if errorlevel 1 (
     echo(
     echo   [x] pip install failed. Try:
@@ -238,7 +238,7 @@ if /i "!INSTALL_RAG!"=="true" (
     echo   [Step 3] Installing RAG dependencies ^(sentence-transformers, ChromaDB^)...
     echo   This adds ~500 MB. Download progress shown below:
     if exist "%SCRIPT_DIR%requirements-rag.txt" (
-        pip install -r "%SCRIPT_DIR%requirements-rag.txt"
+        "%VENV_DIR%\Scripts\python.exe" -m pip install -r "%SCRIPT_DIR%requirements-rag.txt"
         if errorlevel 1 (
             echo   [!] RAG install had issues. You can retry later:
             echo       pip install -r requirements-rag.txt
@@ -260,7 +260,7 @@ echo   ..................................................
 if exist "%FRONTEND_DIR%\package.json" (
     pushd "%FRONTEND_DIR%"
     echo   Running npm install ^(may take 1-3 minutes^)...
-    call npm install
+    call npm.cmd install
     if errorlevel 1 (
         echo(
         echo   [x] npm install failed
@@ -273,7 +273,7 @@ if exist "%FRONTEND_DIR%\package.json" (
     echo [5/5] Building frontend...
     echo   ..................................................
     echo   Running npm run build ^(may take 30-60 sec^)...
-    call npm run build
+    call npm.cmd run build
     if errorlevel 1 (
         echo(
         echo   [x] Frontend build failed
