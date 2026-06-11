@@ -153,17 +153,19 @@ if defined VITE_READY (
     echo(
 )
 
-REM ── Start backend in foreground (blocks until Ctrl+C) ─────────────────────
-echo   ^> Starting backend server ^(port 8000^)...
-echo   ^> Press Ctrl+C to stop all servers.
+REM ── Start backend in its own window ───────────────────────────────────────
+echo   ^> Starting backend server ^(port 8000^) in its own window...
+echo   ^> Press Ctrl+C in the Backend Server window to stop.
 echo(
 cd /d "%SCRIPT_DIR%"
-"%TM_PYTHON%" -m web_ui.backend.server
+start "Backend Server" /wait "%TM_PYTHON%" -m web_ui.backend.server
 
-REM ── Cleanup runs after user presses Ctrl+C ────────────────────────────────
+REM ── Cleanup runs after Backend window closes ─────────────────────────────
 echo(
 echo   ^> Shutting down all servers...
 call "%~dp0kill_thoughtmachine.bat" 2>nul
+echo(
+echo   ^> All servers stopped. You may close this window.
 pause
 exit /b %ERRORLEVEL%
 
