@@ -191,7 +191,7 @@ echo(
 
 REM ── Cleanup ────────────────────────────────────────────────────────────────
 echo   ^> Shutting down all servers...
-taskkill /f /fi "IMAGENAME eq python.exe" 2>nul
+call "%~dp0kill_thoughtmachine.bat" 2>nul
 pause
 exit /b %ERRORLEVEL%
 
