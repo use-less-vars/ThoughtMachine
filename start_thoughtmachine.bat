@@ -153,15 +153,43 @@ if defined VITE_READY (
     echo(
 )
 
-REM ── Start backend in its own window ───────────────────────────────────────
-echo   ^> Starting backend server ^(port 8000^) in its own window...
-echo   ^> Press Ctrl+C in the Backend Server window to stop.
-echo(
+REM ── Start backend in background (same window) ──────────────────────────────
+echo   ^> Starting backend server ^(port 8000^)...
 cd /d "%SCRIPT_DIR%"
-start "Backend Server" /wait "%TM_PYTHON%" -m web_ui.backend.server
+start /b "" "%TM_PYTHON%" -m web_ui.backend.server
 
-REM ── Cleanup runs after Backend window closes ─────────────────────────────
+REM ── Wait for port 8000 (up to 15 s) ────────────────────────────────────────
+echo   ^> Waiting for backend to be ready...
+set BACKEND_READY=
+for /l %%i in (1,1,15) do (
+    powershell -Command "Get-NetTCPConnection -LocalPort 8000 -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Listen' }" >nul 2>&1
+    if not errorlevel 1 (
+        set BACKEND_READY=1
+        goto :dev_backend_ready
+    )
+    ping -n 2 127.0.0.1 >nul 2>&1
+)
+:dev_backend_ready
+if not defined BACKEND_READY (
+    echo(
+    echo  [WARNING] Backend may not have started.
+    echo(
+) else (
+    echo   ^> Backend is ready on http://127.0.0.1:8000
+)
+
 echo(
+echo   ^> Vite:      http://127.0.0.1:5173
+echo   ^> Backend:   http://127.0.0.1:8000
+echo   ^> Press Ctrl+C to stop all servers.
+echo(
+
+REM ── Wait for Ctrl+C using PowerShell ───────────────────────────────────────
+REM PowerShell handles Ctrl+C internally — it exits the while loop
+REM and returns to the bat file, avoiding cmd.exe's "Terminate batch job" prompt.
+powershell -NoProfile -Command "while ($true) { Start-Sleep -Seconds 1 }" 2>nul
+
+REM ── Cleanup ────────────────────────────────────────────────────────────────
 echo   ^> Shutting down all servers...
 call "%~dp0kill_thoughtmachine.bat" 2>nul
 echo(
