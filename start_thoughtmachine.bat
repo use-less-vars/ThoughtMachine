@@ -153,45 +153,20 @@ if defined VITE_READY (
     echo(
 )
 
-REM ── Start backend in background (same window) ──────────────────────────────
+REM ── Start backend in foreground ───────────────────────────────────────────
+REM Ctrl+C goes directly to Python, which handles it gracefully
+REM (saves session, runs cleanup handlers), then exits.
+REM After Python exits, the batch file continues to clean up Vite.
 echo   ^> Starting backend server ^(port 8000^)...
+echo   ^> Press Ctrl+C in this window to stop all servers.
+echo(
 cd /d "%SCRIPT_DIR%"
-start /b "" "%TM_PYTHON%" -m web_ui.backend.server
+"%TM_PYTHON%" -m web_ui.backend.server
 
-REM ── Wait for port 8000 (up to 15 s) ────────────────────────────────────────
-echo   ^> Waiting for backend to be ready...
-set BACKEND_READY=
-for /l %%i in (1,1,15) do (
-    powershell -Command "Get-NetTCPConnection -LocalPort 8000 -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Listen' }" >nul 2>&1
-    if not errorlevel 1 (
-        set BACKEND_READY=1
-        goto :dev_backend_ready
-    )
-    ping -n 2 127.0.0.1 >nul 2>&1
-)
-:dev_backend_ready
-if not defined BACKEND_READY (
-    echo(
-    echo  [WARNING] Backend may not have started.
-    echo(
-) else (
-    echo   ^> Backend is ready on http://127.0.0.1:8000
-)
-
+REM ── Cleanup after backend exits ────────────────────────────────────────────
 echo(
-echo   ^> Vite:      http://127.0.0.1:5173
-echo   ^> Backend:   http://127.0.0.1:8000
-echo   ^> Press Ctrl+C to stop all servers.
-echo(
-
-REM ── Wait for Ctrl+C using PowerShell ───────────────────────────────────────
-REM PowerShell handles Ctrl+C internally — it exits the while loop
-REM and returns to the bat file, avoiding cmd.exe's "Terminate batch job" prompt.
-powershell -NoProfile -Command "while ($true) { Start-Sleep -Seconds 1 }" 2>nul
-
-REM ── Cleanup ────────────────────────────────────────────────────────────────
-echo   ^> Shutting down all servers...
-call "%~dp0kill_thoughtmachine.bat" 2>nul
+echo   ^> Backend stopped. Shutting down Vite...
+call "%~dp0kill_thoughtmachine.bat" >nul 2>&1
 echo(
 echo   ^> All servers stopped. You may close this window.
 pause
