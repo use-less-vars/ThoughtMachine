@@ -180,12 +180,17 @@ if not defined BACKEND_READY (
     echo   ^> Backend is ready on http://127.0.0.1:8000
 )
 
-echo   ^> Press Ctrl+C to stop all servers.
+echo   ^> Press Ctrl+C to stop all servers, or close this window.
+echo(
+
+REM ── Wait for user before cleanup ────────────────────────────────────────────
+echo   ^> Press any key to shut down all servers...
+pause >nul
+
 echo(
 
 REM ── Cleanup ────────────────────────────────────────────────────────────────
-echo(
-echo   ^> Shutting down backend server...
+echo   ^> Shutting down all servers...
 taskkill /f /fi "IMAGENAME eq python.exe" 2>nul
 pause
 exit /b %ERRORLEVEL%
