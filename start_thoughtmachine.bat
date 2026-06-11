@@ -131,7 +131,7 @@ REM ── Wait for port 5173 (up to 15 s) ────────────�
 echo   ^> Waiting for Vite to start...
 set VITE_READY=
 for /l %%i in (1,1,15) do (
-    timeout /t 1 /nobreak >nul
+    ping -n 2 127.0.0.1 >nul 2>&1
     netstat -an 2^>nul | findstr ":5173 " >nul 2>&1
     if not errorlevel 1 (
         set VITE_READY=1
@@ -160,7 +160,7 @@ REM ── Wait for port 8000 (up to 15 s) ────────────�
 echo   ^> Waiting for backend to be ready...
 set BACKEND_READY=
 for /l %%i in (1,1,15) do (
-    timeout /t 1 /nobreak >nul
+    ping -n 2 127.0.0.1 >nul 2>&1
     netstat -an 2^>nul | findstr ":8000 " >nul 2>&1
     if not errorlevel 1 (
         set BACKEND_READY=1
