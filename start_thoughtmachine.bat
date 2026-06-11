@@ -131,12 +131,13 @@ REM ── Wait for port 5173 (up to 15 s) ────────────�
 echo   ^> Waiting for Vite to start...
 set VITE_READY=
 for /l %%i in (1,1,15) do (
-    netstat -an 2^>nul | findstr ":5173 " >nul 2>&1
+    REM Use PowerShell to check TCP connection state (works on Win8+)
+    powershell -Command "Get-NetTCPConnection -LocalPort 5173 -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Listen' }" >nul 2>&1
     if not errorlevel 1 (
         set VITE_READY=1
         goto :vite_ready
     )
-    rem 1-second delay if not ready yet
+    REM 1-second delay if not ready yet
     ping -n 2 127.0.0.1 >nul 2>&1
 )
 :vite_ready
@@ -161,12 +162,13 @@ REM ── Wait for port 8000 (up to 15 s) ────────────�
 echo   ^> Waiting for backend to be ready...
 set BACKEND_READY=
 for /l %%i in (1,1,15) do (
-    netstat -an 2^>nul | findstr ":8000 " >nul 2>&1
+    REM Use PowerShell to check TCP connection state (works on Win8+)
+    powershell -Command "Get-NetTCPConnection -LocalPort 8000 -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Listen' }" >nul 2>&1
     if not errorlevel 1 (
         set BACKEND_READY=1
         goto :dev_backend_ready
     )
-    rem 1-second delay if not ready yet
+    REM 1-second delay if not ready yet
     ping -n 2 127.0.0.1 >nul 2>&1
 )
 :dev_backend_ready
@@ -197,6 +199,45 @@ echo   Mode:    PRODUCTION (fresh build from source)
 echo   Server:  http://127.0.0.1:8000
 echo   Stop:    Ctrl+C
 echo(
+
+REM ── Find npm (needed for frontend build) ────────────────────────────────
+set "FRONTEND_DIR=%SCRIPT_DIR%web_ui\frontend"
+where npm >nul 2>&1
+if not errorlevel 1 (
+    for /f "tokens=*" %%p in ('where npm') do set "TM_NPM_CMD=%%p"
+    echo   npm:    !TM_NPM_CMD!
+) else (
+    echo   [x] npm not found in PATH
+    echo(
+    echo   Production mode requires npm to build the frontend.
+    echo   Make sure Node.js is installed, then restart.
+    echo   If you just installed Node.js, start a new terminal.
+    echo(
+    pause
+    exit /b 1
+)
+
+REM ── Verify frontend build prerequisites ─────────────────────────────────
+if not exist "%FRONTEND_DIR%\package.json" (
+    echo   [x] Frontend source not found at %FRONTEND_DIR%
+    echo   Run install_thoughtmachine.bat first.
+    pause
+    exit /b 1
+)
+if not exist "%FRONTEND_DIR%\node_modules\" (
+    echo   [WARNING] node_modules not found — running npm install...
+    pushd "%FRONTEND_DIR%"
+    call npm install
+    if errorlevel 1 (
+        popd
+        echo   [FAIL] npm install failed.
+        pause
+        exit /b 1
+    )
+    popd
+    echo   [+] npm packages installed
+    echo(
+)
 
 cd /d "%SCRIPT_DIR%"
 "%TM_PYTHON%" -m web_ui.backend.server --serve-frontend
