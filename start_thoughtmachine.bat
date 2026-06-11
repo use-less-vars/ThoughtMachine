@@ -153,43 +153,15 @@ if defined VITE_READY (
     echo(
 )
 
-REM ── Start backend in background (same window) ──────────────────────────────
+REM ── Start backend in foreground (blocks until Ctrl+C) ─────────────────────
 echo   ^> Starting backend server ^(port 8000^)...
+echo   ^> Press Ctrl+C to stop all servers.
+echo(
 cd /d "%SCRIPT_DIR%"
-start /b "" "%TM_PYTHON%" -m web_ui.backend.server
+"%TM_PYTHON%" -m web_ui.backend.server
 
-REM ── Wait for port 8000 (up to 15 s) ────────────────────────────────────────
-echo   ^> Waiting for backend to be ready...
-set BACKEND_READY=
-for /l %%i in (1,1,15) do (
-    REM Use PowerShell to check TCP connection state (works on Win8+)
-    powershell -Command "Get-NetTCPConnection -LocalPort 8000 -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Listen' }" >nul 2>&1
-    if not errorlevel 1 (
-        set BACKEND_READY=1
-        goto :dev_backend_ready
-    )
-    REM 1-second delay if not ready yet
-    ping -n 2 127.0.0.1 >nul 2>&1
-)
-:dev_backend_ready
-if not defined BACKEND_READY (
-    echo(
-    echo  [WARNING] Backend may not have started.
-    echo(
-) else (
-    echo   ^> Backend is ready on http://127.0.0.1:8000
-)
-
-echo   ^> Press Ctrl+C to stop all servers, or close this window.
+REM ── Cleanup runs after user presses Ctrl+C ────────────────────────────────
 echo(
-
-REM ── Wait for user before cleanup ────────────────────────────────────────────
-echo   ^> Press any key to shut down all servers...
-pause >nul
-
-echo(
-
-REM ── Cleanup ────────────────────────────────────────────────────────────────
 echo   ^> Shutting down all servers...
 call "%~dp0kill_thoughtmachine.bat" 2>nul
 pause
