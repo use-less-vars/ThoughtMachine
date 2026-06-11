@@ -20,25 +20,15 @@ echo Killing ThoughtMachine processes...
 
 REM ── Kill Vite dev servers (ports 5173-5177) ──────────────────────────────────
 for %%p in (5173 5174 5175 5176 5177) do (
-    REM PowerShell method — more reliable across Windows versions
-    powershell -Command "
-        $proc = Get-NetTCPConnection -LocalPort %%p -ErrorAction SilentlyContinue |
-                Where-Object { $_.State -eq 'Listen' } |
-                Select-Object -First 1;
-        if ($proc) { Stop-Process -Id $proc.OwningProcess -Force -ErrorAction SilentlyContinue }
-    " 2>nul
+    REM Single-line PowerShell — avoids batch multiline parsing errors
+    powershell -Command "$p=Get-NetTCPConnection -LocalPort %%p -ErrorAction SilentlyContinue|Where-Object{$_.State -eq 'Listen'}|Select-Object -First 1;if($p){Stop-Process -Id $p.OwningProcess -Force -ErrorAction SilentlyContinue}" 2>nul
     if not errorlevel 1 (
         echo   Killed process using port %%p
     )
 )
 
 REM ── Kill Python backend (port 8000) ──────────────────────────────────────────
-powershell -Command "
-    $proc = Get-NetTCPConnection -LocalPort 8000 -ErrorAction SilentlyContinue |
-            Where-Object { $_.State -eq 'Listen' } |
-            Select-Object -First 1;
-    if ($proc) { Stop-Process -Id $proc.OwningProcess -Force -ErrorAction SilentlyContinue }
-" 2>nul
+powershell -Command "$p=Get-NetTCPConnection -LocalPort 8000 -ErrorAction SilentlyContinue|Where-Object{$_.State -eq 'Listen'}|Select-Object -First 1;if($p){Stop-Process -Id $p.OwningProcess -Force -ErrorAction SilentlyContinue}" 2>nul
 if not errorlevel 1 (
     echo   Killed python backend using port 8000
 )

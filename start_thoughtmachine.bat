@@ -17,7 +17,7 @@ REM=============================================================================
 setlocal enabledelayedexpansion
 
 REM Kill leftover processes before starting
-call "%~dp0kill_thoughtmachine.bat" 2>nul
+call "%~dp0kill_thoughtmachine.bat" >nul 2>&1
 
 set "SCRIPT_DIR=%~dp0"
 set "VENV_DIR=%SCRIPT_DIR%.venv"
