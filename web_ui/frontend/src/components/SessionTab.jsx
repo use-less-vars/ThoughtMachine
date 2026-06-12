@@ -42,6 +42,7 @@ const INITIAL_STATE = {
   contextLength: 0,
   isRunning: false,
   config: null,
+  workspaceId: null,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -354,6 +355,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         if (msg.session_id) {
           setCurrentSessionId(msg.session_id)
         }
+        // Capture workspace_id for the WorkspacePanel
+        if (msg.workspace_id) {
+          update({ workspaceId: msg.workspace_id })
+        }
         // If this is a new session (tab had no sessionId), notify parent
         if (msg.session_id && !sessionId) {
           onNewSession?.(msg.session_id, msg.session_name)
@@ -480,6 +485,8 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           availableTools={availableTools}
           panelWidth={configPanelWidth}
           wsConnected={wsConnected}
+          workspaceId={state.workspaceId}
+          sessionId={currentSessionId}
           defaultConfigSaveStatus={defaultConfigSaveStatus}
           defaultConfigSaveMessage={defaultConfigSaveMessage}
           onClearDefaultSaveStatus={() => {

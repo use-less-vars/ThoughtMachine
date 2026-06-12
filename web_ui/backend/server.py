@@ -64,7 +64,7 @@ Server → Client (JSON):
     status_message      { "type": "status_message",      "text": "..." }
     sessions_list       { "type": "sessions_list",       "sessions": [...] }
     session_saved       { "type": "session_saved",       "session": {...} }
-    session_loaded      { "type": "session_loaded",      "session_id": "...", "session_name": "...", "message_count": int }
+    session_loaded      { "type": "session_loaded",      "session_id": "...", "session_name": "...", "message_count": int, "workspace_id": "..." }
     session_deleted     { "type": "session_deleted",     "session_id": "..." }
     session_renamed     { "type": "session_renamed",     "session_id": "...", "new_name": "..." }
     open_sessions_list  { "type": "open_sessions_list",  "session_ids": ["..."] }
@@ -805,6 +805,7 @@ async def websocket_endpoint(ws: WebSocket):
                         await ws.send_json({
                             "type": "session_loaded",
                             "session_id": session_id,
+                            "workspace_id": bridge.workspace_id,
                         })
                         await ws.send_json({
                             "type": "state_changed",
@@ -989,6 +990,7 @@ async def websocket_endpoint(ws: WebSocket):
                         "type": "session_loaded",
                         "session_id": new_session.session_id,
                         "session_name": new_session.metadata.get('name', ''),
+                        "workspace_id": bridge._workspace_id,
                     })
                     await ws.send_json({
                         "type": "state_changed",

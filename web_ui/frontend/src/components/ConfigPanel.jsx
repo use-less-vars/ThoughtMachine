@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import ManageProvidersModal from './ManageProvidersModal';
 import ContainerPanelContent from './ContainerPanel';
+import WorkspacePanel from './WorkspacePanel';
 
 // ── Directory Browser sub-component ──────────────────────────────────────
 function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect, setLoading, setEntries, setError }) {
@@ -167,7 +168,7 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
 }
 
 
-function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, defaultConfigSaveMessage, onClearDefaultSaveStatus }) {
+function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, defaultConfigSaveMessage, onClearDefaultSaveStatus, workspaceId, sessionId }) {
   const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error'
   const [showManageProviders, setShowManageProviders] = useState(false);
   const [providerVersion, setProviderVersion] = useState(0);  // incremented when a provider is saved
@@ -349,8 +350,8 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
     color: '#a6adc8',
   };
 
-  const TAB_KEYS = ['general', 'model', 'tools', 'permissions', 'container', 'system_prompt', 'advanced'];  // container tab placeholder
-  const TAB_LABELS = { general: 'General', model: 'Model', tools: 'Tools', permissions: 'Permissions', container: 'Container', system_prompt: 'Prompt', advanced: 'Advanced' };
+  const TAB_KEYS = ['general', 'model', 'tools', 'permissions', 'container', 'workspace', 'system_prompt', 'advanced'];  // container tab placeholder
+  const TAB_LABELS = { workspace: 'Workspace', general: 'General', model: 'Model', tools: 'Tools', permissions: 'Permissions', container: 'Container', system_prompt: 'Prompt', advanced: 'Advanced' };
 
   return (
     <div style={{ padding: '1rem', fontFamily: 'sans-serif', background: '#313244', color: '#cdd6f4', width: panelWidth || 280, minWidth: 200, maxWidth: 500, flexShrink: 0, overflowY: 'auto', height: '100%' }}>
@@ -376,6 +377,11 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
           </button>
         ))}
       </div>
+
+      {/* ── Workspace Tab ──────────────────────────────────────────── */}
+      {activeTab === 'workspace' && (
+        <WorkspacePanel workspaceId={workspaceId} sessionId={sessionId} />
+      )}
 
       {/* ── General Tab ──────────────────────────────────────────────── */}
       {activeTab === 'general' && (

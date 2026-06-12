@@ -1,0 +1,351 @@
+import React, { useState, useEffect, useCallback } from 'react';
+
+// ── Catppuccin palette matching ConfigPanel ──────────────────────────────
+const inputStyle = {
+  background: '#1e1e2e',
+  color: '#cdd6f4',
+  border: '1px solid #585b70',
+  borderRadius: '4px',
+  padding: '0.4rem 0.5rem',
+  fontSize: '0.85rem',
+  width: '100%',
+  boxSizing: 'border-box',
+  outline: 'none',
+};
+
+const labelStyle = {
+  display: 'block',
+  marginBottom: '0.25rem',
+  fontSize: '0.85rem',
+  color: '#a6adc8',
+};
+
+const sectionStyle = {
+  marginBottom: '1.25rem',
+};
+
+// ── Permission pill color map ────────────────────────────────────────────
+const PILL_COLORS = {
+  full:   { bg: '#a6e3a1', fg: '#1e1e2e', label: 'Full' },
+  write:  { bg: '#a6e3a1', fg: '#1e1e2e', label: 'Write' },
+  read:   { bg: '#89b4fa', fg: '#1e1e2e', label: 'Read' },
+  ask:    { bg: '#f9e2af', fg: '#1e1e2e', label: 'Ask' },
+  banned: { bg: '#f38ba8', fg: '#1e1e2e', label: 'Banned' },
+  true:   { bg: '#a6e3a1', fg: '#1e1e2e', label: 'Enabled' },
+  false:  { bg: '#f38ba8', fg: '#1e1e2e', label: 'Disabled' },
+};
+
+function getPill(value) {
+  const key = String(value);
+  return PILL_COLORS[key] || { bg: '#6c7086', fg: '#cdd6f4', label: key };
+}
+
+function PermissionPill({ name, value }) {
+  const p = getPill(value);
+  return (
+    <span
+      style={{
+        display: 'inline-block',
+        background: p.bg,
+        color: p.fg,
+        borderRadius: '12px',
+        padding: '0.15rem 0.6rem',
+        fontSize: '0.75rem',
+        fontWeight: 600,
+        marginRight: '0.35rem',
+        marginBottom: '0.25rem',
+        whiteSpace: 'nowrap',
+      }}
+      title={`${name}: ${value}`}
+    >
+      {name}: {p.label}
+    </span>
+  );
+}
+
+// ── Section: Dockerfile ──────────────────────────────────────────────────
+function DockerfileSection({ workspaceId }) {
+  const [content, setContent] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    if (!workspaceId) return;
+    setLoading(true);
+    setError('');
+    fetch(`/api/workspace/${workspaceId}/dockerfile`)
+      .then(async (res) => {
+        if (!res.ok) {
+          if (res.status === 404) {
+            setContent('(No custom Dockerfile)');
+            return;
+          }
+          throw new Error(`HTTP ${res.status}`);
+        }
+        setContent(await res.text());
+      })
+      .catch((err) => setError(err.message))
+      .finally(() => setLoading(false));
+  }, [workspaceId]);
+
+  if (loading) return <div style={{ color: '#6c7086', fontSize: '0.85rem' }}>Loading Dockerfile…</div>;
+  if (error) return <div style={{ color: '#f38ba8', fontSize: '0.85rem' }}>Error: {error}</div>;
+
+  return (
+    <pre
+      style={{
+        ...inputStyle,
+        fontFamily: 'monospace',
+        fontSize: '0.75rem',
+        lineHeight: '1.4',
+        overflow: 'auto',
+        maxHeight: '200px',
+        whiteSpace: 'pre-wrap',
+        wordBreak: 'break-all',
+        margin: 0,
+      }}
+    >
+      {content}
+    </pre>
+  );
+}
+
+// ── Section: Domain Allowlist ────────────────────────────────────────────
+function DomainAllowlistSection({ workspaceId }) {
+  const [domains, setDomains] = useState([]);
+  const [text, setText] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState('');
+
+  useEffect(() => {
+    if (!workspaceId) return;
+    setLoading(true);
+    fetch(`/api/workspace/${workspaceId}/domain_allowlist`)
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        setDomains(Array.isArray(data) ? data : []);
+      })
+      .catch(() => setDomains([]))
+      .finally(() => setLoading(false));
+  }, [workspaceId]);
+
+  useEffect(() => {
+    setText(domains.join('\n'));
+  }, [domains]);
+
+  const handleSave = useCallback(async () => {
+    const list = text
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    setSaveError('');
+    setSaving(true);
+    try {
+      const res = await fetch(`/api/workspace/${workspaceId}/domain_allowlist`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domains: list }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setDomains(list);
+      setSaved(true);
+      setSaveError('');
+      setTimeout(() => setSaved(false), 2000);
+    } catch (err) {
+      setSaveError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  }, [workspaceId, text]);
+
+  if (loading) return <div style={{ color: '#6c7086', fontSize: '0.85rem' }}>Loading domain allowlist…</div>;
+
+  return (
+    <div>
+      <textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        rows={5}
+        style={{
+          ...inputStyle,
+          fontFamily: 'monospace',
+          fontSize: '0.8rem',
+          resize: 'vertical',
+          marginBottom: '0.4rem',
+        }}
+        placeholder="one domain per line, e.g.&#10;*.github.com&#10;api.openai.com"
+      />
+      {saveError && (
+        <div style={{ color: '#f38ba8', fontSize: '0.8rem', marginBottom: '0.4rem' }}>
+          Error: {saveError}
+        </div>
+      )}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+        <button
+          onClick={handleSave}
+          disabled={saving}
+          style={{
+            background: saved ? '#a6e3a1' : '#89b4fa',
+            color: '#1e1e2e',
+            border: 'none',
+            borderRadius: '4px',
+            padding: '0.3rem 0.75rem',
+            cursor: saving ? 'wait' : 'pointer',
+            fontWeight: 600,
+            fontSize: '0.8rem',
+          }}
+        >
+          {saving ? 'Saving…' : saved ? '✓ Saved' : 'Save'}
+        </button>
+        <small style={{ color: '#6c7086', fontSize: '0.75rem' }}>
+          {domains.length} domain{domains.length !== 1 ? 's' : ''}
+        </small>
+      </div>
+    </div>
+  );
+}
+
+// ── Section: Workers ─────────────────────────────────────────────────────
+function WorkersSection({ workspaceId }) {
+  const [workers, setWorkers] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const fetchWorkers = useCallback(() => {
+    if (!workspaceId) return;
+    setLoading(true);
+    fetch(`/api/workspace/${workspaceId}/workers`)
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        setWorkers(Array.isArray(data) ? data : []);
+      })
+      .catch(() => setWorkers([]))
+      .finally(() => setLoading(false));
+  }, [workspaceId]);
+
+  useEffect(() => {
+    fetchWorkers();
+    const interval = setInterval(fetchWorkers, 10000);
+    return () => clearInterval(interval);
+  }, [fetchWorkers]);
+
+  if (loading) return <div style={{ color: '#6c7086', fontSize: '0.85rem' }}>Loading workers…</div>;
+  if (workers.length === 0) return <div style={{ color: '#6c7086', fontSize: '0.85rem' }}>No workers running.</div>;
+
+  return (
+    <ul style={{ listStyle: 'none', margin: 0, padding: 0 }}>
+      {workers.map((w, i) => (
+        <li
+          key={w.name || i}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.5rem',
+            padding: '0.3rem 0',
+            fontSize: '0.85rem',
+            color: '#cdd6f4',
+            borderBottom: i < workers.length - 1 ? '1px solid #45475a' : 'none',
+          }}
+        >
+          <span
+            style={{
+              width: 8,
+              height: 8,
+              borderRadius: '50%',
+              background: w.status === 'running' ? '#a6e3a1' : w.status === 'idle' ? '#f9e2af' : '#f38ba8',
+              display: 'inline-block',
+              flexShrink: 0,
+            }}
+          />
+          <span style={{ fontWeight: 500 }}>{w.name}</span>
+          <span style={{ color: '#6c7086', fontSize: '0.75rem' }}>({w.type || w.status || 'unknown'})</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+// ── Section: Effective Permissions ───────────────────────────────────────
+function EffectivePermissionsSection({ workspaceId, sessionId }) {
+  const [perms, setPerms] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!workspaceId) return;
+    setLoading(true);
+    const params = new URLSearchParams();
+    if (sessionId) params.set('session_id', sessionId);
+    fetch(`/api/workspace/${workspaceId}/effective_permissions?${params}`)
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        setPerms(await res.json());
+      })
+      .catch(() => setPerms(null))
+      .finally(() => setLoading(false));
+  }, [workspaceId, sessionId]);
+
+  if (loading) return <div style={{ color: '#6c7086', fontSize: '0.85rem' }}>Loading effective permissions…</div>;
+  if (!perms) return <div style={{ color: '#f38ba8', fontSize: '0.85rem' }}>Failed to load effective permissions.</div>;
+
+  const ep = perms.effective_permissions || {};
+  const categories = ['filesystem', 'network', 'git', 'system', 'execution', 'container'];
+
+  return (
+    <div>
+      {categories.map((cat) => {
+        if (cat in ep) {
+          return <PermissionPill key={cat} name={cat.charAt(0).toUpperCase() + cat.slice(1)} value={ep[cat]} />;
+        }
+        return null;
+      })}
+    </div>
+  );
+}
+
+// ── Main WorkspacePanel ──────────────────────────────────────────────────
+export default function WorkspacePanel({ workspaceId, sessionId }) {
+  if (!workspaceId) {
+    return (
+      <div style={{ color: '#6c7086', fontSize: '0.85rem', padding: '1rem 0', textAlign: 'center' }}>
+        No workspace loaded.
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {/* Dockerfile */}
+      <div style={sectionStyle}>
+        <label style={labelStyle}><strong>Dockerfile</strong></label>
+        <DockerfileSection workspaceId={workspaceId} />
+      </div>
+
+      {/* Domain Allowlist */}
+      <div style={sectionStyle}>
+        <label style={labelStyle}><strong>Domain Allowlist</strong></label>
+        <small style={{ color: '#6c7086', fontSize: '0.75rem', display: 'block', marginBottom: '0.3rem' }}>
+          One domain per line. Wildcards supported (e.g. *.example.com).
+        </small>
+        <DomainAllowlistSection workspaceId={workspaceId} />
+      </div>
+
+      {/* Workers */}
+      <div style={sectionStyle}>
+        <label style={labelStyle}><strong>Workers</strong></label>
+        <WorkersSection workspaceId={workspaceId} />
+      </div>
+
+      {/* Effective Permissions */}
+      <div style={sectionStyle}>
+        <label style={labelStyle}><strong>Effective Permissions</strong></label>
+        <small style={{ color: '#6c7086', fontSize: '0.75rem', display: 'block', marginBottom: '0.3rem' }}>
+          Merged session + workspace capabilities.
+        </small>
+        <EffectivePermissionsSection workspaceId={workspaceId} sessionId={sessionId} />
+      </div>
+    </div>
+  );
+}
