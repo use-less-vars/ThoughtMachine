@@ -2290,3 +2290,11 @@ A three-layer system ensuring Docker containers match their expected security co
 - ContainerPanel polls both `/api/container/status` and `/api/container/integrity` on the same 5s interval.
 - Real-Docker test variant uses `pytest.mark.skipif` with Docker daemon ping to conditionally run.
 
+
+## 2026-06-12 — ## Windows Installation Saga Documented
+
+Generated `docs/win...
+
+## Windows Installation Saga Documented
+
+Generated `docs/windows_installation_saga.md` — a reverse‑engineered journey document covering all 30 commits of the Windows install-and-run saga. Covers: pre‑Windows fixes (circular deps, session config loss, graceful shutdown), cross‑platform file locking, the 4‑attempt venv activation struggle, Vite positioning debate (separate window → same window → pre-flight checks), the big refactor (Vite‑first launch, direct binaries), cleanup evolution, wait strategy evolution (timeout→ping→PowerShell→user input), and the Ctrl+C saga (separate window→PowerShell handler→syntax fix→foreground fix). Documents 6 key design principles discovered.
