@@ -195,6 +195,24 @@ try:
 except ImportError as e:
     logger.warning(f"Failed to import Thought: {e}")
 
+try:
+    from .workspace.check_system import CheckSystem
+    TOOL_CLASSES.append(CheckSystem)
+except ImportError as e:
+    logger.warning(f"Failed to import CheckSystem: {e}")
+
+try:
+    from .workspace.worker import Worker
+    TOOL_CLASSES.append(Worker)
+except ImportError as e:
+    logger.warning(f"Failed to import Worker: {e}")
+
+try:
+    from .workspace.edit_dockerfile import EditDockerfile
+    TOOL_CLASSES.append(EditDockerfile)
+except ImportError as e:
+    logger.warning(f"Failed to import EditDockerfile: {e}")
+
 # MCP tools are registered lazily via register_mcp_tools() when the agent starts.
 # Do NOT call register_mcp_tools() here - it starts MCP server subprocesses
 # which can hang if servers are unavailable (see bug #BUG001).
