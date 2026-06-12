@@ -664,7 +664,7 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>Git</strong></label>
             <select
-              value={draft.session_permissions?.git ?? 'write'}
+              value={draft.session_permissions?.git ?? 'read'}
               onChange={(e) => setDraft({
                 ...draft,
                 session_permissions: { ...draft.session_permissions, git: e.target.value }
@@ -678,30 +678,28 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
               <option value="ask" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Ask</option>
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
-              Access level for Git operations. "Ask" prompts for approval on each operation.
+              Access level for Git operations. "Ask" prompts for approval on each write operation (commit, push, pull, etc.).
             </small>
           </div>
 
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>System</strong></label>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginTop: '0.3rem' }}>
-              <label className="toggle-switch">
-                <input
-                  type="checkbox"
-                  checked={draft.session_permissions?.system ?? true}
-                  onChange={(e) => setDraft({
-                    ...draft,
-                    session_permissions: { ...draft.session_permissions, system: e.target.checked }
-                  })}
-                />
-                <span className="toggle-slider"></span>
-              </label>
-              <span style={{ fontSize: '0.85rem', color: draft.session_permissions?.system ? '#a6e3a1' : '#f38ba8' }}>
-                {draft.session_permissions?.system ? 'Enabled' : 'Disabled'}
-              </span>
-            </div>
+            <select
+              value={draft.session_permissions?.system ?? 'read'}
+              onChange={(e) => setDraft({
+                ...draft,
+                session_permissions: { ...draft.session_permissions, system: e.target.value }
+              })}
+              style={inputStyle}
+            >
+              <option value="full" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Full</option>
+              <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
+              <option value="read" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Read</option>
+              <option value="ask" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Ask</option>
+              <option value="banned" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Banned</option>
+            </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
-              Access to system-level operations.
+              Controls access to system-level operations (environment inspection, process management). "Ask" prompts for approval on each write operation.
             </small>
           </div>
 
@@ -715,12 +713,14 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
               })}
               style={inputStyle}
             >
-              <option value="banned" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Banned</option>
-              <option value="ask" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Ask</option>
+              <option value="full" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Full</option>
               <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
+              <option value="read" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Read</option>
+              <option value="ask" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Ask</option>
+              <option value="banned" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Banned</option>
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
-              Allow the agent to run commands and code in the sandbox.
+              Allow the agent to spawn background/child processes (experimental).
             </small>
           </div>
 
