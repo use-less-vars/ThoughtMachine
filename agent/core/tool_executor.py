@@ -212,7 +212,7 @@ class ToolExecutor:
             except ValidationError as e:
                 # Provide LLM-friendly error with valid field names
                 try:
-                    infra_fields = {"workspace_path", "token_limit", "is_docker", "container_workspace_path", "tool"}
+                    infra_fields = {"workspace_path", "token_limit", "is_docker", "container_workspace_path", "tool", "agent_config", "session_permissions"}
                     valid_fields = [f for f in valid_field_names if f not in infra_fields]
                     valid_fields_str = ', '.join(valid_fields)
                     return {'result': f'Invalid arguments: {e}\n\nValid fields: {valid_fields_str}', 'tool_type': 'normal'}
@@ -254,6 +254,19 @@ class ToolExecutor:
                 tool_args['session_permissions'] = session_perms_obj.to_dict()
             else:
                 tool_args['session_permissions'] = DEFAULT_SESSION_PERMISSIONS
+
+            # Inject agent config for introspection tools
+            if hasattr(self, 'config') and self.config is not None:
+                tool_args['agent_config'] = {
+                    'temperature': getattr(self.config, 'temperature', None),
+                    'max_turns': getattr(self.config, 'max_turns', None),
+                    'provider': getattr(self.config, 'provider', None),
+                    'model': getattr(self.config, 'model', None),
+                    'tool_output_token_limit': getattr(self.config, 'tool_output_token_limit', None),
+                }
+            else:
+                tool_args['agent_config'] = None
+
             tool_instance = tool_class(**tool_args)
             if self.logger:
                 if hasattr(self.logger, 'py_logger'):
