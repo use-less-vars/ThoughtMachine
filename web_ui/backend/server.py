@@ -98,6 +98,8 @@ from agent.logging import log
 from contextlib import asynccontextmanager
 from session.store import FileSystemSessionStore
 
+from web_ui.backend.workspace_routes import router as workspace_router
+
 # Ensure project root is on sys.path
 _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _project_root not in sys.path:
@@ -1133,6 +1135,11 @@ async def websocket_endpoint(ws: WebSocket):
             except ValueError:
                 pass
             bridge.stop()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Register workspace REST router ────────────────────────────────────────
+app.include_router(workspace_router)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

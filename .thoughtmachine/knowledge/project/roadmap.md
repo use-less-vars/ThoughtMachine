@@ -348,3 +348,17 @@ A slide-in panel (similar to VS Code's sidebar) that gives the user full visibil
 - **Knowledge Base browser** — a browsable view of the knowledge base, laid out like a "book" with sections, chapters, and search — letting the user flip through architecture docs, bug logs, lessons learned, etc. in a readable, non-linear way
 - **Session context** — current session metadata, token usage, attached files, active config
 - **Environment info** — OS, runtime versions, environment variables
+
+## Phase 2
+
+## 2026-06-12 — 🎉 **Phase 2 Complete** (2025-04-11): Workspace config files ...
+
+🎉 **Phase 2 Complete** (2025-04-11): Workspace config files REST API is fully implemented.
+- `GET/PUT /api/workspace/{ws_id}/domain_allowlist` (with atomic write)
+- `GET /api/workspace/{ws_id}/dockerfile` (from workspace dir)
+- `GET /api/workspace/{ws_id}/workers` (empty JSON)
+- `GET /api/workspace/{ws_id}/mcp_servers` (empty JSON)
+- `GET /api/workspace/{ws_id}/effective_permissions` (with session permission merging & fallback)
+- `ensure_workspace_dirs()` creates all config files idempotently
+- 18 tests covering bootstrap + API endpoints all passing
+

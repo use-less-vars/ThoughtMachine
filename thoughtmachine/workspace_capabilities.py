@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -212,26 +213,46 @@ def resolve_workspace_id(workspace_path: str) -> Optional[str]:
     return None
 
 
+def _resources_dir() -> Path:
+    """Return the absolute path to the project-level ``resources/`` directory.
+
+    Uses ``importlib.resources.files`` to locate the ``thoughtmachine`` package,
+    then resolves ``../resources/`` relative to it.  This works both during
+    development and after ``pip install`` (package data).
+    """
+    import importlib.resources as pkg_resources
+
+    pkg_path = pkg_resources.files("thoughtmachine")
+    return Path(str(pkg_path)).resolve().parent / "resources"
+
+
 def ensure_workspace_dirs(workspace_id: str) -> List[str]:
     """
-    Bootstrap a workspace's subdirectory structure.
+    Bootstrap a workspace's subdirectory structure and default files.
 
     Creates ``~/.thoughtmachine/workspaces/{workspace_id}/`` with standard
-    subdirectories (``sessions/``, ``state/``, ``knowledge/``) and writes a
-    default capabilities file if one does not already exist.
+    subdirectories (``sessions/``, ``state/``, ``knowledge/``) and idempotently
+    creates the following default files **if they do not already exist**:
 
-    Returns a list of created paths.
+    * ``capabilities.json`` — fully permissive workspace capabilities
+    * ``Dockerfile`` — copied from ``resources/default_dockerfile.txt``
+    * ``domain_allowlist.json`` — empty JSON array ``[]``
+    * ``workers.json`` — empty JSON array ``[]``
+    * ``mcp_servers.json`` — empty JSON array ``[]``
+
+    Returns a list of created paths (directories and files).
     """
     base = _workspace_dir(workspace_id)
     created: List[str] = []
 
+    # ── Subdirectories ───────────────────────────────────────────────────
     for subdir in ("", "sessions", "state", "knowledge"):
         target = base / subdir
         if not target.exists():
             target.mkdir(parents=True, exist_ok=True)
             created.append(str(target))
 
-    # Write default capabilities if not present
+    # ── Default capabilities ─────────────────────────────────────────────
     caps_path = base / "capabilities.json"
     if not caps_path.exists():
         caps_path.write_text(
@@ -239,5 +260,32 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
             encoding="utf-8",
         )
         created.append(str(caps_path))
+
+    # ── Dockerfile (copy from resources/default_dockerfile.txt) ───────────
+    dockerfile_path = base / "Dockerfile"
+    if not dockerfile_path.exists():
+        resources_root = _resources_dir()
+        src_dockerfile = resources_root / "default_dockerfile.txt"
+        if src_dockerfile.exists():
+            shutil.copy2(str(src_dockerfile), str(dockerfile_path))
+            created.append(str(dockerfile_path))
+
+    # ── domain_allowlist.json (empty array) ───────────────────────────────
+    domain_allowlist_path = base / "domain_allowlist.json"
+    if not domain_allowlist_path.exists():
+        domain_allowlist_path.write_text("[]", encoding="utf-8")
+        created.append(str(domain_allowlist_path))
+
+    # ── workers.json (empty array) ────────────────────────────────────────
+    workers_path = base / "workers.json"
+    if not workers_path.exists():
+        workers_path.write_text("[]", encoding="utf-8")
+        created.append(str(workers_path))
+
+    # ── mcp_servers.json (empty array) ────────────────────────────────────
+    mcp_servers_path = base / "mcp_servers.json"
+    if not mcp_servers_path.exists():
+        mcp_servers_path.write_text("[]", encoding="utf-8")
+        created.append(str(mcp_servers_path))
 
     return created
