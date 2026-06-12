@@ -38,6 +38,11 @@ class ToolBase(BaseModel):
         description='Session permissions dict injected by ToolExecutor.',
     )
 
+    # Agent config dict injected by ToolExecutor before execute().
+    # Contains runtime-observable settings such as temperature, max_turns,
+    # provider, model, tool_output_token_limit, and workspace_path.
+    agent_config: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
+
     # Security capabilities required by this tool
     requires_capabilities: ClassVar[List[str]] = []
 
