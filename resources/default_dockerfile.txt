@@ -1,0 +1,7 @@
+FROM python:3.11-slim
+RUN useradd -m -s /bin/bash agent
+USER agent
+WORKDIR /workspace
+COPY . .
+RUN pip install --no-cache-dir -r requirements.txt || true
+CMD ["python", "main.py"]
