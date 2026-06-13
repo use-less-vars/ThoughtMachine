@@ -200,6 +200,9 @@ class AgentController:
                 else None
             )
             self.query_queue.put(query)
+            # Daemon thread: if the agent hangs on a long LLM call during
+            # shutdown, this allows the process to still exit without waiting.
+            # The 5-second join in shutdown() is best-effort graceful exit.
             self.thread = threading.Thread(target=self._run, daemon=True)
             # _running will be set to True by _run() after Agent() succeeds
             log('DEBUG', 'core.controller',
@@ -289,6 +292,9 @@ class AgentController:
         self._session = session
         self.current_session_id = session.session_id if session is not None else None
         self.query_queue.put(query)
+        # Daemon thread: if the agent hangs on a long LLM call during
+        # shutdown, this allows the process to still exit without waiting.
+        # The 5-second join in shutdown() is best-effort graceful exit.
         self.thread = threading.Thread(target=self._run, daemon=True)
         # _running will be set to True by _run() after Agent() succeeds
         log('DEBUG', 'core.controller', 'start(): thread starting')
@@ -649,6 +655,10 @@ class AgentController:
                 if query == '[RESET]':
                     agent.reset()
                     continue
+                if query == '[STOP]':
+                    log('DEBUG', 'core.controller',
+                        'Received [STOP] in main loop, breaking')
+                    break
                 log('INFO', 'core.controller', f'Processing query: {query[:80]!r}...')
                 self._processing_query = True
                 stop_reason = None
