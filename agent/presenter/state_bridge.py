@@ -89,8 +89,10 @@ class StateBridge:
 
         Before persisting, the ``system_prompt`` value is extracted and
         written to ``~/.thoughtmachine/custom_system_prompt.txt`` (or the file
-        is removed if the value is ``None`` / empty).  This keeps the JSON
-        config clean and avoids confusion between the two storage locations.
+        is removed if the value is ``None`` / empty, or if the value matches
+        the factory-default prompt from ``resources/default_system_prompt.txt``).
+        This keeps the JSON config clean and avoids confusion between the two
+        storage locations.
         """
         config_to_save = config or self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
         save_path = path or self.config_path
@@ -99,10 +101,24 @@ class StateBridge:
         system_prompt = config_to_save.pop('system_prompt', None)
         custom_path = Path(config_loader.CUSTOM_SYSTEM_PROMPT_PATH)
         if system_prompt and system_prompt.strip():
-            custom_path.parent.mkdir(parents=True, exist_ok=True)
-            custom_path.write_text(system_prompt.strip() + '\n', encoding='utf-8')
-            log('DEBUG', 'presenter.state_bridge',
-                f'Wrote system prompt to {custom_path}')
+            prompt_stripped = system_prompt.strip()
+            # If the prompt matches the factory default, treat it as
+            # "reset to default" — delete the custom file so the
+            # validator falls through to the file-based default.
+            factory_default = config_loader.load_default_system_prompt_text()
+            if prompt_stripped == factory_default.strip():
+                try:
+                    custom_path.unlink(missing_ok=True)
+                except (IOError, OSError) as exc:
+                    log('WARNING', 'presenter.state_bridge',
+                        f'Could not remove {custom_path}: {exc}')
+                log('DEBUG', 'presenter.state_bridge',
+                    f'System prompt matches factory default — removed custom file at {custom_path}')
+            else:
+                custom_path.parent.mkdir(parents=True, exist_ok=True)
+                custom_path.write_text(prompt_stripped + '\n', encoding='utf-8')
+                log('DEBUG', 'presenter.state_bridge',
+                    f'Wrote system prompt to {custom_path}')
         else:
             # No custom prompt → remove the file so the validator falls
             # through to the factory default.
