@@ -182,6 +182,17 @@ class Agent:
         new_config = self._pending_config
         old_config = self.config  # Capture pre-application config for diff
 
+        # ── Early return if config is semantically unchanged ──────────────
+        # Prevents spurious "config updated" notifications on every query
+        # when the frontend re-sends an identical config.
+        if self._configs_are_identical(old_config, new_config):
+            log('DEBUG', 'agent.core',
+                f'Skipping no-op config update: pending config is identical '
+                f'to current config (provider={new_config.provider_type}, '
+                f'model={new_config.model})')
+            self._pending_config = None
+            return True
+
         if self._can_hot_swap(new_config):
             self._hot_swap(new_config)
             self._pending_config = None
@@ -207,6 +218,40 @@ class Agent:
                 self._pending_config = None
                 self._notify_config_change(old_config, new_config)
             return success
+
+    def _configs_are_identical(self, config_a: 'AgentConfig', config_b: 'AgentConfig') -> bool:
+        """Compare two AgentConfig instances field-by-field for semantic equality.
+
+        Excludes fields that are sensitive (api_key) or non-comparable (stop_check).
+        Treats None and empty string as equivalent for Optional[str] fields.
+
+        This prevents spurious "config updated" notifications when the
+        frontend re-sends a config that is semantically identical.
+        """
+        # Fields to exclude from comparison
+        excluded_fields = {'api_key', 'stop_check'}
+
+        for field_name in type(config_a).model_fields:
+            if field_name in excluded_fields:
+                continue
+
+            old_val = getattr(config_a, field_name)
+            new_val = getattr(config_b, field_name)
+
+            # Normalize None vs "" for string fields to avoid trivial mismatches
+            if isinstance(old_val, str) and old_val == '':
+                old_val = None
+            if isinstance(new_val, str) and new_val == '':
+                new_val = None
+
+            if old_val != new_val:
+                log('DEBUG', 'agent.core',
+                    f'Config field "{field_name}" differs: '
+                    f'old={type(old_val).__name__}({repr(old_val)[:60]}) '
+                    f'!= new={type(new_val).__name__}({repr(new_val)[:60]})')
+                return False
+
+        return True
 
     def _notify_config_change(self, old_config, new_config) -> None:
         """Add a system notification describing the config changes that were applied.

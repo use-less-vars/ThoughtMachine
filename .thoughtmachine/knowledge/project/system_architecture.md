@@ -2298,3 +2298,49 @@ Generated `docs/win...
 ## Windows Installation Saga Documented
 
 Generated `docs/windows_installation_saga.md` — a reverse‑engineered journey document covering all 30 commits of the Windows install-and-run saga. Covers: pre‑Windows fixes (circular deps, session config loss, graceful shutdown), cross‑platform file locking, the 4‑attempt venv activation struggle, Vite positioning debate (separate window → same window → pre-flight checks), the big refactor (Vite‑first launch, direct binaries), cleanup evolution, wait strategy evolution (timeout→ping→PowerShell→user input), and the Ctrl+C saga (separate window→PowerShell handler→syntax fix→foreground fix). Documents 6 key design principles discovered.
+
+## 2026-06-13 — ## 2026-06-12: Workspace bootstrap architecture verified
+
+##...
+
+## 2026-06-12: Workspace bootstrap architecture verified
+
+### Directory layout
+- `~/.thoughtmachine/` — top-level user data directory (created by `bootstrap.py::ensure_user_defaults()`)
+  - `sessions/`, `state/`, `knowledge/`, `worker_templates/` — created at **top level only** by `bootstrap.py`
+  - `workspaces/{id}/` — per-workspace config directory (created by `ensure_workspace_dirs()`)
+    - Only 5 files: `capabilities.json`, `Dockerfile`, `domain_allowlist.json`, `workers.json`, `mcp_servers.json`
+    - **No subdirectories** (sessions/, state/, knowledge/ are **not** created here)
+
+### Verification results (2026-06-12)
+1. **Code audit**: Zero remaining mkdir calls targeting workspace config subdirectories
+2. **Fresh bootstrap simulation**: Only 5 files created, no subdirectories, safeguard warns on extras
+3. **Test suite**: 56/56 passed (workspace API, bootstrap, tools, trust toggle tests)
+
+All pre-existing failures are environment-specific (missing packages), not related to workspace code.
+
+## 2026-06-13 — ## 2026-06-12 — System prompt updated with explicit Agent/Ho...
+
+## 2026-06-12 — System prompt updated with explicit Agent/Host/Docker architecture
+
+**File:** `resources/default_system_prompt.txt`
+
+**What changed:**
+1. Added **Architecture (understand this first)** section at the very top, before Core Rules — explicitly states that the agent runs on the host, Docker is a tool invoked from the host (not the agent's runtime), and the user's app runs separately on their computer.
+2. Strengthened **Rule 15** (Capability Transparency) with a reminder line: "You run on the host. Docker is a tool you invoke from the host. The user's app runs on their computer. These are three separate things."
+
+**Motivation:** The agent was getting confused about its own runtime environment — conflating "where I run" (host), "where I run code" (Docker sandbox), and "where the user's app runs" (their computer). The old prompt told the agent to *explain* this distinction to users, but never stated it as a direct fact about the agent itself.
+
+## 2026-06-13 — ## 2026-06-13: Recent changes report compiled — config layer...
+
+## 2026-06-13: Recent changes report compiled — config layering, system prompt custody, session store pagination, workspace panel, lazy connect
+
+Key architectural changes:
+1. **Universal config layering** — `load_factory_config()` loads from `resources/default_config.json` as single source of truth, `load_config()` does deep-merge of factory + user overlay, `save_config()` persists only diff from factory defaults
+2. **System prompt custody** — moved from `system_prompt.txt` in `MANIFEST.json` to `~/.thoughtmachine/custom_system_prompt.txt`, with migration from legacy path; `AgentConfig` field validator loads from custom file with clear precedence: custom file > explicit value > factory default
+3. **Session store pagination** — `load_session()` now accepts `limit`/`offset` parameters, `_fast_extract_metadata()` avoids parsing full `user_history` arrays, `_meta_` files cache metadata separately, cache TTL increased from 5s to 60s
+4. **Browser bridge caching** — `_session_bridges` dict replaces `_active_bridges` list; bridges kept alive across tab switches/reconnects, stopped only on explicit `close_session` or server shutdown
+5. **Lazy WS connect** — inactive tabs skip WebSocket connection; `isActive` prop triggers connection when tab becomes active
+6. **Workspace Panel** — new UI component with Dockerfile viewer, domain allowlist editor, workers list (10s poll), effective permissions display
+7. **pyproject.toml fixes** — build-backend fixed to `setuptools.build_meta`, packages include all application modules, version sourced from `resources/.version` instead of bootstrap function
+8. **No-op config detection** — `_configs_are_identical()` in agent.py skips spurious restarts when frontend re-sends identical config
