@@ -168,7 +168,7 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
 }
 
 
-function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, defaultConfigSaveMessage, onClearDefaultSaveStatus, workspaceId, sessionId }) {
+function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, defaultConfigSaveMessage, onClearDefaultSaveStatus, workspaceId, sessionId, containerRebuildResult, onClearRebuildResult }) {
   const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error'
   const [showManageProviders, setShowManageProviders] = useState(false);
   const [providerVersion, setProviderVersion] = useState(0);  // incremented when a provider is saved
@@ -738,7 +738,12 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
 
       {/* ── Container Tab ─────────────────────────────────────────────── */}
       {activeTab === 'container' && (
-        <ContainerPanelContent workspacePath={config?.workspace_path || ''} />
+        <ContainerPanelContent
+          workspacePath={config?.workspace_path || ''}
+          sendCommand={sendCommand}
+          containerRebuildResult={containerRebuildResult}
+          onClearRebuildResult={onClearRebuildResult}
+        />
       )}
 
       {/* ── System Prompt Tab ──────────────────────────────────────────── */}
