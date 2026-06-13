@@ -93,8 +93,16 @@ class LLMClient:
         else:
             system_prompt = self.load_system_prompt()
 
-        # Remove any existing system messages (old prompt from prior session)
-        conversation[:] = [msg for msg in conversation if msg.get('role') != 'system']
+        # Remove old system prompts but preserve summary messages
+        # (Summaries also use role='system' and are needed by SummaryBuilder.
+        #  Without this guard, the next SummaryBuilder.build() call will find
+        #  no summary and fall back to including the ENTIRE history, causing
+        #  a ~4.7x token explosion on restart.)
+        conversation[:] = [
+            msg for msg in conversation
+            if not (msg.get('role') == 'system'
+                    and not msg.get('content', '').startswith('Summary of previous conversation:'))
+        ]
 
         # Insert the fresh system prompt at the front
         conversation.insert(0, {'role': 'system', 'content': system_prompt})
