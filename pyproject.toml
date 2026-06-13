@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=64.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "thoughtmachine"
@@ -14,7 +14,7 @@ authors = [
 requires-python = ">=3.11"
 
 [tool.setuptools]
-packages = { find = { include = ["thoughtmachine*"] } }
+packages = { find = { include = ["thoughtmachine*", "agent*", "tools*", "security*", "web_ui*", "llm_providers*"] } }
 
 [tool.setuptools.package-data]
 thoughtmachine = [
@@ -34,7 +34,7 @@ thoughtmachine = [
 ]
 
 [tool.setuptools.dynamic]
-version = { attr = "thoughtmachine.bootstrap.get_version" }
+version = { file = "resources/.version" }
 
 [project.urls]
 Homepage = "https://github.com/your-org/thoughtmachine"

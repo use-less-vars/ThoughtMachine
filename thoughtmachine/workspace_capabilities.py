@@ -9,6 +9,7 @@ from ``~/.thoughtmachine/workspaces/{workspace_id}/capabilities.json``.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 from dataclasses import dataclass, field
@@ -158,8 +159,6 @@ def load_workspace_capabilities(
         raw = json.loads(path.read_text(encoding="utf-8"))
         return WorkspaceCapabilities.from_dict(raw)
     except (json.JSONDecodeError, OSError) as exc:
-        import logging
-
         logging.getLogger(__name__).warning(
             "Failed to load capabilities for workspace %s: %s", workspace_id, exc
         )
@@ -228,11 +227,11 @@ def _resources_dir() -> Path:
 
 def ensure_workspace_dirs(workspace_id: str) -> List[str]:
     """
-    Bootstrap a workspace's subdirectory structure and default files.
+    Bootstrap a workspace's default files.
 
-    Creates ``~/.thoughtmachine/workspaces/{workspace_id}/`` with standard
-    subdirectories (``sessions/``, ``state/``, ``knowledge/``) and idempotently
-    creates the following default files **if they do not already exist**:
+    Creates ``~/.thoughtmachine/workspaces/{workspace_id}/`` if it does not
+    exist and idempotently creates the following default files **if they do
+    not already exist**:
 
     * ``capabilities.json`` — fully permissive workspace capabilities
     * ``Dockerfile`` — copied from ``resources/default_dockerfile.txt``
@@ -240,17 +239,22 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
     * ``workers.json`` — empty JSON array ``[]``
     * ``mcp_servers.json`` — empty JSON array ``[]``
 
+    No subdirectories (e.g. ``sessions/``, ``state/``, ``knowledge/``) are
+    created inside the workspace config directory.
+
+    After bootstrapping, a safeguard logs warnings for any files or folders
+    in the workspace directory that are not in the expected set, but does
+    **not** delete them.
+
     Returns a list of created paths (directories and files).
     """
     base = _workspace_dir(workspace_id)
     created: List[str] = []
 
-    # ── Subdirectories ───────────────────────────────────────────────────
-    for subdir in ("", "sessions", "state", "knowledge"):
-        target = base / subdir
-        if not target.exists():
-            target.mkdir(parents=True, exist_ok=True)
-            created.append(str(target))
+    # ── Base directory ───────────────────────────────────────────────────
+    if not base.exists():
+        base.mkdir(parents=True, exist_ok=True)
+        created.append(str(base))
 
     # ── Default capabilities ─────────────────────────────────────────────
     caps_path = base / "capabilities.json"
@@ -288,4 +292,35 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
         mcp_servers_path.write_text("[]", encoding="utf-8")
         created.append(str(mcp_servers_path))
 
+    # ── Safeguard: warn about unexpected items ────────────────────────────
+    _safeguard_workspace_dir(base)
+
     return created
+
+
+def _safeguard_workspace_dir(base: Path) -> None:
+    """
+    Log a warning for each item in *base* that is not in the allowed set.
+
+    Allowed file names:
+        capabilities.json, Dockerfile, domain_allowlist.json,
+        workers.json, mcp_servers.json
+
+    This is a read-only check — no items are deleted or moved.
+    """
+    allowed = {
+        "capabilities.json",
+        "Dockerfile",
+        "domain_allowlist.json",
+        "workers.json",
+        "mcp_servers.json",
+    }
+    if not base.is_dir():
+        return
+    for item in base.iterdir():
+        if item.name not in allowed:
+            logging.warning(
+                "Unexpected item in workspace config dir (%s): %s",
+                base,
+                item.name,
+            )

@@ -37,12 +37,28 @@ def temp_user_dir():
 class TestEnsureWorkspaceDirs:
     """Tests for ensure_workspace_dirs()."""
 
-    def test_creates_all_directories(self, temp_user_dir):
-        """The standard subdirectories are created."""
+    def test_creates_base_directory(self, temp_user_dir):
+        """The workspace base directory is created."""
         ensure_workspace_dirs("test-ws")
         base = _user_dir() / "workspaces" / "test-ws"
-        for sub in ("", "sessions", "state", "knowledge"):
-            assert (base / sub).is_dir(), f"Missing directory: {base / sub}"
+        assert base.is_dir(), f"Missing directory: {base}"
+
+    def test_no_stray_subdirectories_created(self, temp_user_dir):
+        """No subdirectories (sessions, state, knowledge) are created inside the workspace config dir."""
+        ensure_workspace_dirs("test-ws")
+        base = _user_dir() / "workspaces" / "test-ws"
+        # Only the five expected files should exist — no subdirectories
+        expected_files = {
+            "capabilities.json",
+            "Dockerfile",
+            "domain_allowlist.json",
+            "workers.json",
+            "mcp_servers.json",
+        }
+        actual = {p.name for p in base.iterdir()}
+        # Every item in the directory should be one of the expected files
+        for name in actual:
+            assert name in expected_files, f"Unexpected item found: {name}"
 
     def test_creates_capabilities_file(self, temp_user_dir):
         """A default capabilities.json is written."""
@@ -102,9 +118,9 @@ class TestEnsureWorkspaceDirs:
         assert json.loads(dal.read_text(encoding="utf-8")) == ["example.com"]
 
     def test_returns_list_of_created_paths(self, temp_user_dir):
-        """The return value lists all created directories and files."""
+        """The return value lists the base dir and all five files."""
         created = ensure_workspace_dirs("test-ws")
-        # At minimum: base dir, sessions, state, knowledge + 5 files
+        # At minimum: base dir + 5 files (no subdirectories)
         base = _user_dir() / "workspaces" / "test-ws"
         assert str(base) in created
         assert str(base / "capabilities.json") in created
@@ -112,3 +128,47 @@ class TestEnsureWorkspaceDirs:
         assert str(base / "domain_allowlist.json") in created
         assert str(base / "workers.json") in created
         assert str(base / "mcp_servers.json") in created
+        # Ensure no subdirectories were created (sessions, state, knowledge)
+        assert str(base / "sessions") not in created
+        assert str(base / "state") not in created
+        assert str(base / "knowledge") not in created
+
+    def test_safeguard_warns_on_unexpected_item(self, temp_user_dir, caplog):
+        """The safeguard logs warnings for unexpected items in the workspace dir."""
+        import logging
+        caplog.set_level(logging.WARNING)
+
+        ensure_workspace_dirs("test-ws")
+        base = _user_dir() / "workspaces" / "test-ws"
+
+        # Create an unexpected subdirectory and file
+        (base / "sessions").mkdir(exist_ok=True)
+        (base / "container_state.json").write_text("{}", encoding="utf-8")
+
+        # Call ensure_workspace_dirs again — safeguard should warn
+        ensure_workspace_dirs("test-ws")
+
+        # Check that both unexpected items were logged
+        assert any("sessions" in record.message for record in caplog.records)
+        assert any("container_state.json" in record.message for record in caplog.records)
+
+    def test_safeguard_does_not_delete_unexpected_items(self, temp_user_dir, caplog):
+        """The safeguard warns but does not delete unexpected items."""
+        import logging
+        caplog.set_level(logging.WARNING)
+
+        ensure_workspace_dirs("test-ws")
+        base = _user_dir() / "workspaces" / "test-ws"
+
+        # Create an unexpected subdirectory
+        (base / "sessions").mkdir(exist_ok=True)
+        (base / "sessions" / "test.txt").write_text("data", encoding="utf-8")
+
+        ensure_workspace_dirs("test-ws")
+
+        # The unexpected item should still exist
+        assert (base / "sessions").is_dir()
+        assert (base / "sessions" / "test.txt").exists()
+        # And we should have warned about it
+        assert any("sessions" in record.message for record in caplog.records)
+
