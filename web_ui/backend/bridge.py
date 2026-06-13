@@ -66,7 +66,6 @@ except ImportError:
 from session.models import Session
 from session.store import FileSystemSessionStore
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  Bridge class
 # ══════════════════════════════════════════════════════════════════════════════
@@ -93,7 +92,8 @@ class WebAgentBridge:
     a callback.  Designed to be driven by a FastAPI WebSocket endpoint.
     """
 
-    def __init__(self, event_callback: Optional[Callable[[Dict[str, Any]], None]] = None):
+    def __init__(self, event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+                 session_store: Optional[FileSystemSessionStore] = None):
         self._agent: Optional[Agent] = None
         self._thread: Optional[threading.Thread] = None
         self._running = False
@@ -124,8 +124,8 @@ class WebAgentBridge:
         # reuse the existing AgentController instead of creating an Agent directly)
         self._controller: Optional[AgentController] = None
 
-        # Session persistence
-        self._session_store = FileSystemSessionStore()
+        # Session persistence — use shared store if provided, otherwise create one
+        self._session_store = session_store if session_store is not None else FileSystemSessionStore()
         self._session: Optional[Session] = None
         self._loaded_session: Optional[Session] = None
         self._workspace_id: Optional[str] = None
