@@ -62,6 +62,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const [defaultConfigSaveStatus, setDefaultConfigSaveStatus] = useState(null) // null | 'ok' | 'error'
   const [defaultConfigSaveMessage, setDefaultConfigSaveMessage] = useState('')
   const [securityPrompt, setSecurityPrompt] = useState(null) // null | { request_id, tool_name, capabilities, ... }
+  const [containerRebuildResult, setContainerRebuildResult] = useState(null) // null | { status, buildLog }
   const [isDeferred, setIsDeferred] = useState(false) // true = load skipped; waiting for activation
   const [totalMessages, setTotalMessages] = useState(0) // total messages in the session
   const [hasMore, setHasMore] = useState(false) // true if older messages are available
@@ -399,6 +400,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         update({ config: msg.config })
         break
 
+      case 'rebuild_result':
+        setContainerRebuildResult({ status: msg.status, buildLog: msg.build_log })
+        break
+
       case 'status_message':
         update((prev) => ({
           history: [
@@ -561,6 +566,8 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
             setDefaultConfigSaveStatus(null)
             setDefaultConfigSaveMessage('')
           }}
+          containerRebuildResult={containerRebuildResult}
+          onClearRebuildResult={() => setContainerRebuildResult(null)}
         />
         <div
           className="resize-handle"
