@@ -17,7 +17,7 @@ const STATUS_CONFIG = {
   unavailable: { color: '#6c7086', label: 'Container status unavailable' },
 };
 
-const ContainerPanelContent = ({ workspacePath = '' }) => {
+const ContainerPanelContent = ({ workspacePath = '', sendCommand, containerRebuildResult, onClearRebuildResult }) => {
   const [status, setStatus] = useState('unavailable');
   const [capabilities, setCapabilities] = useState(null);
   const [buildLog, setBuildLog] = useState('');
@@ -70,31 +70,24 @@ const ContainerPanelContent = ({ workspacePath = '' }) => {
     return () => clearInterval(interval);
   }, [fetchStatus, fetchIntegrity]);
 
-  const handleRebuild = useCallback(async () => {
+  // When a rebuild result arrives via WebSocket, update local state
+  useEffect(() => {
+    if (containerRebuildResult) {
+      setBuildLog(containerRebuildResult.buildLog || '');
+      setStatus(containerRebuildResult.status === 'ok' ? 'stopped' : containerRebuildResult.status);
+      setRebuilding(false);
+      // Refresh full status after rebuild completes
+      fetchStatus();
+      onClearRebuildResult?.();
+    }
+  }, [containerRebuildResult, fetchStatus, onClearRebuildResult]);
+
+  const handleRebuild = useCallback(() => {
     setRebuilding(true);
     setBuildLog('');
     setStatus('building');
-    try {
-      const params = new URLSearchParams();
-      if (workspacePath) params.set('workspace', workspacePath);
-      const res = await fetch('/api/container/rebuild', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: params.toString(),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      setBuildLog(data.build_log || '');
-      setStatus(data.status === 'ok' ? 'stopped' : data.status);
-      // Refresh full status after rebuild completes
-      fetchStatus();
-    } catch (err) {
-      setBuildLog(`Rebuild failed: ${err.message}`);
-      setStatus('error');
-    } finally {
-      setRebuilding(false);
-    }
-  }, [workspacePath, fetchStatus]);
+    sendCommand?.('rebuild_container', { workspace: workspacePath });
+  }, [workspacePath, sendCommand]);
 
   const cfg = STATUS_CONFIG[status] || STATUS_CONFIG.unavailable;
   const intCfg = INTEGRITY_STATUS[integrity] || INTEGRITY_STATUS.unknown;
