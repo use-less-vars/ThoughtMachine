@@ -113,7 +113,7 @@ class FileSystemSessionStore(SessionStore):
         self._cached_list: Optional[Tuple[float, List[Dict[str, Any]]]] = None  # (timestamp, list)
         self._cached_paths: Dict[str, Optional[Path]] = {}  # session_id -> path (None = not found)
         self._cached_paths_ts: Dict[str, float] = {}  # when each path entry was cached
-        self._cache_ttl = 5.0  # seconds
+        self._cache_ttl = 60.0  # seconds — session list changes infrequently
 
         # Resolve state directory
         if state_dir is None:
@@ -403,7 +403,7 @@ class FileSystemSessionStore(SessionStore):
     def list_sessions(self) -> List[Dict[str, Any]]:
         """
         List all saved sessions with basic metadata.
-        Uses an in-memory cache (TTL: 5s) to avoid re-reading all files on every call.
+        Uses an in-memory cache (TTL: 60s) to avoid re-reading all files on every call.
         Skips files that are not valid session objects (e.g. open_sessions.json).
         """
         now = time.time()
@@ -430,6 +430,15 @@ class FileSystemSessionStore(SessionStore):
             # Skip metadata files and already-processed sessions
             if file_path.name.startswith("_meta_"):
                 continue
+            # Fast path: try to extract metadata from ~8 KB head (avoids full JSON parse)
+            session_info = self._fast_extract_metadata(file_path)
+            if session_info and session_info.get('session_id') not in seen_ids:
+                sid = session_info['session_id']
+                seen_ids.add(sid)
+                sessions.append(session_info)
+                self._write_meta_file(session_info)
+                continue
+            # Fallback: full file read (should be rare after migration)
             try:
                 with open(file_path, 'r') as f:
                     data = json.load(f)
@@ -444,9 +453,11 @@ class FileSystemSessionStore(SessionStore):
                     'name': data.get('metadata', {}).get('name', 'Untitled Session'),
                     'created_at': data.get('created_at'),
                     'updated_at': data.get('updated_at'),
-                    'preview': self._extract_preview(data.get('user_history', [])),
+                    'preview': '',  # Intentionally empty — extracting preview adds no value vs. 52s delay
                 }
+                seen_ids.add(sid)
                 sessions.append(session_info)
+                self._write_meta_file(session_info)
             except json.JSONDecodeError as e:
                 logger.warning(f"[SessionStore] Corrupt session file {file_path.name}: {e}")
                 continue
@@ -466,6 +477,116 @@ class FileSystemSessionStore(SessionStore):
                 if isinstance(content, str):
                     return content[:max_length] + ('...' if len(content) > max_length else '')
         return "(empty)"
+
+    def _fast_extract_metadata(self, file_path: Path) -> Optional[Dict[str, Any]]:
+        """
+        Extract session metadata without parsing the full JSON tree.
+
+        Session JSON files contain a ``user_history`` array that can hold
+        hundreds of messages.  Full ``json.load()`` of such files is the
+        primary cause of 50+ second block.  This method reads the entire
+        file as a string (fast — just bytes) but only calls
+        ``json.JSONDecoder.raw_decode()`` on individual field values,
+        never on the full ``user_history`` array.
+
+        Returns a metadata dict with keys: session_id, name, created_at,
+        updated_at, preview.  Returns None if extraction fails (caller
+        falls back to the full-read path).
+        """
+        try:
+            # Read full file as string (fast I/O, no object creation)
+            with open(file_path, 'r') as f:
+                content = f.read()
+
+            decoder = json.JSONDecoder()
+
+            # ── session_id ────────────────────────────────────────────────
+            sid = self._json_decode_at_key(content, 'session_id', decoder)
+            if not sid or not isinstance(sid, str):
+                return None
+
+            # ── Timestamps ────────────────────────────────────────────────
+            created_at = self._json_decode_at_key(content, 'created_at', decoder)
+            updated_at = self._json_decode_at_key(content, 'updated_at', decoder)
+            if not isinstance(created_at, str):
+                created_at = None
+            if not isinstance(updated_at, str):
+                updated_at = None
+
+            # ── metadata.name ─────────────────────────────────────────────
+            name = 'Untitled Session'
+            meta_idx = content.find('"metadata"')
+            if meta_idx >= 0:
+                # Find the '{' that starts the metadata dict
+                val_start = content.find('{', meta_idx)
+                if val_start >= 0:
+                    try:
+                        meta_obj, _ = decoder.raw_decode(content, val_start)
+                        if isinstance(meta_obj, dict):
+                            raw_name = meta_obj.get('name')
+                            if raw_name and isinstance(raw_name, str):
+                                name = raw_name
+                    except json.JSONDecodeError:
+                        pass
+
+            return {
+                'session_id': sid,
+                'name': name,
+                'created_at': created_at,
+                'updated_at': updated_at,
+                'preview': '',
+            }
+        except Exception:
+            return None
+
+    @staticmethod
+    def _json_decode_at_key(content: str, key: str, decoder: json.JSONDecoder) -> Any:
+        """Find *key* in *content* and decode the JSON value after it."""
+        idx = content.find(f'"{key}"')
+        if idx < 0:
+            return None
+        colon = content.find(':', idx)
+        if colon < 0:
+            return None
+        try:
+            val, _ = decoder.raw_decode(content, colon + 1)
+            return val
+        except json.JSONDecodeError:
+            return None
+
+    def _regex_extract_metadata(self, text: str) -> Optional[Dict[str, Any]]:
+        """Fallback: extract key fields via regex when ``_fast_extract_metadata`` tail-decodes fail."""
+        sid_match = re.search(r'"session_id"\s*:\s*"([^"]+)"', text)
+        if not sid_match:
+            return None
+        name_match = re.search(r'"name"\s*:\s*"([^"]+)"', text)
+        name = name_match.group(1) if name_match else 'Untitled Session'
+        ca_match = re.search(r'"created_at"\s*:\s*"([^"]+)"', text)
+        ua_match = re.search(r'"updated_at"\s*:\s*"([^"]+)"', text)
+        return {
+            'session_id': sid_match.group(1),
+            'name': name,
+            'created_at': ca_match.group(1) if ca_match else None,
+            'updated_at': ua_match.group(1) if ua_match else None,
+            'preview': '',
+        }
+
+    def _write_meta_file(self, session_info: Dict[str, Any]) -> None:
+        """Write a lightweight _meta_ file so the fast path can use it next time."""
+        sid = session_info.get('session_id')
+        if not sid:
+            return
+        meta_path = self._get_meta_path(sid)
+        try:
+            temp_path = meta_path.with_suffix('.tmp')
+            os.makedirs(os.path.dirname(temp_path), exist_ok=True)
+            with open(temp_path, 'w') as f:
+                json.dump(session_info, f)
+            temp_path.replace(meta_path)
+        except Exception:
+            # Non-critical — will retry on next list_sessions() call
+            if temp_path.exists():
+                temp_path.unlink()
 
     def delete_session(self, session_id: str) -> bool:
         """Delete a session file."""

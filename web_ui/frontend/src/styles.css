@@ -183,6 +183,29 @@ body {
   font-style: italic;
 }
 
+/* ── Load older messages button ──────────────────────── */
+.load-more-container {
+  display: flex;
+  justify-content: center;
+  padding: 0.5rem 0;
+}
+
+.load-more-btn {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0.4rem 1rem;
+  transition: background 0.15s, color 0.15s;
+}
+
+.load-more-btn:hover {
+  background: var(--accent-color);
+  color: #fff;
+}
+
 /* ── Scroll-navigation buttons (previous query + bottom) ──── */
 .scroll-nav-group {
   position: absolute;

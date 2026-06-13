@@ -212,7 +212,7 @@ const MessageBubble = React.memo(
 )
 
 /* ── Main panel ── */
-function ChatPanel({ messages }) {
+function ChatPanel({ messages, loadMore, hasMore }) {
   const chatRef = useRef(null)
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true)
 
@@ -265,6 +265,13 @@ function ChatPanel({ messages }) {
       <div className="chat-panel" ref={chatRef} onScroll={handleScroll}>
         {(!messages || messages.length === 0) && (
           <div className="chat-empty">Send a message to start.</div>
+        )}
+        {messages && hasMore && loadMore && (
+          <div className="load-more-container">
+            <button className="load-more-btn" onClick={loadMore}>
+              ← Load older messages
+            </button>
+          </div>
         )}
         {messages && messages.map((msg, i) => (
           <MessageBubble key={i} msg={msg} index={i} />
