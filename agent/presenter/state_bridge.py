@@ -13,7 +13,9 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 from agent.logging import log
-from agent.config import AgentConfig, load_default_config, load_config, save_config
+from agent.config import AgentConfig, load_default_config, load_factory_config, load_config, save_config
+from agent.config.loader import _compute_config_diff
+from agent.config import loader as config_loader
 from agent.config.provider_profile import ProviderManager
 from tools import SIMPLIFIED_TOOL_CLASSES
 from session.models import Session, RuntimeParams, ObservableList
@@ -23,7 +25,10 @@ class StateBridge:
 
     def __init__(self, config_path: Optional[str]=None):
         self.config_path = config_path or str(Path.home() / '.thoughtmachine' / 'agent_config.json')
-        default_dict = load_default_config()
+        # Start with factory defaults, not model defaults — ensures the
+        # initial state matches exactly what load_factory_config() returns,
+        # so that save_config() computes a clean diff against factory.
+        default_dict = load_factory_config()
         self.current_config = AgentConfig(**default_dict)
         self.total_input = 0
         self.total_output = 0
@@ -76,10 +81,80 @@ class StateBridge:
         return self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
 
     def save_config(self, config: Optional[dict]=None, path: Optional[str]=None) -> bool:
-        """Save configuration to file."""
+        """Save configuration to file as a minimal diff overlay.
+
+        Only the keys that differ from the factory defaults are persisted to
+        the JSON file, keeping it small and allowing new factory defaults to
+        flow through on upgrade.
+
+        Before persisting, the ``system_prompt`` value is extracted and
+        written to ``~/.thoughtmachine/custom_system_prompt.txt`` (or the file
+        is removed if the value is ``None`` / empty).  This keeps the JSON
+        config clean and avoids confusion between the two storage locations.
+        """
         config_to_save = config or self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
         save_path = path or self.config_path
-        return save_config(config_to_save, save_path)
+
+        # ── Intercept system_prompt ────────────────────────────────────
+        system_prompt = config_to_save.pop('system_prompt', None)
+        custom_path = Path(config_loader.CUSTOM_SYSTEM_PROMPT_PATH)
+        if system_prompt and system_prompt.strip():
+            custom_path.parent.mkdir(parents=True, exist_ok=True)
+            custom_path.write_text(system_prompt.strip() + '\n', encoding='utf-8')
+            log('DEBUG', 'presenter.state_bridge',
+                f'Wrote system prompt to {custom_path}')
+        else:
+            # No custom prompt → remove the file so the validator falls
+            # through to the factory default.
+            try:
+                custom_path.unlink(missing_ok=True)
+            except (IOError, OSError) as exc:
+                log('WARNING', 'presenter.state_bridge',
+                    f'Could not remove {custom_path}: {exc}')
+
+        # ── Compute diff vs factory defaults ───────────────────────────
+        factory_config = load_factory_config()
+        # Normalize factory through AgentConfig so serialized types match
+        # (e.g. session_permissions booleans vs permission strings)
+        factory_normalized = AgentConfig(**factory_config).model_dump(
+            exclude={'api_key'}, exclude_none=True
+        )
+        overlay = _compute_config_diff(factory_normalized, config_to_save)
+        log('DEBUG', 'presenter.state_bridge',
+            f'Config overlay has {len(overlay)} key(s) differing from factory')
+
+        return save_config(overlay, save_path)
+
+    def reset_config_to_factory(self) -> dict:
+        """Reset configuration to factory defaults.
+
+        Removes ``custom_system_prompt.txt`` if it exists and writes an
+        empty overlay file so that all values revert to factory defaults
+        on the next load.
+
+        Returns:
+            The factory config dict.
+        """
+        # Remove custom system prompt so validator falls through to file default
+        custom_path = Path(config_loader.CUSTOM_SYSTEM_PROMPT_PATH)
+        try:
+            custom_path.unlink(missing_ok=True)
+            log('DEBUG', 'presenter.state_bridge',
+                f'Removed custom system prompt {custom_path}')
+        except (IOError, OSError) as exc:
+            log('WARNING', 'presenter.state_bridge',
+                f'Could not remove {custom_path}: {exc}')
+
+        # Load factory defaults and reset instance
+        factory_config = load_factory_config()
+        self.current_config = AgentConfig(**factory_config)
+
+        # Write empty overlay (clears any previously saved user overrides)
+        save_config({}, self.config_path)
+        log('INFO', 'presenter.state_bridge',
+            'Configuration reset to factory defaults')
+
+        return self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
 
     def load_config(self, path: Optional[str]=None) -> dict:
         """Load configuration from file."""

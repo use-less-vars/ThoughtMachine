@@ -11,6 +11,148 @@ from typing import Dict, Any, Optional, List, Set
 from agent.logging import log
 from .models import AgentConfig
 
+# ── System prompt paths ───────────────────────────────────────────────────────
+USER_DIR = Path.home() / ".thoughtmachine"
+CUSTOM_SYSTEM_PROMPT_PATH = str(USER_DIR / "custom_system_prompt.txt")
+LEGACY_SYSTEM_PROMPT_PATH = str(USER_DIR / "system_prompt.txt")
+
+# ── Factory config ──────────────────────────────────────────────────────────
+FACTORY_CONFIG_PATH = str(Path(__file__).resolve().parent.parent.parent / "resources" / "default_config.json")
+_factory_config_cache: Optional[Dict[str, Any]] = None
+
+
+def load_custom_system_prompt() -> Optional[str]:
+    """Load the custom system prompt from ``~/.thoughtmachine/custom_system_prompt.txt``.
+
+    Returns the prompt text if the file exists and is non-empty, otherwise ``None``.
+    """
+    path = Path(CUSTOM_SYSTEM_PROMPT_PATH)
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+        return text if text else None
+    except (IOError, OSError) as exc:
+        log("WARNING", "config.loader",
+            f"Failed to read custom system prompt from {CUSTOM_SYSTEM_PROMPT_PATH}: {exc}")
+        return None
+
+
+# ── Factory config loader ──────────────────────────────────────────────────────
+
+
+def load_factory_config() -> Dict[str, Any]:
+    """Load factory default configuration from ``resources/default_config.json``.
+
+    The factory config is the single source of truth for default values.
+    Results are cached in memory after the first load for performance.
+
+    Returns:
+        A copy of the factory config dictionary.
+    """
+    global _factory_config_cache
+    if _factory_config_cache is not None:
+        return _factory_config_cache.copy()
+    path = Path(FACTORY_CONFIG_PATH)
+    if not path.exists():
+        log("WARNING", "config.loader",
+            f"Factory config not found at {FACTORY_CONFIG_PATH}, using model defaults")
+        _factory_config_cache = load_default_config()
+        return _factory_config_cache.copy()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            config: Dict[str, Any] = json.load(f)
+        _factory_config_cache = config
+        log("DEBUG", "config.loader", f"Loaded factory config from {FACTORY_CONFIG_PATH}")
+        return config.copy()
+    except Exception as e:
+        log("WARNING", "config.loader",
+            f"Failed to load factory config from {FACTORY_CONFIG_PATH}: {e}, using model defaults")
+        _factory_config_cache = load_default_config()
+        return _factory_config_cache.copy()
+
+
+def _deep_merge_config(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+    """Deep-merge *overlay* into *base*, preserving nested dicts.
+
+    For keys present in both *base* and *overlay* where the value is a dict
+    in both, the merge is recursive (sub-keys are merged).  For all other
+    keys, *overlay* wins outright (scalar replacement).
+
+    Args:
+        base: Base configuration (typically factory defaults).
+        overlay: Override configuration (typically user settings).
+
+    Returns:
+        A new dict with the merged result (neither input is mutated).
+    """
+    result = base.copy()
+    for key, value in overlay.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge_config(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _compute_config_diff(factory: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute the diff between factory defaults and a current config.
+
+    Returns only the keys where *current* differs from *factory*.
+    For nested dict values, recurses to produce a minimal diff.
+
+    Args:
+        factory: Factory default configuration.
+        current: Current (user) configuration.
+
+    Returns:
+        A dict containing only the differences (empty if identical).
+    """
+    diff: Dict[str, Any] = {}
+    for key, value in current.items():
+        if key not in factory:
+            # Key not present in factory at all → include it
+            diff[key] = value
+        elif isinstance(value, dict) and isinstance(factory.get(key), dict):
+            # Nested dict → recurse
+            sub_diff = _compute_config_diff(factory[key], value)
+            if sub_diff:
+                diff[key] = sub_diff
+        elif value != factory[key]:
+            diff[key] = value
+    return diff
+
+
+def _migrate_legacy_system_prompt() -> None:
+    """Migrate the legacy ``~/.thoughtmachine/system_prompt.txt`` to the new
+    ``~/.thoughtmachine/custom_system_prompt.txt``.
+
+    The old file was deployed by the @field_validator in earlier versions but
+    was never in MANIFEST.json. If the new file already exists the migration
+    is skipped (the new file takes precedence).
+    """
+    legacy = Path(LEGACY_SYSTEM_PROMPT_PATH)
+    custom = Path(CUSTOM_SYSTEM_PROMPT_PATH)
+    if not legacy.exists():
+        return
+    if custom.exists():
+        log("DEBUG", "config.loader",
+            f"Both {LEGACY_SYSTEM_PROMPT_PATH} and {CUSTOM_SYSTEM_PROMPT_PATH} exist — "
+            f"keeping custom (new name) and removing legacy.")
+        legacy.unlink(missing_ok=True)
+        return
+    try:
+        text = legacy.read_text(encoding="utf-8").strip()
+        if text:
+            custom.write_text(text + "\n", encoding="utf-8")
+            log("INFO", "config.loader",
+                f"Migrated legacy system prompt from {LEGACY_SYSTEM_PROMPT_PATH} "
+                f"to {CUSTOM_SYSTEM_PROMPT_PATH}")
+        legacy.unlink(missing_ok=True)
+    except (IOError, OSError) as exc:
+        log("WARNING", "config.loader",
+            f"Failed to migrate legacy system prompt {LEGACY_SYSTEM_PROMPT_PATH}: {exc}")
+
 # ── Backup safety ───────────────────────────────────────────────────────────
 BACKUP_DIR_NAME = '.config_backups'
 
@@ -93,63 +235,65 @@ def _map_legacy_fields(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     return mapped
 
 def load_default_config() -> Dict[str, Any]:
-    """Return default configuration dictionary.
-    
-    This matches the defaults from agent_presenter._load_default_config()
-    but uses AgentConfig for validation.
+    """Return default configuration dictionary from model defaults.
+
+    This is a fallback when the factory config file is unavailable.
+    Prefer :func:`load_factory_config` for production use.
     """
     config = AgentConfig()
     config_dict = config.model_dump()
     return config_dict
-
 def load_config(config_path: str) -> Dict[str, Any]:
-    """Load configuration from file and merge with defaults (self-healing).
+    """Load configuration from file and overlay on factory defaults.
+
+    Uses the factory default config (from ``resources/default_config.json``)
+    as the base and overlays user settings from *config_path* on top.
 
     Gracefully handles:
-      - Missing file → returns defaults
-      - Corrupted JSON → logs warning, returns defaults
+      - Missing user config file → returns factory defaults
+      - Corrupted JSON → logs warning, returns factory defaults
       - Legacy field names → auto-migrated via ``_map_legacy_fields``
       - Null fields → backfilled from model defaults via ``_backfill_nulls``
+      - Legacy ``system_prompt.txt`` → auto-migrated to ``custom_system_prompt.txt``
 
     Args:
-        config_path: Path to configuration file (JSON)
+        config_path: Path to user configuration file (JSON overlay)
 
     Returns:
-        Configuration dictionary with defaults for missing keys
+        Configuration dictionary with factory defaults merged with user overrides
     """
-    default_config = load_default_config()
+    # Migrate legacy system_prompt.txt → custom_system_prompt.txt if needed
+    _migrate_legacy_system_prompt()
+
+    factory_config = load_factory_config()
     if not os.path.exists(config_path):
-        log('DEBUG', 'config.loader', f'Config file {config_path} not found, using defaults')
-        return default_config
+        log('DEBUG', 'config.loader', f'Config file {config_path} not found, using factory defaults')
+        return factory_config
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             raw_content = f.read()
         if not raw_content.strip():
-            log('WARNING', 'config.loader', f'Config file {config_path} is empty, using defaults')
-            return default_config
+            log('WARNING', 'config.loader', f'Config file {config_path} is empty, using factory defaults')
+            return factory_config
         saved_config = json.loads(raw_content)
         if not isinstance(saved_config, dict):
             log('WARNING', 'config.loader',
-                f'Config file {config_path} does not contain a JSON object, using defaults')
-            return default_config
+                f'Config file {config_path} does not contain a JSON object, using factory defaults')
+            return factory_config
         saved_config = _map_legacy_fields(saved_config)
         saved_config = _sanitize_config_for_serialization(saved_config)
-        merged_config = default_config.copy()
-        for key, value in saved_config.items():
-            if key in merged_config:
-                merged_config[key] = value
-            else:
-                merged_config[key] = value
-        log('DEBUG', 'config.loader', f'Loaded config from {config_path}')
+        # Deep-merge user overlay on top of factory defaults
+        merged_config = _deep_merge_config(factory_config, saved_config)
+        log('DEBUG', 'config.loader', f'Loaded config from {config_path} (overlay on factory)')
         merged_config = _backfill_nulls(merged_config)
         return merged_config
     except json.JSONDecodeError as e:
         log('WARNING', 'config.loader',
-            f'Corrupted config file {config_path}: {e}. Falling back to defaults.')
-        return default_config
+            f'Corrupted config file {config_path}: {e}. Falling back to factory defaults.')
+        return factory_config
     except Exception as e:
         log('WARNING', 'config.loader', f'Error loading config from {config_path}: {e}')
-        return default_config
+        return factory_config
 def _get_valid_field_names() -> Set[str]:
     """Return the set of valid field names for AgentConfig."""
     return set(AgentConfig.model_fields.keys())
@@ -223,6 +367,20 @@ def save_config(config: Dict[str, Any], config_path: str, backup: bool = True) -
     except Exception as e:
         log('ERROR', 'config.loader', f'Error saving config to {config_path}: {e}')
         return False
+def _migrate_system_prompt_in_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip ``system_prompt`` from config if a custom file is present.
+
+    When the user has a ``custom_system_prompt.txt``, the ``system_prompt``
+    key in the JSON config is redundant (it will be loaded from the file at
+    model-validation time).  Removing it prevents confusion about which
+    source is authoritative.
+    """
+    if "system_prompt" in config_dict and load_custom_system_prompt() is not None:
+        config_dict = config_dict.copy()
+        del config_dict["system_prompt"]
+    return config_dict
+
+
 def migrate_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     """Upgrade a config dict to the latest schema version.
 
@@ -237,6 +395,7 @@ def migrate_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     migrated = _map_legacy_fields(migrated)
     migrated = _sanitize_config_for_serialization(migrated)
     migrated = _backfill_nulls(migrated)
+    migrated = _migrate_system_prompt_in_config(migrated)
     return migrated
 
 

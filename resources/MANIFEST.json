@@ -5,12 +5,7 @@
     {
       "source": "default_config.json",
       "dest": "agent_config.json",
-      "description": "Agent configuration (model, provider, tool settings, API keys)"
-    },
-    {
-      "source": "default_system_prompt.txt",
-      "dest": "system_prompt.txt",
-      "description": "Default system prompt for the agent"
+      "description": "Agent configuration overlay (diff from factory defaults — merged with resources/default_config.json at load time)"
     },
     {
       "source": "default_providers.json",

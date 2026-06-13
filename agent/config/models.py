@@ -105,16 +105,32 @@ class AgentConfig(BaseModel):
 
     @field_validator('system_prompt')
     def load_default_system_prompt(cls, v):
-        """Load the default system prompt from file when None or empty."""
+        """Load the system prompt with the following precedence:
+
+        1. ``~/.thoughtmachine/custom_system_prompt.txt`` (if it exists and is non-empty)
+        2. Explicit value passed to constructor (if non-empty)
+        3. Fallback to ``resources/default_system_prompt.txt``
+        """
         from pathlib import Path
-        if v is None or (isinstance(v, str) and v.strip() == ''):
-            prompt_path = Path(__file__).resolve().parent.parent.parent / 'resources' / 'default_system_prompt.txt'
+        # 1. Check custom_system_prompt.txt first
+        custom_path = Path.home() / '.thoughtmachine' / 'custom_system_prompt.txt'
+        if custom_path.exists():
             try:
-                return prompt_path.read_text(encoding='utf-8')
+                text = custom_path.read_text(encoding='utf-8').strip()
+                if text:
+                    return text
             except (FileNotFoundError, IOError) as exc:
-                log.warning('Could not load default system prompt from %s: %s', prompt_path, exc)
-                return 'You are ThoughtMachine, an AI agent.'
-        return v
+                log.warning('Could not read custom system prompt from %s: %s', custom_path, exc)
+        # 2. Use the explicit value if non-empty
+        if v is not None and (isinstance(v, str) and v.strip() != ''):
+            return v
+        # 3. Fallback to factory default
+        prompt_path = Path(__file__).resolve().parent.parent.parent / 'resources' / 'default_system_prompt.txt'
+        try:
+            return prompt_path.read_text(encoding='utf-8')
+        except (FileNotFoundError, IOError) as exc:
+            log.warning('Could not load default system prompt from %s: %s', prompt_path, exc)
+            return 'You are ThoughtMachine, an AI agent.'
 
     @field_validator('enabled_tools')
     def filter_search_codebase_tool(cls, v, info):

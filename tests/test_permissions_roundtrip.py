@@ -284,11 +284,11 @@ class TestConfigFileRoundTrip:
         loaded_dict = load_config(temp_config_path)
         cfg2 = AgentConfig(**loaded_dict)
 
-        # Should have defaults
+        # Should have factory defaults (layered config)
         sp = cfg2.session_permissions
         assert sp.container is False
-        assert sp.network == "banned"  # default is 'banned'
-        assert sp.filesystem == "read"
+        assert sp.network == "write"  # factory default (True coerces to 'write')
+        assert sp.filesystem == "write"  # factory default
         assert sp.execution == "banned"
 
     def test_partial_permissions_backfilled_from_defaults(self, temp_config_path):
@@ -307,9 +307,9 @@ class TestConfigFileRoundTrip:
 
         sp = cfg.session_permissions
         assert sp.container is True       # from file
-        assert sp.network == "banned"     # default
-        assert sp.filesystem == "read"    # default
-        assert sp.execution == "banned"   # default
+        assert sp.network == "write"      # factory default (network: true -> 'write')
+        assert sp.filesystem == "write"   # factory default
+        assert sp.execution == "banned"
 
 
 # =========================================================================

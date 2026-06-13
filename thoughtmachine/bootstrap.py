@@ -11,9 +11,7 @@ import json
 import os
 import shutil
 from pathlib import Path
-from typing import Optional
 
-from agent.knowledge.global_kb import ensure_global_kb
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -151,6 +149,7 @@ def ensure_user_defaults(overwrite_existing: bool = False) -> list[str]:
                 touched.append(str(dst_dir / src_file.name))
 
     # ── Ensure the global knowledge base (system/ + user/ + .version) ─────
+    from agent.knowledge.global_kb import ensure_global_kb
     touched.extend(ensure_global_kb())
 
     return touched
@@ -171,12 +170,3 @@ def load_user_config() -> dict:
     return _read_default_json("default_config.json")
 
 
-def load_user_system_prompt() -> Optional[str]:
-    """Load the user's ``system_prompt.txt``, or ``None`` if missing."""
-    prompt_path = USER_DIR / "system_prompt.txt"
-    if prompt_path.exists():
-        return prompt_path.read_text(encoding="utf-8")
-    try:
-        return _read_default("default_system_prompt.txt")
-    except FileNotFoundError:
-        return None

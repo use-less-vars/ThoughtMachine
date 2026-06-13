@@ -74,20 +74,31 @@ class LLMClient:
 
     def ensure_system_prompt(self, conversation: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Ensure system prompt is present in conversation.
-        
+        Ensure system prompt is present in conversation, replacing any existing one.
+
+        On agent restart after a config change, the conversation may still
+        contain the *old* system prompt.  This method strips any existing
+        system messages and inserts the fresh prompt from the current config,
+        so that system-prompt changes take effect immediately.
+
         Args:
             conversation: Current conversation messages.
-            
+
         Returns:
-            Updated conversation with system prompt if needed.
+            Updated conversation with the current system prompt at position 0.
         """
-        if not any((msg.get('role') == 'system' for msg in conversation)):
-            if self.config.system_prompt:
-                system_prompt = self.config.system_prompt
-            else:
-                system_prompt = self.load_system_prompt()
-            conversation.insert(0, {'role': 'system', 'content': system_prompt})
+        # Determine the current system prompt (from config or file fallback)
+        if self.config.system_prompt:
+            system_prompt = self.config.system_prompt
+        else:
+            system_prompt = self.load_system_prompt()
+
+        # Remove any existing system messages (old prompt from prior session)
+        conversation[:] = [msg for msg in conversation if msg.get('role') != 'system']
+
+        # Insert the fresh system prompt at the front
+        conversation.insert(0, {'role': 'system', 'content': system_prompt})
+
         return conversation
 
     def chat_completion(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]]=None, **kwargs):
