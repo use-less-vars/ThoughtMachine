@@ -478,6 +478,7 @@ export default function App() {
                   sessionId={tab.sessionId}
                   tabId={tab.tabId}
                   hubReady={hubReady}
+                  isActive={tab.tabId === activeTabId}
                   staggerMs={index * 200}
                   loadOnConnect={tab.sessionId === startupActiveSessionId || tab.tabId === activeTabId}
                   onClose={() => removeTab(tab.tabId)}

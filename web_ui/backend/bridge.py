@@ -803,7 +803,7 @@ class WebAgentBridge:
 
         return normalized
 
-    def load_session(self, session_id: str) -> bool:
+    def load_session(self, session_id: str, limit: Optional[int] = 50, offset: int = 0) -> bool:
         """Load a session from the store, replacing current conversation.
 
         Also extracts ``session.metadata['agent_config']`` and merges it into
@@ -816,6 +816,10 @@ class WebAgentBridge:
         Important: The session's ``user_history`` is kept in canonical API format
         (``role: "tool"``). Frontend display normalization happens at emit time
         via ``_normalize_for_frontend()`` so the data stays valid for API calls.
+
+        Pagination: if ``limit`` is provided, only the most recent ``limit``
+        messages are emitted in ``conversation_changed``, with ``total_count``
+        and ``has_more`` to let the frontend fetch older pages.
         """
         try:
             session = self._session_store.load_session(session_id)
@@ -879,9 +883,21 @@ class WebAgentBridge:
             # Use _normalize_for_frontend to convert API roles
             # (e.g. "tool") to frontend roles (e.g. "tool_result")
             # without modifying the session data.
+            # Pagination: only emit a slice of messages.
+            all_messages = session.user_history or []
+            total_count = len(all_messages)
+            if limit is not None and len(all_messages) > limit:
+                # Send the most recent `limit` messages
+                page = self._normalize_for_frontend(all_messages[-limit:])
+                has_more = total_count > limit
+            else:
+                page = self._normalize_for_frontend(all_messages)
+                has_more = False
             self._emit({
                 "type": "conversation_changed",
-                "messages": self._normalize_for_frontend(session.user_history),
+                "messages": page,
+                "total_count": total_count,
+                "has_more": has_more,
             })
             # Emit session_loaded for metadata
             self._emit({
@@ -913,6 +929,40 @@ class WebAgentBridge:
             traceback.print_exc()
             log('ERROR', 'server.bridge', f"load_session error: {e}")
             return False
+
+    def load_more_messages(self, offset: int, limit: int = 50) -> Optional[Dict[str, Any]]:
+        """Return a page of older messages from the loaded session.
+
+        Args:
+            offset: Number of messages to skip from the end (e.g. offset=50 means
+                    skip the most recent 50, get the ones before that).
+            limit:  How many messages to return.
+
+        Returns:
+            A dict with ``messages``, ``total_count``, ``has_more``, or ``None``
+            if no session is loaded.
+        """
+        session = self._session or self._loaded_session
+        if session is None:
+            return None
+
+        all_messages = session.user_history or []
+        total_count = len(all_messages)
+
+        # offset counts from the end: offset=0 means most recent
+        end_idx = total_count - offset
+        start_idx = max(0, end_idx - limit)
+
+        page = self._normalize_for_frontend(all_messages[start_idx:end_idx])
+        has_more = start_idx > 0
+
+        return {
+            "type": "more_messages",
+            "messages": page,
+            "offset": offset,
+            "total_count": total_count,
+            "has_more": has_more,
+        }
 
     def delete_session(self, session_id: str) -> bool:
         """Delete a session from the store."""

@@ -41,7 +41,8 @@ Client → Server (JSON):
     { "command": "apply_config",      "config": {...} }
     { "command": "list_sessions" }
     { "command": "save_session",          "name": "..." (optional) }
-    { "command": "load_session",          "session_id": "..." }
+    { "command": "load_session",          "session_id": "...", "limit": 50 (optional), "offset": 0 (optional) }
+    { "command": "load_more_messages",  "offset": 50, "limit": 50 }
     { "command": "get_providers" }
     { "command": "save_provider",      "provider": {...} }
     { "command": "delete_provider",    "provider_id": "..." }
@@ -59,7 +60,8 @@ Server → Client (JSON):
     state_changed       { "type": "state_changed",       "state": "IDLE|RUNNING|PAUSED|WAITING_FOR_USER", "is_running": bool }
     tokens_updated      { "type": "tokens_updated",      "input": int, "output": int }
     context_updated     { "type": "context_updated",     "context_length": int }
-    conversation_changed { "type": "conversation_changed", "messages": [...] }
+    conversation_changed { "type": "conversation_changed", "messages": [...], "total_count": int, "has_more": bool }
+    more_messages       { "type": "more_messages",       "messages": [...], "offset": int, "total_count": int, "has_more": bool }
     config_changed      { "type": "config_changed",      "config": {...} }
     status_message      { "type": "status_message",      "text": "..." }
     sessions_list       { "type": "sessions_list",       "sessions": [...] }
@@ -196,8 +198,8 @@ async def lifespan(app: FastAPI):
 # open sessions are saved before the process exits.
 #
 # Approach:
-# 1. _active_bridges — tracks all currently-active bridge instances.
-# 2. _shutdown_save() — iterates _active_bridges and saves each one.
+# 1. _session_bridges — dict mapping session_id → WebAgentBridge (warm cache).
+# 2. _shutdown_save() — iterates _session_bridges values and saves each one.
 # 3. atexit — ensures _shutdown_save runs when the Python process exits
 #    normally (including after uvicorn's Ctrl+C handling).
 # 4. asyncio.Event — the WebSocket handler checks this event between
@@ -209,7 +211,7 @@ async def lifespan(app: FastAPI):
 import signal
 import atexit
 
-_active_bridges: list = []
+_session_bridges: Dict[str, Any] = {}  # session_id → WebAgentBridge (warm cache)
 _shutdown_event: Any = None  # asyncio.Event, set lazily
 
 
@@ -223,12 +225,12 @@ def _get_shutdown_event() -> Any:
 
 
 def _shutdown_save() -> None:
-    """Save all active bridges' open sessions and stop them.
+    """Save all cached bridges' open sessions and stop them.
 
     Called via atexit — runs after uvicorn's event loop exits.
     """
-    log('INFO', 'server', f'Shutdown save: {len(_active_bridges)} active bridge(s)')
-    for bridge in list(_active_bridges):
+    log('INFO', 'server', f'Shutdown save: {len(_session_bridges)} cached bridge(s)')
+    for bridge in list(_session_bridges.values()):
         try:
             if not bridge._cleanly_closed:
                 bridge.save_open_session()
@@ -239,7 +241,7 @@ def _shutdown_save() -> None:
             bridge.stop()
         except Exception:
             pass
-    _active_bridges.clear()
+    _session_bridges.clear()
 
 
 def _trigger_shutdown() -> None:
@@ -363,11 +365,28 @@ async def websocket_endpoint(ws: WebSocket):
         except Exception as exc:
             log('ERROR', 'server.ws', f'send_event failed: {exc}\n{traceback.format_exc()}')
 
+    # Shutdown guard — set when the event loop is closing
+    _shutting_down = False
+
     # Callback wrapper — called from the bridge's agent thread
     def event_callback(event: Dict[str, Any]) -> None:
         """Called from agent thread.  Schedule send on the asyncio loop."""
+        nonlocal _shutting_down
+        if _shutting_down:
+            return
         try:
+            if _loop.is_closed():
+                _shutting_down = True
+                log('DEBUG', 'server.ws', 'Shutting down: event loop closed, discarding callback event.')
+                return
             asyncio.run_coroutine_threadsafe(send_event(event), _loop)
+        except RuntimeError as exc:
+            if 'Event loop is closed' in str(exc):
+                _shutting_down = True
+                log('DEBUG', 'server.ws', 'Shutting down: event loop closed, discarding callback event.')
+                return
+            log('ERROR', 'server.ws', f'event_callback error: {exc}')
+            traceback.print_exc()
         except Exception as exc:
             log('ERROR', 'server.ws', f'event_callback error: {exc}')
             traceback.print_exc()
@@ -410,7 +429,6 @@ async def websocket_endpoint(ws: WebSocket):
                     bridge = WebAgentBridge(event_callback=event_callback)
                     bridge.register()
                     bridge.set_controller(controller)
-                    _active_bridges.append(bridge)
 
                     try:
                         bridge.start(query, config_dict)
@@ -788,54 +806,88 @@ async def websocket_endpoint(ws: WebSocket):
                     if not session_id:
                         await ws.send_json({"type": "status_message", "text": "⚠ session_id is required."})
                         continue
+
                     # Save current session before switching
                     if bridge is not None and bridge.session is not None:
                         bridge.save_session()
-                    # If a bridge/session is running, stop it first
-                    if bridge is not None:
-                        bridge.stop()
-                    try:
+
+                    # Check if we already have a cached bridge for this session
+                    existing = _session_bridges.get(session_id)
+                    if existing is not None and existing._controller is not None:
+                        # Reuse cached bridge — update event callback to point to new WS
+                        log('INFO', 'server.ws', f'Reusing cached bridge for session {session_id}')
+                        bridge = existing
+                        bridge.set_event_callback(event_callback)
+                        # Resend current state
+                        try:
+                            page_limit = msg.get("limit", 50)
+                            page_offset = msg.get("offset", 0)
+                            bridge.load_session(session_id, limit=page_limit, offset=page_offset)
+                        except Exception as exc:
+                            log('WARNING', 'server.ws', f'Cached bridge load_session failed: {exc} — creating fresh bridge')
+                            existing = None
+
+                    if existing is None or existing._controller is None:
                         # Create fresh controller and bridge
                         from agent.controller import AgentController
                         controller = AgentController()
                         bridge = WebAgentBridge(event_callback=event_callback)
                         bridge.register()
                         bridge.set_controller(controller)
-                        bridge.load_session(session_id)
+                        _session_bridges[session_id] = bridge
+                        # Pagination: limit how many messages are sent initially
+                        page_limit = msg.get("limit", 50)
+                        page_offset = msg.get("offset", 0)
+                        bridge.load_session(session_id, limit=page_limit, offset=page_offset)
+
+                    await ws.send_json({
+                        "type": "session_loaded",
+                        "session_id": session_id,
+                        "workspace_id": bridge.workspace_id,
+                    })
+                    await ws.send_json({
+                        "type": "state_changed",
+                        "state": "IDLE",
+                        "is_running": False,
+                    })
+                    # Send tokens_updated so the frontend shows saved token counts
+                    loaded = bridge._session or bridge._loaded_session
+                    if loaded:
                         await ws.send_json({
-                            "type": "session_loaded",
-                            "session_id": session_id,
-                            "workspace_id": bridge.workspace_id,
+                            "type": "tokens_updated",
+                            "input": loaded.total_input_tokens,
+                            "output": loaded.total_output_tokens,
                         })
                         await ws.send_json({
-                            "type": "state_changed",
-                            "state": "IDLE",
-                            "is_running": False,
+                            "type": "context_updated",
+                            "context_length": loaded.context_length,
                         })
-                        # Send tokens_updated so the frontend shows saved token counts
-                        loaded = bridge._session or bridge._loaded_session
-                        if loaded:
-                            await ws.send_json({
-                                "type": "tokens_updated",
-                                "input": loaded.total_input_tokens,
-                                "output": loaded.total_output_tokens,
-                            })
-                            await ws.send_json({
-                                "type": "context_updated",
-                                "context_length": loaded.context_length,
-                            })
-                        # Send config_changed so the frontend shows the session's actual config
-                        fe_config = _frontend_config_from_bridge(bridge)
-                        await ws.send_json({
-                            "type": "config_changed",
-                            "config": fe_config,
-                        })
-                        await ws.send_json({"type": "status_message", "text": f"Session {session_id} loaded. Click Run to continue."})
+                    # Send config_changed so the frontend shows the session's actual config
+                    fe_config = _frontend_config_from_bridge(bridge)
+                    await ws.send_json({
+                        "type": "config_changed",
+                        "config": fe_config,
+                    })
+                    await ws.send_json({"type": "status_message", "text": f"Session {session_id} loaded. Click Run to continue."})
+
+                elif command == "load_more_messages":
+                    offset = msg.get("offset", 50)
+                    limit = msg.get("limit", 50)
+                    if bridge is None:
+                        await ws.send_json({"type": "status_message", "text": "⚠ No active session."})
+                        continue
+                    try:
+                        result = bridge.load_more_messages(offset=offset, limit=limit)
+                        if result is None:
+                            await ws.send_json({"type": "status_message", "text": "⚠ No session loaded."})
+                        else:
+                            await ws.send_json(result)
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
-                            "text": f"⚠ Failed to load session: {exc}",
+                            "text": f"⚠ Failed to load more messages: {exc}",
                         })
+                        log("ERROR", "server.config", f"load_more_messages failed: {exc}")
 
                 elif command == "delete_session":
                     session_id = msg.get("session_id", "")
@@ -933,6 +985,10 @@ async def websocket_endpoint(ws: WebSocket):
                         else:
                             # No bridge active — just acknowledge
                             await ws.send_json({"type": "status_message", "text": "Session closed."})
+                        # Remove from cache and stop the bridge
+                        cached = _session_bridges.pop(session_id, None)
+                        if cached is not None:
+                            cached.stop()
                         await ws.send_json({
                             "type": "session_closed",
                             "session_id": session_id,
@@ -982,6 +1038,8 @@ async def websocket_endpoint(ws: WebSocket):
                     # Store as the loaded session so continue_session picks it up
                     bridge._loaded_session = new_session
 
+                    # Cache bridge by the new session ID so reconnects reuse it
+                    _session_bridges[new_session.session_id] = bridge
                     # Persist to session store so the SessionTab can load it
                     # via load_session on its own WS connection.
                     session_store.save_session(new_session)
@@ -1121,10 +1179,10 @@ async def websocket_endpoint(ws: WebSocket):
     finally:
         # Mark closed so pending send_event calls are silently dropped
         ws._closed = True
-        # Cleanup: auto-save open session + stop bridge
-        # Guard: if close_session() was called cleanly, the session was
-        # already saved — don't re-save to avoid data loss on abrupt
-        # disconnect where save_session() could overwrite clean data.
+        # Save open session but DON'T stop the bridge — keep it cached
+        # for fast reuse when the frontend reconnects (tab switch,
+        # network blip, etc.). The bridge will be stopped either on
+        # close_session or during server shutdown.
         if bridge is not None:
             if not bridge._cleanly_closed:
                 try:
@@ -1132,11 +1190,6 @@ async def websocket_endpoint(ws: WebSocket):
                 except Exception:
                     pass
             bridge.unregister()
-            try:
-                _active_bridges.remove(bridge)
-            except ValueError:
-                pass
-            bridge.stop()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

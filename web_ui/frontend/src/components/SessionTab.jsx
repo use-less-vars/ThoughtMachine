@@ -48,7 +48,7 @@ const INITIAL_STATE = {
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
-function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, onClose, onNewSession, onSessionSaved, onRegister, onRunningChange, onSessionRenamed }) {
+function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onSessionSaved, onRegister, onRunningChange, onSessionRenamed }) {
   const [state, setState] = useState(INITIAL_STATE)
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
   const [providers, setProviders] = useState([])
@@ -63,8 +63,20 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const [defaultConfigSaveMessage, setDefaultConfigSaveMessage] = useState('')
   const [securityPrompt, setSecurityPrompt] = useState(null) // null | { request_id, tool_name, capabilities, ... }
   const [isDeferred, setIsDeferred] = useState(false) // true = load skipped; waiting for activation
+  const [totalMessages, setTotalMessages] = useState(0) // total messages in the session
+  const [hasMore, setHasMore] = useState(false) // true if older messages are available
   const loadSentRef = useRef(false) // true once load_session has been sent (by any path)
   const dataReceivedRef = useRef(false) // true once we've received a response to our load
+  const isActiveRef = useRef(isActive)
+  isActiveRef.current = isActive
+  const providersRef = useRef(providers)
+  providersRef.current = providers
+  const availableToolsRef = useRef(availableTools)
+  availableToolsRef.current = availableTools
+  const isWsConnectedOrConnecting = () => {
+    const ws = wsRef.current
+    return ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)
+  }
 
   // ── Config panel resize state (persisted per tab) ──────────────────
   const [configPanelWidth, setConfigPanelWidth] = useState(() => {
@@ -123,7 +135,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
 
   // ── Derived helpers ─────────────────────────────────────────────────────
   const update = useCallback((patch) => {
-    setState((prev) => ({ ...prev, ...patch }))
+    setState((prev) => ({
+      ...prev,
+      ...(typeof patch === 'function' ? patch(prev) : patch),
+    }))
   }, [])
 
   // ── Notify parent when running state changes (for tab color) ────────
@@ -170,6 +185,13 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   loadOnConnectRef.current = loadOnConnect
 
   const connectSessionWs = useCallback(() => {
+    // LAZY CONNECT: skip entirely if this tab is not the active one
+    if (!isActiveRef.current) {
+      console.log(`[SessionTab ${sessionId || 'new'}] Deferred WS connect (inactive tab)`)
+      tabConnectingRef.current = false
+      return
+    }
+
     // Guard: prevent duplicate connections from StrictMode double-mount
     if (tabConnectingRef.current) {
       console.log(`[SessionTab ${sessionId || 'new'}] Already connecting, skipping duplicate`)
@@ -230,9 +252,17 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         ws.send(JSON.stringify({ command: 'new_session' }))
       }
 
-      // Fetch providers and tools list for this session
-      sendCommand('get_providers')
-      sendCommand('get_available_tools')
+      // Fetch providers and tools list only if not already cached
+      if (!providersRef.current || providersRef.current.length === 0) {
+        sendCommand('get_providers')
+      } else {
+        console.log('[SessionTab] Skipping get_providers (already cached)')
+      }
+      if (!availableToolsRef.current || availableToolsRef.current.length === 0) {
+        sendCommand('get_available_tools')
+      } else {
+        console.log('[SessionTab] Skipping get_available_tools (already cached)')
+      }
     }
 
     ws.onmessage = (event) => {
@@ -285,6 +315,19 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     }
   }, [hubReady])
 
+  // ── Activate: connect WS when tab becomes active (lazy connect) ─────────
+  // This fires when the user clicks an inactive tab. We skip connecting if
+  // already connected (fast tab switching) or already trying to connect.
+  useEffect(() => {
+    if (!hubReady || !isActive) return
+    if (isWsConnectedOrConnecting()) return
+    if (tabConnectingRef.current) return
+
+    console.log(`[SessionTab ${sessionId || 'new'}] Activating — connecting WS now`)
+    closedRef.current = false
+    connectSessionWsRef.current()
+  }, [hubReady, isActive])
+
   // ── Event router ─────────────────────────────────────────────────────────
   function handleEvent(msg) {
     // ── Debug: log conversation data ─────────────────────────────────
@@ -329,6 +372,24 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         const notes = mergedMessages.filter(m => m.is_system_notification);
         if (notes.length > 0) console.log('🔔 SYSTEM NOTIFICATIONS:', notes);
         update({ history: mergedMessages })
+        // Pagination metadata from the server
+        if (msg.total_count !== undefined) {
+          setTotalMessages(msg.total_count)
+        }
+        setHasMore(msg.has_more === true)
+        break
+
+      case 'more_messages':
+        // Prepend older messages to the current history
+        console.log('[SessionTab] more_messages:', msg.messages?.length, 'messages, offset:', msg.offset, 'has_more:', msg.has_more)
+        const olderMessages = (msg.messages ?? []).map((m) => ({
+          ...m,
+          is_system_notification: m.is_system_notification || false,
+        }))
+        update((prev) => ({
+          history: [...olderMessages, ...prev.history],
+        }))
+        setHasMore(msg.has_more === true)
         break
 
       case 'config_changed':
@@ -348,6 +409,8 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         break
 
       case 'session_loaded':
+        // Debug: log the full message payload to see what backend sends
+        console.log('[SessionTab] session_loaded:', msg);
         // Mark that we've received a response (data may arrive before or
         // instead of conversation_changed).
         dataReceivedRef.current = true;
@@ -355,10 +418,9 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         if (msg.session_id) {
           setCurrentSessionId(msg.session_id)
         }
-        // Capture workspace_id for the WorkspacePanel
-        if (msg.workspace_id) {
-          update({ workspaceId: msg.workspace_id })
-        }
+        // Capture workspace_id for the WorkspacePanel.
+        // Fallback to 'default' when old sessions return null/undefined.
+        update({ workspaceId: msg.workspace_id || 'default' })
         // If this is a new session (tab had no sessionId), notify parent
         if (msg.session_id && !sessionId) {
           onNewSession?.(msg.session_id, msg.session_name)
@@ -456,6 +518,12 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   }, [])
 
 
+  // ── Load more (pagination) ────────────────────────────────────────────────
+  const loadMore = useCallback(() => {
+    const offset = state.history.length
+    sendCommand('load_more_messages', { offset, limit: 20 })
+  }, [state.history.length, sendCommand])
+
   // ── Render ───────────────────────────────────────────────────────────────
   // When deferred, show a placeholder instead of the full tab UI
   if (isDeferred) {
@@ -507,7 +575,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
               onDismiss={() => setSecurityPrompt(null)}
             />
           )}
-          <ChatPanel messages={state.history} />
+          <ChatPanel messages={state.history} loadMore={loadMore} hasMore={hasMore} />
           <QueryBar
             sendCommand={sendCommand}
             status={state.status}
@@ -530,6 +598,7 @@ export default React.memo(SessionTab, (prevProps, nextProps) => {
     prevProps.sessionId === nextProps.sessionId &&
     prevProps.hubReady === nextProps.hubReady &&
     prevProps.staggerMs === nextProps.staggerMs &&
-    prevProps.loadOnConnect === nextProps.loadOnConnect
+    prevProps.loadOnConnect === nextProps.loadOnConnect &&
+    prevProps.isActive === nextProps.isActive
   )
 })
