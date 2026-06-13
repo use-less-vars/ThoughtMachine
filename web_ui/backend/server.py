@@ -90,6 +90,8 @@ import shutil
 import tempfile
 import time
 import traceback
+import threading
+
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -99,6 +101,21 @@ from fastapi.staticfiles import StaticFiles
 from agent.logging import log
 from contextlib import asynccontextmanager
 from session.store import FileSystemSessionStore
+
+# ── Shared session store singleton ────────────────────────────────────────────
+# All WebSocket connections and bridges share ONE FileSystemSessionStore so that
+# the in-memory list_sessions() cache is coherent across concurrent connections.
+_session_store: Optional[FileSystemSessionStore] = None
+_session_store_lock = threading.Lock()
+
+def _get_session_store() -> FileSystemSessionStore:
+    global _session_store
+    if _session_store is None:
+        with _session_store_lock:
+            if _session_store is None:
+                _session_store = FileSystemSessionStore()
+    return _session_store
+
 
 from web_ui.backend.workspace_routes import router as workspace_router
 
@@ -345,7 +362,7 @@ async def websocket_endpoint(ws: WebSocket):
     from agent.controller import AgentController
 
     bridge: Optional[WebAgentBridge] = None
-    session_store = FileSystemSessionStore()
+    session_store = _get_session_store()
 
     # Capture the asyncio event loop HERE (inside the async handler)
     # so we can schedule sends from the agent thread later.
@@ -426,7 +443,7 @@ async def websocket_endpoint(ws: WebSocket):
                     if bridge is not None:
                         bridge.stop()
                     controller = AgentController()
-                    bridge = WebAgentBridge(event_callback=event_callback)
+                    bridge = WebAgentBridge(event_callback=event_callback, session_store=session_store)
                     bridge.register()
                     bridge.set_controller(controller)
 
@@ -831,7 +848,7 @@ async def websocket_endpoint(ws: WebSocket):
                         # Create fresh controller and bridge
                         from agent.controller import AgentController
                         controller = AgentController()
-                        bridge = WebAgentBridge(event_callback=event_callback)
+                        bridge = WebAgentBridge(event_callback=event_callback, session_store=session_store)
                         bridge.register()
                         bridge.set_controller(controller)
                         _session_bridges[session_id] = bridge
@@ -1018,7 +1035,7 @@ async def websocket_endpoint(ws: WebSocket):
                     # and calls bridge.start(query) to kick off the agent.
                     from agent.controller import AgentController
                     controller = AgentController()
-                    bridge = WebAgentBridge(event_callback=event_callback)
+                    bridge = WebAgentBridge(event_callback=event_callback, session_store=session_store)
                     bridge.register()
                     bridge.set_controller(controller)
 
@@ -1155,6 +1172,18 @@ async def websocket_endpoint(ws: WebSocket):
                             "type": "status_message",
                             "text": f"⚠ Failed to bootstrap workspace: {exc}",
                         })
+
+                elif command == "rebuild_container":
+                    workspace = msg.get("workspace", "")
+                    if not workspace:
+                        await ws.send_json({"type": "rebuild_result", "status": "error", "build_log": "No workspace path provided."})
+                    else:
+                        from docker_executor import rebuild_container
+                        try:
+                            result = rebuild_container(workspace)
+                            await ws.send_json({"type": "rebuild_result", "status": result.get("status", "unknown"), "build_log": result.get("build_log", "")})
+                        except Exception as exc:
+                            await ws.send_json({"type": "rebuild_result", "status": "error", "build_log": str(exc)})
 
                 else:
                     await ws.send_json({
@@ -1319,23 +1348,6 @@ def container_status(workspace: str = ""):
     except Exception as exc:
         log("ERROR", "server.container_status", f"Container status failed: {exc}")
         return {"status": "error", "capabilities": {}, "build_log": str(exc)}
-
-
-@app.post("/api/container/rebuild")
-def container_rebuild(workspace: str = Form("")):
-    """Rebuild the Docker image for the given workspace path."""
-    if not workspace:
-        return {"status": "error", "build_log": "No workspace path provided."}
-
-    from docker_executor import rebuild_container
-
-    try:
-        result = rebuild_container(workspace)
-        return result
-    except Exception as exc:
-        log("ERROR", "server.container_rebuild", f"Container rebuild failed: {exc}")
-        return {"status": "error", "build_log": str(exc)}
-
 
 @app.get("/")
 async def root():
