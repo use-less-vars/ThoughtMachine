@@ -60,6 +60,12 @@ except ImportError as e:
     logger.warning(f"Failed to import FileEditor: {e}")
 
 try:
+    from .read_file_tool import ReadFile
+    TOOL_CLASSES.append(ReadFile)
+except ImportError as e:
+    logger.warning(f"Failed to import ReadFile: {e}")
+
+try:
     from .file_preview_tool import FilePreviewTool
     TOOL_CLASSES.append(FilePreviewTool)
 except ImportError as e:

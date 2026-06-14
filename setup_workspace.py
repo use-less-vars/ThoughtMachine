@@ -53,7 +53,7 @@ def main():
         "required_categories": [],
         "worker_permissions": {},
         "description": "Simple test worker for verifying the delegation loop",
-        "tools": ["ReadFile"],
+        "tools": ["FilePreviewTool"],
     }
     workers_path.write_text(json.dumps([echo_worker], indent=2), encoding="utf-8")
     print(f"✅ Wrote echo worker definition to {workers_path}")

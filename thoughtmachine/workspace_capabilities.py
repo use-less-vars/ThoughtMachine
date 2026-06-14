@@ -310,9 +310,11 @@ def _safeguard_workspace_dir(base: Path) -> None:
     """
     allowed = {
         "capabilities.json",
+        "config.json",
         "Dockerfile",
         "domain_allowlist.json",
         "workers.json",
+        "workers",
         "mcp_servers.json",
     }
     if not base.is_dir():
