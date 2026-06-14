@@ -219,8 +219,38 @@ class WorkerThread(threading.Thread):
     def stop(self) -> None:
         """Signal the worker to stop after completing its current task."""
         self._stop_event.set()
+        # Write a stop command file for cross-process signalling
+        try:
+            cmd_path = self._worker_dir / "command.json"
+            cmd_path.write_text(json.dumps({"action": "stop"}), encoding="utf-8")
+        except OSError:
+            pass
         # Unblock the input queue wait
         self._input_queue.put(None)
+
+    def _poll_command(self) -> None:
+        """
+        Check for a ``command.json`` file in the worker's directory.
+
+        If found and the action is ``"stop"``, delete the file and signal
+        the stop event.  This enables cross-process stop (e.g. from the
+        Web UI via the REST API).
+        """
+        cmd_path = self._worker_dir / "command.json"
+        if not cmd_path.is_file():
+            return
+        try:
+            data = json.loads(cmd_path.read_text(encoding="utf-8"))
+            if data.get("action") == "stop":
+                cmd_path.unlink(missing_ok=True)
+                self._stop_event.set()
+                self._input_queue.put(None)
+        except (json.JSONDecodeError, OSError):
+            # Corrupted file — delete and ignore
+            try:
+                cmd_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _rebuild_tool_defs(self) -> None:
         """Build OpenAI-style tool definitions from self._tool_classes."""
@@ -456,8 +486,16 @@ class WorkerThread(threading.Thread):
             self._log_event("started", {}, {})
 
             while not self._stop_event.is_set():
-                # Wait for the next query (blocking)
-                query = self._input_queue.get()
+                # Check for command.json before blocking on input queue
+                self._poll_command()
+                if self._stop_event.is_set():
+                    break
+                # Wait for the next query with a 2-second timeout
+                # so we can also poll for command.json periodically
+                try:
+                    query = self._input_queue.get(timeout=2.0)
+                except queue.Empty:
+                    continue
                 if query is None or self._stop_event.is_set():
                     break
 
@@ -590,7 +628,7 @@ class Worker(ToolBase):
     tool: str = "Worker"
     required_categories: ClassVar[List[str]] = ["execution:read"]
 
-    action: str = Field(description="Action: list, spawn, check, query")
+    action: str = Field(description="Action: list, spawn, check, query, stop")
 
     worker_name: Optional[str] = Field(
         default=None,
@@ -609,7 +647,7 @@ class Worker(ToolBase):
 
     skip_output_truncation: ClassVar[bool] = True
 
-    VALID_ACTIONS: ClassVar[list[str]] = ["list", "spawn", "check", "query"]
+    VALID_ACTIONS: ClassVar[list[str]] = ["list", "spawn", "check", "query", "stop"]
 
     # ------------------------------------------------------------------
     def execute(self) -> str:
@@ -637,6 +675,7 @@ class Worker(ToolBase):
                 "spawn": lambda: self._action_spawn(workers, ws_id),
                 "check": lambda: self._action_check(workers),
                 "query": lambda: self._action_query(workers),
+                "stop": lambda: self._action_stop(workers),
             }[self.action]
 
             result = handler()
@@ -982,3 +1021,49 @@ class Worker(ToolBase):
                 "error": str(exc),
                 "worker_name": self.worker_name,
             }
+
+    def _action_stop(self, workers: list) -> dict:
+        """Stop a running worker and persist its context."""
+        with _registry_lock:
+            thread = _worker_registry.get(self.worker_name)
+
+        if thread is None:
+            entry = self._find_worker(workers, self.worker_name)
+            if entry:
+                return {
+                    "worker_name": self.worker_name,
+                    "status": "stopped",
+                    "message": f"Worker '{self.worker_name}' was not running.",
+                }
+            return {
+                "error": f"Worker '{self.worker_name}' not found",
+            }
+
+        if not thread.is_alive():
+            with _registry_lock:
+                _worker_registry.pop(self.worker_name, None)
+            thread._save_context()
+            return {
+                "worker_name": self.worker_name,
+                "status": thread.status,
+                "message": f"Worker '{self.worker_name}' was already stopped.",
+            }
+
+        try:
+            thread.stop()
+            thread.join(timeout=10.0)
+        except Exception as exc:
+            logger.exception("Error joining worker '%s' during stop", self.worker_name)
+            return {
+                "error": f"Error stopping worker '{self.worker_name}': {exc}",
+            }
+        finally:
+            thread._save_context()
+            with _registry_lock:
+                _worker_registry.pop(self.worker_name, None)
+
+        return {
+            "worker_name": self.worker_name,
+            "status": "stopped",
+            "message": f"Worker '{self.worker_name}' stopped successfully.",
+        }

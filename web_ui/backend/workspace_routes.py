@@ -26,6 +26,8 @@ from thoughtmachine.workspace_capabilities import (
     load_workspace_capabilities,
 )
 
+from tools.workspace.worker import _worker_registry, _registry_lock
+
 # ── Router ───────────────────────────────────────────────────────────────────
 
 router = APIRouter(prefix="/api/workspace")
@@ -180,24 +182,28 @@ async def get_workers(ws_id: str):
     else:
         configs = []
 
-    # 2. Get runtime status from the module-level worker registry
+    # 2. Read runtime status from status.json written by the worker thread.
+    #    This bridges the agent process and the backend API server process.
+    workers_dir = ws_dir / "workers"
     runtime_statuses = {}
-    try:
-        from tools.workspace.worker import _worker_registry, _registry_lock
-        with _registry_lock:
-            for wname, thread in list(_worker_registry.items()):
-                runtime_statuses[wname] = {
-                    "runtime_status": thread.status,
-                    "current_task": thread.current_task,
-                    "last_heartbeat": thread.last_heartbeat,
-                    "error": thread.error,
-                }
-    except ImportError:
-        pass
+    if workers_dir.is_dir():
+        for subdir in workers_dir.iterdir():
+            if subdir.is_dir():
+                status_path = subdir / "status.json"
+                if status_path.exists():
+                    try:
+                        data = json.loads(status_path.read_text(encoding="utf-8"))
+                        runtime_statuses[subdir.name] = {
+                            "runtime_status": data.get("runtime_status"),
+                            "current_task": data.get("current_task"),
+                            "last_heartbeat": data.get("last_heartbeat"),
+                            "error": data.get("error"),
+                        }
+                    except (json.JSONDecodeError, OSError):
+                        pass
 
     # 3. Check for persisted contexts on disk
     persisted_names = set()
-    workers_dir = ws_dir / "workers"
     if workers_dir.is_dir():
         for subdir in workers_dir.iterdir():
             if subdir.is_dir() and (subdir / "context.json").exists():
@@ -360,4 +366,46 @@ async def get_worker_events(
         events = events[-limit:]
 
     return events
+
+
+# ── POST /api/workspace/{ws_id}/workers/{name}/stop ────────────────────────
+
+
+@router.post("/{ws_id}/workers/{name}/stop")
+async def stop_worker(ws_id: str, name: str):
+    """Stop a running worker via a file-based command signal.
+
+    Writes ``{"action": "stop"}`` to the worker's ``command.json`` so that
+    the worker thread (which polls for this file) picks it up within 2 seconds.
+    Also attempts an in-memory stop as a fast path if the thread is in the
+    registry.  Returns immediately — the worker will transition to ``stopped``
+    asynchronously.
+
+    Returns:
+        200 with ``{"status": "ok", "name": name}`` on success.
+        404 if the worker directory does not exist.
+    """
+    ensure_workspace_dirs(ws_id)
+    ws_dir = _workspace_dir(ws_id)
+    worker_dir = ws_dir / "workers" / name
+
+    if not worker_dir.is_dir():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"status": "not_found", "name": name},
+        )
+
+    # Write the stop command file — the worker thread polls for this
+    _atomic_write_json({"action": "stop"}, worker_dir / "command.json")
+
+    # Fast-path: if the thread is in-memory (same process), signal directly
+    with _registry_lock:
+        thread = _worker_registry.get(name)
+    if thread is not None:
+        try:
+            thread.stop()
+        except Exception:
+            pass  # File-based stop will still work
+
+    return {"status": "ok", "name": name}
 

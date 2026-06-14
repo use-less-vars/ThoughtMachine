@@ -412,17 +412,18 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
 
       case 'session_loaded':
         // Debug: log the full message payload to see what backend sends
-        console.log('[SessionTab] session_loaded:', msg);
-        // Mark that we've received a response (data may arrive before or
-        // instead of conversation_changed).
         dataReceivedRef.current = true;
         // Track the session ID so subsequent continue_session calls use it
         if (msg.session_id) {
           setCurrentSessionId(msg.session_id)
         }
         // Capture workspace_id for the WorkspacePanel.
-        // Fallback to 'default' when old sessions return null/undefined.
-        update({ workspaceId: msg.workspace_id || 'default' })
+        // Only set when the backend sends a real workspace_id; otherwise
+        // workspaceId stays null and WorkspacePanel shows its graceful
+        // "No workspace loaded" message.
+        if (msg.workspace_id) {
+          update({ workspaceId: msg.workspace_id })
+        }
         // If this is a new session (tab had no sessionId), notify parent
         if (msg.session_id && !sessionId) {
           onNewSession?.(msg.session_id, msg.session_name)

@@ -72,6 +72,61 @@ try:
 except ImportError:
     shutdown_workers = None  # type: ignore
 
+# ── Workspace ID cache ──────────────────────────────────────────────────────
+# Cache mapping workspace path → workspace ID, built once and reused across
+# session load calls within the same bridge instance.
+_workspace_id_cache: Dict[str, str] = {}
+_workspace_cache_lock = threading.Lock()
+
+
+def _build_workspace_id_cache() -> Dict[str, str]:
+    """
+    Scan ``~/.thoughtmachine/workspaces/<id>/config.json`` and build a
+    cache of ``normalised_workspace_root → workspace_id``.
+
+    Called once on first resolution; subsequent calls return the cached dict.
+    """
+    with _workspace_cache_lock:
+        if _workspace_id_cache:
+            return _workspace_id_cache
+        try:
+            from pathlib import Path as _Path
+            import json as _json
+            base = _Path("~").expanduser() / ".thoughtmachine" / "workspaces"
+            if not base.is_dir():
+                return _workspace_id_cache
+            for entry in sorted(base.iterdir()):
+                if not entry.is_dir():
+                    continue
+                config_file = entry / "config.json"
+                if not config_file.is_file():
+                    continue
+                try:
+                    data = _json.loads(config_file.read_text(encoding="utf-8"))
+                    root = data.get("root", "")
+                    if not root:
+                        continue
+                    normalised = os.path.abspath(root).replace("\\", "/").rstrip("/")
+                    _workspace_id_cache[normalised] = entry.name
+                except (_json.JSONDecodeError, OSError):
+                    continue
+        except Exception:
+            pass
+        return _workspace_id_cache
+
+
+def _resolve_workspace_id(workspace_path: str) -> Optional[str]:
+    """
+    Resolve a workspace *workspace_path* to its workspace ID using the
+    in-memory cache.  Builds the cache on first call.
+
+    Returns the workspace ID (directory name under ``workspaces/``) or
+    ``None`` if no match is found.
+    """
+    cache = _build_workspace_id_cache()
+    normalised = os.path.abspath(workspace_path).replace("\\", "/").rstrip("/")
+    return cache.get(normalised)
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Bridge class
 # ══════════════════════════════════════════════════════════════════════════════
@@ -899,6 +954,18 @@ class WebAgentBridge:
                     log('WARNING', 'server.bridge', f'load_session: config merge failed: {exc}')
             else:
                 log('INFO', 'server.bridge', "No agent_config in session metadata")
+
+            # ── Fallback: derive workspace_id from config if session has none ──
+            if self._workspace_id is None and self._config is not None and self._config.workspace_path:
+                try:
+                    resolved = _resolve_workspace_id(self._config.workspace_path)
+                    if resolved:
+                        self._workspace_id = resolved
+                        log('INFO', 'server.bridge',
+                            f"Resolved workspace_id from config.workspace_path: {resolved}")
+                except Exception as exc:
+                    log('WARNING', 'server.bridge',
+                        f"Could not resolve workspace_id from workspace_path: {exc}")
 
             # Emit conversation_changed so the frontend updates
             # Use _normalize_for_frontend to convert API roles
