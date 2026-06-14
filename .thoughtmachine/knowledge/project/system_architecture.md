@@ -2348,3 +2348,46 @@ Key architectural changes:
 ## 2026-06-14 — Starting comprehensive audit of session tab lifecycle and br...
 
 Starting comprehensive audit of session tab lifecycle and bridge architecture. Will examine: session creation/loading/saving/closing, open_sessions.json persistence, WebSocket protocol, bridge responsibilities, frontend tab management.
+
+## 2026-06-14 — ## Permission system redesign (completed 2026-06-14)
+
+### Ch...
+
+## Permission system redesign (completed 2026-06-14)
+
+### Changes made to `tools/workspace/worker.py`
+
+1. **Removed private `_value_satisfies` import** (lines 73-79) and `VALUE_SATISFIES_AVAILABLE` flag
+2. **Removed manual HIERARCHY fallback** in `_check_tool_permissions`
+3. `_check_tool_permissions` now routes through the single gate: `check_required_categories(required, effective, tool_name, tool_args, description, event_bus=None, worker_permissions=self._worker_permissions)`
+4. If gate is unavailable, denies all (safe default)
+
+### Changes made to `tools/read_file_tool.py`
+
+1. Added `import os`
+2. Path containment check now uses `str(root_path) + os.sep` prefix check + equality guard to prevent false-positive matches on sibling directory names
+
+### Changes made to worker spawn logic (`_action_spawn`)
+
+1. Missing tools are now tracked in a `missing_tools` list
+2. Spawn response includes `missing_tools` field and a warning message when tools aren't found
+3. Logger warning emitted for missing tools
+
+## 2026-06-14 — ## Worker Tool Workspace Path Resolution (2026-06-14)
+
+**Dec...
+
+## Worker Tool Workspace Path Resolution (2026-06-14)
+
+**Decision:** Worker tool instances inherit the session's project root as their `workspace_path`, not a field from the worker definition.
+
+**Rationale:**
+- Worker definitions should be pure configuration (name, system_prompt, permissions, tools)
+- Runtime state like filesystem paths should come from the session runtime
+- The session already knows the project root from `~/.thoughtmachine/workspaces/<id>/config.json`
+- Hardcoding paths in worker definitions creates a maintenance burden (breaks on project move)
+
+**Implementation:**
+- `Worker._action_spawn()` reads project root from `ws_dir/config.json` and passes it to `WorkerThread(project_root=...)`
+- `WorkerThread._execute_tool()` uses `self._project_root` as the tool's `workspace_path`
+- Fallback to `self._worker_dir` only if project_root is unknown

@@ -144,6 +144,9 @@ class WebAgentBridge:
         # to avoid re-saving on abrupt disconnect (data loss guard).
         self._cleanly_closed = False
 
+        # Persisted worker contexts loaded from workspace on session load
+        self._persisted_workers: Dict[str, Dict[str, Any]] = {}
+
 
     # ── Security event subscription ───────────────────────────────────────────
 
@@ -692,6 +695,10 @@ class WebAgentBridge:
             session.ensure_name()
             self._session_store.save_session(session)
             self._loaded_session = session
+
+            # ── Load persisted worker contexts for this workspace ──────────
+            self._persisted_workers.clear()
+            self._load_worker_contexts()
             log('INFO', 'server.bridge', f"Session saved: {session.session_id} ({session.metadata.get('name')})")
             return session
         except Exception as e:
@@ -856,6 +863,10 @@ class WebAgentBridge:
                 self._session_store.save_session(session)
 
             self._loaded_session = session
+
+            # ── Load persisted worker contexts for this workspace ──────────
+            self._persisted_workers.clear()
+            self._load_worker_contexts()
 
             # ── Extract agent_config from session metadata into self._config ──
             # This makes self._config the single source of truth so bridge.get_config()
@@ -1092,6 +1103,9 @@ class WebAgentBridge:
             except Exception:
                 log('WARNING', 'server.bridge', 'Error shutting down workers during session close')
 
+        # Clear persisted worker contexts
+        self._persisted_workers.clear()
+
         # Reset state
         self._session = None
         self._loaded_session = None
@@ -1106,6 +1120,69 @@ class WebAgentBridge:
         })
         self._cleanly_closed = True
         log('INFO', 'server.bridge', f"Session closed: {sid or '(no id)'}")
+
+    # ── Worker persistence ──────────────────────────────────────────────
+
+    def _load_worker_contexts(self) -> None:
+        """
+        Scan the workspace ``workers/`` directory for persisted worker
+        conversation contexts and populate ``self._persisted_workers``.
+
+        Called from ``load_session()`` after the session is loaded so that
+        the bridge knows about idle workers that can be resumed.
+        """
+        if not self._workspace_id:
+            return
+        try:
+            from thoughtmachine.workspace_capabilities import _workspace_dir
+            ws_dir = _workspace_dir(self._workspace_id)
+        except ImportError:
+            log('WARNING', 'server.bridge',
+                '_load_worker_contexts: workspace_capabilities not available')
+            return
+        except Exception as exc:
+            log('WARNING', 'server.bridge',
+                f'_load_worker_contexts: failed to resolve workspace dir: {exc}')
+            return
+
+        workers_dir = ws_dir / "workers"
+        if not workers_dir.is_dir():
+            return
+
+        loaded = 0
+        for subdir in workers_dir.iterdir():
+            if not subdir.is_dir():
+                continue
+            name = subdir.name
+            context_path = subdir / "context.json"
+            if not context_path.exists():
+                continue
+            try:
+                context = json.loads(context_path.read_text(encoding="utf-8"))
+                self._persisted_workers[name] = {
+                    "name": name,
+                    "context": context,
+                }
+                loaded += 1
+            except (json.JSONDecodeError, OSError):
+                continue
+
+        if loaded:
+            log('INFO', 'server.bridge',
+                f'_load_worker_contexts: loaded {loaded} persisted worker(s)')
+
+    def resume_worker(self, name: str) -> Optional[Dict[str, Any]]:
+        """
+        Return the persisted conversation context for a worker by name.
+
+        Returns ``None`` if no persisted context exists for that worker.
+        The caller (typically the ``Worker`` tool) can use this to restore
+        a worker's conversation history before ``spawn``.
+        """
+        entry = self._persisted_workers.get(name)
+        if entry is None:
+            return None
+        return entry.get("context")
 
     def clear_loaded_session(self) -> None:
         """Clear the loaded session reference for a fresh start."""

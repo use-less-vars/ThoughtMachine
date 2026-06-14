@@ -157,16 +157,71 @@ async def put_domain_allowlist(ws_id: str, body: DomainAllowlistBody):
 
 @router.get("/{ws_id}/workers")
 async def get_workers(ws_id: str):
-    """Return the workspace's worker configurations as a JSON array."""
+    """Return worker configs merged with runtime status and persisted context.
+
+    Each worker entry includes:
+      - Config fields from workers.json (name, system_prompt, tool_classes, etc.)
+      - runtime_status:  "running" | "completed" | "failed" | "idle" | None
+      - current_task:    current activity description (if running)
+      - last_heartbeat:  ISO-8601 timestamp of last activity
+      - error:           error message (if failed)
+      - has_persisted_context: whether the worker has saved conversation on disk
+    """
     ensure_workspace_dirs(ws_id)
-    path = _workspace_dir(ws_id) / "workers.json"
-    if not path.exists():
-        return []
+    ws_dir = _workspace_dir(ws_id)
+
+    # 1. Load worker configurations from workers.json
+    config_path = ws_dir / "workers.json"
+    if config_path.exists():
+        try:
+            configs = json.loads(config_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            configs = []
+    else:
+        configs = []
+
+    # 2. Get runtime status from the module-level worker registry
+    runtime_statuses = {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data
-    except (json.JSONDecodeError, OSError):
-        return []
+        from tools.workspace.worker import _worker_registry, _registry_lock
+        with _registry_lock:
+            for wname, thread in list(_worker_registry.items()):
+                runtime_statuses[wname] = {
+                    "runtime_status": thread.status,
+                    "current_task": thread.current_task,
+                    "last_heartbeat": thread.last_heartbeat,
+                    "error": thread.error,
+                }
+    except ImportError:
+        pass
+
+    # 3. Check for persisted contexts on disk
+    persisted_names = set()
+    workers_dir = ws_dir / "workers"
+    if workers_dir.is_dir():
+        for subdir in workers_dir.iterdir():
+            if subdir.is_dir() and (subdir / "context.json").exists():
+                persisted_names.add(subdir.name)
+
+    # 4. Merge everything
+    result = []
+    for cfg in configs:
+        name = cfg.get("name", "")
+        entry = dict(cfg)
+        if name in runtime_statuses:
+            entry["runtime_status"] = runtime_statuses[name]["runtime_status"]
+            entry["current_task"] = runtime_statuses[name]["current_task"]
+            entry["last_heartbeat"] = runtime_statuses[name]["last_heartbeat"]
+            entry["error"] = runtime_statuses[name]["error"]
+        else:
+            entry["runtime_status"] = None
+            entry["current_task"] = None
+            entry["last_heartbeat"] = None
+            entry["error"] = None
+        entry["has_persisted_context"] = name in persisted_names
+        result.append(entry)
+
+    return result
 
 
 # ── GET /api/workspace/{ws_id}/mcp_servers ───────────────────────────────────
@@ -253,3 +308,56 @@ async def get_effective_permissions(
             },
         }
     return {"workspace_id": ws_id, "effective_permissions": effective}
+
+# ── GET /api/workspace/{ws_id}/workers/{name}/events ─────────────────────
+
+
+@router.get("/{ws_id}/workers/{name}/events")
+async def get_worker_events(
+    ws_id: str,
+    name: str,
+    limit: Optional[int] = Query(None, description="Max number of events to return (most recent)"),
+    since: Optional[str] = Query(None, description="ISO-8601 timestamp \u2014 return only events after this time"),
+):
+    """Return the event log for a specific worker as a JSON array.
+
+    Events are read from ``workers/events.jsonl`` and filtered by the
+    worker's ``name`` field (present on every event line).
+
+    Query parameters:
+      - ``limit``: max number of events to return (most recent)
+      - ``since``: ISO-8601 timestamp \u2014 return only events after this time
+    """
+    ensure_workspace_dirs(ws_id)
+    events_path = _workspace_dir(ws_id) / "workers" / "events.jsonl"
+    if not events_path.exists():
+        return []
+
+    events = []
+    try:
+        with open(events_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                    if event.get("worker_name") != name:
+                        continue
+                    # Apply ?since= filter
+                    if since is not None:
+                        ts = event.get("timestamp", "")
+                        if ts < since:
+                            continue
+                    events.append(event)
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        pass
+
+    # Apply ?limit= (most recent N)
+    if limit is not None and limit > 0 and len(events) > limit:
+        events = events[-limit:]
+
+    return events
+
