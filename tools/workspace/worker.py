@@ -34,6 +34,7 @@ from typing import Any, ClassVar, Dict, List, Optional
 from pydantic import Field
 
 from tools.base import ToolBase
+from tools.utils import model_to_openai_tool
 
 # File lock for atomic writes (same pattern as FileSystemSessionStore)
 try:
@@ -69,8 +70,29 @@ except ImportError:
     GATE_AVAILABLE = False
     check_required_categories = None  # type: ignore
 
+# Gate module already imported above — no secondary import needed.
+
 
 logger = logging.getLogger(__name__)
+
+# Tools excluded from workers for safety reasons
+# Workers could spawn other workers (recursion), manage containers, or
+# modify workspace infrastructure — all operations reserved for the
+# main agent / human user.
+_WORKER_BLOCKLIST: frozenset[str] = frozenset({
+    "Worker",           # recursion: worker spawning workers
+    "DockerCodeRunner",  # container execution
+    "EditDockerfile",    # container configuration
+    "MCPValidator",      # MCP server management
+})
+
+# Global tool name → class registry (built from tools.__init__.TOOL_CLASSES)
+# Resolved at import time — tools registered after this module loads
+# (Worker, EditDockerfile) are all in the blocklist, so no gap.
+from tools import TOOL_CLASSES as _TOOL_CLASSES_LIST
+_TOOL_REGISTRY: dict[str, type["ToolBase"]] = {
+    cls.__name__: cls for cls in _TOOL_CLASSES_LIST
+}
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +163,9 @@ class WorkerThread(threading.Thread):
         definition: dict,
         llm_client: Any,
         workspace_dir: Path,
+        tool_classes: Optional[Dict[str, type[ToolBase]]] = None,
+        session_permissions: Optional[Dict[str, Any]] = None,
+        project_root: Optional[str] = None,
     ) -> None:
         super().__init__(daemon=True, name=f"worker-{name}")
         self.worker_name = name
@@ -148,6 +173,20 @@ class WorkerThread(threading.Thread):
         self.llm_client = llm_client
         self._worker_dir = workspace_dir / "workers" / name
         self._worker_dir.mkdir(parents=True, exist_ok=True)
+
+        # Tool classes available to this worker (name -> class)
+        self._tool_classes: Dict[str, type[ToolBase]] = tool_classes or {}
+        # Tool definitions in OpenAI format (built once)
+        self._tool_defs: List[Dict[str, Any]] = []
+        self._rebuild_tool_defs()
+
+        # Session permissions for gate-checking tool calls
+        self._session_permissions: Dict[str, Any] = session_permissions or {}
+        # Worker-level permission footprint from definition
+        self._worker_permissions: Dict[str, Any] = definition.get("worker_permissions", {})
+
+        # Project root from the session (resolved from workspace config)
+        self._project_root: Optional[str] = project_root
 
         # Runtime state
         self.status: str = "idle"      # idle | running | completed | failed
@@ -183,6 +222,219 @@ class WorkerThread(threading.Thread):
         # Unblock the input queue wait
         self._input_queue.put(None)
 
+    def _rebuild_tool_defs(self) -> None:
+        """Build OpenAI-style tool definitions from self._tool_classes."""
+        defs = []
+        for name, cls in self._tool_classes.items():
+            try:
+                defs.append(model_to_openai_tool(cls))
+            except Exception as exc:
+                logger.warning(
+                    "Failed to build tool def for '%s': %s", name, exc
+                )
+        self._tool_defs = defs
+
+    def _check_tool_permissions(
+        self,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+    ) -> Optional[str]:
+        """
+        Check whether this tool call is allowed by worker + session permissions.
+
+        Routes through ``check_required_categories`` — the single gate
+        enforcement point for all tool calls.  Returns ``None`` if allowed,
+        or an error message string if denied.
+        """
+        tool_cls = self._tool_classes.get(tool_name)
+        if tool_cls is None:
+            return f"Unknown tool: {tool_name}"
+
+        # Get the tool's required categories
+        required = tool_cls.get_required_categories(tool_args)
+        if not required:
+            return None  # no categories needed = always allowed
+
+        # Use session permissions as the effective base;
+        # check_required_categories applies worker_permissions internally
+        # via _min_permission (more restrictive of the two).
+        effective = dict(self._session_permissions)
+
+        if GATE_AVAILABLE and check_required_categories is not None:
+            ok, error_msg = check_required_categories(
+                required,
+                effective,
+                tool_name=tool_name,
+                tool_args=tool_args,
+                description=f"Worker '{self.worker_name}' executing {tool_name}",
+                event_bus=None,  # No user to prompt in worker context
+                worker_permissions=self._worker_permissions,
+            )
+            if not ok:
+                return error_msg
+            return None
+        else:
+            # Gate not available: deny all (safe default for worker context)
+            return (
+                f"Permission denied: Gate unavailable for '{tool_name}'. "
+                f"Required: {', '.join(required)}"
+            )
+
+    def _execute_tool(
+        self,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+    ) -> str:
+        """
+        Instantiate and execute a tool by name.
+
+        Returns the tool's output string (JSON).
+        """
+        tool_cls = self._tool_classes.get(tool_name)
+        if tool_cls is None:
+            return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+        try:
+            tool_instance = tool_cls(**tool_args)
+        except Exception as exc:
+            return json.dumps({
+                "error": f"Failed to instantiate tool '{tool_name}': {exc}",
+            })
+
+        # Inject the workspace_path if the tool needs it
+        # Use the session's project root so tools can resolve files relative
+        # to the project (e.g., secret_alpha.txt -> <project_root>/secret_alpha.txt).
+        # Fall back to the worker's own directory only if project_root is unknown.
+        if self._project_root:
+            tool_instance.workspace_path = self._project_root
+        elif self._worker_dir:
+            tool_instance.workspace_path = str(self._worker_dir)
+
+        try:
+            result = tool_instance.execute()
+            return result
+        except Exception as exc:
+            return json.dumps({
+                "error": f"Tool '{tool_name}' execution failed: {exc}",
+            })
+
+    def _run_tool_loop(
+        self,
+        query: str,
+    ) -> str:
+        """
+        Run the tool-use conversation loop for a single query.
+
+        Steps:
+          1. Append user query to conversation.
+          2. Call LLM with tool definitions.
+          3. If response has tool_calls → validate, gate-check, execute, append, loop.
+          4. If text response → return it.
+          5. On error → return error JSON.
+        """
+        self.conversation.append({"role": "user", "content": query})
+
+        max_tool_turns = 10  # safety limit to prevent infinite loops
+        tool_turn = 0
+
+        while tool_turn < max_tool_turns and not self._stop_event.is_set():
+            tool_turn += 1
+            self.last_heartbeat = datetime.now(timezone.utc).isoformat()
+
+            try:
+                response = self.llm_client.chat_completion(
+                    self.conversation,
+                    tools=self._tool_defs if self._tool_defs else None,
+                )
+            except Exception as exc:
+                logger.exception("Worker LLM call failed")
+                return json.dumps({"error": f"LLM call failed: {exc}"})
+
+            content = response.content or ""
+            tool_calls = getattr(response, "tool_calls", None)
+
+            if not tool_calls:
+                # Text response — this is the final answer
+                self.conversation.append({
+                    "role": "assistant",
+                    "content": content,
+                })
+                return content
+
+            # ── Tool call(s) received ─────────────────────────────────
+            assistant_msg: Dict[str, Any] = {
+                "role": "assistant",
+                "content": content or "",
+                "tool_calls": tool_calls,
+            }
+            self.conversation.append(assistant_msg)
+
+            for tc in tool_calls:
+                tool_name = tc.get("function", {}).get("name", "")
+
+                # Parse arguments
+                try:
+                    raw_args = tc.get("function", {}).get("arguments", "{}")
+                    tool_args = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    tool_args = {}
+
+                tool_call_id = tc.get("id", "")
+
+                # 1. Validate the tool exists
+                if tool_name not in self._tool_classes:
+                    error_result = json.dumps({
+                        "error": f"Unknown tool: '{tool_name}'. "
+                                  f"Available tools: {list(self._tool_classes.keys())}",
+                    })
+                    self.conversation.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": error_result,
+                    })
+                    continue
+
+                # 2. Gate check
+                gate_error = self._check_tool_permissions(tool_name, tool_args)
+                if gate_error is not None:
+                    error_result = json.dumps({"error": gate_error})
+                    self.conversation.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": error_result,
+                    })
+                    continue
+
+                # 3. Execute the tool
+                self.current_task = f"Running {tool_name}..."
+                result = self._execute_tool(tool_name, tool_args)
+                self.current_task = None
+
+                self.conversation.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": result,
+                })
+
+                # Log the tool event
+                self._log_event(
+                    "tool_call",
+                    {"tool": tool_name, "args": tool_args},
+                    {"result": result[:500] if len(result) > 500 else result},
+                )
+
+            # Save context after each tool turn
+            self._save_context()
+
+            # Loop back for the next LLM response
+
+        if tool_turn >= max_tool_turns:
+            return json.dumps({
+                "error": f"Worker exceeded maximum tool turns ({max_tool_turns}).",
+            })
+
+        return ""  # unreachable, but keep the type checker happy
+
     # ── thread run loop ────────────────────────────────────────────
 
     def run(self) -> None:
@@ -210,13 +462,17 @@ class WorkerThread(threading.Thread):
                     break
 
                 self.current_task = query[:200]  # truncate display
-                self.conversation.append({"role": "user", "content": query})
 
-                # Make a synchronous (blocking) LLM call
-                response = self.llm_client.chat_completion(self.conversation)
-                reply = response.content if response and response.content else ""
+                # Run the tool-use loop (or plain LLM if no tools configured)
+                if self._tool_classes:
+                    reply = self._run_tool_loop(query)
+                else:
+                    # Simple mode: single LLM call, no tools
+                    self.conversation.append({"role": "user", "content": query})
+                    response = self.llm_client.chat_completion(self.conversation)
+                    reply = response.content if response and response.content else ""
+                    self.conversation.append({"role": "assistant", "content": reply})
 
-                self.conversation.append({"role": "assistant", "content": reply})
                 self.current_task = None
                 self.last_heartbeat = datetime.now(timezone.utc).isoformat()
 
@@ -476,15 +732,31 @@ class Worker(ToolBase):
 
         worker_perms = definition.get("worker_permissions", {})
 
-        result = check_required_categories(
-            required_categories=required,
-            session_permissions=session_permissions or {},
+        ok, error_msg = check_required_categories(
+            required=required,
+            effective=session_permissions or {},
+            tool_name="Worker",
+            tool_args={"action": self.action, "worker_name": self.worker_name},
+            description=f"Spawn worker '{self.worker_name}'",
+            event_bus=None,
             worker_permissions=worker_perms,
         )
 
-        if result is not None:
-            return result  # error message
+        if not ok:
+            return error_msg
         return None
+
+    def _resolve_tool_class(self, tool_name: str) -> Optional[type[ToolBase]]:
+        """Resolve a tool name string to its class via _TOOL_REGISTRY.
+
+        Uses the module-level ``_TOOL_REGISTRY`` dict built from
+        ``tools.TOOL_CLASSES`` at import time, so no lazy imports are needed.
+        """
+        cls = _TOOL_REGISTRY.get(tool_name)
+        if cls is None:
+            logger.warning("No known tool class for '%s'", tool_name)
+            return None
+        return cls
 
     # -- action implementations --------------------------------------
 
@@ -554,12 +826,64 @@ class Worker(ToolBase):
                 "worker_name": self.worker_name,
             }
 
+        # Resolve tool classes from definition
+        tool_classes: Dict[str, type[ToolBase]] = {}
+        missing_tools: list[str] = []
+        tool_names = definition.get("tools", [])
+        worker_perms = definition.get("worker_permissions", {})
+        if tool_names:
+            for tool_name in tool_names:
+                if tool_name in _WORKER_BLOCKLIST:
+                    missing_tools.append(f"{tool_name} (excluded for worker safety)")
+                    continue
+                cls = self._resolve_tool_class(tool_name)
+                if cls is None:
+                    missing_tools.append(tool_name)
+                    continue
+                # Spawn-time footprint validation: check tool categories against
+                # the worker's declared permission footprint.
+                tool_cats = cls.get_required_categories({})
+                if tool_cats and GATE_AVAILABLE and check_required_categories is not None:
+                    ok, _err = check_required_categories(
+                        required=tool_cats,
+                        effective={},
+                        tool_name=tool_name,
+                        tool_args={},
+                        description=(
+                            f"Worker '{self.worker_name}' footprint validation"
+                            f" for {tool_name}"
+                        ),
+                        event_bus=None,
+                        worker_permissions=worker_perms,
+                    )
+                    if not ok:
+                        missing_tools.append(
+                            f"{tool_name} (permission denied by worker footprint)"
+                        )
+                        continue
+                tool_classes[tool_name] = cls
+
+        # Resolve project root from workspace config so tools get the right
+        # workspace_path (the project root, not the worker's internal dir).
+        project_root: Optional[str] = None
+        if ws_dir:
+            config_path = ws_dir / "config.json"
+            try:
+                config_data = json.loads(config_path.read_text(encoding="utf-8"))
+                if isinstance(config_data, dict):
+                    project_root = config_data.get("root")
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                project_root = None
+
         # Create and start the worker thread
         thread = WorkerThread(
             name=self.worker_name,
             definition=definition,
             llm_client=llm_client,
             workspace_dir=ws_dir,
+            tool_classes=tool_classes if tool_classes else None,
+            session_permissions=self.session_permissions,
+            project_root=project_root,
         )
 
         # Pass initial context if provided
@@ -575,12 +899,22 @@ class Worker(ToolBase):
 
         thread.start()
 
-        return {
+        result: dict[str, Any] = {
             "spawned": True,
             "worker_name": self.worker_name,
             "status": thread.status,
             "message": f"Worker '{self.worker_name}' started.",
         }
+        if missing_tools:
+            result["missing_tools"] = missing_tools
+            result["message"] += (
+                f" Warning: tool(s) not available: {', '.join(missing_tools)}."
+            )
+            logger.warning(
+                "Worker '%s' spawned but tool(s) not found: %s",
+                self.worker_name, missing_tools,
+            )
+        return result
 
     def _action_check(self, workers: list) -> dict:
         """Check on a specific worker by name."""

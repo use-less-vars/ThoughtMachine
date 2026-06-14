@@ -502,8 +502,8 @@ class TestWorker:
     @patch("tools.workspace.worker.GATE_AVAILABLE", True)
     @patch("tools.workspace.worker.check_required_categories")
     def test_permission_gate_allows(self, mock_gate):
-        """check_required_categories returning None means allowed."""
-        mock_gate.return_value = None
+        """check_required_categories returning (True, "") means allowed."""
+        mock_gate.return_value = (True, "")
         tool = Worker(action="list", workspace_path="/tmp/test_ws")
         result = tool._check_worker_permissions(
             {"required_categories": ["execution:read"], "worker_permissions": {}},
@@ -514,8 +514,8 @@ class TestWorker:
     @patch("tools.workspace.worker.GATE_AVAILABLE", True)
     @patch("tools.workspace.worker.check_required_categories")
     def test_permission_gate_denies(self, mock_gate):
-        """check_required_categories returning a string means denied."""
-        mock_gate.return_value = "Insufficient permissions"
+        """check_required_categories returning (False, msg) means denied."""
+        mock_gate.return_value = (False, "Insufficient permissions")
         tool = Worker(action="list", workspace_path="/tmp/test_ws")
         result = tool._check_worker_permissions(
             {"required_categories": ["execution:write"], "worker_permissions": {}},
@@ -542,6 +542,157 @@ class TestWorker:
             {},
         )
         assert result is None
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  Spawn-time tool stripping (4b — footprint + 4a blocklist)
+    # ═══════════════════════════════════════════════════════════════════
+
+    @patch("tools.workspace.worker.GATE_AVAILABLE", True)
+    @patch("tools.workspace.worker.check_required_categories")
+    @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
+    @patch("tools.workspace.worker._workspace_dir")
+    @patch("tools.workspace.worker.Worker._build_llm_client")
+    @patch("tools.workspace.worker.WorkerThread")
+    def test_spawn_strips_by_footprint(
+        self, mock_thread_cls, mock_build_llm, mock_ws_dir,
+        mock_resolve, mock_gate,
+    ):
+        """
+        4d — Spawn-time stripping test.
+
+        Worker with ``filesystem:read`` footprint requests FileEditor.
+        FileEditor's default category is ``filesystem:write``, which the
+        ``check_required_categories`` mock denies → FileEditor is stripped.
+        """
+        mock_gate.return_value = (False, "footprint denied")
+
+        mock_dir = MagicMock()
+        mock_file = MagicMock()
+        mock_file.exists.return_value = True
+        mock_file.read_text.return_value = json.dumps([
+            {
+                "name": "reader",
+                "tools": ["FileEditor", "DateTimeTool"],
+                "worker_permissions": {"filesystem": "read"},
+            },
+        ])
+        mock_dir.__truediv__.return_value = mock_file
+        mock_ws_dir.return_value = mock_dir
+        mock_build_llm.return_value = MagicMock()
+
+        mock_thread = MagicMock()
+        mock_thread.status = "idle"
+        mock_thread_cls.return_value = mock_thread
+
+        tool = Worker(
+            action="spawn",
+            worker_name="reader",
+            workspace_path="/tmp/test_ws",
+            agent_config={"provider": "openai", "model": "gpt-4"},
+        )
+        result = _parse_result(tool.execute())
+        assert result["spawned"] is True
+        assert "missing_tools" in result, (
+            f"Expected missing_tools in result, got {result}"
+        )
+        assert any(
+            "FileEditor" in mt for mt in result["missing_tools"]
+        ), f"FileEditor should be stripped, got {result['missing_tools']}"
+        # DateTimeTool has no required_categories → no gate check → kept
+        assert not any(
+            "DateTimeTool" in mt for mt in result["missing_tools"]
+        ), f"DateTimeTool should be kept, got {result['missing_tools']}"
+
+    @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
+    @patch("tools.workspace.worker._workspace_dir")
+    @patch("tools.workspace.worker.Worker._build_llm_client")
+    @patch("tools.workspace.worker.WorkerThread")
+    def test_spawn_strips_blocklisted_tools(
+        self, mock_thread_cls, mock_build_llm, mock_ws_dir, mock_resolve,
+    ):
+        """
+        4e — Blocklist test.
+
+        Worker tool is blocklisted and stripped at spawn.
+        FileEditor and DateTimeTool are kept.
+        """
+        mock_dir = MagicMock()
+        mock_file = MagicMock()
+        mock_file.exists.return_value = True
+        mock_file.read_text.return_value = json.dumps([
+            {
+                "name": "safe_worker",
+                "tools": ["Worker", "FileEditor", "DateTimeTool"],
+                "worker_permissions": {},
+            },
+        ])
+        mock_dir.__truediv__.return_value = mock_file
+        mock_ws_dir.return_value = mock_dir
+        mock_build_llm.return_value = MagicMock()
+
+        mock_thread = MagicMock()
+        mock_thread.status = "idle"
+        mock_thread_cls.return_value = mock_thread
+
+        tool = Worker(
+            action="spawn",
+            worker_name="safe_worker",
+            workspace_path="/tmp/test_ws",
+            agent_config={"provider": "openai", "model": "gpt-4"},
+        )
+        result = _parse_result(tool.execute())
+        assert result["spawned"] is True
+        assert "missing_tools" in result, (
+            f"Expected missing_tools in result, got {result}"
+        )
+        # Worker is blocklisted
+        assert any(
+            "Worker" in mt for mt in result["missing_tools"]
+        ), f"Worker should be stripped, got {result['missing_tools']}"
+        # FileEditor and DateTimeTool should be kept
+        assert not any(
+            "FileEditor" in mt for mt in result["missing_tools"]
+        ), f"FileEditor should be kept, got {result['missing_tools']}"
+        assert not any(
+            "DateTimeTool" in mt for mt in result["missing_tools"]
+        ), f"DateTimeTool should be kept, got {result['missing_tools']}"
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  Per-call gate (4c)
+    # ═══════════════════════════════════════════════════════════════════
+
+    def test_per_call_gate_denies_write_for_readonly_worker(self, tmp_path: Path):
+        """
+        4c — Per-call gate test.
+
+        WorkerThread with ``filesystem:read`` footprint calls FileEditor
+        with ``operation=write``.  ``_check_tool_permissions`` should deny it.
+        """
+        from tools.file_editor import FileEditor as FECls
+
+        mock_llm = MagicMock()
+        thread = WorkerThread(
+            name="readonly_worker",
+            definition={
+                "system_prompt": "You are a test.",
+                "worker_permissions": {"filesystem": "read"},
+            },
+            llm_client=mock_llm,
+            workspace_dir=tmp_path,
+            tool_classes={"FileEditor": FECls},
+            session_permissions={},
+        )
+
+        error = thread._check_tool_permissions(
+            "FileEditor",
+            {"operation": "write", "filename": "/dev/null"},
+        )
+        assert error is not None, (
+            "Expected denial for FileEditor write with filesystem:read footprint"
+        )
+        assert "permission" in error.lower() or "denied" in error.lower(), (
+            f"Error message should mention permission/denied, got: {error}"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
