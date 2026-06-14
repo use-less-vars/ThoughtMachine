@@ -260,7 +260,9 @@ class ToolExecutor:
                 tool_args['agent_config'] = {
                     'temperature': getattr(self.config, 'temperature', None),
                     'max_turns': getattr(self.config, 'max_turns', None),
-                    'provider': getattr(self.config, 'provider', None),
+                    'provider': getattr(self.config, 'provider_type', None),
+                    'api_key': getattr(self.config, 'api_key', None),
+                    'base_url': getattr(self.config, 'base_url', None),
                     'model': getattr(self.config, 'model', None),
                     'tool_output_token_limit': getattr(self.config, 'tool_output_token_limit', None),
                 }
