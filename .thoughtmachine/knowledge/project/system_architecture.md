@@ -2344,3 +2344,7 @@ Key architectural changes:
 6. **Workspace Panel** — new UI component with Dockerfile viewer, domain allowlist editor, workers list (10s poll), effective permissions display
 7. **pyproject.toml fixes** — build-backend fixed to `setuptools.build_meta`, packages include all application modules, version sourced from `resources/.version` instead of bootstrap function
 8. **No-op config detection** — `_configs_are_identical()` in agent.py skips spurious restarts when frontend re-sends identical config
+
+## 2026-06-14 — Starting comprehensive audit of session tab lifecycle and br...
+
+Starting comprehensive audit of session tab lifecycle and bridge architecture. Will examine: session creation/loading/saving/closing, open_sessions.json persistence, WebSocket protocol, bridge responsibilities, frontend tab management.
