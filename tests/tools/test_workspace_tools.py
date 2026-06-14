@@ -14,6 +14,7 @@ Covers
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from unittest.mock import patch, MagicMock, mock_open
@@ -260,6 +261,55 @@ class TestWorker:
         assert len(thread2.conversation) == 2
         assert thread2.conversation[1]["content"] == "Hello"
         assert thread2.status == "running"
+
+    def test_resume_worker_loads_current_system_prompt(self, tmp_path: Path, caplog):
+        """
+        When a persisted context.json has a stale system prompt,
+        WorkerThread.run() replaces it with the current definition's prompt
+        and logs a warning. The rest of the conversation is preserved.
+        """
+        # Write a persisted context with an OLD system prompt + messages
+        ctx = {
+            "conversation": [
+                {"role": "system", "content": "You are an old assistant."},
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi there!"},
+            ],
+            "status": "idle",
+        }
+        context_path = tmp_path / "workers" / "resume_test" / "context.json"
+        context_path.parent.mkdir(parents=True)
+        context_path.write_text(json.dumps(ctx), encoding="utf-8")
+
+        mock_llm = MagicMock()
+        thread = WorkerThread(
+            name="resume_test",
+            definition={"system_prompt": "You are a NEW assistant."},
+            llm_client=mock_llm,
+            workspace_dir=tmp_path,
+        )
+
+        # Before run() — loaded from disk with old prompt
+        assert len(thread.conversation) == 3
+        assert thread.conversation[0]["content"] == "You are an old assistant."
+
+        # Start the thread and stop immediately so run() processes the prompt
+        with caplog.at_level(logging.WARNING):
+            thread.start()
+            thread.stop()
+            thread.join(timeout=2)
+
+        # After run() — prompt replaced with current definition
+        assert thread.conversation[0]["content"] == "You are a NEW assistant."
+        # User/assistant pair preserved
+        assert thread.conversation[1]["role"] == "user"
+        assert thread.conversation[1]["content"] == "Hello"
+        assert thread.conversation[2]["role"] == "assistant"
+        assert thread.conversation[2]["content"] == "Hi there!"
+        # Warning logged about the change
+        assert "system prompt changed" in caplog.text
+        assert "old assistant" in caplog.text
+        assert "NEW assistant" in caplog.text
 
     def test_worker_thread_logs_events(self, tmp_path: Path):
         """WorkerThread logs events to events.jsonl."""
