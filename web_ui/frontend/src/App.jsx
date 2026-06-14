@@ -239,20 +239,26 @@ export default function App() {
   // Open a tab for an existing session (auto-load from hub WS or sidebar)
   // preferredSessionId — if set, only make this tab active if its sessionId matches.
   const loadTab = useCallback((sessionId, preferredSessionId) => {
-      // Don't create duplicate tabs for the same session.
+      console.log(`[DEBUG App.loadTab] sessionId=${sessionId}, preferredSessionId=${preferredSessionId}`)
+    // Don't create duplicate tabs for the same session.
     // Use functional updater to avoid stale closure on `tabs`.
     setTabs((prev) => {
       const existing = prev.find((t) => t.sessionId === sessionId)
       if (existing) {
+        console.log(`[DEBUG App.loadTab] FOUND existing tab ${existing.tabId} for session ${sessionId}`)
         // Only switch to this tab if it's the preferred one (or no preference)
         if (!preferredSessionId || existing.sessionId === preferredSessionId) {
           setActiveTabId(existing.tabId)
           // Mark for deferred load — this tab may not have been loaded yet
           tabLoadTriggeredRef.current[existing.tabId] = true
+          console.log(`[DEBUG App.loadTab] Set active + triggered for existing tab ${existing.tabId}`)
+        } else {
+          console.log(`[DEBUG App.loadTab] NOT preferred — skipping setActive for existing tab ${existing.tabId}`)
         }
         return prev
       }
       const tabId = `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      console.log(`[DEBUG App.loadTab] CREATING new tab ${tabId} for session ${sessionId}, preferred=${preferredSessionId}, match=${!preferredSessionId || sessionId === preferredSessionId}`)
       // Only switch to this tab if it's the preferred one (or no preference)
       if (!preferredSessionId || sessionId === preferredSessionId) {
         setActiveTabId(tabId)
@@ -260,6 +266,9 @@ export default function App() {
         // once the SessionTab WS connects. Without this, new tabs created
         // via "+" would get stuck in deferred mode (empty placeholder).
         tabLoadTriggeredRef.current[tabId] = true
+        console.log(`[DEBUG App.loadTab] Set active + triggered for new tab ${tabId}`)
+      } else {
+        console.log(`[DEBUG App.loadTab] NOT preferred — skipping setActive/trigger for new tab ${tabId}`)
       }
       return [...prev, { tabId, sessionId }]
     })
@@ -268,9 +277,10 @@ export default function App() {
   // Initiate close: send close_session over the tab's own WS.
   // Do NOT remove from DOM yet — wait for server acknowledgement.
   const initiateCloseTab = useCallback((tabId) => {
+    const tab = tabsRef.current.find(t => t.tabId === tabId)
     const actions = tabActionsRef.current[tabId]
     if (actions?.sendCommand) {
-      actions.sendCommand('close_session')
+      actions.sendCommand('close_session', { session_id: tab?.sessionId })
     } else {
       // No WS connected — remove immediately
       removeTab(tabId)
@@ -351,6 +361,10 @@ export default function App() {
 
   // ── Tab selection handler with deferred-load trigger ─────────────────
   const handleSelectTab = useCallback((tabId) => {
+    console.log(`[DEBUG App.handleSelectTab] tabId=${tabId}, tabs=`, tabsRef.current.map(t => t.tabId),
+      'loadTriggered=', tabLoadTriggeredRef.current[tabId],
+      'sessionId=', tabsRef.current.find(t => t.tabId === tabId)?.sessionId,
+      'actionsExist=', !!tabActionsRef.current[tabId])
     setActiveTabId(tabId)
     // If this tab was deferred (didn't load on WS connect), trigger its load now
     if (!tabLoadTriggeredRef.current[tabId]) {
@@ -362,21 +376,31 @@ export default function App() {
           actions.sendCommand('load_session', { session_id: tab.sessionId })
           deferredLoadSentRef.current[tabId] = true
           console.log(`[App] Triggered deferred load for tab ${tabId}, session ${tab.sessionId}`)
+        } else {
+          console.log(`[DEBUG App.handleSelectTab] actions MISSING for tab ${tabId} — deferred won't fire yet`)
         }
+      } else {
+        console.log(`[DEBUG App.handleSelectTab] tab ${tabId} has no sessionId — skipping deferred load`)
       }
+    } else {
+      console.log(`[DEBUG App.handleSelectTab] tab ${tabId} already triggered — no deferred action`)
     }
   }, [])
 
   // ── Tab action registry (for save from SessionList) ───────────────────
   const handleRegisterTab = useCallback((tabId, actions) => {
+    console.log(`[DEBUG App.handleRegisterTab] tabId=${tabId}, triggered=${!!tabLoadTriggeredRef.current[tabId]}, sent=${!!deferredLoadSentRef.current[tabId]}, sessionId=`, tabsRef.current.find(t => t.tabId === tabId)?.sessionId)
     tabActionsRef.current[tabId] = actions
     // If this tab was selected before its actions were registered, trigger deferred load now
     if (tabLoadTriggeredRef.current[tabId] && !deferredLoadSentRef.current[tabId]) {
       const tab = tabsRef.current.find((t) => t.tabId === tabId)
       if (tab?.sessionId) {
+        console.log(`[DEBUG App.handleRegisterTab] FIRE! sending load_session for tab ${tabId}`)
         actions.sendCommand('load_session', { session_id: tab.sessionId })
         deferredLoadSentRef.current[tabId] = true
         console.log(`[App] Triggered deferred load for tab ${tabId} (via delayed registration)`)
+      } else {
+        console.log(`[DEBUG App.handleRegisterTab] tab ${tabId} has no sessionId — cannot send load_session`)
       }
     }
   }, [])

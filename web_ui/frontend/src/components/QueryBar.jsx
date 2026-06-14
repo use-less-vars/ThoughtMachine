@@ -32,6 +32,7 @@ function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
 
   const handleRun = () => {
     if (!query.trim()) return
+    console.log(`[DEBUG QueryBar handleRun] sessionId=${sessionId}, status=${status}, isRunning=${isRunning}, query="${query.trim().substring(0, 50)}"`)
     if (sessionId) {
       // Loaded session — continue with existing context, passing config
       sendCommand('continue_session', {

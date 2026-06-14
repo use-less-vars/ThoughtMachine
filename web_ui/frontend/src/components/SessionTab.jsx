@@ -186,13 +186,6 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   loadOnConnectRef.current = loadOnConnect
 
   const connectSessionWs = useCallback(() => {
-    // LAZY CONNECT: skip entirely if this tab is not the active one
-    if (!isActiveRef.current) {
-      console.log(`[SessionTab ${sessionId || 'new'}] Deferred WS connect (inactive tab)`)
-      tabConnectingRef.current = false
-      return
-    }
-
     // Guard: prevent duplicate connections from StrictMode double-mount
     if (tabConnectingRef.current) {
       console.log(`[SessionTab ${sessionId || 'new'}] Already connecting, skipping duplicate`)
@@ -215,7 +208,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     wsRef.current = ws
 
     ws.onopen = () => {
-      console.log(`[SessionTab ${sessionId || 'new'}] WS onopen`)
+      console.log(`[SessionTab ${sessionId || 'new'}] WS onopen, isActive=${isActiveRef.current}, loadOnConnect=${loadOnConnectRef.current}, sessionId=${sessionIdRef.current}`)
       tabConnectingRef.current = false
       setWsConnected(true)
 
@@ -316,12 +309,16 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     }
   }, [hubReady])
 
-  // ── Activate: connect WS when tab becomes active (lazy connect) ─────────
-  // This fires when the user clicks an inactive tab. We skip connecting if
-  // already connected (fast tab switching) or already trying to connect.
+  // ── Activation safety net (reconnect on tab switch) ────────────────────
+  // This fires when the user clicks an inactive tab. If the tab somehow lost
+  // its WebSocket (e.g. server restart), this reconnects it.
   useEffect(() => {
+    console.log(`[DEBUG SessionTab Activate effect] tabId=${tabId}, sessionId=${sessionId}, isActive=${isActive}, hubReady=${hubReady}, wsConnected=${isWsConnectedOrConnecting()}, tabConnecting=${tabConnectingRef.current}`)
     if (!hubReady || !isActive) return
-    if (isWsConnectedOrConnecting()) return
+    if (isWsConnectedOrConnecting()) {
+      console.log(`[DEBUG SessionTab Activate effect] tab ${tabId} already connected — skipping`)
+      return
+    }
     if (tabConnectingRef.current) return
 
     console.log(`[SessionTab ${sessionId || 'new'}] Activating — connecting WS now`)

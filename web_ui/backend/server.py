@@ -999,13 +999,28 @@ async def websocket_endpoint(ws: WebSocket):
                     try:
                         if bridge is not None:
                             bridge.close_session(session_id if session_id else None)
+                            # If session_id was empty, the bridge resolved it internally.
+                            # Remove the bridge from _session_bridges by value (since the key
+                            # might differ from the empty session_id).
+                            for cached_sid, cached_bridge in list(_session_bridges.items()):
+                                if cached_bridge is bridge:
+                                    cached_bridge.stop()
+                                    del _session_bridges[cached_sid]
+                                    break
+                            else:
+                                # Fallback: try pop with the original key
+                                cached = _session_bridges.pop(session_id, None)
+                                if cached is not None:
+                                    cached.stop()
                         else:
-                            # No bridge active — just acknowledge
+                            # No bridge active — clean up open sessions list
+                            if session_id:
+                                session_store.remove_open_session(session_id)
                             await ws.send_json({"type": "status_message", "text": "Session closed."})
-                        # Remove from cache and stop the bridge
-                        cached = _session_bridges.pop(session_id, None)
-                        if cached is not None:
-                            cached.stop()
+                            # Remove from cache (by key) even without a bridge
+                            cached = _session_bridges.pop(session_id, None)
+                            if cached is not None:
+                                cached.stop()
                         await ws.send_json({
                             "type": "session_closed",
                             "session_id": session_id,
