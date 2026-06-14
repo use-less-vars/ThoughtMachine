@@ -21,7 +21,7 @@ from unittest.mock import patch, MagicMock, mock_open
 import pytest
 
 from tools.workspace.check_system import CheckSystem
-from tools.workspace.worker import Worker
+from tools.workspace.worker import Worker, WorkerThread
 from tools.workspace.edit_dockerfile import EditDockerfile
 
 
@@ -207,7 +207,102 @@ class TestCheckSystem:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestWorker:
-    """Tests for Worker (stub implementations)."""
+    """Tests for Worker tool and WorkerThread."""
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  WorkerThread unit tests
+    # ═══════════════════════════════════════════════════════════════════
+
+    def test_worker_thread_init(self, tmp_path: Path):
+        """WorkerThread initialises with idle status and empty conversation."""
+        mock_llm = MagicMock()
+        thread = WorkerThread(
+            name="test_worker",
+            definition={"system_prompt": "You are a test."},
+            llm_client=mock_llm,
+            workspace_dir=tmp_path,
+        )
+        assert thread.worker_name == "test_worker"
+        assert thread.status == "idle"
+        assert thread.conversation == []
+        assert thread.current_task is None
+        assert thread.error is None
+        assert thread.is_alive() is False  # not started yet
+
+    def test_worker_thread_save_and_load_context(self, tmp_path: Path):
+        """WorkerThread persists and reloads context to/from disk."""
+        mock_llm = MagicMock()
+        thread = WorkerThread(
+            name="persist_test",
+            definition={},
+            llm_client=mock_llm,
+            workspace_dir=tmp_path,
+        )
+        thread.conversation = [
+            {"role": "system", "content": "You are a test."},
+            {"role": "user", "content": "Hello"},
+        ]
+        thread.status = "running"
+        thread.last_heartbeat = "2025-01-01T00:00:00"
+        thread._save_context()
+
+        # Verify file exists
+        context_file = tmp_path / "workers" / "persist_test" / "context.json"
+        assert context_file.exists()
+
+        # Load into a fresh thread
+        thread2 = WorkerThread(
+            name="persist_test",
+            definition={},
+            llm_client=mock_llm,
+            workspace_dir=tmp_path,
+        )
+        assert len(thread2.conversation) == 2
+        assert thread2.conversation[1]["content"] == "Hello"
+        assert thread2.status == "running"
+
+    def test_worker_thread_logs_events(self, tmp_path: Path):
+        """WorkerThread logs events to events.jsonl."""
+        mock_llm = MagicMock()
+        thread = WorkerThread(
+            name="log_test",
+            definition={},
+            llm_client=mock_llm,
+            workspace_dir=tmp_path,
+        )
+        thread._log_event("started", {}, {})
+        thread._log_event("query", "hello", "world")
+
+        events_file = tmp_path / "workers" / "events.jsonl"
+        assert events_file.exists()
+        lines = events_file.read_text(encoding="utf-8").strip().split("\n")
+        assert len(lines) == 2
+
+        evt1 = json.loads(lines[0])
+        assert evt1["event"] == "started"
+        assert evt1["worker_name"] == "log_test"
+
+        evt2 = json.loads(lines[1])
+        assert evt2["event"] == "query"
+        assert evt2["request"] == "hello"
+        assert evt2["response"] == "world"
+
+    def test_worker_thread_send_query_timeout(self, tmp_path: Path):
+        """send_query raises TimeoutError when worker doesn't respond."""
+        mock_llm = MagicMock()
+        thread = WorkerThread(
+            name="timeout_test",
+            definition={},
+            llm_client=mock_llm,
+            workspace_dir=tmp_path,
+        )
+        # Thread not running — queue.get will time out
+        with pytest.raises(TimeoutError):
+            thread.send_query("hello", timeout=0.01)
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  Worker tool — list
+    # ═══════════════════════════════════════════════════════════════════
 
     @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.worker._workspace_dir")
@@ -228,7 +323,7 @@ class TestWorker:
     @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.worker._workspace_dir")
     def test_action_list_with_workers(self, mock_ws_dir, mock_resolve):
-        """list returns workers from workers.json."""
+        """list returns workers from workers.json with runtime_status."""
         mock_dir = MagicMock()
         mock_file = MagicMock()
         mock_file.exists.return_value = True
@@ -242,11 +337,25 @@ class TestWorker:
         result = _parse_result(tool.execute())
         assert result["count"] == 1
         assert result["workers"][0]["name"] == "coder"
+        # Not spawned yet, so runtime_status should be "stopped"
+        assert result["workers"][0]["runtime_status"] == "stopped"
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  Worker tool — spawn
+    # ═══════════════════════════════════════════════════════════════════
 
     @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.worker._workspace_dir")
-    def test_action_spawn_found(self, mock_ws_dir, mock_resolve):
-        """spawn returns success when worker_name exists in workers.json."""
+    @patch("tools.workspace.worker.Worker._build_llm_client")
+    @patch("tools.workspace.worker.WorkerThread")
+    def test_action_spawn_found(
+        self, mock_thread_cls, mock_build_llm, mock_ws_dir, mock_resolve,
+    ):
+        """spawn returns success when worker_name exists in workers.json.
+
+        We mock WorkerThread entirely to avoid starting a real thread
+        or making LLM calls.  The thread's .start() is a no-op.
+        """
         mock_dir = MagicMock()
         mock_file = MagicMock()
         mock_file.exists.return_value = True
@@ -255,11 +364,23 @@ class TestWorker:
         ])
         mock_dir.__truediv__.return_value = mock_file
         mock_ws_dir.return_value = mock_dir
+        mock_build_llm.return_value = MagicMock()
 
-        tool = Worker(action="spawn", worker_name="coder", workspace_path="/tmp/test_ws")
+        mock_thread = MagicMock()
+        mock_thread.status = "idle"
+        mock_thread_cls.return_value = mock_thread
+
+        tool = Worker(
+            action="spawn",
+            worker_name="coder",
+            workspace_path="/tmp/test_ws",
+            agent_config={"provider": "openai", "model": "gpt-4"},
+        )
         result = _parse_result(tool.execute())
         assert result["spawned"] is True
         assert result["worker_name"] == "coder"
+        assert result["status"] == "idle"
+        mock_thread.start.assert_called_once()
 
     @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.worker._workspace_dir")
@@ -277,11 +398,17 @@ class TestWorker:
         tool = Worker(action="spawn", worker_name="nonexistent", workspace_path="/tmp/test_ws")
         result = _parse_result(tool.execute())
         assert "error" in result
+        assert "not found in workers.json" in result["error"]
 
+    # ═══════════════════════════════════════════════════════════════════
+    #  Worker tool — check
+    # ═══════════════════════════════════════════════════════════════════
+
+    @patch("tools.workspace.worker._worker_registry", new_callable=dict)
     @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.worker._workspace_dir")
-    def test_action_check_found(self, mock_ws_dir, mock_resolve):
-        """check returns status for a known worker."""
+    def test_action_check_not_spawned(self, mock_ws_dir, mock_resolve, mock_registry):
+        """check returns 'stopped' status for a defined but not-spawned worker."""
         mock_dir = MagicMock()
         mock_file = MagicMock()
         mock_file.exists.return_value = True
@@ -294,13 +421,13 @@ class TestWorker:
         tool = Worker(action="check", worker_name="coder", workspace_path="/tmp/test_ws")
         result = _parse_result(tool.execute())
         assert result["worker_name"] == "coder"
-        assert result["status"] == "idle"
-        assert "current_task" in result
+        assert result["status"] == "stopped"
+        assert result["current_task"] is None
 
     @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.worker._workspace_dir")
     def test_action_check_not_found(self, mock_ws_dir, mock_resolve):
-        """check returns error for unknown worker."""
+        """check returns error for a worker that's not even in workers.json."""
         mock_dir = MagicMock()
         mock_file = MagicMock()
         mock_file.exists.return_value = True
@@ -312,23 +439,29 @@ class TestWorker:
         result = _parse_result(tool.execute())
         assert "error" in result
 
-    @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
-    @patch("tools.workspace.worker._workspace_dir")
-    def test_action_query_found(self, mock_ws_dir, mock_resolve):
-        """query returns stub response for a known worker."""
-        mock_dir = MagicMock()
-        mock_file = MagicMock()
-        mock_file.exists.return_value = True
-        mock_file.read_text.return_value = json.dumps([
-            {"name": "coder", "status": "idle"},
-        ])
-        mock_dir.__truediv__.return_value = mock_file
-        mock_ws_dir.return_value = mock_dir
+    # ═══════════════════════════════════════════════════════════════════
+    #  Worker tool — query
+    # ═══════════════════════════════════════════════════════════════════
 
-        tool = Worker(action="query", worker_name="coder", workspace_path="/tmp/test_ws")
+    @patch("tools.workspace.worker._worker_registry", new_callable=dict)
+    @patch("tools.workspace.worker.resolve_workspace_id")
+    def test_action_query_not_spawned(self, mock_resolve, mock_registry):
+        """query returns error when worker hasn't been spawned."""
+        mock_resolve.return_value = "ws_test"
+
+        tool = Worker(
+            action="query",
+            worker_name="coder",
+            worker_query="hello",
+            workspace_path="/tmp/test_ws",
+        )
         result = _parse_result(tool.execute())
-        assert result["worker_name"] == "coder"
-        assert "stub" in result["response"]
+        assert "error" in result
+        assert "not running" in result["error"]
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  Worker tool — misc
+    # ═══════════════════════════════════════════════════════════════════
 
     def test_action_missing_worker_name(self):
         """spawn/check/query return error when worker_name is missing."""
@@ -361,6 +494,54 @@ class TestWorker:
     def test_required_categories(self):
         """Worker declares execution:read."""
         assert "execution:read" in Worker.required_categories
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  Permission gate
+    # ═══════════════════════════════════════════════════════════════════
+
+    @patch("tools.workspace.worker.GATE_AVAILABLE", True)
+    @patch("tools.workspace.worker.check_required_categories")
+    def test_permission_gate_allows(self, mock_gate):
+        """check_required_categories returning None means allowed."""
+        mock_gate.return_value = None
+        tool = Worker(action="list", workspace_path="/tmp/test_ws")
+        result = tool._check_worker_permissions(
+            {"required_categories": ["execution:read"], "worker_permissions": {}},
+            {"execution": "read"},
+        )
+        assert result is None
+
+    @patch("tools.workspace.worker.GATE_AVAILABLE", True)
+    @patch("tools.workspace.worker.check_required_categories")
+    def test_permission_gate_denies(self, mock_gate):
+        """check_required_categories returning a string means denied."""
+        mock_gate.return_value = "Insufficient permissions"
+        tool = Worker(action="list", workspace_path="/tmp/test_ws")
+        result = tool._check_worker_permissions(
+            {"required_categories": ["execution:write"], "worker_permissions": {}},
+            {"execution": "read"},
+        )
+        assert result == "Insufficient permissions"
+
+    @patch("tools.workspace.worker.GATE_AVAILABLE", True)
+    def test_no_required_categories_skips_gate(self):
+        """If definition has no required_categories, gate is skipped."""
+        tool = Worker(action="list", workspace_path="/tmp/test_ws")
+        result = tool._check_worker_permissions(
+            {"worker_permissions": {}},
+            {},
+        )
+        assert result is None
+
+    @patch("tools.workspace.worker.GATE_AVAILABLE", False)
+    def test_gate_unavailable(self):
+        """If security gate is not importable, all workers allowed."""
+        tool = Worker(action="list", workspace_path="/tmp/test_ws")
+        result = tool._check_worker_permissions(
+            {"required_categories": ["execution:write"], "worker_permissions": {}},
+            {},
+        )
+        assert result is None
 
 
 # ══════════════════════════════════════════════════════════════════════════════

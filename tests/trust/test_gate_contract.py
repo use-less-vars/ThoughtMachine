@@ -19,6 +19,7 @@ from __future__ import annotations
 import pytest
 
 from security.security_gate import (
+    check_required_categories,
     get_effective_permissions,
     get_expected_container_config,
 )
@@ -284,3 +285,167 @@ class TestGetExpectedContainerConfig:
         result = get_expected_container_config({})
         assert result["network_mode"] == "none"
         assert result["workspace_mode"] == "ro"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Worker-permissions overlay on check_required_categories
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestCheckRequiredCategoriesWorkerPermissions:
+    """
+    Verify that the optional ``worker_permissions`` dict further restricts
+    the effective permission dict using string-level permission values.
+
+    ``worker_permissions`` uses the same string hierarchy as session/workspace
+    permissions (``"banned"``, ``"read"``, ``"write"``, ``"full"``).
+    ``_min_permission`` compares levels and returns the more restrictive one.
+    """
+
+    def test_worker_read_narrows_write(self):
+        """
+        Worker has ``"read"`` where session+workspace have ``"write"``.
+        Effective ``{network: "write", filesystem: "write"}``,
+        worker ``{network: "read"}``
+        → network narrowed to ``"read"``, filesystem stays ``"write"``.
+        """
+        ok, msg = check_required_categories(
+            ["network:read"],
+            {"network": "write", "filesystem": "write"},
+            "ReadTool",
+            {},
+            "",
+            None,
+            worker_permissions={"network": "read"},
+        )
+        assert ok is True, f"network:read should still be allowed: {msg}"
+
+        # network:write should now be denied (narrowed from write→read)
+        ok2, msg2 = check_required_categories(
+            ["network:write"],
+            {"network": "write", "filesystem": "write"},
+            "WriteTool",
+            {},
+            "",
+            None,
+            worker_permissions={"network": "read"},
+        )
+        assert ok2 is False, msg2
+        assert "denied" in msg2.lower()
+
+        # filesystem:write should still pass (not in worker_permissions)
+        ok3, _ = check_required_categories(
+            ["filesystem:write"],
+            {"network": "write", "filesystem": "write"},
+            "WriteTool",
+            {},
+            "",
+            None,
+            worker_permissions={"network": "read"},
+        )
+        assert ok3 is True
+
+    def test_worker_banned_hard_denies(self):
+        """
+        Worker has ``{"filesystem": "banned"}`` → hard deny even for
+        read-level access.
+        """
+        ok, msg = check_required_categories(
+            ["filesystem:read"],
+            {"filesystem": "read"},
+            "ReadTool",
+            {},
+            "",
+            None,
+            worker_permissions={"filesystem": "banned"},
+        )
+        assert ok is False
+        assert "denied" in msg.lower()
+
+    def test_worker_same_level_passthrough(self):
+        """
+        Worker has same level as effective → effective passes through.
+        """
+        ok, msg = check_required_categories(
+            ["filesystem:write"],
+            {"filesystem": "write"},
+            "WriteTool",
+            {},
+            "",
+            None,
+            worker_permissions={"filesystem": "write"},
+        )
+        assert ok is True
+
+        # read also passes when worker matches
+        ok2, _ = check_required_categories(
+            ["filesystem:read"],
+            {"filesystem": "read"},
+            "ReadTool",
+            {},
+            "",
+            None,
+            worker_permissions={"filesystem": "read"},
+        )
+        assert ok2 is True
+
+    def test_worker_multi_category_restriction(self):
+        """
+        Worker restricts multiple categories at once.
+        Effective ``{network: "write", filesystem: "write"}``,
+        worker ``{network: "read", filesystem: "banned"}``
+        → ``network:read`` allowed, ``network:write`` denied,
+          ``filesystem:read`` denied (banned).
+        """
+        eff = {"network": "write", "filesystem": "write"}
+        wp = {"network": "read", "filesystem": "banned"}
+
+        # network:read still allowed
+        ok, _ = check_required_categories(
+            ["network:read"], eff, "Tool", {}, "", None, worker_permissions=wp
+        )
+        assert ok is True
+
+        # network:write denied (read < write)
+        ok2, msg2 = check_required_categories(
+            ["network:write"], eff, "Tool", {}, "", None, worker_permissions=wp
+        )
+        assert ok2 is False, msg2
+
+        # filesystem:read denied (banned)
+        ok3, msg3 = check_required_categories(
+            ["filesystem:read"], eff, "Tool", {}, "", None, worker_permissions=wp
+        )
+        assert ok3 is False, msg3
+
+    def test_worker_missing_key_falls_back(self):
+        """
+        Worker only defines ``{"execution": "read"}``.
+        Other keys (filesystem, network) fall back to the effective
+        session+workspace value unchanged.
+        """
+        eff = {
+            "filesystem": "write",
+            "network": True,
+            "execution": "write",
+        }
+        wp = {"execution": "read"}
+
+        # filesystem:write still passes (not in worker)
+        ok, _ = check_required_categories(
+            ["filesystem:write"], eff, "Tool", {}, "", None, worker_permissions=wp
+        )
+        assert ok is True
+
+        # network:true still passes
+        ok2, _ = check_required_categories(
+            ["network:true"], eff, "Tool", {}, "", None, worker_permissions=wp
+        )
+        assert ok2 is True
+
+        # execution:write now denied (worker narrowed to read)
+        ok3, msg3 = check_required_categories(
+            ["execution:write"], eff, "Tool", {}, "", None, worker_permissions=wp
+        )
+        assert ok3 is False, msg3
+        assert "denied" in msg3.lower()

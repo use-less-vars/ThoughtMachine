@@ -66,6 +66,12 @@ except ImportError:
 from session.models import Session
 from session.store import FileSystemSessionStore
 
+# Worker lifecycle — graceful shutdown of worker threads on session close
+try:
+    from tools.workspace.worker import shutdown_workers
+except ImportError:
+    shutdown_workers = None  # type: ignore
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Bridge class
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1078,6 +1084,14 @@ class WebAgentBridge:
         if sid:
             self.save_session()
             self.remove_open_session(sid)
+
+        # Gracefully stop any worker threads spawned during this session
+        if shutdown_workers is not None:
+            try:
+                shutdown_workers(timeout=5.0)
+            except Exception:
+                log('WARNING', 'server.bridge', 'Error shutting down workers during session close')
+
         # Reset state
         self._session = None
         self._loaded_session = None

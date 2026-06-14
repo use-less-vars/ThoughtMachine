@@ -61,23 +61,46 @@ def get_workspace_capabilities(workspace_id: str) -> WorkspaceCapabilities:
 
 
 def _min_permission(
-    session_value: Any,
-    workspace_allows: Optional[bool],
+    effective_val: Any,
+    override_val: Any,
 ) -> Any:
     """
-    Combine a session permission value with a workspace capability boolean.
+    Combine two permission values, returning the more restrictive one.
 
-    * If *workspace_allows* is ``None``, return *session_value* unchanged.
-    * If *workspace_allows* is ``False``, the effective value is ``False``
-      (hard deny) for boolean-like categories; for string categories we
-      return the lowest equivalent.
-    * If *workspace_allows* is ``True``, return *session_value* unchanged.
+    Used for two purposes:
+
+    1. **Session × workspace** (existing callers):
+       *override_val* is ``Optional[bool]``.
+       * ``None`` → *effective_val* unchanged.
+       * ``False`` → hard deny (``False``).
+       * ``True`` → *effective_val* unchanged.
+
+    2. **Effective × worker** (worker_permissions):
+       *override_val* is a string level (``"banned"``, ``"read"``,
+       ``"write"``, ``"full"``).  Compared by permission level;
+       the lower (more restrictive) level wins.
     """
-    if workspace_allows is None:
-        return session_value
-    if not workspace_allows:
-        return False  # workspace denies → hard block
-    return session_value
+    if override_val is None:
+        return effective_val
+    if isinstance(override_val, bool):
+        if not override_val:
+            return False  # hard deny
+        return effective_val  # True → passthrough
+
+    # override_val is a string — compare permission levels
+    _LEVEL_MAP: dict[str, float] = {
+        "banned": 0.0, "ask": 1.0, "none": 1.0,
+        "read": 2.0, "outbound": 2.5, "write": 3.0, "full": 4.0,
+    }
+
+    def _level(v: Any) -> float:
+        if isinstance(v, bool):
+            return 3.0 if v else 0.0
+        if v is None:
+            return 4.0
+        return _LEVEL_MAP.get(str(v).lower(), 2.0)
+
+    return override_val if _level(override_val) < _level(effective_val) else effective_val
 
 
 def get_effective_permissions(
@@ -270,6 +293,7 @@ def check_required_categories(
     event_bus: Any,
     agent_id: str = "0",
     session_id: str = "",
+    worker_permissions: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, str]:
     """
     Check a tool's required categories against the effective permission dict.
@@ -293,12 +317,31 @@ def check_required_categories(
             Agent identifier string (for prompt context).
         session_id:
             Session identifier (for prompt context).
+        worker_permissions:
+            Optional dict of worker-level permission overrides using the
+            same string hierarchy as session/workspace permissions
+            (e.g. ``{"network": "read", "filesystem": "banned"}``).
+            Each value is a string level (``"banned"``, ``"read"``,
+            ``"write"``, ``"full"``).  Applied via ``_min_permission``
+            which returns the more restrictive of the effective and
+            worker value.  If a key exists in *worker_permissions* but
+            not in *effective*, the worker value is used as-is.
 
     Returns:
         ``(True, "")`` if all checks pass.
         ``(False, error_message)`` if any check fails or the user denies.
     """
     PROMPT_TIMEOUT = 120.0
+
+    # ── Apply worker-level restrictions ─────────────────────────────────
+    if worker_permissions is not None:
+        for category, worker_val in worker_permissions.items():
+            if category in effective:
+                effective[category] = _min_permission(
+                    effective[category], worker_val
+                )
+            else:
+                effective[category] = worker_val
 
     ask_categories: List[str] = []
     prompts_needed = False
