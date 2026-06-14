@@ -252,9 +252,11 @@ class FileEditor(ToolBase):
         if self.line_number is None:
             # Write entire file
             content_str = self.content if isinstance(self.content, str) else "\n".join(self.content)
-            with open(filename, 'w', encoding='utf-8') as f:
+            mode_flag = 'a' if self.mode == 'append' else 'w'
+            with open(filename, mode_flag, encoding='utf-8') as f:
                 f.write(content_str)
-            return f"Successfully wrote to {filename}"
+            verb = "appended to" if self.mode == 'append' else "wrote to"
+            return f"Successfully {verb} {filename}"
         else:
             # Write to specific line
             with open(filename, 'r', encoding='utf-8') as f:
