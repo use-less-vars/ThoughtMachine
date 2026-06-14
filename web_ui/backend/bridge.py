@@ -316,6 +316,10 @@ class WebAgentBridge:
             config_dict: Frontend configuration overrides (see AgentConfig fields).
                          Applied on top of the existing (or global) config.
         """
+        # Reset session reference to ensure a clean slate — the correct
+        # session will be resolved and set below.
+        self._session = None
+
         # ── Layer 1: existing config from apply_config, or global config ──
         if self._config is not None:
             # A prior apply_config() call already set a validated config.
@@ -1121,6 +1125,12 @@ class WebAgentBridge:
         Also captures the session ID from the first event that carries one
         and triggers save_open_session() — deferred from start() because
         the session ID isn't known until the controller has created its agent.
+
+        Additionally, propagates the session object from the controller's
+        agent back to the bridge when it becomes available. This fixes the
+        case where a new session (started with session=None) is created
+        internally by the controller's Agent and the bridge never receives
+        it, causing _map_and_emit to skip conversation_changed events.
         """
         log('DEBUG', 'server.bridge', f"Bridge received event: {event.get('type')}")
         # Capture session ID from first event that has one
@@ -1130,6 +1140,24 @@ class WebAgentBridge:
                 self._session_id = sid
                 self.save_open_session()
                 log('INFO', 'server.bridge', f"Session ID captured from controller event: {sid}")
+
+        # If the bridge doesn't have a session yet, try to grab it from the
+        # controller's agent (which created a new Session internally in _run()).
+        # This runs on the controller thread, where self._controller.agent is
+        # guaranteed to be set before the first event is emitted.
+        if self._session is None and self._controller is not None:
+            try:
+                controller_agent = getattr(self._controller, 'agent', None)
+                if controller_agent is not None:
+                    agent_session = getattr(controller_agent, 'session', None)
+                    if agent_session is not None:
+                        self._session = agent_session
+                        self._history_version = getattr(agent_session, 'conversation_version', 0)
+                        log('DEBUG', 'server.bridge',
+                            f'Session {agent_session.session_id} propagated to bridge from controller agent')
+            except Exception:
+                pass  # Safe to retry on next event
+
         self._map_and_emit(event)
 
     def _map_and_emit(self, raw_event: Dict[str, Any]) -> None:
