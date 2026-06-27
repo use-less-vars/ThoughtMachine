@@ -373,6 +373,9 @@ def save_config(config: Dict[str, Any], config_path: str, backup: bool = True) -
         _warn_stray_keys(config)
         config = _sanitize_config_for_serialization(config)
 
+        # Strip sensitive keys before persisting to disk
+        config.pop('api_key', None)
+
         if backup:
             _backup_config(config_path)
 

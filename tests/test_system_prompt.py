@@ -9,6 +9,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Dict
 
@@ -201,3 +202,88 @@ class TestAgentConfigSystemPromptValidator:
         expected = prompt_path.read_text(encoding="utf-8")
         # The validator returns the raw file content (with trailing newline)
         assert cfg.system_prompt == expected
+
+
+# ── Overlay contamination guard ──────────────────────────────────────────────
+
+
+class TestSystemPromptOverlayContamination:
+    """Guard: ``system_prompt`` must never leak into ``agent_config.json``.
+
+    The ``StateBridge.save_config()`` method extracts the ``system_prompt``
+    value and writes it to ``custom_system_prompt.txt`` *before* persisting
+    the overlay diff.  These tests ensure that the overlay file never
+    contains a ``system_prompt`` key.
+    """
+
+    def test_system_prompt_not_in_overlay(
+        self, _patch_loader_paths, monkeypatch, tmp_path
+    ):
+        """After save_config() the overlay JSON has no system_prompt key."""
+        # Point the loader's USER_DIR to tmp_path so the overlay is written there
+        import agent.config.loader as loader_mod
+        from agent.presenter.state_bridge import StateBridge
+
+        fake_home = _patch_loader_paths
+        monkeypatch.setattr(loader_mod, "USER_DIR", fake_home / ".thoughtmachine")
+
+        overlay_path = tmp_path / "agent_config.json"
+        bridge = StateBridge(config_path=str(overlay_path))
+
+        # Set a custom system prompt
+        bridge.current_config.system_prompt = "Custom prompt for testing"
+        bridge.save_config()
+
+        # Read back the overlay file
+        saved = json.loads(overlay_path.read_text(encoding="utf-8"))
+        assert "system_prompt" not in saved, (
+            "system_prompt must not appear in agent_config.json overlay; "
+            "it should be stored in custom_system_prompt.txt instead"
+        )
+
+    def test_empty_system_prompt_not_in_overlay(
+        self, _patch_loader_paths, monkeypatch, tmp_path
+    ):
+        """Even when system_prompt is empty/None, it stays out of the overlay."""
+        import agent.config.loader as loader_mod
+        from agent.presenter.state_bridge import StateBridge
+
+        fake_home = _patch_loader_paths
+        monkeypatch.setattr(loader_mod, "USER_DIR", fake_home / ".thoughtmachine")
+
+        overlay_path = tmp_path / "agent_config.json"
+        bridge = StateBridge(config_path=str(overlay_path))
+
+        # system_prompt is None by default - save as-is
+        bridge.save_config()
+
+        saved = json.loads(overlay_path.read_text(encoding="utf-8"))
+        assert "system_prompt" not in saved, (
+            "system_prompt must not appear in overlay even when empty"
+        )
+
+    def test_factory_matching_system_prompt_not_in_overlay(
+        self, _patch_loader_paths, monkeypatch, tmp_path
+    ):
+        """When system_prompt matches factory default, it stays out of overlay."""
+        import agent.config.loader as loader_mod
+        from agent.presenter.state_bridge import StateBridge
+
+        fake_home = _patch_loader_paths
+        monkeypatch.setattr(loader_mod, "USER_DIR", fake_home / ".thoughtmachine")
+
+        overlay_path = tmp_path / "agent_config.json"
+        bridge = StateBridge(config_path=str(overlay_path))
+
+        # The factory config has system_prompt="" which the validator
+        # resolves to the file-based default.  Save with an explicit
+        # value that matches that default.
+        default_text = loader_mod.load_default_system_prompt_text()
+        bridge.current_config.system_prompt = default_text
+        bridge.save_config()
+
+        saved = json.loads(overlay_path.read_text(encoding="utf-8"))
+        assert "system_prompt" not in saved, (
+            "system_prompt must not appear in overlay even when value "
+            "matches the factory default"
+        )
