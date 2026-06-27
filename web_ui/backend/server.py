@@ -443,7 +443,8 @@ async def websocket_endpoint(ws: WebSocket):
                     if bridge is not None:
                         bridge.stop()
                     controller = AgentController()
-                    bridge = WebAgentBridge(event_callback=event_callback, session_store=session_store)
+                    bridge = WebAgentBridge(session_store=session_store)
+                    bridge.set_event_callback(event_callback, key=id(ws))
                     bridge.register()
                     bridge.set_controller(controller)
 
@@ -834,7 +835,7 @@ async def websocket_endpoint(ws: WebSocket):
                         # Reuse cached bridge — update event callback to point to new WS
                         log('INFO', 'server.ws', f'Reusing cached bridge for session {session_id}')
                         bridge = existing
-                        bridge.set_event_callback(event_callback)
+                        bridge.set_event_callback(event_callback, key=id(ws))
                         # Resend current state
                         try:
                             page_limit = msg.get("limit", 50)
@@ -848,7 +849,8 @@ async def websocket_endpoint(ws: WebSocket):
                         # Create fresh controller and bridge
                         from agent.controller import AgentController
                         controller = AgentController()
-                        bridge = WebAgentBridge(event_callback=event_callback, session_store=session_store)
+                        bridge = WebAgentBridge(session_store=session_store)
+                        bridge.set_event_callback(event_callback, key=id(ws))
                         bridge.register()
                         bridge.set_controller(controller)
                         _session_bridges[session_id] = bridge
@@ -1050,7 +1052,8 @@ async def websocket_endpoint(ws: WebSocket):
                     # and calls bridge.start(query) to kick off the agent.
                     from agent.controller import AgentController
                     controller = AgentController()
-                    bridge = WebAgentBridge(event_callback=event_callback, session_store=session_store)
+                    bridge = WebAgentBridge(session_store=session_store)
+                    bridge.set_event_callback(event_callback, key=id(ws))
                     bridge.register()
                     bridge.set_controller(controller)
 
@@ -1223,6 +1226,13 @@ async def websocket_endpoint(ws: WebSocket):
     finally:
         # Mark closed so pending send_event calls are silently dropped
         ws._closed = True
+        # Unregister this WebSocket's callback so stale connections
+        # don't linger (fixes multi-tab / tab-reconnect bug).
+        if bridge is not None:
+            try:
+                bridge.remove_event_callback(id(ws))
+            except Exception:
+                pass
         # Save open session but DON'T stop the bridge — keep it cached
         # for fast reuse when the frontend reconnects (tab switch,
         # network blip, etc.). The bridge will be stopped either on

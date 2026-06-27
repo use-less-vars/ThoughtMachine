@@ -2391,3 +2391,60 @@ Starting comprehensive audit of session tab lifecycle and bridge architecture. W
 - `Worker._action_spawn()` reads project root from `ws_dir/config.json` and passes it to `WorkerThread(project_root=...)`
 - `WorkerThread._execute_tool()` uses `self._project_root` as the tool's `workspace_path`
 - Fallback to `self._worker_dir` only if project_root is unknown
+
+## Worker Tool Safety Assessment
+
+## 2026-06-15 — 
+2025-01-15: Complete tool safety assessment for workers.
+
+W...
+
+
+2025-01-15: Complete tool safety assessment for workers.
+
+Worker blocklist (hardcoded in tools/workspace/worker.py):
+- Worker (recursion)
+- DockerCodeRunner (container execution)
+- EditDockerfile (container config)
+- MCPValidator (MCP server management)
+
+Every tool's required_categories determines what permission the worker's 
+permission_footprint must include. The security gate enforces at spawn time.
+
+RECOMMENDED "full-blown worker" tool set:
+All tools except the blocklisted 4. Tools with permission-sensitive ops
+are gated by the worker's permission_footprint.
+
+## Multi-Tab Bridge Lifecycle
+
+## 2026-06-27 — ## Multi-Tab Bridge Lifecycle Design Decision (2025-01-15)
+
+...
+
+## Multi-Tab Bridge Lifecycle Design Decision (2025-01-15)
+
+**Context:** The callback dict fix correctly broadcasts events to multiple WebSocket connections,
+but the shared WebAgentBridge object per session means destructive operations (start_session,
+new_session, close_session) from any tab stop the shared bridge, freezing other tabs.
+
+**Decision:** Defer the proper fix until Phase 3 bridge refactor.
+
+**Rationale:**
+- Option A (no bridge sharing) would lose the "live mirror" experience where a second tab
+  shows an ongoing agent run in real-time — exactly what the callback dict was designed for.
+- Option B/C (tab-scoped lifecycle with shared event broadcast) are architecturally invasive
+  and fit naturally into the planned Phase 3 bridge decomposition (SessionManager + SessionView).
+- Current work (multi-agent, container persistence) must not be disrupted.
+- Bug is minor: only manifests with second tab + destructive action. Normal single-tab usage
+  and multi-tab continue_session are unaffected.
+
+**Planned Phase 3 Architecture:**
+- SessionManager: owns the single session controller + history
+- SessionView (per-tab): lightweight lifecycle handler that cannot kill the shared core
+- This architecture inherently eliminates the shared-mutable-state trap
+
+**References:**
+- bridge.py: set_event_callback(), remove_event_callback(), _event_callbacks dict
+- server.py: load_session cache-reuse (lines 832-838), start_session (441-446),
+  new_session (1041-1057), close_session (999-1016)
+

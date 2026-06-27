@@ -6,13 +6,11 @@ as part of a tool-use loop. It wraps basic file-reading operations
 and requires ``filesystem:read`` permission.
 """
 
-from __future__ import annotations
-
 import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar, Literal, Optional
 
 from pydantic import Field
 
@@ -24,7 +22,7 @@ logger = logging.getLogger(__name__)
 class ReadFile(ToolBase):
     """Read the contents of a file from the workspace directory."""
 
-    tool: str = "ReadFile"
+    tool: Literal["ReadFile"] = "ReadFile"
     required_categories: ClassVar[list[str]] = ["filesystem:read"]
 
     file_path: str = Field(
