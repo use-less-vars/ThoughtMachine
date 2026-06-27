@@ -832,17 +832,38 @@ async def websocket_endpoint(ws: WebSocket):
                     # Check if we already have a cached bridge for this session
                     existing = _session_bridges.get(session_id)
                     if existing is not None and existing._controller is not None:
-                        # Reuse cached bridge — update event callback to point to new WS
+                        # Reuse cached bridge — register the new WS callback but DON'T
+                        # call bridge.load_session() (which would reload from disk,
+                        # replace self._session, and broadcast to ALL tabs).
+                        # Instead, send the live state directly to the NEW WS only.
                         log('INFO', 'server.ws', f'Reusing cached bridge for session {session_id}')
                         bridge = existing
                         bridge.set_event_callback(event_callback, key=id(ws))
-                        # Resend current state
+                        # Send current state from live bridge data (not from disk)
                         try:
                             page_limit = msg.get("limit", 50)
-                            page_offset = msg.get("offset", 0)
-                            bridge.load_session(session_id, limit=page_limit, offset=page_offset)
+                            session = bridge._session
+                            if session is not None and session.user_history:
+                                all_messages = session.user_history
+                                total_count = len(all_messages)
+                                if page_limit is not None and len(all_messages) > page_limit:
+                                    page = bridge._normalize_for_frontend(all_messages[-page_limit:])
+                                    has_more = total_count > page_limit
+                                else:
+                                    page = bridge._normalize_for_frontend(all_messages)
+                                    has_more = False
+                            else:
+                                page = []
+                                total_count = 0
+                                has_more = False
+                            await ws.send_json({
+                                "type": "conversation_changed",
+                                "messages": page,
+                                "total_count": total_count,
+                                "has_more": has_more,
+                            })
                         except Exception as exc:
-                            log('WARNING', 'server.ws', f'Cached bridge load_session failed: {exc} — creating fresh bridge')
+                            log('WARNING', 'server.ws', f'Cached bridge state sending failed: {exc} — creating fresh bridge')
                             existing = None
 
                     if existing is None or existing._controller is None:
