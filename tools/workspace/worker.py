@@ -70,7 +70,14 @@ except ImportError:
     GATE_AVAILABLE = False
     check_required_categories = None  # type: ignore
 
-# Gate module already imported above — no secondary import needed.
+# NullEventBus — used for worker security prompts where no interactive
+# user is available to respond (returns "deny" instantly).
+try:
+    from agent.events import NullEventBus
+    _NULL_EVENT_BUS = NullEventBus()
+except ImportError:
+    NullEventBus = None  # type: ignore
+    _NULL_EVENT_BUS = None
 
 
 logger = logging.getLogger(__name__)
@@ -297,7 +304,7 @@ class WorkerThread(threading.Thread):
                 tool_name=tool_name,
                 tool_args=tool_args,
                 description=f"Worker '{self.worker_name}' executing {tool_name}",
-                event_bus=None,  # No user to prompt in worker context
+                event_bus=_NULL_EVENT_BUS,
                 worker_permissions=self._worker_permissions,
             )
             if not ok:
@@ -777,7 +784,7 @@ class Worker(ToolBase):
             tool_name="Worker",
             tool_args={"action": self.action, "worker_name": self.worker_name},
             description=f"Spawn worker '{self.worker_name}'",
-            event_bus=None,
+            event_bus=_NULL_EVENT_BUS,
             worker_permissions=worker_perms,
         )
 
@@ -892,7 +899,7 @@ class Worker(ToolBase):
                             f"Worker '{self.worker_name}' footprint validation"
                             f" for {tool_name}"
                         ),
-                        event_bus=None,
+                        event_bus=_NULL_EVENT_BUS,
                         worker_permissions=worker_perms,
                     )
                     if not ok:

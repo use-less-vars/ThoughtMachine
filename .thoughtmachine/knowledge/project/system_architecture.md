@@ -2448,3 +2448,73 @@ new_session, close_session) from any tab stop the shared bridge, freezing other 
 - server.py: load_session cache-reuse (lines 832-838), start_session (441-446),
   new_session (1041-1057), close_session (999-1016)
 
+
+## 2026-06-29 — ## Architecture Deep-Dive Completed
+
+Read and analyzed all 4...
+
+## Architecture Deep-Dive Completed
+
+Read and analyzed all 40+ source files across agent/, session/, llm_providers/, tools/, thoughtmachine/, and security/. Comprehensive document built covering:
+
+- Agent facade and component delegation pattern
+- process_query turn loop with 3 pause checkpoints
+- Mailbox pattern for config hot-swap vs restart
+- AgentState machine (READY/RUNNING/PAUSING)
+- TurnTransaction buffer-and-commit pattern
+- EventBus pub/sub with legacy compatibility
+- Session model: ObservableList, conversation_version, append-only user_history
+- HistoryProvider > ContextBuilder > HistoryPruner pipeline
+- ProviderFactory: OpenAI-compatible + Anthropic
+- AgentController: background thread with event queue
+- Presenter layer: StateBridge -> EventProcessor -> SessionLifecycle
+- ToolExecutor: tool execution with security gate
+- FileSystemSessionStore with locking
+- Token counting, rate limiting, emergency retry
+- Logging subsystem
+
+Still to analyze: security/__init__.py, thoughtmachine/*, web_ui/*
+
+## 2026-06-29 — ## Architecture Investigation: 10 Questions (July 2025)
+
+###...
+
+## Architecture Investigation: 10 Questions (July 2025)
+
+### Q1 — Session attributes accessed by Agent
+The `Agent` class in `agent/core/agent.py` accesses these `self.session` attributes via direct attribute assignment (no TurnTransaction):
+- `self.session.user_history` (read: lines 555, 1298)
+- `self.session.total_input_tokens` (read/write: lines 696, 702)
+- `self.session.total_output_tokens` (read/write: lines 708, 714)
+- `self.session.conversation_version` (read: line 730)
+- `self.session.conversation_hash` (read: line 730)
+- `self.session._get_next_seq()` (call: line 751)
+- `self.session.session_id` (read: line 836)
+- `self.session.summary` (write: lines 1300, 1330)
+- `self.session.updated_at` (write: line 1331)
+
+### Q2 — Token/Turn warning injection
+Complete flow: (a) `state.update_token_state()`/`update_turn_state()` create typed events; (b) `agent.py` turn loop (lines 885-906) consumes events, creates `[SYSTEM NOTIFICATION]` Messages; (c) `tool_executor.py` (line 122) checks `is_tool_allowed()` before executing; (d) `get_allowed_tools()` returns `['Respond', 'SummarizeTool']` when `restrictions_active=True`. Warning texts documented.
+
+### Q3 — Time-based state
+**None exists.** No idle timers, no timeouts, no scheduling. Only event timestamps for display.
+
+### Q4 — Worker tool code
+`tools/workspace/worker.py` (1069 lines) — **not stubs.** Full `WorkerThread` class with LLM provider, tool execution, conversation persistence, idle timeout. 5 actions: list, spawn, check, query, stop. Real implementations in `_action_spawn`, `_action_check`, `_action_query`.
+
+### Q5 — Streaming in llm_providers
+**No streaming API exists.** `LLMProvider.chat_completion()` is synchronous abstractmethod. No `stream`, `chunk`, `delta` methods. No async code in agent/core/ or llm_providers/. Both `openai_compatible.py` and `anthropic_provider.py` implement synchronous `chat_completion()` only.
+
+### Q6 — `_handle_state_event` processing
+Simple event router at `agent.py:565-587`. For `token_warning`/`turn_warning`: no-op (injection happens in turn loop). For `execution_state_change`/`session_state_change`: logs and yields event.
+
+### Q7 — Tool restriction enforcement
+`tool_executor.py` line 122: checks `is_tool_allowed()` before each tool. If disallowed, `_create_tool_rejection_message()` (line 314) returns formatted rejection listing allowed tools. Rejection is recorded as tool result.
+
+### Q8 — `update_token_state` full method
+`state.py:67-116`. Compares tokens to thresholds → LOW/WARNING/CRITICAL. On first escalation, creates `token_warning` event with formatted message. Critical immediately sets `restrictions_active=True`. Return to LOW clears restrictions.
+
+### Q9 — `update_turn_state` full method
+`state.py:118-159`. Compares turn to `max_turns-3`. At threshold, sets `restrictions_active=True`, creates `turn_warning` event. Return to LOW clears restrictions.
+
+### Q10 — `_handle_state_event` (same as Q6)
