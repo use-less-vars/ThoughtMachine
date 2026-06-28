@@ -28,7 +28,7 @@ from thoughtmachine.workspace_capabilities import (
     load_workspace_capabilities,
 )
 from thoughtmachine.security import SessionPermissions, _pending_security_requests, _pending_requests_lock, resolve_security_prompt
-from agent.events import SecurityPromptEvent, EventType
+from agent.events import SecurityPromptEvent, EventType, NullEventBus
 
 # ── Pending-prompt registry ──────────────────────────────────────────────
 
@@ -370,6 +370,13 @@ def check_required_categories(
 
     if not prompts_needed:
         return True, ""
+
+    # ── Null / worker event bus: deny immediately without blocking ──────
+    if event_bus is None or isinstance(event_bus, NullEventBus):
+        return False, (
+            f"Permission denied: {', '.join(ask_categories)} required by "
+            f"'{tool_name}' — no interactive user available for worker prompt approval."
+        )
 
     # ── Prompt the user for approval ────────────────────────────────────
     request_id = str(uuid.uuid4())

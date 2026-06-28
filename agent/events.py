@@ -404,6 +404,11 @@ class NullEventBus:
 
     Provides the same interface as ``EventBus`` but silently discards all
     publishes and accepts (but ignores) subscribes.
+
+    Unlike the real ``EventBus``, this class also implements an ``ask()``
+    method that returns ``"deny"`` instantly with no blocking — this is
+    critical for worker sub-agents where there is no human to answer
+    security prompts.
     """
 
     def subscribe(self, event_type=None, callback=None):
@@ -414,9 +419,29 @@ class NullEventBus:
         """No-op publish — silently discards the event."""
         pass
 
+    def publish_dict(self, event_dict):
+        """No-op publish_dict — silently discards."""
+        pass
+
     def unsubscribe(self, event_type=None, callback=None):
         """No-op unsubscribe — does nothing."""
         pass
+
+    def ask(self, request):
+        """
+        Return ``"deny"`` instantly with no blocking.
+
+        In a worker context there is no human to answer a security prompt,
+        so we always deny immediately.  This method matches the signature
+        expected by callers that interact with the security prompt queue.
+
+        Args:
+            request: A tuple of ``(title, message)`` or any request object.
+
+        Returns:
+            ``"deny"`` (always).
+        """
+        return "deny"
 
 
 global_event_bus = EventBus()
