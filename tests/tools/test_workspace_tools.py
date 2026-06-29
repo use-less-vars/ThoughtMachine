@@ -191,16 +191,237 @@ class TestCheckSystem:
         assert result["container"] is False
 
     def test_unknown_query(self):
-        """Unknown query returns error with available queries."""
+        """Unknown query returns error with valid queries."""
         tool = CheckSystem(query="nonexistent_query", workspace_path="/tmp/test_ws")
         result = _parse_result(tool.execute())
         assert "error" in result
         assert "nonexistent_query" in result["error"]
-        assert "available_queries" in result
+        assert "valid_queries" in result
 
     def test_required_categories_empty(self):
         """CheckSystem declares no required categories."""
         assert CheckSystem.required_categories == []
+
+    # ── New query tests ────────────────────────────────────────────────
+
+    def test_my_config_is_valid_json(self):
+        """my_config returns structured JSON with key fields."""
+        tool = CheckSystem(
+            query="my_config",
+            agent_config={
+                "provider": "anthropic",
+                "model": "claude-sonnet-4",
+                "timeout_seconds": 600,
+                "max_turns": 50,
+                "enabled_tools": ["Thought", "FileEditor"],
+                "temperature": 0.7,
+                "system_prompt": "You are a helpful assistant.",
+                "session_permissions": {"filesystem:write": True},
+                "api_key": "sk-real-key",
+            },
+        )
+        result = json.loads(tool.execute())
+        assert result["provider"] == "anthropic"
+        assert result["model"] == "claude-sonnet-4"
+        assert result["timeout_seconds"] == 600
+        assert result["max_turns"] == 50
+        assert result["enabled_tools"] == ["Thought", "FileEditor"]
+        # API key should be masked
+        assert result["api_key"] == "***"
+        assert "raw_config" in result
+
+    def test_my_config_includes_restriction_reason(self):
+        """my_config includes restriction_reason when set."""
+        tool = CheckSystem(
+            query="my_config",
+            agent_config={
+                "provider": "anthropic",
+                "model": "claude-sonnet-4",
+                "restriction_reason": "token_critical",
+            },
+        )
+        result = json.loads(tool.execute())
+        assert result["restriction_reason"] == "token_critical"
+
+    @patch("tools.workspace.check_system.resolve_workspace_id", return_value="ws_test")
+    @patch("tools.workspace.check_system._workspace_dir")
+    def test_workers_query_returns_definitions(self, mock_ws_dir, mock_resolve):
+        """'workers' query returns worker definitions from workers.json."""
+        mock_dir = MagicMock()
+        mock_workers = MagicMock()
+        mock_workers.exists.return_value = True
+        mock_workers.read_text.return_value = json.dumps([
+            {"name": "echo", "system_prompt": "Echo worker", "tools": ["Thought"], "timeout_seconds": 60},
+        ])
+
+        def _div(key):
+            if "workers.json" in str(key):
+                return mock_workers
+            return MagicMock()
+
+        mock_dir.__truediv__.side_effect = _div
+        mock_ws_dir.return_value = mock_dir
+
+        tool = CheckSystem(
+            query="workers",
+            workspace_path="/tmp/test_ws",
+        )
+        result = json.loads(tool.execute())
+        assert "workers" in result
+        assert result["count"] == 1
+        assert result["workers"][0]["name"] == "echo"
+
+    @patch("tools.workspace.check_system.resolve_workspace_id", return_value="ws_test")
+    @patch("tools.workspace.check_system._workspace_dir")
+    def test_worker_detail_query(self, mock_ws_dir, mock_resolve):
+        """'worker/<name>' returns specific worker definition."""
+        mock_dir = MagicMock()
+        mock_workers = MagicMock()
+        mock_workers.exists.return_value = True
+        mock_workers.read_text.return_value = json.dumps([
+            {"name": "echo", "system_prompt": "Echo worker", "tools": ["Thought"], "timeout_seconds": 60},
+            {"name": "helper", "system_prompt": "Helper worker", "tools": ["FileEditor"]},
+        ])
+
+        def _div(key):
+            if "workers.json" in str(key):
+                return mock_workers
+            return MagicMock()
+
+        mock_dir.__truediv__.side_effect = _div
+        mock_ws_dir.return_value = mock_dir
+
+        tool = CheckSystem(
+            query="worker/echo",
+            workspace_path="/tmp/test_ws",
+        )
+        result = json.loads(tool.execute())
+        assert result["name"] == "echo"
+        assert result["system_prompt"] == "Echo worker"
+        assert result["timeout_seconds"] == 60
+
+    def test_worker_detail_query_not_found(self):
+        """'worker/<unknown>' returns error."""
+        tool = CheckSystem(
+            query="worker/nonexistent",
+            workspace_path="/tmp/test_ws",
+        )
+        result = json.loads(tool.execute())
+        assert "error" in result
+
+    @patch("tools.workspace.check_system.WORKER_REGISTRY_AVAILABLE", False)
+    def test_running_workers_query(self):
+        """'running_workers' returns list from registry."""
+        tool = CheckSystem(
+            query="running_workers",
+            workspace_path="/tmp/test_ws",
+        )
+        result = json.loads(tool.execute())
+        assert "running_workers" in result
+        assert result["count"] == 0
+
+    @patch("tools.workspace.check_system.resolve_workspace_id", return_value="ws_test")
+    @patch("tools.workspace.check_system._workspace_dir")
+    def test_capabilities_query(self, mock_ws_dir, mock_resolve):
+        """'capabilities' returns workspace feature info."""
+        mock_dir = MagicMock()
+        mock_caps = MagicMock()
+        mock_caps.exists.return_value = True
+        mock_caps.read_text.return_value = json.dumps({
+            "allow_docker": True,
+            "git_available": True,
+            "max_context_length": 100000,
+        })
+
+        def _div(key):
+            if "capabilities.json" in str(key):
+                return mock_caps
+            return MagicMock()
+
+        mock_dir.__truediv__.side_effect = _div
+        mock_ws_dir.return_value = mock_dir
+
+        tool = CheckSystem(
+            query="capabilities",
+            agent_config={"provider": "anthropic", "model": "claude-sonnet-4", "enabled_tools": ["Thought"]},
+            workspace_path="/tmp/test_ws",
+        )
+        result = json.loads(tool.execute())
+        assert "provider" in result
+        assert "model" in result
+        assert "has_docker" in result
+        assert "has_git" in result
+        assert "os" in result
+
+    @patch("tools.workspace.check_system.resolve_workspace_id", return_value="ws_test")
+    @patch("tools.workspace.check_system._workspace_dir")
+    def test_dockerfile_query(self, mock_ws_dir, mock_resolve):
+        """'dockerfile' returns Dockerfile content."""
+        mock_dir = MagicMock()
+        mock_df = MagicMock()
+        mock_df.exists.return_value = True
+        mock_df.read_text.return_value = "FROM python:3.11\n"
+
+        def _div(key):
+            if "Dockerfile" in str(key):
+                return mock_df
+            return MagicMock()
+
+        mock_dir.__truediv__.side_effect = _div
+        mock_ws_dir.return_value = mock_dir
+
+        tool = CheckSystem(
+            query="dockerfile",
+            workspace_path="/tmp/test_ws",
+        )
+        result = json.loads(tool.execute())
+        assert result["available"] is True
+        assert "FROM python:3.11" in result["content"]
+
+    def test_dockerfile_query_not_available(self):
+        """'dockerfile' returns available=false when no Dockerfile."""
+        tool = CheckSystem(
+            query="dockerfile",
+            workspace_path="/tmp/nonexistent",
+        )
+        result = json.loads(tool.execute())
+        assert result["available"] is False
+
+    @patch("tools.workspace.check_system.resolve_workspace_id", return_value="ws_test")
+    @patch("tools.workspace.check_system._workspace_dir")
+    def test_mcp_servers_query(self, mock_ws_dir, mock_resolve):
+        """'mcp_servers' returns configured MCP servers."""
+        mock_dir = MagicMock()
+        mock_mcp = MagicMock()
+        mock_mcp.exists.return_value = True
+        mock_mcp.read_text.return_value = json.dumps([
+            {"name": "my-mcp", "url": "http://localhost:9090"},
+        ])
+
+        def _div(key):
+            if "mcp_servers.json" in str(key):
+                return mock_mcp
+            return MagicMock()
+
+        mock_dir.__truediv__.side_effect = _div
+        mock_ws_dir.return_value = mock_dir
+
+        tool = CheckSystem(
+            query="mcp_servers",
+            workspace_path="/tmp/test_ws",
+        )
+        result = json.loads(tool.execute())
+        assert "mcp_servers" in result
+        assert result["count"] == 1
+        assert result["mcp_servers"][0]["name"] == "my-mcp"
+
+    def test_unknown_query_returns_valid_queries(self):
+        """Unknown query returns error with valid_queries list."""
+        tool = CheckSystem(query="nonexistent", workspace_path="/tmp/test_ws")
+        result = json.loads(tool.execute())
+        assert "error" in result
+        assert "valid_queries" in result
+        assert isinstance(result["valid_queries"], list)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -216,11 +437,10 @@ class TestWorker:
 
     def test_worker_thread_init(self, tmp_path: Path):
         """WorkerThread initialises with idle status and empty conversation."""
-        mock_llm = MagicMock()
         thread = WorkerThread(
             name="test_worker",
             definition={"system_prompt": "You are a test."},
-            llm_client=mock_llm,
+            agent_config={},
             workspace_dir=tmp_path,
         )
         assert thread.worker_name == "test_worker"
@@ -232,11 +452,10 @@ class TestWorker:
 
     def test_worker_thread_save_and_load_context(self, tmp_path: Path):
         """WorkerThread persists and reloads context to/from disk."""
-        mock_llm = MagicMock()
         thread = WorkerThread(
             name="persist_test",
             definition={},
-            llm_client=mock_llm,
+            agent_config={},
             workspace_dir=tmp_path,
         )
         thread.conversation = [
@@ -255,7 +474,7 @@ class TestWorker:
         thread2 = WorkerThread(
             name="persist_test",
             definition={},
-            llm_client=mock_llm,
+            agent_config={},
             workspace_dir=tmp_path,
         )
         assert len(thread2.conversation) == 2
@@ -281,11 +500,10 @@ class TestWorker:
         context_path.parent.mkdir(parents=True)
         context_path.write_text(json.dumps(ctx), encoding="utf-8")
 
-        mock_llm = MagicMock()
         thread = WorkerThread(
             name="resume_test",
             definition={"system_prompt": "You are a NEW assistant."},
-            llm_client=mock_llm,
+            agent_config={},
             workspace_dir=tmp_path,
         )
 
@@ -313,11 +531,10 @@ class TestWorker:
 
     def test_worker_thread_logs_events(self, tmp_path: Path):
         """WorkerThread logs events to events.jsonl."""
-        mock_llm = MagicMock()
         thread = WorkerThread(
             name="log_test",
             definition={},
-            llm_client=mock_llm,
+            agent_config={},
             workspace_dir=tmp_path,
         )
         thread._log_event("started", {}, {})
@@ -339,11 +556,10 @@ class TestWorker:
 
     def test_worker_thread_send_query_timeout(self, tmp_path: Path):
         """send_query raises TimeoutError when worker doesn't respond."""
-        mock_llm = MagicMock()
         thread = WorkerThread(
             name="timeout_test",
             definition={},
-            llm_client=mock_llm,
+            agent_config={},
             workspace_dir=tmp_path,
         )
         # Thread not running — queue.get will time out
@@ -720,14 +936,13 @@ class TestWorker:
         """
         from tools.file_editor import FileEditor as FECls
 
-        mock_llm = MagicMock()
         thread = WorkerThread(
             name="readonly_worker",
             definition={
                 "system_prompt": "You are a test.",
                 "worker_permissions": {"filesystem": "read"},
             },
-            llm_client=mock_llm,
+            agent_config={},
             workspace_dir=tmp_path,
             tool_classes={"FileEditor": FECls},
             session_permissions={},
