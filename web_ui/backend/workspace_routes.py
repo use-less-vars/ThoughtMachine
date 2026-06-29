@@ -12,6 +12,7 @@ import os
 import shutil
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -381,6 +382,11 @@ async def stop_worker(ws_id: str, name: str):
     registry.  Returns immediately — the worker will transition to ``stopped``
     asynchronously.
 
+    Also immediately writes ``status.json`` with ``runtime_status: "completed"``
+    so the web UI's next poll sees a terminal state right away (instead of
+    "jumping back" to "running" when the optimistic update gets overwritten
+    before the worker processes the stop).
+
     Returns:
         200 with ``{"status": "ok", "name": name}`` on success.
         404 if the worker directory does not exist.
@@ -397,6 +403,16 @@ async def stop_worker(ws_id: str, name: str):
 
     # Write the stop command file — the worker thread polls for this
     _atomic_write_json({"action": "stop"}, worker_dir / "command.json")
+
+    # Immediately write status.json as "completed" so the UI doesn't
+    # "jump back" to "running" on the next poll before the worker
+    # thread has a chance to process the stop signal.
+    _atomic_write_json({
+        "runtime_status": "completed",
+        "current_task": None,
+        "last_heartbeat": datetime.now(timezone.utc).isoformat(),
+        "error": None,
+    }, worker_dir / "status.json")
 
     # Fast-path: if the thread is in-memory (same process), signal directly
     with _registry_lock:
