@@ -2518,3 +2518,53 @@ Simple event router at `agent.py:565-587`. For `token_warning`/`turn_warning`: n
 `state.py:118-159`. Compares turn to `max_turns-3`. At threshold, sets `restrictions_active=True`, creates `turn_warning` event. Return to LOW clears restrictions.
 
 ### Q10 — `_handle_state_event` (same as Q6)
+
+## Config Loading Architecture
+
+## 2026-06-29 — 2025-07-16: Documented full config loading architecture — fi...
+
+2025-07-16: Documented full config loading architecture — file hierarchy (resources/default_config.json → ~/.thoughtmachine/config.json → profile overrides), bootstrap flow, AgentConfig model, workspace capabilities, how tools get config injected (ToolExecutor passes session_permissions and agent_config_dict), worker config building (with hardcoded 300s timeout), and CheckSystem.my_config. Key gaps: agent_config_dict is partial, Worker timeout default (300) diverges from AgentConfig default (600), no dedicated "read my config" tool exists.
+
+
+## 2026-06-29 — ## 2026-06-29: Runtime Timeout Override + CheckSystem Extens...
+
+## 2026-06-29: Runtime Timeout Override + CheckSystem Extension
+
+### Worker timeout architecture
+- Worker tool class now has `timeout_seconds` field (default None → falls back to definition → 600)
+- WorkerThread stores resolved timeout as `self._timeout_seconds` 
+- `_build_agent_config` uses `self._timeout_seconds` instead of `definition.get("timeout_seconds", 300)`
+- Priority: spawn `timeout_seconds` param > definition `timeout_seconds` > 600
+
+### Elapsed time tracking
+- `_run_tool_loop` records `time.monotonic()` start time
+- Stored as `_last_elapsed_val` after query completes
+- Exposed via `_last_elapsed()` method
+- Included as `elapsed_seconds` in Worker query result
+
+### CheckSystem new queries
+- `workers`: Reads workers.json from workspace dir, returns all definitions
+- `worker/<name>`: Returns specific worker definition by name
+- `running_workers`: Queries in-memory `_worker_registry`, returns status/elapsed
+- `capabilities`: Combines agent_config (provider, model, tools) with OS, Docker, Git detection, plus capabilities.json
+- `dockerfile`: Returns Dockerfile content from workspace dir
+- `mcp_servers`: Returns mcp_servers.json config
+- `my_config`: Now returns structured JSON with masked API key, raw_config fallback
+
+## 2026-06-29 — ## Worker status reporting (IPC pattern)
+
+Workers run as thr...
+
+## Worker status reporting (IPC pattern)
+
+Workers run as threads inside the agent process, but the web API backend runs as a **separate process**. To bridge status information, `worker.py` writes lightweight `status.json` files into `~/.thoughtmachine/workspaces/{ws_id}/workers/{name}/status.json`.
+
+The web API (`workspace_routes.py:185-203`) reads these files when serving `GET /api/workspace/{ws_id}/workers` to populate `runtime_status`, `current_task`, `last_heartbeat`, and `error` fields.
+
+Fields written:
+- `runtime_status`: one of `"idle"`, `"running"`, `"completed"`, `"failed"` (mapped from `WorkerThread.status`)
+- `current_task`: truncated query currently being processed (or null)
+- `last_heartbeat`: ISO-8601 timestamp of last agent activity
+- `error`: error message (or null)
+
+This file is written atomically (temp file + `os.replace`) to avoid partial reads.
