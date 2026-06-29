@@ -13,6 +13,8 @@
  *   │  └───────────┘  └───────────┘  └───────────┘      │
  *   ├──────────────────────────────────────────────────┤
  *   │              SessionList (sidebar)                │
+ *   ├──────────────────────────────────────────────────┤
+ *   │           WorkerOutputPanel (sidebar)             │
  *   └──────────────────────────────────────────────────┘
  *
  * App maintains one "hub" WebSocket that only handles:
@@ -31,6 +33,7 @@ import SessionTab from './components/SessionTab'
 import SessionList from './components/SessionList'
 import TabBar from './components/TabBar'
 import SessionActionsPanel from './components/SessionActionsPanel'
+import WorkerOutputPanel from './components/WorkerOutputPanel'
 import './styles.css'
 
 const WS_URL = `ws://${window.location.hostname}:8000/ws`
@@ -46,6 +49,7 @@ export default function App() {
   const [hubWs, setHubWs] = useState(null)
   const hubHasConnectedOnceRef = useRef(false)   // persist past StrictMode double-mount
   const [hubReady, setHubReady] = useState(false)
+  const [selectedWorker, setSelectedWorker] = useState(null)  // { name, workspaceId } | null
   const [sessionPanelOpen, setSessionPanelOpen] = useState(false)
 
   const tabActionsRef = useRef({})
@@ -335,6 +339,14 @@ export default function App() {
     setTabRunningStates((prev) => ({ ...prev, [tabId]: status }))
   }, [])
 
+  const handleSelectWorker = useCallback((workerName, workspaceId) => {
+    setSelectedWorker({ name: workerName, workspaceId })
+  }, [])
+
+  const handleCloseWorkerPanel = useCallback(() => {
+    setSelectedWorker(null)
+  }, [])
+
   const handleSessionSaved = useCallback((sessionId) => {
     // Refresh sessions list
     hubSend('list_sessions')
@@ -511,6 +523,7 @@ export default function App() {
                   onRegister={(actions) => handleRegisterTab(tab.tabId, actions)}
                   onRunningChange={handleRunningChange}
                   onSessionRenamed={handleSessionRenamed}
+                  onSelectWorker={handleSelectWorker}
                 />
               </div>
             ))
@@ -526,6 +539,17 @@ export default function App() {
             onDelete={handleDelete}
             onRename={handleRename}
           />
+        </div>
+
+        {/* Worker Output Panel — right sidebar for worker event logs */}
+        <div className={`worker-output-panel ${selectedWorker ? 'open' : ''}`}>
+          {selectedWorker && (
+            <WorkerOutputPanel
+              workspaceId={selectedWorker.workspaceId}
+              workerName={selectedWorker.name}
+              onClose={handleCloseWorkerPanel}
+            />
+          )}
         </div>
 
       </div>

@@ -168,7 +168,7 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
 }
 
 
-function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, defaultConfigSaveMessage, onClearDefaultSaveStatus, workspaceId, sessionId, containerRebuildResult, onClearRebuildResult }) {
+function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, defaultConfigSaveMessage, onClearDefaultSaveStatus, workspaceId, sessionId, containerRebuildResult, onClearRebuildResult, onSelectWorker }) {
   const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error'
   const [showManageProviders, setShowManageProviders] = useState(false);
   const [providerVersion, setProviderVersion] = useState(0);  // incremented when a provider is saved
@@ -380,7 +380,7 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
 
       {/* ── Workspace Tab ──────────────────────────────────────────── */}
       {activeTab === 'workspace' && (
-        <WorkspacePanel workspaceId={workspaceId} sessionId={sessionId} />
+        <WorkspacePanel workspaceId={workspaceId} sessionId={sessionId} onSelectWorker={onSelectWorker} />
       )}
 
       {/* ── General Tab ──────────────────────────────────────────────── */}

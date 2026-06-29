@@ -358,6 +358,13 @@ class WorkerThread(threading.Thread):
         final_content = ""
         _start = time.monotonic()
 
+        # Log the user query as a user_message event
+        self._log_event(
+            "user_message",
+            {"query": query[:500]},
+            {},
+        )
+
         try:
             for event in self._agent.process_query(query):
                 # Log heartbeat for liveliness checks
@@ -378,6 +385,16 @@ class WorkerThread(threading.Thread):
                 if event_type == "agent_responded":
                     final_content = event.get("content", "")
                     self._last_reasoning = event.get("reasoning")
+                    # Log final_response event
+                    self._log_event(
+                        "final_response",
+                        {},
+                        {
+                            "content": str(final_content)[:1000],
+                            "reasoning": bool(self._last_reasoning),
+                            "response_type": event.get("response_type", "answer"),
+                        },
+                    )
 
                 elif event_type == "stopped":
                     stop_reason = event.get("stop_reason", "unknown")
@@ -387,7 +404,7 @@ class WorkerThread(threading.Thread):
                         })
                     elif stop_reason == "max_turns_reached":
                         final_content = json.dumps({
-                            "error": f"Worker reached max turns",
+                            "error": "Worker reached max turns",
                         })
                     break
 
@@ -404,7 +421,73 @@ class WorkerThread(threading.Thread):
                     final_content = json.dumps({"error": error_msg})
                     break
 
-                # Log tool events for audit trail
+                # --- Rich event logging for worker output panel ---
+
+                # Log tool calls (agent yields these before executing each tool)
+                if event_type == "tool_call":
+                    tool_name = event.get("tool_name", "")
+                    arguments = event.get("arguments", {})
+                    self._log_event(
+                        "tool_call",
+                        {"tool": tool_name, "args": arguments},
+                        {},
+                    )
+
+                # Log tool results (agent yields these after each tool completes)
+                if event_type == "tool_result":
+                    tool_name = event.get("tool_name", "")
+                    result = event.get("result", "")
+                    success = event.get("success", True)
+                    error = event.get("error")
+                    self._log_event(
+                        "tool_result",
+                        {"tool": tool_name, "success": success, "error": error},
+                        {"result": str(result)[:1000] if result else ""},
+                    )
+
+                # Log token warnings as system notifications
+                if event_type == "token_warning":
+                    message = event.get("message", "") or event.get("warning_message", "")
+                    token_count = event.get("token_count", 0)
+                    self._log_event(
+                        "system_notification",
+                        {},
+                        {
+                            "type": "token_warning",
+                            "message": str(message)[:500],
+                            "token_count": token_count,
+                        },
+                    )
+
+                # Log turn warnings as system notifications
+                if event_type == "turn_warning":
+                    message = event.get("message", "") or event.get("warning", "")
+                    turn_count = event.get("turn_count", 0)
+                    self._log_event(
+                        "system_notification",
+                        {},
+                        {
+                            "type": "turn_warning",
+                            "message": str(message)[:500],
+                            "turn_count": turn_count,
+                        },
+                    )
+
+                # Log time warnings as system notifications
+                if event_type == "time_warning":
+                    message = event.get("message", "") or event.get("warning_message", "")
+                    elapsed = event.get("elapsed_seconds", 0)
+                    self._log_event(
+                        "system_notification",
+                        {},
+                        {
+                            "type": "time_warning",
+                            "message": str(message)[:500],
+                            "elapsed_seconds": elapsed,
+                        },
+                    )
+
+                # Keep legacy tool_execution handler for backward compatibility
                 if event_type == "tool_execution":
                     tool_name = event.get("tool_name", "")
                     tool_args = event.get("tool_args", {})

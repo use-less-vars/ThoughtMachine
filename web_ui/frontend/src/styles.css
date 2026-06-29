@@ -812,6 +812,23 @@ body {
 
 
 /* ──────────────────────────────────────────────────────────────────────────
+   Worker Output Panel (right-most sidebar)
+   ────────────────────────────────────────────────────────────────────────── */
+
+.worker-output-panel {
+  height: 100%;
+  overflow: hidden;
+  width: 0;
+  transition: width 0.2s ease;
+  flex-shrink: 0;
+}
+
+.worker-output-panel.open {
+  width: 380px;
+}
+
+
+/* ──────────────────────────────────────────────────────────────────────────
    Scrollbar (Webkit)
    ────────────────────────────────────────────────────────────────────────── */
 ::-webkit-scrollbar {

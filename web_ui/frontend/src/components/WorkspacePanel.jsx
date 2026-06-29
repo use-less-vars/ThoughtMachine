@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 
 // ── Catppuccin palette matching ConfigPanel ──────────────────────────────
 const inputStyle = {
@@ -269,191 +269,14 @@ function WorkerDot({ status }) {
   );
 }
 
-// ── Event Log Overlay ────────────────────────────────────────────────────
-function EventLogOverlay({ workspaceId, workerName, onClose }) {
-  const [events, setEvents] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
-  const listRef = useRef(null);
-
-  const fetchEvents = useCallback(() => {
-    if (!workspaceId || !workerName) return;
-    setLoading(true);
-    setError('');
-    fetch(`/api/workspace/${workspaceId}/workers/${encodeURIComponent(workerName)}/events?limit=50`)
-      .then(async (res) => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        setEvents(Array.isArray(data) ? data : []);
-      })
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false));
-  }, [workspaceId, workerName]);
-
-  useEffect(() => {
-    fetchEvents();
-    const interval = setInterval(fetchEvents, 3000);
-    return () => clearInterval(interval);
-  }, [fetchEvents]);
-
-  // Auto-scroll to bottom (most recent events)
-  useEffect(() => {
-    if (listRef.current) {
-      listRef.current.scrollTop = listRef.current.scrollHeight;
-    }
-  }, [events]);
-
-  return (
-    <div
-      style={{
-        position: 'fixed',
-        top: 0,
-        left: 0,
-        width: '100%',
-        height: '100%',
-        background: 'rgba(0,0,0,0.6)',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        zIndex: 1000,
-      }}
-      onClick={onClose}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          background: '#313244',
-          color: '#cdd6f4',
-          borderRadius: '8px',
-          width: '700px',
-          maxWidth: '90vw',
-          maxHeight: '80vh',
-          display: 'flex',
-          flexDirection: 'column',
-          boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
-          border: '1px solid #45475a',
-        }}
-      >
-        {/* Header */}
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            padding: '0.75rem 1rem',
-            borderBottom: '1px solid #45475a',
-          }}
-        >
-          <h3 style={{ margin: 0, fontSize: '1rem' }}>
-            Event Log: <span style={{ color: '#89b4fa' }}>{workerName}</span>
-          </h3>
-          <button
-            onClick={onClose}
-            style={{
-              background: '#45475a',
-              color: '#cdd6f4',
-              border: 'none',
-              borderRadius: '4px',
-              padding: '0.25rem 0.6rem',
-              cursor: 'pointer',
-              fontSize: '0.85rem',
-              fontWeight: 600,
-            }}
-          >
-            ✕ Close
-          </button>
-        </div>
-
-        {/* Event list */}
-        <div
-          ref={listRef}
-          style={{
-            flex: 1,
-            overflowY: 'auto',
-            padding: '0.5rem 1rem',
-            minHeight: '200px',
-          }}
-        >
-          {loading && events.length === 0 && (
-            <div style={{ color: '#6c7086', textAlign: 'center', padding: '2rem' }}>
-              Loading events…
-            </div>
-          )}
-          {error && (
-            <div style={{ color: '#f38ba8', textAlign: 'center', padding: '2rem' }}>
-              Error: {error}
-            </div>
-          )}
-          {!loading && !error && events.length === 0 && (
-            <div style={{ color: '#6c7086', textAlign: 'center', padding: '2rem' }}>
-              No events yet.
-            </div>
-          )}
-          {events.map((evt, idx) => {
-            const badge = getEventBadge(evt.event);
-            let summary = '';
-            if (evt.event === 'query') {
-              const req = typeof evt.request === 'string' ? evt.request : JSON.stringify(evt.request);
-              summary = `Q: ${truncate(req, 100)}`;
-            } else if (evt.event === 'tool_call') {
-              const toolName = evt.request?.tool || '';
-              const args = evt.request?.args || {};
-              summary = `${toolName}(${truncate(JSON.stringify(args), 80)})`;
-            } else if (evt.event === 'error') {
-              summary = evt.response?.error || 'Unknown error';
-            } else if (evt.event === 'started') {
-              summary = 'Worker started';
-            } else if (evt.event === 'completed') {
-              summary = 'Worker completed';
-            }
-            return (
-              <div
-                key={idx}
-                style={{
-                  padding: '0.4rem 0',
-                  borderBottom: idx < events.length - 1 ? '1px solid #45475a' : 'none',
-                  fontSize: '0.82rem',
-                  lineHeight: '1.4',
-                }}
-              >
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.15rem' }}>
-                  <span style={{ color: '#6c7086', fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
-                    {evt.timestamp ? relativeTime(evt.timestamp) : ''}
-                  </span>
-                  <span
-                    style={{
-                      display: 'inline-block',
-                      background: badge.bg,
-                      color: badge.fg,
-                      borderRadius: '10px',
-                      padding: '0.1rem 0.45rem',
-                      fontSize: '0.7rem',
-                      fontWeight: 600,
-                      whiteSpace: 'nowrap',
-                    }}
-                  >
-                    {badge.label}
-                  </span>
-                </div>
-                {summary && (
-                  <div style={{ color: '#a6adc8', marginLeft: '0.2rem', wordBreak: 'break-word' }}>
-                    {summary}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      </div>
-    </div>
-  );
-}
+// ── Event Log Overlay (moved to WorkerOutputPanel) ─────────────────────
+// Worker event viewing now uses the persistent WorkerOutputPanel sidebar,
+// wired via onSelectWorker callback passed up through ConfigPanel.
 
 // ── Section: Workers ─────────────────────────────────────────────────────
-function WorkersSection({ workspaceId }) {
+function WorkersSection({ workspaceId, onSelectWorker }) {
   const [workers, setWorkers] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [eventWorker, setEventWorker] = useState(null); // name of worker to show events for
   const [stopErrors, setStopErrors] = useState({}); // name -> error message (clears after 3s)
 
   const fetchWorkers = useCallback(() => {
@@ -531,7 +354,7 @@ function WorkersSection({ workspaceId }) {
               <WorkerDot status={w.runtime_status} />
               <span
                 style={{ fontWeight: 500, whiteSpace: 'nowrap' }}
-                onClick={() => setEventWorker(w.name)}
+                onClick={() => onSelectWorker?.(w.name, workspaceId)}
               >
                 {w.name}
               </span>
@@ -591,13 +414,7 @@ function WorkersSection({ workspaceId }) {
           );
         })}
       </ul>
-      {eventWorker && (
-        <EventLogOverlay
-          workspaceId={workspaceId}
-          workerName={eventWorker}
-          onClose={() => setEventWorker(null)}
-        />
-      )}
+
     </>
   );
 }
@@ -640,7 +457,7 @@ function EffectivePermissionsSection({ workspaceId, sessionId }) {
 }
 
 // ── Main WorkspacePanel ──────────────────────────────────────────────────
-export default function WorkspacePanel({ workspaceId, sessionId }) {
+export default function WorkspacePanel({ workspaceId, sessionId, onSelectWorker }) {
   if (!workspaceId) {
     return (
       <div style={{ color: '#6c7086', fontSize: '0.85rem', padding: '1rem 0', textAlign: 'center' }}>
@@ -669,7 +486,7 @@ export default function WorkspacePanel({ workspaceId, sessionId }) {
       {/* Workers */}
       <div style={sectionStyle}>
         <label style={labelStyle}><strong>Workers</strong></label>
-        <WorkersSection workspaceId={workspaceId} />
+        <WorkersSection workspaceId={workspaceId} onSelectWorker={onSelectWorker} />
       </div>
 
       {/* Effective Permissions */}
