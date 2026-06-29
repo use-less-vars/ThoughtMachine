@@ -28,6 +28,7 @@ import os
 import queue
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional
@@ -177,6 +178,7 @@ class WorkerThread(threading.Thread):
         tool_classes: Optional[Dict[str, type[ToolBase]]] = None,
         session_permissions: Optional[Dict[str, Any]] = None,
         project_root: Optional[str] = None,
+        timeout_seconds: Optional[int] = None,
     ) -> None:
         super().__init__(daemon=True, name=f"worker-{name}")
         self.worker_name = name
@@ -195,6 +197,13 @@ class WorkerThread(threading.Thread):
 
         # Project root from the session (resolved from workspace config)
         self._project_root: Optional[str] = project_root
+
+        # Override timeout (from spawn parameter, else from definition, else 600)
+        self._timeout_seconds: int = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else definition.get("timeout_seconds", 600)
+        )
 
         # Runtime state
         self.status: str = "idle"      # idle | running | completed | failed
@@ -262,6 +271,10 @@ class WorkerThread(threading.Thread):
             except OSError:
                 pass
 
+    def _last_elapsed(self) -> Optional[float]:
+        """Return elapsed seconds from the most recent query execution."""
+        return getattr(self, '_last_elapsed_val', None)
+
     def _build_agent_config(self) -> Any:
         """
         Build an AgentConfig from the worker definition and parent agent config.
@@ -269,7 +282,15 @@ class WorkerThread(threading.Thread):
         Imports ``AgentConfig`` lazily to avoid circular imports with
         ``agent.core.agent`` which pulls in ``tools.TOOL_CLASSES``.
 
-        Returns None if AgentConfig is not importable.
+        The worker inherits all fields from the parent (ToolExecutor-injected)
+        config dict, then overrides only worker-specific settings
+        (system_prompt, enabled_tools, max_turns, timeout_seconds, stop_check).
+
+        Also injects ``session_permissions`` so that tools running inside
+        the worker use the same security policy as the parent agent.
+
+        Returns None if AgentConfig is not importable, or if provider/model
+        are missing.
         """
         try:
             from agent.config.models import AgentConfig
@@ -287,25 +308,36 @@ class WorkerThread(threading.Thread):
             )
             return None
 
-        enabled_tools = list(self._tool_classes.keys()) if self._tool_classes else []
-        system_prompt = self.definition.get(
-            "system_prompt",
-            "You are a helpful worker assistant."
-        )
+        # ── Forward the full parent config dict ────────────────────────
+        worker_cfg = dict(cfg)
+        # The ToolExecutor injects the key as ``provider``, but AgentConfig
+        # expects the Pydantic field name ``provider_type``.
+        worker_cfg["provider_type"] = worker_cfg.pop("provider")
 
-        return AgentConfig(
-            provider_type=provider_type,
-            model=model,
-            api_key=cfg.get("api_key", ""),
-            base_url=cfg.get("base_url", None),
-            temperature=cfg.get("temperature", 0.7),
-            system_prompt=system_prompt,
-            max_turns=self.definition.get("max_turns", 10),
-            enabled_tools=enabled_tools,
-            timeout_seconds=self.definition.get("timeout_seconds", 300),
-            time_monitor_enabled=True,
-            stop_check=self._stop_event.is_set,
+        # ── Worker-specific overrides ──────────────────────────────────
+        worker_cfg["system_prompt"] = self.definition.get(
+            "system_prompt",
+            cfg.get("system_prompt", "You are a helpful worker assistant."),
         )
+        worker_cfg["enabled_tools"] = (
+            list(self._tool_classes.keys()) if self._tool_classes else []
+        )
+        worker_cfg["max_turns"] = self.definition.get(
+            "max_turns", cfg.get("max_turns", 100)
+        )
+        worker_cfg["timeout_seconds"] = self._timeout_seconds
+        # Warn at 80% of timeout (minimum 5s) so CRITICAL triggers before
+        # the hard cutoff when using the worker tool's timeout window.
+        worker_cfg["time_warning_threshold"] = max(
+            5, int(self._timeout_seconds * 0.8)
+        )
+        worker_cfg["time_monitor_enabled"] = True
+        worker_cfg["stop_check"] = self._stop_event.is_set
+
+        # ── Inject session permissions ─────────────────────────────────
+        worker_cfg["session_permissions"] = self._session_permissions
+
+        return AgentConfig(**worker_cfg)
 
 
 
@@ -324,6 +356,7 @@ class WorkerThread(threading.Thread):
 
         self.current_task = query[:200]
         final_content = ""
+        _start = time.monotonic()
 
         try:
             for event in self._agent.process_query(query):
@@ -333,6 +366,10 @@ class WorkerThread(threading.Thread):
                 # Check stop signal
                 if self._stop_event.is_set():
                     self._agent.request_pause()
+                    final_content = json.dumps({
+                        "status": "stopped",
+                        "message": "Worker stopped by user",
+                    })
                     break
 
                 event_type = event.get("type", "")
@@ -383,6 +420,8 @@ class WorkerThread(threading.Thread):
             final_content = json.dumps({"error": f"Worker execution failed: {exc}"})
 
         self.current_task = None
+        # Store elapsed time for inclusion in query result
+        self._last_elapsed_val = time.monotonic() - _start
         return final_content
 
     # ── thread run loop ────────────────────────────────────────────
@@ -402,6 +441,7 @@ class WorkerThread(threading.Thread):
             # Override persisted status/error with live thread state
             self.status = "running"
             self.error = None
+            self._write_status_file()
             if self._worker_ctx is None:
                 # Load system prompt from definition
                 system_prompt = self.definition.get(
@@ -482,6 +522,7 @@ class WorkerThread(threading.Thread):
             logger.exception("Worker thread %s failed", self.worker_name)
             self.status = "failed"
             self.error = str(exc)
+            self._write_status_file()
             # Put the error into the output queue so any waiting query call gets it
             error_json = json.dumps({"error": str(exc)})
             try:
@@ -491,6 +532,7 @@ class WorkerThread(threading.Thread):
             self._log_event("error", {}, {"error": str(exc)})
         else:
             self.status = "completed"
+            self._write_status_file()
             self._log_event("completed", {}, {})
         finally:
             if self._worker_ctx is not None:
@@ -521,14 +563,54 @@ class WorkerThread(threading.Thread):
                 )
         return None
 
+    def _write_status_file(self) -> None:
+        """
+        Write runtime status to ``status.json`` so the web API backend
+        (which runs in a separate process) can read it.
+
+        This file is read by ``GET /api/workspace/{ws_id}/workers``
+        to populate ``runtime_status``, ``current_task``,
+        ``last_heartbeat`` and ``error`` for each worker.
+        """
+        data = {
+            "runtime_status": self.status,
+            "current_task": self.current_task,
+            "last_heartbeat": self.last_heartbeat,
+            "error": self.error,
+        }
+        target = self._worker_dir / "status.json"
+        fd, tmp_path_str = tempfile.mkstemp(
+            dir=str(target.parent),
+            prefix=".status_",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, default=str)
+            if FileLock is not None:
+                with FileLock(str(target)):
+                    os.replace(tmp_path_str, str(target))
+            else:
+                os.replace(tmp_path_str, str(target))
+        except (OSError, Exception) as exc:
+            logger.error("Failed to write worker status file: %s", exc)
+            try:
+                if os.path.exists(tmp_path_str):
+                    os.unlink(tmp_path_str)
+            except OSError:
+                pass
+
     def _save_context(self) -> None:
         """
         Persist WorkerContext + runtime status to disk atomically.
 
         Uses WorkerContext.to_persistable_dict() for the conversation
         data, augmented with runtime fields (status, error, heartbeat).
+        Also writes a lightweight ``status.json`` consumed by the
+        web API backend.
         """
         if self._worker_ctx is None:
+            self._write_status_file()
             return
         ctx_data = self._worker_ctx.to_persistable_dict()
         data = {
@@ -561,6 +643,7 @@ class WorkerThread(threading.Thread):
                     os.unlink(tmp_path_str)
             except OSError:
                 pass
+        self._write_status_file()
 
     def _log_event(self, event_type: str, request: Any, response: Any) -> None:
         """Append a timestamped event to the workspace events.jsonl."""
@@ -604,6 +687,12 @@ class Worker(ToolBase):
     context: Optional[Dict] = Field(
         default=None,
         description="Optional context passed on spawn",
+    )
+
+    timeout_seconds: Optional[int] = Field(
+        default=None,
+        description="Override the worker's default timeout in seconds. "
+                      "If not set, the worker definition's timeout is used.",
     )
 
     skip_output_truncation: ClassVar[bool] = True
@@ -853,6 +942,13 @@ class Worker(ToolBase):
             except (FileNotFoundError, json.JSONDecodeError, OSError):
                 project_root = None
 
+        # Compute effective timeout: spawn override > definition > 600
+        effective_timeout = (
+            self.timeout_seconds
+            if self.timeout_seconds is not None
+            else definition.get("timeout_seconds", 600)
+        )
+
         # Create and start the worker thread
         thread = WorkerThread(
             name=self.worker_name,
@@ -862,6 +958,7 @@ class Worker(ToolBase):
             tool_classes=tool_classes if tool_classes else None,
             session_permissions=self.session_permissions,
             project_root=project_root,
+            timeout_seconds=effective_timeout,
         )
 
         # Store initial context for the thread to pick up in run()
@@ -947,10 +1044,13 @@ class Worker(ToolBase):
         try:
             # Block until the worker responds
             response = thread.send_query(self.worker_query, timeout=300.0)
+            elapsed = thread._last_elapsed()
             result = {
                 "worker_name": self.worker_name,
                 "response": response,
             }
+            if elapsed is not None:
+                result["elapsed_seconds"] = round(elapsed, 1)
             if thread._last_reasoning is not None:
                 result["reasoning"] = thread._last_reasoning
             return result
