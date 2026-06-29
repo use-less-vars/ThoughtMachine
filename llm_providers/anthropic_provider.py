@@ -11,7 +11,7 @@ import anthropic
 from anthropic import APIError, RateLimitError
 from .base import LLMProvider, ProviderConfig, LLMResponse
 from .tool_converter import ToolFormatConverter
-from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError
+from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError, TokenLimitExceededError
 from agent.logging import log
 
 class AnthropicProvider(LLMProvider):
@@ -87,6 +87,15 @@ class AnthropicProvider(LLMProvider):
                         log('DEBUG', 'llm.anthropic', f'[DEBUG_ANTHROPIC_ERROR] APIError response: {resp_text}')
                     except:
                         pass
+            # Detect context-length exceeded errors (Anthropic returns 'too many tokens' or similar)
+            error_str = str(e)
+            has_context_length_error = 'too many tokens' in error_str.lower() or 'maximum context length' in error_str.lower() or 'context length' in error_str.lower() or 'prompt is too long' in error_str.lower()
+            if has_context_length_error:
+                log('WARNING', 'llm.anthropic', f'Token limit exceeded detected: {error_str[:200]}')
+                token_error = TokenLimitExceededError(f'Token limit exceeded: {error_str[:500]}')
+                if hasattr(e, 'response'):
+                    token_error.raw_response = e.response
+                raise token_error
             if 'authentication' in str(e).lower() or 'api key' in str(e).lower():
                 auth_error = AuthenticationError(f'Authentication failed: {e}')
                 if hasattr(e, 'response'):

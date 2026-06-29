@@ -9,7 +9,7 @@ import sys
 from openai import OpenAI, APIError, RateLimitError, APIConnectionError
 import tiktoken
 from .base import LLMProvider, ProviderConfig, LLMResponse
-from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError
+from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError, TokenLimitExceededError
 from agent.logging import log
 
 class OpenAICompatibleProvider(LLMProvider):
@@ -390,6 +390,15 @@ class OpenAICompatibleProvider(LLMProvider):
                     raise auth_error
                 elif os.environ.get('DEBUG_OPENAI'):
                     log('DEBUG', 'llm.openai', f'Not DeepSeek, passing through as API error')
+            # Detect context-length exceeded errors (OpenAI returns 400 with code context_length_exceeded)
+            error_str = str(e)
+            has_context_length_error = 'context_length_exceeded' in error_str.lower() or 'maximum context length' in error_str.lower() or 'context length' in error_str.lower()
+            if has_context_length_error:
+                log('WARNING', 'llm.openai', f'Token limit exceeded detected: {error_str[:200]}')
+                token_error = TokenLimitExceededError(f'Token limit exceeded: {error_str[:500]}')
+                if hasattr(e, 'response'):
+                    token_error.raw_response = e.response
+                raise token_error
             if 'authentication' in str(e).lower() or 'api key' in str(e).lower():
                 auth_error = AuthenticationError(f'Authentication failed: {e}')
                 if hasattr(e, 'response'):
