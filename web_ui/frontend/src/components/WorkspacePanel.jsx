@@ -458,7 +458,6 @@ function WorkersSection({ workspaceId }) {
 
   const fetchWorkers = useCallback(() => {
     if (!workspaceId) return;
-    setLoading(true);
     fetch(`/api/workspace/${workspaceId}/workers`)
       .then(async (res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -553,11 +552,9 @@ function WorkersSection({ workspaceId }) {
               <span style={{ color: '#6c7086', fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
                 {w.runtime_status || 'idle'}
               </span>
-              {w.current_task && (
-                <span style={{ color: '#a6adc8', fontSize: '0.75rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }}>
-                  {truncate(w.current_task, 80)}
-                </span>
-              )}
+              <span style={{ color: '#a6adc8', fontSize: '0.75rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }}>
+                {w.current_task ? truncate(w.current_task, 80) : ''}
+              </span>
               {/* Stop button — only for workers that can be stopped */}
               {isRunning && (
                 <button
