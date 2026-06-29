@@ -29,7 +29,7 @@ from tools.summarize_tool import SummarizeTool
 from agent.core.message import Message
 from fast_json_repair import loads as repair_loads
 from session.context_builder import ContextBuilder
-from agent.core.state import AgentState, ExecutionState, SessionState
+from agent.core.state import AgentState, ExecutionState, SessionState, TimeState
 from agent import events as ev
 from .token_counter import TokenCounter
 from .llm_client import LLMClient, LLMError
@@ -124,7 +124,7 @@ class Agent:
             self._token_counts = {'input': 0, 'output': 0}
         self.conversation = self.llm_client.ensure_system_prompt(self.conversation)
         log('DEBUG', 'core.context_builder', f'Agent init: session is None={session is None}')
-        self.context_builder = self.llm_client.create_context_builder(token_limit=None)
+        self.context_builder = self.llm_client.create_context_builder()
         log('DEBUG', 'core.context_builder', f'Agent init: context_builder created, is None={self.context_builder is None}')
         if self.context_builder:
             self.conversation_manager.context_builder = self.context_builder
@@ -452,7 +452,7 @@ class Agent:
             self.tool_executor = ToolExecutor(self.tool_classes, new_config, self.state, old_logger, self.security_available, agent=self)
 
             # Rebuild context builder
-            self.context_builder = self.llm_client.create_context_builder(token_limit=None)
+            self.context_builder = self.llm_client.create_context_builder()
             if self.context_builder:
                 self.conversation_manager.context_builder = self.context_builder
 
@@ -510,8 +510,8 @@ class Agent:
             self.context_builder.session = value
             log('DEBUG', 'core.context_builder', f'Updated existing context_builder.session')
         elif value is not None and hasattr(self, 'llm_client') and (self.llm_client is not None):
-            self.context_builder = self.llm_client.create_context_builder(token_limit=None)
-            log('DEBUG', 'core.context_builder', f'Created new context_builder with token_limit=None: is None={self.context_builder is None}')
+            self.context_builder = self.llm_client.create_context_builder()
+            log('DEBUG', 'core.context_builder', f'Created new context_builder: is None={self.context_builder is None}')
             if hasattr(self, 'conversation_manager') and self.conversation_manager is not None:
                 self.conversation_manager.context_builder = self.context_builder
         if hasattr(self, 'conversation_manager') and self.conversation_manager is not None:
@@ -597,8 +597,8 @@ class Agent:
             if needs_update:
                 if hasattr(self, 'llm_client') and self.llm_client is not None:
                     self.llm_client.session = self.session
-                    self.context_builder = self.llm_client.create_context_builder(token_limit=None)
-                    log('DEBUG', 'core.context_builder', 'Created/updated context_builder with token_limit=None')
+                    self.context_builder = self.llm_client.create_context_builder()
+                    log('DEBUG', 'core.context_builder', 'Created/updated context_builder')
                     if self.context_builder and hasattr(self, 'conversation_manager') and (self.conversation_manager is not None):
                         self.conversation_manager.context_builder = self.context_builder
         if not hasattr(self, 'context_builder') or self.context_builder is None:
@@ -713,13 +713,6 @@ class Agent:
         if self.session is not None:
             self.session.total_output_tokens = value
         self._token_counts['output'] = value
-
-    def _get_max_context_tokens(self) -> int:
-        """Calculate maximum tokens available for context."""
-        context_window = self.token_counter.get_model_context_window()
-        max_context = context_window - self.SAFETY_MARGIN
-        max_context -= self.DEFAULT_RESPONSE_TOKENS
-        return max_context
 
     def _get_conversation_data_for_event(self) -> Dict[str, Any]:
         """
@@ -859,6 +852,8 @@ class Agent:
             prev_conversation_len = len(self.conversation)
             last_input_tokens = 0
             last_output_tokens = 0
+            # Initialize time monitoring at start of agent execution
+            self.state.time_start = time.time()
             for turn in range(self.config.max_turns):
                 turn_start_time = time.time()
                 log('DEBUG', 'core.agent', f'process_query: starting turn {turn}/{self.config.max_turns}, conversation length={len(self.conversation)}')
@@ -882,6 +877,30 @@ class Agent:
                     self._add_conversation_data_to_event(stopped_event)
                     yield stopped_event
                     return
+                # Time monitoring
+                if self.state.time_start is not None:
+                    elapsed = time.time() - self.state.time_start
+                    time_events = self.state.update_time_state(elapsed)
+                    for event in time_events:
+                        if event['type'] == 'time_warning':
+                            warning_msg = Message(
+                                role='user',
+                                content='[SYSTEM NOTIFICATION] ' + event.get('message', event.get('warning_message', '')),
+                                is_system_notification=True
+                            )
+                            self._add_to_conversation(warning_msg)
+                            warning_tokens = self._estimate_tokens(warning_msg)
+                            self.state.current_conversation_tokens += warning_tokens
+                            yield self._create_token_update_event()
+                            # If time is critical, log it but don't stop — soft restriction
+                            if self.state.time_state == TimeState.CRITICAL:
+                                log('WARNING', 'core.agent', f'Time critical: soft restriction applied after {elapsed:.1f}s')
+                                if self.logger:
+                                    self.logger.log_agent_end('timeout', f'Agent execution timed out after {elapsed:.1f}s')
+                        event_dict = {'type': event['type'], 'message': event.get('message', event.get('warning_message', '')), 'elapsed_seconds': event.get('elapsed_seconds', elapsed), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                        self._add_conversation_data_to_event(event_dict)
+                        yield event_dict
+
                 turn_events = self.state.update_turn_state(turn)
                 for event in turn_events:
                     if event['type'] == 'turn_warning':

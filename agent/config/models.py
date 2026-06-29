@@ -56,6 +56,9 @@ class AgentConfig(BaseModel):
         'provider_id': RESTART_REQUIRED,
         'model_override': RESTART_REQUIRED,
         'session_permissions': HOT_SWAPPABLE,
+        'timeout_seconds': HOT_SWAPPABLE,
+        'time_monitor_enabled': HOT_SWAPPABLE,
+        'time_warning_threshold': HOT_SWAPPABLE,
     }
 
     api_key: str = Field(default='', exclude=True)
@@ -98,6 +101,9 @@ class AgentConfig(BaseModel):
     tool_output_token_limit: int = Field(default=10000, description='Maximum token limit for tool outputs (default 10,000 tokens)')
     detail: Literal['minimal', 'normal', 'verbose'] = Field(default='normal', description='Detail level for event display')
     enabled_tools: List[str] = Field(default_factory=lambda: [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES], description='List of enabled tool class names')
+    timeout_seconds: int = Field(default=300, description='Maximum runtime in seconds before timeout')
+    time_monitor_enabled: bool = Field(default=False, description='Enable time-based execution monitoring')
+    time_warning_threshold: int = Field(default=240, description='Elapsed seconds at which a time warning is issued (default 80% of timeout)')
     session_permissions: SessionPermissions = Field(
         default_factory=SessionPermissions,
         description='Session permissions profile controlling tool access categories.',

@@ -23,6 +23,12 @@ class ExecutionState(enum.Enum):
     PAUSING = 'pausing'
     READY = 'ready'
 
+class TimeState(enum.Enum):
+    """Time-based execution state based on elapsed runtime."""
+    LOW = 'low'
+    WARNING = 'warning'
+    CRITICAL = 'critical'
+
 class SessionState(enum.Enum):
     """Session state of the agent."""
     NEW = 'new'
@@ -37,6 +43,7 @@ class AgentState:
     security_config: Optional[Dict[str, Any]] = None
     token_state: TokenState = TokenState.LOW
     turn_state: TurnState = TurnState.LOW
+    time_state: TimeState = TimeState.LOW
     execution_state: ExecutionState = ExecutionState.READY
     session_state: SessionState = SessionState.NEW
     current_conversation_tokens: int = 0
@@ -45,10 +52,17 @@ class AgentState:
     restrictions_active: bool = False
     last_token_warning_state: TokenState = TokenState.LOW
     last_turn_warning_state: TurnState = TurnState.LOW
+    last_time_warning_state: TimeState = TimeState.LOW
     last_token_warning: Optional[str] = None
     last_token_warning_count: int = 0
     last_turn_warning: Optional[str] = None
     last_turn_warning_count: int = 0
+    last_time_warning: Optional[str] = None
+    last_time_warning_count: int = 0
+    timeout_seconds: int = 300
+    time_warning_threshold: int = 240
+    time_start: Optional[float] = None
+    restriction_reason: Optional[str] = None
     _pending_events: List[Dict[str, Any]] = field(default_factory=list)
 
 
@@ -107,12 +121,84 @@ class AgentState:
         if self.token_state == TokenState.CRITICAL:
             self.restrictions_active = True
             self.restrictions_pending = False
+            self.restriction_reason = 'token'
         elif self.token_state != TokenState.CRITICAL and self.turn_state == TurnState.LOW:
             self.restrictions_pending = False
             self.restrictions_active = False
+            self.restriction_reason = None
 
         if new_state == TokenState.LOW:
             self.last_token_warning_state = TokenState.LOW
+        return events
+
+    def update_time_state(self, elapsed_seconds: float) -> List[Dict[str, Any]]:
+        """Update time state based on elapsed runtime.
+
+        Compares elapsed runtime against configured timeout thresholds.
+        Issues a single warning when elapsed passes the warning threshold
+        and activates restrictions when elapsed passes the critical threshold.
+
+        Returns list of events (e.g., warnings) that should be yielded.
+        """
+        if not hasattr(self.config, 'time_monitor_enabled') or not self.config.time_monitor_enabled:
+            self.time_state = TimeState.LOW
+            return []
+
+        timeout = getattr(self.config, 'timeout_seconds', self.timeout_seconds)
+        warning_at = getattr(self.config, 'time_warning_threshold', self.time_warning_threshold)
+
+        if elapsed_seconds < warning_at:
+            new_state = TimeState.LOW
+        elif elapsed_seconds < timeout:
+            new_state = TimeState.WARNING
+        else:
+            new_state = TimeState.CRITICAL
+
+        old_state = self.time_state
+        self.time_state = new_state
+        events = []
+
+        state_order = {TimeState.LOW: 0, TimeState.WARNING: 1, TimeState.CRITICAL: 2}
+        if state_order[new_state] > state_order[old_state] and self.last_time_warning_state != new_state:
+            if new_state == TimeState.WARNING:
+                remaining = timeout - elapsed_seconds
+                warning = (
+                    f'**Time warning**: Agent has been running for '
+                    f'{elapsed_seconds:.1f}s ({remaining:.1f}s remaining before timeout). '
+                    f'Tool restrictions will be applied when the timeout is reached.'
+                )
+            else:
+                warning = (
+                    f'**Time critical**: Agent has exceeded the timeout '
+                    f'({timeout}s). Tool restrictions are now active. '
+                    f'Only the Respond tool is available. Please finish your work '
+                    f'and respond immediately.'
+                )
+            self.last_time_warning = warning
+            self.last_time_warning_count = int(elapsed_seconds)
+            self.last_time_warning_state = new_state
+
+            if new_state == TimeState.CRITICAL:
+                self.restrictions_active = True
+                self.restrictions_pending = False
+                self.restriction_reason = 'timeout'
+
+            if self.logger:
+                self.logger.log_time_warning(old_state.value, new_state.value, elapsed_seconds, warning)
+
+            time_warning_data = {
+                'old_state': old_state.value,
+                'new_state': new_state.value,
+                'elapsed_seconds': elapsed_seconds,
+                'warning_message': warning,
+                'state': new_state.value,
+            }
+            events.append(self._create_event('time_warning', time_warning_data))
+
+        if new_state == TimeState.LOW:
+            self.last_time_warning_state = TimeState.LOW
+            self.restriction_reason = None
+
         return events
 
     def update_turn_state(self, current_turn: int) -> List[Dict[str, Any]]:
@@ -129,7 +215,7 @@ class AgentState:
             return []
         max_turns = self.config.max_turns
         warning_turn = max_turns - 3
-        if current_turn < warning_turn:
+        if warning_turn < 0 or current_turn < warning_turn:
             new_state = TurnState.LOW
         else:
             new_state = TurnState.WARNING
@@ -139,6 +225,7 @@ class AgentState:
         if new_state == TurnState.WARNING and old_state != TurnState.WARNING and self.last_turn_warning_state != TurnState.WARNING:
             self.restrictions_active = True
             self.restrictions_pending = False
+            self.restriction_reason = 'turn'
             warning = (
                 f'**Turn limit warning**: You are running out of turns ({current_turn}/{max_turns}). '
                 f'You must wait for the user to re-enable your session. Please provide a final answer now '
@@ -156,6 +243,7 @@ class AgentState:
             self.last_turn_warning_state = TurnState.LOW
             self.restrictions_active = False
             self.restrictions_pending = False
+            self.restriction_reason = None
         return events
     def set_execution_state(self, new_state: ExecutionState) -> List[Dict[str, Any]]:
         """Transition to a new execution state.
@@ -183,7 +271,7 @@ class AgentState:
 
     def reset(self) -> List[Dict[str, Any]]:
         """Reset all states to initial values.
-        
+
         Returns list of events for the reset.
         """
         events = []
@@ -194,22 +282,30 @@ class AgentState:
         self.last_token_warning_count = 0
         self.restrictions_pending = False
         self.restrictions_active = False
+        self.restriction_reason = None
         self.turn_state = TurnState.LOW
         self.current_turn = 0
         self.last_turn_warning_state = TurnState.LOW
         self.last_turn_warning = None
         self.last_turn_warning_count = 0
+        self.time_state = TimeState.LOW
+        self.time_start = None
+        self.last_time_warning_state = TimeState.LOW
+        self.last_time_warning = None
+        self.last_time_warning_count = 0
         events.extend(self.set_execution_state(ExecutionState.READY))
         events.extend(self.set_session_state(SessionState.NEW))
         return events
 
-
     def get_allowed_tools(self) -> List[str]:
         """Get list of allowed tool names based on current states.
 
-        When restrictions_active is True, only Respond and SummarizeTool are allowed.
+        When restrictions_active is True, only Respond (and optionally SummarizeTool) are allowed.
+        For timeout restrictions, only Respond is available (no SummarizeTool).
         """
         if self.restrictions_active:
+            if self.restriction_reason == 'timeout':
+                return ['Respond']
             return ['Respond', 'SummarizeTool']
         return []
 
