@@ -147,7 +147,13 @@ class AgentState:
         timeout = getattr(self.config, 'timeout_seconds', self.timeout_seconds)
         warning_at = getattr(self.config, 'time_warning_threshold', self.time_warning_threshold)
 
-        if elapsed_seconds < warning_at:
+        # Defensive: if warning_at >= timeout, skip WARNING and go straight to CRITICAL
+        if warning_at >= timeout:
+            if elapsed_seconds < timeout:
+                new_state = TimeState.LOW
+            else:
+                new_state = TimeState.CRITICAL
+        elif elapsed_seconds < warning_at:
             new_state = TimeState.LOW
         elif elapsed_seconds < timeout:
             new_state = TimeState.WARNING
