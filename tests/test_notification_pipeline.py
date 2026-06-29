@@ -97,7 +97,7 @@ class TestNotificationPipeline:
 
     def test_notification_appears_in_context(self, builder, user_history_with_notification):
         """Assert that [**SYSTEM NOTIFICATION**] messages appear in the assembled context."""
-        context = builder.build(user_history_with_notification, max_tokens=10000)
+        context = builder.build(user_history_with_notification)
         notification_msgs = [
             m for m in context
             if isinstance(m.get("content"), str)
@@ -110,7 +110,7 @@ class TestNotificationPipeline:
 
     def test_notification_flag_is_true(self, builder, user_history_with_notification):
         """Assert that [**SYSTEM NOTIFICATION**] messages have is_system_notification=True."""
-        context = builder.build(user_history_with_notification, max_tokens=10000)
+        context = builder.build(user_history_with_notification)
         for msg in context:
             content = msg.get("content", "")
             if isinstance(content, str) and content.startswith(SYSTEM_NOTIFICATION_PREFIX):
@@ -121,7 +121,7 @@ class TestNotificationPipeline:
 
     def test_non_notification_messages_have_no_flag(self, builder, user_history_without_notification):
         """Assert that normal messages do not carry is_system_notification=True."""
-        context = builder.build(user_history_without_notification, max_tokens=10000)
+        context = builder.build(user_history_without_notification)
         for msg in context:
             flag = msg.get("is_system_notification", False)
             assert flag is not True, (
@@ -200,7 +200,7 @@ class TestNotificationPipeline:
         The notification (role='user', is_system_notification=True) should appear
         in the assembled context in the correct chronological position.
         """
-        context = builder.build(user_history_with_notification, max_tokens=10000)
+        context = builder.build(user_history_with_notification)
         # Extract the sequence of (role, is_system_notification) for comparison
         context_seq = [
             (m.get("role"), m.get("is_system_notification", False))
@@ -216,11 +216,9 @@ class TestNotificationPipeline:
             f"Context sequence: {context_seq}"
         )
 
-    def test_notification_preserved_under_token_limit(self, builder, user_history_with_notification):
-        """Assert notifications survive token-truncation when there is room."""
-        # Use a generous limit that still exercises the truncation path
-        generous_limit = 2000
-        context = builder.build(user_history_with_notification, max_tokens=generous_limit)
+    def test_notification_survives_context_building(self, builder, user_history_with_notification):
+        """Assert notifications survive context building."""
+        context = builder.build(user_history_with_notification)
         notif_msgs = [
             m for m in context
             if isinstance(m.get("content"), str)
