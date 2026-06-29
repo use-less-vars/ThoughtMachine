@@ -46,11 +46,20 @@ if DEBUG_HISTORY_PROVIDER or DEBUG_CONTEXT:
 class HistoryProvider:
     """Manages conversation history for token-limited LLM context windows."""
 
-    def __init__(self, session: Session, token_limit: Optional[int]=None):
+    def __init__(self, session: Session):
         self._session = session
-        self.token_limit = token_limit
         self._cached_context: Optional[List[Dict[str, Any]]] = None
         self.context_builder = SummaryBuilder()
+
+    @property
+    def emergency_mode(self):
+        """Delegate emergency_mode flag to the context_builder (SummaryBuilder)."""
+        return self.context_builder.emergency_mode if hasattr(self.context_builder, 'emergency_mode') else False
+
+    @emergency_mode.setter
+    def emergency_mode(self, value):
+        if hasattr(self.context_builder, 'emergency_mode'):
+            self.context_builder.emergency_mode = value
 
     @property
     def session(self):
@@ -80,15 +89,11 @@ class HistoryProvider:
             log('DEBUG', 'core.cache', f"cache hit: {len(self._cached_context)} messages")
             return self._cached_context
         log('DEBUG', 'core.cache', 'cache miss — rebuilding')
-        context = self.context_builder.build(self.session.user_history, max_tokens=self.token_limit)
+        context = self.context_builder.build(self.session.user_history)
         if DEBUG_CONTEXT:
             log('DEBUG', 'session.history_provider', f'get_context_for_llm: {len(self.session.user_history)} history → {len(context)} context')
-            if self.token_limit:
-                log('DEBUG', 'session.history_provider', f'Token limit: {self.token_limit}')
         elif DEBUG_CONTEXT:
             logger.debug(f'[DEBUG_CONTEXT] HistoryProvider.get_context_for_llm: full history={len(self.session.user_history)} messages, context={len(context)} messages')
-            if self.token_limit:
-                logger.debug(f'[DEBUG_CONTEXT] Token limit: {self.token_limit}')
         if DEBUG_HISTORY_PROVIDER:
             logger.info(f'[DEBUG_HISTORY_PROVIDER] Original history ({len(self.session.user_history)} messages):')
             max_to_show = 10
@@ -129,15 +134,13 @@ class HistoryProvider:
         self._cached_context = context
         return context
 
-    def build(self, user_history: List[Dict[str, Any]], max_tokens: Optional[int]=None) -> List[Dict[str, Any]]:
-        """Build context from user_history with optional max_tokens limit.
-        
+    def build(self, user_history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Build context from user_history.
+
         This method implements the ContextBuilder interface, delegating to
         the internal SummaryBuilder.
         """
-        limit = max_tokens if max_tokens is not None else self.token_limit
-        return self.context_builder.build(user_history, max_tokens=limit)
-
+        return self.context_builder.build(user_history)
     def add_message(self, message: Dict[str, Any]) -> None:
         """Append message to session.user_history."""
         session_id = self.session.session_id if self.session and hasattr(self.session, 'session_id') else 'no-id'

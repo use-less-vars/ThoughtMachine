@@ -36,12 +36,8 @@ class LLMClient:
         self.provider = ProviderFactory.create_provider(provider_type=config.provider_type, api_key=config.api_key, base_url=config.base_url, model=config.model, temperature=config.temperature)
         self.context_builder = None
 
-    def create_context_builder(self, token_limit=None):
-        """Create a ContextBuilder based on configuration.
-        
-        Args:
-            token_limit: Maximum token limit for context. Defaults to 8000 if not provided.
-        """
+    def create_context_builder(self):
+        """Create a ContextBuilder based on configuration."""
         from session.history_provider import HistoryProvider
         if self.session is None:
             if self.logger and hasattr(self.logger, 'py_logger'):
@@ -52,10 +48,8 @@ class LLMClient:
                 log('WARNING', 'core.llm_client', 'Creating HistoryProvider without session')
             log('DEBUG', 'core.context_builder', f'LLMClient.create_context_builder: session is None, returning None')
             return None
-        if self.logger and hasattr(self.logger, 'py_logger'):
-            log('INFO', 'core.llm_client', f'[CONTEXT_BUILDER] Creating HistoryProvider with token_limit={token_limit}')
-        return HistoryProvider(session=self.session, token_limit=token_limit)
-
+        log('INFO', 'core.llm_client', f'[CONTEXT_BUILDER] Creating HistoryProvider')
+        return HistoryProvider(session=self.session)
     def load_system_prompt(self) -> str:
         """Load system prompt from file."""
         script_dir = os.path.dirname(os.path.abspath(__file__))

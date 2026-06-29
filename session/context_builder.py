@@ -78,13 +78,12 @@ class ContextBuilder(ABC):
     """Abstract base class for context building strategies."""
 
     @abstractmethod
-    def build(self, user_history: List[Dict[str, Any]], max_tokens: Optional[int]=None) -> List[Dict[str, Any]]:
+    def build(self, user_history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Build the agent_context from the full user_history.
 
         Args:
             user_history: Complete list of message dicts (role, content)
-            max_tokens: Optional maximum token count for the context
 
         Returns:
             A list of message dicts to be sent to the LLM.
@@ -213,17 +212,14 @@ class SummaryBuilder(ContextBuilder):
         self.default_keep_turns = default_keep_turns
         self.emergency_mode = False
 
-    def build(self, user_history: List[Dict[str, Any]], max_tokens: Optional[int]=None) -> List[Dict[str, Any]]:
+    def build(self, user_history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Build context from full history, respecting summaries.
-        
-        When a summary exists: includes all messages after the summary, with token
-        truncation removing newest messages first (to preserve originally-kept turns).
-        
-        When no summary exists: includes all messages, with token truncation
-        removing oldest messages first.
+
+        When a summary exists: includes all messages after the summary.
+        When no summary exists: includes all messages.
         """
-        log('DEBUG', 'core.context_builder', f'SummaryBuilder.build: {len(user_history)} history messages, max_tokens={max_tokens}')
+        log('DEBUG', 'core.context_builder', f'SummaryBuilder.build: {len(user_history)} history messages')
         if os.environ.get('DEBUG_CONTEXT'):
             logger.debug(f'[DEBUG_CONTEXT] SummaryBuilder.build called with {len(user_history)} history messages')
             if user_history:
@@ -310,21 +306,9 @@ class SummaryBuilder(ContextBuilder):
         context.extend(system_warnings)
         for turn in turns:
             context.extend(turn)
-        log('DEBUG', 'session.summary_builder', f'SummaryBuilder.build: assembled {len(context)} messages before truncation')
+        log('DEBUG', 'session.summary_builder', f'SummaryBuilder.build: assembled {len(context)} messages')
         if os.environ.get('DEBUG_CONTEXT'):
-            logger.debug(f'[DEBUG_CONTEXT] Context before truncation ({len(context)} messages):')
-            for i, msg in enumerate(context):
-                role = msg.get('role')
-                content_preview = str(msg.get('content', ''))[:80].replace('\\n', ' ')
-                logger.debug(f'  [{i}] role={role}: {content_preview}')
-        before_trunc_count = len(context)
-        if max_tokens is not None:
-            context = self._truncate_to_max_tokens(context, max_tokens, preserve_system=True, remove_from_end=False)
-        truncated_count = before_trunc_count - len(context)
-        if truncated_count > 0:
-            log('INFO', 'core.context', f"truncation: removed={truncated_count}, tokens_before={before_trunc_count}_msgs, tokens_after={len(context)}_msgs")
-        if os.environ.get('DEBUG_CONTEXT'):
-            logger.debug(f'[DEBUG_CONTEXT] Context after truncation ({len(context)} messages):')
+            logger.debug(f'[DEBUG_CONTEXT] Context before cleanup ({len(context)} messages):')
             for i, msg in enumerate(context):
                 role = msg.get('role')
                 content_preview = str(msg.get('content', ''))[:80].replace('\\n', ' ')
@@ -433,62 +417,3 @@ class SummaryBuilder(ContextBuilder):
         log('DEBUG', 'ctxbuild', f"GROUP: {len(result)} turns from {len(messages)} messages")
         return result
 
-    def _truncate_to_max_tokens(self, messages: List[Dict[str, Any]], max_tokens: int, preserve_system: bool=True, remove_from_end: bool=False) -> List[Dict[str, Any]]:
-        """Truncate messages until under max_tokens.
-        
-        By default removes from beginning (oldest) and preserves system messages.
-        If remove_from_end=True, removes from end (newest) instead.
-        """
-        try:
-            encoder = tiktoken.get_encoding('cl100k_base')
-        except Exception:
-            encoder = None
-        total = sum((self._estimate_tokens(msg, encoder) for msg in messages))
-        removed_count = 0
-        if total > max_tokens:
-            log('DEBUG', 'session.context_builder', f'Truncating: {len(messages)} messages, removing 0 initially, need to reduce from ~{total} to {max_tokens} tokens')
-        if remove_from_end:
-            while total > max_tokens and len(messages) > 0:
-                if preserve_system and messages[-1].get('role') == 'system':
-                    if all((msg.get('role') == 'system' for msg in messages)):
-                        break
-                    for i in range(2, len(messages) + 1):
-                        if not (preserve_system and messages[-i].get('role') == 'system'):
-                            removed_msg = messages.pop(-i)
-                            total -= self._estimate_tokens(removed_msg, encoder)
-                            removed_count += 1
-                            if os.environ.get('DEBUG_CONTEXT'):
-                                role = removed_msg.get('role', 'unknown')
-                                content_preview = str(removed_msg.get('content', ''))[:100].replace('\\n', ' ')
-                                logger.debug(f'[DEBUG_CONTEXT] Truncation removed message [-i]: role={role}, content: {content_preview}')
-                            break
-                    else:
-                        break
-                else:
-                    removed_msg = messages.pop()
-                    total -= self._estimate_tokens(removed_msg, encoder)
-                    removed_count += 1
-                    if os.environ.get('DEBUG_CONTEXT'):
-                        role = removed_msg.get('role', 'unknown')
-                        content_preview = str(removed_msg.get('content', ''))[:100].replace('\\n', ' ')
-                        logger.debug(f'[DEBUG_CONTEXT] Truncation removed message [end]: role={role}, content: {content_preview}')
-        else:
-            idx_to_remove = 0
-            while total > max_tokens and idx_to_remove < len(messages):
-                if preserve_system and messages[idx_to_remove].get('role') == 'system':
-                    idx_to_remove += 1
-                    continue
-                removed_msg = messages.pop(idx_to_remove)
-                total -= self._estimate_tokens(removed_msg, encoder)
-                removed_count += 1
-        if removed_count > 0:
-            log('DEBUG', 'session.context_builder', f'Truncating: {len(messages)} messages, removing {removed_count} to stay under {max_tokens} tokens')
-            log('DEBUG', 'session.context_builder', f'Truncated: removed {removed_count} messages, now {len(messages)} messages at ~{total} tokens')
-            # Append a system notification to inform the LLM that truncation occurred
-            notification = Message(
-                role='user',
-                content=f'[SYSTEM NOTIFICATION] Context truncated: {removed_count} older message(s) were removed to stay within token limits ({total} tokens ≈ {max_tokens} max).',
-                is_system_notification=True,
-            )
-            messages.append(notification)
-        return messages
