@@ -56,11 +56,15 @@ except ImportError:
     resolve_workspace_id = None
     _workspace_dir = None
 
-# Optional: LLM client for worker conversations
+# Optional: WorkerContext (imported eagerly — no circular dep)
 try:
-    from agent.core.llm_client import LLMClient
+    from agent.core.worker_context import WorkerContext
 except ImportError:
-    LLMClient = None  # type: ignore
+    WorkerContext = None  # type: ignore
+
+# NOTE: Agent and AgentConfig are imported *lazily* inside
+# WorkerThread._build_agent_config() to avoid a circular import with
+# agent/core/agent.py which imports from tools (TOOL_CLASSES).
 
 # Optional: security gate for worker permission checks
 try:
@@ -168,7 +172,7 @@ class WorkerThread(threading.Thread):
         self,
         name: str,
         definition: dict,
-        llm_client: Any,
+        agent_config: dict,
         workspace_dir: Path,
         tool_classes: Optional[Dict[str, type[ToolBase]]] = None,
         session_permissions: Optional[Dict[str, Any]] = None,
@@ -177,15 +181,12 @@ class WorkerThread(threading.Thread):
         super().__init__(daemon=True, name=f"worker-{name}")
         self.worker_name = name
         self.definition = definition
-        self.llm_client = llm_client
+        self._agent_config_dict = agent_config
         self._worker_dir = workspace_dir / "workers" / name
         self._worker_dir.mkdir(parents=True, exist_ok=True)
 
         # Tool classes available to this worker (name -> class)
         self._tool_classes: Dict[str, type[ToolBase]] = tool_classes or {}
-        # Tool definitions in OpenAI format (built once)
-        self._tool_defs: List[Dict[str, Any]] = []
-        self._rebuild_tool_defs()
 
         # Session permissions for gate-checking tool calls
         self._session_permissions: Dict[str, Any] = session_permissions or {}
@@ -200,10 +201,12 @@ class WorkerThread(threading.Thread):
         self.current_task: Optional[str] = None
         self.error: Optional[str] = None
         self.last_heartbeat: Optional[str] = None
+        self._last_reasoning: Optional[str] = None
 
-        # Conversation context (loaded from disk on init)
-        self.conversation: List[Dict[str, str]] = []
-        self._load_context()
+        # Agent instance + WorkerContext (created lazily in run())
+        self._agent: Optional[Any] = None
+        self._worker_ctx: Optional[Any] = None
+        self._initial_context: Optional[Dict[str, Any]] = None
 
         # Inter-thread communication
         self._input_queue: queue.Queue = queue.Queue()
@@ -259,236 +262,164 @@ class WorkerThread(threading.Thread):
             except OSError:
                 pass
 
-    def _rebuild_tool_defs(self) -> None:
-        """Build OpenAI-style tool definitions from self._tool_classes."""
-        defs = []
-        for name, cls in self._tool_classes.items():
-            try:
-                defs.append(model_to_openai_tool(cls))
-            except Exception as exc:
-                logger.warning(
-                    "Failed to build tool def for '%s': %s", name, exc
-                )
-        self._tool_defs = defs
-
-    def _check_tool_permissions(
-        self,
-        tool_name: str,
-        tool_args: Dict[str, Any],
-    ) -> Optional[str]:
+    def _build_agent_config(self) -> Any:
         """
-        Check whether this tool call is allowed by worker + session permissions.
+        Build an AgentConfig from the worker definition and parent agent config.
 
-        Routes through ``check_required_categories`` — the single gate
-        enforcement point for all tool calls.  Returns ``None`` if allowed,
-        or an error message string if denied.
+        Imports ``AgentConfig`` lazily to avoid circular imports with
+        ``agent.core.agent`` which pulls in ``tools.TOOL_CLASSES``.
+
+        Returns None if AgentConfig is not importable.
         """
-        tool_cls = self._tool_classes.get(tool_name)
-        if tool_cls is None:
-            return f"Unknown tool: {tool_name}"
-
-        # Get the tool's required categories
-        required = tool_cls.get_required_categories(tool_args)
-        if not required:
-            return None  # no categories needed = always allowed
-
-        # Use session permissions as the effective base;
-        # check_required_categories applies worker_permissions internally
-        # via _min_permission (more restrictive of the two).
-        effective = dict(self._session_permissions)
-
-        if GATE_AVAILABLE and check_required_categories is not None:
-            ok, error_msg = check_required_categories(
-                required,
-                effective,
-                tool_name=tool_name,
-                tool_args=tool_args,
-                description=f"Worker '{self.worker_name}' executing {tool_name}",
-                event_bus=_NULL_EVENT_BUS,
-                worker_permissions=self._worker_permissions,
-            )
-            if not ok:
-                return error_msg
+        try:
+            from agent.config.models import AgentConfig
+        except ImportError:
+            logger.warning("AgentConfig not available — cannot create worker agent")
             return None
-        else:
-            # Gate not available: deny all (safe default for worker context)
-            return (
-                f"Permission denied: Gate unavailable for '{tool_name}'. "
-                f"Required: {', '.join(required)}"
+
+        cfg = self._agent_config_dict or {}
+        provider_type = cfg.get("provider", "")
+        model = cfg.get("model", "")
+        if not provider_type or not model:
+            logger.warning(
+                "agent_config missing provider (%s) or model (%s)",
+                provider_type, model,
             )
+            return None
 
-    def _execute_tool(
-        self,
-        tool_name: str,
-        tool_args: Dict[str, Any],
-    ) -> str:
-        """
-        Instantiate and execute a tool by name.
+        enabled_tools = list(self._tool_classes.keys()) if self._tool_classes else []
+        system_prompt = self.definition.get(
+            "system_prompt",
+            "You are a helpful worker assistant."
+        )
 
-        Returns the tool's output string (JSON).
-        """
-        tool_cls = self._tool_classes.get(tool_name)
-        if tool_cls is None:
-            return json.dumps({"error": f"Unknown tool: {tool_name}"})
+        return AgentConfig(
+            provider_type=provider_type,
+            model=model,
+            api_key=cfg.get("api_key", ""),
+            base_url=cfg.get("base_url", None),
+            temperature=cfg.get("temperature", 0.7),
+            system_prompt=system_prompt,
+            max_turns=self.definition.get("max_turns", 10),
+            enabled_tools=enabled_tools,
+            timeout_seconds=self.definition.get("timeout_seconds", 300),
+            time_monitor_enabled=True,
+            stop_check=self._stop_event.is_set,
+        )
 
-        try:
-            tool_instance = tool_cls(**tool_args)
-        except Exception as exc:
-            return json.dumps({
-                "error": f"Failed to instantiate tool '{tool_name}': {exc}",
-            })
 
-        # Inject the workspace_path if the tool needs it
-        # Use the session's project root so tools can resolve files relative
-        # to the project (e.g., secret_alpha.txt -> <project_root>/secret_alpha.txt).
-        # Fall back to the worker's own directory only if project_root is unknown.
-        if self._project_root:
-            tool_instance.workspace_path = self._project_root
-        elif self._worker_dir:
-            tool_instance.workspace_path = str(self._worker_dir)
-
-        try:
-            result = tool_instance.execute()
-            return result
-        except Exception as exc:
-            return json.dumps({
-                "error": f"Tool '{tool_name}' execution failed: {exc}",
-            })
 
     def _run_tool_loop(
         self,
         query: str,
     ) -> str:
         """
-        Run the tool-use conversation loop for a single query.
+        Run the agent conversation loop for a single query using Agent.process_query().
 
-        Steps:
-          1. Append user query to conversation.
-          2. Call LLM with tool definitions.
-          3. If response has tool_calls → validate, gate-check, execute, append, loop.
-          4. If text response → return it.
-          5. On error → return error JSON.
+        Iterates over all events yielded by the agent, logging heartbeats
+        and checking the stop event. Returns the final response text.
         """
-        self.conversation.append({"role": "user", "content": query})
+        if self._agent is None:
+            return json.dumps({"error": "Agent not initialized"})
 
-        max_tool_turns = 10  # safety limit to prevent infinite loops
-        tool_turn = 0
+        self.current_task = query[:200]
+        final_content = ""
 
-        while tool_turn < max_tool_turns and not self._stop_event.is_set():
-            tool_turn += 1
-            self.last_heartbeat = datetime.now(timezone.utc).isoformat()
+        try:
+            for event in self._agent.process_query(query):
+                # Log heartbeat for liveliness checks
+                self.last_heartbeat = datetime.now(timezone.utc).isoformat()
 
-            try:
-                response = self.llm_client.chat_completion(
-                    self.conversation,
-                    tools=self._tool_defs if self._tool_defs else None,
-                )
-            except Exception as exc:
-                logger.exception("Worker LLM call failed")
-                return json.dumps({"error": f"LLM call failed: {exc}"})
+                # Check stop signal
+                if self._stop_event.is_set():
+                    self._agent.request_pause()
+                    break
 
-            content = response.content or ""
-            tool_calls = getattr(response, "tool_calls", None)
+                event_type = event.get("type", "")
 
-            if not tool_calls:
-                # Text response — this is the final answer
-                self.conversation.append({
-                    "role": "assistant",
-                    "content": content,
-                })
-                return content
+                # Capture final response content and reasoning
+                if event_type == "agent_responded":
+                    final_content = event.get("content", "")
+                    self._last_reasoning = event.get("reasoning")
 
-            # ── Tool call(s) received ─────────────────────────────────
-            assistant_msg: Dict[str, Any] = {
-                "role": "assistant",
-                "content": content or "",
-                "tool_calls": tool_calls,
-            }
-            self.conversation.append(assistant_msg)
+                elif event_type == "stopped":
+                    stop_reason = event.get("stop_reason", "unknown")
+                    if stop_reason == "timeout":
+                        final_content = json.dumps({
+                            "error": "Worker execution timed out",
+                        })
+                    elif stop_reason == "max_turns_reached":
+                        final_content = json.dumps({
+                            "error": f"Worker reached max turns",
+                        })
+                    break
 
-            for tc in tool_calls:
-                tool_name = tc.get("function", {}).get("name", "")
+                elif event_type == "stop_reason":
+                    reason = event.get("stop_reason", "unknown")
+                    if reason == "max_turns_reached":
+                        final_content = json.dumps({
+                            "error": "Worker reached maximum turns",
+                        })
+                    break
 
-                # Parse arguments
-                try:
-                    raw_args = tc.get("function", {}).get("arguments", "{}")
-                    tool_args = json.loads(raw_args)
-                except json.JSONDecodeError:
-                    tool_args = {}
+                elif event_type == "error":
+                    error_msg = event.get("error", "Unknown error")
+                    final_content = json.dumps({"error": error_msg})
+                    break
 
-                tool_call_id = tc.get("id", "")
+                # Log tool events for audit trail
+                if event_type == "tool_execution":
+                    tool_name = event.get("tool_name", "")
+                    tool_args = event.get("tool_args", {})
+                    result = event.get("result", "")
+                    self._log_event(
+                        "tool_call",
+                        {"tool": tool_name, "args": tool_args},
+                        {"result": str(result)[:500] if result else ""},
+                    )
 
-                # 1. Validate the tool exists
-                if tool_name not in self._tool_classes:
-                    error_result = json.dumps({
-                        "error": f"Unknown tool: '{tool_name}'. "
-                                  f"Available tools: {list(self._tool_classes.keys())}",
-                    })
-                    self.conversation.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": error_result,
-                    })
-                    continue
+        except Exception as exc:
+            logger.exception("Worker _run_tool_loop failed")
+            final_content = json.dumps({"error": f"Worker execution failed: {exc}"})
 
-                # 2. Gate check
-                gate_error = self._check_tool_permissions(tool_name, tool_args)
-                if gate_error is not None:
-                    error_result = json.dumps({"error": gate_error})
-                    self.conversation.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": error_result,
-                    })
-                    continue
-
-                # 3. Execute the tool
-                self.current_task = f"Running {tool_name}..."
-                result = self._execute_tool(tool_name, tool_args)
-                self.current_task = None
-
-                self.conversation.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": result,
-                })
-
-                # Log the tool event
-                self._log_event(
-                    "tool_call",
-                    {"tool": tool_name, "args": tool_args},
-                    {"result": result[:500] if len(result) > 500 else result},
-                )
-
-            # Save context after each tool turn
-            self._save_context()
-
-            # Loop back for the next LLM response
-
-        if tool_turn >= max_tool_turns:
-            return json.dumps({
-                "error": f"Worker exceeded maximum tool turns ({max_tool_turns}).",
-            })
-
-        return ""  # unreachable, but keep the type checker happy
+        self.current_task = None
+        return final_content
 
     # ── thread run loop ────────────────────────────────────────────
 
     def run(self) -> None:
-        """Main worker loop — processes queries until stop is signalled."""
-        self.status = "running"
+        """Main worker loop — processes queries until stop is signalled.
+
+        Creates the Agent and WorkerContext lazily on first query,
+        reusing them for subsequent queries to maintain conversation state.
+        """
         self.last_heartbeat = datetime.now(timezone.utc).isoformat()
 
         try:
-            # Load system prompt from definition (or use default)
-            system_prompt = self.definition.get(
-                "system_prompt",
-                "You are a helpful worker assistant."
-            )
-            # Ensure system prompt is first
-            if not self.conversation or self.conversation[0].get("role") != "system":
-                self.conversation.insert(0, {"role": "system", "content": system_prompt})
+            # ── Load persisted context or create fresh ────────────────
+            self._worker_ctx = self._load_context()
 
+            # Override persisted status/error with live thread state
+            self.status = "running"
+            self.error = None
+            if self._worker_ctx is None:
+                # Load system prompt from definition
+                system_prompt = self.definition.get(
+                    "system_prompt",
+                    "You are a helpful worker assistant."
+                )
+                user_history = [
+                    {"role": "system", "content": system_prompt}
+                ]
+                if self._initial_context:
+                    user_history.append({
+                        "role": "system",
+                        "content": f"Initial context: {json.dumps(self._initial_context, default=str)}",
+                    })
+                self._worker_ctx = WorkerContext(
+                    worker_name=self.worker_name,
+                    user_history=user_history,
+                )
             self._save_context()
             self._log_event("started", {}, {})
 
@@ -506,20 +437,39 @@ class WorkerThread(threading.Thread):
                 if query is None or self._stop_event.is_set():
                     break
 
-                self.current_task = query[:200]  # truncate display
+                # ── Create Agent lazily (first query only) ────────────
+                if self._agent is None:
+                    agent_cfg = self._build_agent_config()
+                    if agent_cfg is None:
+                        reply = json.dumps({
+                            "error": "Cannot create Agent: invalid agent_config"
+                        })
+                        self._output_queue.put(reply)
+                        break
+                    # Lazy import to avoid circular dep: agent.core.agent ↔ tools
+                    try:
+                        from agent.core.agent import Agent
+                    except ImportError:
+                        reply = json.dumps({
+                            "error": "Cannot create Agent: module not importable"
+                        })
+                        self._output_queue.put(reply)
+                        break
+                    self._agent = Agent(
+                        config=agent_cfg,
+                        session=self._worker_ctx,
+                    )
 
-                # Run the tool-use loop (or plain LLM if no tools configured)
-                if self._tool_classes:
-                    reply = self._run_tool_loop(query)
-                else:
-                    # Simple mode: single LLM call, no tools
-                    self.conversation.append({"role": "user", "content": query})
-                    response = self.llm_client.chat_completion(self.conversation)
-                    reply = response.content if response and response.content else ""
-                    self.conversation.append({"role": "assistant", "content": reply})
+                # ── Process the query via Agent ───────────────────────
+                reply = self._run_tool_loop(query)
 
                 self.current_task = None
                 self.last_heartbeat = datetime.now(timezone.utc).isoformat()
+
+                # Compact conversation history after summarization
+                # (Agent inserts summary messages but doesn't remove old ones)
+                if self._worker_ctx is not None:
+                    self._worker_ctx.compact_after_summary()
 
                 # Persist and log
                 self._save_context()
@@ -543,7 +493,8 @@ class WorkerThread(threading.Thread):
             self.status = "completed"
             self._log_event("completed", {}, {})
         finally:
-            self._save_context()
+            if self._worker_ctx is not None:
+                self._save_context()
 
     # ── persistence ────────────────────────────────────────────────
 
@@ -553,36 +504,39 @@ class WorkerThread(threading.Thread):
     def _events_path(self) -> Path:
         return self._worker_dir.parent / "events.jsonl"
 
-    def _load_context(self) -> None:
-        """Load conversation context from disk, if present."""
+    def _load_context(self) -> Optional[WorkerContext]:
+        """Load WorkerContext from disk, if present. Returns None if not found."""
         path = self._context_path()
         if path.exists():
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
-                self.conversation = data.get("conversation", [])
+                ctx = WorkerContext.from_persistable_dict(data)
                 self.status = data.get("status", "idle")
                 self.error = data.get("error")
                 self.last_heartbeat = data.get("last_heartbeat")
+                return ctx
             except (json.JSONDecodeError, OSError) as exc:
                 logger.warning(
                     "Failed to load worker context %s: %s", path, exc
                 )
+        return None
 
     def _save_context(self) -> None:
         """
-        Persist conversation context to disk atomically.
+        Persist WorkerContext + runtime status to disk atomically.
 
-        Uses a temp-file + os.replace pattern (same as
-        ``FileSystemSessionStore.save_session``) so that a crash
-        mid-write never leaves a truncated ``context.json``.
+        Uses WorkerContext.to_persistable_dict() for the conversation
+        data, augmented with runtime fields (status, error, heartbeat).
         """
+        if self._worker_ctx is None:
+            return
+        ctx_data = self._worker_ctx.to_persistable_dict()
         data = {
-            "worker_name": self.worker_name,
+            **ctx_data,
             "status": self.status,
             "error": self.error,
             "current_task": self.current_task,
             "last_heartbeat": self.last_heartbeat,
-            "conversation": self.conversation,
         }
         target = self._context_path()
         # Write to a temp file in the same directory (atomic on same filesystem)
@@ -724,40 +678,6 @@ class Worker(ToolBase):
             return None
         return _workspace_dir(ws_id)
 
-    def _build_llm_client(self) -> Any:
-        """
-        Build an LLMClient from the injected ``agent_config`` dict.
-
-        Returns ``None`` if LLMClient is not importable or config is
-        missing required keys.
-        """
-        if LLMClient is None:
-            logger.warning("LLMClient not available — cannot create worker LLM client")
-            return None
-
-        cfg = self.agent_config or {}
-        provider_type = cfg.get("provider")
-        model = cfg.get("model")
-        if not provider_type or not model:
-            logger.warning(
-                "agent_config missing provider (%s) or model (%s)",
-                provider_type, model,
-            )
-            return None
-
-        # Build a minimal object with the attributes LLMClient expects
-        class _ConfigProxy:
-            """Minimal config proxy with the attributes LLMClient reads."""
-            def __init__(self, d: dict):
-                self.provider_type = d.get("provider", "")
-                self.api_key = d.get("api_key", "")
-                self.base_url = d.get("base_url", None)
-                self.model = d.get("model", "")
-                self.temperature = d.get("temperature", 0.7)
-                self.system_prompt = d.get("system_prompt", None)
-
-        proxy = _ConfigProxy(cfg)
-        return LLMClient(config=proxy)
 
     def _check_worker_permissions(
         self,
@@ -791,6 +711,18 @@ class Worker(ToolBase):
         if not ok:
             return error_msg
         return None
+
+    def _build_agent_config(self) -> dict:
+        """
+        Build an agent config dict from the tool's injected agent_config.
+
+        Returns a dict with provider, model, api_key, base_url, temperature
+        and any other fields present in ``self.agent_config`` (injected by
+        ToolExecutor).  This dict is passed to WorkerThread so it can create
+        an ``AgentConfig`` at runtime.
+        """
+        cfg = self.agent_config or {}
+        return dict(cfg)
 
     def _resolve_tool_class(self, tool_name: str) -> Optional[type[ToolBase]]:
         """Resolve a tool name string to its class via _TOOL_REGISTRY.
@@ -853,11 +785,11 @@ class Worker(ToolBase):
                 "worker_name": self.worker_name,
             }
 
-        # Build LLM client for this worker
-        llm_client = self._build_llm_client()
-        if llm_client is None:
+        # Build agent config for this worker
+        agent_config = self._build_agent_config()
+        if agent_config is None:
             return {
-                "error": "Cannot create worker: LLM client unavailable. "
+                "error": "Cannot create worker: AgentConfig unavailable. "
                           "Check that agent_config has provider and model.",
                 "worker_name": self.worker_name,
             }
@@ -925,20 +857,16 @@ class Worker(ToolBase):
         thread = WorkerThread(
             name=self.worker_name,
             definition=definition,
-            llm_client=llm_client,
+            agent_config=agent_config,
             workspace_dir=ws_dir,
             tool_classes=tool_classes if tool_classes else None,
             session_permissions=self.session_permissions,
             project_root=project_root,
         )
 
-        # Pass initial context if provided
-        if self.context is not None:
-            if isinstance(self.context, dict):
-                thread.conversation.append({
-                    "role": "system",
-                    "content": f"Initial context: {json.dumps(self.context, default=str)}",
-                })
+        # Store initial context for the thread to pick up in run()
+        if self.context is not None and isinstance(self.context, dict):
+            thread._initial_context = self.context
 
         with _registry_lock:
             _worker_registry[self.worker_name] = thread
@@ -989,7 +917,7 @@ class Worker(ToolBase):
             "last_heartbeat": thread.last_heartbeat,
             "error": thread.error,
             "alive": thread.is_alive(),
-            "conversation_length": len(thread.conversation),
+            "conversation_length": len(thread._worker_ctx.user_history) if thread._worker_ctx else 0,
         }
 
     def _action_query(self, workers: list) -> dict:
@@ -1019,10 +947,13 @@ class Worker(ToolBase):
         try:
             # Block until the worker responds
             response = thread.send_query(self.worker_query, timeout=300.0)
-            return {
+            result = {
                 "worker_name": self.worker_name,
                 "response": response,
             }
+            if thread._last_reasoning is not None:
+                result["reasoning"] = thread._last_reasoning
+            return result
         except TimeoutError as exc:
             return {
                 "error": str(exc),
