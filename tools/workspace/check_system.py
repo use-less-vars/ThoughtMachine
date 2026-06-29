@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional
 from pydantic import Field
@@ -65,6 +66,15 @@ except ImportError:
     DOCKER_EXECUTOR_CLS_AVAILABLE = False
     DockerExecutor = None
 
+# Worker registry access (for running_workers query)
+try:
+    from tools.workspace.worker import _worker_registry, _registry_lock
+    WORKER_REGISTRY_AVAILABLE = True
+except ImportError:
+    _worker_registry = None
+    _registry_lock = None
+    WORKER_REGISTRY_AVAILABLE = False
+
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +90,13 @@ class CheckSystem(ToolBase):
     required_categories: ClassVar[List[str]] = []
 
     query: str = Field(
-        description="What to inspect: effective_permissions, container_status, workspace_info, my_config, network_diagnostics",
+        description="What to check. Valid values: 'my_config' (full agent config), "
+                      "'workers' (all worker definitions), 'running_workers' (active worker statuses), "
+                      "'worker/<name>' (specific worker config), 'capabilities' (workspace features), "
+                      "'dockerfile' (container environment), 'mcp_servers' (external tool servers), "
+                      "'effective_permissions' (session × workspace permissions), "
+                      "'container_status' (Docker status), 'workspace_info' (workspace metadata), "
+                      "'network_diagnostics' (connectivity checks).",
     )
 
     skip_output_truncation: ClassVar[bool] = True
@@ -92,19 +108,30 @@ class CheckSystem(ToolBase):
             if resolve_workspace_id and self.workspace_path:
                 ws_id = resolve_workspace_id(self.workspace_path)
 
+            # Dynamic handlers: worker/<name> needs special handling
+            if self.query.startswith("worker/"):
+                worker_name = self.query[len("worker/"):]
+                result = self._query_worker_detail(ws_id, worker_name)
+                return json.dumps(result, indent=2, default=str)
+
             handler_map = {
                 "effective_permissions": lambda: self._query_permissions(ws_id),
                 "container_status": lambda: self._query_container_status(),
                 "workspace_info": lambda: self._query_workspace_info(ws_id),
                 "my_config": lambda: self._query_my_config(),
                 "network_diagnostics": lambda: self._query_network_diagnostics(ws_id),
+                "workers": lambda: self._query_workers(ws_id),
+                "running_workers": lambda: self._query_running_workers(),
+                "capabilities": lambda: self._query_capabilities(ws_id),
+                "dockerfile": lambda: self._query_dockerfile(ws_id),
+                "mcp_servers": lambda: self._query_mcp_servers(ws_id),
             }
 
             handler = handler_map.get(self.query)
             if handler is None:
                 return json.dumps({
                     "error": f"Unknown query: {self.query}",
-                    "available_queries": list(handler_map.keys()),
+                    "valid_queries": list(handler_map.keys()),
                 })
 
             result = handler()
@@ -213,9 +240,28 @@ class CheckSystem(ToolBase):
         }
 
     def _query_my_config(self) -> dict:
-        """Return the agent-config snapshot injected by ToolExecutor."""
+        """Return the agent-config snapshot injected by ToolExecutor (clean JSON)."""
         if self.agent_config is not None:
-            return dict(self.agent_config)
+            cfg = dict(self.agent_config)
+            # Ensure key fields are always present
+            result = {
+                "provider": cfg.get("provider", cfg.get("provider_type", "")),
+                "model": cfg.get("model", ""),
+                "timeout_seconds": cfg.get("timeout_seconds", 600),
+                "max_turns": cfg.get("max_turns", 50),
+                "enabled_tools": cfg.get("enabled_tools", []),
+                "temperature": cfg.get("temperature", 0.7),
+                "system_prompt": cfg.get("system_prompt", ""),
+                "session_permissions": cfg.get("session_permissions", {}),
+                "token_monitor_warning_threshold": cfg.get("token_monitor_warning_threshold", None),
+                "token_monitor_critical_threshold": cfg.get("token_monitor_critical_threshold", None),
+                "restriction_reason": cfg.get("restriction_reason", None),
+                "reasoning_effort": cfg.get("reasoning_effort", None),
+                "base_url": cfg.get("base_url", None),
+                "api_key": "***" if cfg.get("api_key") else None,
+                "raw_config": cfg,
+            }
+            return result
         return {"error": "agent_config not available"}
 
     def _query_network_diagnostics(self, ws_id: Optional[str]) -> dict:
@@ -245,3 +291,134 @@ class CheckSystem(ToolBase):
                 return {"container": False, "message": f"No container running: {e}"}
 
         return {"container": False, "message": "No container running"}
+
+    # ── new query handlers ─────────────────────────────────────────
+
+    def _query_workers(self, ws_id: Optional[str]) -> dict:
+        """Return all worker definitions from workers.json."""
+        if not CAPABILITIES_AVAILABLE or not _workspace_dir or not ws_id:
+            return {"workers": [], "count": 0}
+        workers_path = _workspace_dir(ws_id) / "workers.json"
+        if not workers_path.exists():
+            return {"workers": [], "count": 0}
+        try:
+            workers = json.loads(workers_path.read_text(encoding="utf-8"))
+            return {"workers": workers, "count": len(workers)}
+        except (json.JSONDecodeError, OSError) as e:
+            return {"error": f"Failed to read workers.json: {e}", "workers": [], "count": 0}
+
+    def _query_worker_detail(self, ws_id: Optional[str], worker_name: str) -> dict:
+        """Return full definition of a specific worker by name."""
+        if not CAPABILITIES_AVAILABLE or not _workspace_dir or not ws_id:
+            return {"error": "workspace not available"}
+        workers_path = _workspace_dir(ws_id) / "workers.json"
+        if not workers_path.exists():
+            return {"error": "worker not found"}
+        try:
+            workers = json.loads(workers_path.read_text(encoding="utf-8"))
+            for w in workers:
+                if isinstance(w, dict) and w.get("name") == worker_name:
+                    return w
+            return {"error": f"worker '{worker_name}' not found"}
+        except (json.JSONDecodeError, OSError) as e:
+            return {"error": f"Failed to read workers.json: {e}"}
+
+    def _query_running_workers(self) -> dict:
+        """Return list of currently running workers with status details."""
+        running = []
+        if WORKER_REGISTRY_AVAILABLE and _worker_registry is not None and _registry_lock is not None:
+            with _registry_lock:
+                for name, thread in list(_worker_registry.items()):
+                    entry = {
+                        "name": name,
+                        "status": thread.status,
+                        "alive": thread.is_alive(),
+                        "current_task": thread.current_task,
+                        "last_heartbeat": thread.last_heartbeat,
+                        "error": thread.error,
+                        "conversation_length": len(thread._worker_ctx.user_history) if thread._worker_ctx else 0,
+                    }
+                    elapsed = thread._last_elapsed()
+                    if elapsed is not None:
+                        entry["elapsed_seconds"] = round(elapsed, 1)
+                    running.append(entry)
+        return {"running_workers": running, "count": len(running)}
+
+    def _query_capabilities(self, ws_id: Optional[str]) -> dict:
+        """Return workspace capabilities: provider, model, tools, docker, git, OS, token limits."""
+        result = {
+            "provider": None,
+            "model": None,
+            "enabled_tools": [],
+            "has_docker": False,
+            "has_git": False,
+            "os": None,
+            "token_limits": {},
+        }
+
+        # Try to get from agent_config first
+        if self.agent_config:
+            cfg = dict(self.agent_config)
+            result["provider"] = cfg.get("provider", cfg.get("provider_type"))
+            result["model"] = cfg.get("model")
+            result["enabled_tools"] = cfg.get("enabled_tools", [])
+
+        # Check Docker availability
+        try:
+            import shutil
+            result["has_docker"] = shutil.which("docker") is not None
+        except Exception:
+            pass
+
+        # Check git availability
+        try:
+            import shutil
+            result["has_git"] = shutil.which("git") is not None
+        except Exception:
+            pass
+
+        result["os"] = os.name
+
+        # Try to read capabilities.json for token limits
+        if CAPABILITIES_AVAILABLE and _workspace_dir and ws_id:
+            caps_path = _workspace_dir(ws_id) / "capabilities.json"
+            if caps_path.exists():
+                try:
+                    caps_data = json.loads(caps_path.read_text(encoding="utf-8"))
+                    result["token_limits"] = {
+                        "max_context_length": caps_data.get("max_context_length", 0),
+                        "max_conversation_turns": caps_data.get("max_conversation_turns", 0),
+                        "max_file_size_bytes": caps_data.get("max_file_size_bytes", 0),
+                    }
+                    result["has_docker"] = caps_data.get("allow_docker", result["has_docker"])
+                    result["has_git"] = caps_data.get("git_available", result["has_git"])
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+        return result
+
+    def _query_dockerfile(self, ws_id: Optional[str]) -> dict:
+        """Return current Dockerfile content as a string."""
+        if not CAPABILITIES_AVAILABLE or not _workspace_dir or not ws_id:
+            return {"available": False, "error": "workspace not available"}
+        dockerfile_path = _workspace_dir(ws_id) / "Dockerfile"
+        if not dockerfile_path.exists():
+            return {"available": False, "error": "Dockerfile not found"}
+        try:
+            content = dockerfile_path.read_text(encoding="utf-8")
+            return {"available": True, "content": content}
+        except OSError as e:
+            return {"available": False, "error": str(e)}
+
+    def _query_mcp_servers(self, ws_id: Optional[str]) -> dict:
+        """Return list of configured MCP servers."""
+        if not CAPABILITIES_AVAILABLE or not _workspace_dir or not ws_id:
+            return {"mcp_servers": [], "count": 0}
+        mcp_path = _workspace_dir(ws_id) / "mcp_servers.json"
+        if not mcp_path.exists():
+            return {"mcp_servers": [], "count": 0}
+        try:
+            servers = json.loads(mcp_path.read_text(encoding="utf-8"))
+            return {"mcp_servers": servers, "count": len(servers)}
+        except (json.JSONDecodeError, OSError) as e:
+            return {"error": f"Failed to read mcp_servers.json: {e}", "mcp_servers": [], "count": 0}
