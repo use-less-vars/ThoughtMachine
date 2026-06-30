@@ -283,12 +283,41 @@ function WorkersSection({ workspaceId, onSelectWorker, selectedWorker }) {
   // on transitions (null→running, completed→running, etc.) not just new names.
   const prevStatusMapRef = useRef(new Map());
 
+  // Track workers the user manually dismissed (closed the panel on).
+  // A dismissed worker won't auto-open again until its status transitions
+  // away from 'running' (e.g. completes a task and starts a new one).
+  const dismissedWorkersRef = useRef(new Set());
+
+  // Remember the previous selectedWorker to detect when the panel is closed.
+  const prevSelectedWorkerRef = useRef(selectedWorker);
+
+  // When the user closes the panel (selectedWorker → null), mark the
+  // previously-selected worker as dismissed so it won't re-auto-open
+  // until its status changes.
+  useEffect(() => {
+    const prev = prevSelectedWorkerRef.current;
+    if (prev && !selectedWorker) {
+      dismissedWorkersRef.current.add(prev.name);
+    }
+    prevSelectedWorkerRef.current = selectedWorker;
+  }, [selectedWorker]);
+
   // Auto-open panel when a worker appears or transitions to 'running'
   useEffect(() => {
     const currentMap = new Map(workers.map(w => [w.name, w.runtime_status]));
     const prev = prevStatusMapRef.current;
 
     for (const [name, status] of currentMap) {
+      // Skip workers the user manually dismissed (panel was closed on them).
+      // If a dismissed worker is no longer running, undismiss it so it can
+      // re-trigger auto-open on the next status transition to running.
+      if (dismissedWorkersRef.current.has(name)) {
+        if (status !== 'running') {
+          dismissedWorkersRef.current.delete(name);
+        }
+        continue;
+      }
+
       const prevStatus = prev.get(name);
       // Trigger if: name is entirely new, OR an existing worker just became running
       // (catches null→running, completed→running, error→running, idle→running)
@@ -380,7 +409,10 @@ function WorkersSection({ workspaceId, onSelectWorker, selectedWorker }) {
               <WorkerDot status={w.runtime_status} />
               <span
                 style={{ fontWeight: 500, whiteSpace: 'nowrap' }}
-                onClick={() => onSelectWorker?.(w.name, workspaceId)}
+                onClick={() => {
+                  dismissedWorkersRef.current.delete(w.name);
+                  onSelectWorker?.(w.name, workspaceId);
+                }}
               >
                 {w.name}
               </span>
