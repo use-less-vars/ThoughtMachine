@@ -827,6 +827,394 @@ body {
   width: 380px;
 }
 
+/* ── Worker Output Panel inner layout ────────────────────── */
+.worker-output-wrapper {
+  display: flex;
+  height: 100%;
+  font-family: var(--font-sans);
+}
+
+.worker-output-inner {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg-primary);
+}
+
+.worker-output-header {
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.worker-output-header-top {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 0.25rem;
+}
+
+.worker-output-header-name {
+  font-weight: 600;
+  font-size: 0.9rem;
+  color: var(--text-primary);
+}
+
+.worker-output-header-status {
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  text-transform: capitalize;
+}
+
+.worker-output-header-task {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  margin-bottom: 0.2rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.worker-output-header-bottom {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.worker-output-elapsed {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
+.worker-output-stop-btn {
+  background: var(--danger);
+  color: var(--bg-primary);
+  border: none;
+  border-radius: 4px;
+  padding: 0.2rem 0.6rem;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.72rem;
+  line-height: 1.4;
+  transition: opacity 0.15s;
+}
+.worker-output-stop-btn:disabled {
+  background: var(--border);
+  color: var(--text-secondary);
+  cursor: not-allowed;
+}
+.worker-output-stop-btn:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.worker-output-close-btn {
+  background: transparent;
+  color: var(--text-secondary);
+  border: none;
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0.15rem 0.3rem;
+  border-radius: 4px;
+  transition: background 0.15s;
+}
+.worker-output-close-btn:hover {
+  background: var(--bg-surface);
+}
+
+/* ── Scroll area ─────────────────────────────────────────── */
+.worker-output-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.6rem 0.75rem;
+  background: var(--bg-primary);
+  position: relative;
+}
+
+.worker-output-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text-secondary);
+  font-style: italic;
+  text-align: center;
+  padding: 2rem;
+  font-size: 0.85rem;
+}
+
+.worker-output-error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--danger);
+  text-align: center;
+  padding: 2rem;
+  font-size: 0.82rem;
+}
+
+/* ── Worker events ───────────────────────────────────────── */
+.worker-event {
+  margin-bottom: 0.4rem;
+}
+
+/* User message — right-aligned bubble */
+.worker-event-user {
+  display: flex;
+  justify-content: flex-end;
+}
+.worker-event-user .worker-event-bubble {
+  background: var(--accent);
+  color: var(--bg-primary);
+  border-radius: 12px 12px 4px 12px;
+  padding: 0.45rem 0.75rem;
+  max-width: 85%;
+  font-size: 0.82rem;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+/* Assistant / final_response — left-aligned bubble */
+.worker-event-assistant {
+  display: flex;
+  justify-content: flex-start;
+}
+.worker-event-assistant .worker-event-bubble {
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border-radius: 12px 12px 12px 4px;
+  padding: 0.45rem 0.75rem;
+  max-width: 85%;
+  font-size: 0.82rem;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.worker-event-reasoning-note {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  margin-top: 0.3rem;
+  font-style: italic;
+}
+
+/* ── Tool call bubble ────────────────────────────────────── */
+.worker-event-tool-call-bubble {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  max-width: 95%;
+}
+
+.worker-event-tool-header {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.6rem;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.8rem;
+  color: var(--text-primary);
+}
+
+.worker-event-tool-icon {
+  font-size: 0.85rem;
+  flex-shrink: 0;
+}
+
+.worker-event-tool-args-badge {
+  margin-left: auto;
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  background: var(--bg-primary);
+  padding: 0.1rem 0.4rem;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+
+.worker-event-tool-args {
+  padding: 0.4rem 0.6rem;
+}
+
+.worker-event-tool-pre {
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-mono);
+  line-height: 1.4;
+}
+
+/* ── Tool result bubble ─────────────────────────────────── */
+.worker-event-tool-result-bubble {
+  border-radius: 10px;
+  overflow: hidden;
+  max-width: 95%;
+}
+.worker-event-tool-result-ok {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+}
+.worker-event-tool-result-err {
+  background: rgba(243, 139, 168, 0.08);
+  border: 1px solid var(--danger);
+}
+
+.worker-event-tool-result-content {
+  padding: 0.4rem 0.6rem;
+}
+
+.worker-event-tool-truncated {
+  margin-left: auto;
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  background: var(--bg-primary);
+  padding: 0.1rem 0.4rem;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+
+/* System notification — centered pill */
+.worker-event-system {
+  margin-bottom: 0.4rem;
+  text-align: center;
+}
+.worker-event-system .worker-event-pill {
+  display: inline-block;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.3rem 0.7rem;
+  font-size: 0.78rem;
+  color: var(--warning);
+  max-width: 90%;
+  word-break: break-word;
+}
+.worker-event-system-subtitle {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  margin-top: 0.15rem;
+}
+
+/* Error event */
+.worker-event-error {
+  margin-bottom: 0.4rem;
+}
+.worker-event-error .worker-event-errortext {
+  color: var(--danger);
+  font-size: 0.82rem;
+  word-break: break-word;
+}
+
+/* Lifecycle events (started / completed / stopped) — centered pill */
+.worker-event-lifecycle {
+  text-align: center;
+  margin-bottom: 0.4rem;
+}
+.worker-event-lifecycle .worker-event-pill {
+  display: inline-block;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  border-radius: 10px;
+  padding: 0.15rem 0.6rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+
+/* Unknown event — raw JSON block */
+.worker-event-unknown {
+  margin-bottom: 0.3rem;
+}
+.worker-event-unknown-label {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+}
+.worker-event-unknown-event {
+  color: var(--text-secondary);
+}
+.worker-event-unknown-json {
+  margin: 0;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-mono);
+  background: var(--bg-secondary);
+  padding: 0.3rem 0.5rem;
+  border-radius: 4px;
+}
+
+/* ── Timestamp ───────────────────────────────────────────── */
+.worker-event-timestamp {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  margin-left: 0.5rem;
+}
+
+/* ── New events floating button ──────────────────────────── */
+.new-events-container {
+  position: sticky;
+  bottom: 0.5rem;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+  z-index: 5;
+}
+.new-events-btn {
+  background: var(--accent);
+  color: var(--bg-primary);
+  border: none;
+  border-radius: 20px;
+  padding: 0.35rem 1rem;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.8rem;
+  pointer-events: auto;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  transition: opacity 0.15s, transform 0.15s;
+}
+.new-events-btn:hover {
+  opacity: 0.9;
+  transform: translateY(-1px);
+}
+
+/* ── Scroll nav buttons for worker panel ─────────────────── */
+.worker-scroll-nav {
+  position: absolute;
+  bottom: 1rem;
+  right: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  z-index: 10;
+}
+
+/* ── Status dot (color applied via JS, base styles here) ── */
+.worker-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+/* ── No-worker selected state ────────────────────────────── */
+.worker-output-no-selection {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  font-family: var(--font-sans);
+}
+.worker-output-no-selection-text {
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  padding: 1rem;
+}
 
 /* ──────────────────────────────────────────────────────────────────────────
    Scrollbar (Webkit)

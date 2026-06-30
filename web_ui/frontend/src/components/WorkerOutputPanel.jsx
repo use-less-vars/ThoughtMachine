@@ -1,29 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 
-// ── Catppuccin palette ────────────────────────────────────────────────
-const colors = {
-  base: '#1e1e2e',
-  mantle: '#181825',
-  crust: '#11111b',
-  surface0: '#313244',
-  surface1: '#45475a',
-  surface2: '#585b70',
-  overlay0: '#6c7086',
-  overlay1: '#7f849c',
-  subtext0: '#a6adc8',
-  subtext1: '#bac2de',
-  text: '#cdd6f4',
-  lavender: '#b4befe',
-  blue: '#89b4fa',
-  green: '#a6e3a1',
-  yellow: '#f9e2af',
-  red: '#f38ba8',
-  mauve: '#cba6f7',
-  teal: '#94e2d5',
-  peach: '#fab387',
-  accent: '#89b4fa',
-};
-
 const PANEL_MIN = 250;
 const PANEL_MAX = 600;
 const PANEL_DEFAULT = 350;
@@ -72,79 +48,11 @@ function truncate(str, maxLen) {
   return str.length > maxLen ? str.slice(0, maxLen) + '…' : str;
 }
 
-// ── Collapsible block (for tool_call / tool_result) ────────────────────
-function CollapsibleBlock({ header, headerColor, children, defaultOpen }) {
-  const [open, setOpen] = useState(defaultOpen || false);
-  return (
-    <div
-      style={{
-        background: colors.mantle,
-        border: `1px solid ${colors.surface1}`,
-        borderRadius: '6px',
-        marginBottom: '0.35rem',
-        overflow: 'hidden',
-      }}
-    >
-      <div
-        onClick={() => setOpen(!open)}
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: '0.4rem',
-          padding: '0.35rem 0.5rem',
-          cursor: 'pointer',
-          fontSize: '0.8rem',
-          color: headerColor || colors.text,
-          userSelect: 'none',
-        }}
-      >
-        <span style={{ flexShrink: 0, fontSize: '0.7rem', color: colors.overlay0 }}>
-          {open ? '▼' : '▶'}
-        </span>
-        <span style={{ flex: 1, wordBreak: 'break-word' }}>{header}</span>
-      </div>
-      {open && (
-        <div
-          style={{
-            padding: '0.35rem 0.5rem 0.5rem 0.5rem',
-            borderTop: `1px solid ${colors.surface1}`,
-          }}
-        >
-          {children}
-        </div>
-      )}
-    </div>
-  );
-}
-
 // ── "New events" floating button ──────────────────────────────────────
 function NewEventsButton({ onClick }) {
   return (
-    <div
-      onClick={onClick}
-      style={{
-        position: 'sticky',
-        bottom: '0.5rem',
-        display: 'flex',
-        justifyContent: 'center',
-        pointerEvents: 'none',
-        zIndex: 5,
-      }}
-    >
-      <button
-        style={{
-          background: colors.blue,
-          color: colors.base,
-          border: 'none',
-          borderRadius: '20px',
-          padding: '0.35rem 1rem',
-          cursor: 'pointer',
-          fontWeight: 600,
-          fontSize: '0.8rem',
-          pointerEvents: 'auto',
-          boxShadow: '0 2px 8px rgba(0,0,0,0.4)',
-        }}
-      >
+    <div className="new-events-container" onClick={onClick}>
+      <button className="new-events-btn">
         ↓ New events
       </button>
     </div>
@@ -215,15 +123,19 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
             setWorkerInfo(found);
             setWorkerError('');
           } else {
-            // Worker might have not appeared yet; don't clear info
-            if (!workerInfo) setWorkerError('Worker not found');
+            // Worker might have not appeared yet; only set error
+            // if we've never had any data (check via ref, not state)
+            if (!workerInfoRef.current) setWorkerError('Worker not found');
           }
         }
       })
       .catch((err) => {
-        if (!workerInfo) setWorkerError(err.message);
+        if (!workerInfoRef.current) setWorkerError(err.message);
       });
-  }, [workspaceId, workerName, workerInfo]);
+  }, [workspaceId, workerName]);
+
+  const workerInfoRef = useRef(null);
+  workerInfoRef.current = workerInfo;
 
   useEffect(() => {
     fetchWorkerInfo();
@@ -366,87 +278,58 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
     switch (evt.event) {
       case 'user_message':
         return (
-          <div key={key} style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '0.4rem' }}>
-            <div
-              style={{
-                background: colors.surface1,
-                color: colors.text,
-                borderRadius: '12px 12px 4px 12px',
-                padding: '0.45rem 0.75rem',
-                maxWidth: '85%',
-                fontSize: '0.82rem',
-                lineHeight: '1.4',
-                wordBreak: 'break-word',
-              }}
-            >
+          <div key={key} className="worker-event worker-event-user">
+            <div className="worker-event-bubble">
               {evt.request?.query || JSON.stringify(evt.request)}
             </div>
           </div>
         );
 
       case 'tool_call':
+        const toolName = evt.request?.tool || 'unknown';
+        const argsStr = JSON.stringify(evt.request?.args || {}, null, 2);
+        const argsLines = argsStr.split('\n').length;
         return (
-          <div key={key} style={{ marginBottom: '0.4rem' }}>
-            <CollapsibleBlock
-              header={
-                <span>
-                  🧰 <strong>Tool:</strong> {evt.request?.tool || 'unknown'}
-                </span>
-              }
-              headerColor={colors.mauve}
-            >
-              <pre
-                style={{
-                  margin: 0,
-                  fontSize: '0.75rem',
-                  color: colors.subtext0,
-                  whiteSpace: 'pre-wrap',
-                  wordBreak: 'break-word',
-                  fontFamily: 'monospace',
-                }}
-              >
-                {JSON.stringify(evt.request?.args || {}, null, 2)}
-              </pre>
-            </CollapsibleBlock>
-            <div style={{ fontSize: '0.7rem', color: colors.overlay0, marginLeft: '0.5rem' }}>
+          <div key={key} className="worker-event">
+            <div className="worker-event-tool-call-bubble">
+              <div className="worker-event-tool-header">
+                <span className="worker-event-tool-icon">🔧</span>
+                <strong>{toolName}</strong>
+                <span className="worker-event-tool-args-badge">{argsLines - 2} args</span>
+              </div>
+              <div className="worker-event-tool-args">
+                <pre className="worker-event-tool-pre">{argsStr}</pre>
+              </div>
+            </div>
+            <div className="worker-event-timestamp">
               {relativeTime(ts)}
             </div>
           </div>
         );
 
       case 'tool_result':
-        const success = evt.request?.success !== false;
+        const resultSuccess = evt.request?.success !== false;
+        const resultStr = resultSuccess
+          ? (evt.response?.result || '(empty)')
+          : (evt.request?.error || evt.response?.result || 'Unknown error');
+        const resultTruncated = resultStr.length > 500
+          ? resultStr.slice(0, 500) + '…'
+          : resultStr;
         return (
-          <div key={key} style={{ marginBottom: '0.4rem' }}>
-            <CollapsibleBlock
-              header={
-                <span>
-                  📋 <strong>Result:</strong> {evt.request?.tool || 'unknown'}
-                  {' '}{success ? '✅' : '❌'}
-                </span>
-              }
-              headerColor={success ? colors.green : colors.red}
-            >
-              {success ? (
-                <pre
-                  style={{
-                    margin: 0,
-                    fontSize: '0.75rem',
-                    color: colors.subtext0,
-                    whiteSpace: 'pre-wrap',
-                    wordBreak: 'break-word',
-                    fontFamily: 'monospace',
-                  }}
-                >
-                  {evt.response?.result || '(empty)'}
-                </pre>
-              ) : (
-                <div style={{ color: colors.red, fontSize: '0.8rem' }}>
-                  {evt.request?.error || evt.response?.result || 'Unknown error'}
-                </div>
-              )}
-            </CollapsibleBlock>
-            <div style={{ fontSize: '0.7rem', color: colors.overlay0, marginLeft: '0.5rem' }}>
+          <div key={key} className="worker-event">
+            <div className={`worker-event-tool-result-bubble ${resultSuccess ? 'worker-event-tool-result-ok' : 'worker-event-tool-result-err'}`}>
+              <div className="worker-event-tool-header">
+                <span className="worker-event-tool-icon">{resultSuccess ? '✅' : '❌'}</span>
+                <strong>{evt.request?.tool || 'unknown'} result</strong>
+                {resultStr !== resultTruncated && (
+                  <span className="worker-event-tool-truncated">truncated</span>
+                )}
+              </div>
+              <div className="worker-event-tool-result-content">
+                <pre className="worker-event-tool-pre">{resultTruncated}</pre>
+              </div>
+            </div>
+            <div className="worker-event-timestamp">
               {relativeTime(ts)}
             </div>
           </div>
@@ -454,30 +337,17 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
 
       case 'system_notification': {
         const resp = evt.response || {};
-        const notifType = resp.type || 'info';
         let subtitle = '';
         if (resp.token_count !== undefined) subtitle = `Tokens: ${resp.token_count}`;
         else if (resp.turn_count !== undefined) subtitle = `Turns: ${resp.turn_count}`;
         else if (resp.elapsed_seconds !== undefined) subtitle = `Elapsed: ${resp.elapsed_seconds}s`;
 
         return (
-          <div key={key} style={{ marginBottom: '0.4rem', textAlign: 'center' }}>
-            <div
-              style={{
-                display: 'inline-block',
-                background: colors.mantle,
-                border: `1px solid ${colors.surface1}`,
-                borderRadius: '8px',
-                padding: '0.3rem 0.7rem',
-                fontSize: '0.78rem',
-                color: colors.yellow,
-                maxWidth: '90%',
-                wordBreak: 'break-word',
-              }}
-            >
+          <div key={key} className="worker-event-system">
+            <div className="worker-event-pill">
               ⚠️ [SYSTEM] {resp.message || ''}
               {subtitle && (
-                <div style={{ fontSize: '0.7rem', color: colors.overlay0, marginTop: '0.15rem' }}>
+                <div className="worker-event-system-subtitle">
                   {subtitle}
                 </div>
               )}
@@ -488,22 +358,11 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
 
       case 'final_response':
         return (
-          <div key={key} style={{ display: 'flex', justifyContent: 'flex-start', marginBottom: '0.4rem' }}>
-            <div
-              style={{
-                background: colors.surface0,
-                color: colors.text,
-                borderRadius: '12px 12px 12px 4px',
-                padding: '0.45rem 0.75rem',
-                maxWidth: '85%',
-                fontSize: '0.82rem',
-                lineHeight: '1.4',
-                wordBreak: 'break-word',
-              }}
-            >
+          <div key={key} className="worker-event worker-event-assistant">
+            <div className="worker-event-bubble">
               {evt.response?.content || ''}
               {evt.response?.reasoning && (
-                <div style={{ fontSize: '0.7rem', color: colors.overlay0, marginTop: '0.3rem', fontStyle: 'italic' }}>
+                <div className="worker-event-reasoning-note">
                   (reasoning mode)
                 </div>
               )}
@@ -513,8 +372,8 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
 
       case 'error':
         return (
-          <div key={key} style={{ marginBottom: '0.4rem' }}>
-            <div style={{ color: colors.red, fontSize: '0.82rem', wordBreak: 'break-word' }}>
+          <div key={key} className="worker-event-error">
+            <div className="worker-event-errortext">
               ❌ {evt.response?.error || evt.request?.error || 'Unknown error'}
             </div>
           </div>
@@ -525,18 +384,8 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
       case 'completed':
       case 'stopped':
         return (
-          <div key={key} style={{ textAlign: 'center', marginBottom: '0.4rem' }}>
-            <span
-              style={{
-                display: 'inline-block',
-                background: colors.mantle,
-                color: colors.overlay0,
-                borderRadius: '10px',
-                padding: '0.15rem 0.6rem',
-                fontSize: '0.72rem',
-                fontWeight: 600,
-              }}
-            >
+          <div key={key} className="worker-event-lifecycle">
+            <span className="worker-event-pill">
               {evt.event === 'started'
                 ? '⬤ Worker started'
                 : evt.event === 'completed'
@@ -549,18 +398,8 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
       case 'query':
         // Old format — treat like user_message
         return (
-          <div key={key} style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '0.4rem' }}>
-            <div
-              style={{
-                background: colors.surface1,
-                color: colors.text,
-                borderRadius: '12px 12px 4px 12px',
-                padding: '0.45rem 0.75rem',
-                maxWidth: '85%',
-                fontSize: '0.82rem',
-                wordBreak: 'break-word',
-              }}
-            >
+          <div key={key} className="worker-event worker-event-user">
+            <div className="worker-event-bubble">
               {typeof evt.request === 'string'
                 ? evt.request
                 : evt.request?.query || JSON.stringify(evt.request)}
@@ -571,23 +410,11 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
       default:
         // Unknown event type — show raw JSON
         return (
-          <div key={key} style={{ marginBottom: '0.3rem' }}>
-            <div style={{ fontSize: '0.7rem', color: colors.overlay0 }}>
-              {relativeTime(ts)} <span style={{ color: colors.subtext0 }}>{evt.event}</span>
+          <div key={key} className="worker-event-unknown">
+            <div className="worker-event-unknown-label">
+              {relativeTime(ts)} <span className="worker-event-unknown-event">{evt.event}</span>
             </div>
-            <pre
-              style={{
-                margin: 0,
-                fontSize: '0.72rem',
-                color: colors.subtext0,
-                whiteSpace: 'pre-wrap',
-                wordBreak: 'break-word',
-                fontFamily: 'monospace',
-                background: colors.mantle,
-                padding: '0.3rem 0.5rem',
-                borderRadius: '4px',
-              }}
-            >
+            <pre className="worker-event-unknown-json">
               {JSON.stringify(evt, null, 2)}
             </pre>
           </div>
@@ -599,21 +426,16 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
   if (!workerName) {
     return (
       <div
+        className="worker-output-no-selection"
         style={{
           width: panelWidth,
           minWidth: PANEL_MIN,
           maxWidth: PANEL_MAX,
           flexShrink: 0,
-          background: colors.base,
-          borderLeft: `1px solid ${colors.surface1}`,
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          height: '100%',
-          fontFamily: 'sans-serif',
+          borderLeft: '1px solid var(--border)',
         }}
       >
-        <div style={{ textAlign: 'center', color: colors.overlay0, fontSize: '0.85rem', padding: '1rem' }}>
+        <div className="worker-output-no-selection-text">
           No worker selected.<br />Click a worker to view its output.
         </div>
       </div>
@@ -622,87 +444,44 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
 
   // ── Render ────────────────────────────────────────────────────────────
   return (
-    <div
-      style={{
-        display: 'flex',
-        height: '100%',
-        fontFamily: 'sans-serif',
-      }}
-    >
+    <div className="worker-output-wrapper">
       {/* Resize handle (left edge) */}
       <div
+        className="resize-handle"
         onMouseDown={handleResizeStart}
         title="Drag to resize"
-        style={{
-          width: '5px',
-          cursor: 'col-resize',
-          background: 'transparent',
-          flexShrink: 0,
-          position: 'relative',
-          zIndex: 10,
-          transition: 'background 0.15s',
-        }}
-        onMouseEnter={(e) => { e.currentTarget.style.background = colors.accent; }}
-        onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
       />
 
       {/* Panel content */}
       <div
+        className="worker-output-inner"
         style={{
           width: panelWidth,
           minWidth: PANEL_MIN,
           maxWidth: PANEL_MAX,
           flexShrink: 0,
-          background: colors.base,
-          display: 'flex',
-          flexDirection: 'column',
-          height: '100%',
-          overflow: 'hidden',
         }}
       >
         {/* ── Status bar ─────────────────────────────────────────────── */}
-        <div
-          style={{
-            padding: '0.6rem 0.75rem',
-            borderBottom: `1px solid ${colors.surface1}`,
-            flexShrink: 0,
-          }}
-        >
+        <div className="worker-output-header">
           {/* Worker name + status dot */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.25rem' }}>
+          <div className="worker-output-header-top">
             <span
-              style={{
-                width: '8px',
-                height: '8px',
-                borderRadius: '50%',
-                background: statusDotColor(runtimeStatus),
-                flexShrink: 0,
-              }}
+              className="worker-status-dot"
+              style={{ background: statusDotColor(runtimeStatus) }}
             />
-            <span style={{ fontWeight: 600, fontSize: '0.9rem', color: colors.text }}>
+            <span className="worker-output-header-name">
               {workerName}
             </span>
-            <span style={{ fontSize: '0.72rem', color: colors.overlay0, textTransform: 'capitalize' }}>
+            <span className="worker-output-header-status">
               {runtimeStatus}
             </span>
             <div style={{ flex: 1 }} />
             {onClose && (
               <button
+                className="worker-output-close-btn"
                 onClick={onClose}
                 title="Close panel"
-                style={{
-                  background: 'transparent',
-                  color: colors.overlay0,
-                  border: 'none',
-                  cursor: 'pointer',
-                  fontSize: '1rem',
-                  lineHeight: 1,
-                  padding: '0.15rem 0.3rem',
-                  borderRadius: '4px',
-                  transition: 'background 0.15s',
-                }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = colors.surface1; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
               >
                 ✕
               </button>
@@ -712,14 +491,7 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
           {/* Current task */}
           {workerInfo?.current_task && (
             <div
-              style={{
-                fontSize: '0.78rem',
-                color: colors.subtext0,
-                marginBottom: '0.2rem',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                whiteSpace: 'nowrap',
-              }}
+              className="worker-output-header-task"
               title={workerInfo.current_task}
             >
               {truncate(workerInfo.current_task, 80)}
@@ -727,28 +499,18 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
           )}
 
           {/* Elapsed time + Stop button */}
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.5rem' }}>
-            <span style={{ fontSize: '0.75rem', color: colors.overlay0 }}>
+          <div className="worker-output-header-bottom">
+            <span className="worker-output-elapsed">
               ⏱ {elapsedTime(startTime)}
             </span>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
               {stopError && (
-                <span style={{ fontSize: '0.7rem', color: colors.red }}>{stopError}</span>
+                <span style={{ fontSize: '0.7rem', color: 'var(--danger)' }}>{stopError}</span>
               )}
               <button
+                className="worker-output-stop-btn"
                 onClick={handleStop}
                 disabled={!canStop}
-                style={{
-                  background: canStop ? colors.red : colors.surface2,
-                  color: canStop ? colors.base : colors.overlay0,
-                  border: 'none',
-                  borderRadius: '4px',
-                  padding: '0.2rem 0.6rem',
-                  cursor: canStop ? 'pointer' : 'not-allowed',
-                  fontWeight: 600,
-                  fontSize: '0.72rem',
-                  lineHeight: '1.4',
-                }}
               >
                 ⏹ Stop
               </button>
@@ -760,22 +522,16 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
         <div
           ref={scrollRef}
           onScroll={handleScroll}
-          style={{
-            flex: 1,
-            overflowY: 'auto',
-            padding: '0.6rem 0.75rem',
-            background: colors.base,
-            position: 'relative',
-          }}
+          className="worker-output-scroll"
         >
           {events.length === 0 && !eventsError && (
-            <div style={{ textAlign: 'center', color: colors.overlay0, padding: '2rem', fontSize: '0.85rem' }}>
+            <div className="worker-output-empty">
               {workerError || 'No events yet.'}
             </div>
           )}
 
           {events.length === 0 && eventsError && (
-            <div style={{ textAlign: 'center', color: colors.red, padding: '2rem', fontSize: '0.82rem' }}>
+            <div className="worker-output-error">
               Events unavailable.
             </div>
           )}
@@ -786,6 +542,17 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
           {hasNewEvents && (
             <NewEventsButton onClick={scrollToBottom} />
           )}
+
+          {/* Scroll navigation buttons */}
+          <div className="worker-scroll-nav">
+            <button
+              className="scroll-bottom-btn"
+              onClick={scrollToBottom}
+              title="Scroll to bottom"
+            >
+              ↓
+            </button>
+          </div>
         </div>
       </div>
     </div>
