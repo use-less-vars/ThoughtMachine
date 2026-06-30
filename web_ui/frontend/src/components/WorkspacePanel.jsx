@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 
 // ── Catppuccin palette matching ConfigPanel ──────────────────────────────
 const inputStyle = {
@@ -278,6 +278,31 @@ function WorkersSection({ workspaceId, onSelectWorker, selectedWorker }) {
   const [workers, setWorkers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [stopErrors, setStopErrors] = useState({}); // name -> error message (clears after 3s)
+
+  // Track previously seen (name, runtime_status) pairs to auto-open the panel
+  // on transitions (null→running, completed→running, etc.) not just new names.
+  const prevStatusMapRef = useRef(new Map());
+
+  // Auto-open panel when a worker appears or transitions to 'running'
+  useEffect(() => {
+    const currentMap = new Map(workers.map(w => [w.name, w.runtime_status]));
+    const prev = prevStatusMapRef.current;
+
+    for (const [name, status] of currentMap) {
+      const prevStatus = prev.get(name);
+      // Trigger if: name is entirely new, OR an existing worker just became running
+      // (catches null→running, completed→running, error→running, idle→running)
+      if (!prev.has(name) || (prevStatus !== 'running' && status === 'running')) {
+        const worker = workers.find(w => w.name === name);
+        if (worker) {
+          onSelectWorker?.(worker.name, workspaceId);
+        }
+        break; // auto-select only one per poll cycle
+      }
+    }
+
+    prevStatusMapRef.current = currentMap;
+  }, [workers, workspaceId, onSelectWorker]);
 
   const fetchWorkers = useCallback(() => {
     if (!workspaceId) return;

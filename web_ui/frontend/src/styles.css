@@ -819,12 +819,14 @@ body {
   height: 100%;
   overflow: hidden;
   width: 0;
-  transition: width 0.2s ease;
+  opacity: 0;
+  transition: width 0.25s ease, opacity 0.2s ease 0.05s;
   flex-shrink: 0;
 }
 
 .worker-output-panel.open {
   width: 380px;
+  opacity: 1;
 }
 
 /* ── Worker Output Panel inner layout ────────────────────── */
