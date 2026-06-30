@@ -238,6 +238,8 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
     setStopError('');
     setEvents([]);
     setLastFetchTime(null);
+    lastFetchTimeRef.current = null;
+    eventsRef.current = [];
   }, [workspaceId, workerName]);
 
   // ── Events fetching with polling ──────────────────────────────────────
@@ -247,6 +249,8 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
   const [hasNewEvents, setHasNewEvents] = useState(false);
   const scrollRef = useRef(null);
   const isAtBottomRef = useRef(true);
+  const lastFetchTimeRef = useRef(null);
+  const eventsRef = useRef([]);
 
   const runtimeStatus = workerInfo?.runtime_status || 'idle';
 
@@ -254,7 +258,7 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
     if (!workspaceId || !workerName) return;
     const params = new URLSearchParams();
     params.set('limit', '50');
-    if (lastFetchTime) params.set('since', lastFetchTime);
+    if (lastFetchTimeRef.current) params.set('since', lastFetchTimeRef.current);
 
     fetch(`/api/workspace/${workspaceId}/workers/${encodeURIComponent(workerName)}/events?${params}`)
       .then(async (res) => {
@@ -267,17 +271,22 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
             if (newEntries.length === 0) return prev;
             // Only mark "has new events" if user is not at bottom
             if (!isAtBottomRef.current) setHasNewEvents(true);
-            return [...prev, ...newEntries];
+            const updated = [...prev, ...newEntries];
+            eventsRef.current = updated;
+            return updated;
           });
           const lastTs = data[data.length - 1].timestamp;
-          if (lastTs) setLastFetchTime(lastTs);
+          if (lastTs) {
+            lastFetchTimeRef.current = lastTs;
+            setLastFetchTime(lastTs);
+          }
         }
         setEventsError('');
       })
       .catch((err) => {
-        if (events.length === 0) setEventsError(err.message);
+        if (eventsRef.current.length === 0) setEventsError(err.message);
       });
-  }, [workspaceId, workerName, lastFetchTime, events.length]);
+  }, [workspaceId, workerName]); // stable deps only — no cascading re-fetches
 
   // Poll period: 1s if running, 3s otherwise
   const pollInterval = runtimeStatus === 'running' ? 1000 : 3000;

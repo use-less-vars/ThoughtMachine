@@ -523,6 +523,7 @@ export default function App() {
                   onRegister={(actions) => handleRegisterTab(tab.tabId, actions)}
                   onRunningChange={handleRunningChange}
                   onSessionRenamed={handleSessionRenamed}
+                  selectedWorker={selectedWorker}
                   onSelectWorker={handleSelectWorker}
                 />
               </div>

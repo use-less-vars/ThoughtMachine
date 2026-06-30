@@ -48,7 +48,7 @@ const INITIAL_STATE = {
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
-function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onSessionSaved, onRegister, onRunningChange, onSessionRenamed, onSelectWorker }) {
+function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onSessionSaved, onRegister, onRunningChange, onSessionRenamed, selectedWorker, onSelectWorker }) {
   const [state, setState] = useState(INITIAL_STATE)
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
   const [providers, setProviders] = useState([])
@@ -566,6 +566,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           }}
           containerRebuildResult={containerRebuildResult}
           onClearRebuildResult={() => setContainerRebuildResult(null)}
+          selectedWorker={selectedWorker}
           onSelectWorker={onSelectWorker}
         />
         <div
@@ -598,6 +599,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
 
 export default React.memo(SessionTab, (prevProps, nextProps) => {
   // Only re-render if session-specific props change
+  // or selectedWorker changes (affects worker highlighting)
   // Ignore changes to callback props (onClose, onRegister, etc.)
   // which create new references on every parent render
   return (
@@ -605,6 +607,8 @@ export default React.memo(SessionTab, (prevProps, nextProps) => {
     prevProps.hubReady === nextProps.hubReady &&
     prevProps.staggerMs === nextProps.staggerMs &&
     prevProps.loadOnConnect === nextProps.loadOnConnect &&
-    prevProps.isActive === nextProps.isActive
+    prevProps.isActive === nextProps.isActive &&
+    prevProps.selectedWorker?.name === nextProps.selectedWorker?.name &&
+    prevProps.selectedWorker?.workspaceId === nextProps.selectedWorker?.workspaceId
   )
 })

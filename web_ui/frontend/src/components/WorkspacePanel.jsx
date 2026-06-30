@@ -274,7 +274,7 @@ function WorkerDot({ status }) {
 // wired via onSelectWorker callback passed up through ConfigPanel.
 
 // ── Section: Workers ─────────────────────────────────────────────────────
-function WorkersSection({ workspaceId, onSelectWorker }) {
+function WorkersSection({ workspaceId, onSelectWorker, selectedWorker }) {
   const [workers, setWorkers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [stopErrors, setStopErrors] = useState({}); // name -> error message (clears after 3s)
@@ -347,9 +347,10 @@ function WorkersSection({ workspaceId, onSelectWorker }) {
                 cursor: 'pointer',
                 borderRadius: '4px',
                 transition: 'background 0.15s',
+                background: selectedWorker?.name === w.name && selectedWorker?.workspaceId === workspaceId ? '#45475a' : 'transparent',
               }}
-              onMouseEnter={(e) => { e.currentTarget.style.background = '#45475a'; }}
-              onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = '#585b70'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = selectedWorker?.name === w.name && selectedWorker?.workspaceId === workspaceId ? '#45475a' : 'transparent'; }}
             >
               <WorkerDot status={w.runtime_status} />
               <span
@@ -457,7 +458,7 @@ function EffectivePermissionsSection({ workspaceId, sessionId }) {
 }
 
 // ── Main WorkspacePanel ──────────────────────────────────────────────────
-export default function WorkspacePanel({ workspaceId, sessionId, onSelectWorker }) {
+export default function WorkspacePanel({ workspaceId, sessionId, onSelectWorker, selectedWorker }) {
   if (!workspaceId) {
     return (
       <div style={{ color: '#6c7086', fontSize: '0.85rem', padding: '1rem 0', textAlign: 'center' }}>
@@ -486,7 +487,7 @@ export default function WorkspacePanel({ workspaceId, sessionId, onSelectWorker 
       {/* Workers */}
       <div style={sectionStyle}>
         <label style={labelStyle}><strong>Workers</strong></label>
-        <WorkersSection workspaceId={workspaceId} onSelectWorker={onSelectWorker} />
+        <WorkersSection workspaceId={workspaceId} onSelectWorker={onSelectWorker} selectedWorker={selectedWorker} />
       </div>
 
       {/* Effective Permissions */}
