@@ -1075,11 +1075,14 @@ body {
   flex-shrink: 0;
   position: relative;
   z-index: 10;
-  transition: background 0.15s;
+  transition: background 0.15s, border-color 0.15s;
+  /* Always-visible dividing line so users know where to grab */
+  border-left: 1px solid var(--border);
 }
 
 .resize-handle:hover {
   background: var(--accent);
+  border-color: var(--accent);
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
