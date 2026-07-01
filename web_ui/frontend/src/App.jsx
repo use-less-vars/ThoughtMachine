@@ -49,6 +49,7 @@ export default function App() {
   const wsRef = useRef(null)
   const [hubWs, setHubWs] = useState(null)
   const hubHasConnectedOnceRef = useRef(false)   // persist past StrictMode double-mount
+  const loadedSessionIdsRef = useRef(new Set())   // robust dedup: track sessions already converted to tabs
   const [hubReady, setHubReady] = useState(false)
   // ── Worker panel state per session ─────────────────────────────────
   // Map: sessionId -> { name, workspaceId } | null
@@ -116,7 +117,7 @@ export default function App() {
     ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data)
-        handleHubEvent(msg)
+        handleHubEventRef.current(msg)
         // Tabs may connect only after hub has received open_sessions
         if (msg.type === 'open_sessions') {
           console.log('[Hub WS] open_sessions processed, tabs may connect now')
@@ -128,6 +129,15 @@ export default function App() {
     }
 
     ws.onclose = (e) => {
+      // Guard: only act if this WS is still the "current" one.
+      // In StrictMode, WS1 (the cleanup WS) closes but WS2 (the remount WS)
+      // is already connected.  WS1's onclose fires asynchronously, so we
+      // must ignore it to prevent a false "reset this WS" event that would
+      // trigger an unnecessary reconnect (WS3) → duplicate loadTab calls.
+      if (wsRef.current !== ws) {
+        console.log('[Hub WS] ignoring stale onclose (not the current WS)')
+        return
+      }
       setHubWs(null)
       setHubReady(false)
       // 1001 = normal close (component unmounting / page unload), keep flag, don't reconnect
@@ -179,6 +189,13 @@ export default function App() {
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current)
       }
+      // Clear ref + guard BEFORE calling close().  This ensures that if
+      // WS1's onclose fires asynchronously (after the remount has already
+      // happened under StrictMode), the identity guard in onclose will see
+      // wsRef.current !== ws1 and block the stale event.  Resetting the
+      // guard also lets the remount create a fresh WebSocket (WS2).
+      wsRef.current = null
+      hubHasConnectedOnceRef.current = false
       ws?.close()  // may be null if connectHub guard skipped duplicate
     }
   }, [connectHub])
@@ -238,6 +255,13 @@ export default function App() {
     }
   }
 
+  // Ref to capture the latest handleHubEvent (avoids stale closure in ws.onmessage)
+  // connectHub is useCallback([]) with zero deps, so ws.onmessage captures the
+  // initial handleHubEvent.  This ref ensures ws.onmessage always calls the
+  // current version, even after re-renders.
+  const handleHubEventRef = useRef(handleHubEvent)
+  handleHubEventRef.current = handleHubEvent
+
   // ── Hub sendCommand (only for sessions-list operations) ─────────────────
   const hubSend = useCallback((command, payload = {}) => {
     const ws = wsRef.current
@@ -260,39 +284,50 @@ export default function App() {
   // Open a tab for an existing session (auto-load from hub WS or sidebar)
   // preferredSessionId — if set, only make this tab active if its sessionId matches.
   const loadTab = useCallback((sessionId, preferredSessionId) => {
-      console.log(`[DEBUG App.loadTab] sessionId=${sessionId}, preferredSessionId=${preferredSessionId}`)
-    // Don't create duplicate tabs for the same session.
-    // Use functional updater to avoid stale closure on `tabs`.
-    setTabs((prev) => {
-      const existing = prev.find((t) => t.sessionId === sessionId)
-      if (existing) {
-        console.log(`[DEBUG App.loadTab] FOUND existing tab ${existing.tabId} for session ${sessionId}`)
-        // Only switch to this tab if it's the preferred one (or no preference)
-        if (!preferredSessionId || existing.sessionId === preferredSessionId) {
-          setActiveTabId(existing.tabId)
-          // Mark for deferred load — this tab may not have been loaded yet
-          tabLoadTriggeredRef.current[existing.tabId] = true
-          console.log(`[DEBUG App.loadTab] Set active + triggered for existing tab ${existing.tabId}`)
-        } else {
-          console.log(`[DEBUG App.loadTab] NOT preferred — skipping setActive for existing tab ${existing.tabId}`)
-        }
-        return prev
+    console.log(`[DEBUG App.loadTab] sessionId=${sessionId}, preferredSessionId=${preferredSessionId}`)
+
+    // ── Robust dedup via Set ref (beyond stale closure) ────────────────
+    // The loadedSessionIdsRef Set is synchronous (not a React state), so
+    // multiple loadTab calls within the same event loop tick can check it
+    // immediately.  This prevents duplicate tabs from WS1's stale onclose
+    // → reconnect → second get_open_sessions race condition.
+    if (loadedSessionIdsRef.current.has(sessionId)) {
+      console.log(`[DEBUG App.loadTab] SKIP (already loaded session ${sessionId}) — activating existing tab`)
+      // Activate existing tab if preferred
+      const existing = tabsRef.current.find((t) => t.sessionId === sessionId)
+      if (existing && (!preferredSessionId || existing.sessionId === preferredSessionId)) {
+        setActiveTabId(existing.tabId)
+        tabLoadTriggeredRef.current[existing.tabId] = true
       }
-      const tabId = `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-      console.log(`[DEBUG App.loadTab] CREATING new tab ${tabId} for session ${sessionId}, preferred=${preferredSessionId}, match=${!preferredSessionId || sessionId === preferredSessionId}`)
-      // Only switch to this tab if it's the preferred one (or no preference)
-      if (!preferredSessionId || sessionId === preferredSessionId) {
-        setActiveTabId(tabId)
-        // Mark this tab so handleRegisterTab will trigger deferred load
-        // once the SessionTab WS connects. Without this, new tabs created
-        // via "+" would get stuck in deferred mode (empty placeholder).
-        tabLoadTriggeredRef.current[tabId] = true
-        console.log(`[DEBUG App.loadTab] Set active + triggered for new tab ${tabId}`)
-      } else {
-        console.log(`[DEBUG App.loadTab] NOT preferred — skipping setActive/trigger for new tab ${tabId}`)
+      return
+    }
+    loadedSessionIdsRef.current.add(sessionId)
+
+    const tabId = `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    console.log(`[DEBUG App.loadTab] CREATING new tab ${tabId} for session ${sessionId}, preferred=${preferredSessionId}`)
+
+    // Add the tab to state (pure updater — no setActiveTabId inside)
+    setTabs((prev) => {
+      // Belt-and-suspenders: double-check inside the updater too
+      if (prev.find((t) => t.sessionId === sessionId)) {
+        console.log(`[DEBUG App.loadTab] Double-check: tab already in state for ${sessionId}`)
+        return prev
       }
       return [...prev, { tabId, sessionId }]
     })
+
+    // Set active tab OUTSIDE the updater — avoids React anti-pattern
+    // of calling setActiveTabId from inside setTabs's updater function.
+    if (!preferredSessionId || sessionId === preferredSessionId) {
+      setActiveTabId(tabId)
+      // Mark this tab so handleRegisterTab will trigger deferred load
+      // once the SessionTab WS connects. Without this, new tabs created
+      // via "+" would get stuck in deferred mode (empty placeholder).
+      tabLoadTriggeredRef.current[tabId] = true
+      console.log(`[DEBUG App.loadTab] Set active + triggered for new tab ${tabId}`)
+    } else {
+      console.log(`[DEBUG App.loadTab] NOT preferred — skipping setActive/trigger for new tab ${tabId}`)
+    }
   }, [])
 
   // Initiate close: send close_session over the tab's own WS.
@@ -311,6 +346,11 @@ export default function App() {
   // Actually remove the tab from DOM (called when server acknowledges close
   // via session_closed event, or on unexpected WS close).
   const removeTab = useCallback((tabId) => {
+    // Allow re-adding this session's tab later (e.g., reopen via sidebar)
+    const closingTab = tabsRef.current.find((t) => t.tabId === tabId)
+    if (closingTab?.sessionId) {
+      loadedSessionIdsRef.current.delete(closingTab.sessionId)
+    }
     setTabs((prev) => {
       const idx = prev.findIndex((t) => t.tabId === tabId)
       if (idx === -1) return prev  // already removed

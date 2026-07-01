@@ -2694,3 +2694,93 @@ This file is written atomically (temp file + `os.replace`) to avoid partial read
 **Design**: Class component (React error boundaries must be class components). Inline styles only — no external dependencies. Shows the error message in a monospaced `<pre>` block and a Reload button that calls `window.location.reload()`.
 
 **Commit**: `08f3de0`
+
+## Workspace REST API
+
+## 2026-07-01 — ### Package 2 — Worker CRUD + Dockerfile PUT (2026-07-02)
+
+N...
+
+### Package 2 — Worker CRUD + Dockerfile PUT (2026-07-02)
+
+New endpoints in `web_ui/backend/workspace_routes.py`:
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/workspace/{ws_id}/workers` | Create worker definition (201, 409 on dup) |
+| PUT | `/api/workspace/{ws_id}/workers/{name}` | Update worker definition |
+| DELETE | `/api/workspace/{ws_id}/workers/{name}` | Delete worker definition (204) |
+| PUT | `/api/workspace/{ws_id}/dockerfile` | Atomically write Dockerfile raw text |
+
+GET `/api/workspace/{ws_id}/workers` enhanced with `?name=` query param for single-worker lookup (returns merged config+runtime, or 404).
+
+All writes use the atomic tempfile+os.replace pattern (`_atomic_write_json` or new `_atomic_write_text`).
+
+
+## 2026-07-02 — WorkerManagementPanel (new component) replaces WorkersSectio...
+
+WorkerManagementPanel (new component) replaces WorkersSection:
+- Located at `web_ui/frontend/src/components/WorkerManagementPanel.jsx`
+- Consumed by WorkspacePanel.jsx in the Workers section
+- Shows all worker definitions (from workers.json) merged with runtime status
+- CRUD operations via API: POST/PUT/DELETE /api/workspace/{ws_id}/workers
+- Template picker uses GET /api/workspace/templates
+- Reuses the auto-open/stop/dismiss logic from old WorkersSection
+- Uses inline Catppuccin styles matching the rest of the panel
+
+## 2026-07-02 — ## DockerfileEditor (new component, 2026-07-02)
+
+Created `we...
+
+## DockerfileEditor (new component, 2026-07-02)
+
+Created `web_ui/frontend/src/components/DockerfileEditor.jsx` (194 lines), integrated into `WorkspacePanel.jsx`.
+
+### What it replaces
+The old `DockerfileSection` was a read-only `<pre>` block that fetched the Dockerfile via `GET /api/workspace/{id}/dockerfile` and displayed it. No editing, no saving.
+
+### New capabilities
+- **Editable textarea** (20 rows, monospace, dark background, spellcheck off)
+- **Change detection** — tracks `lastSaved` content separately from current textarea value; shows a persistent amber warning banner when they diverge: *"You've changed the Dockerfile. Rebuild the container for changes to take effect."*
+- **Save via PUT** — sends `PUT /api/workspace/{workspaceId}/dockerfile` with `Content-Type: text/plain` and the raw text as body. On success, updates `lastSaved` + shows a "Last saved" timestamp. On error, shows inline error.
+- **Smart disabled state** — Save button is disabled/greyed when there are no unsaved changes
+- **404 → empty editor** — If no custom Dockerfile exists yet, opens with an empty textarea (instead of showing "(No custom Dockerfile)" placeholder text)
+- **Loading / error / retry** — Same pattern as other panels (loading text, error with Retry button)
+
+### API endpoints consumed
+| Endpoint | Usage |
+|---|---|
+| `GET /api/workspace/{workspaceId}/dockerfile` | Fetch current Dockerfile (404 = empty) |
+| `PUT /api/workspace/{workspaceId}/dockerfile` | Save Dockerfile (raw text body, text/plain) |
+
+### Styling
+Inline Catppuccin matching existing panels. Warning banner uses `rgba(249, 226, 175, 0.15)` background + `#f9e2af` border/text. Save button uses the same `#89b4fa` accent as DomainAllowlist.
+
+## 2026-07-02 — ## DomainAllowlistEditor (new component, 2026-07-02)
+
+Create...
+
+## DomainAllowlistEditor (new component, 2026-07-02)
+
+Created `web_ui/frontend/src/components/DomainAllowlistEditor.jsx` (305 lines), integrated into `WorkspacePanel.jsx`.
+
+### What it replaces
+The old `DomainAllowlistSection` was a free-text `<textarea>` that joined domains with newlines, requiring users to type domains manually. Save sent `PUT` with `{"domains": [...]}`.
+
+### New capabilities
+- **Structured list display** — Each domain shown as a row (monospace font, alternating row backgrounds) with a **✕ remove button** on the right (red hover effect).
+- **Add domain input** — Text input + "Add" button at the bottom. Enter key also triggers add. Validation: non-empty, no duplicates (case-insensitive). Auto-refocuses input after adding.
+- **Empty state** — Shows italic "No domains in allowlist. Add one below." when list is empty.
+- **Unsaved changes indicator** — Amber dot + "Unsaved changes" text when current list differs from last saved (compares length + element equality).
+- **Smart Save button** — Disabled/greyed when no unsaved changes.
+- **Loading / error / retry** — Same pattern as DockerfileEditor and other panels.
+- **Validation errors** — Shown inline in amber (`#f9e2af`) below the add input.
+
+### API endpoints consumed
+| Endpoint | Usage |
+|---|---|
+| `GET /api/workspace/{workspaceId}/domain_allowlist` | Fetch current allowlist (JSON array) |
+| `PUT /api/workspace/{workspaceId}/domain_allowlist` | Save allowlist (`{"domains": [...]}`, `application/json`) |
+
+### Styling
+Inline Catppuccin matching existing panels. Same add/save button patterns as DockerfileEditor.
