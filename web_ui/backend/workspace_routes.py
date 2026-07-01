@@ -20,8 +20,8 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-from fastapi import APIRouter, HTTPException, Query, status
-from fastapi.responses import PlainTextResponse
+from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 
 from thoughtmachine.workspace_capabilities import (
@@ -140,6 +140,46 @@ def _atomic_write_json(data: Any, file_path: Path, retries: int = 3) -> None:
             time.sleep(0.2 * attempt)
 
 
+def _atomic_write_text(data: str, file_path: Path, retries: int = 3) -> None:
+    """Atomically write a plain-text string to *file_path*, with Windows-safe retries.
+
+    Same pattern as ``_atomic_write_json`` but writes raw text instead of JSON.
+    """
+    for attempt in range(1, retries + 2):
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w",
+            delete=False,
+            dir=str(file_path.parent),
+            suffix=".tmp",
+            prefix="workspace_",
+            encoding="utf-8",
+        )
+        try:
+            tmp.write(data)
+            tmp.flush()
+            tmp_path = tmp.name
+        finally:
+            tmp.close()
+
+        try:
+            os.replace(tmp_path, str(file_path))
+            return  # success
+        except OSError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+            if attempt > retries:
+                try:
+                    shutil.move(tmp_path, str(file_path))
+                    return
+                except OSError as exc:
+                    raise exc
+
+            time.sleep(0.2 * attempt)
+
+
 def _load_session_permissions(session_id: str) -> Optional[Dict[str, Any]]:
     """Load session permissions from a saved session's metadata.
 
@@ -213,7 +253,10 @@ async def put_domain_allowlist(ws_id: str, body: DomainAllowlistBody):
 
 
 @router.get("/{ws_id}/workers")
-async def get_workers(ws_id: str):
+async def get_workers(
+    ws_id: str,
+    name: Optional[str] = Query(None, description="Filter to a single worker by name"),
+):
     """Return worker configs merged with runtime status and persisted context.
 
     Each worker entry includes:
@@ -270,16 +313,16 @@ async def get_workers(ws_id: str):
     # 4. Merge everything
     result = []
     for cfg in configs:
-        name = cfg.get("name", "")
+        worker_name = cfg.get("name", "")
         entry = dict(cfg)
-        if name in runtime_statuses:
-            entry["runtime_status"] = runtime_statuses[name]["runtime_status"]
-            entry["current_task"] = runtime_statuses[name]["current_task"]
-            entry["last_heartbeat"] = runtime_statuses[name]["last_heartbeat"]
-            entry["error"] = runtime_statuses[name]["error"]
-            entry["session_id"] = runtime_statuses[name]["session_id"]
-            entry["current_context_tokens"] = runtime_statuses[name]["current_context_tokens"]
-            entry["max_context_tokens"] = runtime_statuses[name]["max_context_tokens"]
+        if worker_name in runtime_statuses:
+            entry["runtime_status"] = runtime_statuses[worker_name]["runtime_status"]
+            entry["current_task"] = runtime_statuses[worker_name]["current_task"]
+            entry["last_heartbeat"] = runtime_statuses[worker_name]["last_heartbeat"]
+            entry["error"] = runtime_statuses[worker_name]["error"]
+            entry["session_id"] = runtime_statuses[worker_name]["session_id"]
+            entry["current_context_tokens"] = runtime_statuses[worker_name]["current_context_tokens"]
+            entry["max_context_tokens"] = runtime_statuses[worker_name]["max_context_tokens"]
         else:
             entry["runtime_status"] = None
             entry["current_task"] = None
@@ -288,10 +331,146 @@ async def get_workers(ws_id: str):
             entry["session_id"] = None
             entry["current_context_tokens"] = None
             entry["max_context_tokens"] = None
-        entry["has_persisted_context"] = name in persisted_names
+        entry["has_persisted_context"] = worker_name in persisted_names
         result.append(entry)
 
+    # 5. Optional ?name= filter — return single worker entry or 404
+    if name is not None:
+        for entry in result:
+            if entry.get("name") == name:
+                return entry
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Worker '{name}' not found",
+        )
+
     return result
+
+
+# ── POST /api/workspace/{ws_id}/workers ───────────────────────────────────────
+
+
+@router.post("/{ws_id}/workers", status_code=status.HTTP_201_CREATED)
+async def create_worker(ws_id: str, request: Request):
+    """Create a new worker definition in the workspace.
+
+    Validates the request body against ``WorkerDefinition``, checks for
+    duplicate names, and appends to ``workers.json`` atomically.
+    """
+    # 1. Parse and validate request body
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Invalid JSON: {e}")
+    # 2. Validate with Pydantic
+    try:
+        worker = WorkerDefinition.model_validate(body)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    # 2. Load existing workers.json
+    ensure_workspace_dirs(ws_id)
+    path = _workspace_dir(ws_id) / "workers.json"
+    existing = []
+    if path.exists():
+        existing = json.loads(path.read_text())
+    # 3. Duplicate check
+    if any(w["name"] == worker.name for w in existing):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Worker '{worker.name}' already exists",
+        )
+    # 4. Append & write
+    existing.append(worker.model_dump())
+    _atomic_write_json(existing, path)
+    return JSONResponse(status_code=status.HTTP_201_CREATED, content=worker.model_dump())
+
+
+# ── PUT /api/workspace/{ws_id}/workers/{name} ──────────────────────────────
+
+
+@router.put("/{ws_id}/workers/{name}")
+async def update_worker(ws_id: str, name: str, request: Request):
+    """Update an existing worker definition by name.
+
+    Validates the request body, finds the matching worker, replaces it
+    in ``workers.json`` atomically, and returns the updated definition.
+    """
+    # 1. Parse and validate request body
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Invalid JSON: {e}")
+    # 2. Validate
+    try:
+        updated_worker = WorkerDefinition.model_validate(body)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    # 2. Load existing
+    ws_dir = _workspace_dir(ws_id)
+    path = ws_dir / "workers.json"
+    if not path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Workers file not found",
+        )
+    existing = json.loads(path.read_text())
+    # 3. Find index
+    index = next((i for i, w in enumerate(existing) if w["name"] == name), None)
+    if index is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Worker '{name}' not found",
+        )
+    # 4. Replace & write
+    existing[index] = updated_worker.model_dump()
+    _atomic_write_json(existing, path)
+    return updated_worker.model_dump()
+
+
+# ── DELETE /api/workspace/{ws_id}/workers/{name} ───────────────────────────
+
+
+@router.delete("/{ws_id}/workers/{name}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_worker(ws_id: str, name: str):
+    """Delete a worker definition by name from ``workers.json``.
+
+    Removes the matching worker and writes the remaining list atomically.
+    Returns 204 with no content on success.
+    """
+    ws_dir = _workspace_dir(ws_id)
+    path = ws_dir / "workers.json"
+    if not path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Workers file not found",
+        )
+    existing = json.loads(path.read_text())
+    filtered = [w for w in existing if w["name"] != name]
+    if len(filtered) == len(existing):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Worker '{name}' not found",
+        )
+    _atomic_write_json(filtered, path)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ── PUT /api/workspace/{ws_id}/dockerfile ──────────────────────────────────
+
+
+@router.put("/{ws_id}/dockerfile")
+async def put_dockerfile(ws_id: str, request: Request):
+    """Atomically replace the workspace's ``Dockerfile`` with raw text.
+
+    Reads the request body as UTF-8 text and writes it to the workspace's
+    ``Dockerfile`` using the same atomic-write pattern as other endpoints.
+    """
+    body = await request.body()
+    text = body.decode("utf-8")
+    ensure_workspace_dirs(ws_id)
+    path = _workspace_dir(ws_id) / "Dockerfile"
+    _atomic_write_text(text, path)
+    return {"status": "ok", "workspace_id": ws_id}
 
 
 # ── GET /api/workspace/{ws_id}/mcp_servers ───────────────────────────────────
