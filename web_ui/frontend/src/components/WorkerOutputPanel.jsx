@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { MessageBubble } from './chat/MessageBubble';
+import adaptWorkerEvent from './chat/adaptWorkerEvent';
 
 const PANEL_MIN = 250;
 const PANEL_MAX = 600;
@@ -292,143 +294,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose }) {
   }, [runtimeStatus]);
 
   // ── Render helpers ────────────────────────────────────────────────────
-  function renderEvent(evt, idx) {
-    const key = evt.timestamp + evt.event + idx;
-    const ts = evt.timestamp;
-
-    switch (evt.event) {
-      case 'user_message':
-        // Suppress — user's own query is already visible in main chat panel
-        return null;
-
-      case 'tool_call':
-        const toolName = evt.request?.tool || 'unknown';
-        const argsStr = JSON.stringify(evt.request?.args || {}, null, 2);
-        const argsLines = argsStr.split('\n').length;
-        return (
-          <div key={key} className="worker-event">
-            <div className="worker-event-tool-call-bubble">
-              <div className="worker-event-tool-header">
-                <span className="worker-event-tool-icon">🔧</span>
-                <strong>{toolName}</strong>
-                <span className="worker-event-tool-args-badge">{argsLines - 2} args</span>
-              </div>
-              <div className="worker-event-tool-args">
-                <pre className="worker-event-tool-pre">{argsStr}</pre>
-              </div>
-            </div>
-            <div className="worker-event-timestamp">
-              {relativeTime(ts)}
-            </div>
-          </div>
-        );
-
-      case 'tool_result':
-        const resultSuccess = evt.request?.success !== false;
-        const resultStr = resultSuccess
-          ? (evt.response?.result || '(empty)')
-          : (evt.request?.error || evt.response?.result || 'Unknown error');
-        const resultTruncated = resultStr.length > 500
-          ? resultStr.slice(0, 500) + '…'
-          : resultStr;
-        return (
-          <div key={key} className="worker-event">
-            <div className={`worker-event-tool-result-bubble ${resultSuccess ? 'worker-event-tool-result-ok' : 'worker-event-tool-result-err'}`}>
-              <div className="worker-event-tool-header">
-                <span className="worker-event-tool-icon">{resultSuccess ? '✅' : '❌'}</span>
-                <strong>{evt.request?.tool || 'unknown'} result</strong>
-                {resultStr !== resultTruncated && (
-                  <span className="worker-event-tool-truncated">truncated</span>
-                )}
-              </div>
-              <div className="worker-event-tool-result-content">
-                <pre className="worker-event-tool-pre">{resultTruncated}</pre>
-              </div>
-            </div>
-            <div className="worker-event-timestamp">
-              {relativeTime(ts)}
-            </div>
-          </div>
-        );
-
-      case 'system_notification': {
-        const resp = evt.response || {};
-        let subtitle = '';
-        if (resp.token_count !== undefined) subtitle = `Tokens: ${resp.token_count}`;
-        else if (resp.turn_count !== undefined) subtitle = `Turns: ${resp.turn_count}`;
-        else if (resp.elapsed_seconds !== undefined) subtitle = `Elapsed: ${resp.elapsed_seconds}s`;
-
-        return (
-          <div key={key} className="worker-event-system">
-            <div className="worker-event-pill">
-              ⚠️ [SYSTEM] {resp.message || ''}
-              {subtitle && (
-                <div className="worker-event-system-subtitle">
-                  {subtitle}
-                </div>
-              )}
-            </div>
-          </div>
-        );
-      }
-
-      case 'final_response':
-        return (
-          <div key={key} className="worker-event worker-event-assistant">
-            <div className="worker-event-bubble">
-              {evt.response?.content || ''}
-              {evt.response?.reasoning && (
-                <div className="worker-event-reasoning-note">
-                  (reasoning mode)
-                </div>
-              )}
-            </div>
-          </div>
-        );
-
-      case 'error':
-        return (
-          <div key={key} className="worker-event-error">
-            <div className="worker-event-errortext">
-              ❌ {evt.response?.error || evt.request?.error || 'Unknown error'}
-            </div>
-          </div>
-        );
-
-      // Legacy / lifecycle events
-      case 'started':
-      case 'completed':
-      case 'stopped':
-        return (
-          <div key={key} className="worker-event-lifecycle">
-            <span className="worker-event-pill">
-              {evt.event === 'started'
-                ? '⬤ Worker started'
-                : evt.event === 'completed'
-                  ? '■ Worker completed'
-                  : '⏹ Worker stopped'}
-            </span>
-          </div>
-        );
-
-      case 'query':
-        // Suppress — same as user_message, shown in main chat
-        return null;
-
-      default:
-        // Unknown event type — show raw JSON
-        return (
-          <div key={key} className="worker-event-unknown">
-            <div className="worker-event-unknown-label">
-              {relativeTime(ts)} <span className="worker-event-unknown-event">{evt.event}</span>
-            </div>
-            <pre className="worker-event-unknown-json">
-              {JSON.stringify(evt, null, 2)}
-            </pre>
-          </div>
-        );
-    }
-  }
+  // renderEvent removed in Phase B Step 3 — replaced by adaptWorkerEvent + MessageBubble below
 
   // ── No worker selected state ──────────────────────────────────────────
   if (!workerName) {
@@ -520,7 +386,19 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose }) {
             </div>
           )}
 
-          {events.map((evt, idx) => renderEvent(evt, idx))}
+          {events.map((evt, idx) => {
+            const msg = adaptWorkerEvent(evt);
+            if (!msg) return null;  // suppress events like user_message / query
+            const key = msg._id || (evt.timestamp + evt.event + idx);
+            return (
+              <div key={key} className="worker-event-row">
+                <span className="worker-event-timestamp">
+                  {relativeTime(evt.timestamp)}
+                </span>
+                <MessageBubble msg={msg} index={idx} />
+              </div>
+            );
+          })}
 
           {/* Floating "New events" button */}
           {hasNewEvents && (
