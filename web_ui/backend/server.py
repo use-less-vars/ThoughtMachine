@@ -93,7 +93,7 @@ import traceback
 import threading
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 from fastapi import FastAPI, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -231,6 +231,7 @@ import atexit
 
 _session_bridges: Dict[str, Any] = {}  # session_id → WebAgentBridge (warm cache)
 _shutdown_event: Any = None  # asyncio.Event, set lazily
+_explicitly_closed_sessions: Set[str] = set()  # session_ids closed via close_session command
 
 
 def _get_shutdown_event() -> Any:
@@ -1023,6 +1024,13 @@ async def websocket_endpoint(ws: WebSocket):
                     try:
                         if bridge is not None:
                             bridge.close_session(session_id if session_id else None)
+                            # Track explicitly closed sessions so the disconnect
+                            # handler doesn't re-add them to open_sessions.json
+                            resolved_id = session_id or bridge._session_id or (
+                                bridge._loaded_session.session_id if bridge._loaded_session else None
+                            )
+                            if resolved_id:
+                                _explicitly_closed_sessions.add(resolved_id)
                             # If session_id was empty, the bridge resolved it internally.
                             # Remove the bridge from _session_bridges by value (since the key
                             # might differ from the empty session_id).
@@ -1260,7 +1268,13 @@ async def websocket_endpoint(ws: WebSocket):
         # network blip, etc.). The bridge will be stopped either on
         # close_session or during server shutdown.
         if bridge is not None:
-            if not bridge._cleanly_closed:
+            # Check if this session was explicitly closed — if so, skip re-saving
+            sid = bridge._session_id or (
+                bridge._loaded_session.session_id if bridge._loaded_session else None
+            )
+            if sid and sid in _explicitly_closed_sessions:
+                _explicitly_closed_sessions.discard(sid)
+            elif not bridge._cleanly_closed:
                 try:
                     bridge.save_open_session()
                 except Exception:
