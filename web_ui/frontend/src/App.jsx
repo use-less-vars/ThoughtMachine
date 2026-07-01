@@ -50,7 +50,18 @@ export default function App() {
   const [hubWs, setHubWs] = useState(null)
   const hubHasConnectedOnceRef = useRef(false)   // persist past StrictMode double-mount
   const [hubReady, setHubReady] = useState(false)
-  const [selectedWorker, setSelectedWorker] = useState(null)  // { name, workspaceId } | null
+  // ── Worker panel state per session ─────────────────────────────────
+  // Map: sessionId -> { name, workspaceId } | null
+  // Persisted in localStorage so panel state survives tab switches & page reloads.
+  const [workerPanelState, setWorkerPanelState] = useState(() => {
+    try {
+      const saved = localStorage.getItem('workerPanelState')
+      return saved ? JSON.parse(saved) : {}
+    } catch {
+      return {}
+    }
+  })
+
   const [sessionPanelOpen, setSessionPanelOpen] = useState(false)
 
   const tabActionsRef = useRef({})
@@ -341,12 +352,20 @@ export default function App() {
   }, [])
 
   const handleSelectWorker = useCallback((workerName, workspaceId) => {
-    setSelectedWorker({ name: workerName, workspaceId })
-  }, [])
+    if (!activeSessionId) return
+    setWorkerPanelState(prev => ({
+      ...prev,
+      [activeSessionId]: { name: workerName, workspaceId }
+    }))
+  }, [activeSessionId])
 
   const handleCloseWorkerPanel = useCallback(() => {
-    setSelectedWorker(null)
-  }, [])
+    if (!activeSessionId) return
+    setWorkerPanelState(prev => ({
+      ...prev,
+      [activeSessionId]: null
+    }))
+  }, [activeSessionId])
 
   const handleSessionSaved = useCallback((sessionId) => {
     // Refresh sessions list
@@ -474,6 +493,26 @@ export default function App() {
   const activeTab = tabs.find((t) => t.tabId === activeTabId)
   const activeSessionId = activeTab?.sessionId
   const activeSessionName = activeSessionId ? (sessionMap[activeSessionId] || 'Untitled') : 'New Session'
+
+  // Derive the current worker from the active session (must be after activeSessionId)
+  const selectedWorker = activeSessionId ? (workerPanelState[activeSessionId] ?? null) : null
+
+  // ── Persist worker panel state to localStorage ──────────────────────────
+  useEffect(() => {
+    localStorage.setItem('workerPanelState', JSON.stringify(workerPanelState))
+  }, [workerPanelState])
+
+  // ── Clean up stale keys when sessions are removed from tabs ─────────────
+  useEffect(() => {
+    const activeSessionIds = new Set(tabs.map(t => t.sessionId).filter(Boolean))
+    setWorkerPanelState(prev => {
+      const stale = Object.keys(prev).filter(id => !activeSessionIds.has(id))
+      if (stale.length === 0) return prev
+      const next = { ...prev }
+      stale.forEach(id => delete next[id])
+      return next
+    })
+  }, [tabs])
 
   // ── Persist active session ID in localStorage (stable across page loads) ─
   useEffect(() => {
