@@ -135,10 +135,12 @@ export default function adaptWorkerEvent(evt) {
       const content = success
         ? (resp.result || '(empty)')
         : (req.error || resp.result || 'Unknown error')
+      const isSummary = (req.tool === 'SummarizeTool')
       return {
         _id: eventId(evt),
         role: 'tool_result',
         content: String(content),
+        is_summary: isSummary,
       }
     }
 
@@ -149,6 +151,19 @@ export default function adaptWorkerEvent(evt) {
       if (type === 'token_warning') return tokenWarningMsg(evt)
       if (type === 'turn_warning') return turnWarningMsg(evt)
       if (type === 'time_warning') return timeWarningMsg(evt)
+      if (type === 'context_summarized') {
+        const ctxLen = resp.context_length
+        let content = `${SYSTEM_NOTIFICATION_EMOJI} ${resp.message || 'Context summarized'}`
+        if (ctxLen !== undefined && ctxLen !== null) {
+          content += ` (Tokens: ${ctxLen})`
+        }
+        return {
+          _id: eventId(evt),
+          role: 'user',
+          content: content.trim(),
+          is_system_notification: true,
+        }
+      }
       // Fallback for system_notification without a recognized type
       return {
         _id: eventId(evt),
