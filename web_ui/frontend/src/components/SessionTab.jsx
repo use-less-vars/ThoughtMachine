@@ -29,7 +29,8 @@ const CONFIG_PANEL_MIN_WIDTH = 200
 const CONFIG_PANEL_MAX_WIDTH = 500
 const CONFIG_PANEL_DEFAULT_WIDTH = 280
 
-const WS_URL = `ws://${window.location.hostname}:8000/ws`
+const WS_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
+const WS_URL = `ws://${window.location.hostname}:${WS_PORT}/ws`
 
 // ────────────────────────────────────────────────────────────────────────────
 // Initial per-tab state

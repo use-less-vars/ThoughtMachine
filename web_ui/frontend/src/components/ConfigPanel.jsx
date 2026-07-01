@@ -3,13 +3,16 @@ import ManageProvidersModal from './ManageProvidersModal';
 import ContainerPanelContent from './ContainerPanel';
 import WorkspacePanel, { WorkerAutoOpenWatcher } from './WorkspacePanel';
 
+const BACKEND_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
+const API_BASE = `http://${window.location.hostname}:${BACKEND_PORT}`;
+
 // ── Directory Browser sub-component ──────────────────────────────────────
 function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect, setLoading, setEntries, setError }) {
   const fetchDir = useCallback(async (dirPath) => {
     setLoading(true);
     setError('');
     try {
-      const url = `http://${window.location.hostname}:8000/api/browse?path=${encodeURIComponent(dirPath || '')}`;
+      const url = `${API_BASE}/api/browse?path=${encodeURIComponent(dirPath || '')}`;
       const res = await fetch(url);
       const data = await res.json();
       if (data.success) {
@@ -35,7 +38,7 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
     if (!name) return;
     setCreating(true);
     try {
-      const url = `http://${window.location.hostname}:8000/api/browse/create`;
+      const url = `${API_BASE}/api/browse/create`;
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -407,7 +410,7 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
                   let initialPath = draft.workspace_path;
                   if (!initialPath) {
                     try {
-                      const res = await fetch(`http://${window.location.hostname}:8000/api/browse?path=`);
+                      const res = await fetch(`${API_BASE}/api/browse?path=`);
                       const data = await res.json();
                       if (data.success && data.current_path) {
                         initialPath = data.current_path;

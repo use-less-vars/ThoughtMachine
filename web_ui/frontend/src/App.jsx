@@ -36,7 +36,8 @@ import SessionActionsPanel from './components/SessionActionsPanel'
 import WorkerOutputPanel from './components/WorkerOutputPanel'
 import './styles.css'
 
-const WS_URL = `ws://${window.location.hostname}:8000/ws`
+const WS_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
+const WS_URL = `ws://${window.location.hostname}:${WS_PORT}/ws`
 
 let nextTabId = 1
 
