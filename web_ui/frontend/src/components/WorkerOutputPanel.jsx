@@ -64,6 +64,7 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
   // Panel resize state (self-contained)
   const [panelWidth, setPanelWidth] = useState(PANEL_DEFAULT);
   const dragRef = useRef(null);
+  const panelRef = useRef(null);
   const storageKey = 'worker-output-panel-width';
 
   // Restore persisted width
@@ -77,16 +78,21 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
 
   const handleResizeStart = useCallback((e) => {
     e.preventDefault();
-    dragRef.current = { startX: e.clientX, startWidth: panelWidth };
+    const startX = e.clientX;
+    const startWidth = panelWidth;
+    dragRef.current = 'dragging';
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
 
     const handleMouseMove = (e) => {
       if (!dragRef.current) return;
       // Panel is on the right → dragging left decreases width
-      const delta = e.clientX - dragRef.current.startX;
-      const newWidth = Math.max(PANEL_MIN, Math.min(PANEL_MAX, dragRef.current.startWidth - delta));
-      setPanelWidth(newWidth);
+      const delta = e.clientX - startX;
+      const newWidth = Math.max(PANEL_MIN, Math.min(PANEL_MAX, startWidth - delta));
+      // Direct DOM manipulation for smooth jank-free resize
+      if (panelRef.current) {
+        panelRef.current.style.width = `${newWidth}px`;
+      }
     };
 
     const handleMouseUp = () => {
@@ -95,6 +101,13 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
       document.body.style.userSelect = '';
       document.removeEventListener('mousemove', handleMouseMove);
       document.removeEventListener('mouseup', handleMouseUp);
+      // Sync final width back to React state
+      if (panelRef.current) {
+        const finalWidth = parseInt(panelRef.current.style.width, 10);
+        if (finalWidth && finalWidth !== panelWidth) {
+          setPanelWidth(finalWidth);
+        }
+      }
     };
 
     document.addEventListener('mousemove', handleMouseMove);
@@ -454,6 +467,7 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
 
       {/* Panel content */}
       <div
+        ref={panelRef}
         className="worker-output-inner"
         style={{
           width: panelWidth,

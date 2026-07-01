@@ -543,7 +543,7 @@ export default function App() {
         </div>
 
         {/* Worker Output Panel — right sidebar for worker event logs */}
-        <div className={`worker-output-panel ${selectedWorker ? 'open' : ''}`}>
+        <div className="worker-output-panel">
           {selectedWorker && (
             <WorkerOutputPanel
               workspaceId={selectedWorker.workspaceId}
