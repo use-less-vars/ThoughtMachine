@@ -8,6 +8,7 @@ workers, mcp_servers) as well as GET effective_permissions.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -15,6 +16,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import PlainTextResponse
@@ -29,9 +33,59 @@ from thoughtmachine.workspace_capabilities import (
 
 from tools.workspace.worker import _worker_registry, _registry_lock
 
+from agent.models.worker_definition import WorkerDefinition
+
 # ── Router ───────────────────────────────────────────────────────────────────
 
 router = APIRouter(prefix="/api/workspace")
+
+
+# ── GET /api/workspace/templates ────────────────────────────────────────────────
+
+
+@router.get("/templates")
+async def get_worker_templates() -> List[Dict[str, Any]]:
+    """Return validated worker templates as a JSON array.
+
+    Reads from ``~/.thoughtmachine/worker_templates/`` first (the user's
+    deployed templates, set up by ``bootstrap.py`` on first run).  Falls
+    back to ``resources/worker_templates/`` in the repo if the user directory
+    doesn't exist or contains no ``.json`` files — this ensures the endpoint
+    works on a fresh install before the first bootstrap completes.
+
+    Invalid or unparseable ``.json`` files are skipped with a warning log
+    message; remaining valid templates are still returned.
+    """
+    # Resolve template directories
+    user_dir = Path.home() / ".thoughtmachine" / "worker_templates"
+    repo_dir = (
+        Path(__file__).resolve().parents[2]
+        / "resources"
+        / "worker_templates"
+    )
+
+    # Prefer deployed user templates; fall back to repo source templates
+    if user_dir.is_dir() and list(user_dir.glob("*.json")):
+        template_dir = user_dir
+    else:
+        template_dir = repo_dir
+
+    results: List[Dict[str, Any]] = []
+
+    if template_dir.is_dir():
+        for json_file in sorted(template_dir.glob("*.json")):
+            try:
+                data = json.loads(json_file.read_text(encoding="utf-8"))
+                wd = WorkerDefinition.model_validate(data)
+                results.append(wd.model_dump())
+            except Exception as exc:
+                logger.warning(
+                    "Skipping invalid template %s: %s",
+                    json_file.name,
+                    exc,
+                )
+
+    return results
 
 
 # ── Pydantic models ──────────────────────────────────────────────────────────
