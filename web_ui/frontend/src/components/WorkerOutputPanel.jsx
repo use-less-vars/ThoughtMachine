@@ -155,11 +155,16 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose }) {
   const workerInfoRef = useRef(null);
   workerInfoRef.current = workerInfo;
 
+  const runtimeStatus = workerInfo?.runtime_status || 'ready';
+
+  // Poll period for worker info: 1s if busy (aligns with events), 3s otherwise
+  const workerInfoPollInterval = runtimeStatus === 'busy' ? 1000 : 3000;
+
   useEffect(() => {
     fetchWorkerInfo();
-    const interval = setInterval(fetchWorkerInfo, 3000);
+    const interval = setInterval(fetchWorkerInfo, workerInfoPollInterval);
     return () => clearInterval(interval);
-  }, [fetchWorkerInfo]);
+  }, [fetchWorkerInfo, workerInfoPollInterval]);
 
   // Reset when workerName changes
   useEffect(() => {
@@ -181,8 +186,6 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose }) {
   const isAtBottomRef = useRef(true);
   const lastFetchTimeRef = useRef(null);
   const eventsRef = useRef([]);
-
-  const runtimeStatus = workerInfo?.runtime_status || 'ready';
 
   const fetchEvents = useCallback(() => {
     if (!workspaceId || !workerName) return;
@@ -477,7 +480,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose }) {
           <span className="worker-output-header-label">
             Worker: {workerName}
           </span>
-          <span className="worker-output-header-ctx">
+          <span className={`worker-output-header-ctx${runtimeStatus === 'busy' ? ' worker-busy' : ''}`}>
             ctx: {workerInfo ? `${formatTokens(workerInfo.current_context_tokens)} / ${formatTokens(workerInfo.max_context_tokens)}` : '—'}
           </span>
           <div style={{ flex: 1 }} />
