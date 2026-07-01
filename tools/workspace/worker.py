@@ -1061,10 +1061,14 @@ class Worker(ToolBase):
         if cmd_path.exists():
             cmd_path.unlink(missing_ok=True)
         
-        # ── Fix 1.3: Fresh context on every spawn ──
-        ctx_path = thread._context_path()
-        if ctx_path.exists():
-            ctx_path.unlink(missing_ok=True)
+        # ── Preserve persisted context for resume across sessions ──
+        # WorkerThread.run() will call _load_context() which reads
+        # context.json from disk. If it exists (from a previous session
+        # or a completed run), the thread resumes that conversation.
+        # If it doesn't exist, the thread creates a fresh context.
+        #
+        # To force a clean start, delete the worker's directory
+        # via the filesystem tool before spawning.
 
         with _registry_lock:
             _worker_registry[self.worker_name] = thread

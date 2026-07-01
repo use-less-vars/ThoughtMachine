@@ -610,6 +610,55 @@ class TestWorker:
     #  Worker tool — spawn
     # ═══════════════════════════════════════════════════════════════════
 
+    def test_spawn_preserves_context_file(self, tmp_path: Path):
+        """Spawning preserves existing context.json — the file is NOT deleted.
+
+        WorkerThread creation (same as spawn does) must not wipe a pre-existing
+        context.json, so that resume across sessions works.
+        """
+        # ── Create a pre-existing context.json ──
+        ctx_data = {
+            "conversation": [{"role": "user", "content": "resume me"}],
+            "status": "ready",
+            "worker_name": "resume_worker",
+        }
+        ctx_path = tmp_path / "workers" / "resume_worker" / "context.json"
+        ctx_path.parent.mkdir(parents=True)
+        ctx_path.write_text(json.dumps(ctx_data), encoding="utf-8")
+        assert ctx_path.exists()  # sanity
+
+        # ── Create WorkerThread (same code path as _action_spawn) ──
+        thread = WorkerThread(
+            name="resume_worker",
+            definition={},
+            agent_config={},
+            workspace_dir=tmp_path,
+        )
+
+        # ── Verify file was NOT deleted during __init__ ──
+        assert ctx_path.exists(), (
+            "context.json was deleted during spawn! "
+            "_action_spawn must preserve it for resume to work."
+        )
+
+        # ── Verify _load_context() can restore the WorkerContext ──
+        ctx = thread._load_context()
+        assert ctx is not None, "_load_context() should return WorkerContext"
+        assert len(ctx.user_history) == 1
+        assert ctx.user_history[0]["content"] == "resume me"
+        assert ctx.worker_name == "resume_worker"
+
+    def test_spawn_without_context_creates_fresh(self, tmp_path: Path):
+        """Without a pre-existing context.json, spawn creates fresh context."""
+        thread = WorkerThread(
+            name="fresh_worker",
+            definition={"system_prompt": "You are fresh."},
+            agent_config={},
+            workspace_dir=tmp_path,
+        )
+        ctx = thread._load_context()
+        assert ctx is None, "No context file yet — _load_context returns None"
+
     @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.worker._workspace_dir")
     @patch("tools.workspace.worker.Worker._build_llm_client")
