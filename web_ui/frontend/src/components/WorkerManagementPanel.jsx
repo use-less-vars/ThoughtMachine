@@ -740,7 +740,7 @@ export default function WorkerManagementPanel({
       {/* ── Worker list ───────────────────────────────────────────────── */}
       {workers.length === 0 ? (
         <EmptyState
-          message="No workers defined for this workspace."
+          message="No workers configured. Create one now, or start from a template."
           onNew={() => {
             setEditingWorker(null);
             setShowForm(true);
