@@ -95,8 +95,17 @@ export default function adaptWorkerEvent(evt) {
   if (!evt || !evt.event) return null
 
   switch (evt.event) {
-    // ── Suppressed events (already shown in main chat) ────────────
-    case 'user_message':
+    // ── Query (user's request to the worker) ─────────────────────
+    case 'user_message': {
+      const req = evt.request || {}
+      return {
+        _id: eventId(evt),
+        role: 'user',
+        content: req.query || '(empty query)',
+        is_worker_query: true,
+      }
+    }
+    // Legacy query event (same format)
     case 'query':
       return null
 
