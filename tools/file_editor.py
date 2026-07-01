@@ -395,9 +395,23 @@ class FileEditor(ToolBase):
             # Create replacements dict from content
             content = self.content
             if isinstance(content, str):
-                # Single content for all lines
-                for line_num in line_nums:
-                    replacements[line_num] = content
+                if len(line_nums) == 1:
+                    # Single line replacement
+                    replacements[line_nums[0]] = content
+                else:
+                    # Block replacement: replace the entire range with the content block
+                    start_line = min(line_nums)
+                    end_line = max(line_nums)
+                    # Delete the range from the lines list
+                    del lines[start_line - 1:end_line]
+                    # Split content into individual lines and insert at the range start
+                    content_lines = content.split('\n')
+                    for i, cl in enumerate(content_lines):
+                        lines.insert(start_line - 1 + i, cl + '\n')
+                    # Write directly and return early (avoid replacement dict loop below)
+                    with open(filename, 'w', encoding='utf-8') as f:
+                        f.writelines(lines)
+                    return f"Successfully replaced {len(line_nums)} line(s) in {filename}"
             elif isinstance(content, list):
                 # List of content - should match number of lines
                 if len(content) != len(line_nums):
