@@ -148,7 +148,10 @@ export default function App() {
           return
         }
         hubHasConnectedOnceRef.current = false  // allow reconnection on real errors
-        const delay = 1000 + Math.random() * 3000  // 1–4s jitter
+        // First retry is faster (0.5–1s), subsequent attempts use wider jitter (1–4s)
+        const delay = reconnectAttemptsRef.current <= 1
+          ? 500 + Math.random() * 500
+          : 1000 + Math.random() * 3000
         console.log(`[Hub WS] disconnected (attempt ${reconnectAttemptsRef.current}/${MAX_RECONNECT_ATTEMPTS}), reconnecting in ${Math.round(delay)}ms...`)
         reconnectTimeoutRef.current = setTimeout(connectHub, delay)
       }
