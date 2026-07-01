@@ -930,7 +930,7 @@ def get_default_security_config() -> Dict[str, Any]:
             "read_only": False,
             "allowed_networks": [],  # list of domain patterns
             "tool_overrides": {},    # {"FileEditor": "ask", "DockerCodeRunner": "deny"}
-            "default_policy": "allow",  # "allow", "ask", "deny"
+            "default_policy": "deny",  # "allow", "ask", "deny"
             "capability_requirements": {}  # {"fs:write": "ask", "container:exec": "deny"}
         },
         "agent_overrides": {}  # for future multi-agent support
