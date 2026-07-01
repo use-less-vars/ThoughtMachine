@@ -1,0 +1,110 @@
+{
+  "description": "Reusable worker configuration.\n\nAll fields are flat (no nesting).  Optional fields (``timeout_seconds``,\n``max_context_tokens``, etc.) default to ``None``, meaning the value is\ninherited from the spawning session at spawn time.",
+  "properties": {
+    "name": {
+      "description": "Unique name for this worker definition.",
+      "title": "Name",
+      "type": "string"
+    },
+    "description": {
+      "description": "Human-readable description of what this worker does.",
+      "title": "Description",
+      "type": "string"
+    },
+    "system_prompt": {
+      "description": "System prompt used to initialise the worker agent.",
+      "title": "System Prompt",
+      "type": "string"
+    },
+    "tools": {
+      "description": "List of tool names this worker is allowed to call.",
+      "items": {
+        "type": "string"
+      },
+      "title": "Tools",
+      "type": "array"
+    },
+    "permission_footprint": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Permission categories required by this worker, e.g. ``{\"filesystem\": \"read\"}``.",
+      "title": "Permission Footprint",
+      "type": "object"
+    },
+    "timeout_seconds": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Maximum wall-clock time for a single worker turn.",
+      "title": "Timeout Seconds"
+    },
+    "max_context_tokens": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Maximum tokens for the worker's conversation context.",
+      "title": "Max Context Tokens"
+    },
+    "warning_threshold_tokens": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Token count at which the worker emits a warning.",
+      "title": "Warning Threshold Tokens"
+    },
+    "turn_limit": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Maximum number of turns before the worker stops.",
+      "title": "Turn Limit"
+    },
+    "temperature": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "LLM temperature override for this worker.",
+      "title": "Temperature"
+    }
+  },
+  "required": [
+    "name",
+    "description",
+    "system_prompt",
+    "tools",
+    "permission_footprint"
+  ],
+  "title": "WorkerDefinition",
+  "type": "object"
+}
