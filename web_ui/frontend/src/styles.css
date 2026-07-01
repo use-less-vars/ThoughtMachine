@@ -838,8 +838,15 @@ body {
 }
 
 .worker-output-header {
-  padding: 0.6rem 0.75rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  background: var(--bg-secondary);
   border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
   flex-shrink: 0;
 }
 
@@ -850,10 +857,27 @@ body {
   margin-bottom: 0.25rem;
 }
 
-.worker-output-header-name {
+.worker-output-header-label {
   font-weight: 600;
-  font-size: 0.9rem;
   color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.worker-output-header-ctx {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.worker-output-header-task-inline {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 150px;
 }
 
 .worker-output-header-status {
@@ -917,6 +941,39 @@ body {
 }
 .worker-output-close-btn:hover {
   background: var(--bg-surface);
+}
+
+/* ── Bottom bar (matches main QueryBar) ──────────────────── */
+.worker-output-bottom-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.worker-output-bottom-name {
+  font-size: 0.8rem;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.worker-output-bottom-elapsed {
+  font-size: 0.8rem;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.worker-output-bottom-error {
+  font-size: 0.7rem;
+  color: var(--danger);
+  white-space: nowrap;
 }
 
 /* ── Scroll area ─────────────────────────────────────────── */

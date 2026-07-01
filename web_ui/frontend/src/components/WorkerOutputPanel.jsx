@@ -476,60 +476,33 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
           flexShrink: 0,
         }}
       >
-        {/* ── Status bar ─────────────────────────────────────────────── */}
+        {/* ── Status bar (slim, matching main StatusBar) ────────────── */}
         <div className="worker-output-header">
-          {/* Worker name + status dot */}
-          <div className="worker-output-header-top">
-            <span
-              className="worker-status-dot"
-              style={{ background: statusDotColor(runtimeStatus) }}
-            />
-            <span className="worker-output-header-name">
-              {workerName}
-            </span>
-            <span className="worker-output-header-status">
-              {runtimeStatus}
-            </span>
-            <div style={{ flex: 1 }} />
-            {onClose && (
-              <button
-                className="worker-output-close-btn"
-                onClick={onClose}
-                title="Close panel"
-              >
-                ✕
-              </button>
-            )}
-          </div>
-
-          {/* Current task */}
+          <span
+            className="worker-status-dot"
+            style={{ background: statusDotColor(runtimeStatus) }}
+          />
+          <span className="worker-output-header-label">
+            Worker: {workerName}
+          </span>
+          <span className="worker-output-header-ctx">
+            ctx —
+          </span>
+          <div style={{ flex: 1 }} />
           {workerInfo?.current_task && (
-            <div
-              className="worker-output-header-task"
-              title={workerInfo.current_task}
-            >
-              {truncate(workerInfo.current_task, 80)}
-            </div>
-          )}
-
-          {/* Elapsed time + Stop button */}
-          <div className="worker-output-header-bottom">
-            <span className="worker-output-elapsed">
-              ⏱ {elapsedTime(startTime)}
+            <span className="worker-output-header-task-inline" title={workerInfo.current_task}>
+              {truncate(workerInfo.current_task, 50)}
             </span>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-              {stopError && (
-                <span style={{ fontSize: '0.7rem', color: 'var(--danger)' }}>{stopError}</span>
-              )}
-              <button
-                className="worker-output-stop-btn"
-                onClick={handleStop}
-                disabled={!canStop}
-              >
-                ⏹ Stop
-              </button>
-            </div>
-          </div>
+          )}
+          {onClose && (
+            <button
+              className="worker-output-close-btn"
+              onClick={onClose}
+              title="Close panel"
+            >
+              ✕
+            </button>
+          )}
         </div>
 
         {/* ── Conversation stream ────────────────────────────────────── */}
@@ -567,6 +540,27 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
               ↓
             </button>
           </div>
+        </div>
+
+        {/* ── Bottom bar (matches main QueryBar height) ─────────────── */}
+        <div className="worker-output-bottom-bar">
+          <span className="worker-output-bottom-name" title={workerName}>
+            {truncate(workerName, 15)}
+          </span>
+          <span className="worker-output-bottom-elapsed">
+            ⏱ {elapsedTime(startTime)}
+          </span>
+          <div style={{ flex: 1 }} />
+          {stopError && (
+            <span className="worker-output-bottom-error">{stopError}</span>
+          )}
+          <button
+            className="worker-output-stop-btn"
+            onClick={handleStop}
+            disabled={!canStop}
+          >
+            ⏹ Stop
+          </button>
         </div>
       </div>
     </div>
