@@ -2661,3 +2661,36 @@ This file is written atomically (temp file + `os.replace`) to avoid partial read
 ### Known Worker GUI Limitations
 - Worker context size updated via polling, not streaming
 - Worker panel auto-opening from other tabs required extra event routing
+
+## 2026-07-01 — ## Item 1: Worker Panel State Memory (2025-03-30)
+
+**Problem...
+
+## Item 1: Worker Panel State Memory (2025-03-30)
+## Item 1: Worker Panel State Memory (2025-03-30)
+
+**Problem**: Worker panel state was global — switching tabs lost which worker panel was open.
+
+**Solution**: Replaced global `selectedWorker` state with per-session `workerPanelState` map (`{ [sessionId]: { name, workspaceId } | null }`). Derived `selectedWorker` from `activeSessionId`. Persisted in localStorage under key `'workerPanelState'`.
+
+**Key details**:
+- `selectedWorker` is now a derived value, computed right after state/ref declarations (before any hooks) to avoid Temporal Dead Zone errors.
+- Stale keys are garbage-collected when tabs are removed via a `useEffect` on `tabs`.
+- Both `handleSelectWorker` and `handleCloseWorkerPanel` now use `activeSessionId` to key into the map.
+- `WorkerAutoOpenWatcher` auto-open works correctly per session since it saves under the active session ID.
+
+**TDZ Fix (2025-03-30)**: `activeSessionId` derivation was moved from after all hooks (line 493) to before any hooks (after state/ref declarations). The `useCallback` dependency arrays `[activeSessionId]` in `handleSelectWorker`/`handleCloseWorkerPanel` are evaluated during render, so `activeSessionId` must be initialized before those hooks run.
+
+## 2026-07-01 — ## Error Boundary Layer (2025-03-30)
+
+**Added**: `web_ui/fro...
+
+## Error Boundary Layer (2025-03-30)
+
+**Added**: `web_ui/frontend/src/components/ErrorBoundary.jsx` wraps `<App />` in `main.jsx`
+
+**Purpose**: Catches any render-phase error (like the TDZ bug that produced a blank white page) and displays a fallback UI with error message, stack trace, and a reload button. Prevents the "blank screen of death" that previously required the user to switch to a stable branch to recover.
+
+**Design**: Class component (React error boundaries must be class components). Inline styles only — no external dependencies. Shows the error message in a monospaced `<pre>` block and a Reload button that calls `window.location.reload()`.
+
+**Commit**: `08f3de0`
