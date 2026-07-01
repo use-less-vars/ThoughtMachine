@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import WorkerManagementPanel from './WorkerManagementPanel';
 import DockerfileEditor from './DockerfileEditor';
+import DomainAllowlistEditor from './DomainAllowlistEditor';
 
 // ── Catppuccin palette matching ConfigPanel ──────────────────────────────
 const inputStyle = {
@@ -62,104 +63,6 @@ function PermissionPill({ name, value }) {
     >
       {name}: {p.label}
     </span>
-  );
-}
-
-// ── Section: Domain Allowlist ────────────────────────────────────────────
-function DomainAllowlistSection({ workspaceId }) {
-  const [domains, setDomains] = useState([]);
-  const [text, setText] = useState('');
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
-  const [saveError, setSaveError] = useState('');
-
-  useEffect(() => {
-    if (!workspaceId) return;
-    setLoading(true);
-    fetch(`/api/workspace/${workspaceId}/domain_allowlist`)
-      .then(async (res) => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        setDomains(Array.isArray(data) ? data : []);
-      })
-      .catch(() => setDomains([]))
-      .finally(() => setLoading(false));
-  }, [workspaceId]);
-
-  useEffect(() => {
-    setText(domains.join('\n'));
-  }, [domains]);
-
-  const handleSave = useCallback(async () => {
-    const list = text
-      .split('\n')
-      .map((s) => s.trim())
-      .filter(Boolean);
-    setSaveError('');
-    setSaving(true);
-    try {
-      const res = await fetch(`/api/workspace/${workspaceId}/domain_allowlist`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ domains: list }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setDomains(list);
-      setSaved(true);
-      setSaveError('');
-      setTimeout(() => setSaved(false), 2000);
-    } catch (err) {
-      setSaveError(err.message);
-    } finally {
-      setSaving(false);
-    }
-  }, [workspaceId, text]);
-
-  if (loading) return <div style={{ color: '#6c7086', fontSize: '0.85rem' }}>Loading domain allowlist…</div>;
-
-  return (
-    <div>
-      <textarea
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        rows={5}
-        style={{
-          ...inputStyle,
-          fontFamily: 'monospace',
-          fontSize: '0.8rem',
-          resize: 'vertical',
-          marginBottom: '0.4rem',
-        }}
-        placeholder="one domain per line, e.g.&#10;*.github.com&#10;api.openai.com"
-      />
-      {saveError && (
-        <div style={{ color: '#f38ba8', fontSize: '0.8rem', marginBottom: '0.4rem' }}>
-          Error: {saveError}
-        </div>
-      )}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-        <button
-          onClick={handleSave}
-          disabled={saving}
-          style={{
-            background: saved ? '#a6e3a1' : '#89b4fa',
-            color: '#1e1e2e',
-            border: 'none',
-            borderRadius: '4px',
-            padding: '0.3rem 0.75rem',
-            cursor: saving ? 'wait' : 'pointer',
-            fontWeight: 600,
-            fontSize: '0.8rem',
-          }}
-        >
-          {saving ? 'Saving…' : saved ? '✓ Saved' : 'Save'}
-        </button>
-        <small style={{ color: '#6c7086', fontSize: '0.75rem' }}>
-          {domains.length} domain{domains.length !== 1 ? 's' : ''}
-        </small>
-      </div>
-    </div>
   );
 }
 
@@ -367,7 +270,7 @@ export default function WorkspacePanel({ workspaceId, sessionId, onSelectWorker,
         <small style={{ color: '#6c7086', fontSize: '0.75rem', display: 'block', marginBottom: '0.3rem' }}>
           One domain per line. Wildcards supported (e.g. *.example.com).
         </small>
-        <DomainAllowlistSection workspaceId={workspaceId} />
+        <DomainAllowlistEditor workspaceId={workspaceId} />
       </div>
 
       {/* Workers */}
