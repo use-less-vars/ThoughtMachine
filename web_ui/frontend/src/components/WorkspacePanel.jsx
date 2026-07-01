@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import WorkerManagementPanel from './WorkerManagementPanel';
+import DockerfileEditor from './DockerfileEditor';
 
 // ── Catppuccin palette matching ConfigPanel ──────────────────────────────
 const inputStyle = {
@@ -61,53 +62,6 @@ function PermissionPill({ name, value }) {
     >
       {name}: {p.label}
     </span>
-  );
-}
-
-// ── Section: Dockerfile ──────────────────────────────────────────────────
-function DockerfileSection({ workspaceId }) {
-  const [content, setContent] = useState('');
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
-
-  useEffect(() => {
-    if (!workspaceId) return;
-    setLoading(true);
-    setError('');
-    fetch(`/api/workspace/${workspaceId}/dockerfile`)
-      .then(async (res) => {
-        if (!res.ok) {
-          if (res.status === 404) {
-            setContent('(No custom Dockerfile)');
-            return;
-          }
-          throw new Error(`HTTP ${res.status}`);
-        }
-        setContent(await res.text());
-      })
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false));
-  }, [workspaceId]);
-
-  if (loading) return <div style={{ color: '#6c7086', fontSize: '0.85rem' }}>Loading Dockerfile…</div>;
-  if (error) return <div style={{ color: '#f38ba8', fontSize: '0.85rem' }}>Error: {error}</div>;
-
-  return (
-    <pre
-      style={{
-        ...inputStyle,
-        fontFamily: 'monospace',
-        fontSize: '0.75rem',
-        lineHeight: '1.4',
-        overflow: 'auto',
-        maxHeight: '200px',
-        whiteSpace: 'pre-wrap',
-        wordBreak: 'break-all',
-        margin: 0,
-      }}
-    >
-      {content}
-    </pre>
   );
 }
 
@@ -404,7 +358,7 @@ export default function WorkspacePanel({ workspaceId, sessionId, onSelectWorker,
       {/* Dockerfile */}
       <div style={sectionStyle}>
         <label style={labelStyle}><strong>Dockerfile</strong></label>
-        <DockerfileSection workspaceId={workspaceId} />
+        <DockerfileEditor workspaceId={workspaceId} />
       </div>
 
       {/* Domain Allowlist */}
