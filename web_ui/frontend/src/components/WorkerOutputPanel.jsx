@@ -138,7 +138,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose }) {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         if (Array.isArray(data)) {
-          const found = data.find((w) => w.name === workerName);
+          const found = data.find((w) => w.name === workerName && (!sessionId || w.session_id === sessionId));
           if (found) {
             setWorkerInfo(found);
             setWorkerError('');
@@ -152,7 +152,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose }) {
       .catch((err) => {
         if (!workerInfoRef.current) setWorkerError(err.message);
       });
-  }, [workspaceId, workerName]);
+  }, [workspaceId, workerName, sessionId]);
 
   const workerInfoRef = useRef(null);
   workerInfoRef.current = workerInfo;

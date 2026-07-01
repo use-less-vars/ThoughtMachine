@@ -590,6 +590,7 @@ export default function App() {
             <WorkerOutputPanel
               workspaceId={selectedWorker.workspaceId}
               workerName={selectedWorker.name}
+              sessionId={activeSessionId}
               onClose={handleCloseWorkerPanel}
             />
           )}

@@ -422,7 +422,7 @@ function WorkersSection({ workspaceId, onSelectWorker, selectedWorker, sessionId
       })
       .catch(() => setWorkers([]))
       .finally(() => setLoading(false));
-  }, [workspaceId]);
+  }, [workspaceId, sessionId]);
 
   useEffect(() => {
     fetchWorkers();
