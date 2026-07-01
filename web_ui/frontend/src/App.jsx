@@ -70,6 +70,11 @@ export default function App() {
   const tabsRef = useRef(tabs)
   tabsRef.current = tabs
 
+  // ── Derive active session from the selected tab (must be before any hooks that reference it) ──
+  const activeTab = tabs.find((t) => t.tabId === activeTabId)
+  const activeSessionId = activeTab?.sessionId
+  const selectedWorker = activeSessionId ? (workerPanelState[activeSessionId] ?? null) : null
+
   // Snapshot which session ID was active at startup (from localStorage),
   // so we know which tabs should load on WS connect vs defer.
   const startupActiveSessionId = useMemo(() => {
@@ -490,12 +495,7 @@ export default function App() {
     name: t.sessionId ? (sessionMap[t.sessionId] || t.sessionId.slice(0, 8)) : 'New Session',
   }))
 
-  const activeTab = tabs.find((t) => t.tabId === activeTabId)
-  const activeSessionId = activeTab?.sessionId
   const activeSessionName = activeSessionId ? (sessionMap[activeSessionId] || 'Untitled') : 'New Session'
-
-  // Derive the current worker from the active session (must be after activeSessionId)
-  const selectedWorker = activeSessionId ? (workerPanelState[activeSessionId] ?? null) : null
 
   // ── Persist worker panel state to localStorage ──────────────────────────
   useEffect(() => {
