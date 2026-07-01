@@ -605,7 +605,6 @@ class WorkerThread(threading.Thread):
 
                 # Persist and log
                 self._save_context()
-                self._log_event("query", query, reply)
 
                 # Send the response back to the waiting tool call
                 self._output_queue.put(reply)
