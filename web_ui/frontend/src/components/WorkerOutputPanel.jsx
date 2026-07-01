@@ -5,11 +5,11 @@ const PANEL_MAX = 600;
 const PANEL_DEFAULT = 350;
 
 const STATUS_DOT = {
-  running: { bg: '#a6e3a1', label: 'Running' },
-  idle: { bg: '#f9e2af', label: 'Idle' },
-  completed: { bg: '#6c7086', label: 'Completed' },
-  error: { bg: '#f38ba8', label: 'Error' },
-  stopped: { bg: '#f38ba8', label: 'Stopped' },
+  ready: { bg: '#a6e3a1', label: 'Ready' },      /* green solid — alive, waiting */
+  busy: { bg: '#a6e3a1', label: 'Busy' },        /* green pulsing — processing */
+  completed: { bg: '#6c7086', label: 'Completed' }, /* grey — done */
+  error: { bg: '#f38ba8', label: 'Error' },       /* red — failed */
+  stopped: { bg: '#f38ba8', label: 'Stopped' },   /* red — stopped */
 };
 
 function statusDotColor(status) {
@@ -164,7 +164,7 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
   const lastFetchTimeRef = useRef(null);
   const eventsRef = useRef([]);
 
-  const runtimeStatus = workerInfo?.runtime_status || 'idle';
+  const runtimeStatus = workerInfo?.runtime_status || 'ready';
 
   const fetchEvents = useCallback(() => {
     if (!workspaceId || !workerName) return;
@@ -201,7 +201,7 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
   }, [workspaceId, workerName]); // stable deps only — no cascading re-fetches
 
   // Poll period: 1s if running, 3s otherwise
-  const pollInterval = runtimeStatus === 'running' ? 1000 : 3000;
+  const pollInterval = runtimeStatus === 'busy' ? 1000 : 3000;
 
   useEffect(() => {
     if (!workspaceId || !workerName) return;
@@ -256,7 +256,7 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
     }
   }, [workspaceId, workerName]);
 
-  const canStop = runtimeStatus === 'running' || runtimeStatus === 'idle';
+  const canStop = runtimeStatus === 'busy' || runtimeStatus === 'ready';
 
   // ── Compute elapsed time from first event ─────────────────────────────
   const startTime = workerInfo?.started ||
@@ -265,7 +265,7 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
   // ── Elapsed timer tick ────────────────────────────────────────────────
   const [tick, setTick] = useState(0);
   useEffect(() => {
-    if (runtimeStatus !== 'running') return;
+    if (runtimeStatus !== 'busy') return;
     const interval = setInterval(() => setTick((t) => t + 1), 1000);
     return () => clearInterval(interval);
   }, [runtimeStatus]);

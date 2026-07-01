@@ -384,7 +384,7 @@ async def stop_worker(ws_id: str, name: str):
 
     Also immediately writes ``status.json`` with ``runtime_status: "completed"``
     so the web UI's next poll sees a terminal state right away (instead of
-    "jumping back" to "running" when the optimistic update gets overwritten
+    "jumping back" to "busy" when the optimistic update gets overwritten
     before the worker processes the stop).
 
     Returns:
@@ -405,7 +405,7 @@ async def stop_worker(ws_id: str, name: str):
     _atomic_write_json({"action": "stop"}, worker_dir / "command.json")
 
     # Immediately write status.json as "completed" so the UI doesn't
-    # "jump back" to "running" on the next poll before the worker
+    # "jump back" to "busy" on the next poll before the worker
     # thread has a chance to process the stop signal.
     _atomic_write_json({
         "runtime_status": "completed",

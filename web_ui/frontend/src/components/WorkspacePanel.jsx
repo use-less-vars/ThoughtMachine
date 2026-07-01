@@ -273,6 +273,72 @@ function WorkerDot({ status }) {
 // Worker event viewing now uses the persistent WorkerOutputPanel sidebar,
 // wired via onSelectWorker callback passed up through ConfigPanel.
 
+// ── Worker Auto-Open Watcher (always-running, no visual output) ───────────
+// Polls worker status and auto-opens the output panel when a worker
+// transitions to ready/busy. Renders nothing — can be placed anywhere.
+export function WorkerAutoOpenWatcher({ workspaceId, onSelectWorker, selectedWorker }) {
+  const [workers, setWorkers] = useState([]);
+
+  // Track previously seen (name, runtime_status) pairs
+  const prevStatusMapRef = useRef(new Map());
+  // Track workers the user manually dismissed
+  const dismissedWorkersRef = useRef(new Set());
+
+  // Remember the previous selectedWorker to detect when the panel is closed.
+  const prevSelectedWorkerRef = useRef(selectedWorker);
+
+  // When the user closes the panel (selectedWorker → null), mark the
+  // previously-selected worker as dismissed so it won't re-auto-open
+  // until its status changes.
+  useEffect(() => {
+    const prev = prevSelectedWorkerRef.current;
+    if (prev && !selectedWorker) {
+      dismissedWorkersRef.current.add(prev.name);
+    }
+    prevSelectedWorkerRef.current = selectedWorker;
+  }, [selectedWorker]);
+
+  // Auto-open panel when a worker appears or transitions to 'running'
+  useEffect(() => {
+    const currentMap = new Map(workers.map(w => [w.name, w.runtime_status]));
+    const prev = prevStatusMapRef.current;
+
+    for (const [name, status] of currentMap) {
+      // Skip dismissed workers
+      if (dismissedWorkersRef.current.has(name)) {
+        if (status !== 'busy' && status !== 'ready') {
+          dismissedWorkersRef.current.delete(name);
+        }
+        continue;
+      }
+
+      const prevStatus = prev.get(name);
+      if (!prev.has(name) || (prevStatus !== 'ready' && prevStatus !== 'busy' && (status === 'ready' || status === 'busy'))) {
+        onSelectWorker?.(name, workspaceId);
+        break;
+      }
+    }
+
+    prevStatusMapRef.current = currentMap;
+  }, [workers, workspaceId, onSelectWorker]);
+
+  // Poll workers every 3s
+  useEffect(() => {
+    if (!workspaceId) return;
+    const fetchWorkers = () => {
+      fetch(`/api/workspace/${workspaceId}/workers`)
+        .then(res => res.ok ? res.json() : [])
+        .then(data => setWorkers(Array.isArray(data) ? data : []))
+        .catch(() => setWorkers([]));
+    };
+    fetchWorkers();
+    const interval = setInterval(fetchWorkers, 3000);
+    return () => clearInterval(interval);
+  }, [workspaceId]);
+
+  return null;
+}
+
 // ── Section: Workers ─────────────────────────────────────────────────────
 function WorkersSection({ workspaceId, onSelectWorker, selectedWorker }) {
   const [workers, setWorkers] = useState([]);
@@ -309,19 +375,20 @@ function WorkersSection({ workspaceId, onSelectWorker, selectedWorker }) {
 
     for (const [name, status] of currentMap) {
       // Skip workers the user manually dismissed (panel was closed on them).
-      // If a dismissed worker is no longer running, undismiss it so it can
-      // re-trigger auto-open on the next status transition to running.
+      // If a dismissed worker is no longer alive, undismiss it so it can
+      // re-trigger auto-open on the next spawn or query.
       if (dismissedWorkersRef.current.has(name)) {
-        if (status !== 'running') {
+        if (status !== 'busy' && status !== 'ready') {
           dismissedWorkersRef.current.delete(name);
         }
         continue;
       }
 
       const prevStatus = prev.get(name);
-      // Trigger if: name is entirely new, OR an existing worker just became running
-      // (catches null→running, completed→running, error→running, idle→running)
-      if (!prev.has(name) || (prevStatus !== 'running' && status === 'running')) {
+      // Trigger if: name is entirely new, OR an existing worker just became alive
+      // (catches null→ready, completed→ready, error→ready, ready→busy)
+      // 'ready' means freshly spawned, 'busy' means actively processing a query.
+      if (!prev.has(name) || (prevStatus !== 'ready' && prevStatus !== 'busy' && (status === 'ready' || status === 'busy'))) {
         const worker = workers.find(w => w.name === name);
         if (worker) {
           onSelectWorker?.(worker.name, workspaceId);
@@ -375,7 +442,7 @@ function WorkersSection({ workspaceId, onSelectWorker, selectedWorker }) {
   }, [workspaceId]);
 
   const canStop = useCallback((status) => {
-    return status === 'running' || status === 'idle' || !status;
+    return status === 'busy' || status === 'ready' || !status;
   }, []);
 
   if (loading) return <div style={{ color: '#6c7086', fontSize: '0.85rem' }}>Loading workers…</div>;
@@ -431,7 +498,7 @@ function WorkersSection({ workspaceId, onSelectWorker, selectedWorker }) {
                 </span>
               )}
               <span style={{ color: '#6c7086', fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
-                {w.runtime_status || 'idle'}
+                {w.runtime_status || 'ready'}
               </span>
               <span style={{ color: '#a6adc8', fontSize: '0.75rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }}>
                 {w.current_task ? truncate(w.current_task, 80) : ''}

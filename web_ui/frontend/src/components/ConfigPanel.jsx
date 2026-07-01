@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import ManageProvidersModal from './ManageProvidersModal';
 import ContainerPanelContent from './ContainerPanel';
-import WorkspacePanel from './WorkspacePanel';
+import WorkspacePanel, { WorkerAutoOpenWatcher } from './WorkspacePanel';
 
 // ── Directory Browser sub-component ──────────────────────────────────────
 function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect, setLoading, setEntries, setError }) {
@@ -377,6 +377,9 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
           </button>
         ))}
       </div>
+
+      {/* ── Worker Auto-Open Watcher (always running, no visual output) ── */}
+      <WorkerAutoOpenWatcher workspaceId={workspaceId} onSelectWorker={onSelectWorker} selectedWorker={selectedWorker} />
 
       {/* ── Workspace Tab ──────────────────────────────────────────── */}
       {activeTab === 'workspace' && (
