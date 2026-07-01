@@ -704,3 +704,37 @@ Add a row to the merge table in the existing gate contract tests (`tests/docker/
 - `start /b` (same-window) makes the app ignore Ctrl+C — NOT what we want
 - Vite was already launched in a separate window via `start "ThoughtMachine Vite" cmd /c "npm run dev"` — the backend now follows the same pattern
 - The `exit /b %ERRORLEVEL%` after `start /wait` propagates Python's exit code
+
+## 2026-07-01 — ## Second instance port configuration (2025-07-16)
+
+### How ...
+
+## Second instance port configuration (2025-07-16)
+
+### How to start a second instance
+```bash
+# Terminal 1 — first instance (default ports)
+python -m web_ui.backend.server
+# In another terminal:
+cd web_ui/frontend && npm run dev
+
+# Terminal 2 — second instance (custom ports)
+TM_PORT=8001 python -m web_ui.backend.server
+# In another terminal:
+cd web_ui/frontend && VITE_PORT=5174 VITE_BACKEND_PORT=8001 npm run dev
+```
+
+### Environment variables
+| Variable | Default | Scope | Description |
+|----------|---------|-------|-------------|
+| `PORT` / `TM_PORT` | 8000 | Backend | Backend server port (already supported) |
+| `VITE_PORT` | 5173 | Vite dev | Frontend dev server port |
+| `VITE_BACKEND_PORT` | 8000 | Frontend | Backend port for WS/API connections |
+
+### Files changed
+- `web_ui/frontend/vite.config.js` — env var for port + proxy target
+- `web_ui/frontend/src/App.jsx` — env var for WS_URL
+- `web_ui/frontend/src/components/SessionTab.jsx` — env var for WS_URL
+- `web_ui/frontend/src/components/ConfigPanel.jsx` — env var for API base URL
+
+Backend (`server.py`) already supported `--port` and `PORT` env var from earlier work.

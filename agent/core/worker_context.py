@@ -103,6 +103,31 @@ class WorkerContext:
         except Exception:
             return ""
 
+    # ── Token estimation ────────────────────────────────────────────
+
+    def estimated_context_tokens(self) -> int:
+        """
+        Estimate the total token count of the current conversation using
+        ``tiktoken`` with the ``cl100k_base`` encoding (OpenAI-compatible).
+
+        Falls back to a rough character-based estimate (4 chars \u2248 1 token)
+        if ``tiktoken`` is not available.
+
+        Returns:
+            Estimated token count (int).
+        """
+        import json
+        try:
+            import tiktoken
+            encoder = tiktoken.get_encoding('cl100k_base')
+            total = 0
+            for msg in self.user_history:
+                total += len(encoder.encode(json.dumps(msg)))
+            return total
+        except Exception:
+            # Fallback: rough character-based estimate
+            return sum(len(json.dumps(msg)) // 4 for msg in self.user_history)
+
     # ── Compaction after summarization ─────────────────
 
     def compact_after_summary(self) -> bool:

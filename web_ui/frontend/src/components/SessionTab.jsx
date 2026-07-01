@@ -49,7 +49,7 @@ const INITIAL_STATE = {
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
-function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onSessionSaved, onRegister, onRunningChange, onSessionRenamed, selectedWorker, onSelectWorker }) {
+function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onSessionSaved, onRegister, onRunningChange, onSessionRenamed, selectedWorker, onSelectWorker, activeSessionId, onClearWorker }) {
   const [state, setState] = useState(INITIAL_STATE)
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
   const [providers, setProviders] = useState([])
@@ -569,6 +569,9 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           onClearRebuildResult={() => setContainerRebuildResult(null)}
           selectedWorker={selectedWorker}
           onSelectWorker={onSelectWorker}
+          isActive={isActive}
+          activeSessionId={activeSessionId}
+          onClearWorker={onClearWorker}
         />
         <div
           className="resize-handle"

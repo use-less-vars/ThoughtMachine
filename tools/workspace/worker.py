@@ -180,11 +180,13 @@ class WorkerThread(threading.Thread):
         session_permissions: Optional[Dict[str, Any]] = None,
         project_root: Optional[str] = None,
         timeout_seconds: Optional[int] = None,
+        session_id: Optional[str] = None,
     ) -> None:
         super().__init__(daemon=True, name=f"worker-{name}")
         self.worker_name = name
         self.definition = definition
         self._agent_config_dict = agent_config
+        self.session_id = session_id
         self._worker_dir = workspace_dir / "workers" / name
         self._worker_dir.mkdir(parents=True, exist_ok=True)
 
@@ -224,6 +226,51 @@ class WorkerThread(threading.Thread):
         self._stop_event = threading.Event()
 
     # ── public API called from the tool thread ─────────────────────
+
+    @property
+    def max_context_tokens(self) -> int:
+        """
+        Return the context window limit for this worker's model.
+
+        Derives the limit from the model name in the injected
+        ``_agent_config_dict``, using the same lookup as
+        ``TokenCounter.get_model_context_window()``.
+
+        Returns:
+            Maximum context tokens (int). Defaults to 128000.
+        """
+        model = (self._agent_config_dict or {}).get("model", "").lower()
+        windows = {
+            "gpt-4-32k": 32768,
+            "gpt-4-turbo": 128000,
+            "gpt-4o": 128000,
+            "gpt-4": 8192,
+            "gpt-3.5-turbo": 16385,
+            "gpt-3.5": 16385,
+            "deepseek": 128000,
+            "claude-3-opus": 200000,
+            "claude-3-sonnet": 200000,
+            "claude-3-haiku": 200000,
+            "claude": 200000,
+        }
+        for key, window in windows.items():
+            if key in model:
+                return window
+        return 128000
+
+    def get_current_context_tokens(self) -> int:
+        """
+        Estimate the current conversation's token count.
+
+        Delegates to ``WorkerContext.estimated_context_tokens()``.
+        Returns 0 if the worker context has not been initialised yet.
+
+        Returns:
+            Estimated token count (int).
+        """
+        if self._worker_ctx is not None:
+            return self._worker_ctx.estimated_context_tokens()
+        return 0
 
     def send_query(self, query: str, timeout: float = 120.0) -> str:
         """Send a query to this worker and block for a response."""
@@ -668,6 +715,9 @@ class WorkerThread(threading.Thread):
             "current_task": self.current_task,
             "last_heartbeat": self.last_heartbeat,
             "error": self.error,
+            "session_id": self.session_id,
+            "current_context_tokens": self.get_current_context_tokens(),
+            "max_context_tokens": self.max_context_tokens,
         }
         target = self._worker_dir / "status.json"
         fd, tmp_path_str = tempfile.mkstemp(
@@ -784,6 +834,11 @@ class Worker(ToolBase):
         default=None,
         description="Override the worker's default timeout in seconds. "
                       "If not set, the worker definition's timeout is used.",
+    )
+
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Session ID that spawned this worker (injected by ToolExecutor)",
     )
 
     skip_output_truncation: ClassVar[bool] = True
@@ -1050,6 +1105,7 @@ class Worker(ToolBase):
             session_permissions=self.session_permissions,
             project_root=project_root,
             timeout_seconds=effective_timeout,
+            session_id=self.session_id,
         )
 
         # Store initial context for the thread to pick up in run()
@@ -1118,6 +1174,9 @@ class Worker(ToolBase):
             "current_task": thread.current_task,
             "last_heartbeat": thread.last_heartbeat,
             "error": thread.error,
+            "session_id": thread.session_id,
+            "current_context_tokens": thread.get_current_context_tokens(),
+            "max_context_tokens": thread.max_context_tokens,
             "alive": thread.is_alive(),
             "conversation_length": len(thread._worker_ctx.user_history) if thread._worker_ctx else 0,
         }

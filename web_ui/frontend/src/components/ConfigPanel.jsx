@@ -171,7 +171,7 @@ function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect,
 }
 
 
-function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, defaultConfigSaveMessage, onClearDefaultSaveStatus, workspaceId, sessionId, containerRebuildResult, onClearRebuildResult, selectedWorker, onSelectWorker }) {
+function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, defaultConfigSaveMessage, onClearDefaultSaveStatus, workspaceId, sessionId, containerRebuildResult, onClearRebuildResult, selectedWorker, onSelectWorker, isActive, activeSessionId, onClearWorker }) {
   const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error'
   const [showManageProviders, setShowManageProviders] = useState(false);
   const [providerVersion, setProviderVersion] = useState(0);  // incremented when a provider is saved
@@ -382,11 +382,11 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
       </div>
 
       {/* ── Worker Auto-Open Watcher (always running, no visual output) ── */}
-      <WorkerAutoOpenWatcher workspaceId={workspaceId} onSelectWorker={onSelectWorker} selectedWorker={selectedWorker} />
+      <WorkerAutoOpenWatcher workspaceId={workspaceId} onSelectWorker={onSelectWorker} onClearWorker={onClearWorker} selectedWorker={selectedWorker} sessionId={activeSessionId} isActive={isActive} />
 
       {/* ── Workspace Tab ──────────────────────────────────────────── */}
       {activeTab === 'workspace' && (
-        <WorkspacePanel workspaceId={workspaceId} sessionId={sessionId} selectedWorker={selectedWorker} onSelectWorker={onSelectWorker} />
+        <WorkspacePanel workspaceId={workspaceId} sessionId={sessionId} selectedWorker={selectedWorker} onSelectWorker={onSelectWorker} isActive={isActive} />
       )}
 
       {/* ── General Tab ──────────────────────────────────────────────── */}

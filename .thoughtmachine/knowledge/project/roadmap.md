@@ -165,6 +165,18 @@ Items with one-line dispositions so they don't clutter active thinking:
 | **F24 — Delta message updates (not full snapshot each turn)** | GUI engineer optimization. After security prompts. |
 | **F25 — Docker: long-running tasks, Dockerfile view in GUI, "ask user" for env changes** | Part of the workspace-centric security model. |
 | **F26 — KB: semantic search, central "meta KB" vs workspace KB distinction** | KB engineer. After notebook panel. |
+| **F27 — GitInfoTool: add fetch/push operations** | The tool's write ops (commit/init/clone) are good for now. fetch (safe, read-only network) and push (natural pair with commit) were discussed. Pull/merge/rebase rejected due to conflict risk. **Parked — revisit when write-op demand increases.** See KB conversation history. |
+| **F28 — WorkerOutputPanel styling ≠ ChatPanel styling** | Two completely separate component trees with separate CSS class systems (`.message-*` vs `.worker-event-*`), different HTML structure, different data models, no shared rendering primitives. Worker panel also lacks Markdown rendering. To unify: extract shared MessageBubble component or map event data to ChatPanel message format. **Parked — cosmetic, not functional.** |
+
+*(Items already in roadmap — not duplicated: live logging toggle F15, streaming Phase 6, sysprompt library F7, async multi-agent F13)*
+| **F26 — KB: semantic search, central "meta KB" vs workspace KB distinction** | KB engineer. After notebook panel. |
+| **F27 — GitInfoTool: add fetch/push operations** | The tool's write ops (commit/init/clone) are good for now. fetch (safe, read-only network) and push (natural pair with commit) were discussed. Pull/merge/rebase rejected due to conflict risk. **Parked — revisit when write-op demand increases.** See KB conversation history. |
+| **F28 — WorkerOutputPanel styling ≠ ChatPanel styling** | Two completely separate component trees with separate CSS class systems (`.message-*` vs `.worker-event-*`), different HTML structure, different data models, no shared rendering primitives. Worker panel also lacks Markdown rendering. To unify: extract shared MessageBubble component or map event data to ChatPanel message format. **Parked — cosmetic, not functional.** |
+
+*(Items already in roadmap — not duplicated: live logging toggle F15, streaming Phase 6, sysprompt library F7, async multi-agent F13)*
+| **F26 — KB: semantic search, central "meta KB" vs workspace KB distinction** | KB engineer. After notebook panel. |
+| **F27 — GitInfoTool: add fetch/push operations** | The tool's write ops (commit/init/clone) are good for now. fetch (safe, read-only network) and push (natural pair with commit) were discussed. Pull/merge/rebase rejected due to conflict risk. **Parked — revisit when write-op demand increases.** See KB conversation history. |
+| **F28 — WorkerOutputPanel styling ≠ ChatPanel styling** | Two completely separate component trees with separate CSS class systems (`.message-*` vs `.worker-event-*`), different HTML structure, different data models, no shared rendering primitives. Worker panel also lacks Markdown rendering. To unify: extract shared MessageBubble component or map event data to ChatPanel message format. **Parked — cosmetic, not functional.** |
 
 *(Items already in roadmap — not duplicated: live logging toggle F15, streaming Phase 6, sysprompt library F7, async multi-agent F13)*
 

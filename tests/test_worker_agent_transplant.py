@@ -1226,3 +1226,88 @@ class TestWorkerConfigForwarding:
         assert perms.network == 'banned'
         assert perms.execution == 'banned'
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# Token estimation tests
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestTokenEstimation:
+    """WorkerContext.estimated_context_tokens() and WorkerThread token methods."""
+
+    def test_context_tokens_returns_int(self):
+        """estimated_context_tokens() should return a positive integer for non-empty history."""
+        ctx = WorkerContext(session_id="token-test-001")
+        ctx.user_history = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Hello, how are you?"},
+            {"role": "assistant", "content": "I'm doing well, thank you!"},
+        ]
+
+        tokens = ctx.estimated_context_tokens()
+
+        assert isinstance(tokens, int), f"Expected int, got {type(tokens)}"
+        assert tokens > 0, f"Expected positive token count, got {tokens}"
+
+    def test_context_tokens_empty_history(self):
+        """estimated_context_tokens() should return 0 for empty history."""
+        ctx = WorkerContext(session_id="token-test-002")
+        ctx.user_history = []
+
+        tokens = ctx.estimated_context_tokens()
+
+        assert tokens == 0, f"Expected 0 for empty history, got {tokens}"
+        assert isinstance(tokens, int)
+
+    def test_context_tokens_with_long_content(self):
+        """estimated_context_tokens() should scale with content length."""
+        ctx = WorkerContext(session_id="token-test-003")
+        short_msg = {"role": "user", "content": "Hello"}
+        long_msg = {"role": "user", "content": "A" * 1000}
+
+        ctx.user_history = [short_msg]
+        short_tokens = ctx.estimated_context_tokens()
+
+        ctx.user_history = [long_msg]
+        long_tokens = ctx.estimated_context_tokens()
+
+        assert short_tokens < long_tokens, (
+            f"Short message ({short_tokens}) should have fewer tokens "
+            f"than long message ({long_tokens})"
+        )
+
+    def test_worker_thread_token_properties(self, worker_thread):
+        """WorkerThread should expose current_context_tokens and max_context_tokens."""
+        # worker_thread fixture creates a WorkerThread with _agent_config_dict
+        tokens = worker_thread.get_current_context_tokens()
+        max_tokens = worker_thread.max_context_tokens
+
+        assert isinstance(tokens, int)
+        assert isinstance(max_tokens, int) and max_tokens > 0
+
+    def test_max_context_tokens_from_model(self):
+        """max_context_tokens should derive from the model name in _agent_config_dict."""
+        from pathlib import Path
+        from tools.workspace.worker import WorkerThread
+
+        thread = WorkerThread(
+            name="token-model-test",
+            definition={"system_prompt": "test"},
+            agent_config={"model": "gpt-4o", "provider": "openai"},
+            workspace_dir=Path("/tmp"),
+        )
+        assert thread.max_context_tokens == 128000, (
+            f"Expected 128000 for gpt-4o, got {thread.max_context_tokens}"
+        )
+
+        thread2 = WorkerThread(
+            name="token-model-test-2",
+            definition={"system_prompt": "test"},
+            agent_config={"model": "gpt-4-32k", "provider": "openai"},
+            workspace_dir=Path("/tmp"),
+        )
+        assert thread2.max_context_tokens == 32768
+        assert thread2.max_context_tokens != 128000, (
+            "Different models should return different context windows"
+        )
+

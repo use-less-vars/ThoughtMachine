@@ -199,6 +199,9 @@ async def get_workers(ws_id: str):
                             "current_task": data.get("current_task"),
                             "last_heartbeat": data.get("last_heartbeat"),
                             "error": data.get("error"),
+                            "session_id": data.get("session_id"),
+                            "current_context_tokens": data.get("current_context_tokens"),
+                            "max_context_tokens": data.get("max_context_tokens"),
                         }
                     except (json.JSONDecodeError, OSError):
                         pass
@@ -220,11 +223,17 @@ async def get_workers(ws_id: str):
             entry["current_task"] = runtime_statuses[name]["current_task"]
             entry["last_heartbeat"] = runtime_statuses[name]["last_heartbeat"]
             entry["error"] = runtime_statuses[name]["error"]
+            entry["session_id"] = runtime_statuses[name]["session_id"]
+            entry["current_context_tokens"] = runtime_statuses[name]["current_context_tokens"]
+            entry["max_context_tokens"] = runtime_statuses[name]["max_context_tokens"]
         else:
             entry["runtime_status"] = None
             entry["current_task"] = None
             entry["last_heartbeat"] = None
             entry["error"] = None
+            entry["session_id"] = None
+            entry["current_context_tokens"] = None
+            entry["max_context_tokens"] = None
         entry["has_persisted_context"] = name in persisted_names
         result.append(entry)
 

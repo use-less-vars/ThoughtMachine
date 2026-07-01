@@ -43,6 +43,11 @@ function elapsedTime(startIso) {
   return `${mins}m ${secs}s`;
 }
 
+function formatTokens(n) {
+  if (n == null) return '—';
+  return n >= 1000 ? (n / 1000).toFixed(1) + 'K' : String(n);
+}
+
 function truncate(str, maxLen) {
   if (!str) return '';
   return str.length > maxLen ? str.slice(0, maxLen) + '…' : str;
@@ -60,7 +65,7 @@ function NewEventsButton({ onClick }) {
 }
 
 // ── Main component ────────────────────────────────────────────────────
-function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
+function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose }) {
   // Panel resize state (self-contained)
   const [panelWidth, setPanelWidth] = useState(PANEL_DEFAULT);
   const dragRef = useRef(null);
@@ -290,13 +295,8 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
 
     switch (evt.event) {
       case 'user_message':
-        return (
-          <div key={key} className="worker-event worker-event-user">
-            <div className="worker-event-bubble">
-              {evt.request?.query || JSON.stringify(evt.request)}
-            </div>
-          </div>
-        );
+        // Suppress — user's own query is already visible in main chat panel
+        return null;
 
       case 'tool_call':
         const toolName = evt.request?.tool || 'unknown';
@@ -409,16 +409,8 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
         );
 
       case 'query':
-        // Old format — treat like user_message
-        return (
-          <div key={key} className="worker-event worker-event-user">
-            <div className="worker-event-bubble">
-              {typeof evt.request === 'string'
-                ? evt.request
-                : evt.request?.query || JSON.stringify(evt.request)}
-            </div>
-          </div>
-        );
+        // Suppress — same as user_message, shown in main chat
+        return null;
 
       default:
         // Unknown event type — show raw JSON
@@ -486,7 +478,7 @@ function WorkerOutputPanel({ workspaceId, workerName, onClose }) {
             Worker: {workerName}
           </span>
           <span className="worker-output-header-ctx">
-            ctx —
+            ctx: {workerInfo ? `${formatTokens(workerInfo.current_context_tokens)} / ${formatTokens(workerInfo.max_context_tokens)}` : '—'}
           </span>
           <div style={{ flex: 1 }} />
           {workerInfo?.current_task && (

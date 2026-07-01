@@ -526,6 +526,8 @@ export default function App() {
                   onSessionRenamed={handleSessionRenamed}
                   selectedWorker={selectedWorker}
                   onSelectWorker={handleSelectWorker}
+                  activeSessionId={activeSessionId}
+                  onClearWorker={handleCloseWorkerPanel}
                 />
               </div>
             ))

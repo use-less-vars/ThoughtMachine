@@ -276,7 +276,7 @@ function WorkerDot({ status }) {
 // ── Worker Auto-Open Watcher (always-running, no visual output) ───────────
 // Polls worker status and auto-opens the output panel when a worker
 // transitions to ready/busy. Renders nothing — can be placed anywhere.
-export function WorkerAutoOpenWatcher({ workspaceId, onSelectWorker, selectedWorker }) {
+export function WorkerAutoOpenWatcher({ workspaceId, onSelectWorker, onClearWorker, selectedWorker, sessionId, isActive }) {
   const [workers, setWorkers] = useState([]);
 
   // Track previously seen (name, runtime_status) pairs
@@ -300,6 +300,7 @@ export function WorkerAutoOpenWatcher({ workspaceId, onSelectWorker, selectedWor
 
   // Auto-open panel when a worker appears or transitions to 'running'
   useEffect(() => {
+    if (!isActive) return;
     const currentMap = new Map(workers.map(w => [w.name, w.runtime_status]));
     const prev = prevStatusMapRef.current;
 
@@ -320,27 +321,38 @@ export function WorkerAutoOpenWatcher({ workspaceId, onSelectWorker, selectedWor
     }
 
     prevStatusMapRef.current = currentMap;
-  }, [workers, workspaceId, onSelectWorker]);
+  }, [workers, workspaceId, onSelectWorker, isActive]);
+
+  // If selectedWorker is set but doesn't match any active worker for this session, clear it
+  useEffect(() => {
+    if (!isActive) return;
+    if (selectedWorker && workers.length === 0) {
+      onClearWorker?.();
+    }
+  }, [isActive, selectedWorker, workers, onClearWorker]);
 
   // Poll workers every 3s
   useEffect(() => {
-    if (!workspaceId) return;
+    if (!workspaceId || !isActive) return;
     const fetchWorkers = () => {
       fetch(`/api/workspace/${workspaceId}/workers`)
         .then(res => res.ok ? res.json() : [])
-        .then(data => setWorkers(Array.isArray(data) ? data : []))
+        .then(data => {
+          const filtered = Array.isArray(data) ? data.filter(w => !sessionId || w.session_id === sessionId) : [];
+          setWorkers(filtered);
+        })
         .catch(() => setWorkers([]));
     };
     fetchWorkers();
     const interval = setInterval(fetchWorkers, 3000);
     return () => clearInterval(interval);
-  }, [workspaceId]);
+  }, [workspaceId, isActive, sessionId]);
 
   return null;
 }
 
 // ── Section: Workers ─────────────────────────────────────────────────────
-function WorkersSection({ workspaceId, onSelectWorker, selectedWorker }) {
+function WorkersSection({ workspaceId, onSelectWorker, selectedWorker, sessionId }) {
   const [workers, setWorkers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [stopErrors, setStopErrors] = useState({}); // name -> error message (clears after 3s)
@@ -406,7 +418,7 @@ function WorkersSection({ workspaceId, onSelectWorker, selectedWorker }) {
       .then(async (res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        setWorkers(Array.isArray(data) ? data : []);
+        setWorkers(Array.isArray(data) ? data.filter(w => !sessionId || w.session_id === sessionId) : []);
       })
       .catch(() => setWorkers([]))
       .finally(() => setLoading(false));
@@ -446,7 +458,7 @@ function WorkersSection({ workspaceId, onSelectWorker, selectedWorker }) {
   }, []);
 
   if (loading) return <div style={{ color: '#6c7086', fontSize: '0.85rem' }}>Loading workers…</div>;
-  if (workers.length === 0) return <div style={{ color: '#6c7086', fontSize: '0.85rem' }}>No workers running.</div>;
+  if (workers.length === 0) return <div style={{ color: '#6c7086', fontSize: '0.85rem' }}>No workers running for this session.</div>;
 
   return (
     <>
@@ -582,7 +594,7 @@ function EffectivePermissionsSection({ workspaceId, sessionId }) {
 }
 
 // ── Main WorkspacePanel ──────────────────────────────────────────────────
-export default function WorkspacePanel({ workspaceId, sessionId, onSelectWorker, selectedWorker }) {
+export default function WorkspacePanel({ workspaceId, sessionId, onSelectWorker, selectedWorker, isActive }) {
   if (!workspaceId) {
     return (
       <div style={{ color: '#6c7086', fontSize: '0.85rem', padding: '1rem 0', textAlign: 'center' }}>
@@ -611,7 +623,7 @@ export default function WorkspacePanel({ workspaceId, sessionId, onSelectWorker,
       {/* Workers */}
       <div style={sectionStyle}>
         <label style={labelStyle}><strong>Workers</strong></label>
-        <WorkersSection workspaceId={workspaceId} onSelectWorker={onSelectWorker} selectedWorker={selectedWorker} />
+        <WorkersSection workspaceId={workspaceId} onSelectWorker={onSelectWorker} selectedWorker={selectedWorker} sessionId={sessionId} />
       </div>
 
       {/* Effective Permissions */}

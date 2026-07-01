@@ -212,7 +212,7 @@ class ToolExecutor:
             except ValidationError as e:
                 # Provide LLM-friendly error with valid field names
                 try:
-                    infra_fields = {"workspace_path", "token_limit", "is_docker", "container_workspace_path", "tool", "agent_config", "session_permissions"}
+                    infra_fields = {"workspace_path", "token_limit", "is_docker", "container_workspace_path", "tool", "agent_config", "session_permissions", "session_id"}
                     valid_fields = [f for f in valid_field_names if f not in infra_fields]
                     valid_fields_str = ', '.join(valid_fields)
                     return {'result': f'Invalid arguments: {e}\n\nValid fields: {valid_fields_str}', 'tool_type': 'normal'}
@@ -269,7 +269,21 @@ class ToolExecutor:
             else:
                 tool_args['agent_config'] = None
 
-            tool_instance = tool_class(**tool_args)
+            # Inject session_id only for tools that support it (e.g. Worker)
+            if 'session_id' in valid_field_names:
+                tool_args['session_id'] = session_id
+
+            try:
+                tool_instance = tool_class(**tool_args)
+            except ValidationError:
+                # Safety net: if an injected infra field isn't accepted by this
+                # tool (e.g. a field was added unconditionally instead of gated),
+                # strip any key not in the model and retry once.
+                valid = set(tool_class.model_fields.keys())
+                for key in list(tool_args.keys()):
+                    if key not in valid:
+                        tool_args.pop(key)
+                tool_instance = tool_class(**tool_args)
             if self.logger:
                 if hasattr(self.logger, 'py_logger'):
                     tool_instance._set_logger(self.logger.py_logger)
