@@ -215,6 +215,9 @@ class WorkerThread(threading.Thread):
         self.last_heartbeat: Optional[str] = None
         self._last_reasoning: Optional[str] = None
 
+        # Cached authoritative token count from agent's token_update events
+        self._cached_context_tokens: Optional[int] = None
+
         # Agent instance + WorkerContext (created lazily in run())
         self._agent: Optional[Any] = None
         self._worker_ctx: Optional[Any] = None
@@ -260,14 +263,18 @@ class WorkerThread(threading.Thread):
 
     def get_current_context_tokens(self) -> int:
         """
-        Estimate the current conversation's token count.
+        Return the current conversation's token count.
 
-        Delegates to ``WorkerContext.estimated_context_tokens()``.
-        Returns 0 if the worker context has not been initialised yet.
+        Uses the authoritative post-prune count cached from the agent's
+        ``token_update`` events when available. Falls back to estimation
+        via ``WorkerContext.estimated_context_tokens()`` if no
+        ``token_update`` event has been received yet.
 
         Returns:
-            Estimated token count (int).
+            Token count (int).
         """
+        if self._cached_context_tokens is not None:
+            return self._cached_context_tokens
         if self._worker_ctx is not None:
             return self._worker_ctx.estimated_context_tokens()
         return 0
@@ -538,6 +545,26 @@ class WorkerThread(threading.Thread):
                         },
                     )
 
+                # Log system notifications emitted by the agent (e.g., context summarization)
+                if event_type == "system_notification":
+                    message = event.get("message", "")
+                    context_length = event.get("context_length", 0)
+                    self._log_event(
+                        "system_notification",
+                        {},
+                        {
+                            "type": "context_summarized",
+                            "message": str(message)[:500],
+                            "context_length": context_length,
+                        },
+                    )
+
+                # Cache the agent's authoritative post-prune token count
+                if event_type == "token_update":
+                    context_length = event.get("context_length")
+                    if context_length is not None:
+                        self._cached_context_tokens = int(context_length)
+
                 # Keep legacy tool_execution handler for backward compatibility
                 if event_type == "tool_execution":
                     tool_name = event.get("tool_name", "")
@@ -590,6 +617,8 @@ class WorkerThread(threading.Thread):
                         "role": "system",
                         "content": f"Initial context: {json.dumps(self._initial_context, default=str)}",
                     })
+                # Reset cached token count for a fresh run
+                self._cached_context_tokens = None
                 self._worker_ctx = WorkerContext(
                     worker_name=self.worker_name,
                     user_history=user_history,
