@@ -15,6 +15,45 @@ from agent.models.worker_definition import WorkerDefinition
 
 
 # ---------------------------------------------------------------------------
+# Template file validation
+# ---------------------------------------------------------------------------
+
+TEMPLATE_DIR = Path("resources/worker_templates")
+TEMPLATE_NAMES = ["coder.json", "reviewer.json", "researcher.json"]
+
+
+class TestTemplates:
+    def test_all_templates_load_from_disk(self):
+        """Every template in resources/worker_templates/ validates."""
+        for name in TEMPLATE_NAMES:
+            path = TEMPLATE_DIR / name
+            assert path.exists(), f"Missing template: {path}"
+            data = json.loads(path.read_text())
+            wd = WorkerDefinition.model_validate(data)
+            assert wd.name in path.stem, f"name mismatch in {name}"
+
+    def test_coder_has_write_permissions(self):
+        """Coder template has filesystem write + docker execution."""
+        data = json.loads((TEMPLATE_DIR / "coder.json").read_text())
+        wd = WorkerDefinition.model_validate(data)
+        assert wd.permission_footprint.get("filesystem") == "write"
+        assert wd.permission_footprint.get("execution") == "docker"
+
+    def test_reviewer_read_only(self):
+        """Reviewer template has filesystem read only."""
+        data = json.loads((TEMPLATE_DIR / "reviewer.json").read_text())
+        wd = WorkerDefinition.model_validate(data)
+        assert wd.permission_footprint.get("filesystem") == "read"
+        assert "write" not in wd.permission_footprint.values()
+
+    def test_researcher_read_only(self):
+        """Researcher template has filesystem read only."""
+        data = json.loads((TEMPLATE_DIR / "researcher.json").read_text())
+        wd = WorkerDefinition.model_validate(data)
+        assert wd.permission_footprint.get("filesystem") == "read"
+
+
+# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
