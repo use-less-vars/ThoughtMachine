@@ -163,10 +163,11 @@ class WorkerThread(threading.Thread):
 
     Lifecycle
     ---------
-    idle  ──spawn──▶  running  ──response──▶  running  ──stop──▶  completed
-                        │                                              │
-                        └──error──▶  failed                            │
-                                                    ◄──  idle on restart
+    ready  ──spawn──▶  ready  ──query──▶  busy  ──done──▶  ready
+      ▲                    │                                  │
+      │                    ├──stop──▶  completed               │
+      │                    └──error──▶  error                  │
+      └───────────────────────────  spawn again  ◄─────────────┘
     """
 
     def __init__(
@@ -206,7 +207,7 @@ class WorkerThread(threading.Thread):
         )
 
         # Runtime state
-        self.status: str = "idle"      # idle | running | completed | failed
+        self.status: str = "ready"      # ready | busy | completed | error
         self.current_task: Optional[str] = None
         self.error: Optional[str] = None
         self.last_heartbeat: Optional[str] = None
@@ -367,6 +368,9 @@ class WorkerThread(threading.Thread):
 
         try:
             for event in self._agent.process_query(query):
+                # Fix 1.1B: Poll for stop command on every event
+                self._poll_command()
+
                 # Log heartbeat for liveliness checks
                 self.last_heartbeat = datetime.now(timezone.utc).isoformat()
 
@@ -522,7 +526,7 @@ class WorkerThread(threading.Thread):
             self._worker_ctx = self._load_context()
 
             # Override persisted status/error with live thread state
-            self.status = "running"
+            self.status = "ready"
             self.error = None
             self._write_status_file()
             if self._worker_ctx is None:
@@ -583,8 +587,13 @@ class WorkerThread(threading.Thread):
                         session=self._worker_ctx,
                     )
 
-                # ── Process the query via Agent ───────────────────────
+                # ── Fix 1.2: Set busy before processing query ───────────
+                self.status = "busy"
+                self._write_status_file()
                 reply = self._run_tool_loop(query)
+                # Back to ready after query completes
+                self.status = "ready"
+                self._write_status_file()
 
                 self.current_task = None
                 self.last_heartbeat = datetime.now(timezone.utc).isoformat()
@@ -603,7 +612,7 @@ class WorkerThread(threading.Thread):
 
         except Exception as exc:
             logger.exception("Worker thread %s failed", self.worker_name)
-            self.status = "failed"
+            self.status = "error"
             self.error = str(exc)
             self._write_status_file()
             # Put the error into the output queue so any waiting query call gets it
@@ -636,7 +645,7 @@ class WorkerThread(threading.Thread):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 ctx = WorkerContext.from_persistable_dict(data)
-                self.status = data.get("status", "idle")
+                self.status = data.get("status", "ready")
                 self.error = data.get("error")
                 self.last_heartbeat = data.get("last_heartbeat")
                 return ctx
@@ -1047,6 +1056,16 @@ class Worker(ToolBase):
         # Store initial context for the thread to pick up in run()
         if self.context is not None and isinstance(self.context, dict):
             thread._initial_context = self.context
+
+        # ── Fix 1.1A: Clean up stale command.json before starting ──
+        cmd_path = thread._worker_dir / "command.json"
+        if cmd_path.exists():
+            cmd_path.unlink(missing_ok=True)
+        
+        # ── Fix 1.3: Fresh context on every spawn ──
+        ctx_path = thread._context_path()
+        if ctx_path.exists():
+            ctx_path.unlink(missing_ok=True)
 
         with _registry_lock:
             _worker_registry[self.worker_name] = thread

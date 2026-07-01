@@ -120,7 +120,7 @@ class TestCheckSystem:
         mock_workers = MagicMock()
         mock_workers.exists.return_value = True
         mock_workers.read_text.return_value = json.dumps([
-            {"name": "worker1", "status": "idle"},
+            {"name": "worker1", "status": "ready"},
         ])
 
         # Mock mcp_servers.json
@@ -155,7 +155,7 @@ class TestCheckSystem:
         assert "domain_allowlist" in result
         assert "workers" in result
         assert "mcp_tools" in result
-        assert result["workers"] == [{"name": "worker1", "status": "idle"}]
+        assert result["workers"] == [{"name": "worker1", "status": "ready"}]
 
     def test_query_my_config(self):
         """my_config returns agent_config as JSON string."""
@@ -444,7 +444,7 @@ class TestWorker:
             workspace_dir=tmp_path,
         )
         assert thread.worker_name == "test_worker"
-        assert thread.status == "idle"
+        assert thread.status == "ready"
         assert thread.conversation == []
         assert thread.current_task is None
         assert thread.error is None
@@ -462,7 +462,7 @@ class TestWorker:
             {"role": "system", "content": "You are a test."},
             {"role": "user", "content": "Hello"},
         ]
-        thread.status = "running"
+        thread.status = "busy"
         thread.last_heartbeat = "2025-01-01T00:00:00"
         thread._save_context()
 
@@ -479,7 +479,7 @@ class TestWorker:
         )
         assert len(thread2.conversation) == 2
         assert thread2.conversation[1]["content"] == "Hello"
-        assert thread2.status == "running"
+        assert thread2.status == "busy"
 
     def test_resume_worker_loads_current_system_prompt(self, tmp_path: Path, caplog):
         """
@@ -494,7 +494,7 @@ class TestWorker:
                 {"role": "user", "content": "Hello"},
                 {"role": "assistant", "content": "Hi there!"},
             ],
-            "status": "idle",
+            "status": "ready",
         }
         context_path = tmp_path / "workers" / "resume_test" / "context.json"
         context_path.parent.mkdir(parents=True)
@@ -594,7 +594,7 @@ class TestWorker:
         mock_file = MagicMock()
         mock_file.exists.return_value = True
         mock_file.read_text.return_value = json.dumps([
-            {"name": "coder", "status": "idle", "permission_subset": ["execution:read"], "last_heartbeat": None},
+            {"name": "coder", "status": "ready", "permission_subset": ["execution:read"], "last_heartbeat": None},
         ])
         mock_dir.__truediv__.return_value = mock_file
         mock_ws_dir.return_value = mock_dir
@@ -626,14 +626,14 @@ class TestWorker:
         mock_file = MagicMock()
         mock_file.exists.return_value = True
         mock_file.read_text.return_value = json.dumps([
-            {"name": "coder", "status": "idle"},
+            {"name": "coder", "status": "ready"},
         ])
         mock_dir.__truediv__.return_value = mock_file
         mock_ws_dir.return_value = mock_dir
         mock_build_llm.return_value = MagicMock()
 
         mock_thread = MagicMock()
-        mock_thread.status = "idle"
+        mock_thread.status = "ready"
         mock_thread_cls.return_value = mock_thread
 
         tool = Worker(
@@ -645,7 +645,7 @@ class TestWorker:
         result = _parse_result(tool.execute())
         assert result["spawned"] is True
         assert result["worker_name"] == "coder"
-        assert result["status"] == "idle"
+        assert result["status"] == "ready"
         mock_thread.start.assert_called_once()
 
     @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
@@ -656,7 +656,7 @@ class TestWorker:
         mock_file = MagicMock()
         mock_file.exists.return_value = True
         mock_file.read_text.return_value = json.dumps([
-            {"name": "coder", "status": "idle"},
+            {"name": "coder", "status": "ready"},
         ])
         mock_dir.__truediv__.return_value = mock_file
         mock_ws_dir.return_value = mock_dir
@@ -679,7 +679,7 @@ class TestWorker:
         mock_file = MagicMock()
         mock_file.exists.return_value = True
         mock_file.read_text.return_value = json.dumps([
-            {"name": "coder", "status": "idle"},
+            {"name": "coder", "status": "ready"},
         ])
         mock_dir.__truediv__.return_value = mock_file
         mock_ws_dir.return_value = mock_dir
@@ -847,7 +847,7 @@ class TestWorker:
         mock_build_llm.return_value = MagicMock()
 
         mock_thread = MagicMock()
-        mock_thread.status = "idle"
+        mock_thread.status = "ready"
         mock_thread_cls.return_value = mock_thread
 
         tool = Worker(
@@ -897,7 +897,7 @@ class TestWorker:
         mock_build_llm.return_value = MagicMock()
 
         mock_thread = MagicMock()
-        mock_thread.status = "idle"
+        mock_thread.status = "ready"
         mock_thread_cls.return_value = mock_thread
 
         tool = Worker(

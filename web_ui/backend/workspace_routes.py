@@ -164,7 +164,7 @@ async def get_workers(ws_id: str):
 
     Each worker entry includes:
       - Config fields from workers.json (name, system_prompt, tool_classes, etc.)
-      - runtime_status:  "running" | "completed" | "failed" | "idle" | None
+      - runtime_status:  "ready" | "busy" | "completed" | "error" | None
       - current_task:    current activity description (if running)
       - last_heartbeat:  ISO-8601 timestamp of last activity
       - error:           error message (if failed)
