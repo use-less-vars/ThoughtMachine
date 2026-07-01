@@ -738,3 +738,45 @@ cd web_ui/frontend && VITE_PORT=5174 VITE_BACKEND_PORT=8001 npm run dev
 - `web_ui/frontend/src/components/ConfigPanel.jsx` — env var for API base URL
 
 Backend (`server.py`) already supported `--port` and `PORT` env var from earlier work.
+
+## 2026-07-01 — ## 2026-07-02 — Master Vault: Design Principles (10 Sacred R...
+
+## 2026-07-02 — Master Vault: Design Principles (10 Sacred Rules)
+
+These are the core design principles that guide all architecture decisions. They should not be violated without explicit deliberation.
+
+### Rule 1: Workers are Agents with Restricted Tools
+Workers reuse the agent's reasoning loop. They are not scripts or plugins — they are full agents that happen to have fewer tools and a narrower context. This ensures consistency, debugability, and future extensibility.
+
+### Rule 2: Separation of Agent and Host
+The agent should never need direct access to the host filesystem, Docker daemon, or network beyond what tools expose. The Host is the boundary. The agent operates inside tool-mediated constraints.
+
+### Rule 3: Events are the Universal Language
+All state changes should flow through events. No direct method calls between subsystems. The EventBus is the nervous system. This decouples components and enables real-time UI updates.
+
+### Rule 4: Persistence is Transparent
+Sessions, configs, and state should serialize and deserialize without custom migration scripts. If you need a migration, the persistence model is wrong.
+
+### Rule 5: The UI is a Client, Not the System
+The Web UI is one client among many (CLI, API, future clients). All logic lives in the backend. The frontend is a rendering layer, not a decision-maker.
+
+### Rule 6: Security Defaults to Deny
+Permissions should default to the most restrictive safe state. Users explicitly grant access. This prevents accidental exposure and follows least-privilege principles.
+
+### Rule 7: Config is Code
+Configuration files should be treated as code: version-controlled, validated, and structured. No magic strings, no undocumented keys. Config schemas should be explicit and typed.
+
+### Rule 8: One Source of Truth for State
+No duplicated state between frontend and backend. The backend owns state; the frontend reflects it. Avoid local state that mirrors server state.
+
+### Rule 9: Fail Closed, Not Open
+When in doubt about permissions, connectivity, or state validity, refuse the operation and report the issue. Silent failures are bugs. Defensive checks are welcome.
+
+### Rule 10: Test the Boundaries
+Unit test the internals, integration test the boundaries (tool interface, event bus, persistence, WebSocket bridge). E2E tests cover the happy path. Edge cases live in integration tests.
+
+### Deriving Sprints from Principles
+- Panel Unification (Sprint 1-3): Upholds Rule 8 (one source of truth) and Rule 5 (UI is client)
+- Worker Config Panel: Upholds Rule 1 (workers are agents) and Rule 6 (security defaults)
+- Container Persistence: Upholds Rule 4 (persistence is transparent)
+- Security Defaults: Upholds Rule 6 (default to deny) and Rule 9 (fail closed)

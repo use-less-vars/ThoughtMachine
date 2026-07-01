@@ -450,6 +450,8 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose }) {
     );
   }
 
+  const latestEvent = events.length > 0 ? events[events.length - 1] : null;
+
   // ── Render ────────────────────────────────────────────────────────────
   return (
     <div className="worker-output-wrapper">
@@ -480,8 +482,8 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose }) {
           <span className="worker-output-header-label">
             Worker: {workerName}
           </span>
-          <span className={`worker-output-header-ctx${runtimeStatus === 'busy' ? ' worker-busy' : ''}`}>
-            ctx: {workerInfo ? `${formatTokens(workerInfo.current_context_tokens)} / ${formatTokens(workerInfo.max_context_tokens)}` : '—'}
+          <span className="worker-output-header-ctx">
+            ctx: {(workerInfo || events.length > 0) ? `${formatTokens(latestEvent?.current_context_tokens ?? workerInfo?.current_context_tokens ?? 0)} / ${formatTokens(latestEvent?.max_context_tokens ?? workerInfo?.max_context_tokens ?? 0)}` : '—'}
           </span>
           <div style={{ flex: 1 }} />
           {workerInfo?.current_task && (

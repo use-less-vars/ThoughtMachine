@@ -2568,3 +2568,96 @@ Fields written:
 - `error`: error message (or null)
 
 This file is written atomically (temp file + `os.replace`) to avoid partial reads.
+
+## 2026-07-01 — ## 2026-07-02 — Master Vault: Completed & Stable — Core Arch...
+
+## 2026-07-02 — Master Vault: Completed & Stable — Core Architecture
+
+### Tool System
+- Tool interface (ToolResult, ToolSpec), ApplyEdits, search tools, FileEditor, DockerCodeRunner
+- Tool output truncation (framework-level with opt-out)
+- Error handling: clean error returns, no raw tracebacks exposed to agent
+
+### Multi-Provider LLM System
+- llm_providers/ with Anthropic, OpenAI, Google (Gemini), OpenRouter
+- ProviderManager with automatic failover, unified completion interface
+- Config-driven provider selection
+
+### Hub Controller
+- Central orchestrator: spawn, route events, manage sessions
+- Handles config changes, WebSocket upgrades, agent-worker interactions
+- EventBus abstraction with NullEventBus for testing
+
+### Session Lifecycle
+- SessionStore, SessionPersistence, session naming, save/load/rename/delete
+- Sessions directory per-workspace (config/sessions/)
+
+### Event Streaming
+- EventBus → Bridge → WebSocket client
+- System notifications, agent messages, tool calls/results
+- Event deduplication and type filtering
+
+### WebSocket Bridge
+- Real-time bidirectional communication between backend agent and frontend
+- Session isolation (per-tab bridges)
+- Event types: agent_responded, tool_use, tool_result, system_notification, error, final
+
+### UI Panels
+- ChatPanel, ConfigPanel, SessionPanel, WorkspacePanel, ContainerPanel, PermissionPanel
+- Component-based architecture with shared hooks (useSession, useBridge)
+- Multi-tab session support with lazy WebSocket connection
+
+## 2026-07-01 — ## 2026-07-02 — Master Vault: Completed & Stable — Worker Sy...
+
+## 2026-07-02 — Master Vault: Completed & Stable — Worker System (Transplant)
+
+### WorkerThread Implementation
+- WorkerThread extends threading.Thread with dedicated agent loop
+- Message-based IPC via queues: command queue (incoming) and event queue (outgoing)
+- WorkerContext holds session_id, worker_name, permissions, timeout_seconds
+- WorkerToolUseLoop: tool selection, execution, result collection
+- Tool stripping: Workers get a restricted toolset (no DockerCodeRunner, no Write, limited permissions)
+- Worker permissions model: read, write, execute, network with string levels ('allow', 'deny', 'ask')
+
+### Worker Status & Lifecycle
+- Status enum: IDLE, RUNNING, WAITING, COMPLETED, FAILED, TERMINATED
+- Worker state machine: spawn → running → paused/completed/terminated
+- Workspace-aware path resolution for worker tools
+- Worker tool safety assessment completed (all tools mapped)
+
+### Worker IPC Events
+- worker_spawned, worker_output, worker_tool_use, worker_tool_result, worker_status_change, worker_completed, worker_error
+- Real-time status reporting via WorkerDot (green=idle, yellow=running, red=error, grey=inactive)
+- Polling-based context size updates (limitation: not streaming)
+
+### Worker Tool Safety
+- All tools assessed for worker safety
+- ReadFile: path traversal protection
+- Write operations: restricted for workers
+- DockerCodeRunner: excluded from worker toolset
+- MCP tools: excluded from worker toolset
+
+## 2026-07-01 — ## 2026-07-02 — Master Vault: Completed & Stable — GUI Worke...
+
+## 2026-07-02 — Master Vault: Completed & Stable — GUI Worker Panel
+
+### WorkerOutputPanel
+- React component showing worker stdout/stderr in real-time
+- Auto-opens when worker spawns (configurable)
+- Manual close + reopen support (reopening reconnects to event stream)
+- Resize bug fixed: panel height recalculated on content change
+- Event Viewer tab: raw worker event stream display
+
+### WorkerDot / WorkerStatusIndicator
+- Color-coded status: green (idle/ready), yellow (running), red (error), grey (inactive/stopped)
+- Frontend status mapping fixed (running/idle → proper enum values)
+
+### Worker Lifecycle (GUI)
+- Spawn: bridge.spawn_worker() → backend creates WorkerThread → GUI shows output panel
+- Stop: bridge.stop_worker() → TERMINATED signal → WorkerDot goes grey
+- Resume: Wire bridge.resume_worker() into Worker tool's spawn action (DONE)
+- Pre-configured workers auto-open output panel on session start
+
+### Known Worker GUI Limitations
+- Worker context size updated via polling, not streaming
+- Worker panel auto-opening from other tabs required extra event routing

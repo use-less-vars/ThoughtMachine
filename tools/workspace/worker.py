@@ -442,7 +442,7 @@ class WorkerThread(threading.Thread):
                         {},
                         {
                             "content": str(final_content)[:1000],
-                            "reasoning": bool(self._last_reasoning),
+                            "reasoning_content": str(self._last_reasoning)[:2000] if self._last_reasoning else None,
                             "response_type": event.get("response_type", "answer"),
                         },
                     )
@@ -794,6 +794,8 @@ class WorkerThread(threading.Thread):
             "event": event_type,
             "request": request,
             "response": response,
+            "current_context_tokens": self.get_current_context_tokens(),
+            "max_context_tokens": self.max_context_tokens,
         }
         events_path = self._events_path()
         try:

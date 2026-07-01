@@ -374,3 +374,57 @@ A slide-in panel (similar to VS Code's sidebar) that gives the user full visibil
 - `ensure_workspace_dirs()` creates all config files idempotently
 - 18 tests covering bootstrap + API endpoints all passing
 
+
+## 2026-07-01 — ## 2026-07-02 — Master Vault: Future Plans
+
+### 1. Workspace...
+
+## 2026-07-02 — Master Vault: Future Plans
+
+### 1. Workspace Config Panel 🟡 HIGH
+- GUI panel for managing workspaces (create, delete, switch, configure)
+- Backend workspace CRUD API exists, frontend panel needed
+
+### 2. Docker Containers 🟡 HIGH
+- Container persistence / resurrection across restarts
+- Container health monitoring with auto-restart
+- Container snapshots and rollback
+- Per-worker container isolation
+
+### 3. Permissions / Security 🟡 HIGH
+- Security defaults: deny-all with explicit allow
+- Granular tool-level permissions for workers
+- Permission presets (e.g., "safe coder", "file reader", "admin")
+- Audit logging for permission grants/denials
+
+### 4. MCP Integration 🟢 MEDIUM
+- Model Context Protocol server integration
+- Allow agents/workers to use MCP tools from configured servers
+- MCP server management UI
+
+### 5. Agent Capabilities 🟢 MEDIUM
+- Multi-agent collaboration (agents spawning sub-agents)
+- Agent memory/persistence improvement
+- Agent tool-use planning and optimization
+- Agent personas (system prompt profiles)
+
+### 6. Advanced Logging 🟢 MEDIUM
+- Dynamic log tag toggling from GUI
+- Centralized log viewer in frontend
+- Log search and filtering
+- Log export
+
+### 7. Config Distribution 🟢 MEDIUM
+- Sync/merge configs across machines
+- Config versioning and rollback
+- Shared team configurations
+
+### 8. Multi-Session Visibility 🟢 MEDIUM
+- View all sessions across all workspaces
+- Cross-session search and compare
+- Session templates
+
+### 9. Installer / First-Run Experience 🟢 LOW
+- One-click installer for Windows/Mac/Linux
+- First-run wizard: provider key setup, workspace init, guided tour
+- Auto-update mechanism

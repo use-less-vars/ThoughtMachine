@@ -864,15 +864,6 @@ body {
   white-space: nowrap;
 }
 
-.worker-output-header-ctx.worker-busy {
-  color: var(--accent-green, #a6e3a1);
-  animation: ctx-pulse 2s ease-in-out infinite;
-}
-
-@keyframes ctx-pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.6; }
-}
 
 .worker-output-header-task-inline {
   font-size: 0.78rem;
@@ -1125,8 +1116,8 @@ body {
 }
 .worker-event-system .worker-event-pill {
   display: inline-block;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border);
+  background: rgba(249, 226, 175, 0.12);
+  border: 1px solid rgba(249, 226, 175, 0.3);
   border-radius: 8px;
   padding: 0.3rem 0.7rem;
   font-size: 0.78rem;

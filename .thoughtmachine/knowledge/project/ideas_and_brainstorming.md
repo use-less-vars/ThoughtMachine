@@ -109,3 +109,56 @@ The pipelin...
 The pipeline already existed at `resources/global_kb/` → `~/.thoughtmachine/knowledge/system/` via `agent/knowledge/global_kb.py:ensure_global_kb()`. Our new `onboarding_guide.md` and `capabilities_reference.md` were placed in `~/.thoughtmachine/knowledge/user/` — the writable user area with no seed mechanism.
 
 **Resolution (Option A):** Moved content to `resources/global_kb/` and updated system prompt references from `user/` to `system/`. The files will now ship with TM and auto-sync on version changes like all other system-level KB docs.
+
+## 2026-07-01 — ## 2026-07-02 — Master Vault: Open Questions & Loose Threads...
+
+## 2026-07-02 — Master Vault: Open Questions & Loose Threads
+
+### Q1: Should the Bridge be split into multiple managers?
+The bridge god object grows with every feature. Options:
+- Split into SessionBridge, WorkerBridge, ConfigBridge
+- Keep unified but refactor internals (facade pattern)
+- Decision needed before Panel Unification Sprint 2
+
+### Q2: Should Workers share a container or each get one?
+- Shared container: resource-efficient, but no isolation between workers
+- Per-worker container: strong isolation, higher resource usage
+- Hybrid: default shared, opt-in per-worker isolation
+- Decision needed before container persistence feature
+
+### Q3: Should the default security model be deny-all or ask-first?
+- Deny-all: most secure, but poor UX (everything breaks until configured)
+- Ask-first: better UX, but normalizes granting permissions (habituation risk)
+- Middle ground: deny-all + guided first-run wizard
+- Decision needed before 1.0 release
+
+### Q4: What is the long-term role of the Worker?
+- Are workers sub-agents you talk to, or background automation scripts?
+- Different answers lead to different UI (chat-based vs log-based)
+- Current design: hybrid (chat + output panel)
+- Decision: revisit after Panel Unification
+
+### Q5: Should the config system support hot-swap or restart?
+- Hot-swap: seamless UX, but complex to implement correctly
+- Restart: simple, reliable, but disruptive
+- Current: mixed (some hot-swap, some restart)
+- Decision: full analysis done, but no final ruling
+
+### Q6: Should session state be fully ephemeral with optional save, or always persisted?
+- Ephemeral: simpler, faster, privacy-friendly
+- Always persisted: crash recovery, audit trail
+- Current: always persisted (sessions auto-save)
+- Decision: seems settled for now
+
+### Q7: Should we support multiple frontends (CLI, desktop, API)?
+- Currently: Web UI only (React)
+- CLI: useful for scripting and power users
+- Desktop: OS-native feel (Tauri/Electron)
+- API: programmatic access (REST + WebSocket already exists)
+- Decision: no active work, but architecture supports it (Rule 5)
+
+### Q8: Where should system prompt templates live?
+- Currently: hardcoded in Python, overridable via config
+- Option: move to config files entirely (YAML/markdown)
+- Option: allow user-defined prompt profiles/personas
+- Decision: Hot-swappable system prompts idea exists in roadmap
