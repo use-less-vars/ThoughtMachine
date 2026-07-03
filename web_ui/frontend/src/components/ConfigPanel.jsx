@@ -180,10 +180,9 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
       filesystem: 'read',
       network: 'banned',
       container: false,
-      security: 'read',
-      git: 'write',
+      system: 'read',
+      git: 'read',
       execution: 'banned',
-      system: true,
       ...(permissions ?? {}),
     };
 

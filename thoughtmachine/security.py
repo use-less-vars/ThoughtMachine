@@ -75,7 +75,7 @@ class SessionPermissions(BaseModel):
     - **container**:  Boolean — may the tool spawn containers?
     - **network**:    ``'banned' | 'ask' | 'write'`` (legacy booleans are accepted)
     - **filesystem**: ``'banned' | 'read' | 'write' | 'full' | 'ask'``
-    - **security**:   ``'banned' | 'read' | 'write' | 'full' | 'ask'``
+    - **system**:   ``'banned' | 'read' | 'write' | 'full' | 'ask'``
     - **git**:        ``'banned' | 'read' | 'write' | 'full' | 'ask'``
     - **execution**:  ``'banned' | 'read' | 'write' | 'full' | 'ask'``
     """
