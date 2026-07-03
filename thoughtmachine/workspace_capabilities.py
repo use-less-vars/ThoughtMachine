@@ -16,6 +16,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# Minimal validation for template workers (avoids circular import via agent.__init__)
+_REQUIRED_WORKER_FIELDS = {"name", "description", "system_prompt", "tools", "permission_footprint"}
+
+
+def _validate_worker_dict(data: dict) -> dict | None:
+    """Validate a worker dict has all required fields.  Returns the dict or
+    ``None`` if validation fails."""
+    missing = _REQUIRED_WORKER_FIELDS - set(data.keys())
+    if missing:
+        return None
+    if not isinstance(data.get("tools"), list):
+        return None
+    if not isinstance(data.get("permission_footprint"), dict):
+        return None
+    return data
+
 # ── Default user data directory ───────────────────────────────────────────────
 
 def _user_dir() -> Path:
@@ -280,10 +296,11 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
         domain_allowlist_path.write_text("[]", encoding="utf-8")
         created.append(str(domain_allowlist_path))
 
-    # ── workers.json (empty array) ────────────────────────────────────────
+    # ── workers.json (echo + template workers) ────────────────────────────
     workers_path = base / "workers.json"
     if not workers_path.exists():
-        workers_path.write_text("[]", encoding="utf-8")
+        workers_data = _build_default_workers()
+        _atomic_write_json(workers_path, workers_data)
         created.append(str(workers_path))
 
     # ── mcp_servers.json (empty array) ────────────────────────────────────
@@ -296,6 +313,105 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
     _safeguard_workspace_dir(base)
 
     return created
+
+
+# ── Worker template helpers ───────────────────────────────────────────────────
+
+
+def _default_echo_worker() -> dict:
+    """Return the echo test worker dict (always included in workers.json)."""
+    return {
+        "name": "echo",
+        "system_prompt": (
+            "You are Echo, a simple test worker. "
+            "Respond concisely and directly to any query."
+        ),
+        "required_categories": [],
+        "worker_permissions": {},
+        "permission_footprint": {},
+        "description": "Simple test worker for verifying the delegation loop",
+        "tools": ["FilePreviewTool"],
+    }
+
+
+def _load_template_workers() -> list[dict]:
+    """
+    Load template worker definitions from disk.
+
+    Checks ``~/.thoughtmachine/worker_templates/`` first, then falls back to
+    ``resources/worker_templates/``.  Each ``.json`` file is parsed, validated
+    with ``WorkerDefinition.model_validate()``, and converted to a dict.  Invalid
+    templates are logged as warnings and skipped.
+
+    Returns:
+        A list of dicts (valid template workers).
+    """
+    logger = logging.getLogger(__name__)
+
+    # Determine which directory to read templates from
+    user_template_dir = _user_dir() / "worker_templates"
+    if user_template_dir.is_dir() and any(user_template_dir.iterdir()):
+        template_dir = user_template_dir
+    else:
+        template_dir = _resources_dir() / "worker_templates"
+
+    if not template_dir.is_dir():
+        return []
+
+    workers: list[dict] = []
+
+    for fpath in sorted(template_dir.iterdir()):
+        if fpath.suffix != ".json":
+            continue
+        try:
+            raw = json.loads(fpath.read_text(encoding="utf-8"))
+            validated = _validate_worker_dict(raw)
+            if validated is None:
+                logger.warning(
+                    "Skipping invalid worker template %s (missing required fields)",
+                    fpath.name,
+                )
+                continue
+            workers.append(validated)
+        except Exception as exc:
+            logger.warning(
+                "Skipping invalid worker template %s: %s", fpath.name, exc
+            )
+
+    return workers
+
+
+def _build_default_workers() -> list[dict]:
+    """
+    Build the default workers list for a freshly bootstrapped workspace.
+
+    Starts with the echo test worker, then appends any template workers
+    (coder, researcher, reviewer) that do not share a name with an already-
+    present worker.
+    """
+    result = [_default_echo_worker()]
+    existing_names = {w["name"] for w in result}
+
+    for template in _load_template_workers():
+        if template["name"] not in existing_names:
+            result.append(template)
+            existing_names.add(template["name"])
+
+    return result
+
+
+def _atomic_write_json(path: Path, data: list) -> None:
+    """
+    Write *data* as pretty-printed JSON to *path*, atomically.
+
+    Writes to a ``.tmp`` file first, then renames it over the target.
+    """
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text(
+        json.dumps(data, indent=2, default=str),
+        encoding="utf-8",
+    )
+    os.replace(str(tmp_path), str(path))
 
 
 def _safeguard_workspace_dir(base: Path) -> None:
