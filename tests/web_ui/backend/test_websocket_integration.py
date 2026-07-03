@@ -228,6 +228,35 @@ class TestWebSocketLifecycle:
             f"{[m.get('text') for m in status_msgs]}"
         )
 
+    def test_new_session_resolves_workspace_id(self, pathed_server):
+        """new_session without workspace_id → session_loaded with resolved workspace_id."""
+        import uuid
+        app, tmp_home = pathed_server
+
+        # ── Register a workspace on disk whose "root" matches the project root ──
+        from web_ui.backend.server import _project_root
+
+        ws_id = uuid.uuid4().hex[:15]
+        ws_dir = Path(tmp_home) / ".thoughtmachine" / "workspaces" / ws_id
+        ws_dir.mkdir(parents=True, exist_ok=True)
+        ws_config = {"root": _project_root, "session_permissions": {}}
+        (ws_dir / "config.json").write_text(json.dumps(ws_config), encoding="utf-8")
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws") as ws:
+                ws.send_json({"command": "new_session"})
+                messages = recv_n(ws, 6, timeout=5.0)
+
+        # ── session_loaded must contain the resolved workspace_id ──────────
+        sl = messages[0]
+        assert sl["type"] == "session_loaded"
+        assert sl["workspace_id"] == ws_id, (
+            f"Expected workspace_id={ws_id!r}, "
+            f"got {sl['workspace_id']!r}"
+        )
+        # Also verify the session_id is present
+        assert isinstance(sl["session_id"], str) and len(sl["session_id"]) > 0
+
     def test_apply_config_with_api_key(self, pathed_server):
         """apply_config with an API key → config_changed with api_key_configured: True."""
         app, tmp_home = pathed_server
