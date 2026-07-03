@@ -882,6 +882,20 @@ async def websocket_endpoint(ws: WebSocket):
                         page_offset = msg.get("offset", 0)
                         bridge.load_session(session_id, limit=page_limit, offset=page_offset)
 
+                    # ── Fallback: resolve workspace_id from project root ──
+                    # Old sessions may have been saved without a workspace_id.
+                    if not bridge.workspace_id:
+                        try:
+                            from web_ui.backend.bridge import _resolve_workspace_id
+                            resolved = _resolve_workspace_id(_project_root)
+                            if resolved:
+                                bridge._workspace_id = resolved
+                                log('INFO', 'server',
+                                    f"Resolved workspace_id from project root for loaded session: {resolved}")
+                        except Exception as exc:
+                            log('WARNING', 'server',
+                                f"Could not resolve workspace_id from project root: {exc}")
+
                     await ws.send_json({
                         "type": "session_loaded",
                         "session_id": session_id,
@@ -1091,6 +1105,23 @@ async def websocket_endpoint(ws: WebSocket):
                     workspace_id = msg.get("workspace_id") or None
                     if workspace_id:
                         bridge._workspace_id = workspace_id
+
+                    # ── Fallback: resolve workspace_id from the project root ──
+                    # The frontend does not send workspace_id in new_session,
+                    # so we try to derive it from the registered workspace that
+                    # matches our project root directory.
+                    if not workspace_id:
+                        try:
+                            from web_ui.backend.bridge import _resolve_workspace_id
+                            resolved = _resolve_workspace_id(_project_root)
+                            if resolved:
+                                workspace_id = resolved
+                                bridge._workspace_id = resolved
+                                log('INFO', 'server',
+                                    f"Resolved workspace_id from project root: {resolved}")
+                        except Exception as exc:
+                            log('WARNING', 'server',
+                                f"Could not resolve workspace_id from project root: {exc}")
 
                     # Create a new empty session
                     from session.models import Session
