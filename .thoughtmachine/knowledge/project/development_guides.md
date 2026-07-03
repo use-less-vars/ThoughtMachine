@@ -234,58 +234,47 @@ JSON-formatted string with: `success`, `exit_code`, `stdout`, `stderr`, `command
 ### New Me...
 
 ## Phase 1 Complete: Branch Creation & Switching
+## Phase 1-3: Git Branch Operations — 🔴 NEVER IMPLEMENTED
 
-### New Methods Added (3 methods, ~220 lines)
-1. **`_create_agent_branch(repo_root)`** — Creates `agent_{base}_{suffix}` branch from base, validates suffix format, checks for duplicates
-2. **`_switch_branch(repo_root)`** — Switches to existing branch (agent branches + readonly branches allowed)
-3. **`_cleanup_agent_branch(repo_root)`** — Stashes changes, switches to merge target, safe-deletes branch
+**Correction (2026-KB-AUDIT):** The Git branch operations documented below in Phases 1-3 (`create_agent_branch`, `switch_branch`, `cleanup_agent_branch`, `commit_on_agent_branch`, `sync_agent_with_dev`, `merge_agent_to_dev`) were **planned but never implemented** in the actual codebase.
 
-### New Fields (3 Pydantic fields)
-- `branch_suffix: Optional[str]` — Suffix for new branch names
-- `base_branch: str = "dev"` — Source branch for branching
-- `branch_name: Optional[str]` — Target for switch/cleanup
+`GitInfoTool` at `tools/git_info_tool.py` only supports: `status, diff, log, branch, show, remote, blame, config, commit, init, clone`. None of the agent-branch-specific operations exist.
 
-### New Literal Operations
-- `"create_agent_branch"`, `"switch_branch"`, `"cleanup_agent_branch"`
+If these features are needed in the future, the original design docs are preserved below as a starting point for implementation.
 
-### Config Used
-- `.thoughtmachine/git_config.json`: `agent_branch_prefix`, `readonly_branches`, `allowed_merge_targets`
+### Archived Design — Phase 1: Branch Creation & Switching (Never Implemented)
+**Planned methods (3 methods, ~220 lines):**
+1. `_create_agent_branch(repo_root)` — Creates `agent_{base}_{suffix}` branch from base, validates suffix format, checks for duplicates
+2. `_switch_branch(repo_root)` — Switches to existing branch (agent branches + readonly branches allowed)
+3. `_cleanup_agent_branch(repo_root)` — Stashes changes, switches to merge target, safe-deletes branch
 
-### Protection
-- All writes blocked on `dev`/`main`/`master` via `_assert_not_readonly_branch()`
-- `_switch_branch` only allows agent/readonly branches
-- `_cleanup_agent_branch` only operates on agent-prefixed branches
-- Safe delete (`-d` flag) — only if fully merged
+**Planned fields:** `branch_suffix: Optional[str]`, `base_branch: str = "dev"`, `branch_name: Optional[str]`
+
+**Planned operations:** `"create_agent_branch"`, `"switch_branch"`, `"cleanup_agent_branch"`
+
+### Archived Design — Phase 2: Commit on Agent Branches (Never Implemented)
+**Planned fields:** `commit_message: Optional[str]`, `file_paths: Optional[List[str]]`, `add_all: bool = False`
+
+**Planned operation:** `"commit_on_agent_branch"`
+
+### Archived Design — Phase 3: Sync and Merge (Never Implemented)
+**Planned fields:** `prose_message: Optional[str]` (200 char max)
+
+**Planned operations:** `"sync_agent_with_dev"`, `"merge_agent_to_dev"`
 
 ## 2026-05-07 — ## Phase 2 Complete: Commit on Agent Branches
 
 **New Pydanti...
 
 ## Phase 2 Complete: Commit on Agent Branches
+## Phase 2 Complete: Commit on Agent Branches
 
-**New Pydantic fields added:**
-- `commit_message: Optional[str]` — commit message (required, validates format)
-- `file_paths: Optional[List[str]]` — list of files to `git add`
-- `add_all: bool = False` — if True, runs `git add -A` instead
+**🔴 NOT IMPLEMENTED — See "Phase 1-3: Git Branch Operations" section above for archived design docs.**
 
-**New operation:** `"commit_on_agent_branch"`
+## Phase 3 Complete: Sync and Merge
+## Phase 3 Complete: Sync and Merge
 
-**Method `_commit_on_agent_branch()` validates:**
-1. `commit_message` is non-empty
-2. Current branch is an agent branch (starts with `agent_` prefix from config)
-3. Message matches `<type>: <description>` format where type is one of `allowed_commit_types` (configurable, defaults: fix, feat, refactor, chore, docs, test, perf, ci)
-4. If `add_all=False`, `file_paths` must be provided
-5. If `add_all=True`, runs `git add -A` ignoring file_paths
-
-**Staging flow:**
-- `add_all=True` → single `git add -A`
-- `add_all=False` → iterative `git add <path>` for each path in file_paths
-
-**Commit:** `git commit -m "<message>"` via `_run_git_write`
-
-**Safety:** Blocked on non-agent branches, protected by `_assert_not_readonly_branch()`. All writes through `_run_git_write` with error_context.
-
-**Cleanup:** Moved `import re` from local scope in `_create_agent_branch` to module-level import.
+**🔴 NOT IMPLEMENTED — See "Phase 1-3: Git Branch Operations" section above for archived design docs.**
 
 ## 2026-05-07 — ## Phase 3 Complete: Sync and Merge
 

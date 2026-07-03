@@ -116,6 +116,26 @@ Every tool now declares a `required_categories` ClassVar (e.g. `["filesystem:rea
 - Lazy imports used strategically to avoid circular dependencies (docker_executor, security)
 - Configuration has been migrated from flat config/ to agent/config/ with Pydantic models
 
+## 2026-07-03 — ## 2026-KB-AUDIT — Corrections to the above assessment
+
+### ...
+
+## 2026-KB-AUDIT — Corrections to the above assessment
+
+### `logging_helpers.py` — NOW ACTIVE (not DEAD)
+The `dump_messages` utility from `agent/logging/logging_helpers.py` is now actively imported and used by:
+- `agent/core/agent.py` (line 23, direct import) — called in process_query() debug logging
+- `session/history_provider.py` (line 22, try/except fallback import) — called at line 131
+- `session/context_builder.py` (line 30, try/except fallback import) — called at line 334
+
+The dead code table row `| agent/logging/logging_helpers.py | DEAD | dump_messages utility not imported |` should read:
+**| `agent/logging/logging_helpers.py` | ACTIVE | dump_messages utility imported by agent.py, history_provider.py, context_builder.py |**
+
+### `config/` (top-level directory) — REMOVED (not "DEAD")
+The top-level `config/` directory has been deleted from disk. The table entry `| config/ (top-level directory) | DEAD | Files like preset_loader.py, ...` should read:
+**| `config/` (top-level directory) | REMOVED | Directory and all files deleted from disk |**
+
+
 ## Pruning & Context Management
 ## Pruning & Context Management
 
@@ -2784,3 +2804,17 @@ The old `DomainAllowlistSection` was a free-text `<textarea>` that joined domain
 
 ### Styling
 Inline Catppuccin matching existing panels. Same add/save button patterns as DockerfileEditor.
+
+## 2026-07-03 — ## 2026-07-04 — Worker templates merged into workers.json on...
+
+## 2026-07-04 — Worker templates merged into workers.json on bootstrap
+
+`ensure_workspace_dirs()` in `thoughtmachine/workspace_capabilities.py` now writes echo + coder + researcher + reviewer workers from templates.
+
+Key design decisions:
+- Manual `_validate_worker_dict()` avoids circular import from `agent.__init__`
+- Template load order: `~/.thoughtmachine/worker_templates/` → `resources/worker_templates/`
+- Dedup by `name` field; echo always first
+- Atomic write via `.tmp` + `os.replace`
+- `setup_workspace.py` updated to not overwrite existing workers.json
+- 13 new tests in `tests/workspace/test_worker_templates.py`
