@@ -210,7 +210,7 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
     tool_output_token_limit: cfg?.tool_output_token_limit ?? 10000,
   });
 
-  const [activeTab, setActiveTab] = useState('general');
+  const [activeTab, setActiveTab] = useState('workspace');
   const [draft, setDraft] = useState(getSafeDraft(config));
 
   // ── Directory browser state ────────────────────────────────────────
@@ -352,8 +352,8 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
     color: '#a6adc8',
   };
 
-  const TAB_KEYS = ['general', 'model', 'tools', 'permissions', 'container', 'workspace', 'system_prompt', 'advanced'];  // container tab placeholder
-  const TAB_LABELS = { workspace: 'Workspace', general: 'General', model: 'Model', tools: 'Tools', permissions: 'Permissions', container: 'Container', system_prompt: 'Prompt', advanced: 'Advanced' };
+  const TAB_KEYS = ['workspace', 'permissions', 'system_prompt', 'general', 'model', 'tools', 'container', 'advanced'];  // container tab placeholder
+  const TAB_LABELS = { workspace: 'Workspace', permissions: 'Permissions', system_prompt: 'Prompt', general: 'General', model: 'Model', tools: 'Tools', container: 'Container', advanced: 'Advanced' };
 
   return (
     <div style={{ padding: '1rem', fontFamily: 'sans-serif', background: '#313244', color: '#cdd6f4', width: panelWidth || 280, minWidth: 200, maxWidth: 500, flexShrink: 0, overflowY: 'auto', height: '100%' }}>
@@ -383,17 +383,12 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
       {/* ── Worker Auto-Open Watcher (always running, no visual output) ── */}
       <WorkerAutoOpenWatcher workspaceId={workspaceId} onSelectWorker={onSelectWorker} onClearWorker={onClearWorker} selectedWorker={selectedWorker} sessionId={activeSessionId} isActive={isActive} />
 
-      {/* ── Workspace Tab ──────────────────────────────────────────── */}
+      {/* ── Workspace Tab ── */}
       {activeTab === 'workspace' && (
-        <WorkspacePanel workspaceId={workspaceId} sessionId={sessionId} selectedWorker={selectedWorker} onSelectWorker={onSelectWorker} isActive={isActive} />
-      )}
-
-      {/* ── General Tab ──────────────────────────────────────────────── */}
-      {activeTab === 'general' && (
         <div>
-          {/* ── Workspace (first) ── */}
+          {/* ── Workspace Path Picker ── */}
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Workspace</strong></label>
+            <label style={labelStyle}><strong>Workspace Path</strong></label>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.3rem' }}>
               {draft.workspace_path ? (
                 <span style={{ color: '#cdd6f4', fontSize: '0.9rem' }}>
@@ -435,6 +430,15 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
               >Browse</button>
             </div>
           </div>
+
+          <WorkspacePanel workspaceId={workspaceId} sessionId={sessionId} selectedWorker={selectedWorker} onSelectWorker={onSelectWorker} isActive={isActive} />
+        </div>
+      )}
+
+      {/* ── General Tab ──────────────────────────────────────────────── */}
+      {activeTab === 'general' && (
+        <div>
+
 
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>Temperature:</strong> {draft.temperature}</label>
@@ -841,7 +845,11 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
             setIsApplying(true);
             setApplyError(null);
             setProviderVersion(0);
+            const prevWorkspacePath = lastAppliedConfig?.workspace_path;
             sendCommand('apply_config', { config: draft });
+            if (draft.workspace_path && prevWorkspacePath !== draft.workspace_path) {
+              sendCommand('set_project', { project: draft.workspace_path });
+            }
           }}
           disabled={!wsConnected || isApplying}
           style={{

@@ -255,8 +255,8 @@ const formRow = {
   marginBottom: '0.6rem',
 };
 
-function WorkerFormModal({ worker, templates, onSave, onCancel }) {
-  const isEdit = !!worker;
+function WorkerFormModal({ worker, templates, onSave, onCancel, isCreateFromTemplate }) {
+  const isEdit = !!worker && !isCreateFromTemplate;
   const [name, setName] = useState(worker?.name || '');
   const [description, setDescription] = useState(worker?.description || '');
   const [systemPrompt, setSystemPrompt] = useState(worker?.system_prompt || '');
@@ -504,6 +504,7 @@ export default function WorkerManagementPanel({
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(null); // worker name string
   const [showTemplatePicker, setShowTemplatePicker] = useState(false);
   const [templates, setTemplates] = useState([]);
+  const [isCreateFromTemplate, setIsCreateFromTemplate] = useState(false);
 
   // ── Auto-open logic (from old WorkersSection) ────────────────────────────
   const prevStatusMapRef = useRef(new Map());
@@ -677,12 +678,14 @@ export default function WorkerManagementPanel({
   // ── Open form for editing ────────────────────────────────────────────────
   const openEdit = useCallback((worker) => {
     setEditingWorker(worker);
+    setIsCreateFromTemplate(false);
     setShowForm(true);
   }, []);
 
   // ── Open form for new worker from template ───────────────────────────────
   const openNewFromTemplate = useCallback((template) => {
     setShowTemplatePicker(false);
+    setIsCreateFromTemplate(true);
     setEditingWorker({
       name: template.name,
       description: template.description || '',
@@ -721,6 +724,7 @@ export default function WorkerManagementPanel({
           style={btnPrimary}
           onClick={() => {
             setEditingWorker(null);
+            setIsCreateFromTemplate(false);
             setShowForm(true);
           }}
         >
@@ -743,6 +747,7 @@ export default function WorkerManagementPanel({
           message="No workers configured. Create one now, or start from a template."
           onNew={() => {
             setEditingWorker(null);
+            setIsCreateFromTemplate(false);
             setShowForm(true);
           }}
           onFromTemplate={() => {
@@ -1055,10 +1060,12 @@ export default function WorkerManagementPanel({
         <WorkerFormModal
           worker={editingWorker}
           templates={templates}
+          isCreateFromTemplate={isCreateFromTemplate}
           onSave={handleSaveWorker}
           onCancel={() => {
             setShowForm(false);
             setEditingWorker(null);
+            setIsCreateFromTemplate(false);
           }}
         />
       )}
