@@ -328,9 +328,10 @@ class CheckSystem(ToolBase):
         running = []
         if WORKER_REGISTRY_AVAILABLE and _worker_registry is not None and _registry_lock is not None:
             with _registry_lock:
-                for name, thread in list(_worker_registry.items()):
+                for key, thread in list(_worker_registry.items()):
                     entry = {
-                        "name": name,
+                        "name": key[1] if isinstance(key, tuple) else str(key),
+                        "session_id": key[0] if isinstance(key, tuple) else None,
                         "status": thread.status,
                         "alive": thread.is_alive(),
                         "current_task": thread.current_task,

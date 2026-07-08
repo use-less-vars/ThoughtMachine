@@ -49,6 +49,7 @@ except ImportError:
 try:
     from thoughtmachine.workspace_capabilities import (
         resolve_workspace_id,
+        _load_template_workers,
         _workspace_dir,
     )
     CAPABILITIES_AVAILABLE = True
@@ -120,23 +121,24 @@ def shutdown_workers(timeout: float = 5.0) -> None:
     a session is closed with active workers.
     """
     with _registry_lock:
-        names = list(_worker_registry.keys())
-    for name in names:
+        keys = list(_worker_registry.keys())
+    for key in keys:
         with _registry_lock:
-            thread = _worker_registry.get(name)
+            thread = _worker_registry.get(key)
         if thread is None or not thread.is_alive():
             continue
-        logger.info("Shutting down worker '%s' (status=%s)", name, thread.status)
+        worker_label = key[1] if isinstance(key, tuple) else str(key)
+        logger.info("Shutting down worker '%s' (status=%s)", worker_label, thread.status)
         try:
             thread.stop()
             thread.join(timeout=timeout)
         except Exception:
-            logger.exception("Error joining worker '%s' during shutdown", name)
+            logger.exception("Error joining worker '%s' during shutdown", worker_label)
         finally:
             try:
                 thread._save_context()
             except Exception:
-                logger.exception("Error saving context for worker '%s' during shutdown", name)
+                logger.exception("Error saving context for worker '%s' during shutdown", worker_label)
 
 
 # Register atexit handler
@@ -147,7 +149,7 @@ atexit.register(shutdown_workers)
 # Module-level worker registry  (persists across tool calls)
 # ---------------------------------------------------------------------------
 
-_worker_registry: Dict[str, "WorkerThread"] = {}
+_worker_registry: dict = {}
 _registry_lock = threading.Lock()
 
 
@@ -187,7 +189,11 @@ class WorkerThread(threading.Thread):
         self.definition = definition
         self._agent_config_dict = agent_config
         self.session_id = session_id
-        self._worker_dir = workspace_dir / "workers" / name
+        session_subdir = session_id or ""
+        if session_subdir:
+            self._worker_dir = workspace_dir / "workers" / session_subdir / name
+        else:
+            self._worker_dir = workspace_dir / "workers" / name
         self._worker_dir.mkdir(parents=True, exist_ok=True)
 
         # Tool classes available to this worker (name -> class)
@@ -281,13 +287,33 @@ class WorkerThread(threading.Thread):
 
     def send_query(self, query: str, timeout: float = 120.0) -> str:
         """Send a query to this worker and block for a response."""
+        # Push query before checking heartbeat (query clears the queue)
         self._input_queue.put(query)
         try:
             response = self._output_queue.get(timeout=timeout)
             return response
         except queue.Empty:
+            # Fallback: read heartbeat from status.json if in-memory is None
+            hb = self.last_heartbeat
+            if hb is None:
+                try:
+                    status_path = self._worker_dir / "status.json"
+                    if status_path.exists():
+                        data = json.loads(status_path.read_text(encoding="utf-8"))
+                        hb = data.get("last_heartbeat")
+                except (OSError, json.JSONDecodeError):
+                    pass
+            if hb:
+                try:
+                    hb_dt = datetime.fromisoformat(hb)
+                    age = (datetime.now(timezone.utc) - hb_dt).total_seconds()
+                    detail = f" (last heartbeat {age:.0f}s ago)"
+                except (ValueError, TypeError):
+                    detail = f" (last heartbeat: {hb})"
+            else:
+                detail = ""
             raise TimeoutError(
-                f"Worker '{self.worker_name}' did not respond within {timeout}s"
+                f"Worker '{self.worker_name}' did not respond within {timeout}s{detail}"
             )
 
     def stop(self) -> None:
@@ -380,6 +406,10 @@ class WorkerThread(threading.Thread):
         worker_cfg["max_turns"] = self.definition.get(
             "max_turns", cfg.get("max_turns", 100)
         )
+        # Override token monitor critical threshold from worker definition
+        critical_threshold = self.definition.get("critical_threshold_tokens", None)
+        if critical_threshold is not None:
+            worker_cfg["token_monitor_critical_threshold"] = critical_threshold
         worker_cfg["timeout_seconds"] = self._timeout_seconds
         # Warn at 80% of timeout (minimum 5s) so CRITICAL triggers before
         # the hard cutoff when using the worker tool's timeout window.
@@ -391,6 +421,14 @@ class WorkerThread(threading.Thread):
 
         # ── Inject session permissions ─────────────────────────────────
         worker_cfg["session_permissions"] = self._session_permissions
+
+        # ── Safety net: inject workspace_path if missing ────────────────
+        # Worker._build_agent_config (the Tool-class method) now injects
+        # workspace_path from the parent, but in case that fails (e.g., the
+        # path was not available at the tool level), fall back to the
+        # project_root that was resolved from workspace_dir/config.json.
+        if "workspace_path" not in worker_cfg and self._project_root:
+            worker_cfg["workspace_path"] = self._project_root
 
         return AgentConfig(**worker_cfg)
 
@@ -420,13 +458,21 @@ class WorkerThread(threading.Thread):
             {},
         )
 
+        # Check stop before starting tool loop
+        if self._stop_event.is_set():
+            return json.dumps({
+                "status": "stopped",
+                "message": "Worker stopped before processing query",
+            })
+
         try:
             for event in self._agent.process_query(query):
                 # Fix 1.1B: Poll for stop command on every event
                 self._poll_command()
 
-                # Log heartbeat for liveliness checks
+                # Log heartbeat for liveliness checks and flush to disk
                 self.last_heartbeat = datetime.now(timezone.utc).isoformat()
+                self._write_status_file()
 
                 # Check stop signal
                 if self._stop_event.is_set():
@@ -623,6 +669,22 @@ class WorkerThread(threading.Thread):
                     worker_name=self.worker_name,
                     user_history=user_history,
                 )
+
+                # ── Fix 2: Auto-process initial context query ──
+                # When spawn provides context with a "query" key, the worker
+                # should start working immediately without requiring a
+                # separate query action. We push the query into the input
+                # queue so the existing loop (agent creation + _run_tool_loop)
+                # handles it naturally.
+                if self._initial_context:
+                    initial_query = self._initial_context.get("query")
+                    if initial_query:
+                        logger.debug(
+                            "Auto-queueing initial query for worker '%s'",
+                            self.worker_name,
+                        )
+                        self._input_queue.put(initial_query)
+
             self._save_context()
             self._log_event("started", {}, {})
 
@@ -661,6 +723,7 @@ class WorkerThread(threading.Thread):
                     self._agent = Agent(
                         config=agent_cfg,
                         session=self._worker_ctx,
+                        event_bus=_NULL_EVENT_BUS,
                     )
 
                 # ── Fix 1.2: Set busy before processing query ───────────
@@ -844,7 +907,12 @@ class Worker(ToolBase):
     tool: str = "Worker"
     required_categories: ClassVar[List[str]] = ["execution:read"]
 
-    action: str = Field(description="Action: list, spawn, check, query, stop")
+    action: str = Field(
+        description="Action: list, spawn, check, query, stop. "
+        "When action='spawn' and context has a 'query' key, the spawn call "
+        "BLOCKS until the worker finishes the task and returns the full result. "
+        "Without a 'query' key, spawn returns immediately; use action='query' later."
+    )
 
     worker_name: Optional[str] = Field(
         default=None,
@@ -853,12 +921,18 @@ class Worker(ToolBase):
 
     worker_query: Optional[str] = Field(
         default=None,
-        description="Query to send to worker",
+        description="Query string to send to an already-spawned worker. "
+        "Only valid with action='query'. The worker processes this and the call "
+        "BLOCKS until the worker responds.",
     )
 
     context: Optional[Dict] = Field(
         default=None,
-        description="Optional context passed on spawn",
+        description="Optional context dict passed only on action='spawn'. "
+        "If this dict includes a 'query' key (e.g., {'query': 'Review src/'}), "
+        "the worker executes that task immediately and the spawn call BLOCKS "
+        "until the worker finishes. The 'query' value becomes the worker's "
+        "first instruction. Other keys (e.g., config) are passed as metadata.",
     )
 
     timeout_seconds: Optional[int] = Field(
@@ -916,20 +990,29 @@ class Worker(ToolBase):
     # -- helpers -----------------------------------------------------
 
     def _load_workers(self, ws_id: Optional[str]) -> list:
-        """Load workers list from workers.json in workspace dir."""
+        """
+        Load workers list from workers.json in workspace dir.
+
+        Falls back to ``_load_template_workers()`` when the file is missing,
+        empty, or fails to parse.
+        """
         if not CAPABILITIES_AVAILABLE or not _workspace_dir or not ws_id:
             return []
 
         workers_path = _workspace_dir(ws_id) / "workers.json"
         if not workers_path.exists():
-            logger.warning(f"workers.json not found at {workers_path}")
-            return []
+            logger.info(f"workers.json not found at {workers_path}, falling back to templates")
+            return _load_template_workers()
 
         try:
-            return json.loads(workers_path.read_text(encoding="utf-8"))
+            data = json.loads(workers_path.read_text(encoding="utf-8"))
+            if not data:  # empty array
+                logger.info(f"workers.json is empty, falling back to templates")
+                return _load_template_workers()
+            return data
         except (json.JSONDecodeError, OSError) as e:
-            logger.warning(f"Failed to load workers.json: {e}")
-            return []
+            logger.warning(f"Failed to load workers.json: {e}, falling back to templates")
+            return _load_template_workers()
 
     def _find_worker(self, workers: list, name: str) -> Optional[dict]:
         """Find a worker by name in the workers list."""
@@ -986,9 +1069,16 @@ class Worker(ToolBase):
         and any other fields present in ``self.agent_config`` (injected by
         ToolExecutor).  This dict is passed to WorkerThread so it can create
         an ``AgentConfig`` at runtime.
+
+        Also injects ``workspace_path`` from the parent tool's workspace_path
+        so that the worker's AgentConfig has it set, which in turn lets the
+        worker's ToolExecutor propagate it to tool calls.
         """
         cfg = self.agent_config or {}
-        return dict(cfg)
+        result = dict(cfg)
+        if self.workspace_path:
+            result["workspace_path"] = self.workspace_path
+        return result
 
     def _resolve_tool_class(self, tool_name: str) -> Optional[type[ToolBase]]:
         """Resolve a tool name string to its class via _TOOL_REGISTRY.
@@ -1006,13 +1096,14 @@ class Worker(ToolBase):
 
     def _action_list(self, workers: list) -> dict:
         """Return all known worker definitions plus runtime status."""
+        session_key = self.session_id or ""
         augmented = []
         for w in workers:
             name = w.get("name", "")
             entry = dict(w)
-            # Merge runtime status from registry
+            # Merge runtime status from registry (session-scoped key)
             with _registry_lock:
-                thread = _worker_registry.get(name)
+                thread = _worker_registry.get((session_key, name))
             if thread is not None:
                 entry["runtime_status"] = thread.status
                 entry["current_task"] = thread.current_task
@@ -1032,9 +1123,10 @@ class Worker(ToolBase):
                 "error": f"Worker '{self.worker_name}' not found in workers.json",
             }
 
-        # Prevent duplicate spawns
+        # Prevent duplicate spawns (session-scoped key)
+        session_key = self.session_id or ""
         with _registry_lock:
-            existing = _worker_registry.get(self.worker_name)
+            existing = _worker_registry.get((session_key, self.worker_name))
             if existing is not None and existing.is_alive():
                 return {
                     "error": f"Worker '{self.worker_name}' is already running",
@@ -1143,46 +1235,85 @@ class Worker(ToolBase):
         if self.context is not None and isinstance(self.context, dict):
             thread._initial_context = self.context
 
+        # ── Fix 1: Delete stale persistence when fresh context is provided ──
+        # WorkerThread.run() calls _load_context() which reads context.json
+        # from disk. If context.json exists from a previous run, the old
+        # conversation is loaded and _initial_context is silently dropped.
+        # By deleting context.json here when we set _initial_context, we
+        # ensure _load_context() returns None and the fresh context branch
+        # in run() is entered.
+        if thread._initial_context is not None:
+            ctx_path = thread._worker_dir / "context.json"
+            if ctx_path.exists():
+                ctx_path.unlink(missing_ok=True)
+                logger.debug(
+                    "Deleted stale context.json for worker '%s' due to fresh spawn context",
+                    self.worker_name,
+                )
+
         # ── Fix 1.1A: Clean up stale command.json before starting ──
         cmd_path = thread._worker_dir / "command.json"
         if cmd_path.exists():
             cmd_path.unlink(missing_ok=True)
-        
-        # ── Preserve persisted context for resume across sessions ──
-        # WorkerThread.run() will call _load_context() which reads
-        # context.json from disk. If it exists (from a previous session
-        # or a completed run), the thread resumes that conversation.
-        # If it doesn't exist, the thread creates a fresh context.
-        #
-        # To force a clean start, delete the worker's directory
-        # via the filesystem tool before spawning.
 
         with _registry_lock:
-            _worker_registry[self.worker_name] = thread
+            _worker_registry[(session_key, self.worker_name)] = thread
 
         thread.start()
 
-        result: dict[str, Any] = {
-            "spawned": True,
-            "worker_name": self.worker_name,
-            "status": thread.status,
-            "message": f"Worker '{self.worker_name}' started.",
-        }
         if missing_tools:
-            result["missing_tools"] = missing_tools
-            result["message"] += (
-                f" Warning: tool(s) not available: {', '.join(missing_tools)}."
-            )
             logger.warning(
                 "Worker '%s' spawned but tool(s) not found: %s",
                 self.worker_name, missing_tools,
             )
-        return result
+
+        # ── Wait for first response if auto-query was queued ──
+        # If initial context has a "query" key, the worker auto-processes it
+        # and puts the result in _output_queue.  We wait for that first
+        # response, then return it while the thread stays alive for future
+        # queries.  If no auto-query was queued, return immediately.
+        has_auto_query = (
+            thread._initial_context is not None
+            and isinstance(thread._initial_context, dict)
+            and "query" in thread._initial_context
+        )
+        if has_auto_query:
+            try:
+                final_result = thread._output_queue.get(timeout=effective_timeout)
+            except queue.Empty:
+                final_result = json.dumps({
+                    "error": f"Worker '{self.worker_name}' did not respond "
+                             f"within {effective_timeout}s",
+                    "note": "Worker timed out. The result above is partial work "
+                             "completed before timeout. The worker thread is still "
+                             "alive — you can query it again via action='query' to "
+                             "request continuation.",
+                })
+            try:
+                parsed = json.loads(final_result) if final_result else {}
+            except (json.JSONDecodeError, TypeError):
+                parsed = {"response": final_result}
+            if not isinstance(parsed, dict):
+                parsed = {"response": str(parsed)}
+            parsed.setdefault("worker_name", self.worker_name)
+            parsed.setdefault("spawned", True)
+            elapsed = thread._last_elapsed()
+            if elapsed is not None:
+                parsed["elapsed_seconds"] = round(elapsed, 1)
+            return parsed
+        else:
+            # No auto-query — return immediately; worker stays alive
+            return {
+                "worker_name": self.worker_name,
+                "spawned": True,
+                "status": "ready",
+            }
 
     def _action_check(self, workers: list) -> dict:
         """Check on a specific worker by name."""
+        session_key = self.session_id or ""
         with _registry_lock:
-            thread = _worker_registry.get(self.worker_name)
+            thread = _worker_registry.get((session_key, self.worker_name))
 
         if thread is None:
             # Worker exists in definition but was never spawned
@@ -1214,8 +1345,9 @@ class Worker(ToolBase):
 
     def _action_query(self, workers: list) -> dict:
         """Query a worker and wait for a response (synchronous, blocking)."""
+        session_key = self.session_id or ""
         with _registry_lock:
-            thread = _worker_registry.get(self.worker_name)
+            thread = _worker_registry.get((session_key, self.worker_name))
 
         if thread is None:
             return {
@@ -1243,22 +1375,38 @@ class Worker(ToolBase):
             result = {
                 "worker_name": self.worker_name,
                 "response": response,
+                "elapsed_seconds": round(elapsed, 1) if elapsed is not None else None,
             }
-            if elapsed is not None:
-                result["elapsed_seconds"] = round(elapsed, 1)
             if thread._last_reasoning is not None:
                 result["reasoning"] = thread._last_reasoning
             return result
         except TimeoutError as exc:
+            # Check heartbeat to distinguish "worker hung" vs "worker still busy"
+            if thread.last_heartbeat:
+                try:
+                    hb_dt = datetime.fromisoformat(thread.last_heartbeat)
+                    age_seconds = (datetime.now(timezone.utc) - hb_dt).total_seconds()
+                    if age_seconds > 600.0:  # 2× the 300s query timeout
+                        return {
+                            "error": f"Worker appears hung (last heartbeat: {thread.last_heartbeat}, {age_seconds:.0f}s ago)",
+                            "worker_name": self.worker_name,
+                            "status": thread.status,
+                            "current_task": thread.current_task,
+                        }
+                except (ValueError, TypeError):
+                    pass  # Malformed heartbeat — fall through to generic timeout
             return {
                 "error": str(exc),
+                "note": "Worker did not respond in time. The worker thread is "
+                         "still alive — you can query it again with a shorter task.",
                 "worker_name": self.worker_name,
             }
 
     def _action_stop(self, workers: list) -> dict:
         """Stop a running worker and persist its context."""
+        session_key = self.session_id or ""
         with _registry_lock:
-            thread = _worker_registry.get(self.worker_name)
+            thread = _worker_registry.get((session_key, self.worker_name))
 
         if thread is None:
             entry = self._find_worker(workers, self.worker_name)
@@ -1274,7 +1422,7 @@ class Worker(ToolBase):
 
         if not thread.is_alive():
             with _registry_lock:
-                _worker_registry.pop(self.worker_name, None)
+                _worker_registry.pop((session_key, self.worker_name), None)
             thread._save_context()
             return {
                 "worker_name": self.worker_name,
@@ -1293,7 +1441,7 @@ class Worker(ToolBase):
         finally:
             thread._save_context()
             with _registry_lock:
-                _worker_registry.pop(self.worker_name, None)
+                _worker_registry.pop((session_key, self.worker_name), None)
 
         return {
             "worker_name": self.worker_name,

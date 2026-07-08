@@ -252,7 +252,7 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
     * ``capabilities.json`` — fully permissive workspace capabilities
     * ``Dockerfile`` — copied from ``resources/default_dockerfile.txt``
     * ``domain_allowlist.json`` — empty JSON array ``[]``
-    * ``workers.json`` — empty JSON array ``[]``
+    * ``workers.json`` — default template workers from worker_templates/ (coder, reviewer, researcher)
     * ``mcp_servers.json`` — empty JSON array ``[]``
 
     No subdirectories (e.g. ``sessions/``, ``state/``, ``knowledge/``) are
@@ -296,12 +296,39 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
         domain_allowlist_path.write_text("[]", encoding="utf-8")
         created.append(str(domain_allowlist_path))
 
-    # ── workers.json (echo + template workers) ────────────────────────────
+    # ── workers.json (template workers) ────────────────────────────
     workers_path = base / "workers.json"
     if not workers_path.exists():
         workers_data = _build_default_workers()
         _atomic_write_json(workers_path, workers_data)
         created.append(str(workers_path))
+
+    # ── Migration: Clean up existing workers.json ──
+    #  1. Strip echo worker (legacy)
+    #  2. Merge in any missing template workers (coder, reviewer, researcher)
+    if workers_path.exists():
+        try:
+            existing = json.loads(workers_path.read_text(encoding="utf-8"))
+            if isinstance(existing, list):
+                # Strip echo
+                cleaned = [w for w in existing if w.get("name") != "echo"]
+                # Merge missing template workers
+                existing_names = {w.get("name") for w in cleaned if w.get("name")}
+                templates = _build_default_workers()
+                for tmpl in templates:
+                    if tmpl["name"] not in existing_names:
+                        cleaned.append(tmpl)
+                        existing_names.add(tmpl["name"])
+                # Write back if anything changed
+                if len(cleaned) != len(existing) or any(
+                    w.get("name") == "echo" for w in existing
+                ):
+                    _atomic_write_json(workers_path, cleaned)
+                    logging.getLogger(__name__).info(
+                        "Migrated workers.json: removed echo, merged template workers"
+                    )
+        except (json.JSONDecodeError, OSError):
+            pass
 
     # ── mcp_servers.json (empty array) ────────────────────────────────────
     mcp_servers_path = base / "mcp_servers.json"
@@ -385,12 +412,12 @@ def _build_default_workers() -> list[dict]:
     """
     Build the default workers list for a freshly bootstrapped workspace.
 
-    Starts with the echo test worker, then appends any template workers
-    (coder, researcher, reviewer) that do not share a name with an already-
-    present worker.
+    Loads template workers (coder, researcher, reviewer) from
+    worker_templates/.  The echo test worker is NOT included by default;
+    it is available via ``_default_echo_worker()`` for manual use.
     """
-    result = [_default_echo_worker()]
-    existing_names = {w["name"] for w in result}
+    result: list[dict] = []
+    existing_names: set[str] = set()
 
     for template in _load_template_workers():
         if template["name"] not in existing_names:
