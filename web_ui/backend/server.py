@@ -52,6 +52,7 @@ Client → Server (JSON):
     { "command": "get_open_sessions" }
     { "command": "close_session",          "session_id": "..." (optional) }
     { "command": "new_session" }
+    { "command": "set_project",           "project": "/path/to/project" }
     { "command": "security_response",  "request_id": "...", "approved": true/false, "remember": false }
     { "command": "get_workspace_capabilities", "workspace_id": "..." }
     { "command": "bootstrap_workspace",       "workspace_id": "..." }
@@ -352,12 +353,22 @@ app.add_middleware(
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  WebSocket endpoint
+#
+#  Query parameters:
+#    ?project=<path>  — Absolute path to the project directory. Used to
+#                       resolve the correct workspace for this connection.
+#                       When omitted, falls back to _project_root (this file's
+#                       grandparent directory at import-time).
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
+async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
     await ws.accept()
-    log('INFO', 'server.ws', f'WebSocket connected: {ws.client}')
+    # If the frontend provides a project query parameter, use it to resolve
+    # the workspace instead of the default _project_root.  This allows the
+    # web UI to serve sessions for multiple projects from a single server.
+    _project_path = project or _project_root
+    log('INFO', 'server.ws', f'WebSocket connected: {ws.client} project={_project_path}')
 
     # Import bridge here (after project root is on sys.path)
     from web_ui.backend.bridge import WebAgentBridge
@@ -882,19 +893,52 @@ async def websocket_endpoint(ws: WebSocket):
                         page_offset = msg.get("offset", 0)
                         bridge.load_session(session_id, limit=page_limit, offset=page_offset)
 
-                    # ── Fallback: resolve workspace_id from project root ──
+                    # ── Fallback: resolve workspace_id from project path ──
                     # Old sessions may have been saved without a workspace_id.
                     if not bridge.workspace_id:
                         try:
                             from web_ui.backend.bridge import _resolve_workspace_id
-                            resolved = _resolve_workspace_id(_project_root)
+                            resolved = _resolve_workspace_id(_project_path)
                             if resolved:
                                 bridge._workspace_id = resolved
                                 log('INFO', 'server',
-                                    f"Resolved workspace_id from project root for loaded session: {resolved}")
+                                    f"Resolved workspace_id from project path for loaded session: {resolved}")
                         except Exception as exc:
                             log('WARNING', 'server',
-                                f"Could not resolve workspace_id from project root: {exc}")
+                                f"Could not resolve workspace_id from project path: {exc}")
+
+                    # ── Auto-switch project path if session belongs to a different workspace ──
+                    # When loading a session from a different project (e.g., Wordle),
+                    # _project_path still points to the old project. Update it so that
+                    # workers, templates, and subsequent operations use the correct workspace.
+                    if bridge.workspace_id:
+                        try:
+                            from pathlib import Path as _Path
+                            import json as _json
+                            ws_config_path = _Path("~").expanduser() / ".thoughtmachine" / "workspaces" / bridge.workspace_id / "config.json"
+                            if ws_config_path.is_file():
+                                ws_data = _json.loads(ws_config_path.read_text(encoding="utf-8"))
+                                ws_project_path = ws_data.get("root", "")
+                                if ws_project_path and os.path.abspath(ws_project_path) != os.path.abspath(_project_path):
+                                    old_path = _project_path
+                                    _project_path = ws_project_path
+                                    log('INFO', 'server',
+                                        f"load_session: auto-switched project path from {old_path} to {_project_path}")
+                                    # Sync workspace_path into bridge config so that
+                                    # _frontend_config_from_bridge sends the correct path
+                                    # to the frontend (instead of falling back to _project_root).
+                                    if hasattr(bridge, '_config') and bridge._config is not None:
+                                        bridge._config.workspace_path = _project_path
+                                    # Re-resolve workspace_id for the new project path
+                                    from web_ui.backend.bridge import _resolve_workspace_id
+                                    resolved = _resolve_workspace_id(_project_path)
+                                    if resolved and resolved != bridge.workspace_id:
+                                        bridge._workspace_id = resolved
+                                        log('INFO', 'server',
+                                            f"load_session: re-resolved workspace_id to {resolved} for {_project_path}")
+                        except Exception as exc:
+                            log('WARNING', 'server',
+                                f"load_session: auto-switch project path error: {exc}")
 
                     await ws.send_json({
                         "type": "session_loaded",
@@ -1106,22 +1150,49 @@ async def websocket_endpoint(ws: WebSocket):
                     if workspace_id:
                         bridge._workspace_id = workspace_id
 
-                    # ── Fallback: resolve workspace_id from the project root ──
-                    # The frontend does not send workspace_id in new_session,
-                    # so we try to derive it from the registered workspace that
-                    # matches our project root directory.
+                    # ── Fallback: resolve workspace_id from the project path ──
+                    # The frontend can pass a project query param to select
+                    # which workspace to use.  Fall back to _project_root.
                     if not workspace_id:
                         try:
                             from web_ui.backend.bridge import _resolve_workspace_id
-                            resolved = _resolve_workspace_id(_project_root)
+                            resolved = _resolve_workspace_id(_project_path)
                             if resolved:
                                 workspace_id = resolved
                                 bridge._workspace_id = resolved
                                 log('INFO', 'server',
-                                    f"Resolved workspace_id from project root: {resolved}")
+                                    f"Resolved workspace_id from project path: {resolved}")
                         except Exception as exc:
                             log('WARNING', 'server',
-                                f"Could not resolve workspace_id from project root: {exc}")
+                                f"Could not resolve workspace_id from project path: {exc}")
+
+                    # ── Auto-register new workspace if no registration exists ──
+                    # When the frontend opens a folder that has never been
+                    # registered, there is no workspace_id on disk.  We create
+                    # one on the fly so the workspace panel and workers work.
+                    if not workspace_id:
+                        try:
+                            import uuid
+                            import json as _json
+                            from thoughtmachine.workspace_capabilities import (
+                                ensure_workspace_dirs, _workspace_dir,
+                            )
+                            new_ws_id = uuid.uuid4().hex
+                            ws_dir = _workspace_dir(new_ws_id)
+                            ws_dir.mkdir(parents=True, exist_ok=True)
+                            config_path = ws_dir / "config.json"
+                            config_path.write_text(
+                                _json.dumps({"root": str(_project_path)}, indent=2),
+                                encoding="utf-8",
+                            )
+                            ensure_workspace_dirs(new_ws_id)
+                            workspace_id = new_ws_id
+                            bridge._workspace_id = new_ws_id
+                            log('INFO', 'server',
+                                f"Auto-registered workspace {new_ws_id} for {_project_path}")
+                        except Exception as exc:
+                            log('WARNING', 'server',
+                                f"Could not auto-register workspace: {exc}")
 
                     # Create a new empty session
                     from session.models import Session
@@ -1167,6 +1238,128 @@ async def websocket_endpoint(ws: WebSocket):
                         "config": _default_frontend_config(),
                     })
                     await ws.send_json({"type": "status_message", "text": "Ready. Type a query to start."})
+
+                elif command == "set_project":
+                    """Switch the connection to a different project directory.
+
+                    The Config Panel sends this when the user changes the workspace
+                    folder and presses Apply.  The server tears down the current
+                    session, registers (or resolves) the workspace for the new path,
+                    creates a fresh session, and sends session_loaded back.
+                    """
+                    new_project = msg.get("project", "")
+                    if not new_project:
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": "⚠ set_project: project path is required",
+                        })
+                        continue
+
+                    # Validate path exists and is a directory
+                    if not os.path.isdir(new_project):
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": f"⚠ Project path does not exist or is not a directory: {new_project}",
+                        })
+                        continue
+
+                    log('INFO', 'server', f"Switching project to {new_project}")
+
+                    # 1. Save current session and stop the bridge
+                    if bridge is not None and bridge.session is not None:
+                        bridge.save_session()
+                    if bridge is not None:
+                        bridge.stop()
+
+                    # 2. Update the per-connection project path
+                    _project_path = new_project
+
+                    # 3. Create fresh bridge + controller
+                    from agent.controller import AgentController
+                    controller = AgentController()
+                    bridge = WebAgentBridge(session_store=session_store)
+                    bridge.set_event_callback(event_callback, key=id(ws))
+                    bridge.register()
+                    bridge.set_controller(controller)
+
+                    # 4. Resolve or auto-register workspace for the new path
+                    workspace_id = None
+                    try:
+                        from web_ui.backend.bridge import _resolve_workspace_id
+                        resolved = _resolve_workspace_id(_project_path)
+                        if resolved:
+                            workspace_id = resolved
+                            bridge._workspace_id = resolved
+                            log('INFO', 'server',
+                                f"set_project: resolved workspace {resolved} for {_project_path}")
+                    except Exception as exc:
+                        log('WARNING', 'server',
+                            f"set_project: resolve error: {exc}")
+
+                    if not workspace_id:
+                        try:
+                            import uuid
+                            import json as _json
+                            from thoughtmachine.workspace_capabilities import (
+                                ensure_workspace_dirs, _workspace_dir,
+                            )
+                            new_ws_id = uuid.uuid4().hex
+                            ws_dir = _workspace_dir(new_ws_id)
+                            ws_dir.mkdir(parents=True, exist_ok=True)
+                            config_path = ws_dir / "config.json"
+                            config_path.write_text(
+                                _json.dumps({"root": str(_project_path)}, indent=2),
+                                encoding="utf-8",
+                            )
+                            ensure_workspace_dirs(new_ws_id)
+                            workspace_id = new_ws_id
+                            bridge._workspace_id = new_ws_id
+                            log('INFO', 'server',
+                                f"set_project: auto-registered workspace {new_ws_id} for {_project_path}")
+                        except Exception as exc:
+                            log('WARNING', 'server',
+                                f"set_project: auto-register error: {exc}")
+
+                    # 5. Create a new empty session for the new workspace
+                    from session.models import Session
+                    new_session = Session()
+                    new_session.metadata['source'] = 'web_ui'
+                    if workspace_id:
+                        new_session.workspace_id = workspace_id
+                    new_session.ensure_name()
+                    bridge._loaded_session = new_session
+                    _session_bridges[new_session.session_id] = bridge
+                    session_store.save_session(new_session)
+
+                    # 6. Send session_loaded and state messages
+                    await ws.send_json({
+                        "type": "session_loaded",
+                        "session_id": new_session.session_id,
+                        "session_name": new_session.metadata.get('name', ''),
+                        "workspace_id": bridge._workspace_id,
+                    })
+                    await ws.send_json({
+                        "type": "state_changed",
+                        "state": "IDLE",
+                        "is_running": False,
+                    })
+                    await ws.send_json({
+                        "type": "tokens_updated",
+                        "input": 0,
+                        "output": 0,
+                    })
+                    await ws.send_json({
+                        "type": "context_updated",
+                        "context_length": 0,
+                    })
+                    await ws.send_json({
+                        "type": "config_changed",
+                        "config": _default_frontend_config(),
+                    })
+                    await ws.send_json({
+                        "type": "status_message",
+                        "text": f"✅ Switched to project: {_project_path}",
+                    })
 
                 elif command == "security_response":
                     """Handle user response to a security prompt."""
@@ -1808,6 +2001,9 @@ def main():
         python -m web_ui.backend.server
         python -m web_ui.backend.server --serve-frontend
         python -m web_ui.backend.server --serve-frontend --host 127.0.0.1 --port 8080
+
+    The frontend can pass ?project=<path> as a URL query param to select
+    which workspace/project to use (each tab's WebSocket sends it).
     """
     import uvicorn
 

@@ -282,11 +282,39 @@ async def get_workers(
 
     # 2. Read runtime status from status.json written by the worker thread.
     #    This bridges the agent process and the backend API server process.
+    #    Supports both structures:
+    #      - workers/<name>/status.json (no session)
+    #      - workers/<session_id>/<name>/status.json (session-scoped)
     workers_dir = ws_dir / "workers"
     runtime_statuses = {}
     if workers_dir.is_dir():
         for subdir in workers_dir.iterdir():
-            if subdir.is_dir():
+            if not subdir.is_dir():
+                continue
+            # Check if this is a session directory (contains sub-worker dirs)
+            first_child = next(subdir.iterdir(), None) if subdir.is_dir() else None
+            if first_child is not None and first_child.is_dir():
+                # Session-scoped: workers/<session_id>/<name>/
+                session_id = subdir.name
+                for worker_subdir in subdir.iterdir():
+                    if worker_subdir.is_dir():
+                        status_path = worker_subdir / "status.json"
+                        if status_path.exists():
+                            try:
+                                data = json.loads(status_path.read_text(encoding="utf-8"))
+                                runtime_statuses[worker_subdir.name] = {
+                                    "runtime_status": data.get("runtime_status"),
+                                    "current_task": data.get("current_task"),
+                                    "last_heartbeat": data.get("last_heartbeat"),
+                                    "error": data.get("error"),
+                                    "session_id": data.get("session_id") or session_id,
+                                    "current_context_tokens": data.get("current_context_tokens"),
+                                    "max_context_tokens": data.get("max_context_tokens"),
+                                }
+                            except (json.JSONDecodeError, OSError):
+                                pass
+            else:
+                # Legacy: workers/<name>/
                 status_path = subdir / "status.json"
                 if status_path.exists():
                     try:
@@ -304,16 +332,32 @@ async def get_workers(
                         pass
 
     # 3. Check for persisted contexts on disk
+    #    Supports both legacy and session-scoped structures.
     persisted_names = set()
     if workers_dir.is_dir():
         for subdir in workers_dir.iterdir():
-            if subdir.is_dir() and (subdir / "context.json").exists():
-                persisted_names.add(subdir.name)
+            if not subdir.is_dir():
+                continue
+            first_child = next(subdir.iterdir(), None) if subdir.is_dir() else None
+            if first_child is not None and first_child.is_dir():
+                # Session-scoped: workers/<session_id>/<name>/context.json
+                for worker_subdir in subdir.iterdir():
+                    if worker_subdir.is_dir() and (worker_subdir / "context.json").exists():
+                        persisted_names.add(worker_subdir.name)
+            else:
+                # Legacy: workers/<name>/context.json
+                if (subdir / "context.json").exists():
+                    persisted_names.add(subdir.name)
 
     # 4. Merge everything
     result = []
     for cfg in configs:
-        worker_name = cfg.get("name", "")
+        if isinstance(cfg, str):
+            # Entry is just a string name — promote to a minimal dict
+            worker_name = cfg
+            cfg = {"name": cfg}
+        else:
+            worker_name = cfg.get("name", "")
         entry = dict(cfg)
         if worker_name in runtime_statuses:
             entry["runtime_status"] = runtime_statuses[worker_name]["runtime_status"]
