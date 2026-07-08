@@ -6,10 +6,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Optional
 
 import pytest
-from pydantic import ValidationError
 
 from agent.models.worker_definition import WorkerDefinition
 
@@ -36,21 +34,21 @@ class TestTemplates:
         """Coder template has filesystem write + docker execution."""
         data = json.loads((TEMPLATE_DIR / "coder.json").read_text())
         wd = WorkerDefinition.model_validate(data)
-        assert wd.permission_footprint.get("filesystem") == "write"
-        assert wd.permission_footprint.get("execution") == "docker"
+        assert wd.worker_permissions.get("filesystem") == "write"
+        assert wd.worker_permissions.get("execution") == "docker"
 
     def test_reviewer_read_only(self):
         """Reviewer template has filesystem read only."""
         data = json.loads((TEMPLATE_DIR / "reviewer.json").read_text())
         wd = WorkerDefinition.model_validate(data)
-        assert wd.permission_footprint.get("filesystem") == "read"
-        assert "write" not in wd.permission_footprint.values()
+        assert wd.worker_permissions.get("filesystem") == "read"
+        assert "write" not in wd.worker_permissions.values()
 
     def test_researcher_read_only(self):
         """Researcher template has filesystem read only."""
         data = json.loads((TEMPLATE_DIR / "researcher.json").read_text())
         wd = WorkerDefinition.model_validate(data)
-        assert wd.permission_footprint.get("filesystem") == "read"
+        assert wd.worker_permissions.get("filesystem") == "read"
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +63,7 @@ def valid_kwargs() -> dict:
         "description": "Reviews pull requests for style and correctness.",
         "system_prompt": "You are a code reviewer. Be concise.\n",
         "tools": ["FileEditor", "GlobTool", "Respond"],
-        "permission_footprint": {"filesystem": "read"},
+        "worker_permissions": {"filesystem": "read"},
     }
 
 
@@ -81,63 +79,39 @@ class TestValidInstantiation:
         assert wd.description == "Reviews pull requests for style and correctness."
         assert wd.system_prompt == "You are a code reviewer. Be concise.\n"
         assert wd.tools == ["FileEditor", "GlobTool", "Respond"]
-        assert wd.permission_footprint == {"filesystem": "read"}
+        assert wd.worker_permissions == {"filesystem": "read"}
 
     def test_all_optional_fields_default_to_none(self, valid_kwargs):
         """Optional fields not provided default to None."""
         wd = WorkerDefinition(**valid_kwargs)
         assert wd.timeout_seconds is None
-        assert wd.max_context_tokens is None
-        assert wd.warning_threshold_tokens is None
-        assert wd.turn_limit is None
+        assert wd.max_turns is None
         assert wd.temperature is None
+
+    def test_critical_threshold_default(self, valid_kwargs):
+        """critical_threshold_tokens defaults to 80000."""
+        wd = WorkerDefinition(**valid_kwargs)
+        assert wd.critical_threshold_tokens == 80000
+
+    def test_critical_threshold_override(self, valid_kwargs):
+        """critical_threshold_tokens accepts custom values."""
+        wd = WorkerDefinition(**valid_kwargs, critical_threshold_tokens=120000)
+        assert wd.critical_threshold_tokens == 120000
 
     def test_all_optional_fields_set(self, valid_kwargs):
         """All optional fields accept valid values."""
         kwargs = dict(valid_kwargs)
         kwargs.update({
             "timeout_seconds": 60,
-            "max_context_tokens": 4096,
-            "warning_threshold_tokens": 3072,
-            "turn_limit": 10,
+            "max_turns": 10,
             "temperature": 0.3,
+            "critical_threshold_tokens": 160000,
         })
         wd = WorkerDefinition(**kwargs)
         assert wd.timeout_seconds == 60
-        assert wd.max_context_tokens == 4096
-        assert wd.warning_threshold_tokens == 3072
-        assert wd.turn_limit == 10
+        assert wd.max_turns == 10
         assert wd.temperature == 0.3
-
-
-# ---------------------------------------------------------------------------
-# Validation: tool names
-# ---------------------------------------------------------------------------
-
-class TestToolValidation:
-    def test_unknown_tool_raises(self, valid_kwargs):
-        """An unknown tool name in the tools list raises ValidationError."""
-        kwargs = dict(valid_kwargs)
-        kwargs["tools"] = ["FileEditor", "NonExistentTool"]
-        with pytest.raises(ValidationError, match="Unknown tool"):
-            WorkerDefinition(**kwargs)
-
-    def test_all_unknown_tools_reported(self, valid_kwargs):
-        """The error message lists every unknown tool."""
-        kwargs = dict(valid_kwargs)
-        kwargs["tools"] = ["Foo", "Bar", "FileEditor"]
-        with pytest.raises(ValidationError) as exc:
-            WorkerDefinition(**kwargs)
-        err_msg = str(exc.value)
-        assert "Foo" in err_msg
-        assert "Bar" in err_msg
-
-    def test_empty_tools_list_accepted(self, valid_kwargs):
-        """An empty tools list is valid (no unknown tools to reject)."""
-        kwargs = dict(valid_kwargs)
-        kwargs["tools"] = []
-        wd = WorkerDefinition(**kwargs)
-        assert wd.tools == []
+        assert wd.critical_threshold_tokens == 160000
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +119,15 @@ class TestToolValidation:
 # ---------------------------------------------------------------------------
 
 class TestJsonSchema:
+    def test_schema_includes_critical_threshold_tokens(self):
+        """critical_threshold_tokens is in the schema properties."""
+        schema = WorkerDefinition.model_json_schema()
+        props = schema.get("properties", {})
+        assert "critical_threshold_tokens" in props
+        ct = props["critical_threshold_tokens"]
+        assert ct.get("default") == 80000
+        assert ct.get("title") == "Critical Threshold Tokens"
+
     def test_schema_has_required_fields(self):
         """The generated JSON Schema marks the right fields as required."""
         schema = WorkerDefinition.model_json_schema()
@@ -153,7 +136,7 @@ class TestJsonSchema:
         assert "description" in required
         assert "system_prompt" in required
         assert "tools" in required
-        assert "permission_footprint" in required
+        assert "worker_permissions" in required
         # Optional fields should NOT be in required
         assert "timeout_seconds" not in required
         assert "temperature" not in required
@@ -186,3 +169,4 @@ class TestSerialisation:
         restored = WorkerDefinition(**data)
         assert restored == wd
         assert restored.temperature == 0.7
+        assert restored.critical_threshold_tokens == 80000

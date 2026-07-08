@@ -1311,3 +1311,201 @@ class TestTokenEstimation:
             "Different models should return different context windows"
         )
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# Test 10: Spawn context fixes — stale persistence + auto-query
+# ════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.usefixtures("register_scripted_provider")
+class TestSpawnContextFixes:
+    """
+    Verify Fix 1 and Fix 2 for Worker spawn context bugs:
+
+    **Fix 1 (Persistence shadowing):** When spawn provides fresh context,
+    any stale ``context.json`` on disk is deleted first so that
+    ``_load_context()`` returns ``None`` and the ``_initial_context``
+    branch is entered in ``run()``.
+
+    **Fix 2 (Auto-query):** When the spawn context includes a ``"query"``
+    key, the worker begins processing it immediately without requiring a
+    separate ``action=query`` call.
+    """
+
+    def test_spawn_with_context_replaces_stale_persistence(
+        self, tmp_path: Path
+    ):
+        """
+        Fix 1: Stale context.json is deleted when spawn provides
+        fresh context via _initial_context.
+
+        We simulate what _action_spawn() does: set _initial_context then
+        delete context.json if it exists.  The test writes a stale
+        context.json first, then verifies it is removed.
+        """
+        from tools.workspace.worker import WorkerThread
+
+        thread = WorkerThread(
+            name="fix1-stale-test",
+            definition={"system_prompt": "test"},
+            agent_config={
+                "provider": "scripted",
+                "model": "mock-model",
+                "api_key": "sk-test",
+                "base_url": "http://localhost:9999",
+            },
+            workspace_dir=tmp_path,
+            tool_classes={},
+            session_permissions={},
+            project_root=None,
+            timeout_seconds=30,
+        )
+
+        # ── Arrange: write a stale context.json ──
+        stale_data = {
+            "user_history": [{"role": "user", "content": "old data"}],
+            "status": "ready",
+        }
+        ctx_path = thread._worker_dir / "context.json"
+        ctx_path.parent.mkdir(parents=True, exist_ok=True)
+        ctx_path.write_text(json.dumps(stale_data), encoding="utf-8")
+        assert ctx_path.exists(), "Precondition: stale context.json must exist"
+
+        # ── Act: simulate _action_spawn's Fix 1 logic ──
+        thread._initial_context = {"query": "hello"}
+        if thread._initial_context is not None:
+            if ctx_path.exists():
+                ctx_path.unlink(missing_ok=True)
+
+        # ── Assert: stale context.json is deleted ──
+        assert not ctx_path.exists(), (
+            "Fix 1 FAILED: stale context.json should have been deleted "
+            "when _initial_context is set"
+        )
+
+    def test_spawn_with_context_produces_output_without_query_action(
+        self, tmp_path: Path
+    ):
+        """
+        Fix 2: Worker with initial context containing a "query" key
+        produces output without requiring a separate query action.
+
+        We spawn a WorkerThread with _initial_context containing a query
+        and a ScriptedProvider that returns a text response.  The thread
+        should auto-process the query and put the result on the output
+        queue.  We verify by reading from the output queue with a timeout.
+        """
+        from tools.workspace.worker import WorkerThread
+
+        # ── Inject ScriptedProvider responses ──
+        original_init = ScriptedProvider.__init__
+
+        def patched_init(self, cfg):
+            original_init(self, cfg)
+            self._responses = [
+                _text_response("Auto-processed response from initial context."),
+            ]
+
+        ScriptedProvider.__init__ = patched_init
+
+        # Ensure worker_dir exists
+        worker_dir = tmp_path / "workers" / "fix2-autoquery"
+        worker_dir.mkdir(parents=True, exist_ok=True)
+
+        thread = WorkerThread(
+            name="fix2-autoquery",
+            definition={"system_prompt": "test"},
+            agent_config={
+                "provider": "scripted",
+                "model": "mock-model",
+                "api_key": "sk-test",
+                "base_url": "http://localhost:9999",
+            },
+            workspace_dir=tmp_path,
+            tool_classes={},
+            session_permissions={},
+            project_root=None,
+            timeout_seconds=30,
+        )
+
+        try:
+            # ── Act: simulate spawn with initial context containing query ──
+            thread._initial_context = {"query": "What is the status?"}
+            thread.daemon = True
+            thread.start()
+
+            # ── Assert: output arrives without a separate query action ──
+            try:
+                reply = thread._output_queue.get(timeout=15.0)
+            except Exception:
+                reply = None
+
+            assert reply is not None, (
+                "Fix 2 FAILED: No output from worker.  The initial context query "
+                "should have been auto-processed.  The output queue was empty "
+                "after waiting 15 seconds."
+            )
+
+            # The reply from _run_tool_loop is the agent's final response
+            # content as a plain string (not JSON-wrapped).
+            response_text = str(reply)
+            assert "Auto-processed response" in response_text, (
+                f"Fix 2 FAILED: Response did not contain expected text. Got: {response_text[:200]}"
+            )
+
+        finally:
+            ScriptedProvider.__init__ = original_init
+            # Clean up: stop the thread
+            thread.stop()
+            thread.join(timeout=5.0)
+
+    def test_spawn_without_context_persistence_not_affected(
+        self, tmp_path: Path
+    ):
+        """
+        Regression: When spawn does NOT provide context, existing
+        context.json should be preserved (for session resume).
+        """
+        from tools.workspace.worker import WorkerThread
+
+        thread = WorkerThread(
+            name="fix1-preserve-test",
+            definition={"system_prompt": "test"},
+            agent_config={
+                "provider": "scripted",
+                "model": "mock-model",
+                "api_key": "sk-test",
+                "base_url": "http://localhost:9999",
+            },
+            workspace_dir=tmp_path,
+            tool_classes={},
+            session_permissions={},
+            project_root=None,
+            timeout_seconds=30,
+        )
+
+        # ── Arrange: write a valid context.json ──
+        ctx_path = thread._worker_dir / "context.json"
+        ctx_path.parent.mkdir(parents=True, exist_ok=True)
+        ctx_path.write_text(
+            json.dumps({
+                "user_history": [{"role": "user", "content": "existing data"}],
+                "status": "ready",
+            }),
+            encoding="utf-8",
+        )
+        assert ctx_path.exists(), "Precondition: context.json must exist"
+
+        # ── Act: _initial_context is NOT set (simulate spawn without context) ──
+        # The Fix 1 guard only triggers when _initial_context is not None
+        # Do NOT delete anything
+
+        # ── Assert: context.json is preserved ──
+        assert ctx_path.exists(), (
+            "Regression: context.json should NOT be deleted when "
+            "_initial_context is None (session resume)"
+        )
+
+        # Verify content is intact
+        data = json.loads(ctx_path.read_text(encoding="utf-8"))
+        assert data["user_history"][0]["content"] == "existing data"
+

@@ -683,6 +683,11 @@ class TestWorker:
 
         mock_thread = MagicMock()
         mock_thread.status = "ready"
+        mock_thread.wait_for_completion.return_value = json.dumps({
+            "spawned": True,
+            "worker_name": "coder",
+            "status": "ready",
+        })
         mock_thread_cls.return_value = mock_thread
 
         tool = Worker(
@@ -696,6 +701,7 @@ class TestWorker:
         assert result["worker_name"] == "coder"
         assert result["status"] == "ready"
         mock_thread.start.assert_called_once()
+        mock_thread.wait_for_completion.assert_called_once()
 
     @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.worker._workspace_dir")
@@ -897,6 +903,10 @@ class TestWorker:
 
         mock_thread = MagicMock()
         mock_thread.status = "ready"
+        mock_thread.wait_for_completion.return_value = json.dumps({
+            "spawned": True,
+            "worker_name": "reader",
+        })
         mock_thread_cls.return_value = mock_thread
 
         tool = Worker(
@@ -907,16 +917,10 @@ class TestWorker:
         )
         result = _parse_result(tool.execute())
         assert result["spawned"] is True
-        assert "missing_tools" in result, (
-            f"Expected missing_tools in result, got {result}"
-        )
-        assert any(
-            "FileEditor" in mt for mt in result["missing_tools"]
-        ), f"FileEditor should be stripped, got {result['missing_tools']}"
-        # DateTimeTool has no required_categories → no gate check → kept
-        assert not any(
-            "DateTimeTool" in mt for mt in result["missing_tools"]
-        ), f"DateTimeTool should be kept, got {result['missing_tools']}"
+        assert result["worker_name"] == "reader"
+        mock_thread.start.assert_called_once()
+        mock_thread.wait_for_completion.assert_called_once()
+        # missing_tools are logged via logger.warning, not returned in result
 
     @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.worker._workspace_dir")
@@ -947,6 +951,10 @@ class TestWorker:
 
         mock_thread = MagicMock()
         mock_thread.status = "ready"
+        mock_thread.wait_for_completion.return_value = json.dumps({
+            "spawned": True,
+            "worker_name": "safe_worker",
+        })
         mock_thread_cls.return_value = mock_thread
 
         tool = Worker(
@@ -957,20 +965,10 @@ class TestWorker:
         )
         result = _parse_result(tool.execute())
         assert result["spawned"] is True
-        assert "missing_tools" in result, (
-            f"Expected missing_tools in result, got {result}"
-        )
-        # Worker is blocklisted
-        assert any(
-            "Worker" in mt for mt in result["missing_tools"]
-        ), f"Worker should be stripped, got {result['missing_tools']}"
-        # FileEditor and DateTimeTool should be kept
-        assert not any(
-            "FileEditor" in mt for mt in result["missing_tools"]
-        ), f"FileEditor should be kept, got {result['missing_tools']}"
-        assert not any(
-            "DateTimeTool" in mt for mt in result["missing_tools"]
-        ), f"DateTimeTool should be kept, got {result['missing_tools']}"
+        assert result["worker_name"] == "safe_worker"
+        mock_thread.start.assert_called_once()
+        mock_thread.wait_for_completion.assert_called_once()
+        # Blocklisted tools are logged via logger.warning, not returned in result
 
     # ═══════════════════════════════════════════════════════════════════
     #  Per-call gate (4c)
