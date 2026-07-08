@@ -71,6 +71,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const dataReceivedRef = useRef(false) // true once we've received a response to our load
   const isActiveRef = useRef(isActive)
   isActiveRef.current = isActive
+  const prevIsActiveRef = useRef(isActive)
   const providersRef = useRef(providers)
   providersRef.current = providers
   const availableToolsRef = useRef(availableTools)
@@ -313,9 +314,19 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   // ── Activation safety net (reconnect on tab switch) ────────────────────
   // This fires when the user clicks an inactive tab. If the tab somehow lost
   // its WebSocket (e.g. server restart), this reconnects it.
+  // NOTE: On initial mount, the mount effect (hubReady + staggerMs) handles
+  // the first connection attempt. This effect only activates on isActive
+  // *transitions* (false → true), not on the initial mount where isActive
+  // is already true.
   useEffect(() => {
-    console.log(`[DEBUG SessionTab Activate effect] tabId=${tabId}, sessionId=${sessionId}, isActive=${isActive}, hubReady=${hubReady}, wsConnected=${isWsConnectedOrConnecting()}, tabConnecting=${tabConnectingRef.current}`)
-    if (!hubReady || !isActive) return
+    const prevIsActive = prevIsActiveRef.current
+    prevIsActiveRef.current = isActive
+    console.log(`[DEBUG SessionTab Activate effect] tabId=${tabId}, sessionId=${sessionId}, isActive=${isActive}, prevIsActive=${prevIsActive}, hubReady=${hubReady}, wsConnected=${isWsConnectedOrConnecting()}, tabConnecting=${tabConnectingRef.current}`)
+    // Skip on initial mount — mount effect handles the first connection
+    if (prevIsActive === isActive) return
+    // Only reconnect on inactive → active transitions (user clicked tab)
+    if (!isActive) return
+    if (!hubReady) return
     if (isWsConnectedOrConnecting()) {
       console.log(`[DEBUG SessionTab Activate effect] tab ${tabId} already connected — skipping`)
       return

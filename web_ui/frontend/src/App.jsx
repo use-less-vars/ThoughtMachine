@@ -598,7 +598,7 @@ export default function App() {
                   tabId={tab.tabId}
                   hubReady={hubReady}
                   isActive={tab.tabId === activeTabId}
-                  staggerMs={index * 200}
+                  staggerMs={(index + 1) * 200}   // +1 so first tab doesn't connect at 0ms (page still loading)
                   loadOnConnect={tab.sessionId === startupActiveSessionId || tab.tabId === activeTabId}
                   onClose={() => removeTab(tab.tabId)}
                   onNewSession={handleNewSessionCreated}
