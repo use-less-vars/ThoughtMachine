@@ -2818,3 +2818,89 @@ Key design decisions:
 - Atomic write via `.tmp` + `os.replace`
 - `setup_workspace.py` updated to not overwrite existing workers.json
 - 13 new tests in `tests/workspace/test_worker_templates.py`
+
+## 2026-07-05 — ## Workspace Opening Flow (End to End)
+
+### Architecture Lay...
+
+## Workspace Opening Flow (End to End)
+
+### Architecture Layers
+1. **Frontend** — React (`App.jsx`, `SessionTab.jsx`, `ConfigPanel.jsx`, `WorkspacePanel.jsx`)
+2. **Backend WebSocket (/ws)** — `server.py` → `bridge.py` (WebAgentBridge) → Agent
+3. **Backend REST (/api/...)** — `server.py` (browse) + `workspace_routes.py` (workspace files)
+4. **Workspace Storage** — `~/.thoughtmachine/workspaces/{workspace_id}/` (Dockerfile, capabilities.json, workers.json, domain_allowlist.json, mcp_servers.json, config.json)
+5. **Session Storage** — `~/.thoughtmachine/sessions/` (FileSystemSessionStore)
+
+### Two WebSocket Connections Per Session
+- **Hub WS** (in App.jsx) — session management only: list_sessions, new_session, load_session, close_session, delete_session, rename_session, get_open_sessions
+- **Tab WS** (in SessionTab.jsx) — agent interaction: start_session, continue_session, pause/resume/stop, get_config, apply_config, get_conversation, get_providers, save_provider, security_response, bootstrap_workspace, get_workspace_capabilities, rebuild_container
+
+### Full Flow: Browse → Select Folder → Apply Config → New Session → Bootstrap Workspace
+
+**Step 1: User clicks "Browse" button** (ConfigPanel.jsx, General tab, line 407-435)
+- Fetches `GET /api/browse?path=...` from server.py's REST endpoint (line 1326-1355)
+- Lists directory contents in DirectoryBrowser modal
+
+**Step 2: User clicks "Select This Folder"** (ConfigPanel.jsx, line 145/825)
+- Sets `draft.workspace_path = selectedPath` (line 826)
+
+**Step 3: User clicks "Apply"** (ConfigPanel.jsx, line 840-844)
+- Sends WebSocket command `apply_config` with full draft config including workspace_path (line 844)
+- Server processes via `_translate_frontend_config()` then `bridge.apply_config()`
+- Bridge persists config to `~/.thoughtmachine/agent_config.json`
+- `AgentConfig` model stores workspace_path; workspace_id is derived later
+
+**Step 4: Hub WS receives session_loaded → opens new tab** (App.jsx)
+- User clicks "+" tab → `hubSend('new_session')` (App.jsx line 373)
+- Hub WS handler in server.py (line 1085-1169):
+  1. Saves/clears old bridge
+  2. Creates fresh bridge + controller
+  3. Extracts `workspace_id` from message (optional, frontend doesn't send it)
+  4. Fallback: calls `_resolve_workspace_id(_project_root)` from bridge.py
+  5. _resolve_workspace_id scans `~/.thoughtmachine/workspaces/*/config.json` for matching root
+  6. Creates new Session() object, assigns workspace_id if found
+  7. Caches bridge in `_session_bridges[session_id]`
+  8. Saves session via FileSystemSessionStore
+  9. Sends `session_loaded` with session_id, session_name, workspace_id
+
+**Step 5: SessionTab connects and user types first query** (SessionTab.jsx)
+- SessionTab opens its own WebSocket connection
+- Sends `continue_session` with the query
+- bridge.start() reads config (including workspace_path) from agent_config.json
+- During Agent initialization, workspace is resolved from workspace_path
+- Bootstrap: `ensure_workspace_dirs(ws_id)` creates ~/.thoughtmachine/workspaces/{id}/ with Dockerfile, capabilities.json, workers.json, domain_allowlist.json, mcp_servers.json
+
+### Key Files
+- `server.py` — WebSocket hub + tab endpoint, REST browse endpoints, config handling
+- `bridge.py` — WebAgentBridge, `_resolve_workspace_id()` cache, session lifecycle
+- `workspace_routes.py` — REST API for Dockerfile, domain_allowlist, workers, permissions
+- `workspace_capabilities.py` — `_workspace_dir()`, `ensure_workspace_dirs()`, `resolve_workspace_id()`
+- `ConfigPanel.jsx` — Browse UI, workspace path selection, apply config
+- `WorkspacePanel.jsx` — Dockerfile editor, domain allowlist, workers, permissions display
+- `App.jsx` — Hub WS management, tab creation via new_session
+- `SessionTab.jsx` — Tab WS connection, agent interaction
+
+
+## 2026-07-09 — ## Session-Scoped Worker Registry (2025-07-17)
+
+### Change S...
+
+## Session-Scoped Worker Registry (2025-07-17)
+
+### Change Summary
+- `_worker_registry` keys changed from `str` (worker_name) to `tuple(session_id, worker_name)`
+- Worker directory path: `workers/<session_id>/<name>` (when session_id provided), `workers/<name>` (legacy, backward compatible)
+- All 5 action methods (list/spawn/check/query/stop) use composite tuple key with `self.session_id or ""`
+- `shutdown_workers()` iterates tuple keys, extracting worker name with `key[1]`
+- `check_system._query_running_workers()` updated to extract name/session_id from tuple keys
+- `get_workers()` in workspace_routes.py updated to handle both legacy and session-scoped directory structures
+
+### Backward Compatibility
+- Workers spawned without `session_id` use legacy path `workers/<name>` and registry key `("", name)`
+- All existing tests continue to work because they don't pass `session_id`
+- Tests patching `_worker_registry` with `{}` still work (tuple key `("", "coder")` not found in empty dict)
+
+### Task 1: send_query() Improvement
+- Added fallback to read `last_heartbeat` from `status.json` when in-memory value is None
+- Improved `TimeoutError` message to include heartbeat age if available
