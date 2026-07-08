@@ -61,7 +61,7 @@ DEFAULT_SESSION_PERMISSIONS = {
 class ToolExecutor:
     """Handles tool execution, JSON repair, and tool result processing."""
 
-    def __init__(self, tool_classes, config, state, logger=None, security_available=False, agent=None):
+    def __init__(self, tool_classes, config, state, logger=None, security_available=False, agent=None, event_bus=None):
         """
         Initialize tool executor.
         
@@ -79,6 +79,7 @@ class ToolExecutor:
         self.logger = logger
         self.security_available = security_available
         self.agent = agent
+        self._event_bus = event_bus
 
     def execute_tool_calls(self, tool_calls: List[Dict[str, Any]], add_to_conversation_func, update_token_func=None, agent_id: int = 0, session_id: str = "", turn_transaction: Optional[TurnTransaction]=None) -> Tuple[List[Dict[str, Any]], bool, Optional[Dict[str, Any]], Optional[str], Optional[int]]:
         """
@@ -241,7 +242,7 @@ class ToolExecutor:
                     tool_name=tool_name,
                     tool_args=arguments,
                     description=getattr(tool_class, 'describe_action', lambda a: '')(arguments),
-                    event_bus=global_event_bus,
+                    event_bus=self._event_bus or global_event_bus,
                     agent_id=str(agent_id),
                     session_id=session_id,
                 )

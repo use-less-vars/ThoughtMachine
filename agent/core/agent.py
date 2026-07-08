@@ -31,6 +31,7 @@ from fast_json_repair import loads as repair_loads
 from session.context_builder import ContextBuilder
 from agent.core.state import AgentState, ExecutionState, SessionState, TimeState
 from agent import events as ev
+from agent.events import global_event_bus
 from .token_counter import TokenCounter
 from .llm_client import LLMClient, LLMError
 from .conversation_manager import ConversationManager
@@ -49,7 +50,7 @@ class Agent:
     SAFETY_MARGIN = 1000
     DEFAULT_RESPONSE_TOKENS = 4096
 
-    def __init__(self, config: AgentConfig, session=None, session_id: str=None):
+    def __init__(self, config: AgentConfig, session=None, session_id: str=None, event_bus=None):
         """
         Initialize modular agent.
         
@@ -113,7 +114,7 @@ class Agent:
         except Exception as e:
             log('WARNING', 'core.agent', f"Failed to start MCP background registration: {e}")
         self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
-        self.tool_executor = ToolExecutor(self.tool_classes, config, None, self.logger, self.security_available, agent=self)
+        self.tool_executor = ToolExecutor(self.tool_classes, config, None, self.logger, self.security_available, agent=self, event_bus=event_bus or global_event_bus)
         self.provider = self.llm_client.provider
         from session.models import RuntimeParams
         self.runtime_params = RuntimeParams(temperature=config.temperature, top_p=None)
