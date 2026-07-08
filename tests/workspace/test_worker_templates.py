@@ -136,18 +136,19 @@ class TestLoadTemplateWorkers:
 class TestBuildDefaultWorkers:
     """Tests for _build_default_workers()."""
 
-    def test_echo_worker_is_first(self, with_template_dir):
-        """The echo worker is always the first entry."""
-        workers = _build_default_workers()
-        assert workers[0]["name"] == "echo"
-        assert workers[0]["description"] == "Simple test worker for verifying the delegation loop"
-
-    def test_all_four_workers_present(self, with_template_dir):
-        """Echo + coder + reviewer + researcher are all present."""
+    def test_template_workers_present(self, with_template_dir):
+        """Template workers (coder, reviewer, researcher) are present."""
         workers = _build_default_workers()
         names = {w["name"] for w in workers}
-        assert names == {"echo", "coder", "reviewer", "researcher"}
-        assert len(workers) == 4
+        assert names == {"coder", "reviewer", "researcher"}
+        assert "echo" not in names
+
+    def test_all_three_workers_present(self, with_template_dir):
+        """Coder + reviewer + researcher are all present (no echo)."""
+        workers = _build_default_workers()
+        names = {w["name"] for w in workers}
+        assert names == {"coder", "reviewer", "researcher"}
+        assert len(workers) == 3
 
     def test_no_duplicate_names(self, with_template_dir):
         """No two workers share the same name."""
@@ -168,24 +169,25 @@ class TestEnsureWorkspaceDirsMerged:
     """Integration tests for ensure_workspace_dirs with template merging."""
 
     def test_creates_workers_with_templates(self, with_template_dir):
-        """workers.json contains echo + all three templates on first bootstrap."""
+        """workers.json contains all three templates (coder, reviewer, researcher) on first bootstrap."""
         ensure_workspace_dirs("test-ws-merged")
         path = _user_dir() / "workspaces" / "test-ws-merged" / "workers.json"
         assert path.exists()
 
         workers = json.loads(path.read_text(encoding="utf-8"))
         names = {w["name"] for w in workers}
-        assert names == {"echo", "coder", "reviewer", "researcher"}
-        assert len(workers) == 4
+        assert names == {"coder", "reviewer", "researcher"}
+        assert "echo" not in names
+        assert len(workers) == 3
 
     def test_idempotent_does_not_modify_existing_workers(self, with_template_dir):
         """Once workers.json exists, ensure_workspace_dirs does not touch it."""
         ensure_workspace_dirs("test-ws-merged-2")
         path = _user_dir() / "workspaces" / "test-ws-merged-2" / "workers.json"
 
-        # Modify the file to only have echo
+        # Modify the file to only have a custom worker
         path.write_text(
-            json.dumps([{"name": "echo", "system_prompt": "custom", "description": "custom", "tools": [], "permission_footprint": {}}], indent=2),
+            json.dumps([{"name": "custom", "system_prompt": "custom", "description": "custom", "tools": [], "permission_footprint": {}}], indent=2),
             encoding="utf-8",
         )
 
@@ -194,7 +196,7 @@ class TestEnsureWorkspaceDirsMerged:
 
         workers = json.loads(path.read_text(encoding="utf-8"))
         assert len(workers) == 1
-        assert workers[0]["name"] == "echo"
+        assert workers[0]["name"] == "custom"
         assert workers[0]["system_prompt"] == "custom"  # untouched
 
     def test_atomic_write_leaves_no_tmp_file(self, with_template_dir):

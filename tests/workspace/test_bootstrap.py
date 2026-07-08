@@ -85,15 +85,18 @@ class TestEnsureWorkspaceDirs:
         assert json.loads(path.read_text(encoding="utf-8")) == []
 
     def test_creates_workers_json(self, temp_user_dir):
-        """workers.json contains echo worker plus template workers."""
+        """workers.json contains template workers (coder, reviewer, researcher)."""
         ensure_workspace_dirs("test-ws")
         path = _user_dir() / "workspaces" / "test-ws" / "workers.json"
         assert path.exists()
         workers = json.loads(path.read_text(encoding="utf-8"))
-        # Must contain at least the echo worker
+        # Must contain template workers, NOT echo
         names = {w["name"] for w in workers}
-        assert "echo" in names
-        assert len(workers) >= 1
+        assert "echo" not in names
+        assert "coder" in names
+        assert "reviewer" in names
+        assert "researcher" in names
+        assert len(workers) == 3
 
     def test_creates_mcp_servers_json(self, temp_user_dir):
         """mcp_servers.json is an empty JSON array."""
