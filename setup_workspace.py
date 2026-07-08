@@ -45,22 +45,12 @@ def main():
     for path in created:
         print(f"✅ Created {path}")
 
-    # ── Write the echo worker into workers.json ──────────────────────────
-    # ── Workers already written by ensure_workspace_dirs (echo + templates) ─
+    # ── Workers already written by ensure_workspace_dirs (templates only, no echo) ─
     workers_path = ws_dir / "workers.json"
     if workers_path.exists():
         print(f"Workers already bootstrapped at {workers_path}")
     else:
-        echo_worker = {
-            "name": "echo",
-            "system_prompt": "You are Echo, a simple test worker. Respond concisely and directly to any query.",
-            "required_categories": [],
-            "worker_permissions": {},
-            "description": "Simple test worker for verifying the delegation loop",
-            "tools": ["FilePreviewTool"],
-        }
-        workers_path.write_text(json.dumps([echo_worker], indent=2), encoding="utf-8")
-        print(f"Wrote echo worker definition to {workers_path}")
+        print(f"workers.json not found at {workers_path} — ensure_workspace_dirs should create it")
 
 
 if __name__ == "__main__":
