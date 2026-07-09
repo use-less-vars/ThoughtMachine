@@ -102,7 +102,6 @@ logger = logging.getLogger(__name__)
 # main agent / human user.
 _WORKER_BLOCKLIST: frozenset[str] = frozenset({
     "Worker",           # recursion: worker spawning workers
-    "DockerCodeRunner",  # container execution
     "EditDockerfile",    # container configuration
     "MCPValidator",      # MCP server management
 })
