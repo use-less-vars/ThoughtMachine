@@ -159,6 +159,76 @@ atexit.register(shutdown_workers)
 _worker_registry: dict = {}
 _registry_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# Restrictive merge for permission ceiling enforcement
+# ---------------------------------------------------------------------------
+
+# Session permissions act as the ceiling — worker can only reduce strictness
+_STRICTNESS_ORDER: dict[str, int] = {
+    "container": 0,
+    "filesystem": 1,
+    "execution": 2,
+    "network": 3,
+}
+
+# Value ordering within each category: stricter = lower index
+# "deny" is stricter than "allow", "none" is stricter than "read"
+_PERMISSION_ORDER: dict[str, dict[str, int]] = {
+    "container": {"deny": 0, "allow": 1},
+    "filesystem": {"none": 0, "read": 1, "write": 2},
+    "execution": {"deny": 0, "allow": 1},
+    "network": {"deny": 0, "allow": 1},
+}
+
+
+def _restrictive_merge(
+    session_perms: dict[str, Any],
+    worker_perms: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Merge worker permissions into session permissions, picking the *more
+    restrictive* (stricter) value for each key.
+
+    The session acts as the ceiling — a worker cannot exceed the session's
+    permission level for any category.  Values may be booleans (``False`` =
+    deny, ``True`` = allow) or strings whose strictness order is defined
+    by ``_PERMISSION_ORDER``.
+
+    Examples
+    --------
+    >>> _restrictive_merge({"execution": "allow"}, {"execution": "deny"})
+    {'execution': 'deny'}
+    >>> _restrictive_merge({"execution": "deny"}, {"execution": "allow"})
+    {'execution': 'deny'}        # session ceiling wins
+    >>> _restrictive_merge({"filesystem": "none"}, {"filesystem": "write"})
+    {'filesystem': 'none'}
+    >>> _restrictive_merge({"container": False}, {"container": True})
+    {'container': False}         # session ceiling wins
+    """
+    result = {}
+    all_keys = set(session_perms) | set(worker_perms)
+    for key in all_keys:
+        s_val = session_perms.get(key)
+        w_val = worker_perms.get(key)
+
+        if s_val is None:
+            result[key] = w_val  # worker fills in
+        elif w_val is None:
+            result[key] = s_val  # session provides
+        elif isinstance(s_val, bool) or isinstance(w_val, bool):
+            # Boolean case: False (deny) is stricter than True (allow)
+            result[key] = False if (s_val is False or w_val is False) else True
+        else:
+            # Both are strings — pick the stricter one by order map
+            order = _PERMISSION_ORDER.get(key, {})
+            s_rank = order.get(s_val, 99)
+            w_rank = order.get(w_val, 99)
+            # Lower rank = stricter
+            result[key] = s_val if s_rank <= w_rank else w_val
+    return result
+
+
+
 
 # ---------------------------------------------------------------------------
 # Worker thread
@@ -426,8 +496,9 @@ class WorkerThread(threading.Thread):
         worker_cfg["time_monitor_enabled"] = True
         worker_cfg["stop_check"] = self._stop_event.is_set
 
-        # ── Inject session permissions ─────────────────────────────────
-        worker_cfg["session_permissions"] = self._session_permissions
+        # ── Inject session permissions (restrictive merge — session is ceiling) ──
+        merged = _restrictive_merge(self._session_permissions, self._worker_permissions)
+        worker_cfg["session_permissions"] = merged
 
         # ── Safety net: inject workspace_path if missing ────────────────
         # Worker._build_agent_config (the Tool-class method) now injects
@@ -933,7 +1004,13 @@ class WorkerThread(threading.Thread):
 # ---------------------------------------------------------------------------
 
 class Worker(ToolBase):
-    """Manage background or child worker processes."""
+    """Manage background or child worker processes.
+
+    When spawning a worker, set ``force=True`` to automatically stop any
+    existing instance of the same worker (across all sessions) before
+    creating a fresh one.  This is useful for recovering from stale or
+    hanging workers left behind by previous sessions.
+    """
 
     tool: str = "Worker"
     required_categories: ClassVar[List[str]] = ["execution:read"]
@@ -975,6 +1052,11 @@ class Worker(ToolBase):
     session_id: Optional[str] = Field(
         default=None,
         description="Session ID that spawned this worker (injected by ToolExecutor)",
+    )
+
+    force: bool = Field(
+        default=False,
+        description="If True, stop any existing worker instance (across all sessions) before spawning a fresh one.",
     )
 
     skip_output_truncation: ClassVar[bool] = True
@@ -1123,6 +1205,22 @@ class Worker(ToolBase):
             return None
         return cls
 
+
+    def _find_all_worker_threads(self, worker_name: str) -> list[tuple[str, Any]]:
+        """
+        Search the entire ``_worker_registry`` for all entries matching
+        *worker_name*, regardless of session_id.
+
+        Returns a list of ``(session_key, thread)`` tuples.
+        """
+        results: list[tuple[str, Any]] = []
+        with _registry_lock:
+            for (sid, wname), thread in list(_worker_registry.items()):
+                if wname == worker_name:
+                    results.append((sid, thread))
+        return results
+
+
     # -- action implementations --------------------------------------
 
     def _action_list(self, workers: list) -> dict:
@@ -1153,6 +1251,29 @@ class Worker(ToolBase):
             return {
                 "error": f"Worker '{self.worker_name}' not found in workers.json",
             }
+
+        # ── Force-respawn: stop any existing instances across all sessions ──
+        if self.force:
+            stale_instances = self._find_all_worker_threads(self.worker_name)
+            stopped_info = []
+            for sid, thread in stale_instances:
+                worker_label = f"{self.worker_name} (session={sid})"
+                logger.info("Force-spawn: stopping stale worker '%s'", worker_label)
+                try:
+                    thread.stop()
+                    thread.join(timeout=10.0)
+                except Exception:
+                    logger.exception("Error stopping stale worker '%s'", worker_label)
+                finally:
+                    thread._save_context()
+                    with _registry_lock:
+                        _worker_registry.pop((sid, self.worker_name), None)
+                stopped_info.append({"session_id": sid, "status": thread.status})
+            if stopped_info:
+                logger.info(
+                    "Force-spawn: stopped %d stale instance(s) of worker '%s'",
+                    len(stopped_info), self.worker_name,
+                )
 
         # Prevent duplicate spawns (session-scoped key)
         session_key = self.session_id or ""
@@ -1341,13 +1462,51 @@ class Worker(ToolBase):
             }
 
     def _action_check(self, workers: list) -> dict:
-        """Check on a specific worker by name."""
+        """Check on a specific worker by name.
+
+        First tries the current session; if not found, searches across all
+        sessions and reports any foreign-session instances found.
+        """
         session_key = self.session_id or ""
         with _registry_lock:
             thread = _worker_registry.get((session_key, self.worker_name))
 
         if thread is None:
-            # Worker exists in definition but was never spawned
+            # Not found in current session → search across all sessions
+            all_instances = self._find_all_worker_threads(self.worker_name)
+            if all_instances:
+                # Found in another session — report with note
+                if len(all_instances) == 1:
+                    sid, t = all_instances[0]
+                    return {
+                        "worker_name": self.worker_name,
+                        "status": t.status,
+                        "current_task": t.current_task,
+                        "last_heartbeat": t.last_heartbeat,
+                        "error": t.error,
+                        "session_id": sid,
+                        "note": "Worker is from a different session",
+                        "alive": t.is_alive(),
+                    }
+                # Multiple instances across sessions
+                instances = []
+                for sid, t in all_instances:
+                    instances.append({
+                        "session_id": sid,
+                        "status": t.status,
+                        "current_task": t.current_task,
+                        "last_heartbeat": t.last_heartbeat,
+                        "error": t.error,
+                        "alive": t.is_alive(),
+                    })
+                return {
+                    "worker_name": self.worker_name,
+                    "note": "Worker instances found across multiple sessions",
+                    "instances": instances,
+                    "count": len(instances),
+                }
+
+            # No instances found anywhere — report as stopped
             entry = self._find_worker(workers, self.worker_name)
             if entry:
                 return {
@@ -1434,23 +1593,60 @@ class Worker(ToolBase):
             }
 
     def _action_stop(self, workers: list) -> dict:
-        """Stop a running worker and persist its context."""
+        """Stop a running worker and persist its context.
+
+        First tries the current session; if not found, searches across all
+        sessions and stops any matching instances.
+        """
         session_key = self.session_id or ""
         with _registry_lock:
             thread = _worker_registry.get((session_key, self.worker_name))
 
+        # ── Not found in current session → search across all sessions ──
         if thread is None:
-            entry = self._find_worker(workers, self.worker_name)
-            if entry:
+            all_instances = self._find_all_worker_threads(self.worker_name)
+            if not all_instances:
+                # No instances anywhere — report as not running
+                entry = self._find_worker(workers, self.worker_name)
+                if entry:
+                    return {
+                        "worker_name": self.worker_name,
+                        "status": "stopped",
+                        "message": f"Worker '{self.worker_name}' was not running.",
+                    }
                 return {
-                    "worker_name": self.worker_name,
-                    "status": "stopped",
-                    "message": f"Worker '{self.worker_name}' was not running.",
+                    "error": f"Worker '{self.worker_name}' not found",
                 }
+
+            # Found in another session — stop all instances
+            stopped_info = []
+            for sid, t in all_instances:
+                worker_label = f"{self.worker_name} (session={sid})"
+                logger.info("Cross-session stop: stopping worker '%s'", worker_label)
+                try:
+                    t.stop()
+                    t.join(timeout=10.0)
+                except Exception as exc:
+                    logger.exception("Error stopping worker '%s'", worker_label)
+                    stopped_info.append({"session_id": sid, "error": str(exc)})
+                finally:
+                    t._save_context()
+                    with _registry_lock:
+                        _worker_registry.pop((sid, self.worker_name), None)
+                    if t.status not in [s.get("status") for s in stopped_info]:
+                        stopped_info.append({"session_id": sid, "status": t.status})
+
             return {
-                "error": f"Worker '{self.worker_name}' not found",
+                "worker_name": self.worker_name,
+                "status": "stopped",
+                "message": (
+                    f"Stopped {len(stopped_info)} instance(s) of worker "
+                    f"'{self.worker_name}' across sessions."
+                ),
+                "stopped_instances": stopped_info,
             }
 
+        # ── Found in current session ──
         if not thread.is_alive():
             with _registry_lock:
                 _worker_registry.pop((session_key, self.worker_name), None)

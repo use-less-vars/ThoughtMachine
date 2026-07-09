@@ -24,7 +24,7 @@
   "max_backup_files": 5,
   "workspace_path": "",
   "session_permissions": {
-    "container": false,
+    "container": true,
     "network": true,
     "filesystem": "write",
     "system": "read",
