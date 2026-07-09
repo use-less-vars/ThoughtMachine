@@ -5,16 +5,15 @@
   "tools": [
     "FileEditor",
     "FileSearchTool",
-    "SearchCodebaseTool",
     "GlobTool",
     "DirectoryTreeTool",
-    "DockerCodeRunner",
     "FilePreviewTool",
     "FileSummaryTool"
   ],
   "worker_permissions": {
     "filesystem": "read"
   },
+  "permission_footprint": {},
   "timeout_seconds": 90,
   "max_turns": 100,
   "temperature": 0.1,

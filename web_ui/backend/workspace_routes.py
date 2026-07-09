@@ -614,45 +614,63 @@ async def get_worker_events(
 ):
     """Return the event log for a specific worker as a JSON array.
 
-    Events are read from ``workers/events.jsonl`` and filtered by the
-    worker's ``name`` field (present on every event line).
+    Events are read from ``workers/events.jsonl`` (flat path, legacy) or
+    ``workers/<session_id>/events.jsonl`` (session-scoped) and filtered by
+    the worker's ``name`` field (present on every event line).
 
     Query parameters:
       - ``limit``: max number of events to return (most recent)
       - ``since``: ISO-8601 timestamp \u2014 return only events after this time
     """
     ensure_workspace_dirs(ws_id)
-    events_path = _workspace_dir(ws_id) / "workers" / "events.jsonl"
-    if not events_path.exists():
-        return []
+    workers_dir = _workspace_dir(ws_id) / "workers"
+
+    # Collect all candidate events.jsonl paths
+    candidates: List[Path] = []
+
+    # 1. Flat path: workers/events.jsonl (legacy, no session_id)
+    flat_path = workers_dir / "events.jsonl"
+    if flat_path.exists():
+        candidates.append(flat_path)
+
+    # 2. Session-scoped paths: workers/<session_id>/events.jsonl
+    if workers_dir.is_dir():
+        for subdir in workers_dir.iterdir():
+            if not subdir.is_dir():
+                continue
+            session_events = subdir / "events.jsonl"
+            if session_events.exists():
+                candidates.append(session_events)
 
     events = []
-    try:
-        with open(events_path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                    if event.get("worker_name") != name:
+    for events_path in candidates:
+        try:
+            with open(events_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
                         continue
-                    # Apply ?since= filter
-                    if since is not None:
-                        ts = event.get("timestamp", "")
-                        if ts < since:
+                    try:
+                        event = json.loads(line)
+                        if event.get("worker_name") != name:
                             continue
-                    events.append(event)
-                except json.JSONDecodeError:
-                    continue
-    except OSError:
-        pass
+                        # Apply ?since= filter
+                        if since is not None:
+                            ts = event.get("timestamp", "")
+                            if ts < since:
+                                continue
+                        events.append(event)
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            pass
 
     # Apply ?limit= (most recent N)
     if limit is not None and limit > 0 and len(events) > limit:
         events = events[-limit:]
 
     return events
+
 
 
 # ── POST /api/workspace/{ws_id}/workers/{name}/stop ────────────────────────

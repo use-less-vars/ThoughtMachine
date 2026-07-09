@@ -67,7 +67,7 @@ function NewEventsButton({ onClick }) {
 }
 
 // ── Main component ────────────────────────────────────────────────────
-function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose }) {
+function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomingEvents = [] }) {
   // Panel resize state (self-contained)
   const [panelWidth, setPanelWidth] = useState(PANEL_DEFAULT);
   const dragRef = useRef(null);
@@ -138,7 +138,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose }) {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         if (Array.isArray(data)) {
-          const found = data.find((w) => w.name === workerName && (!sessionId || w.session_id === sessionId));
+          const found = data.find((w) => w.name === workerName);
           if (found) {
             setWorkerInfo(found);
             setWorkerError('');
@@ -178,6 +178,32 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose }) {
     lastFetchTimeRef.current = null;
     eventsRef.current = [];
   }, [workspaceId, workerName]);
+
+  // ── Merge incoming WS events (from bridge via SessionTab) ────────────
+  // Filter by worker name so cross-session WS events are correctly routed
+  useEffect(() => {
+    if (!incomingEvents || incomingEvents.length === 0) return
+    const relevantEvents = incomingEvents.filter(e => {
+      const evtWorkerName = e.worker_name || e.response?.worker_name
+      return !evtWorkerName || evtWorkerName === workerName
+    })
+    if (relevantEvents.length === 0) return
+    setEvents(prev => {
+      const existingKeys = new Set(prev.map(e => e.event + (e.timestamp || '')))
+      const newOnes = relevantEvents
+        .filter(e => !existingKeys.has((e.type?.replace('worker:', '') || '') + (e.timestamp || '')))
+        .map(e => ({
+          event: e.type?.replace('worker:', '') || 'unknown',
+          timestamp: e.timestamp,
+          request: e.request || {},
+          response: e.response || { error: e.error, status: e.status, worker_name: e.worker_name },
+        }))
+      if (newOnes.length === 0) return prev
+      const updated = [...prev, ...newOnes]
+      eventsRef.current = updated
+      return updated
+    })
+  }, [incomingEvents, workerName])
 
   // ── Events fetching with polling ──────────────────────────────────────
   const [events, setEvents] = useState([]);
@@ -259,9 +285,15 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose }) {
     isAtBottomRef.current = true;
   };
 
-  // ── Stop handler ──────────────────────────────────────────────────────
+  // ── Stop handler (session-scoped control) ───────────────────────────────
   const handleStop = useCallback(async () => {
     if (!workspaceId || !workerName) return;
+    // Block control from non-owning sessions
+    if (workerInfo && workerInfo.session_id && workerInfo.session_id !== sessionId) {
+      setStopError('Cannot stop worker from another session');
+      setTimeout(() => setStopError(''), 3000);
+      return;
+    }
     setStopError('');
     try {
       const res = await fetch(`/api/workspace/${workspaceId}/workers/${encodeURIComponent(workerName)}/stop`, {

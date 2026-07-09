@@ -49,9 +49,10 @@ const INITIAL_STATE = {
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
-function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onSessionSaved, onRegister, onRunningChange, onSessionRenamed, selectedWorker, onSelectWorker, activeSessionId, onClearWorker }) {
+function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onSessionSaved, onRegister, onRunningChange, onSessionRenamed, selectedWorker, onSelectWorker, activeSessionId, onClearWorker, onWorkerEvent }) {
   const [state, setState] = useState(INITIAL_STATE)
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
+  const currentSessionIdRef = useRef(currentSessionId)
   const [providers, setProviders] = useState([])
   const [availableTools, setAvailableTools] = useState([])
   const wsRef = useRef(null)
@@ -137,6 +138,11 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   }, [isDeferred, state.history])
 
   // ── Derived helpers ─────────────────────────────────────────────────────
+  // ── Keep currentSessionIdRef in sync (avoids stale closure in handleEvent) ──
+  useEffect(() => {
+    currentSessionIdRef.current = currentSessionId
+  }, [currentSessionId])
+
   const update = useCallback((patch) => {
     setState((prev) => ({
       ...prev,
@@ -186,6 +192,8 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   onRegisterRef.current = onRegister
   const loadOnConnectRef = useRef(loadOnConnect)
   loadOnConnectRef.current = loadOnConnect
+  const onWorkerEventRef = useRef(onWorkerEvent)
+  onWorkerEventRef.current = onWorkerEvent
 
   const connectSessionWs = useCallback(() => {
     // Guard: prevent duplicate connections from StrictMode double-mount
@@ -495,6 +503,17 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           arguments: msg.arguments || {},
           description: msg.description || `Tool '${msg.tool_name || 'unknown'}' requires your approval.`,
         })
+        break
+
+      // ── Worker lifecycle events (real-time from bridge) ──
+      case 'worker:worker_spawned':
+      case 'worker:worker_status':
+      case 'worker:worker_completed':
+      case 'worker:worker_error':
+        // Use refs to avoid stale closure (connectSessionWs has [] deps)
+        if (onWorkerEventRef.current && currentSessionIdRef.current) {
+          onWorkerEventRef.current(currentSessionIdRef.current, msg)
+        }
         break
 
       default:

@@ -219,6 +219,63 @@ export default function adaptWorkerEvent(evt) {
         is_system_notification: true,
       }
     }
+    // ── Worker lifecycle events (from WebSocket bridge) ────────────
+    case 'worker_spawned': {
+      const sReq = evt.request || {}
+      const sResp = evt.response || {}
+      const workerName = sResp.worker_name || sReq.worker_name || 'default'
+      return {
+        _id: eventId(evt),
+        role: 'system',
+        content: `🟢 Worker spawned: ${workerName}`,
+        is_system_notification: true,
+        is_worker_event: true,
+      }
+    }
+
+    case 'worker_status': {
+      const stReq = evt.request || {}
+      const stResp = evt.response || {}
+      const status = stResp.status || stReq.status || 'running'
+      const message = stResp.message || stReq.message || ''
+      const content = message
+        ? `⏳ Worker status: ${status} — ${message}`
+        : `⏳ Worker status: ${status}`
+      return {
+        _id: eventId(evt),
+        role: 'system',
+        content,
+        is_system_notification: true,
+        is_worker_event: true,
+      }
+    }
+
+    case 'worker_completed': {
+      const cReq = evt.request || {}
+      const cResp = evt.response || {}
+      const workerName2 = cResp.worker_name || cReq.worker_name || 'default'
+      return {
+        _id: eventId(evt),
+        role: 'system',
+        content: `✅ Worker completed: ${workerName2}`,
+        is_system_notification: true,
+        is_worker_event: true,
+      }
+    }
+
+    case 'worker_error': {
+      const eReq = evt.request || {}
+      const eResp = evt.response || {}
+      const errMsg = eResp.error || eReq.error || 'Unknown worker error'
+      const workerName3 = eResp.worker_name || eReq.worker_name || 'default'
+      return {
+        _id: eventId(evt),
+        role: 'user',
+        content: `🔴 Worker error (${workerName3}): ${errMsg}`,
+        is_system_notification: true,
+        is_worker_event: true,
+      }
+    }
 
     // ── Fallback: unknown event type ──────────────────────────────
     default:

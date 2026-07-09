@@ -196,7 +196,7 @@ export function WorkerAutoOpenWatcher({ workspaceId, onSelectWorker, onClearWork
       fetch(`/api/workspace/${workspaceId}/workers`)
         .then(res => res.ok ? res.json() : [])
         .then(data => {
-          const filtered = Array.isArray(data) ? data.filter(w => !sessionId || w.session_id === sessionId) : [];
+          const filtered = Array.isArray(data) ? data : [];
           setWorkers(filtered);
         })
         .catch(() => setWorkers([]));

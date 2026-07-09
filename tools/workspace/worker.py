@@ -85,6 +85,14 @@ except ImportError:
     NullEventBus = None  # type: ignore
     _NULL_EVENT_BUS = None
 
+try:
+    from agent.events import global_event_bus, create_event, EventType
+    _WORKER_EVENT_BUS = global_event_bus
+except ImportError:
+    _WORKER_EVENT_BUS = None
+    create_event = None
+    EventType = None
+
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +210,7 @@ class WorkerThread(threading.Thread):
         # Session permissions for gate-checking tool calls
         self._session_permissions: Dict[str, Any] = session_permissions or {}
         # Worker-level permission footprint from definition
-        self._worker_permissions: Dict[str, Any] = definition.get("worker_permissions", {})
+        self._worker_permissions: Dict[str, Any] = definition.get("worker_permissions") or definition.get("permission_footprint", {})
 
         # Project root from the session (resolved from workspace config)
         self._project_root: Optional[str] = project_root
@@ -649,6 +657,7 @@ class WorkerThread(threading.Thread):
             self.status = "ready"
             self.error = None
             self._write_status_file()
+            self._publish_event('worker_spawned', {'status': 'ready'})
             if self._worker_ctx is None:
                 # Load system prompt from definition
                 system_prompt = self.definition.get(
@@ -729,10 +738,12 @@ class WorkerThread(threading.Thread):
                 # ── Fix 1.2: Set busy before processing query ───────────
                 self.status = "busy"
                 self._write_status_file()
+                self._publish_event('worker_status', {'status': 'busy', 'current_task': self.current_task})
                 reply = self._run_tool_loop(query)
                 # Back to ready after query completes
                 self.status = "ready"
                 self._write_status_file()
+                self._publish_event('worker_status', {'status': 'ready'})
 
                 self.current_task = None
                 self.last_heartbeat = datetime.now(timezone.utc).isoformat()
@@ -760,10 +771,12 @@ class WorkerThread(threading.Thread):
             except queue.Full:
                 pass
             self._log_event("error", {}, {"error": str(exc)})
+            self._publish_event('worker_error', {'error': str(exc)})
         else:
             self.status = "completed"
             self._write_status_file()
             self._log_event("completed", {}, {})
+            self._publish_event('worker_completed', {'status': 'completed'})
         finally:
             if self._worker_ctx is not None:
                 self._save_context()
@@ -895,6 +908,25 @@ class WorkerThread(threading.Thread):
                 fh.write(json.dumps(event, default=str) + "\n")
         except OSError as exc:
             logger.error("Failed to log worker event: %s", exc)
+
+    def _publish_event(self, event_type: str, data: dict) -> None:
+        """
+        Publish a typed event to the global_event_bus for real-time forwarding
+        to WebSocket clients via the bridge subscriber.
+        """
+        if _WORKER_EVENT_BUS is None or create_event is None or EventType is None:
+            return
+        try:
+            evt_type = EventType(event_type)
+            evt = create_event(
+                evt_type,
+                data={**data, 'worker_name': self.worker_name, 'session_id': self.session_id},
+                source=f'worker:{self.worker_name}',
+                session_id=self.session_id,
+            )
+            _WORKER_EVENT_BUS.publish(evt)
+        except Exception as exc:
+            logger.debug("Failed to publish worker event '%s': %s", event_type, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1045,7 +1077,7 @@ class Worker(ToolBase):
         if not required:
             return None
 
-        worker_perms = definition.get("worker_permissions", {})
+        worker_perms = definition.get("worker_permissions") or definition.get("permission_footprint", {})
 
         ok, error_msg = check_required_categories(
             required=required,
@@ -1166,7 +1198,7 @@ class Worker(ToolBase):
         tool_classes: Dict[str, type[ToolBase]] = {}
         missing_tools: list[str] = []
         tool_names = definition.get("tools", [])
-        worker_perms = definition.get("worker_permissions", {})
+        worker_perms = definition.get("worker_permissions") or definition.get("permission_footprint", {})
         if tool_names:
             for tool_name in tool_names:
                 if tool_name in _WORKER_BLOCKLIST:
@@ -1182,7 +1214,7 @@ class Worker(ToolBase):
                 if tool_cats and GATE_AVAILABLE and check_required_categories is not None:
                     ok, _err = check_required_categories(
                         required=tool_cats,
-                        effective={},
+                        effective=worker_perms,
                         tool_name=tool_name,
                         tool_args={},
                         description=(

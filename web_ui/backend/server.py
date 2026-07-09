@@ -78,6 +78,10 @@ Server → Client (JSON):
     provider_deleted    { "type": "provider_deleted",    "provider_id": "..." }
     tools_list          { "type": "tools_list",          "tools": [...] }
     security_prompt     { "type": "security_prompt",     "request_id": "...", "tool_name": "...", "capabilities": [...], "description": "..." }
+    worker_spawned      { "type": "worker:worker_spawned",      "worker_name": "...", "timestamp": "...", "data": {...} }
+    worker_status       { "type": "worker:worker_status",       "worker_name": "...", "timestamp": "...", "data": {...} }
+    worker_completed    { "type": "worker:worker_completed",    "worker_name": "...", "timestamp": "...", "data": {...} }
+    worker_error        { "type": "worker:worker_error",        "worker_name": "...", "timestamp": "...", "data": {...} }
 """
 
 from __future__ import annotations

@@ -64,7 +64,9 @@ export default function App() {
   })
 
   const [sessionPanelOpen, setSessionPanelOpen] = useState(false)
+  const [workerEvents, setWorkerEvents] = useState({})  // { [sessionId]: [event, ...] } live WS worker events
 
+  const pendingWorkerSelectionRef = useRef(null)  // { workerName, workspaceId } queued before activeSessionId is set
   const tabActionsRef = useRef({})
   const tabLoadTriggeredRef = useRef({})   // track which deferred tabs have had load triggered
   const deferredLoadSentRef = useRef({})   // track whether load_session was actually sent via sendCommand
@@ -400,7 +402,14 @@ export default function App() {
   }, [])
 
   const handleSelectWorker = useCallback((workerName, workspaceId) => {
-    if (!activeSessionId) return
+    if (!activeSessionId) {
+      // Queue the selection — activeSessionId may not be available yet
+      // (e.g., worker spawned before session_loaded WS message arrives).
+      // A useEffect below flushes this when activeSessionId becomes set.
+      pendingWorkerSelectionRef.current = { workerName, workspaceId }
+      return
+    }
+    pendingWorkerSelectionRef.current = null
     setWorkerPanelState(prev => ({
       ...prev,
       [activeSessionId]: { name: workerName, workspaceId }
@@ -414,6 +423,17 @@ export default function App() {
       [activeSessionId]: null
     }))
   }, [activeSessionId])
+
+  // ── Handle worker lifecycle events from SessionTab WS ────────────────
+  const handleWorkerEvent = useCallback((sessionId, event) => {
+    if (!sessionId) return
+    setWorkerEvents(prev => {
+      const events = prev[sessionId] || []
+      const key = event.type + (event.timestamp || '')
+      if (events.some(e => (e.type + (e.timestamp || '')) === key)) return prev
+      return { ...prev, [sessionId]: [...events, event] }
+    })
+  }, [])
 
   const handleSessionSaved = useCallback((sessionId) => {
     // Refresh sessions list
@@ -557,6 +577,18 @@ export default function App() {
     })
   }, [tabs])
 
+  // ── Flush any pending worker selection once activeSessionId becomes available ─
+  useEffect(() => {
+    const pending = pendingWorkerSelectionRef.current
+    if (pending && activeSessionId) {
+      pendingWorkerSelectionRef.current = null
+      setWorkerPanelState(prev => ({
+        ...prev,
+        [activeSessionId]: { name: pending.workerName, workspaceId: pending.workspaceId }
+      }))
+    }
+  }, [activeSessionId])
+
   // ── Persist active session ID in localStorage (stable across page loads) ─
   useEffect(() => {
     if (activeSessionId) {
@@ -610,6 +642,7 @@ export default function App() {
                   onSelectWorker={handleSelectWorker}
                   activeSessionId={activeSessionId}
                   onClearWorker={handleCloseWorkerPanel}
+                  onWorkerEvent={handleWorkerEvent}
                 />
               </div>
             ))
@@ -635,6 +668,7 @@ export default function App() {
               workerName={selectedWorker.name}
               sessionId={activeSessionId}
               onClose={handleCloseWorkerPanel}
+              incomingEvents={Object.values(workerEvents).flat()}
             />
           )}
         </div>

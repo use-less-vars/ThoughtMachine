@@ -55,12 +55,19 @@ from agent.logging import log
 
 # Import event system for security prompt forwarding
 try:
-    from agent.events import global_event_bus, EventType, SecurityPromptEvent
+    from agent.events import (
+        global_event_bus, EventType, SecurityPromptEvent,
+        WorkerSpawnedEvent, WorkerStatusEvent, WorkerCompletedEvent, WorkerErrorEvent,
+    )
     EVENT_SYSTEM_AVAILABLE = True
 except ImportError:
     global_event_bus = None
     EventType = None
     SecurityPromptEvent = None
+    WorkerSpawnedEvent = None
+    WorkerStatusEvent = None
+    WorkerCompletedEvent = None
+    WorkerErrorEvent = None
     EVENT_SYSTEM_AVAILABLE = False
 
 from session.models import Session
@@ -197,7 +204,13 @@ class WebAgentBridge:
 
         # Subscribe to global event bus for security prompt events
         self._security_subscription = None
+        # Subscribe to global event bus for worker lifecycle events
+        self._worker_spawned_sub = None
+        self._worker_status_sub = None
+        self._worker_completed_sub = None
+        self._worker_error_sub = None
         self._subscribe_to_security_events()
+        self._subscribe_to_worker_events()
 
         # Track whether close_session() was called cleanly — used by server.py
         # to avoid re-saving on abrupt disconnect (data loss guard).
@@ -260,6 +273,51 @@ class WebAgentBridge:
         )
         log('INFO', 'server.bridge', 'Subscribed to SECURITY_PROMPT events')
 
+    def _subscribe_to_worker_events(self) -> None:
+        """
+        Subscribe to worker lifecycle events from the global event bus and
+        forward them to frontend WebSocket clients as worker:* messages.
+        """
+        if not EVENT_SYSTEM_AVAILABLE or global_event_bus is None:
+            log('WARNING', 'server.bridge', 'Event system unavailable - worker events not forwarded')
+            return
+
+        def _make_handler(event_cls):
+            def _handler(event: event_cls) -> None:
+                if not self._event_callbacks:
+                    return
+                data = event.data or {}
+                # Only forward events for this bridge's session
+                if data.get('session_id') and data['session_id'] != self._session_id:
+                    return
+                event_dict = {
+                    'type': f'worker:{event.type.value}',
+                    'worker_name': data.get('worker_name', ''),
+                    'timestamp': event.metadata.timestamp.isoformat(),
+                    'data': data,
+                }
+                for cb in list(self._event_callbacks.values()):
+                    try:
+                        cb(event_dict)
+                    except Exception as exc:
+                        log('ERROR', 'server.bridge',
+                            f'Failed to forward worker event: {exc}')
+            return _handler
+
+        self._worker_spawned_sub = global_event_bus.subscribe(
+            EventType.WORKER_SPAWNED, _make_handler(WorkerSpawnedEvent)
+        )
+        self._worker_status_sub = global_event_bus.subscribe(
+            EventType.WORKER_STATUS, _make_handler(WorkerStatusEvent)
+        )
+        self._worker_completed_sub = global_event_bus.subscribe(
+            EventType.WORKER_COMPLETED, _make_handler(WorkerCompletedEvent)
+        )
+        self._worker_error_sub = global_event_bus.subscribe(
+            EventType.WORKER_ERROR, _make_handler(WorkerErrorEvent)
+        )
+        log('INFO', 'server.bridge', 'Subscribed to worker lifecycle events')
+
     def _unsubscribe_security_events(self) -> None:
         """Unsubscribe from security events."""
         if self._security_subscription is not None:
@@ -271,6 +329,24 @@ class WebAgentBridge:
             except Exception:
                 pass
             self._security_subscription = None
+
+    def _unsubscribe_worker_events(self) -> None:
+        """Unsubscribe from worker lifecycle events."""
+        worker_subs = [
+            ('_worker_spawned_sub',),
+            ('_worker_status_sub',),
+            ('_worker_completed_sub',),
+            ('_worker_error_sub',),
+        ]
+        for attr_name, in worker_subs:
+            sub = getattr(self, attr_name, None)
+            if sub is not None:
+                try:
+                    if hasattr(global_event_bus, 'unsubscribe'):
+                        global_event_bus.unsubscribe(sub)
+                except Exception:
+                    pass
+                setattr(self, attr_name, None)
 
     # ── Global tab registry ──────────────────────────────────────────────────
 
@@ -546,6 +622,7 @@ class WebAgentBridge:
         """Request the agent to stop (finishes current operation then exits)."""
         self.unregister()
         self._unsubscribe_security_events()
+        self._unsubscribe_worker_events()
         if self._controller is not None:
             self._controller.stop()
             return

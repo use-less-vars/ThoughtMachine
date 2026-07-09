@@ -769,3 +769,41 @@ Unit test the internals, integration test the boundaries (tool interface, event 
 - Worker Config Panel: Upholds Rule 1 (workers are agents) and Rule 6 (security defaults)
 - Container Persistence: Upholds Rule 4 (persistence is transparent)
 - Security Defaults: Upholds Rule 6 (default to deny) and Rule 9 (fail closed)
+
+## 2026-07-09 — ## Cross-Session Worker Panel Access — Changes Implemented
+
+...
+
+## Cross-Session Worker Panel Access — Changes Implemented
+
+**Date:** 2026-07-09
+
+**Objective:** Make workers visible across all session tabs in the same workspace for VIEWING (list, panel, events) while keeping CONTROL (query, stop) session-scoped.
+
+### Files Changed:
+
+1. **`web_ui/frontend/src/components/WorkspacePanel.jsx` (line 199)**
+   - **Before:** `data.filter(w => !sessionId || w.session_id === sessionId)`
+   - **After:** `data` (no filter)
+   - **Effect:** WorkerAutoOpenWatcher now auto-opens for ANY worker in the workspace, not just the current session's workers.
+
+2. **`web_ui/frontend/src/components/WorkerOutputPanel.jsx` (line 141)**
+   - **Before:** `data.find((w) => w.name === workerName && (!sessionId || w.session_id === sessionId))`
+   - **After:** `data.find((w) => w.name === workerName)`
+   - **Effect:** fetchWorkerInfo() finds any worker by name regardless of session.
+
+3. **`web_ui/frontend/src/components/WorkerOutputPanel.jsx` (line 288-296)**
+   - Added session-scoped guard in `handleStop`:
+   - If `workerInfo.session_id !== sessionId`, shows error "Cannot stop worker from another session" and returns early.
+   - **Effect:** Control operations are blocked for cross-session workers; viewing still works.
+
+4. **`web_ui/frontend/src/components/WorkerOutputPanel.jsx` (lines 182-206)**
+   - Added worker-name filtering on incoming WS events merge:
+   - Filters `incomingEvents` by `e.worker_name` or `e.response?.worker_name` matching the current `workerName`.
+   - **Effect:** When all sessions' events are passed, only events for the displayed worker are merged in.
+
+5. **`web_ui/frontend/src/App.jsx` (line 671)**
+   - **Before:** `incomingEvents={workerEvents[activeSessionId] || []}`
+   - **After:** `incomingEvents={Object.values(workerEvents).flat()}`
+   - **Effect:** ALL session worker events are passed to the WorkerOutputPanel, which then filters by worker name internally.
+

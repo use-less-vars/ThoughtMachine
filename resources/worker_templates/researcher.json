@@ -15,6 +15,7 @@
   "worker_permissions": {
     "filesystem": "read"
   },
+  "permission_footprint": {},
   "timeout_seconds": 150,
   "max_turns": 100,
   "temperature": 0.3,
