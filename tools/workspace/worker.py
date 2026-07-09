@@ -1301,9 +1301,21 @@ class Worker(ToolBase):
                 logger.info("Force-spawn: stopping stale worker '%s'", worker_label)
                 try:
                     thread.stop()
-                    thread.join(timeout=10.0)
-                except Exception:
-                    logger.exception("Error stopping stale worker '%s'", worker_label)
+                    # Robust join with retry (same pattern as _action_stop)
+                    _budget = max(30, thread._timeout_seconds)
+                    _elapsed = 0.0
+                    while _elapsed < _budget:
+                        thread.join(timeout=2.0)
+                        _elapsed += 2.0
+                        if not thread.is_alive():
+                            break
+                    if thread.is_alive():
+                        logger.warning(
+                            "Force-spawn: stale worker '%s' did not stop within %ds",
+                            worker_label, _budget,
+                        )
+                except Exception as exc:
+                    logger.exception("Error stopping stale worker '%s': %s", worker_label, exc)
                 finally:
                     thread._save_context()
                     with _registry_lock:
@@ -1665,7 +1677,19 @@ class Worker(ToolBase):
                 logger.info("Cross-session stop: stopping worker '%s'", worker_label)
                 try:
                     t.stop()
-                    t.join(timeout=10.0)
+                    # Robust join with retry (same pattern as _action_stop)
+                    _budget = max(30, t._timeout_seconds)
+                    _elapsed = 0.0
+                    while _elapsed < _budget:
+                        t.join(timeout=2.0)
+                        _elapsed += 2.0
+                        if not t.is_alive():
+                            break
+                    if t.is_alive():
+                        logger.warning(
+                            "Cross-session stop: worker '%s' did not stop within %ds",
+                            worker_label, _budget,
+                        )
                 except Exception as exc:
                     logger.exception("Error stopping worker '%s'", worker_label)
                     stopped_info.append({"session_id": sid, "error": str(exc)})
@@ -1699,7 +1723,30 @@ class Worker(ToolBase):
 
         try:
             thread.stop()
-            thread.join(timeout=10.0)
+            # ── Robust join: retry loop to handle slow LLM API calls ──
+            # The worker's _run_tool_loop can be blocked inside
+            # agent.process_query() waiting for an LLM response that takes
+            # 15-30s.  A single join(timeout=10) would expire before the
+            # _stop_event is checked.  We retry with a longer total budget.
+            _join_budget = max(30, thread._timeout_seconds)
+            _join_elapsed = 0.0
+            _join_step = 2.0
+            while _join_elapsed < _join_budget:
+                thread.join(timeout=_join_step)
+                _join_elapsed += _join_step
+                if not thread.is_alive():
+                    break
+                logger.debug(
+                    "Still waiting for worker '%s' to stop "
+                    "(%.0f/%ds elapsed)",
+                    self.worker_name, _join_elapsed, _join_budget,
+                )
+            if thread.is_alive():
+                logger.warning(
+                    "Worker '%s' did not stop within %ds budget. "
+                    "Popping from registry anyway (daemon thread).",
+                    self.worker_name, _join_budget,
+                )
         except Exception as exc:
             logger.exception("Error joining worker '%s' during stop", self.worker_name)
             return {
