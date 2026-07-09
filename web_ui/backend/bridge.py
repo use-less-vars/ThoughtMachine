@@ -58,6 +58,7 @@ try:
     from agent.events import (
         global_event_bus, EventType, SecurityPromptEvent,
         WorkerSpawnedEvent, WorkerStatusEvent, WorkerCompletedEvent, WorkerErrorEvent,
+        TokenWarningEvent,
     )
     EVENT_SYSTEM_AVAILABLE = True
 except ImportError:
@@ -68,6 +69,7 @@ except ImportError:
     WorkerStatusEvent = None
     WorkerCompletedEvent = None
     WorkerErrorEvent = None
+    TokenWarningEvent = None
     EVENT_SYSTEM_AVAILABLE = False
 
 from session.models import Session
@@ -316,7 +318,36 @@ class WebAgentBridge:
         self._worker_error_sub = global_event_bus.subscribe(
             EventType.WORKER_ERROR, _make_handler(WorkerErrorEvent)
         )
+        self._worker_token_warning_sub = global_event_bus.subscribe(
+            EventType.TOKEN_WARNING, self._on_worker_token_warning
+        )
         log('INFO', 'server.bridge', 'Subscribed to worker lifecycle events')
+
+    def _on_worker_token_warning(self, event: TokenWarningEvent) -> None:
+        """Forward worker token warnings to the frontend."""
+        if not self._event_callbacks:
+            return
+        source = event.metadata.source if event.metadata else ""
+        if not source.startswith("worker:"):
+            return  # only handle worker-sourced warnings
+        data = event.data or {}
+        # Only forward events for this bridge's session
+        if data.get('session_id') and data['session_id'] != self._session_id:
+            return
+        event_dict = {
+            'type': 'worker_system_notification',
+            'worker_name': data.get('worker_name', ''),
+            'session_id': event.metadata.session_id if event.metadata else None,
+            'message_type': 'token_warning',
+            'token_count': data.get('token_count', 0),
+            'warning_message': data.get('warning_message', ''),
+        }
+        for cb in list(self._event_callbacks.values()):
+            try:
+                cb(event_dict)
+            except Exception as exc:
+                log('ERROR', 'server.bridge',
+                    f'Failed to forward worker token warning: {exc}')
 
     def _unsubscribe_security_events(self) -> None:
         """Unsubscribe from security events."""
@@ -337,6 +368,7 @@ class WebAgentBridge:
             ('_worker_status_sub',),
             ('_worker_completed_sub',),
             ('_worker_error_sub',),
+            ('_worker_token_warning_sub',),
         ]
         for attr_name, in worker_subs:
             sub = getattr(self, attr_name, None)

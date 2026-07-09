@@ -106,6 +106,18 @@ _WORKER_BLOCKLIST: frozenset[str] = frozenset({
     "MCPValidator",      # MCP server management
 })
 
+# Default system prompt for worker sub-agents.
+# This is a fixed instruction rather than inheriting the main agent's prompt,
+# preventing delegation loops in Engineer mode.
+DEFAULT_WORKER_SYSTEM_PROMPT = (
+    "You are a capable autonomous sub-agent of ThoughtMachine. "
+    "Complete the task given to you thoroughly, using all available tools. "
+    "Think, research, write, edit, test, review. "
+    "When finished, use the Respond tool to return your final result. "
+    "Be concise but complete. "
+    "Do not ask the user for clarification — the main agent already understood the request."
+)
+
 # Global tool name → class registry (built from tools.__init__.TOOL_CLASSES)
 # Resolved at import time — tools registered after this module loads
 # (Worker, EditDockerfile) are all in the blocklist, so no gap.
@@ -475,11 +487,16 @@ class WorkerThread(threading.Thread):
         # ── Worker-specific overrides ──────────────────────────────────
         worker_cfg["system_prompt"] = self.definition.get(
             "system_prompt",
-            cfg.get("system_prompt", "You are a helpful worker assistant."),
+            DEFAULT_WORKER_SYSTEM_PROMPT,
         )
-        worker_cfg["enabled_tools"] = (
-            list(self._tool_classes.keys()) if self._tool_classes else []
-        )
+        worker_tools = self.definition.get("tools", [])
+        if worker_tools:
+            enabled_tools = [t for t in worker_tools if t not in _WORKER_BLOCKLIST]
+        else:
+            from tools import SIMPLIFIED_TOOL_CLASSES
+            enabled_tools = [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES
+                             if cls.__name__ not in _WORKER_BLOCKLIST]
+        worker_cfg["enabled_tools"] = enabled_tools
         worker_cfg["max_turns"] = self.definition.get(
             "max_turns", cfg.get("max_turns", 100)
         )
@@ -640,6 +657,29 @@ class WorkerThread(threading.Thread):
                             "token_count": token_count,
                         },
                     )
+                    # Forward to global EventBus so the bridge can send to frontend
+                    if _WORKER_EVENT_BUS is not None:
+                        try:
+                            from agent.events import TokenWarningEvent, EventMetadata, EventType
+                            _WORKER_EVENT_BUS.publish(TokenWarningEvent(
+                                type=EventType.TOKEN_WARNING,
+                                metadata=EventMetadata(
+                                    source=f"worker:{self.worker_name}",
+                                    session_id=self.session_id,
+                                ),
+                                data={
+                                    "worker_name": self.worker_name,
+                                    "token_count": token_count,
+                                    "warning_message": str(message)[:500],
+                                    "old_state": "",
+                                    "new_state": "",
+                                },
+                            ))
+                        except Exception:
+                            logger.debug(
+                                "Failed to publish token warning event for worker '%s'",
+                                self.worker_name,
+                            )
 
                 # Log turn warnings as system notifications
                 if event_type == "turn_warning":

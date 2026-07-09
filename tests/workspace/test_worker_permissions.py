@@ -19,8 +19,11 @@ import pytest
 
 from tools.workspace.worker import (
     _restrictive_merge,
+    _WORKER_BLOCKLIST,
+    DEFAULT_WORKER_SYSTEM_PROMPT,
     WorkerThread,
 )
+from tools import SIMPLIFIED_TOOL_CLASSES
 
 
 class TestRestrictiveMerge:
@@ -290,4 +293,37 @@ class TestWorkerPermissionsMergeIntegration:
             "filesystem": "read",
             "execution": "allow",
         }, f"Expected worker to fill gap, got {merged}"
+
+    def test_default_tool_set(self, _mock_agent_config):
+        """When definition has no 'tools', enabled_tools = SIMPLIFIED_TOOL_CLASSES minus blocklist."""
+        definition = {"name": "test-worker"}
+        wt = make_worker_thread(definition)
+
+        with patch.object(wt, "_agent_config_dict", {"provider": "test", "model": "test"}):
+            wt._build_agent_config()
+
+        call_kwargs = _mock_agent_config.call_args[1]
+        enabled = call_kwargs.get("enabled_tools", [])
+        expected = [
+            cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES
+            if cls.__name__ not in _WORKER_BLOCKLIST
+        ]
+        assert enabled == expected, (
+            f"Expected enabled_tools to match SIMPLIFIED_TOOL_CLASSES minus blocklist, "
+            f"got {set(enabled) ^ set(expected)} difference"
+        )
+
+    def test_default_system_prompt(self, _mock_agent_config):
+        """When definition has no system_prompt, DEFAULT_WORKER_SYSTEM_PROMPT is used."""
+        definition = {"name": "test-worker"}
+        wt = make_worker_thread(definition)
+
+        with patch.object(wt, "_agent_config_dict", {"provider": "test", "model": "test"}):
+            wt._build_agent_config()
+
+        call_kwargs = _mock_agent_config.call_args[1]
+        prompt = call_kwargs.get("system_prompt", "")
+        assert prompt == DEFAULT_WORKER_SYSTEM_PROMPT, (
+            f"Expected DEFAULT_WORKER_SYSTEM_PROMPT, got {prompt[:80]!r}..."
+        )
 
