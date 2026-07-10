@@ -50,18 +50,14 @@ assert _REPO_TEMPLATES.is_dir(), (
 )
 
 
-def _valid_coder_entry() -> Dict[str, Any]:
-    """Return a minimal valid WorkerDefinition dict (mimics coder.json)."""
+def _valid_default_entry() -> Dict[str, Any]:
+    """Return a minimal valid WorkerDefinition dict (mimics default.json)."""
     return {
-        "name": "coder",
-        "description": "Writes and modifies code in the project.",
-        "system_prompt": "You are Coder.\n",
-        "tools": [
-            "ApplyEdits", "CodeModifier", "RefactorTool",
-            "FileEditor", "FileSearchTool", "GlobTool",
-            "DirectoryTreeTool",
-        ],
-        "permission_footprint": {"filesystem": "write", "execution": "docker"},
+        "name": "default",
+        "description": "Default general-purpose worker with no restrictions.",
+        "system_prompt": "You are a capable autonomous sub-agent.\n",
+        "tools": [],
+        "worker_permissions": {},
     }
 
 
@@ -98,7 +94,7 @@ class TestGetTemplates:
             assert wd.description is not None
             assert wd.system_prompt is not None
             assert wd.tools is not None
-            assert wd.permission_footprint is not None
+            assert wd.worker_permissions is not None
 
     def test_returns_valid_jsons_only_skips_invalid(self, client, tmp_path):
         """When the user directory contains a mix of valid and invalid JSON,
@@ -107,8 +103,8 @@ class TestGetTemplates:
         templates_dir.mkdir(parents=True)
 
         # Write one valid template
-        valid = _valid_coder_entry()
-        (templates_dir / "coder.json").write_text(json.dumps(valid))
+        valid = _valid_default_entry()
+        (templates_dir / "default.json").write_text(json.dumps(valid))
 
         # Write an invalid JSON file (malformed)
         (templates_dir / "garbage.json").write_text("{not valid json}")
@@ -125,7 +121,7 @@ class TestGetTemplates:
         data = resp.json()
         assert isinstance(data, list)
         names = [item["name"] for item in data]
-        assert "coder" in names, "Valid template should be returned"
+        assert "default" in names, "Valid template should be returned"
         assert "bad_schema" not in names, "Invalid schema should be skipped"
         assert len(data) == 1, "Only 1 valid template expected"
 
@@ -143,19 +139,19 @@ class TestGetTemplates:
         data = resp.json()
         assert len(data) > 0, "Should fall back to repo templates"
         names = {item["name"] for item in data}
-        expected = {"coder", "reviewer", "researcher"}
+        expected = {"default"}
         assert names == expected, f"Expected {expected}, got {names}"
 
-    def test_all_three_template_names_present(self, client):
-        """The fallback returns coder, reviewer, and researcher."""
+    def test_default_template_name_present(self, client):
+        """The fallback returns the default template."""
         with patch.object(pathlib.Path, "home") as mock_home:
             mock_home.return_value = Path("/nonexistent")
             resp = client.get("/api/workspace/templates")
 
         assert resp.status_code == 200
         names = {item["name"] for item in resp.json()}
-        assert names == {"coder", "reviewer", "researcher"}, (
-            f"Expected coder/reviewer/researcher, got {names}"
+        assert names == {"default"}, (
+            f"Expected default, got {names}"
         )
 
     def test_logs_warning_for_invalid_files(self, client, tmp_path, caplog):
@@ -163,8 +159,8 @@ class TestGetTemplates:
         templates_dir = tmp_path / ".thoughtmachine" / "worker_templates"
         templates_dir.mkdir(parents=True)
 
-        valid = _valid_coder_entry()
-        (templates_dir / "coder.json").write_text(json.dumps(valid))
+        valid = _valid_default_entry()
+        (templates_dir / "default.json").write_text(json.dumps(valid))
         (templates_dir / "garbage.json").write_text("{not valid json}")
 
         caplog.set_level(logging.WARNING)

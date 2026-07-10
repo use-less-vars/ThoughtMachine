@@ -37,37 +37,19 @@ def temp_user_dir():
 
 @pytest.fixture
 def with_template_dir(temp_user_dir):
-    """Set up a fake worker_templates directory with three template JSON files."""
+    """Set up a fake worker_templates directory with a default template JSON file."""
     template_dir = _user_dir() / "worker_templates"
     template_dir.mkdir(parents=True, exist_ok=True)
 
     templates = {
-        "coder.json": {
-            "name": "coder",
-            "description": "Specialized agent for writing and modifying code",
-            "system_prompt": "You are a Coder.",
-            "tools": ["FileEditor", "ApplyEdits"],
-            "permission_footprint": {"filesystem": "write", "execution": "docker"},
+        "default.json": {
+            "name": "default",
+            "description": "Default general-purpose worker",
+            "system_prompt": "You are a capable autonomous sub-agent.",
+            "tools": [],
+            "worker_permissions": {},
             "timeout_seconds": 120,
             "temperature": 0.2,
-        },
-        "reviewer.json": {
-            "name": "reviewer",
-            "description": "Specialized agent for code review",
-            "system_prompt": "You are a Reviewer.",
-            "tools": ["FileEditor", "FileSearchTool"],
-            "permission_footprint": {"filesystem": "read"},
-            "timeout_seconds": 90,
-            "temperature": 0.1,
-        },
-        "researcher.json": {
-            "name": "researcher",
-            "description": "Specialized agent for codebase analysis",
-            "system_prompt": "You are a Researcher.",
-            "tools": ["FileEditor", "FileSearchTool", "KnowledgeBaseTool"],
-            "permission_footprint": {"filesystem": "read"},
-            "timeout_seconds": 150,
-            "temperature": 0.3,
         },
     }
 
@@ -89,7 +71,7 @@ class TestLoadTemplateWorkers:
         """When user templates dir exists and has files, it takes priority."""
         workers = _load_template_workers()
         names = {w["name"] for w in workers}
-        assert names == {"coder", "reviewer", "researcher"}
+        assert names == {"default"}
 
     def test_invalid_template_is_skipped(self, with_template_dir, caplog):
         """A template with missing required fields logs a warning and is skipped."""
@@ -111,17 +93,17 @@ class TestLoadTemplateWorkers:
 
         workers = _load_template_workers()
         names = {w["name"] for w in workers}
-        assert len(names) == 3  # only the three valid ones
+        assert len(names) == 1  # only the valid default
 
         assert any("garbage.json" in rec.message for rec in caplog.records)
 
     def test_falls_back_to_resources(self, temp_user_dir):
         """When user template dir is missing, falls back to resources/worker_templates/."""
         workers = _load_template_workers()
-        # The real resources/worker_templates/ should have at least coder.json
+        # The real resources/worker_templates/ should have at least default.json
         assert len(workers) > 0
         names = {w["name"] for w in workers}
-        assert "coder" in names
+        assert "default" in names
 
     def test_empty_user_dir_uses_fallback(self, temp_user_dir):
         """An empty user template directory triggers fallback."""
@@ -130,25 +112,25 @@ class TestLoadTemplateWorkers:
         # Directory exists but is empty -> fallback
         workers = _load_template_workers()
         assert len(workers) > 0
-        assert "coder" in workers[0] or any("name" in w for w in workers)
+        assert "default" in workers[0] or any("name" in w for w in workers)
 
 
 class TestBuildDefaultWorkers:
     """Tests for _build_default_workers()."""
 
     def test_template_workers_present(self, with_template_dir):
-        """Template workers (coder, reviewer, researcher) are present."""
+        """Default template worker is present."""
         workers = _build_default_workers()
         names = {w["name"] for w in workers}
-        assert names == {"coder", "reviewer", "researcher"}
+        assert names == {"default"}
         assert "echo" not in names
 
-    def test_all_three_workers_present(self, with_template_dir):
-        """Coder + reviewer + researcher are all present (no echo)."""
+    def test_default_worker_present(self, with_template_dir):
+        """Default worker is present (no echo)."""
         workers = _build_default_workers()
         names = {w["name"] for w in workers}
-        assert names == {"coder", "reviewer", "researcher"}
-        assert len(workers) == 3
+        assert names == {"default"}
+        assert len(workers) == 1
 
     def test_no_duplicate_names(self, with_template_dir):
         """No two workers share the same name."""
@@ -169,35 +151,38 @@ class TestEnsureWorkspaceDirsMerged:
     """Integration tests for ensure_workspace_dirs with template merging."""
 
     def test_creates_workers_with_templates(self, with_template_dir):
-        """workers.json contains all three templates (coder, reviewer, researcher) on first bootstrap."""
+        """workers.json contains the default template on first bootstrap."""
         ensure_workspace_dirs("test-ws-merged")
         path = _user_dir() / "workspaces" / "test-ws-merged" / "workers.json"
         assert path.exists()
 
         workers = json.loads(path.read_text(encoding="utf-8"))
         names = {w["name"] for w in workers}
-        assert names == {"coder", "reviewer", "researcher"}
+        assert names == {"default"}
         assert "echo" not in names
-        assert len(workers) == 3
+        assert len(workers) == 1
 
-    def test_idempotent_does_not_modify_existing_workers(self, with_template_dir):
-        """Once workers.json exists, ensure_workspace_dirs does not touch it."""
+    def test_idempotent_does_not_overwrite_existing(self, with_template_dir):
+        """Existing workers are preserved; the default template is merged in if missing."""
         ensure_workspace_dirs("test-ws-merged-2")
         path = _user_dir() / "workspaces" / "test-ws-merged-2" / "workers.json"
 
         # Modify the file to only have a custom worker
         path.write_text(
-            json.dumps([{"name": "custom", "system_prompt": "custom", "description": "custom", "tools": [], "permission_footprint": {}}], indent=2),
+            json.dumps([{"name": "custom", "system_prompt": "custom", "description": "custom", "tools": [], "worker_permissions": {}}], indent=2),
             encoding="utf-8",
         )
 
-        # Call again — should NOT overwrite
+        # Call again — should NOT overwrite existing, but should merge in missing default template
         ensure_workspace_dirs("test-ws-merged-2")
 
         workers = json.loads(path.read_text(encoding="utf-8"))
-        assert len(workers) == 1
-        assert workers[0]["name"] == "custom"
-        assert workers[0]["system_prompt"] == "custom"  # untouched
+        assert len(workers) == 2  # custom preserved + default merged in
+        names = {w["name"] for w in workers}
+        assert "custom" in names  # existing worker untouched
+        assert "default" in names  # default template merged in
+        custom = [w for w in workers if w["name"] == "custom"][0]
+        assert custom["system_prompt"] == "custom"  # untouched
 
     def test_atomic_write_leaves_no_tmp_file(self, with_template_dir):
         """The .tmp file is cleaned up after writing workers.json."""

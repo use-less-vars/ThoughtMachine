@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # Minimal validation for template workers (avoids circular import via agent.__init__)
-_REQUIRED_WORKER_FIELDS = {"name", "description", "system_prompt", "tools", "permission_footprint"}
+_REQUIRED_WORKER_FIELDS = {"name", "description", "system_prompt", "tools", "worker_permissions"}
 
 
 def _validate_worker_dict(data: dict) -> dict | None:
@@ -28,7 +28,7 @@ def _validate_worker_dict(data: dict) -> dict | None:
         return None
     if not isinstance(data.get("tools"), list):
         return None
-    if not isinstance(data.get("permission_footprint"), dict):
+    if not isinstance(data.get("worker_permissions"), dict):
         return None
     return data
 
@@ -252,7 +252,7 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
     * ``capabilities.json`` — fully permissive workspace capabilities
     * ``Dockerfile`` — copied from ``resources/default_dockerfile.txt``
     * ``domain_allowlist.json`` — empty JSON array ``[]``
-    * ``workers.json`` — default template workers from worker_templates/ (coder, reviewer, researcher)
+    * ``workers.json`` — default template worker from worker_templates/ (default)
     * ``mcp_servers.json`` — empty JSON array ``[]``
 
     No subdirectories (e.g. ``sessions/``, ``state/``, ``knowledge/``) are
@@ -305,7 +305,7 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
 
     # ── Migration: Clean up existing workers.json ──
     #  1. Strip echo worker (legacy)
-    #  2. Merge in any missing template workers (coder, reviewer, researcher)
+    #  2. Merge in the default template worker
     if workers_path.exists():
         try:
             existing = json.loads(workers_path.read_text(encoding="utf-8"))
@@ -412,8 +412,8 @@ def _build_default_workers() -> list[dict]:
     """
     Build the default workers list for a freshly bootstrapped workspace.
 
-    Loads template workers (coder, researcher, reviewer) from
-    worker_templates/.  The echo test worker is NOT included by default;
+    Loads the default template worker from worker_templates/.
+    The echo test worker is NOT included by default;
     it is available via ``_default_echo_worker()`` for manual use.
     """
     result: list[dict] = []

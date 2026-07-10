@@ -594,7 +594,7 @@ class TestWorker:
         mock_file = MagicMock()
         mock_file.exists.return_value = True
         mock_file.read_text.return_value = json.dumps([
-            {"name": "coder", "status": "ready", "permission_subset": ["execution:read"], "last_heartbeat": None},
+            {"name": "default", "status": "ready", "permission_subset": ["execution:read"], "last_heartbeat": None},
         ])
         mock_dir.__truediv__.return_value = mock_file
         mock_ws_dir.return_value = mock_dir
@@ -602,7 +602,7 @@ class TestWorker:
         tool = Worker(action="list", workspace_path="/tmp/test_ws")
         result = _parse_result(tool.execute())
         assert result["count"] == 1
-        assert result["workers"][0]["name"] == "coder"
+        assert result["workers"][0]["name"] == "default"
         # Not spawned yet, so runtime_status should be "stopped"
         assert result["workers"][0]["runtime_status"] == "stopped"
 
@@ -675,7 +675,7 @@ class TestWorker:
         mock_file = MagicMock()
         mock_file.exists.return_value = True
         mock_file.read_text.return_value = json.dumps([
-            {"name": "coder", "status": "ready"},
+            {"name": "default", "status": "ready"},
         ])
         mock_dir.__truediv__.return_value = mock_file
         mock_ws_dir.return_value = mock_dir
@@ -685,20 +685,20 @@ class TestWorker:
         mock_thread.status = "ready"
         mock_thread.wait_for_completion.return_value = json.dumps({
             "spawned": True,
-            "worker_name": "coder",
+            "worker_name": "default",
             "status": "ready",
         })
         mock_thread_cls.return_value = mock_thread
 
         tool = Worker(
             action="spawn",
-            worker_name="coder",
+            worker_name="default",
             workspace_path="/tmp/test_ws",
             agent_config={"provider": "openai", "model": "gpt-4"},
         )
         result = _parse_result(tool.execute())
         assert result["spawned"] is True
-        assert result["worker_name"] == "coder"
+        assert result["worker_name"] == "default"
         assert result["status"] == "ready"
         mock_thread.start.assert_called_once()
         mock_thread.wait_for_completion.assert_called_once()
@@ -711,7 +711,7 @@ class TestWorker:
         mock_file = MagicMock()
         mock_file.exists.return_value = True
         mock_file.read_text.return_value = json.dumps([
-            {"name": "coder", "status": "ready"},
+            {"name": "default", "status": "ready"},
         ])
         mock_dir.__truediv__.return_value = mock_file
         mock_ws_dir.return_value = mock_dir
@@ -734,14 +734,14 @@ class TestWorker:
         mock_file = MagicMock()
         mock_file.exists.return_value = True
         mock_file.read_text.return_value = json.dumps([
-            {"name": "coder", "status": "ready"},
+            {"name": "default", "status": "ready"},
         ])
         mock_dir.__truediv__.return_value = mock_file
         mock_ws_dir.return_value = mock_dir
 
-        tool = Worker(action="check", worker_name="coder", workspace_path="/tmp/test_ws")
+        tool = Worker(action="check", worker_name="default", workspace_path="/tmp/test_ws")
         result = _parse_result(tool.execute())
-        assert result["worker_name"] == "coder"
+        assert result["worker_name"] == "default"
         assert result["status"] == "stopped"
         assert result["current_task"] is None
 
@@ -772,7 +772,7 @@ class TestWorker:
 
         tool = Worker(
             action="query",
-            worker_name="coder",
+            worker_name="default",
             worker_query="hello",
             workspace_path="/tmp/test_ws",
         )
