@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Union, TypedDict, Protocol, runtime_checkable
 from dataclasses import dataclass, field, asdict
 from pydantic import BaseModel, Field, validator
+import threading
 
 class EventType(enum.Enum):
     """Standardized event types for the agent system."""
@@ -332,6 +333,7 @@ class EventBus:
     def __init__(self):
         self._subscribers: Dict[EventType, List[callable]] = {}
         self._wildcard_subscribers: List[callable] = []
+        self._lock = threading.Lock()
 
     def subscribe(self, event_type: Optional[EventType]=None, callback: callable=None):
         """Subscribe to events of specific type or all events."""
@@ -341,22 +343,25 @@ class EventBus:
                 self.subscribe(event_type, func)
                 return func
             return decorator
-        if event_type is None:
-            self._wildcard_subscribers.append(callback)
-        else:
-            if event_type not in self._subscribers:
-                self._subscribers[event_type] = []
-            self._subscribers[event_type].append(callback)
+        with self._lock:
+            if event_type is None:
+                self._wildcard_subscribers.append(callback)
+            else:
+                if event_type not in self._subscribers:
+                    self._subscribers[event_type] = []
+                self._subscribers[event_type].append(callback)
 
     def publish(self, event: BaseEvent):
         """Publish an event to all subscribers."""
-        if event.type in self._subscribers:
-            for callback in self._subscribers[event.type]:
-                try:
-                    callback(event)
-                except Exception as e:
-                    log('ERROR', 'core.event_bus', f'Error in event subscriber for {event.type}: {e}')
-        for callback in self._wildcard_subscribers:
+        with self._lock:
+            subscribers = list(self._subscribers.get(event.type, []))
+            wildcard = list(self._wildcard_subscribers)
+        for callback in subscribers:
+            try:
+                callback(event)
+            except Exception as e:
+                log('ERROR', 'core.event_bus', f'Error in event subscriber for {event.type}: {e}')
+        for callback in wildcard:
             try:
                 callback(event)
             except Exception as e:
@@ -366,6 +371,24 @@ class EventBus:
         """Publish an event from dictionary format."""
         event = BaseEvent.from_dict(event_dict)
         self.publish(event)
+
+    def unsubscribe(self, event_type: Optional[EventType]=None, callback: callable=None):
+        """Unsubscribe a callback from events of specific type or all events."""
+        with self._lock:
+            if event_type is None:
+                try:
+                    self._wildcard_subscribers.remove(callback)
+                except ValueError:
+                    pass
+            else:
+                if event_type in self._subscribers:
+                    try:
+                        self._subscribers[event_type].remove(callback)
+                    except ValueError:
+                        pass
+                    if not self._subscribers[event_type]:
+                        del self._subscribers[event_type]
+
 
 def _map_legacy_event_type(event_type_str: str) -> EventType:
     """Map legacy event type strings to standardized EventType."""
