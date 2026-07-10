@@ -22,7 +22,7 @@
   ],
   "worker_permissions": {
     "filesystem": "write",
-    "execution": "docker"
+    "container": true
   },
   "permission_footprint": {},
   "timeout_seconds": 120,
