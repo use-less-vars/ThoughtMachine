@@ -807,3 +807,40 @@ Unit test the internals, integration test the boundaries (tool interface, event 
    - **After:** `incomingEvents={Object.values(workerEvents).flat()}`
    - **Effect:** ALL session worker events are passed to the WorkerOutputPanel, which then filters by worker name internally.
 
+
+## 2026-07-09 — 
+## Adding a New Event Type — Checklist
+
+Every new event typ...
+
+
+## Adding a New Event Type — Checklist
+
+Every new event type must be added to every layer of the pipeline. Missing any step causes silent failures.
+
+### 1. Backend — Event Definition
+- [ ] Add enum value to `EventType` in `agent/events.py`
+- [ ] Create typed Pydantic event class (with validator if payload required)
+- [ ] Add to `event_class_map` in `create_event()` factory
+- [ ] Add to `_map_legacy_event_type()` mapping (for backward compatibility)
+
+### 2. Backend — Event Emission
+- [ ] Add `_publish_event()` call at the appropriate lifecycle point
+- [ ] Ensure data dict includes `worker_name` and `session_id`
+
+### 3. Backend — WebSocket Forwarding
+- [ ] Subscribe to the new event type in `bridge.py` `_subscribe_to_worker_events()`
+- [ ] Add WebSocket message format to `server.py` docstring (Server→Client types)
+- [ ] Add unsubscribe handler in `_unsubscribe_worker_events()`
+
+### 4. Frontend — Event Reception
+- [ ] Add case to WS message handler in `SessionTab.jsx` (connectSessionWs switch)
+
+### 5. Frontend — Event Rendering
+- [ ] Add case to `adaptWorkerEvent.js` switch statement
+- [ ] Add handling in `WorkerOutputPanel.jsx` merge/incoming events logic (if needed)
+
+### 6. Schema & Tests
+- [ ] Add event type to `web_ui/shared/worker_event_schema.json`
+- [ ] Add test case to `adaptWorkerEvent.test.js`
+
