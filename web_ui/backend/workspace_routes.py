@@ -680,6 +680,10 @@ async def get_worker_events(
 async def stop_worker(ws_id: str, name: str):
     """Stop a running worker via a file-based command signal.
 
+    Supports both directory layouts:
+      - ``workers/<session_id>/<name>/`` (session-scoped)
+      - ``workers/<name>/`` (legacy, no session)
+
     Writes ``{"action": "stop"}`` to the worker's ``command.json`` so that
     the worker thread (which polls for this file) picks it up within 2 seconds.
     Also attempts an in-memory stop as a fast path if the thread is in the
@@ -697,9 +701,30 @@ async def stop_worker(ws_id: str, name: str):
     """
     ensure_workspace_dirs(ws_id)
     ws_dir = _workspace_dir(ws_id)
-    worker_dir = ws_dir / "workers" / name
+    workers_dir = ws_dir / "workers"
 
-    if not worker_dir.is_dir():
+    # ── Find the worker directory (session-scoped first, then legacy) ──
+    worker_dir: Optional[Path] = None
+
+    if workers_dir.is_dir():
+        for subdir in workers_dir.iterdir():
+            if not subdir.is_dir():
+                continue
+            # Check if this is a session directory (contains sub-worker dirs)
+            first_child = next(subdir.iterdir(), None) if subdir.is_dir() else None
+            if first_child is not None and first_child.is_dir():
+                # Session-scoped: workers/<session_id>/<name>/
+                candidate = subdir / name
+                if candidate.is_dir():
+                    worker_dir = candidate
+                    break
+            else:
+                # Legacy: workers/<name>/
+                if subdir.name == name:
+                    worker_dir = subdir
+                    break
+
+    if worker_dir is None or not worker_dir.is_dir():
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"status": "not_found", "name": name},
@@ -718,14 +743,16 @@ async def stop_worker(ws_id: str, name: str):
         "error": None,
     }, worker_dir / "status.json")
 
-    # Fast-path: if the thread is in-memory (same process), signal directly
+    # Fast-path: if the thread is in-memory (same process), signal directly.
+    # Registry keys are tuples (session_id, worker_name), so iterate all
+    # entries matching the worker name across all sessions.
     with _registry_lock:
-        thread = _worker_registry.get(name)
-    if thread is not None:
-        try:
-            thread.stop()
-        except Exception:
-            pass  # File-based stop will still work
+        for (sid, wname), thread in list(_worker_registry.items()):
+            if wname == name:
+                try:
+                    thread.stop()
+                except Exception:
+                    pass  # File-based stop will still work
 
     return {"status": "ok", "name": name}
 
