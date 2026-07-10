@@ -1,0 +1,154 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "worker_event_schema.json",
+  "title": "Worker Event Schema",
+  "description": "Defines every worker event type flowing between backend (agent/events.py) and frontend (adaptWorkerEvent.js). Single source of truth.",
+  "type": "object",
+  "definitions": {
+    "base_event": {
+      "type": "object",
+      "properties": {
+        "event": { "type": "string", "description": "Event type identifier matching the switch cases in adaptWorkerEvent.js" },
+        "timestamp": { "type": "string", "format": "date-time", "description": "ISO 8601 timestamp of event occurrence" },
+        "request": { "type": "object", "description": "Request/payload data for the event" },
+        "response": { "type": "object", "description": "Response/result data for the event" }
+      },
+      "required": ["event", "timestamp"]
+    },
+    "worker_spawned": {
+      "allOf": [
+        { "$ref": "#/definitions/base_event" },
+        {
+          "properties": {
+            "event": { "type": "string", "enum": ["worker_spawned"] },
+            "response": {
+              "type": "object",
+              "properties": {
+                "worker_name": { "type": "string", "description": "Name of the spawned worker" },
+                "session_id": { "type": "string", "description": "Session the worker belongs to" },
+                "worker_definition": { "type": "object", "description": "Full worker definition (tools, permissions, etc.)" }
+              },
+              "required": ["worker_name"]
+            },
+            "request": {
+              "type": "object",
+              "properties": {
+                "worker_name": { "type": "string" }
+              }
+            }
+          },
+          "required": ["response"]
+        }
+      ],
+      "description": "Emitted when a new worker thread is spawned and ready. Direction: backend -> frontend."
+    },
+    "worker_status": {
+      "allOf": [
+        { "$ref": "#/definitions/base_event" },
+        {
+          "properties": {
+            "event": { "type": "string", "enum": ["worker_status"] },
+            "response": {
+              "type": "object",
+              "properties": {
+                "worker_name": { "type": "string", "description": "Name of the worker" },
+                "status": { "type": "string", "description": "Runtime status (e.g. running, busy, idle, error)" },
+                "message": { "type": "string", "description": "Optional human-readable status message" }
+              },
+              "required": ["worker_name", "status"]
+            },
+            "request": {
+              "type": "object",
+              "properties": {
+                "worker_name": { "type": "string" },
+                "status": { "type": "string" },
+                "message": { "type": "string" }
+              }
+            }
+          },
+          "required": ["response"]
+        }
+      ],
+      "description": "Emitted when a worker's runtime status changes. Direction: backend -> frontend."
+    },
+    "worker_completed": {
+      "allOf": [
+        { "$ref": "#/definitions/base_event" },
+        {
+          "properties": {
+            "event": { "type": "string", "enum": ["worker_completed"] },
+            "response": {
+              "type": "object",
+              "properties": {
+                "worker_name": { "type": "string", "description": "Name of the completed worker" },
+                "result": { "description": "Optional result data from the worker execution" }
+              },
+              "required": ["worker_name"]
+            },
+            "request": {
+              "type": "object",
+              "properties": {
+                "worker_name": { "type": "string" }
+              }
+            }
+          },
+          "required": ["response"]
+        }
+      ],
+      "description": "Emitted when a worker finishes execution successfully. Direction: backend -> frontend."
+    },
+    "worker_error": {
+      "allOf": [
+        { "$ref": "#/definitions/base_event" },
+        {
+          "properties": {
+            "event": { "type": "string", "enum": ["worker_error"] },
+            "response": {
+              "type": "object",
+              "properties": {
+                "worker_name": { "type": "string", "description": "Name of the worker that errored" },
+                "error": { "type": "string", "description": "Error message or description" }
+              },
+              "required": ["worker_name", "error"]
+            },
+            "request": {
+              "type": "object",
+              "properties": {
+                "worker_name": { "type": "string" },
+                "error": { "type": "string" }
+              }
+            }
+          },
+          "required": ["response"]
+        }
+      ],
+      "description": "Emitted when a worker encounters an error during execution. Direction: backend -> frontend."
+    }
+  },
+  "examples": {
+    "worker_spawned": {
+      "event": "worker_spawned",
+      "timestamp": "2026-07-09T12:00:00.000Z",
+      "response": { "worker_name": "my-coder", "session_id": "sess_abc123" },
+      "request": {}
+    },
+    "worker_status": {
+      "event": "worker_status",
+      "timestamp": "2026-07-09T12:00:05.000Z",
+      "response": { "worker_name": "my-coder", "status": "busy", "message": "Processing file: src/main.py" },
+      "request": {}
+    },
+    "worker_completed": {
+      "event": "worker_completed",
+      "timestamp": "2026-07-09T12:05:00.000Z",
+      "response": { "worker_name": "my-coder", "result": "Task completed successfully" },
+      "request": {}
+    },
+    "worker_error": {
+      "event": "worker_error",
+      "timestamp": "2026-07-09T12:00:10.000Z",
+      "response": { "worker_name": "my-coder", "error": "Timeout exceeded" },
+      "request": {}
+    }
+  }
+}
