@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import ManageProvidersModal from './ManageProvidersModal';
 import ContainerPanelContent from './ContainerPanel';
-import WorkspacePanel, { WorkerAutoOpenWatcher } from './WorkspacePanel';
+import WorkspacePanel from './WorkspacePanel';
 
 const BACKEND_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
 const API_BASE = `http://${window.location.hostname}:${BACKEND_PORT}`;
@@ -379,9 +379,6 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
           </button>
         ))}
       </div>
-
-      {/* ── Worker Auto-Open Watcher (always running, no visual output) ── */}
-      <WorkerAutoOpenWatcher workspaceId={workspaceId} onSelectWorker={onSelectWorker} onClearWorker={onClearWorker} selectedWorker={selectedWorker} sessionId={activeSessionId} isActive={isActive} />
 
       {/* ── Workspace Tab ── */}
       {activeTab === 'workspace' && (

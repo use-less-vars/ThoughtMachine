@@ -130,84 +130,12 @@ function WorkerDot({ status }) {
 // ── Event Log Overlay (moved to WorkerOutputPanel) ─────────────────────
 // Worker event viewing now uses the persistent WorkerOutputPanel sidebar,
 // wired via onSelectWorker callback passed up through ConfigPanel.
+//
+// NOTE: WorkerAutoOpenWatcher was removed in favor of the identical
+// auto-open logic already built into WorkerManagementPanel. The
+// WorkerManagementPanel component (rendered below) handles auto-opening
+// the output panel when workers transition to ready/busy.
 
-// ── Worker Auto-Open Watcher (always-running, no visual output) ───────────
-// Polls worker status and auto-opens the output panel when a worker
-// transitions to ready/busy. Renders nothing — can be placed anywhere.
-export function WorkerAutoOpenWatcher({ workspaceId, onSelectWorker, onClearWorker, selectedWorker, sessionId, isActive }) {
-  const [workers, setWorkers] = useState([]);
-
-  // Track previously seen (name, runtime_status) pairs
-  const prevStatusMapRef = useRef(new Map());
-  // Track workers the user manually dismissed
-  const dismissedWorkersRef = useRef(new Set());
-
-  // Remember the previous selectedWorker to detect when the panel is closed.
-  const prevSelectedWorkerRef = useRef(selectedWorker);
-
-  // When the user closes the panel (selectedWorker → null), mark the
-  // previously-selected worker as dismissed so it won't re-auto-open
-  // until its status changes.
-  useEffect(() => {
-    const prev = prevSelectedWorkerRef.current;
-    if (prev && !selectedWorker) {
-      dismissedWorkersRef.current.add(prev.name);
-    }
-    prevSelectedWorkerRef.current = selectedWorker;
-  }, [selectedWorker]);
-
-  // Auto-open panel when a worker appears or transitions to 'running'
-  useEffect(() => {
-    if (!isActive) return;
-    const currentMap = new Map(workers.map(w => [w.name, w.runtime_status]));
-    const prev = prevStatusMapRef.current;
-
-    for (const [name, status] of currentMap) {
-      // Skip dismissed workers
-      if (dismissedWorkersRef.current.has(name)) {
-        if (status !== 'busy' && status !== 'ready') {
-          dismissedWorkersRef.current.delete(name);
-        }
-        continue;
-      }
-
-      const prevStatus = prev.get(name);
-      if (!prev.has(name) || (prevStatus !== 'ready' && prevStatus !== 'busy' && (status === 'ready' || status === 'busy'))) {
-        onSelectWorker?.(name, workspaceId);
-        break;
-      }
-    }
-
-    prevStatusMapRef.current = currentMap;
-  }, [workers, workspaceId, onSelectWorker, isActive]);
-
-  // If selectedWorker is set but doesn't match any active worker for this session, clear it
-  useEffect(() => {
-    if (!isActive) return;
-    if (selectedWorker && workers.length === 0) {
-      onClearWorker?.();
-    }
-  }, [isActive, selectedWorker, workers, onClearWorker]);
-
-  // Poll workers every 3s
-  useEffect(() => {
-    if (!workspaceId || !isActive) return;
-    const fetchWorkers = () => {
-      fetch(`/api/workspace/${workspaceId}/workers`)
-        .then(res => res.ok ? res.json() : [])
-        .then(data => {
-          const filtered = Array.isArray(data) ? data : [];
-          setWorkers(filtered);
-        })
-        .catch(() => setWorkers([]));
-    };
-    fetchWorkers();
-    const interval = setInterval(fetchWorkers, 3000);
-    return () => clearInterval(interval);
-  }, [workspaceId, isActive, sessionId]);
-
-  return null;
-}
 
 // ── Section: Effective Permissions ───────────────────────────────────────
 function EffectivePermissionsSection({ workspaceId, sessionId }) {
