@@ -2904,3 +2904,9 @@ Key design decisions:
 ### Task 1: send_query() Improvement
 - Added fallback to read `last_heartbeat` from `status.json` when in-memory value is None
 - Improved `TimeoutError` message to include heartbeat age if available
+
+## 2026-07-10 — ## Research Report: Git Permissions, CheckSystem, Config Loa...
+
+## Research Report: Git Permissions, CheckSystem, Config Loading & Layering (2026-07-10)
+
+Researched 4 questions about the codebase. Full report below.

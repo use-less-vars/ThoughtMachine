@@ -844,3 +844,29 @@ Every new event type must be added to every layer of the pipeline. Missing any s
 - [ ] Add event type to `web_ui/shared/worker_event_schema.json`
 - [ ] Add test case to `adaptWorkerEvent.test.js`
 
+## inventory_partial_results
+
+## 2026-07-10 — **Root files:** _run_git_cmds.py (136L, funcs: run, main), _...
+
+**Root files:** _run_git_cmds.py (136L, funcs: run, main), _runner.py (9L), check_syntax.py (0L), docker_executor.py (1051L, class:DockerExecutor, 13 funcs), run_git_commands.py (139L, funcs: run, main), setup_workspace.py (57L, func: main), thoughtmachine_entry.py (48L, func: main)
+
+**agent/cli/:** __init__.py(1L), main.py(40L, func:main), rag_commands.py(200L, 5 funcs)
+**agent/config/:** __init__.py(35L), loader.py(481L, 21 funcs), models.py(243L, class:AgentConfig), preset.py(117L, classes:Preset,PresetLoader), provider_profile.py(177L, classes:ProviderProfile,ProviderManager), service.py(284L, class:ConfigService)
+**agent/controller/:** __init__.py(709L, class:AgentController, 23 methods)
+**agent/core/:** __init__.py(13L), agent.py(1479L, class:Agent, 39 methods), conversation_manager.py(142L, class:ConversationManager), debug_context.py(101L, class:DebugContext), llm_client.py(172L, classes:LLMError,LLMClient), message.py(39L, class:Message), message_utils.py(199L, 2 funcs), state.py(323L, 6 classes: TokenState,TurnState,ExecutionState,TimeState,SessionState,AgentState), token_counter.py(111L, class:TokenCounter), tool_executor.py(344L, class:ToolExecutor), turn_transaction.py(196L, class:TurnTransaction), worker_context.py(216L, class:WorkerContext)
+**agent/knowledge/:** base.py(73L, class:BaseKnowledgeBase), codebase_indexer.py(1279L, 24 funcs), codebase_kb.py(344L, class:LocalCodebaseKB), dependencies.py(90L, func:check_rag_dependencies), global_kb.py(169L, 4 funcs)
+**agent/logging/:** __init__.py(711L, classes:LogLevel,LogCategory,LogEventType,_AgentLogger), debug_log_adapter.py(172L, class:LogAnalyzer), unified.py(549L, class:LogLevel, 20 funcs)
+**agent/models/:** __init__.py(3L), worker_definition.py(62L, class:WorkerDefinition)
+**agent/presenter/:** __init__.py(16L), agent_presenter.py(416L, class:RefactoredAgentPresenter), event_processor.py(307L, class:EventProcessor), gui_integration.py(95L, classes:GUIIntegration,_DummySignal), session_lifecycle.py(537L, class:SessionLifecycle), state_bridge.py(305L, class:StateBridge)
+**agent/:** events.py(519L, 20 classes, 8 funcs), logging_helpers.py(46L, func:dump_messages), startup_health_check.py(331L, classes:CheckResult,HealthReport, 7 funcs), utils.py(42L, func:deep_merge)
+
+**llm_providers/:** __init__.py(38L), anthropic_provider.py(203L, class:AnthropicProvider), base.py(121L, classes:LLMResponse,ProviderConfig,LLMProvider), exceptions.py(43L, 10 exception classes), factory.py(136L, class:ProviderFactory), openai_compatible.py(549L, class:OpenAICompatibleProvider), tool_converter.py(168L, class:ToolFormatConverter)
+
+**security/:** __init__.py(1L), security_gate.py(445L, 8 funcs)
+
+**session/:** context_builder.py(419L, classes:ContextBuilder,SummaryBuilder), event_schema.py(450L, 15 TypedDict classes, 18 funcs), history_provider.py(262L, class:HistoryProvider), history_pruner.py(387L, class:PruningPolicy, 6 funcs), lock.py(175L, classes:FileLockTimeoutError,FileLock), models.py(466L, classes:ObservableList,RuntimeParams,ContainerMetadata,Session), store.py(738L, classes:SessionStore,FileSystemSessionStore), utils.py(39L, func:normalize_conversation_for_hash)
+
+**thoughtmachine/:** __init__.py(0L), audit_logger.py(74L, 3 funcs), bootstrap.py(172L, 10 funcs), security.py(1090L, 5 classes, 20 funcs), workspace_capabilities.py(471L, class:WorkspaceCapabilities, 14 funcs)
+
+**mcp_examples/:** test_client.py(217L, 6 funcs), test_with_agent_mcp_client.py(74L)
+
