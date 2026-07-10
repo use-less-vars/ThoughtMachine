@@ -17,6 +17,11 @@
       "dest": ".version",
       "description": "ThoughtMachine version string",
       "internal": true
+    },
+    {
+      "source": "engineer_system_prompt.txt",
+      "dest": "engineer_system_prompt.txt",
+      "description": "System prompt for the engineer/architect agent role"
     }
   ],
   "directories": [
