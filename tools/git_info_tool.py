@@ -347,6 +347,13 @@ class GitInfoTool(ToolBase):
 
     def _git_commit(self, repo_root: Path) -> str:
         """Run git commit."""
+        # If specific file_paths are given, unstage everything first so that
+        # only the explicitly-listed files are included in the commit.
+        if self.file_path:
+            reset_result = self._run_git(repo_root, ["reset", "HEAD", "--", "."])
+            if reset_result.startswith("Git command failed"):
+                return reset_result
+
         # First, stage changes
         add_result = self._git_add(repo_root)
         if add_result.startswith("Git command failed") or add_result.startswith("Error"):
