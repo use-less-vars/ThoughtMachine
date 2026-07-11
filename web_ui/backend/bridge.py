@@ -61,6 +61,7 @@ try:
         global_event_bus, EventType, SecurityPromptEvent,
         WorkerSpawnedEvent, WorkerStatusEvent, WorkerCompletedEvent, WorkerErrorEvent,
         TokenWarningEvent, BaseEvent,
+        ToolCallEvent, ToolResultEvent, AssistantMessageEvent, WorkerMessageEvent,
     )
     EVENT_SYSTEM_AVAILABLE = True
 except ImportError:
@@ -72,6 +73,10 @@ except ImportError:
     WorkerCompletedEvent = None
     WorkerErrorEvent = None
     TokenWarningEvent = None
+    ToolCallEvent = None
+    ToolResultEvent = None
+    AssistantMessageEvent = None
+    WorkerMessageEvent = None
     EVENT_SYSTEM_AVAILABLE = False
 
 from session.models import Session
@@ -79,9 +84,14 @@ from session.store import FileSystemSessionStore
 
 # Worker lifecycle — graceful shutdown of worker threads on session close
 try:
-    from tools.workspace.worker import shutdown_workers
+    from tools.workspace.worker import shutdown_workers, get_worker_event_bus, register_worker_event_bus, unregister_worker_event_bus
+    WORKER_BUS_AVAILABLE = True
 except ImportError:
     shutdown_workers = None  # type: ignore
+    get_worker_event_bus = None
+    register_worker_event_bus = None
+    unregister_worker_event_bus = None
+    WORKER_BUS_AVAILABLE = False
 
 # ── Workspace ID cache ──────────────────────────────────────────────────────
 # Cache mapping workspace path → workspace ID, built once and reused across
@@ -222,6 +232,10 @@ class WebAgentBridge:
         self._worker_status_sub = None
         self._worker_completed_sub = None
         self._worker_error_sub = None
+        self._worker_token_warning_sub = None
+        self._worker_message_sub = None
+        # Per-worker EventBus subscriptions (worker_name -> {event_type: sub_handle})
+        self._worker_bus_subs: Dict[str, Dict[Any, Any]] = {}
         self._subscribe_to_security_events()
         self._subscribe_to_worker_events()
 
@@ -290,6 +304,10 @@ class WebAgentBridge:
         """
         Subscribe to worker lifecycle events from the global event bus and
         forward them to frontend WebSocket clients as worker:* messages.
+
+        Also manages per-worker EventBus subscriptions for detailed events
+        (tool_call, tool_result, token_warning, etc.) by subscribing on
+        WORKER_SPAWNED and unsubscribing on WORKER_COMPLETED / WORKER_ERROR.
         """
         if not EVENT_SYSTEM_AVAILABLE or global_event_bus is None:
             log('WARNING', 'server.bridge', 'Event system unavailable - worker events not forwarded')
@@ -319,16 +337,16 @@ class WebAgentBridge:
             return _handler
 
         self._worker_spawned_sub = global_event_bus.subscribe(
-            EventType.WORKER_SPAWNED, _make_handler(WorkerSpawnedEvent)
+            EventType.WORKER_SPAWNED, self._on_worker_spawned
         )
         self._worker_status_sub = global_event_bus.subscribe(
             EventType.WORKER_STATUS, _make_handler(WorkerStatusEvent)
         )
         self._worker_completed_sub = global_event_bus.subscribe(
-            EventType.WORKER_COMPLETED, _make_handler(WorkerCompletedEvent)
+            EventType.WORKER_COMPLETED, self._on_worker_completed
         )
         self._worker_error_sub = global_event_bus.subscribe(
-            EventType.WORKER_ERROR, _make_handler(WorkerErrorEvent)
+            EventType.WORKER_ERROR, self._on_worker_error
         )
         self._worker_token_warning_sub = global_event_bus.subscribe(
             EventType.TOKEN_WARNING, self._on_worker_token_warning
@@ -383,7 +401,7 @@ class WebAgentBridge:
             self._security_subscription = None
 
     def _unsubscribe_worker_events(self) -> None:
-        """Unsubscribe from worker lifecycle events."""
+        """Unsubscribe from worker lifecycle events and all per-worker buses."""
         worker_subs = [
             ('_worker_spawned_sub',),
             ('_worker_status_sub',),
@@ -401,6 +419,150 @@ class WebAgentBridge:
                 except Exception:
                     pass
                 setattr(self, attr_name, None)
+
+        # Clean up all per-worker bus subscriptions
+        for worker_name in list(self._worker_bus_subs.keys()):
+            self._unsubscribe_worker_bus(worker_name)
+        self._worker_bus_subs.clear()
+
+    # ── Per-worker EventBus subscription management ───────────────────────────
+
+    def _on_worker_spawned(self, event: WorkerSpawnedEvent) -> None:
+        """
+        Forward worker spawned event to frontend and subscribe to
+        the per-worker EventBus for detailed events.
+        """
+        if not self._event_callbacks:
+            return
+        data = event.data or {}
+        # Only forward events for this bridge's session
+        if data.get('session_id') and data['session_id'] != self._session_id:
+            return
+        event_dict = {
+            'type': f'worker:{event.type.value}',
+            'worker_name': data.get('worker_name', ''),
+            'timestamp': event.metadata.timestamp.isoformat(),
+            'data': data,
+        }
+        for cb in list(self._event_callbacks.values()):
+            try:
+                cb(event_dict)
+            except Exception as exc:
+                log('ERROR', 'server.bridge',
+                    f'Failed to forward worker event: {exc}')
+
+        # Subscribe to per-worker EventBus for detailed events
+        worker_name = data.get('worker_name', '')
+        session_id = data.get('session_id', self._session_id or '')
+        if worker_name and WORKER_BUS_AVAILABLE and get_worker_event_bus is not None:
+            worker_bus = get_worker_event_bus(session_id, worker_name)
+            if worker_bus is not None:
+                self._subscribe_to_worker_bus(worker_name, worker_bus)
+
+    def _subscribe_to_worker_bus(self, worker_name: str, worker_bus: Any) -> None:
+        """
+        Subscribe to a worker's per-worker EventBus for detailed real-time
+        events (tool_call, tool_result, token_warning, worker_message, etc.).
+        """
+        if not EVENT_SYSTEM_AVAILABLE or EventType is None:
+            return
+
+        subs = {}
+
+        def _make_bus_handler(original_type: str):
+            def _handler(event: Any) -> None:
+                if not self._event_callbacks:
+                    return
+                data = event.data or {}
+                event_dict = {
+                    'type': f'worker:{original_type}',
+                    'worker_name': data.get('worker_name', worker_name),
+                    'timestamp': (
+                        event.metadata.timestamp.isoformat()
+                        if hasattr(event, 'metadata') and event.metadata
+                        else datetime.datetime.now().isoformat()
+                    ),
+                    'data': data,
+                }
+                for cb in list(self._event_callbacks.values()):
+                    try:
+                        cb(event_dict)
+                    except Exception as exc:
+                        log('ERROR', 'server.bridge',
+                            f'Failed to forward worker bus event: {exc}')
+            return _handler
+
+        # Subscribe to detailed event types on the per-worker bus
+        for evt_type in ['tool_call', 'tool_result', 'token_warning',
+                         'worker_message', 'assistant_message']:
+            try:
+                evt_enum = EventType(evt_type)
+                sub = worker_bus.subscribe(evt_enum, _make_bus_handler(evt_type))
+                subs[evt_enum] = sub
+            except (ValueError, Exception) as exc:
+                log('DEBUG', 'server.bridge',
+                    f'Could not subscribe to {evt_type} for {worker_name}: {exc}')
+
+        self._worker_bus_subs[worker_name] = subs
+        log('INFO', 'server.bridge',
+            f'Subscribed to per-worker bus for {worker_name} ({len(subs)} event types)')
+
+    def _unsubscribe_worker_bus(self, worker_name: str) -> None:
+        """Unsubscribe all per-worker bus subscriptions for a worker."""
+        subs = self._worker_bus_subs.pop(worker_name, {})
+        if not subs:
+            return
+        for evt_type, sub_handle in subs.items():
+            try:
+                if WORKER_BUS_AVAILABLE and get_worker_event_bus is not None:
+                    worker_bus = get_worker_event_bus(self._session_id or '', worker_name)
+                    if worker_bus is not None and hasattr(worker_bus, 'unsubscribe'):
+                        worker_bus.unsubscribe(sub_handle)
+            except Exception:
+                pass
+        log('INFO', 'server.bridge',
+            f'Unsubscribed from per-worker bus for {worker_name}')
+
+    def _on_worker_completed(self, event: WorkerCompletedEvent) -> None:
+        """
+        Forward worker completed event to frontend and unsubscribe from
+        the per-worker EventBus.
+        """
+        self._forward_worker_event(event)
+        worker_name = (event.data or {}).get('worker_name', '')
+        if worker_name:
+            self._unsubscribe_worker_bus(worker_name)
+
+    def _on_worker_error(self, event: WorkerErrorEvent) -> None:
+        """
+        Forward worker error event to frontend and unsubscribe from
+        the per-worker EventBus.
+        """
+        self._forward_worker_event(event)
+        worker_name = (event.data or {}).get('worker_name', '')
+        if worker_name:
+            self._unsubscribe_worker_bus(worker_name)
+
+    def _forward_worker_event(self, event: Any) -> None:
+        """Forward a worker lifecycle event to frontend (shared handler logic)."""
+        if not self._event_callbacks:
+            return
+        data = event.data or {}
+        # Only forward events for this bridge's session
+        if data.get('session_id') and data['session_id'] != self._session_id:
+            return
+        event_dict = {
+            'type': f'worker:{event.type.value}',
+            'worker_name': data.get('worker_name', ''),
+            'timestamp': event.metadata.timestamp.isoformat(),
+            'data': data,
+        }
+        for cb in list(self._event_callbacks.values()):
+            try:
+                cb(event_dict)
+            except Exception as exc:
+                log('ERROR', 'server.bridge',
+                    f'Failed to forward worker event: {exc}')
 
     # ── Global tab registry ──────────────────────────────────────────────────
 

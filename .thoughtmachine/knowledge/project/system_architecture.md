@@ -3190,3 +3190,34 @@ WorkerThread iterates events, handles responses
 
 **Behavior:** Silently discards all publishes; `ask()` returns `"deny"` instantly. This ensures workers cannot prompt the user for approval and all security prompts auto-deny.
 
+
+## 2026-07-12 — ## Plan: Per-Worker EventBus bridge wiring
+
+**Goal**: Wire p...
+
+## Plan: Per-Worker EventBus bridge wiring
+
+**Goal**: Wire per-worker EventBus events (TOOL_CALL, TOOL_RESULT, TOKEN_WARNING, ASSISTANT_MESSAGE, etc.) through to the WebSocket frontend via the bridge.
+
+**Files to modify**:
+1. `tools/workspace/worker.py` — add worker event bus registry + register/unregister in WorkerThread.run()
+2. `web_ui/backend/bridge.py` — subscribe to per-worker bus on spawn events, unsubscribe on completion
+
+**Step 1 — worker.py: Add bus registry** (near `_worker_registry`)
+- Add module-level `_worker_event_bus_registry: Dict[Tuple[str, str], EventBus]` + `_bus_registry_lock`
+- Add `register_worker_event_bus(session_id, worker_name, event_bus)`
+- Add `unregister_worker_event_bus(session_id, worker_name)`
+- Add `get_worker_event_bus(session_id, worker_name)`
+
+**Step 2 — worker.py: Register/unregister in WorkerThread.run()**
+- After `self._event_bus = EventBus()` is created (lazy agent creation block), call `register_worker_event_bus(self.session_id, self.worker_name, self._event_bus)`
+- In the finally block (or at thread exit), call `unregister_worker_event_bus(self.session_id, self.worker_name)`
+
+**Step 3 — bridge.py: Import registry functions + add per-worker subscription management**
+- Import `get_worker_event_bus` from `tools.workspace.worker`
+- Add `_worker_bus_subscriptions: Dict[str, Dict[str, Any]]` tracking dict (maps worker_name -> subs)
+- In the WORKER_SPAWNED handler: look up per-worker bus via `get_worker_event_bus(session_id, worker_name)`, subscribe to events TOOL_CALL, TOOL_RESULT, TOKEN_WARNING, ASSISTANT_MESSAGE, WORKER_MESSAGE, etc., store subscription handles
+- In WORKER_COMPLETED/WORKER_ERROR handler: unsubscribe from per-worker bus
+- Extend `_unsubscribe_worker_events` to also clean up per-worker bus subs
+
+**Step 4 — Test**: Verify imports work, verify subscriptions are created and cleaned up properly.

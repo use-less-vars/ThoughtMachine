@@ -87,11 +87,12 @@ except ImportError:
     _NULL_EVENT_BUS = None
 
 try:
-    from agent.events import EventBus, create_event, EventType
+    from agent.events import EventBus, create_event, EventType, global_event_bus
 except ImportError:
     EventBus = None
     create_event = None
     EventType = None
+    global_event_bus = None
 
 
 logger = logging.getLogger(__name__)
@@ -164,12 +165,40 @@ def shutdown_workers(timeout: float = 5.0) -> None:
 atexit.register(shutdown_workers)
 
 
+def register_worker_event_bus(session_id: str, worker_name: str, event_bus: Any) -> None:
+    """
+    Register a worker's per-worker EventBus so the bridge can discover it
+    and subscribe to detailed events (tool_call, tool_result, etc.).
+    """
+    key = (session_id or "", worker_name)
+    with _bus_registry_lock:
+        _worker_event_bus_registry[key] = event_bus
+
+
+def unregister_worker_event_bus(session_id: str, worker_name: str) -> None:
+    """Unregister a worker's per-worker EventBus."""
+    key = (session_id or "", worker_name)
+    with _bus_registry_lock:
+        _worker_event_bus_registry.pop(key, None)
+
+
+def get_worker_event_bus(session_id: str, worker_name: str) -> Any:
+    """Get a worker's per-worker EventBus, or None if not registered."""
+    key = (session_id or "", worker_name)
+    with _bus_registry_lock:
+        return _worker_event_bus_registry.get(key)
+
+
 # ---------------------------------------------------------------------------
 # Module-level worker registry  (persists across tool calls)
 # ---------------------------------------------------------------------------
 
 _worker_registry: dict = {}
 _registry_lock = threading.Lock()
+
+# Per-worker EventBus registry (for bridge discovery of per-worker buses)
+_worker_event_bus_registry: Dict[Tuple[str, str], Any] = {}
+_bus_registry_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Restrictive merge for permission ceiling enforcement
@@ -827,6 +856,25 @@ class WorkerThread(threading.Thread):
                         self._output_queue.put(reply)
                         break
                     self._event_bus = EventBus()
+                    register_worker_event_bus(self.session_id or "", self.worker_name, self._event_bus)
+                    # Signal bridge via global bus so it can subscribe to per-worker bus
+                    if global_event_bus is not None and EventType is not None and create_event is not None:
+                        try:
+                            from agent.events import EventMetadata
+                            evt = create_event(
+                                EventType.WORKER_SPAWNED,
+                                metadata=EventMetadata(
+                                    source=f"worker:{self.worker_name}",
+                                    session_id=self.session_id or "",
+                                ),
+                                data={
+                                    "session_id": self.session_id or "",
+                                    "worker_name": self.worker_name,
+                                },
+                            )
+                            global_event_bus.publish(evt)
+                        except Exception:
+                            pass
                     self._agent = Agent(
                         config=agent_cfg,
                         session=self._worker_ctx,
@@ -876,6 +924,10 @@ class WorkerThread(threading.Thread):
             self._log_event("completed", {}, {})
             self._publish_event('worker_completed', {'status': 'completed'})
         finally:
+            try:
+                unregister_worker_event_bus(self.session_id or "", self.worker_name)
+            except Exception:
+                pass
             if self._worker_ctx is not None:
                 self._save_context()
 
