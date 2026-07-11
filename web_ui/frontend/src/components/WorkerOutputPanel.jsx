@@ -7,11 +7,11 @@ const PANEL_MAX = 600;
 const PANEL_DEFAULT = 350;
 
 const STATUS_DOT = {
-  ready: { bg: '#a6e3a1', label: 'Ready' },      /* green solid — alive, waiting */
-  busy: { bg: '#a6e3a1', label: 'Busy' },        /* green pulsing — processing */
-  completed: { bg: '#6c7086', label: 'Completed' }, /* grey — done */
+  ready: { bg: '#585b70', label: 'Idle' },        /* grey — spawned but not doing anything */
+  busy: { bg: '#a6e3a1', label: 'Running' },      /* green with pulse — actively processing */
+  completed: { bg: '#6c7086', label: 'Completed' }, /* muted grey — done */
   error: { bg: '#f38ba8', label: 'Error' },       /* red — failed */
-  stopped: { bg: '#f38ba8', label: 'Stopped' },   /* red — stopped */
+  stopped: { bg: '#313244', label: 'Stopped' },   /* dark/off — not spawned */
 };
 
 function statusDotColor(status) {
@@ -68,6 +68,8 @@ function NewEventsButton({ onClick }) {
 
 // ── Main component ────────────────────────────────────────────────────
 function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomingEvents = [] }) {
+
+  
   // Panel resize state (self-contained)
   const [panelWidth, setPanelWidth] = useState(PANEL_DEFAULT);
   const dragRef = useRef(null);
@@ -140,7 +142,10 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
         if (Array.isArray(data)) {
           const found = data.find((w) => w.name === workerName);
           if (found) {
-            setWorkerInfo(found);
+            setWorkerInfo(prev => {
+              if (!prev) return found;
+              return { ...found, ...prev, runtime_status: prev.runtime_status ?? found.runtime_status };
+            });
             setWorkerError('');
           } else {
             // Worker might have not appeared yet; only set error
@@ -183,11 +188,48 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
   // Filter by worker name so cross-session WS events are correctly routed
   useEffect(() => {
     if (!incomingEvents || incomingEvents.length === 0) return
+
+    
     const relevantEvents = incomingEvents.filter(e => {
       const evtWorkerName = e.worker_name || e.response?.worker_name
       return !evtWorkerName || evtWorkerName === workerName
     })
+
+    
     if (relevantEvents.length === 0) return
+    console.log('[WorkerOutputPanel] WS incomingEvents:', relevantEvents.length, 'events for', workerName, relevantEvents.map(e=>e.type).join(','));
+
+    // Also update live workerInfo status from WS events (instant, no poll lag)
+    for (const e of relevantEvents) {
+      const eventType = e.type?.replace('worker:', '')
+      const status = e.data?.runtime_status || e.data?.status
+      if (eventType === 'worker_spawned' && (status === 'ready' || status === 'busy')) {
+        setWorkerInfo(prev => {
+          const update = { runtime_status: status };
+          if (!prev) return update;
+          return { ...prev, ...update };
+        })
+      } else if (eventType === 'worker_status' && status) {
+        setWorkerInfo(prev => {
+          const update = { runtime_status: status, current_task: e.data?.current_task || prev?.current_task };
+          if (!prev) return update;
+          return { ...prev, ...update };
+        })
+      } else if (eventType === 'worker_completed') {
+        setWorkerInfo(prev => {
+          const update = { runtime_status: 'ready' };
+          if (!prev) return update;
+          return { ...prev, ...update };
+        })
+      } else if (eventType === 'worker_error') {
+        setWorkerInfo(prev => {
+          const update = { runtime_status: 'error', error: e.data?.error || '' };
+          if (!prev) return update;
+          return { ...prev, ...update };
+        })
+      }
+    }
+
     setEvents(prev => {
       const existingKeys = new Set(prev.map(e => e.event + (e.timestamp || '')))
       const newOnes = relevantEvents
@@ -196,7 +238,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
           event: e.type?.replace('worker:', '') || 'unknown',
           timestamp: e.timestamp,
           request: e.request || {},
-          response: e.response || { error: e.error, status: e.status, worker_name: e.worker_name },
+          response: e.response || e.data || { error: e.error, status: e.status, worker_name: e.worker_name },
         }))
       if (newOnes.length === 0) return prev
       const updated = [...prev, ...newOnes]
@@ -220,12 +262,14 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
     const params = new URLSearchParams();
     params.set('limit', '50');
     if (lastFetchTimeRef.current) params.set('since', lastFetchTimeRef.current);
+    console.log('[WorkerOutputPanel] fetchEvents called for', workerName, 'limit=50', params.toString());
 
     fetch(`/api/workspace/${workspaceId}/workers/${encodeURIComponent(workerName)}/events?${params}`)
       .then(async (res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         if (Array.isArray(data) && data.length > 0) {
+          console.log('[WorkerOutputPanel] fetched', data.length, 'events for', workerName, 'types:', data.map(e=>e.event).join(','));
           setEvents((prev) => {
             const existingTimestamps = new Set(prev.map((e) => e.timestamp + e.event));
             const newEntries = data.filter((e) => !existingTimestamps.has(e.timestamp + e.event));
@@ -241,6 +285,8 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
             lastFetchTimeRef.current = lastTs;
             setLastFetchTime(lastTs);
           }
+        } else {
+          console.log('[WorkerOutputPanel] no new events for', workerName);
         }
         setEventsError('');
       })
@@ -351,6 +397,16 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
   const latestEvent = events.length > 0 ? events[events.length - 1] : null;
 
   // ── Render ────────────────────────────────────────────────────────────
+
+  // Build a set of all final (worker_message) content strings for dedup
+  const finalContentSet = new Set()
+  events.forEach(evt => {
+    if (evt.event === 'worker_message') {
+      const content = evt.response?.content || ''
+      if (content) finalContentSet.add(content.trim())
+    }
+  })
+
   return (
     <div className="worker-output-wrapper">
       {/* Resize handle (left edge) */}
@@ -374,7 +430,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
         {/* ── Status bar (slim, matching main StatusBar) ────────────── */}
         <div className="worker-output-header">
           <span
-            className="worker-status-dot"
+            className={'worker-status-dot' + (runtimeStatus === 'busy' ? ' worker-status-dot-busy' : '')}
             style={{ background: statusDotColor(runtimeStatus) }}
           />
           <span className="worker-output-header-label">
@@ -418,8 +474,30 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
             </div>
           )}
 
+          {/* Dedup: content strings from worker_message events */}
           {events.map((evt, idx) => {
             const msg = adaptWorkerEvent(evt);
+            // Dedup: skip tool_call/tool_result events if their content
+            // matches content already shown in a worker_message (final response)
+            if (msg && (evt.event === 'tool_result' || evt.event === 'tool_call')) {
+              const msgContent = msg.content || msg.tool_input || msg.result || ''
+              if (msgContent && typeof msgContent === 'string') {
+                const trimmed = msgContent.trim()
+                if (trimmed) {
+                  let isRedundant = false
+                  for (const finalContent of finalContentSet) {
+                    if (finalContent.includes(trimmed) || trimmed.includes(finalContent)) {
+                      isRedundant = true
+                      break
+                    }
+                  }
+                  if (isRedundant) {
+                    console.log('[WorkerOutputPanel] dedup: skipping', evt.event, 'as its content appears in worker_message')
+                    return null
+                  }
+                }
+              }
+            }
             if (!msg) return null;  // suppress events like user_message / query
             const key = msg._id || (evt.timestamp + evt.event + idx);
             return (

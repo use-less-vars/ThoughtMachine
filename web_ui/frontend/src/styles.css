@@ -1033,6 +1033,32 @@ body {
   flex-shrink: 0;
 }
 
+/* Glow/pulse animation for active (busy) status dot in WorkerOutputPanel */
+@keyframes worker-glow-pulse {
+  0%, 100% {
+    box-shadow: 0 0 4px 0 rgba(166, 227, 161, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 8px 3px rgba(166, 227, 161, 0.6);
+  }
+}
+.worker-status-dot-busy {
+  animation: worker-glow-pulse 1.5s ease-in-out infinite;
+}
+
+/* Glow/pulse animation for busy dot in WorkerManagementPanel lists */
+@keyframes worker-dot-pulse {
+  0%, 100% {
+    box-shadow: 0 0 4px 0 rgba(166, 227, 161, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 8px 3px rgba(166, 227, 161, 0.6);
+  }
+}
+.worker-dot-busy {
+  animation: worker-dot-pulse 1.5s ease-in-out infinite;
+}
+
 /* ── No-worker selected state ────────────────────────────── */
 .worker-output-no-selection {
   display: flex;

@@ -69,7 +69,7 @@ function PermissionPill({ name, value }) {
 // ── Status/event badge colors ───────────────────────────────────────────
 const STATUS_DOT_COLORS = {
   running:   '#a6e3a1',  // green
-  idle:      '#f9e2af',  // yellow
+  idle:      '#585b70',  // grey
   completed: '#6c7086',  // grey
   failed:    '#f38ba8',  // red
 };

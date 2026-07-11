@@ -75,11 +75,11 @@ const modalBox = {
 };
 
 const STATUS_DOT_COLORS = {
-  ready: '#a6e3a1',
-  busy: '#89b4fa',
-  completed: '#a6e3a1',
-  error: '#f38ba8',
-  stopped: '#585b70',
+  ready: '#585b70',    /* grey — idle, spawned but not doing anything */
+  busy: '#a6e3a1',     /* green with pulse — actively processing */
+  completed: '#6c7086', /* muted grey — finished */
+  error: '#f38ba8',    /* red — something went wrong */
+  stopped: '#313244',  /* dark/off — not spawned */
 };
 
 // ── Helper: relative time ──────────────────────────────────────────────────
@@ -105,8 +105,10 @@ function truncate(str, maxLen = 120) {
 // ── Status dot ─────────────────────────────────────────────────────────────
 function WorkerDot({ status }) {
   const color = STATUS_DOT_COLORS[status] || '#585b70';
+  const isBusy = status === 'busy';
   return (
     <span
+      className={isBusy ? 'worker-dot-busy' : ''}
       style={{
         width: 8,
         height: 8,
