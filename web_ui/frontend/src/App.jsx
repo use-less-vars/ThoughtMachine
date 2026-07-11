@@ -34,6 +34,7 @@ import SessionList from './components/SessionList'
 import TabBar from './components/TabBar'
 import SessionActionsPanel from './components/SessionActionsPanel'
 import WorkerOutputPanel from './components/WorkerOutputPanel'
+import LoggingPanel from './components/LoggingPanel'
 import './styles.css'
 
 const WS_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
@@ -64,6 +65,9 @@ export default function App() {
   })
 
   const [sessionPanelOpen, setSessionPanelOpen] = useState(false)
+  const [showLoggingPanel, setShowLoggingPanel] = useState(false)
+  const [loggingConfig, setLoggingConfig] = useState(null)
+  const [loggingConfigError, setLoggingConfigError] = useState(null)
   const [workerEvents, setWorkerEvents] = useState({})  // { [sessionId]: [event, ...] } live WS worker events
 
   const pendingWorkerSelectionRef = useRef(null)  // { workerName, workspaceId } queued before activeSessionId is set
@@ -600,7 +604,29 @@ export default function App() {
     }
   }, [activeSessionId])
 
-  // ── Persist active session ID in localStorage (stable across page loads) ─
+  // ── Fetch logging config (callable for retry) ────────────────────────────────────
+  const fetchLoggingConfig = useCallback(() => {
+    const hostname = window.location.hostname
+    const port = import.meta.env.VITE_BACKEND_PORT || '8000'
+    setLoggingConfigError(null)
+    fetch(`http://${hostname}:${port}/api/logging/config`)
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        return res.json()
+      })
+      .then(data => setLoggingConfig(data))
+      .catch(err => {
+        console.error('Failed to fetch logging config:', err)
+        setLoggingConfigError(err.message || 'Failed to load')
+      })
+  }, [])
+
+  // ── Fetch initial logging config on mount ────────────────────────────────────────
+  useEffect(() => {
+    fetchLoggingConfig()
+  }, [fetchLoggingConfig])
+
+  // ── Persist active session ID in localStorage (stable across page loads) ──
   useEffect(() => {
     if (activeSessionId) {
       localStorage.setItem('activeSessionId', activeSessionId)
@@ -621,6 +647,16 @@ export default function App() {
         runningStates={tabRunningStates}
         onCogwheelClick={handleCogwheelClick}
       />
+
+      <div className="logging-toolbar">
+        <button
+          className={`logging-toggle-btn ${showLoggingPanel ? 'active' : ''}`}
+          onClick={() => setShowLoggingPanel(prev => !prev)}
+          title="Toggle logging panel"
+        >
+          📋 Logging
+        </button>
+      </div>
 
       <div className="app-main">
         {/* All tabs stay mounted; inactive ones hidden with display:none */}
@@ -655,11 +691,35 @@ export default function App() {
                   activeSessionId={activeSessionId}
                   onClearWorker={handleCloseWorkerPanel}
                   onWorkerEvent={handleWorkerEvent}
+                  onLoggingConfigChanged={(config) => setLoggingConfig(config)}
                 />
               </div>
             ))
           )}
         </div>
+
+        {/* Logging Panel — toggle via button above */}
+        {showLoggingPanel && (
+          <LoggingPanel
+            config={loggingConfig}
+            configError={loggingConfigError}
+            onRetry={fetchLoggingConfig}
+            onSaveConfig={async (configPayload) => {
+              const hostname = window.location.hostname
+              const port = import.meta.env.VITE_BACKEND_PORT || '8000'
+              const res = await fetch(`http://${hostname}:${port}/api/logging/config`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(configPayload),
+              })
+              if (!res.ok) throw new Error(`HTTP ${res.status}`)
+              const data = await res.json()
+              setLoggingConfig(data.config || data)
+              return data.config || data
+            }}
+            onClose={() => setShowLoggingPanel(false)}
+          />
+        )}
 
         {/* Sessions sidebar — always visible when no tabs are open, toggle via ⚙️ cogwheel */}
         <div className={`session-sidebar ${(showSessions || tabs.length === 0) ? 'open' : ''}`}>
