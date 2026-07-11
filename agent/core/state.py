@@ -84,7 +84,8 @@ class AgentState:
         Returns list of events (e.g., warnings) that should be yielded.
         """
         self.current_conversation_tokens = total_tokens
-        log('DEBUG', 'core.token_state', f'total_tokens={total_tokens}, warning_threshold={self.config.token_monitor_warning_threshold}, critical_threshold={self.config.token_monitor_critical_threshold}')
+        log('DEBUG', 'core.token', f'total_tokens={total_tokens}, warning_threshold={self.config.token_monitor_warning_threshold}, critical_threshold={self.config.token_monitor_critical_threshold}')
+        log('WARNING', 'core.token', f"update_token_state: total_tokens={total_tokens} threshold={self.config.token_monitor_warning_threshold if hasattr(self.config, 'token_monitor_warning_threshold') else 'N/A'}")
         if total_tokens < self.config.token_monitor_warning_threshold:
             new_state = TokenState.LOW
         elif total_tokens < self.config.token_monitor_critical_threshold:
