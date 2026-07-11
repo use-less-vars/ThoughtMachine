@@ -331,7 +331,7 @@ describe('system_notification', () => {
         response: { type: 'token_warning', message: '' },
       });
       const result = adaptWorkerEvent(evt);
-      expect(result.content).toBe(`${SYSTEM_NOTIFICATION_EMOJI} `);
+      expect(result.content).toBe(`${SYSTEM_NOTIFICATION_EMOJI}`);
     });
   });
 

@@ -164,14 +164,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
 
   const runtimeStatus = workerInfo?.runtime_status || 'ready';
 
-  // Poll period for worker info: 1s if busy (aligns with events), 3s otherwise
-  const workerInfoPollInterval = runtimeStatus === 'busy' ? 1000 : 3000;
-
-  useEffect(() => {
-    fetchWorkerInfo();
-    const interval = setInterval(fetchWorkerInfo, workerInfoPollInterval);
-    return () => clearInterval(interval);
-  }, [fetchWorkerInfo, workerInfoPollInterval]);
+  // Worker info is updated via WebSocket incomingEvents (no polling)
 
   // Reset when workerName changes
   useEffect(() => {
@@ -349,15 +342,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
       });
   }, [workspaceId, workerName]); // stable deps only — no cascading re-fetches
 
-  // Poll period: 1s if running, 3s otherwise
-  const pollInterval = runtimeStatus === 'busy' ? 1000 : 3000;
-
-  useEffect(() => {
-    if (!workspaceId || !workerName) return;
-    fetchEvents();
-    const interval = setInterval(fetchEvents, pollInterval);
-    return () => clearInterval(interval);
-  }, [fetchEvents, pollInterval, workspaceId, workerName]);
+  // Events are received via WebSocket incomingEvents prop (no polling)
 
   // ── Smart scroll ──────────────────────────────────────────────────────
   // Track whether user is at bottom
@@ -531,6 +516,13 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
           {/* Dedup: content strings from worker_message events */}
           {events.map((evt, idx) => {
             const msg = adaptWorkerEvent(evt);
+            // Skip lifecycle events (worker_spawned, worker_status,
+            // worker_completed, worker_error) from filesystem polling.
+            // These come in real-time via WebSocket (incomingEvents) and
+            // should NOT be duplicated from the events.jsonl file.
+            if (msg && msg.is_worker_event) {
+              return null;
+            }
             // Dedup: skip tool_call/tool_result events if their content
             // matches content already shown in a worker_message (final response)
             if (msg && (evt.event === 'tool_result' || evt.event === 'tool_call')) {

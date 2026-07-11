@@ -35,7 +35,7 @@ function tokenWarningMsg(evt) {
   const message = resp.message || ''
   const tokenCount = resp.token_count
   let content = `${SYSTEM_NOTIFICATION_EMOJI} ${message}`
-  if (tokenCount !== undefined) {
+  if (tokenCount != null) {
     content += ` (Tokens: ${tokenCount})`
   }
   return {
@@ -223,7 +223,12 @@ export default function adaptWorkerEvent(evt) {
         is_system_notification: true,
       }
     }
-    // ── Worker lifecycle events (from WebSocket bridge) ────────────
+    // ── Worker lifecycle events (from WebSocket bridge ONLY) ────────────
+    // These events are published to the global_event_bus by worker.py and
+    // forwarded to the frontend via the bridge WebSocket. They are NOT
+    // fetched from events.jsonl filesystem polling — WorkerOutputPanel
+    // filters them out (msg.is_worker_event === true) from file fetches.
+    // All lifecycle handlers must set is_worker_event: true for this to work.
     case 'worker_spawned': {
       const sReq = evt.request || {}
       const sResp = evt.response || {}

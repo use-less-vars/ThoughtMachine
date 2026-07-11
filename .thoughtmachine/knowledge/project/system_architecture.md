@@ -3221,3 +3221,291 @@ WorkerThread iterates events, handles responses
 - Extend `_unsubscribe_worker_events` to also clean up per-worker bus subs
 
 **Step 4 — Test**: Verify imports work, verify subscriptions are created and cleaned up properly.
+
+## 2026-07-12 — 
+## Event Pipeline Architecture — Main Agent vs Worker Agent...
+
+
+## Event Pipeline Architecture — Main Agent vs Worker Agent — 2026-07-12
+
+### Status
+First audit complete. Covers web_ui/backend/bridge.py, agent/events.py, agent/core/agent.py, agent/core/worker_context.py, and frontend event routing.
+
+### Overview
+The system has **two completely separate event paths** that converge at the Bridge and are forwarded to the frontend over a single WebSocket. This section documents both paths end-to-end, compares them, and identifies gaps.
+
+---
+
+### Path 1: Main Agent (Standalone / Controller) → Frontend
+
+**Producer:** `agent/core/agent.py` — `process_query()` generator
+
+**Format:** Raw Python `dict` objects (no typed EventType enum, no EventBus)
+
+**Event types yielded (raw dicts):**
+- `'execution_state_change'` — agent state transitions
+- `'token_update'` — token count changes
+- `'turn'` — turn count changes
+- `'tool_call'` — tool call initiated (with tool name, args, call_id)
+- `'tool_result'` — tool result received (with content, call_id)
+- `'user_query'` — query received
+- `'final'` — final response produced
+- `'paused'` — agent paused (security prompt)
+- `'stopped'` — agent stopped
+- `'max_turns'` — max turns reached
+- `'error'` — error occurred
+- `'rate_limit_warning'` — rate limit warning
+- `'stop_reason'` — LLM stop reason
+- `'agent_responded'` — agent produced a response
+- `'session_stop'` — session stopped
+- `'security_prompt'` — security prompt triggered
+
+**Transport:** Generator iteration (synchronous, blocking)
+
+**Bridge handler:** Two paths:
+- **Mode A (Standalone):** `_run_loop()` thread (line ~1780) pulls from `_query_queue`, iterates `self._agent.process_query(query)`, calls `_map_and_emit()` for each dict
+- **Mode B (Controller):** `_on_controller_event()` callback (line ~1598) receives dicts from controller's agent, calls `_map_and_emit()`
+
+**Mapping function:** `_map_and_emit()` (line ~1643) transforms dict types → frontend protocol:
+| Raw dict type | Frontend event type | Data source |
+|---|---|---|
+| `execution_state_change` | `state_changed` | dict content |
+| `token_update` | `tokens_updated` + `context_updated` | dict content |
+| `turn` | `conversation_changed` | Session.user_history |
+| `tool_call` | `conversation_changed` | Session.user_history |
+| `tool_result` | `conversation_changed` | Session.user_history |
+| `user_query` | `conversation_changed` | Session.user_history |
+| `final` | `conversation_changed` | Session.user_history |
+| `token_warning` | `conversation_changed` | Session.user_history |
+| `turn_warning` | `conversation_changed` | Session.user_history |
+| `agent_responded` | `conversation_changed` + `state_changed` | Session.user_history + dict |
+| `error` | `status_message` + `conversation_changed` | dict + Session |
+| `session_stop` | `state_changed` | dict content |
+| `security_prompt` | `security_prompt` | dict content |
+
+**Key design choice:** Conversation events always re-read `Session.user_history` — never use event dict content for message data.
+
+**Frontend consumer:** `SessionTab.jsx` routes by event type:
+- `state_changed` → agent state machine
+- `tokens_updated` / `context_updated` → token/counters
+- `conversation_changed` → `setMessages()` → re-render
+- `status_message` → flash message
+- `security_prompt` → security dialog
+
+---
+
+### Path 2: Worker Agent → Frontend
+
+**Producer:** Worker tool executor code (`tools/workspace/worker.py` — not analyzed in this audit)
+
+**Format:** Typed EventBus events (EventType enum + typed event classes + .data + .metadata)
+
+**Event types published (typed):**
+- `WORKER_SPAWNED` — WorkerSpawnedEvent
+- `WORKER_STATUS` — WorkerStatusEvent
+- `WORKER_COMPLETED` — WorkerCompletedEvent
+- `WORKER_ERROR` — WorkerErrorEvent
+- `TOKEN_WARNING` — TokenWarningEvent
+- `WORKER_MESSAGE` — WorkerMessageEvent
+- `TOOL_CALL` — ToolCallEvent
+- `TOOL_RESULT` — ToolResultEvent
+- `ASSISTANT_MESSAGE` — AssistantMessageEvent
+- `SECURITY_PROMPT` — SecurityPromptEvent (potential)
+
+**Transport:** EventBus pub/sub (asynchronous, non-blocking)
+- Each worker publishes to its **per-worker EventBus** (keyed by `(session_id, worker_name)`)
+- Lifecycle events are also published to `global_event_bus`
+
+**Bridge subscriptions:**
+1. **Global EventBus** subscriptions (~line 662):
+   - `WORKER_SPAWNED` → `_on_worker_spawned()` — spawns per-worker bus subscription, forwards to frontend
+   - `WORKER_STATUS` → forward as `'worker:worker_status'`
+   - `WORKER_COMPLETED` → `_on_worker_completed()` — forward + cleanup
+   - `WORKER_ERROR` → `_on_worker_error()` — forward + cleanup
+   - `TOKEN_WARNING` → `_on_worker_token_warning()` — filter source starts with 'worker:', forward as `'worker:system_notification'`
+   - `WORKER_MESSAGE` → forward as `'worker:worker_message'`
+   - `SECURITY_PROMPT` → `_security_prompt_handler()` — forward as `'security_prompt'`
+
+2. **Per-worker EventBus** subscriptions (~line 730):
+   - `'tool_call'` → forward as `'worker:tool_call'`
+   - `'tool_result'` → forward as `'worker:tool_result'`
+   - `'token_warning'` → forward as `'worker:token_warning'`
+   - `'worker_message'` → forward as `'worker:worker_message'`
+   - `'assistant_message'` → forward as `'worker:assistant_message'`
+
+**Filtering:** Bridge only forwards events where `data.get('session_id')` matches `self._session_id`
+
+**Frontend consumer:**
+- `SessionTab.jsx` detects `'worker:*'` prefix → dispatches to WorkerOutputPanel
+- `WorkerOutputPanel.jsx` maintains worker state (running/completed/error), uses dual WebSocket + polling design
+- `adaptWorkerEvent.js` transforms raw worker data into frontend message format (handles worker_name, role, content extraction)
+- `MessageBubble.jsx` renders individual messages with role-based styling
+
+---
+
+### Comparison Table
+
+| Aspect | Main Agent Path | Worker Agent Path |
+|---|---|---|
+| **Event format** | Raw dicts | Typed EventBus (EventType enum) |
+| **Transport** | Generator iteration (sync) | EventBus pub/sub (async) |
+| **Producer** | `agent/core/agent.py` | Worker executor code |
+| **Bus used** | None | global_event_bus + per-worker bus |
+| **Context proxy events** | N/A | None (worker_context.py publishes nothing) |
+| **Bridge handling** | `_map_and_emit()` direct call | EventBus subscription callbacks |
+| **Conversation source** | Session.user_history | Event .data dict |
+| **Frontend routing** | By type name | 'worker:{type}' prefix |
+| **Message rendering** | SessionTab.jsx directly | WorkerOutputPanel.jsx → MessageBubble.jsx |
+
+---
+
+### Data Flow Diagram (ASCII)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        MAIN AGENT PATH                                  │
+│                                                                         │
+│  Agent (process_query)      Bridge._run_loop()       Frontend           │
+│  ┌─────────────────┐       ┌──────────────────┐     ┌──────────────┐   │
+│  │ yield dict       │──────>│ _map_and_emit()   │────>│ SessionTab   │   │
+│  │ {type, data, ...}│       │  dict → protocol  │     │ .jsx         │   │
+│  │                  │       │  _emit() → ws.send│     │ setMessages()│   │
+│  └─────────────────┘       └──────────────────┘     └──────────────┘   │
+│         │                                                               │
+│         │ Session.user_history (reads back)                             │
+│         ▼                                                               │
+│  ┌─────────────────┐                                                    │
+│  │ Session          │                                                    │
+│  │ (mutated in-     │                                                    │
+│  │  place by agent) │                                                    │
+│  └─────────────────┘                                                    │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        WORKER AGENT PATH                                │
+│                                                                         │
+│  Worker Executor      EventBus              Bridge Subscriptions       │
+│  ┌────────────────┐   ┌──────────┐         ┌────────────────────┐      │
+│  │ publish(        │──>│ per-     │────────>│ _on_worker_spawned │      │
+│  │  WORKER_SPAWNED │   │ worker   │         │ _on_worker_completed│     │
+│  │  )              │   │ bus      │         │ _on_worker_error   │      │
+│  └────────────────┘   └──────────┘         │ _on_token_warning  │      │
+│         │                                   └────────┬───────────┘      │
+│         │                                    ┌───────┴────────────┐     │
+│         └────────────────────────────────────> _emit() → ws.send   │     │
+│                                     worker:   │ 'worker:{type}'    │     │
+│                                               └───────┬────────────┘     │
+│                                                       │                  │
+│                                                       ▼                  │
+│                                               ┌──────────────────┐      │
+│                                               │ Frontend:         │      │
+│                                               │ SessionTab detects│      │
+│                                               │ worker:* prefix   │      │
+│                                               │ → dispatches to   │      │
+│                                               │ WorkerOutputPanel │      │
+│                                               │ → MessageBubble   │      │
+│                                               └──────────────────┘      │
+│                                                                         │
+│  Global EventBus (lifecycle only)                                       │
+│  ┌──────────────────────────────┐                                       │
+│  │ WORKER_SPAWNED, COMPLETED,   │                                       │
+│  │ ERROR, TOKEN_WARNING         │                                       │
+│  └──────────────────────────────┘                                       │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    PROCESS_QUERY YIELDS (raw dicts)                      │
+│                                                                         │
+│  {'type': 'execution_state_change', 'state': 'thinking'}                │
+│  {'type': 'token_update', ...}                                          │
+│  {'type': 'turn', 'turn': 1}                                            │
+│  {'type': 'tool_call', 'name': 'ReadFile', ...}                         │
+│  {'type': 'tool_result', 'name': 'ReadFile', ...}                       │
+│  {'type': 'final', 'content': '...'}                                    │
+│  ...                                                                     │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    EVENTBUS EVENT TYPES (typed)                          │
+│                                                                         │
+│  EventType.WORKER_SPAWNED → WorkerSpawnedEvent                          │
+│  EventType.WORKER_STATUS → WorkerStatusEvent                            │
+│  EventType.WORKER_COMPLETED → WorkerCompletedEvent                      │
+│  EventType.WORKER_ERROR → WorkerErrorEvent                              │
+│  EventType.TOKEN_WARNING → TokenWarningEvent                            │
+│  EventType.WORKER_MESSAGE → WorkerMessageEvent                          │
+│  EventType.TOOL_CALL → ToolCallEvent                                    │
+│  EventType.TOOL_RESULT → ToolResultEvent                                │
+│  EventType.ASSISTANT_MESSAGE → AssistantMessageEvent                    │
+│  EventType.SECURITY_PROMPT → SecurityPromptEvent                        │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│              BRIDGE MAPPING (raw dict → frontend protocol)               │
+│                                                                         │
+│  execution_state_change → state_changed                                 │
+│  token_update → tokens_updated + context_updated                        │
+│  turn / tool_call / tool_result /                                       │
+│  user_query / final → conversation_changed (from Session)              │
+│  agent_responded → conversation_changed + state_changed                 │
+│  error → status_message + conversation_changed                          │
+│  session_stop → state_changed                                           │
+│  security_prompt → security_prompt (pass-through)                       │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│              FRONTEND EVENT ROUTING (SessionTab.jsx)                     │
+│                                                                         │
+│  state_changed → updateAgentState(state)                                │
+│  tokens_updated → updateTokenCounters(data)                             │
+│  context_updated → updateContextLength(data)                            │
+│  conversation_changed → setMessages(session.user_history)               │
+│  status_message → showFlash(message, type)                              │
+│  worker:* → handler → WorkerOutputPanel                                 │
+│  security_prompt → showSecurityDialog()                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Gaps, Inconsistencies & Improvement Areas
+
+#### 1. Dual Event Protocol
+**Problem:** Main agent uses raw dicts; workers use typed EventBus events. Two different protocols must be maintained and understood.
+**Risk:** New developers must learn both systems. The mapping code in `_map_and_emit()` is the only bridge between raw dict format and frontend protocol.
+**Suggestion:** Consider migrating main agent events to use EventBus for consistency. This would require adding EventType values for main agent events and changing `process_query()` to publish typed events instead of yielding dicts.
+
+#### 2. Conversation Source Inconsistency
+**Problem:** Main agent conversation events read from `Session.user_history` (re-read on every event). Worker conversation events carry message data inline in the event dict.
+**Risk:** If `Session.user_history` is out of sync or delayed, the frontend may show stale data for main agent events. Worker events bypass Session entirely for message content.
+**Suggestion:** Align approaches — either have all events carry inline message content, or have all events reference Session. The former is more robust for real-time updates.
+
+#### 3. No Typed Events for Main Agent
+**Problem:** Main agent events are untyped dicts with string 'type' keys. No schema validation, no metadata, no source tracking.
+**Risk:** A typo in a dict key ('execution_state' vs 'execution_state_change') would silently fail to propagate to frontend.
+**Suggestion:** Define a `MainAgentEvent` TypedDict or use the EventBus Event base class for main agent events.
+
+#### 4. Potential Duplicate Events from Dual Bus Subscriptions
+**Problem:** The bridge subscribes to both global_event_bus (for lifecycle events like WORKER_COMPLETED) and per-worker buses (for detail events). If a lifecycle event is published to both buses, the bridge could receive and forward it twice.
+**Risk:** Duplicate events on the frontend (e.g., two "worker completed" messages).
+**Suggestion:** Audit whether lifecycle events are published to both buses. If so, either deduplicate at the bridge or ensure each bus has exclusive event types.
+
+#### 5. Worker Context Proxy publishes No Events
+**Problem:** `worker_context.py` is a lightweight Session proxy that does not publish events. The worker tool executor code (`tools/workspace/worker.py`) is responsible for publishing. This separation is undocumented.
+**Risk:** If someone modifies worker_context.py to add event publishing, they might produce duplicate events (or miss events they expect).
+**Suggestion:** Document the responsibility split clearly, or move event publishing into the context proxy for consistency.
+
+#### 6. Session as Single Source of Truth vs Event Stream
+**Problem:** The main agent path fundamentally relies on Session.user_history as the authoritative conversation store. The event stream is a side effect of Session mutations. This creates a hidden dependency — the frontend doesn't "follow events" for conversation; it re-reads the Session.
+**Risk:** If the event stream is processed faster than Session writes, the frontend could see stale data. Currently this is unlikely because the generator is synchronous, but if async is introduced, timing bugs could appear.
+**Suggestion:** Add explicit synchronization or switch to event-carried message data for conversation updates.
+
+#### 7. Security Prompt Event Path Ambiguity
+**Problem:** The main agent's `process_query()` can yield `'security_prompt'` as a raw dict (handled by `_map_and_emit`). The docstring also mentions SecurityPromptEvent from global_event_bus. It's unclear if both paths are active or if one is dead.
+**Suggestion:** Audit whether the tool executor publishes SecurityPromptEvent to EventBus. If not, remove the EventBus subscription or add the publishing logic.
+
+#### 8. Frontend Dual-Channel for Workers
+**Problem:** WorkerOutputPanel.jsx uses both WebSocket (event-driven) and polling (HTTP GET) for worker output. The polling path is a fallback, but its purpose and trigger conditions are not well-documented.
+**Risk:** If WebSocket events are lost, polling may show stale data. If both paths deliver the same data, the frontend may show duplicates.
+**Suggestion:** Document when polling is activated and ensure deduplication logic exists.
+

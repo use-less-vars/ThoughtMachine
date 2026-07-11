@@ -885,11 +885,44 @@ class WorkerThread(threading.Thread):
                 self.status = "busy"
                 self._write_status_file()
                 self._publish_event('worker_status', {'status': 'busy', 'current_task': self.current_task})
+                # Also publish to global_event_bus so the bridge receives it
+                if global_event_bus is not None and EventType is not None and create_event is not None:
+                    try:
+                        evt = create_event(
+                            EventType.WORKER_STATUS,
+                            data={
+                                "session_id": self.session_id or "",
+                                "worker_name": self.worker_name,
+                                "status": "busy",
+                                "current_task": self.current_task,
+                            },
+                            source=f"worker:{self.worker_name}",
+                            session_id=self.session_id or "",
+                        )
+                        global_event_bus.publish(evt)
+                    except Exception:
+                        pass
                 reply = self._run_tool_loop(query)
                 # Back to ready after query completes
                 self.status = "ready"
                 self._write_status_file()
                 self._publish_event('worker_status', {'status': 'ready'})
+                # Also publish to global_event_bus so the bridge receives it
+                if global_event_bus is not None and EventType is not None and create_event is not None:
+                    try:
+                        evt = create_event(
+                            EventType.WORKER_STATUS,
+                            data={
+                                "session_id": self.session_id or "",
+                                "worker_name": self.worker_name,
+                                "status": "ready",
+                            },
+                            source=f"worker:{self.worker_name}",
+                            session_id=self.session_id or "",
+                        )
+                        global_event_bus.publish(evt)
+                    except Exception:
+                        pass
 
                 self.current_task = None
                 self.last_heartbeat = datetime.now(timezone.utc).isoformat()
@@ -918,11 +951,43 @@ class WorkerThread(threading.Thread):
                 pass
             self._log_event("error", {}, {"error": str(exc)})
             self._publish_event('worker_error', {'error': str(exc)})
+            # Also publish to global_event_bus so the bridge receives it
+            if global_event_bus is not None and EventType is not None and create_event is not None:
+                try:
+                    evt = create_event(
+                        EventType.WORKER_ERROR,
+                        data={
+                            "session_id": self.session_id or "",
+                            "worker_name": self.worker_name,
+                            "error": str(exc),
+                        },
+                        source=f"worker:{self.worker_name}",
+                        session_id=self.session_id or "",
+                    )
+                    global_event_bus.publish(evt)
+                except Exception:
+                    pass
         else:
             self.status = "completed"
             self._write_status_file()
             self._log_event("completed", {}, {})
             self._publish_event('worker_completed', {'status': 'completed'})
+            # Also publish to global_event_bus so the bridge receives it
+            if global_event_bus is not None and EventType is not None and create_event is not None:
+                try:
+                    evt = create_event(
+                        EventType.WORKER_COMPLETED,
+                        data={
+                            "session_id": self.session_id or "",
+                            "worker_name": self.worker_name,
+                            "status": "completed",
+                        },
+                        source=f"worker:{self.worker_name}",
+                        session_id=self.session_id or "",
+                    )
+                    global_event_bus.publish(evt)
+                except Exception:
+                    pass
         finally:
             try:
                 unregister_worker_event_bus(self.session_id or "", self.worker_name)

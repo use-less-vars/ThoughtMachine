@@ -492,8 +492,11 @@ class WebAgentBridge:
                             f'Failed to forward worker bus event: {exc}')
             return _handler
 
-        # Subscribe to detailed event types on the per-worker bus
-        for evt_type in ['tool_call', 'tool_result', 'token_warning',
+        # Subscribe to detailed event types on the per-worker bus.
+        # Note: 'token_warning' is NOT subscribed here because it is already
+        # handled via the global_event_bus subscription (_on_worker_token_warning)
+        # to avoid duplicate forwarding.
+        for evt_type in ['tool_call', 'tool_result',
                          'worker_message', 'assistant_message']:
             try:
                 evt_enum = EventType(evt_type)
