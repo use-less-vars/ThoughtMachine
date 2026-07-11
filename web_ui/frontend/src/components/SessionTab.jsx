@@ -49,7 +49,7 @@ const INITIAL_STATE = {
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
-function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onSessionSaved, onRegister, onRunningChange, onSessionRenamed, selectedWorker, onSelectWorker, activeSessionId, onClearWorker, onWorkerEvent }) {
+function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onRunningChange, onSessionRenamed, selectedWorker, onSelectWorker, activeSessionId, onClearWorker, onWorkerEvent }) {
   const [state, setState] = useState(INITIAL_STATE)
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
   const currentSessionIdRef = useRef(currentSessionId)
@@ -431,22 +431,25 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         break
 
       case 'session_loaded':
-        // Debug: log the full message payload to see what backend sends
         dataReceivedRef.current = true;
-        // Track the session ID so subsequent continue_session calls use it
-        if (msg.session_id) {
-          setCurrentSessionId(msg.session_id)
-        }
-        // Capture workspace_id for the WorkspacePanel.
-        // Only set when the backend sends a real workspace_id; otherwise
-        // workspaceId stays null and WorkspacePanel shows its graceful
-        // "No workspace loaded" message.
         if (msg.workspace_id) {
           update({ workspaceId: msg.workspace_id })
         }
-        // If this is a new session (tab had no sessionId), notify parent
-        if (msg.session_id && !sessionId) {
-          onNewSession?.(msg.session_id, msg.session_name)
+        if (msg.session_id) {
+          if (sessionId && sessionId !== msg.session_id) {
+            // Tab already has a different session → this is a workspace switch
+            // that created a new session. Notify parent to open a new tab for it,
+            // while keeping this tab pointing to the original session.
+            console.log('[SessionTab] session_loaded for DIFFERENT session, opening new tab:', msg.session_id)
+            onOpenNewTab?.(msg.session_id, msg.session_name)
+          } else {
+            // Fresh tab (no sessionId yet) → update currentSessionId
+            setCurrentSessionId(msg.session_id)
+            // Notify parent that this tab now has a real sessionId
+            if (!sessionId) {
+              onNewSession?.(msg.session_id, msg.session_name)
+            }
+          }
         }
         break
 
@@ -510,6 +513,8 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
       case 'worker:worker_status':
       case 'worker:worker_completed':
       case 'worker:worker_error':
+      case 'worker:system_notification':
+      case 'worker:worker_message':
         // Use refs to avoid stale closure (connectSessionWs has [] deps)
         if (onWorkerEventRef.current && currentSessionIdRef.current) {
           onWorkerEventRef.current(currentSessionIdRef.current, msg)

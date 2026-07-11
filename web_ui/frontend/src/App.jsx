@@ -459,6 +459,17 @@ export default function App() {
     }
   }, [])
 
+  const handleOpenNewTab = useCallback((sessionId, sessionName) => {
+    // Called by SessionTab when a workspace switch creates a NEW session
+    // while the existing tab keeps the old session. Opens a fresh tab.
+    console.log('[App] handleOpenNewTab: opening new tab for', sessionId)
+    loadTab(sessionId)
+    // Refresh sessions list so the new session appears in the sidebar
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ command: 'list_sessions' }))
+    }
+  }, [loadTab])
+
   // ── Tab selection handler with deferred-load trigger ─────────────────
   const handleSelectTab = useCallback((tabId) => {
     console.log(`[DEBUG App.handleSelectTab] tabId=${tabId}, tabs=`, tabsRef.current.map(t => t.tabId),
@@ -634,6 +645,7 @@ export default function App() {
                   loadOnConnect={tab.sessionId === startupActiveSessionId || tab.tabId === activeTabId}
                   onClose={() => removeTab(tab.tabId)}
                   onNewSession={handleNewSessionCreated}
+                  onOpenNewTab={handleOpenNewTab}
                   onSessionSaved={handleSessionSaved}
                   onRegister={(actions) => handleRegisterTab(tab.tabId, actions)}
                   onRunningChange={handleRunningChange}
