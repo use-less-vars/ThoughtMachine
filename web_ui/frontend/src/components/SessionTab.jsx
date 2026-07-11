@@ -49,7 +49,7 @@ const INITIAL_STATE = {
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
-function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onRunningChange, onSessionRenamed, selectedWorker, onSelectWorker, activeSessionId, onClearWorker, onWorkerEvent }) {
+function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onRunningChange, onSessionRenamed, selectedWorker, onSelectWorker, activeSessionId, onClearWorker, onWorkerEvent, onLoggingConfigChanged }) {
   const [state, setState] = useState(INITIAL_STATE)
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
   const currentSessionIdRef = useRef(currentSessionId)
@@ -194,6 +194,8 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   loadOnConnectRef.current = loadOnConnect
   const onWorkerEventRef = useRef(onWorkerEvent)
   onWorkerEventRef.current = onWorkerEvent
+  const onLoggingConfigChangedRef = useRef(onLoggingConfigChanged)
+  onLoggingConfigChangedRef.current = onLoggingConfigChanged
 
   const connectSessionWs = useCallback(() => {
     // Guard: prevent duplicate connections from StrictMode double-mount
@@ -521,6 +523,12 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         }
         break
 
+      case 'logging_config_changed':
+        if (onLoggingConfigChangedRef.current) {
+          onLoggingConfigChangedRef.current(msg.config)
+        }
+        break
+
       default:
         console.warn('[SessionTab] Unknown event type:', msg.type)
     }
@@ -648,6 +656,7 @@ export default React.memo(SessionTab, (prevProps, nextProps) => {
     prevProps.loadOnConnect === nextProps.loadOnConnect &&
     prevProps.isActive === nextProps.isActive &&
     prevProps.selectedWorker?.name === nextProps.selectedWorker?.name &&
-    prevProps.selectedWorker?.workspaceId === nextProps.selectedWorker?.workspaceId
+    prevProps.selectedWorker?.workspaceId === nextProps.selectedWorker?.workspaceId &&
+    prevProps.onLoggingConfigChanged === nextProps.onLoggingConfigChanged
   )
 })

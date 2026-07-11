@@ -158,6 +158,15 @@ def _broadcast_rename(session_id: str, new_name: str) -> None:
             pass
 
 
+def _broadcast_logging_config(config: Dict[str, Any]) -> None:
+    """Emit a logging_config_changed event to every active tab bridge."""
+    for b in list(_active_tab_bridges):
+        try:
+            b._emit({"type": "logging_config_changed", "config": config})
+        except Exception:
+            pass
+
+
 class WebAgentBridge:
     """
     Thread‑safe bridge that runs one Agent session and emits events through
@@ -332,18 +341,16 @@ class WebAgentBridge:
 
     def _on_worker_token_warning(self, event: TokenWarningEvent) -> None:
         """Forward worker token warnings to the frontend."""
-
         if not self._event_callbacks:
             return
         source = event.metadata.source if event.metadata else ""
         if not source.startswith("worker:"):
-
             return  # only handle worker-sourced warnings
         data = event.data or {}
         # Only forward events for this bridge's session
         if data.get('session_id') and data['session_id'] != self._session_id:
-
             return
+        log('DEBUG', 'core.token', f"Bridge forward: worker={event.data.get('worker_name','?') if event.data else '?'} tokens={event.data.get('token_count','?') if event.data else '?'}")
         event_dict = {
             'type': 'worker:system_notification',
             'worker_name': data.get('worker_name', ''),
@@ -409,6 +416,11 @@ class WebAgentBridge:
     def broadcast_rename(session_id: str, new_name: str) -> None:
         """Update in-memory state on all bridges holding this session."""
         _broadcast_rename(session_id, new_name)
+
+    @staticmethod
+    def broadcast_logging_config(config: Dict[str, Any]) -> None:
+        """Broadcast a logging config change to all active tab bridges."""
+        _broadcast_logging_config(config)
 
 
     # ── Public API ──────────────────────────────────────────────────────────

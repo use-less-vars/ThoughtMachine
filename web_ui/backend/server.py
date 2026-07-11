@@ -124,6 +124,7 @@ def _get_session_store() -> FileSystemSessionStore:
 
 from web_ui.backend.workspace_routes import router as workspace_router
 from web_ui.backend.config_routes import router as config_router
+from web_ui.backend.logging_routes import router as logging_router
 
 # Ensure project root is on sys.path
 _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1687,9 +1688,10 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── Register workspace REST router ────────────────────────────────────────
+# ── Register REST routers ────────────────────────────────────────────────
 app.include_router(workspace_router)
 app.include_router(config_router)
+app.include_router(logging_router)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
