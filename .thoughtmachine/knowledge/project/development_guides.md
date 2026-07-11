@@ -870,3 +870,41 @@ Every new event type must be added to every layer of the pipeline. Missing any s
 
 **mcp_examples/:** test_client.py(217L, 6 funcs), test_with_agent_mcp_client.py(74L)
 
+
+## 2026-07-10 — ## Test Infrastructure Summary
+- **44 test files** total (43...
+
+## Test Infrastructure Summary
+- **44 test files** total (43 Python + 1 JavaScript)
+- **~486 tests** total (~414 Python + ~72 JavaScript)
+- **Runner:** pytest (no config section in pyproject.toml) + vitest (frontend)
+- **conftest.py:** 3 files (docker_integration, security, web_ui/backend)
+- **Test commands:** `python -m pytest` | `cd web_ui/frontend && npm test`
+- **Top files by test count:** test_history_pruner.py (45), test_worker_agent_transplant.py (30), test_worker_loop_spike.py (29), test_permissions_roundtrip.py (25), test_security_coercion.py (20)
+- **Full report:** TEST_INFRASTRUCTURE_REPORT.md
+
+## Worker Tool Usage Rules
+
+## 2026-07-10 — ## Worker Tool Usage Rules (Critical)
+
+**NEVER use `spawn` w...
+
+## Worker Tool Usage Rules (Critical)
+
+**NEVER use `spawn` with `context={"query": "..."}` for follow-up tasks.** Doing so **deletes the worker's `context.json`** and creates a **fresh agent with an empty conversation**, losing all prior context.
+
+### Correct pattern:
+1. **`spawn`**: Use ONCE to start the worker with `context={"query": "initial task"}`. This creates the worker thread + agent + conversation.
+2. **`query`**: Use for ALL follow-up tasks by passing `worker_query="follow-up message"`. This preserves the existing Agent, WorkerContext, and all conversation history.
+3. **`force=True`**: Only use when the worker is genuinely stuck/hanging (stale from another session). **Never use `force=True` for routine continuation** — it kills the existing worker and starts fresh.
+
+### Why:
+- `spawn` with context deletes old `context.json` → fresh `WorkerContext` → empty conversation
+- `query` reuses the existing Agent → conversation history preserved
+- The worker thread stays alive after completing a task, waiting on `_input_queue` for the next query
+
+### How to check worker state before acting:
+- `check` returns `current_context_tokens` and `status`
+- If `status="ready"` and `alive=True`, the worker is ready for a follow-up `query`
+- If `status="stopped"` or `alive=False`, need to `spawn` fresh
+
