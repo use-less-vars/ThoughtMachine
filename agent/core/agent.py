@@ -346,10 +346,13 @@ class Agent:
         if new_config.enabled_tools != old_config.enabled_tools:
             self.tool_classes = new_config.get_filtered_tool_classes()
             self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
+            # Preserve event bus from old executor before closing
+            event_bus = self.tool_executor._event_bus if self.tool_executor else None
             self.tool_executor.close()
             self.tool_executor = ToolExecutor(
                 self.tool_classes, new_config, None, self.logger,
                 self.security_available, agent=self,
+                event_bus=event_bus or global_event_bus,
                 is_worker_context=new_config.worker_mode,
             )
             self.tool_executor.state = self.state
@@ -418,6 +421,8 @@ class Agent:
         old_config = getattr(self, 'config', None)
         old_llm_client = getattr(self, 'llm_client', None)
         old_tool_executor = getattr(self, 'tool_executor', None)
+        # Capture event bus from old executor before closing
+        old_event_bus = old_tool_executor._event_bus if old_tool_executor else None
 
         try:
             # Preserve conversation and token state BEFORE closing
@@ -450,7 +455,7 @@ class Agent:
             # Rebuild tool_classes and tool_definitions
             self.tool_classes = new_config.get_filtered_tool_classes()
             self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
-            self.tool_executor = ToolExecutor(self.tool_classes, new_config, self.state, old_logger, self.security_available, agent=self, is_worker_context=new_config.worker_mode)
+            self.tool_executor = ToolExecutor(self.tool_classes, new_config, self.state, old_logger, self.security_available, agent=self, event_bus=old_event_bus or global_event_bus, is_worker_context=new_config.worker_mode)
 
             # Rebuild context builder
             self.context_builder = self.llm_client.create_context_builder()

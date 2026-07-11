@@ -497,8 +497,9 @@ class WebAgentBridge:
                          'worker_message', 'assistant_message']:
             try:
                 evt_enum = EventType(evt_type)
-                sub = worker_bus.subscribe(evt_enum, _make_bus_handler(evt_type))
-                subs[evt_enum] = sub
+                handler_fn = _make_bus_handler(evt_type)
+                worker_bus.subscribe(evt_enum, handler_fn)
+                subs[evt_enum] = (evt_enum, handler_fn)
             except (ValueError, Exception) as exc:
                 log('DEBUG', 'server.bridge',
                     f'Could not subscribe to {evt_type} for {worker_name}: {exc}')
@@ -512,12 +513,12 @@ class WebAgentBridge:
         subs = self._worker_bus_subs.pop(worker_name, {})
         if not subs:
             return
-        for evt_type, sub_handle in subs.items():
+        for evt_type_key, (stored_evt_type, callback_fn) in subs.items():
             try:
                 if WORKER_BUS_AVAILABLE and get_worker_event_bus is not None:
                     worker_bus = get_worker_event_bus(self._session_id or '', worker_name)
                     if worker_bus is not None and hasattr(worker_bus, 'unsubscribe'):
-                        worker_bus.unsubscribe(sub_handle)
+                        worker_bus.unsubscribe(stored_evt_type, callback_fn)
             except Exception:
                 pass
         log('INFO', 'server.bridge',

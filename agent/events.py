@@ -66,6 +66,7 @@ class EventType(enum.Enum):
     WORKER_COMPLETED = 'worker_completed'
     WORKER_ERROR = 'worker_error'
     WORKER_MESSAGE = 'worker_message'
+    ASSISTANT_MESSAGE = 'assistant_message'
 
 
 class EventMetadata(BaseModel):
@@ -290,6 +291,28 @@ class WorkerCompletedEvent(BaseEvent):
             raise ValueError("WorkerCompletedEvent requires 'worker_name' in data")
         return v
 
+class WorkerMessageEvent(BaseEvent):
+    """Worker message event."""
+    type: EventType = Field(default=EventType.WORKER_MESSAGE)
+
+    @validator('data')
+    def validate_data(cls, v):
+        if 'worker_name' not in v:
+            raise ValueError("WorkerMessageEvent requires 'worker_name' in data")
+        return v
+
+
+class AssistantMessageEvent(BaseEvent):
+    """Assistant message from a worker."""
+    type: EventType = Field(default=EventType.ASSISTANT_MESSAGE)
+
+    @validator('data')
+    def validate_data(cls, v):
+        if 'worker_name' not in v:
+            raise ValueError("AssistantMessageEvent requires 'worker_name' in data")
+        return v
+
+
 class WorkerErrorEvent(BaseEvent):
     """Worker encountered an error."""
     type: EventType = Field(default=EventType.WORKER_ERROR)
@@ -310,7 +333,7 @@ def create_event(event_type: Union[EventType, str], data: Dict[str, Any], source
         except ValueError:
             event_type = _map_legacy_event_type(event_type)
     metadata = EventMetadata(source=source, session_id=session_id, turn=turn)
-    event_class_map = {EventType.AGENT_START: AgentStartEvent, EventType.AGENT_END: AgentEndEvent, EventType.TOOL_CALL: ToolCallEvent, EventType.TOOL_RESULT: ToolResultEvent, EventType.TOKEN_WARNING: TokenWarningEvent, EventType.TURN_WARNING: TurnWarningEvent, EventType.ERROR: ErrorEvent, EventType.TURN: TurnEvent, EventType.CAPABILITY_CHECK: BaseEvent, EventType.SECURITY_PROMPT: SecurityPromptEvent, EventType.SECURITY_RESPONSE: SecurityResponseEvent, EventType.FINAL: BaseEvent, EventType.MAX_TURNS: BaseEvent, EventType.STOPPED: BaseEvent, EventType.PAUSED: BaseEvent, EventType.THREAD_FINISHED: BaseEvent, EventType.USER_INTERACTION_REQUESTED: BaseEvent, EventType.RATE_LIMIT_WARNING: BaseEvent, EventType.TOKEN_UPDATE: BaseEvent, EventType.EXECUTION_STATE_CHANGE: BaseEvent, EventType.SESSION_STATE_CHANGE: BaseEvent, EventType.WORKER_SPAWNED: WorkerSpawnedEvent, EventType.WORKER_STATUS: WorkerStatusEvent, EventType.WORKER_COMPLETED: WorkerCompletedEvent, EventType.WORKER_ERROR: WorkerErrorEvent}
+    event_class_map = {EventType.AGENT_START: AgentStartEvent, EventType.AGENT_END: AgentEndEvent, EventType.TOOL_CALL: ToolCallEvent, EventType.TOOL_RESULT: ToolResultEvent, EventType.TOKEN_WARNING: TokenWarningEvent, EventType.TURN_WARNING: TurnWarningEvent, EventType.ERROR: ErrorEvent, EventType.TURN: TurnEvent, EventType.CAPABILITY_CHECK: BaseEvent, EventType.SECURITY_PROMPT: SecurityPromptEvent, EventType.SECURITY_RESPONSE: SecurityResponseEvent, EventType.FINAL: BaseEvent, EventType.MAX_TURNS: BaseEvent, EventType.STOPPED: BaseEvent, EventType.PAUSED: BaseEvent, EventType.THREAD_FINISHED: BaseEvent, EventType.USER_INTERACTION_REQUESTED: BaseEvent, EventType.RATE_LIMIT_WARNING: BaseEvent, EventType.TOKEN_UPDATE: BaseEvent, EventType.EXECUTION_STATE_CHANGE: BaseEvent, EventType.SESSION_STATE_CHANGE: BaseEvent, EventType.WORKER_SPAWNED: WorkerSpawnedEvent, EventType.WORKER_STATUS: WorkerStatusEvent, EventType.WORKER_COMPLETED: WorkerCompletedEvent, EventType.WORKER_ERROR: WorkerErrorEvent, EventType.WORKER_MESSAGE: WorkerMessageEvent, EventType.ASSISTANT_MESSAGE: AssistantMessageEvent}
     event_class = event_class_map.get(event_type, BaseEvent)
     return event_class(type=event_type, metadata=metadata, data=data)
 
