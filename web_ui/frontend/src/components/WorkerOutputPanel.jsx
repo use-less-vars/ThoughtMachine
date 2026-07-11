@@ -234,12 +234,66 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
       const existingKeys = new Set(prev.map(e => e.event + (e.timestamp || '')))
       const newOnes = relevantEvents
         .filter(e => !existingKeys.has((e.type?.replace('worker:', '') || '') + (e.timestamp || '')))
-        .map(e => ({
-          event: e.type?.replace('worker:', '') || 'unknown',
-          timestamp: e.timestamp,
-          request: e.request || {},
-          response: e.response || e.data || { error: e.error, status: e.status, worker_name: e.worker_name },
-        }))
+        .map(e => {
+          const eventType = e.type?.replace('worker:', '') || 'unknown'
+          let request = e.request || {}
+          let response = e.response || {}
+
+          switch (eventType) {
+            case 'tool_call': {
+              const data = e.data || {}
+              let args = {}
+              try {
+                if (data.arguments) {
+                  args = typeof data.arguments === 'string' ? JSON.parse(data.arguments) : data.arguments
+                }
+              } catch (_) { /* ignore parse errors */ }
+              request = { tool: data.tool_name || 'unknown', args }
+              break
+            }
+            case 'tool_result': {
+              const data = e.data || {}
+              request = { tool: data.tool_name || 'unknown', success: data.success !== false }
+              response = { result: data.result || '' }
+              break
+            }
+            case 'assistant_message': {
+              const data = e.data || {}
+              // Map to worker_message since adaptWorkerEvent handles that case
+              response = { content: data.content || '', reasoning_content: data.reasoning_content || undefined }
+              return {
+                event: 'worker_message',
+                timestamp: e.timestamp,
+                request: {},
+                response,
+              }
+            }
+            case 'token_warning': {
+              const data = e.data || {}
+              response = { type: 'token_warning', message: data.warning_message || '', token_count: data.token_count }
+              return {
+                event: 'system_notification',
+                timestamp: e.timestamp,
+                request: {},
+                response,
+              }
+            }
+            default:
+              // For lifecycle events (worker_spawned, worker_status, etc.), keep existing behavior
+              if (!e.request && !e.response) {
+                request = {}
+                response = e.data || { error: e.error, status: e.status, worker_name: e.worker_name }
+              }
+              break
+          }
+
+          return {
+            event: eventType,
+            timestamp: e.timestamp,
+            request,
+            response,
+          }
+        })
       if (newOnes.length === 0) return prev
       const updated = [...prev, ...newOnes]
       eventsRef.current = updated

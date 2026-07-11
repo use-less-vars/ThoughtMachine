@@ -510,7 +510,11 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         })
         break
 
-      // ── Worker lifecycle events (real-time from bridge) ──
+      // ── Worker lifecycle events + per-worker bus events (real-time from bridge) ──
+      case 'worker:tool_call':
+      case 'worker:tool_result':
+      case 'worker:token_warning':
+      case 'worker:assistant_message':
       case 'worker:worker_spawned':
       case 'worker:worker_status':
       case 'worker:worker_completed':
