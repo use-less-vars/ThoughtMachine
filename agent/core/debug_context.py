@@ -10,7 +10,7 @@ PAUSE_DEBUG = os.environ.get('PAUSE_DEBUG') == '1'
 
 def pause_debug(msg):
     if PAUSE_DEBUG:
-        log('WARNING', 'core.pause_debug', f'{msg}')
+        pass
 
 class DebugContext:
     """Debug helper for context monitoring."""

@@ -517,8 +517,7 @@ class DockerExecutor:
         if os.path.isdir(git_path):
             tmpfs["/workspace/.git"] = ""
         else:
-            log("DEBUG", "docker.filesystem",
-                f".git is not a directory ({'file' if os.path.isfile(git_path) else 'absent'}), skipping tmpfs mask")
+            pass
 
         log('INFO', 'tools.docker_executor.container',
             f"AUDIT: Creating container with network={network_mode}, mode={workspace_mode}, tmpfs={tmpfs}")

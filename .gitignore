@@ -99,3 +99,18 @@ output_panel_phase1.py
 
 dummy_data/
 tmp_packages/
+
+# Temporary analysis scripts and artifacts
+FINAL_SUMMARY.md
+PROJECT_ANALYSIS.md
+TEST_INFRASTRUCTURE_REPORT.md
+_run_git_cmds.py
+_runner.py
+check_syntax.py
+count_with_delay.py
+run_git_commands.py
+hello_worker_demo.txt
+worker_live_test.txt
+
+# Workspace auto-generated files
+.thoughtmachine/workers.json

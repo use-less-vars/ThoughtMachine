@@ -124,9 +124,8 @@ class Agent:
         else:
             self._token_counts = {'input': 0, 'output': 0}
         self.conversation = self.llm_client.ensure_system_prompt(self.conversation)
-        log('DEBUG', 'core.context_builder', f'Agent init: session is None={session is None}')
         self.context_builder = self.llm_client.create_context_builder()
-        log('DEBUG', 'core.context_builder', f'Agent init: context_builder created, is None={self.context_builder is None}')
+        log('DEBUG', 'core.context_builder', f'Agent init: session is None={session is None}, cb is None={self.context_builder is None}')
         if self.context_builder:
             self.conversation_manager.context_builder = self.context_builder
         self.stop_check = config.stop_check
@@ -160,7 +159,7 @@ class Agent:
             new_config: New AgentConfig to apply.
         """
         self._pending_config = new_config
-        log('DEBUG', 'agent.core', f'Pending config update queued: provider={new_config.provider_type}, model={new_config.model}')
+        log('DEBUG', 'core.agent', f'Pending config update queued: provider={new_config.provider_type}, model={new_config.model}')
 
     def _apply_pending_config(self) -> bool:
         """Apply pending configuration update if one exists.
@@ -187,7 +186,7 @@ class Agent:
         # Prevents spurious "config updated" notifications on every query
         # when the frontend re-sends an identical config.
         if self._configs_are_identical(old_config, new_config):
-            log('DEBUG', 'agent.core',
+            log('DEBUG', 'core.agent',
                 f'Skipping no-op config update: pending config is identical '
                 f'to current config (provider={new_config.provider_type}, '
                 f'model={new_config.model})')
@@ -203,7 +202,7 @@ class Agent:
 
             # Validate that the new config has an API key available before attempting restart
             if not self._has_api_key(new_config):
-                log('WARNING', 'agent.core', f'Cannot restart with provider {new_config.provider_type}: '
+                log('WARNING', 'core.agent', f'Cannot restart with provider {new_config.provider_type}: '
                     f'no API key available. Set {new_config.provider_type.upper()}_API_KEY '
                     f'environment variable or provide api_key in config.')
                 log('WARNING', 'core.config',
@@ -246,7 +245,7 @@ class Agent:
                 new_val = None
 
             if old_val != new_val:
-                log('DEBUG', 'agent.core',
+                log('DEBUG', 'core.agent',
                     f'Config field "{field_name}" differs: '
                     f'old={type(old_val).__name__}({repr(old_val)[:60]}) '
                     f'!= new={type(new_val).__name__}({repr(new_val)[:60]})')
@@ -356,7 +355,7 @@ class Agent:
             changed.append(f'enabled_tools={", ".join(new_config.enabled_tools)}')
         
         if changed:
-            log('DEBUG', 'agent.core', f'Config hot-swapped: {", ".join(changed)}')
+            log('DEBUG', 'core.agent', f'Config hot-swapped: {", ".join(changed)}')
             if self.logger:
                 self.logger.log_system_event(f'Config hot-swapped: {", ".join(changed)}')
 
@@ -372,7 +371,7 @@ class Agent:
         success = self.restart(new_config)
         if not success:
             error_detail = self._last_config_error or 'Unknown error during restart'
-            log('ERROR', 'agent.core', f'Agent restart with provider={new_config.provider_type} failed: {error_detail}')
+            log('ERROR', 'core.agent', f'Agent restart with provider={new_config.provider_type} failed: {error_detail}')
         return success
 
     @staticmethod
@@ -476,12 +475,12 @@ class Agent:
             # Reset rate limiting
             self.reset_rate_limiting()
 
-            log('DEBUG', 'agent.core', f'Agent restarted with provider={new_config.provider_type}, model={new_config.model}')
+            log('DEBUG', 'core.agent', f'Agent restarted with provider={new_config.provider_type}, model={new_config.model}')
             if self.logger:
                 self.logger.log_info('AGENT_RESTART', f'Configuration reloaded, provider: {self.provider}')
             return True
         except Exception as e:
-            log('ERROR', 'agent.core', f'Failed to restart agent: {e}')
+            log('ERROR', 'core.agent', f'Failed to restart agent: {e}')
             self._last_config_error = str(e)
             # Restore old LLM client so agent isn't left in a broken state
             if old_config is not None and old_logger is not None:
@@ -489,7 +488,7 @@ class Agent:
                     self.llm_client = LLMClient(old_config, self._session, old_logger)
                     self.provider = self.llm_client.provider
                 except Exception as restore_error:
-                    log('CRITICAL', 'agent.core', f'Failed to restore old LLM client after restart failure: {restore_error}')
+                    log('CRITICAL', 'core.agent', f'Failed to restore old LLM client after restart failure: {restore_error}')
             else:
                 self.llm_client = None
                 self.provider = None
@@ -509,10 +508,9 @@ class Agent:
             self.llm_client.session = value
         if hasattr(self, 'context_builder') and self.context_builder is not None and hasattr(self.context_builder, 'session'):
             self.context_builder.session = value
-            log('DEBUG', 'core.context_builder', f'Updated existing context_builder.session')
         elif value is not None and hasattr(self, 'llm_client') and (self.llm_client is not None):
             self.context_builder = self.llm_client.create_context_builder()
-            log('DEBUG', 'core.context_builder', f'Created new context_builder: is None={self.context_builder is None}')
+            log('DEBUG', 'core.context_builder', f'Session setter: cb created, is None={self.context_builder is None}')
             if hasattr(self, 'conversation_manager') and self.conversation_manager is not None:
                 self.conversation_manager.context_builder = self.context_builder
         if hasattr(self, 'conversation_manager') and self.conversation_manager is not None:
@@ -551,7 +549,6 @@ class Agent:
 
     def _initialize_session_state(self):
         """Initialize session state based on existing history."""
-        log('DEBUG', 'core.agent', f'_initialize_session_state: session exists={self.session is not None}')
         if self.session is not None:
             if len(self.session.user_history) > 0:
                 events = self.state.set_session_state(SessionState.CONTINUING)
@@ -576,91 +573,71 @@ class Agent:
             old_state = event.get('old_state')
             new_state = event.get('new_state')
             if self.logger:
-                log('DEBUG', 'agent.core', f'Execution state change: {old_state} -> {new_state}')
+                log('DEBUG', 'core.agent', f'Execution state change: {old_state} -> {new_state}')
             self._add_conversation_data_to_event(event)
             yield event
         elif event.get('type') == 'session_state_change':
             old_state = event.get('old_state')
             new_state = event.get('new_state')
             if self.logger:
-                log('DEBUG', 'agent.core', f'Session state change: {old_state} -> {new_state}')
+                log('DEBUG', 'core.agent', f'Session state change: {old_state} -> {new_state}')
             self._add_conversation_data_to_event(event)
             yield event
     def _update_conversation_token_estimate(self):
         """Update current_conversation_tokens by estimating tokens for runtime context."""
-        log('DEBUG', 'core.context_builder', f"_update_conversation_token_estimate: has context_builder={hasattr(self, 'context_builder')}, context_builder is None={(self.context_builder if hasattr(self, 'context_builder') else 'no attr')}")
-        log('DEBUG', 'core.context_builder', f'conversation length: {len(self.conversation)}')
         if self.session is not None:
             needs_update = False
             if not hasattr(self, 'context_builder') or self.context_builder is None:
-                log('DEBUG', 'core.context_builder', 'Creating missing context_builder for token estimation')
                 needs_update = True
             if needs_update:
                 if hasattr(self, 'llm_client') and self.llm_client is not None:
                     self.llm_client.session = self.session
                     self.context_builder = self.llm_client.create_context_builder()
-                    log('DEBUG', 'core.context_builder', 'Created/updated context_builder')
                     if self.context_builder and hasattr(self, 'conversation_manager') and (self.conversation_manager is not None):
                         self.conversation_manager.context_builder = self.context_builder
         if not hasattr(self, 'context_builder') or self.context_builder is None:
             runtime_context = self.conversation
-            log('DEBUG', 'core.context_builder', f'Token estimation path: context_builder is None, using full conversation, length={len(runtime_context)}')
         elif hasattr(self.context_builder, 'get_context_for_llm'):
             runtime_context = self.context_builder.get_context_for_llm()
-            log('DEBUG', 'core.context_builder', f'Token estimation path: used context_builder.get_context_for_llm, length={len(runtime_context)}')
         else:
             runtime_context = self.context_builder.build(self.conversation)
-            log('DEBUG', 'core.context_builder', f'Token estimation path: used context_builder.build, length={len(runtime_context)}')
         original_len = len(runtime_context)
         runtime_context = ContextBuilder._cleanup_orphaned_tool_messages(runtime_context)
-        if original_len != len(runtime_context):
-            log('DEBUG', 'agent.core', f'[DEBUG_CONTEXT] Token estimate: cleaned {original_len - len(runtime_context)} orphaned tool messages')
         estimated_tokens = 0
         for msg in runtime_context:
             estimated_tokens += self.token_counter.estimate_tokens(msg)
         self.state.current_conversation_tokens = estimated_tokens
-        log('DEBUG', 'core.token_estimate', f'Estimated tokens: {estimated_tokens}, runtime_context length: {len(runtime_context)}, conversation length: {len(self.conversation)}')
-        if hasattr(self, 'context_builder') and self.context_builder is not None and hasattr(self.context_builder, 'token_limit'):
-            log('DEBUG', 'core.token_estimate', f'context_builder.token_limit: {self.context_builder.token_limit}')
-        log('DEBUG', 'core.pruning', f'Runtime context token estimate (from {len(runtime_context)}/{len(self.conversation)} messages)', {'tokens': estimated_tokens})
-        if self.logger and hasattr(self.logger, 'py_logger'):
-            log('INFO', 'agent.core', f'[TOKEN_ESTIMATE] Updated runtime context token estimate: {estimated_tokens} tokens (from {len(runtime_context)}/{len(self.conversation)} messages)')
+        cleaned = original_len - len(runtime_context)
+        cb_status = hasattr(self, 'context_builder') and self.context_builder is not None
+        token_limit = getattr(getattr(self, 'context_builder', None), 'token_limit', None) if cb_status else None
+        log('DEBUG', 'core.token', f'Token estimate: {estimated_tokens} tokens ({len(runtime_context)}/{len(self.conversation)} msgs, cleaned={cleaned}, cb={cb_status}, limit={token_limit})')
 
     def _add_to_conversation(self, message):
         """Add a message via conversation_manager (ensures cache invalidation)."""
-        pause_debug(f"_add_to_conversation called for {message.get('role')}...")
-        pause_debug(f'Before add, conversation length: {len(self.conversation)}')
         updated = self.conversation_manager.add_message(message, self.conversation)
         self.conversation = updated
-        # Phase 1 logging: user_history after add
-        log("DEBUG", "core.history", "Message added", {"role": message.get("role"), "content_preview": message.get("content", "")[:100]})
-        is_sys_notif = message.get('is_system_notification', False)
-        content_hash = hashlib.md5(str(message.get('content', '')).encode()).hexdigest()[:8]
-        log('DEBUG', 'core.history', f"append: role={message.get('role')}, is_sys_notif={is_sys_notif}, content_hash={content_hash}")
-        dump_messages(self.conversation, "user_history after add")
         # Validation: flag consistency check
         role = message.get('role', '')
         content = message.get('content', '')
+        is_sys_notif = message.get('is_system_notification', False)
         content_preview = content[:100]
         if content.startswith('[SYSTEM NOTIFICATION]'):
-            if message.get('is_system_notification') is not True:
+            if is_sys_notif is not True:
                 log('WARNING', 'core.validation', 'Flag inconsistency detected', {
                     'reason': 'missing is_system_notification flag',
                     'role': role,
                     'content_preview': content_preview,
                 })
         else:
-            if message.get('is_system_notification') is True:
+            if is_sys_notif is True:
                 log('WARNING', 'core.validation', 'Flag inconsistency detected', {
                     'reason': 'unexpected is_system_notification flag',
                     'role': role,
                     'content_preview': content_preview,
                 })
-        pause_debug(f'After add, conversation length: {len(self.conversation)}')
         if hasattr(self, 'context_builder') and self.context_builder is not None:
             if hasattr(self.context_builder, '_cached_context'):
                 self.context_builder._cached_context = None
-                pause_debug(f"Cleared context builder cache after adding {message.get('role')} message")
 
     def _estimate_tokens(self, message):
         """Estimate tokens for a message."""
@@ -678,8 +655,7 @@ class Agent:
         """
         if tool_tokens is not None:
             self.state.current_conversation_tokens += tool_tokens
-            log('DEBUG', 'core.agent.token', f'Tool result added {tool_tokens}, current_tokens now: {self.state.current_conversation_tokens}')
-            log('DEBUG', 'core.token', f"tool tokens added: {tool_tokens}, total={self.state.current_conversation_tokens}, token_state={self.state.token_state.value if hasattr(self.state, 'token_state') else 'N/A'}")
+            log('DEBUG', 'core.token', f'Tool result: +{tool_tokens} tokens, total={self.state.current_conversation_tokens}')
 
         # Process any warnings or state changes from the token update
         for event in self.state.update_token_state(self.state.current_conversation_tokens):
@@ -933,7 +909,7 @@ class Agent:
                             msg['reasoning_content'] = ''
                 if self.logger and hasattr(self.logger, 'py_logger'):
                     system_msgs = [msg for msg in self.conversation if msg.get('role') == 'system']
-                    log('INFO', 'agent.core', f'[CONVERSATION] Total messages: {len(self.conversation)}, system messages: {len(system_msgs)}')
+                    log('INFO', 'core.agent', f'[CONVERSATION] Total messages: {len(self.conversation)}, system messages: {len(system_msgs)}')
                 self.debug_context.debug_context('before_build', context_builder=self.context_builder)
                 if hasattr(self, 'context_builder') and self.context_builder is not None:
                     messages = self.context_builder.build(self.conversation)
@@ -948,7 +924,7 @@ class Agent:
                 original_len = len(messages)
                 messages = ContextBuilder._cleanup_orphaned_tool_messages(messages)
                 if original_len != len(messages):
-                    log('DEBUG', 'agent.core', f'[DEBUG_CONTEXT] Agent: cleaned {original_len - len(messages)} orphaned tool messages from final context')
+                    log('DEBUG', 'core.agent', f'[DEBUG_CONTEXT] Agent: cleaned {original_len - len(messages)} orphaned tool messages from final context')
                 if self.logger and hasattr(self.logger, 'py_logger'):
                     import tiktoken
                     try:
@@ -956,29 +932,29 @@ class Agent:
                     except Exception:
                         encoder = None
                     total_tokens = sum((self.token_counter.estimate_tokens(msg) for msg in messages))
-                    log('INFO', 'agent.core', f'[CONTEXT] Built context: {len(messages)} messages, ~{total_tokens} tokens')
+                    log('INFO', 'core.agent', f'[CONTEXT] Built context: {len(messages)} messages, ~{total_tokens} tokens')
                 if self.logger:
                     self.logger.log_llm_request(messages, self.tool_definitions)
                 if self.rate_limit_active:
                     delay = min(self.rate_limit_delay, self.rate_limit_max_wait)
                     if delay > 0:
                         if self.logger and hasattr(self.logger, 'py_logger'):
-                            log('INFO', 'agent.core', f'[RATE_LIMIT] Applying rate limit delay: {delay}s between turns')
+                            log('INFO', 'core.agent', f'[RATE_LIMIT] Applying rate limit delay: {delay}s between turns')
                         time.sleep(delay)
                 tools = self.llm_client.format_tools(self.tool_definitions)
                 # EMERGENCY TRACE: dump conversation and messages before LLM call
-                log('DEBUG', 'debug.emergency', f'====== EMERGENCY TRACE: self.conversation ({len(self.conversation)} msgs) ======')
+                log('DEBUG', 'core.emergency', f'====== EMERGENCY TRACE: self.conversation ({len(self.conversation)} msgs) ======')
                 for i, msg in enumerate(self.conversation):
                     role = msg.get('role', 'unknown')
                     content = msg.get('content', '')
                     preview = content[:80].replace('\n', '\\n')
-                    log('DEBUG', 'debug.emergency', f'  CONV[{i}] role={role}: {preview}')
-                log('DEBUG', 'debug.emergency', f'====== EMERGENCY TRACE: messages from build() ({len(messages)} msgs) ======')
+                    log('DEBUG', 'core.emergency', f'  CONV[{i}] role={role}: {preview}')
+                log('DEBUG', 'core.emergency', f'====== EMERGENCY TRACE: messages from build() ({len(messages)} msgs) ======')
                 for i, msg in enumerate(messages):
                     role = msg.get('role', 'unknown')
                     content = msg.get('content', '')
                     preview = content[:80].replace('\n', '\\n')
-                    log('DEBUG', 'debug.emergency', f'  MSG[{i}] role={role}: {preview}')
+                    log('DEBUG', 'core.emergency', f'  MSG[{i}] role={role}: {preview}')
                 try:
                     chat_kwargs = {'temperature': self.runtime_params.temperature}
                     if self.runtime_params.top_p is not None:
@@ -999,7 +975,7 @@ class Agent:
                     # Use LLM-reported prompt_tokens as ground truth for conversation token count
                     previous_tokens = self.state.current_conversation_tokens
                     self.state.current_conversation_tokens = input_tokens
-                    log('DEBUG', 'core.agent.token', f'LLM prompt_tokens={input_tokens}, overwriting current_tokens (was {previous_tokens})')
+                    log('DEBUG', 'core.token', f'LLM prompt_tokens={input_tokens}, overwriting current_tokens (was {previous_tokens})')
                     # Token drift detection: compare pre-call estimate vs LLM-reported
                     if previous_tokens is not None and previous_tokens > 0 and input_tokens > 0:
                         drift = abs(input_tokens - previous_tokens)
@@ -1091,7 +1067,7 @@ class Agent:
                     yield event_dict
                     return
                 except Exception as e:
-                    log('ERROR', 'agent.core', f'[Agent] Unexpected exception in process_query: {e}')
+                    log('ERROR', 'core.agent', f'[Agent] Unexpected exception in process_query: {e}')
                     if self.logger:
                         self.logger.log_error('UNEXPECTED_ERROR', str(e))
                         self.logger.log_system_resources()
@@ -1289,7 +1265,7 @@ class Agent:
 
         finally:
             self.state.execution_state = ExecutionState.READY
-            log('DEBUG', 'agent.core', 'process_query finished, reset execution_state to READY')
+            log('DEBUG', 'core.agent', 'process_query finished, reset execution_state to READY')
     def _apply_summary_pruning(self, summary: str, keep_recent_turns: int):
         """Add summary message to append-only history with metadata.
         
@@ -1313,7 +1289,7 @@ class Agent:
             self.state.update_token_state(self.state.current_conversation_tokens)
             log('DEBUG', 'core.pruning', f'Fallback pruning token change: {old_token_count} -> {self.state.current_conversation_tokens}')
             if self.logger and hasattr(self.logger, 'py_logger'):
-                log('INFO', 'agent.core', f'[PRUNING] Updated token estimate after fallback: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
+                log('INFO', 'core.agent', f'[PRUNING] Updated token estimate after fallback: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
             return
         user_history = self.session.user_history
         log('DEBUG', 'core.session_history', f'session.user_history length: {len(user_history)}')
@@ -1363,7 +1339,7 @@ class Agent:
             self.logger.log_conversation_prune(len(user_history) - 1, len(user_history), 'summary_pruning_append_only')
         log('DEBUG', 'core.summary', f'Added summary to append-only history: kept {kept_turns_count} turns, inserted at index {insertion_idx}')
         if self.logger and hasattr(self.logger, 'py_logger'):
-            log('INFO', 'agent.core', f'[PRUNING] Added summary to append-only history: kept {kept_turns_count} turns, inserted summary at index {insertion_idx}, history length: {len(user_history)} messages')
+            log('INFO', 'core.agent', f'[PRUNING] Added summary to append-only history: kept {kept_turns_count} turns, inserted summary at index {insertion_idx}, history length: {len(user_history)} messages')
         old_token_count = self.state.current_conversation_tokens
         self._update_conversation_token_estimate()
         # Immediately re-evaluate token state to clear restrictions if below critical
@@ -1371,7 +1347,7 @@ class Agent:
         log('INFO', 'core.token', f"post-summary: tokens={self.state.current_conversation_tokens}, token_state={self.state.token_state.value if hasattr(self.state, 'token_state') else 'N/A'}, turn_state={self.state.turn_state.value if hasattr(self.state, 'turn_state') else 'N/A'}, restrictions_active={self.state.restrictions_active}")
         log('DEBUG', 'core.pruning', f'Summary pruning token change: {old_token_count} -> {self.state.current_conversation_tokens}, summary_idx={insertion_idx}, kept_turns={kept_turns_count}')
         if self.logger and hasattr(self.logger, 'py_logger'):
-            log('INFO', 'agent.core', f'[PRUNING] Updated token estimate: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
+            log('INFO', 'core.agent', f'[PRUNING] Updated token estimate: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
         log('DEBUG', 'core.pruning', f'_apply_summary_pruning completed. History length: {len(user_history)} messages')
         log('DEBUG', 'core.session_history', f'session.summary exists: {self.session.summary is not None}')
         # Reset emergency mode after a successful summary

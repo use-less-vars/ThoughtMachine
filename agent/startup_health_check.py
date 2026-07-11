@@ -308,16 +308,16 @@ def run_health_check(
     # Log results
     for c in report.checks:
         if not c.passed:
-            log('WARNING', 'startup_health_check', c.message)
+            log('WARNING', 'core.health_check', c.message)
         elif verbose:
-            log('INFO', 'startup_health_check', c.message)
+            log('INFO', 'core.health_check', c.message)
 
     if not report.ok:
-        log('WARNING', 'startup_health_check',
+        log('WARNING', 'core.health_check',
             f'{len(report.failed)} health check(s) FAILED — review warnings above')
 
     if exit_on_fail and not report.ok:
-        log('ERROR', 'startup_health_check', 'Aborting startup due to health check failure')
+        log('ERROR', 'core.health_check', 'Aborting startup due to health check failure')
         sys.exit(1)
 
     return report

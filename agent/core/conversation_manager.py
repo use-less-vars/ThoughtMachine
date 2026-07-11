@@ -75,17 +75,6 @@ class ConversationManager:
 
         turns = []
         current_turn = []
-        debug = os.environ.get('DEBUG_TURN_GROUPING')
-        if debug:
-            log('DEBUG', 'core.conversation_manager', f'[DEBUG_TURN_GROUPING] Grouping {len(messages)} messages')
-            max_to_show = 10
-            for i, msg in enumerate(messages[:max_to_show]):
-                role = msg.get('role')
-                content_preview = str(msg.get('content', ''))[:50]
-                has_tool_calls = 'tool_calls' in msg and msg['tool_calls']
-                log('DEBUG', 'core.conversation_manager', f'  [{i}] {role}: {content_preview}... tool_calls={has_tool_calls}')
-            if len(messages) > max_to_show:
-                log('DEBUG', 'core.conversation_manager', f'  ... and {len(messages) - max_to_show} more messages')
         for msg in messages:
             role = msg.get('role')
             if role == 'system':
@@ -108,15 +97,10 @@ class ConversationManager:
                     if current_turn and current_turn[-1].get('role') == 'assistant' and current_turn[-1].get('tool_calls'):
                         current_turn.append(msg)
                     else:
-                        if debug:
-                            tool_call_id = msg.get('tool_call_id', 'unknown')
-                            log('DEBUG', 'core.conversation_manager', f'[DEBUG_TURN_GROUPING] Discarding orphaned tool message: {tool_call_id}')
                         continue
                 else:
                     current_turn.append(msg)
             else:
-                if debug:
-                    log('DEBUG', 'core.conversation_manager', f'[DEBUG_TURN_GROUPING] Discarding orphaned {role} message')
                 continue
         if current_turn:
             turns.append(current_turn)
@@ -130,13 +114,4 @@ class ConversationManager:
                 valid_turns.append(turn)
             elif first_role == 'assistant' and first_msg.get('tool_calls'):
                 valid_turns.append(turn)
-            elif debug:
-                log('DEBUG', 'core.conversation_manager', f'[DEBUG_TURN_GROUPING] Discarding turn starting with {first_role}')
-        if debug:
-            log('DEBUG', 'core.conversation_manager', f'[DEBUG_TURN_GROUPING] Returned {len(valid_turns)} valid turns')
-            max_to_show = 10
-            for i, turn in enumerate(valid_turns[:max_to_show]):
-                log('DEBUG', 'core.conversation_manager', f"  Turn {i}: {[msg.get('role') for msg in turn]}")
-            if len(valid_turns) > max_to_show:
-                log('DEBUG', 'core.conversation_manager', f'  ... and {len(valid_turns) - max_to_show} more turns')
         return valid_turns

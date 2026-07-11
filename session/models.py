@@ -21,19 +21,15 @@ class ObservableList(list):
     """A list that notifies a callback when mutated."""
 
     def __init__(self, iterable=(), callback=None):
-        import sys
-        log('DEBUG', 'debug.unknown', f"[ObservableList.__init__] Creating ObservableList id={id(self)}, input type={type(iterable)}, len={(len(iterable) if hasattr(iterable, '__len__') else 'N/A')}, callback={(callback.__qualname__ if callback else None)}")
         try:
             super().__init__(iterable)
-            log('DEBUG', 'debug.unknown', f'[ObservableList.__init__] Success, list length={len(self)}, id={id(self)}')
         except Exception as e:
-            log('ERROR', 'debug.unknown', f'[ObservableList.__init__] ERROR during initialization: {e}')
+            log('ERROR', 'core.history', f'[ObservableList.__init__] ERROR during initialization: {e}')
             raise
         self.callback = callback
         self._lock = threading.Lock()
 
     def _notify(self):
-        log('DEBUG', 'core.history_notify', f"_notify called: len={len(self)}, version will bump")
         with self._lock:
             if self.callback:
                 self.callback()
@@ -54,11 +50,6 @@ class ObservableList(list):
         self._notify()
 
     def extend(self, iterable):
-        try:
-            length = len(iterable) if hasattr(iterable, '__len__') else 'unknown'
-        except:
-            length = 'unknown'
-        log('DEBUG', 'debug.unknown', f'[ObservableList.extend] called on id={id(self)} with iterable length={length}')
         with self._lock:
             super().extend(iterable)
         self._notify()
@@ -194,15 +185,15 @@ class Session:
         """Wrap user_history with ObservableList if not already wrapped."""
         log('DEBUG', 'core.history', f"wrapping user_history: is_ObservableList={isinstance(self.user_history, ObservableList)}")
         if not isinstance(self.user_history, ObservableList):
-            log('DEBUG', 'debug.unknown', f'[Session] _wrap_user_history: Creating ObservableList from current user_history')
+            log('DEBUG', 'core.history', f'[Session] _wrap_user_history: Creating ObservableList from current user_history')
             new_list = ObservableList(self.user_history, callback=self._on_conversation_changed)
-            log('DEBUG', 'debug.unknown', f'[Session] _wrap_user_history: Created ObservableList, id={id(new_list)}, len={len(new_list)}')
+            log('DEBUG', 'core.history', f'[Session] _wrap_user_history: Created ObservableList, id={id(new_list)}, len={len(new_list)}')
             self.user_history = new_list
         else:
             self.user_history.callback = self._on_conversation_changed
-            log('DEBUG', 'debug.unknown', f'[Session] _wrap_user_history: Already ObservableList, ensuring session callback, id={id(self.user_history)}, len={len(self.user_history)}')
+            log('DEBUG', 'core.history', f'[Session] _wrap_user_history: Already ObservableList, ensuring session callback, id={id(self.user_history)}, len={len(self.user_history)}')
         callback_repr = self.user_history.callback.__qualname__ if self.user_history.callback else None
-        log('DEBUG', 'debug.unknown', f'[Session] _wrap_user_history: after, len={len(self.user_history)}, id={id(self.user_history)}, callback={callback_repr}')
+        log('DEBUG', 'core.history', f'[Session] _wrap_user_history: after, len={len(self.user_history)}, id={id(self.user_history)}, callback={callback_repr}')
 
     def _get_next_seq(self) -> int:
         """Return the next sequence number and increment the counter."""
@@ -238,10 +229,10 @@ class Session:
         """Called when user_history is mutated."""
         import os
         old_version = self._conversation_version
-        log('DEBUG', 'core.history_notify', f"conversation version: {old_version} → {old_version + 1}, hash={self.conversation_hash}, callbacks={len(self._conversation_changed_callbacks)}")
+        log('DEBUG', 'core.history', f"conversation version: {old_version} → {old_version + 1}, hash={self.conversation_hash}, callbacks={len(self._conversation_changed_callbacks)}")
         for i, cb in enumerate(self._conversation_changed_callbacks):
             cb_repr = cb.__qualname__ if hasattr(cb, '__qualname__') else repr(cb)
-            log('DEBUG', 'session.session', f'  Callback {i}: {cb_repr}')
+            log('DEBUG', 'core.session', f'  Callback {i}: {cb_repr}')
         self.updated_at = datetime.now()
         self._conversation_version += 1
         try:
@@ -252,23 +243,23 @@ class Session:
         for callback in self._conversation_changed_callbacks:
             try:
                 callback_repr = callback.__qualname__ if hasattr(callback, '__qualname__') else repr(callback)
-                log('DEBUG', 'session.session', f'invoking callback {callback_repr}')
+                log('DEBUG', 'core.session', f'invoking callback {callback_repr}')
                 callback()
             except Exception as e:
                 import traceback
-                log('ERROR', 'session.session', f'callback error: {e}')
-                log('ERROR', 'session.session', f'[SESSION] _on_conversation_changed callback error')
+                log('ERROR', 'core.session', f'callback error: {e}')
+                log('ERROR', 'core.session', f'[SESSION] _on_conversation_changed callback error')
 
     def connect_conversation_changed(self, callback):
         """Register a callback to be invoked when user_history changes."""
-        log('DEBUG', 'session.session', f'[SESSION] connect_conversation_changed: adding callback, total {len(self._conversation_changed_callbacks) + 1}')
+        log('DEBUG', 'core.session', f'[SESSION] connect_conversation_changed: adding callback, total {len(self._conversation_changed_callbacks) + 1}')
         self._conversation_changed_callbacks.append(callback)
 
     def disconnect_conversation_changed(self, callback):
         """Remove a previously registered callback."""
-        log('DEBUG', 'session.session', f'[SESSION] disconnect_conversation_changed: looking for callback {callback}, total callbacks {len(self._conversation_changed_callbacks)}')
+        log('DEBUG', 'core.session', f'[SESSION] disconnect_conversation_changed: looking for callback {callback}, total callbacks {len(self._conversation_changed_callbacks)}')
         if callback in self._conversation_changed_callbacks:
-            log('DEBUG', 'session.session', f'[SESSION] disconnect_conversation_changed: removing callback, remaining {len(self._conversation_changed_callbacks) - 1}')
+            log('DEBUG', 'core.session', f'[SESSION] disconnect_conversation_changed: removing callback, remaining {len(self._conversation_changed_callbacks) - 1}')
             self._conversation_changed_callbacks.remove(callback)
 
     @property

@@ -190,7 +190,7 @@ class HistoryProvider:
         Returns:
             The summary message dict
         """
-        log('DEBUG', 'core.history_provider', f'create_summary: text_len={len(summary_text)}, keep_recent_turns={keep_recent_turns}')
+        log('DEBUG', 'session.history_provider', f'create_summary: text_len={len(summary_text)}, keep_recent_turns={keep_recent_turns}')
         summary_msg = {'role': 'system', 'content': f'Summary of previous conversation: {summary_text}', 'pruning_keep_recent_turns': keep_recent_turns, 'pruning_insertion_idx': len(self.session.user_history), 'timestamp': datetime.now().isoformat()}
         self.add_message(summary_msg)
         self.session.summary = summary_msg

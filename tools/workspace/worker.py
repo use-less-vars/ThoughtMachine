@@ -36,6 +36,7 @@ from pydantic import Field
 
 from tools.base import ToolBase
 from tools.utils import model_to_openai_tool
+from agent.logging import log
 
 # File lock for atomic writes (same pattern as FileSystemSessionStore)
 try:
@@ -525,6 +526,8 @@ class WorkerThread(threading.Thread):
         if "workspace_path" not in worker_cfg and self._project_root:
             worker_cfg["workspace_path"] = self._project_root
 
+        log('DEBUG', 'core.token', f"Worker agent config: token_monitor_warning_threshold={worker_cfg.get('token_monitor_warning_threshold', 'NOT SET')} token_monitor_critical_threshold={worker_cfg.get('token_monitor_critical_threshold', 'NOT SET')} max_turns={worker_cfg.get('max_turns', 'NOT SET')} timeout_seconds={worker_cfg.get('timeout_seconds', 'NOT SET')}")
+
         return AgentConfig(**worker_cfg)
 
 
@@ -642,6 +645,7 @@ class WorkerThread(threading.Thread):
 
                 # Log token warnings as system notifications
                 if event_type == "token_warning":
+                    log('DEBUG', 'tools.worker', f"[TOKEN] Worker received token_warning event: message={event.get('message','?')} token_count={event.get('token_count','?')}")
                     message = event.get("message", "") or event.get("warning_message", "")
                     token_count = event.get("token_count", 0)
                     self._log_event(
@@ -657,6 +661,7 @@ class WorkerThread(threading.Thread):
                     if _WORKER_EVENT_BUS is not None:
                         try:
                             from agent.events import TokenWarningEvent, EventMetadata, EventType
+                            log('DEBUG', 'tools.worker', f"[TOKEN] Worker publishing TokenWarningEvent: worker_name={self.worker_name} session_id={self.session_id} token_count={token_count}")
                             _WORKER_EVENT_BUS.publish(TokenWarningEvent(
                                 type=EventType.TOKEN_WARNING,
                                 metadata=EventMetadata(

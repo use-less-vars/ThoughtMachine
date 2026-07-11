@@ -38,7 +38,7 @@ class EventProcessor:
         """
         typed_event = ev.convert_from_legacy_format(event)
         event_type = typed_event.type.value
-        log('DEBUG', 'core.signal', f"event: type={event_type}")
+        log('DEBUG', 'presenter.event_processor', f"event: type={event_type}")
         log('DEBUG', 'presenter.event_processor', f'Processing event: {event_type}')
         state_event_types = ['error', 'paused', 'stopped', 'thread_finished', 'max_turns', 'user_interaction_requested', 'rate_limit_warning', 'token_warning', 'turn_warning', 'user_query']
         if event_type not in state_event_types:
@@ -52,7 +52,7 @@ class EventProcessor:
         if self.gui_integration:
             log('DEBUG', 'presenter.event_processor', f'GUI integration available, checking emission for {event_type}')
             if event_type != 'token_update':
-                log('DEBUG', 'core.signal', 'Path A: emit_conversation_changed()')
+                log('DEBUG', 'presenter.event_processor', 'Path A: emit_conversation_changed()')
                 self.gui_integration.emit_conversation_changed()
             else:
                 log('DEBUG', 'presenter.event_processor', f'Skipping token_update event (handled separately)')

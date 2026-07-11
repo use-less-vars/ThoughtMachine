@@ -2910,3 +2910,283 @@ Key design decisions:
 ## Research Report: Git Permissions, CheckSystem, Config Loading & Layering (2026-07-10)
 
 Researched 4 questions about the codebase. Full report below.
+
+## 2026-07-11 — ## Logging Architecture (Comprehensive Landscape)
+
+### Overv...
+
+## Logging Architecture (Comprehensive Landscape)
+
+### Overview
+ThoughtMachine has **three logging systems** coexisting:
+
+1. **`agent/logging/unified.py`** (Primary facade) — Tag-based `log()` function with `debug/info/warning/error/critical` convenience functions. Provides console output filtering + forwarding to AgentLogger for JSONL file output. Runtime API: `set_log_tags()`, `set_log_level()`, `show_log_config()`. Console output format: `[HH:MM:SS] LEVEL [tag] message | data`.
+
+2. **`agent/logging/__init__.py`** (AgentLogger / JSONL file logger) — `_AgentLogger` class with 40+ fine-grained event methods (log_agent_start, log_turn_start, log_tool_call, log_llm_request, etc). Writes structured JSONL to `logs/agent_<session_id>.jsonl`. 10MB rotation, 5 backups. Thread-safe with RLock. Performance metrics, resource utilization, token tracking built in.
+
+3. **Python stdlib logging** (`logging.getLogger`) — Used in `session/`, `tools/`, `thoughtmachine/` modules. Each uses its own module-level logger.
+
+### Log Levels
+DEBUG (10), INFO (20), WARNING (30), ERROR (40), CRITICAL (50)
+
+### Tag Naming Convention
+`area.component` format. Areas: core (session, pruning, config, controller, context_builder, turn_transaction, token_counter), tools (file_editor, docker_code_runner, docker_executor, search), llm (anthropic, openai, stepfun), server (config, bridge), ui (presenter, output_panel, events), session (history_provider, context_builder).
+
+### Log File Format
+JSONL files in `logs/agent_<session_id>.jsonl`. Each line: `{"type": "...", "level": "...", "message": "...", "data": {...}, "turn": N, "total_input_tokens": N, "total_output_tokens": N, "timestamp": "...", "session_id": "...", "version": "1.0"}`
+
+### 200+ log() Usage Sites
+Files using `log('LEVEL', 'tag', 'msg')` pattern: agent/core/agent.py, agent/core/controller.py, agent/logging/unified.py, agent/tools/*.py, web_ui/backend/*.py, tools/workspace/worker.py, docker_executor.py. Many convenience function calls: `debug('tag','msg')`, `info('tag','msg')`, `warning('tag','msg')`, `error('tag','msg')`.
+
+### Environment Variables (20+)
+**Core:** TM_LOG_LEVEL (default: INFO), TM_LOG_TAGS (default: empty = WARNING+ only), THOUGHTMACHINE_DEBUG (firehose), AGENT_LOG_CATEGORIES
+**Legacy Debug Flags:** DEBUG_CONTEXT, DEBUG_TURN_GROUPING, DEBUG_HISTORY_PROVIDER, DEBUG_PRUNE, PAUSE_DEBUG, DEBUG_OPENAI, DEBUG_EVENTBUS, DEBUG_EXECUTOR, DEBUG_TOOLS, DEBUG_WORKER, DEBUG_LANGCHAIN, DEBUG_STEPFUN
+**Truncation:** TM_DEBUG_TRUNCATE_LENGTH (100), TM_TOOL_ARGUMENTS_TRUNCATE (100), TM_TOOL_RESULT_TRUNCATE (100), TM_RAW_RESPONSE_TRUNCATE (100), TM_CONSOLE_DATA_TRUNCATE (200), TM_CONVERSATION_CONTENT_TRUNCATE (10000), TM_DOCKER_OUTPUT_TRUNCATE (10000)
+**File Logging:** TM_LOG_FILE_LEVEL (default: DEBUG), TM_LOG_DIR_MAX_MB (default: 50), TM_LOG_MAX_AGE_DAYS (default: 7)
+
+### Console Filtering Logic
+1. If TM_LOG_TAGS is empty → only WARNING+ shown
+2. If TM_LOG_TAGS is set → matching tags shown at >= TM_LOG_LEVEL
+3. Wildcard: `server.*` matches `server.config`, `server.bridge`, etc.
+4. Per-component DEBUG_* env vars override everything
+5. Runtime set_log_tags()/set_log_level() override env vars
+
+### Truncation System
+Two-stage: Type-specific limits truncate for JSONL, additional console-specific truncation for display. `truncate_hint` parameter in log() controls which limit applies.
+
+### Frontend (React)
+- **State:** Zustand store (useStore.js) — shared sessions list only
+- **Architecture:** Multi-tab with hub WebSocket for session list + per-tab WebSocket for individual sessions
+- **Key Components:** ConfigPanel.jsx (37KB — directory browser, provider management, permissions UI), WorkerOutputPanel.jsx (21KB), SessionTab.jsx, TabBar, SessionList, WorkerManagementPanel
+- **No existing Settings/Logging panel** — gap identified
+
+### Backend (FastAPI)
+- WebSocket protocol: commands include `get_config`, `update_config`, `apply_config`
+- REST API: `/api/config/reset`, `/api/config/mode`
+- Bridge.py handles agent session lifecycle and event forwarding
+- Workspace routes for worker management
+
+### Known Gaps
+- No frontend Settings/Logging panel
+- 7+ step manual chain for adding new event types
+- No formal shared event schema between backend and frontend
+- Frontend has zero tests
+- EventBus not thread-safe (plain dict, no lock)
+
+## 2026-07-11 — COMPREHENSIVE CODE AUDIT REPORT — 12 Questions Answered
+
+## ...
+
+COMPREHENSIVE CODE AUDIT REPORT — 12 Questions Answered
+
+## Q1: WorkerThread Architecture — Agent + WorkerContext + NullEventBus
+
+**File: agent/core/agent.py (1455 lines) — Agent class**
+- Agent is instantiated with `config`, optional `session` (Session or WorkerContext), and optional `event_bus`.
+- `process_query(query)` is a **generator** that yields event dicts. The callers (WorkerThread or GUI) iterate over these events.
+- During `__init__`, Agent creates: `ToolExecutor(tool_classes, config, None, logger, security_available, agent=self, event_bus=event_bus or global_event_bus)`.
+- Agent imports `global_event_bus` from `agent.events` and passes it to ToolExecutor if no custom event_bus is provided.
+
+**File: agent/core/worker_context.py (202 lines) — WorkerContext**
+- Designed as a **lightweight Session surrogate** for sub-agent worker loops.
+- Provides exactly the attributes Agent reads from Session: `session_id`, `user_history`, `total_input_tokens`, `total_output_tokens`, `conversation_version` (property), `conversation_hash`, `summary`, `updated_at`, `_get_next_seq()`, `_on_conversation_changed()`.
+- `compact_after_summary()` implements conversation compaction after summarization.
+- `to_persistable_dict()` / `from_persistable_dict()` for JSON persistence of worker state.
+- Has NO ObservableList wrapping, NO file I/O, NO persistence callbacks.
+
+**File: agent/events.py (521 lines) — NullEventBus (line 475)**
+- `NullEventBus` provides the same interface as `EventBus` but silently discards all publishes.
+- Its `ask()` method returns `"deny"` instantly — critical for worker sub-agents where no human is available to answer security prompts.
+- Used when Agent is constructed without a real EventBus: `event_bus=event_bus or global_event_bus`. When no event_bus is passed, `global_event_bus` (a real EventBus) is used. NullEventBus would need to be explicitly passed.
+
+**Key Finding:** The Agent constructor has `event_bus=None` default parameter. When constructing Agent for worker threads, callers should pass `NullEventBus()` explicitly to silence event publishing. The pattern is:
+```python
+agent = Agent(config, session=ctx, event_bus=NullEventBus())
+```
+
+## Q2: Event Flow — Process_query Yields vs EventBus
+
+**File: agent/core/agent.py (process_query at line 742)**
+- `process_query()` is a generator that **yields plain dict events** — NOT typed EventBus events.
+- Events yielded include: `token_update`, `user_query`, `execution_state_change`, `session_state_change`, `turn_warning`, `time_warning`, `token_warning`, `turn`, `tool_call`, `tool_result`, `agent_responded`, `final`, `stopped`, `paused`, `error`, `rate_limit_warning`, `max_turns`.
+- These events DO NOT flow through EventBus at all. They are yielded directly to the consumer.
+
+**File: agent/events.py — EventBus (line 315)**
+- EventBus is a separate pub/sub mechanism for loose coupling between components.
+- ToolExecutor uses EventBus for security prompts: `event_bus=self._event_bus or global_event_bus`.
+- The security gate's `check()` method publishes `SECURITY_PROMPT` events via EventBus and waits for a `SECURITY_RESPONSE` from the GUI.
+- With NullEventBus (worker context), `ask()` returns `"deny"` instantly, so security prompts are always denied.
+
+**File: agent/core/state.py — AgentState._create_event (line 69)**
+- Warning events (token_warning, time_warning, turn_warning) are created via `ev.create_event()` which returns typed `BaseEvent` objects, then converted to legacy dict format via `ev.convert_to_legacy_format()`.
+- These legacy-format dicts are yielded directly by process_query.
+
+**Key Finding:** There are TWO distinct event paths:
+1. **Generator yield path** (process_query → caller): All agent lifecycle events as plain dicts
+2. **EventBus pub/sub path** (ToolExecutor → security gate → EventBus): Security prompts/responses only
+
+## Q3: Bridge/Presenter Layer
+
+**File: agent/presenter/state_bridge.py (375 lines) — StateBridge**
+- Manages configuration loading/saving (as minimal diff overlay vs factory defaults).
+- Creates AgentConfig from config dictionaries with provider profile resolution.
+- Binds Session objects and syncs token totals between StateBridge and Session.
+- Handles custom system_prompt file management (~/.thoughtmachine/custom_system_prompt.txt).
+- NO separate `bridge.py` file exists; `state_bridge.py` is the bridge module.
+
+**File: tests/test_bridge_permissions_sync.py**
+- Tests permission synchronization between bridge and session layers.
+
+## Q4: Session Management — WorkerContext vs Session
+
+**File: agent/core/worker_context.py**
+- Session attributes implemented: `session_id`, `worker_name`, `user_history` (plain list), `total_input_tokens`, `total_output_tokens`, `turn_count`, `summary`, `updated_at`, `conversation_version` (property), `conversation_hash`.
+- `_on_conversation_changed()`: Increments version, recomputes hash, updates timestamp — mirrors Session behavior.
+- `_get_next_seq()`: Returns and increments sequence counter.
+- `compact_after_summary()`: Prunes old messages while preserving:
+  - Leading system prompts (role='system' before first non-system message)
+  - The latest summary message (dict with `'summary': True`)
+  - All messages after the latest summary
+
+**File: session/models.py** — Session dataclass (presumed)
+- Uses ObservableList wrapping for user_history with change notification callbacks.
+- Full persistence machinery (file I/O, serialization callbacks).
+
+## Q5: Token/Time/Turn State Management
+
+**File: agent/core/state.py (361 lines) — AgentState**
+- Three independent state machines:
+  - `TokenState`: LOW → WARNING → CRITICAL (based on `token_monitor_warning_threshold`, `token_monitor_critical_threshold`)
+  - `TimeState`: LOW → WARNING → CRITICAL (based on `time_warning_threshold`, `timeout_seconds`)
+  - `TurnState`: LOW → WARNING (based on `max_turns - 3`)
+- Each state machine emits warning events on transitions to higher states.
+- `restrictions_active` flag is set when any state becomes critical.
+- `restriction_reason` records which state triggered restrictions ('token', 'timeout', 'turn').
+- `get_allowed_tools()`: Returns ['Respond'] for timeout, ['Respond', 'SummarizeTool'] for token/turn.
+- Only warns ONCE per new state (not on every check).
+
+## Q6: Tool Execution and Security Gate
+
+**File: agent/core/tool_executor.py — ToolExecutor**
+- `execute_tool_calls()` processes tool calls from assistant messages.
+- For each tool call, checks permissions via security gate:
+  - Uses `event_bus=self._event_bus or global_event_bus`
+  - Security gate's `check()` method uses EventBus to prompt for approval
+  - With NullEventBus, `ask()` returns "deny" instantly
+- Tools are restricted via `state.is_tool_allowed(tool_name)` before execution.
+
+## Q7: Stop Check and Pause Mechanism
+
+**File: agent/core/agent.py (process_query)**
+- `stop_check`: A callable set on `config.stop_check`. Checked in the turn loop between iterations. When it returns True, a 'stopped' event is yielded with `stop_reason='stopped'`.
+- `_pause_requested`: Set via `request_pause()`. Checked at three checkpoints:
+  1. At the start of each turn
+  2. After turn processing (before next LLM call)
+  3. After final event
+- When paused, yields 'paused' event and returns control to consumer.
+
+## Q8: Error Handling
+
+**File: agent/core/agent.py (process_query lines ~1020-1081)**
+- Catches: `ProviderError`, `RateLimitExceeded`, `LLMError`, generic `Exception`
+- Each yields an 'error' event dict with `error_type`, `message`, `traceback`, and `stop_reason='error'`
+- Rate limiting: Exponential backoff (`rate_limit_backoff_factor=1.2`, max 60s). After all retries exhausted, yields 'stop_reason' with `stop_reason='rate_limit'`.
+- Emergency retries: On token limit exceeded, the turn loop can retry (up to `_emergency_retries` limit).
+
+## Q9: Conversation History Management
+
+**File: agent/core/turn_transaction.py — TurnTransaction**
+- Atomic commits: Messages are collected in a transaction during a turn.
+- `commit_assistant_only()`: Commits assistant message to user_history before yielding events.
+- `commit()`: Commits all messages (assistant + tool results) atomically.
+- This ensures data is never lost even if consumer pauses between yielded events.
+
+**File: agent/core/agent.py**
+- `_add_to_conversation(msg)`: Adds message to conversation via `conversation_manager.add_message_to_session()`.
+- Session's `user_history` (or WorkerContext's `user_history`) is the source of truth.
+- ContextBuilder is used to build the LLM context window from conversation history.
+
+## Q10: Summarization and Compaction
+
+**File: tools/summarize_tool.py — SummarizeTool**
+- Triggered when token state becomes CRITICAL (or explicitly by LLM).
+- SummarizeTool generates a summary message with `'summary': True` and a context-cleared notification.
+- After summarization, `WorkerContext.compact_after_summary()` prunes old messages.
+
+**File: agent/core/worker_context.py (compact_after_summary)**
+- Finds the last summary message in user_history.
+- Preserves leading system prompts (role='system' before first non-system message).
+- Removes all messages between the system prompts and the summary.
+- Keeps the summary + all messages after it.
+- Updates conversation_hash and conversation_version.
+
+## Q11: Test Coverage
+
+**File: tests/test_worker_agent_transplant.py (6 test classes)**
+1. `TestSmokeMultiTurnTask` — Agent runs multiple turns with tool calls + final response
+2. `TestResumeWorkerContinuesConversation` — Sequential process_query() calls preserve history in WorkerContext
+3. `TestTimeoutEnforcesRestrictions` — Short timeout triggers CRITICAL time_state, soft restriction
+4. `TestTokenCriticalTriggersSummarisation` — Low token threshold triggers CRITICAL token state
+5. `TestStopFlagGracefulExit` — stop_check stops agent mid-execution
+6. `TestGateDenialInstant` — Security gate denies via NullEventBus instantly
+7. `TestCompactAfterSummary` (7 sub-tests) — WorkerContext.compact_after_summary() behavior
+
+**Mock Strategy:** Uses `ScriptedProvider` (a custom `LLMProvider` subclass registered in `ProviderFactory`) that returns pre-configured `LLMResponse` objects. Monkey-patches `ScriptedProvider.__init__` to inject responses.
+
+## Q12: Findings and Recommendations
+
+### Strengths
+1. **Clean separation**: Generator pattern (process_query yielding dicts) cleanly separates agent execution from event consumption.
+2. **Well-tested**: 6 comprehensive test classes with ScriptedProvider mock covering all key scenarios.
+3. **Dual event paths**: Generator yield for lifecycle + EventBus for security prompts is well-designed.
+4. **Atomic commits**: TurnTransaction prevents data loss on pause.
+5. **State machine design**: Independent token/time/turn states with restriction logic is robust.
+6. **NullEventBus.ask()**: Returns "deny" instantly — correct for worker context.
+7. **Compaction logic**: Well-tested with edge cases (multiple summaries, empty history, hash/version updates).
+
+### Potential Issues
+1. **EventBus default**: Agent.__init__ defaults `event_bus=None`, then uses `global_event_bus` (a real EventBus). Worker callers must explicitly pass `NullEventBus()`. If forgotten, security prompts will hang waiting for GUI response.
+2. **Worker code location**: There is NO `worker.py` or dedicated WorkerThread file in the codebase. WorkerThread must be defined elsewhere or not yet migrated. The tests demonstrate the expected interface but the actual worker implementation may be in the `thoughtmachine` package (external to this project).
+3. **_pending_events field**: AgentState has `_pending_events: List[Dict[str, Any]] = field(default_factory=list)` but this list is never populated or consumed in the code examined — dead code.
+4. **Token estimation**: Process_query uses `self._estimate_tokens()` for system notifications/warnings added to conversation, which is rough but acceptable for tracking.
+5. **Session vs WorkerContext property differences**: WorkerContext uses plain `user_history: list`, while Session wraps it in `ObservableList`. The conversation setter in Agent may call `session.user_history[:] = ...` which works for both types but WorkerContext lacks the change notification that ObservableList provides.
+
+### Architectural Summary
+
+```
+WorkerThread (external)
+    │
+    │  creates
+    ▼
+WorkerContext(session_id) ──► Agent(config, session=ctx, event_bus=NullEventBus())
+    │                              │
+    │  process_query(query)        │  __init__ creates:
+    │  yields event dicts ─────────┼──► ToolExecutor(tool_classes, config, state, event_bus=NullEventBus)
+    │                              │       │
+    │                              │       └──► Security Gate (via EventBus.ask() → "deny")
+    │                              │
+    │                              ├──► LLMClient → LLMProvider
+    │                              ├──► ConversationManager
+    │                              ├──► TokenCounter
+    │                              └──► AgentState (token/time/turn state machines)
+    │
+    ▼
+WorkerThread iterates events, handles responses
+```
+
+## NullEventBus
+
+## 2026-07-11 — ## NullEventBus
+
+**Defined in:** `agent/events.py` (line 475...
+
+## NullEventBus
+
+**Defined in:** `agent/events.py` (line 475) — no-op EventBus stub.
+
+**Instantiation:** Single module-level singleton `_NULL_EVENT_BUS = NullEventBus()` in `tools/workspace/worker.py` (line ~73), guarded by try/except ImportError.
+
+**Usage:** Passed as `event_bus=_NULL_EVENT_BUS` when constructing `Agent()` inside `WorkerThread.run()` (line ~361). All worker agents share the same instance.
+
+**Behavior:** Silently discards all publishes; `ask()` returns `"deny"` instantly. This ensures workers cannot prompt the user for approval and all security prompts auto-deny.
+

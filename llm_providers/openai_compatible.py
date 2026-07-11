@@ -103,13 +103,13 @@ class OpenAICompatibleProvider(LLMProvider):
                 if 'tool_call_id' not in msg_copy:
                     msg_copy['tool_call_id'] = msg_copy.get('id', f'tool_{i}')
             messages_with_ids.append(msg_copy)
-        log('DEBUG', 'debug.unknown', f'Processed {len(messages)} messages')
+        log('DEBUG', 'llm.openai', f'Processed {len(messages)} messages')
         for i, msg in enumerate(messages_with_ids):
             if msg.get('role') == 'assistant' and 'tool_calls' in msg:
                 for tc in msg['tool_calls']:
-                    log('DEBUG', 'debug.unknown', f"Assistant tool call id={tc.get('id')}")
+                    log('DEBUG', 'llm.openai', f"Assistant tool call id={tc.get('id')}")
             if msg.get('role') == 'tool':
-                log('DEBUG', 'debug.unknown', f"Tool message tool_call_id={msg.get('tool_call_id')}")
+                log('DEBUG', 'llm.openai', f"Tool message tool_call_id={msg.get('tool_call_id')}")
         return messages_with_ids
 
     def _normalize_stepfun_tool_calls(self, messages, is_openrouter=False):
@@ -122,12 +122,10 @@ class OpenAICompatibleProvider(LLMProvider):
         When is_openrouter=True, convert to standard OpenAI format (type='function' with 'function' field)
         since OpenRouter expects that format.
         """
-        log('DEBUG', 'llm.stepfun', f'Normalizing with is_openrouter={is_openrouter}')
         messages_normalized = []
-        log('DEBUG', 'llm.stepfun', f'Starting normalization of {len(messages)} messages')
         for idx, msg in enumerate(messages):
             if msg.get('role') == 'assistant' and 'tool_calls' in msg:
-                log('DEBUG', 'llm.stepfun', f"Message {idx} has tool_calls: {msg['tool_calls']}")
+                pass
         for i, msg in enumerate(messages):
             msg_copy = msg.copy()
             if msg_copy.get('role') == 'assistant' and 'tool_calls' in msg_copy:
@@ -138,7 +136,7 @@ class OpenAICompatibleProvider(LLMProvider):
                         if not isinstance(tc, dict):
                             tc = dict(tc) if hasattr(tc, '__dict__') else {}
                         tc_copy = tc.copy() if isinstance(tc, dict) else {}
-                        log('DEBUG', 'llm.stepfun', f'Tool call {j} before: {tc_copy}')
+
                         if 'type' not in tc_copy:
                             tc_copy['type'] = 'function'
                         current_type = tc_copy.get('type', 'function')
@@ -219,20 +217,17 @@ class OpenAICompatibleProvider(LLMProvider):
                                     tc_copy['custom'] = tc_copy.pop('function')
                                 else:
                                     tc_copy['custom'] = {'name': '', 'arguments': {}}
-                        log('DEBUG', 'llm.stepfun', f'Tool call {j} after: {tc_copy}')
+
                         normalized_tool_calls.append(tc_copy)
                     msg_copy['tool_calls'] = normalized_tool_calls
             messages_normalized.append(msg_copy)
-        log('DEBUG', 'llm.stepfun', f'Processed {len(messages)} messages')
         for i, msg in enumerate(messages_normalized):
             if msg.get('role') == 'assistant' and 'tool_calls' in msg:
                 for tc in msg['tool_calls']:
-                    log('DEBUG', 'llm.stepfun', f"Assistant tool call id={tc.get('id')}, type={tc.get('type')}, has_function={'function' in tc}, has_custom={'custom' in tc}, index={tc.get('index')}")
-        log('DEBUG', 'llm.stepfun', f'Final normalized messages:')
+                    pass
         for idx, msg in enumerate(messages_normalized):
-            log('DEBUG', 'llm.stepfun', f"Message {idx}: role={msg.get('role')}")
             if msg.get('role') == 'assistant' and 'tool_calls' in msg:
-                log('DEBUG', 'llm.stepfun', f"  tool_calls: {msg['tool_calls']}")
+                pass
         return messages_normalized
 
     def chat_completion(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]]=None, **kwargs) -> LLMResponse:

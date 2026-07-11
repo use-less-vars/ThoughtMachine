@@ -32,7 +32,7 @@ All logs are always written to JSONL file (AgentLogger) regardless of console fi
 import os
 import sys
 from enum import Enum
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List, Union, Set
 import json
 from datetime import datetime
 
@@ -118,7 +118,7 @@ _LOG_TAGS: List[str] = []
 if _LOG_TAGS_STR:
     _LOG_TAGS = [tag.strip() for tag in _LOG_TAGS_STR.split(",") if tag.strip()]
 
-# Load truncation lengths
+# Load truncation lengths (kept for backward compatibility but runtime dict is the source of truth)
 TM_TOOL_ARGUMENTS_TRUNCATE = _get_env_int("TM_TOOL_ARGUMENTS_TRUNCATE", DEFAULT_TRUNCATE_LENGTH)
 TM_TOOL_RESULT_TRUNCATE = _get_env_int("TM_TOOL_RESULT_TRUNCATE", DEFAULT_TRUNCATE_LENGTH)
 TM_RAW_RESPONSE_TRUNCATE = _get_env_int("TM_RAW_RESPONSE_TRUNCATE", DEFAULT_TRUNCATE_LENGTH)
@@ -127,26 +127,35 @@ TM_CONVERSATION_CONTENT_TRUNCATE = _get_env_int("TM_CONVERSATION_CONTENT_TRUNCAT
 TM_DOCKER_OUTPUT_TRUNCATE = _get_env_int("TM_DOCKER_OUTPUT_TRUNCATE", DEFAULT_DOCKER_OUTPUT_TRUNCATE)
 TM_DEBUG_TRUNCATE_LENGTH = _get_env_int("TM_DEBUG_TRUNCATE_LENGTH", DEFAULT_TRUNCATE_LENGTH)
 
+# Runtime truncation limits (mutable at runtime via set_truncation_limits())
+_runtime_truncation_limits: Dict[str, int] = {
+    "tool_arguments": TM_TOOL_ARGUMENTS_TRUNCATE,
+    "tool_result": TM_TOOL_RESULT_TRUNCATE,
+    "raw_response": TM_RAW_RESPONSE_TRUNCATE,
+    "console_data": TM_CONSOLE_DATA_TRUNCATE,
+    "conversation_content": TM_CONVERSATION_CONTENT_TRUNCATE,
+    "docker_output": TM_DOCKER_OUTPUT_TRUNCATE,
+    "debug_fallback": TM_DEBUG_TRUNCATE_LENGTH,
+}
+
+# Track all tags that have been seen (for config queries)
+_seen_tags: Set[str] = set()
+
+# Per-session logging config overrides
+_session_configs: Dict[str, Dict[str, Any]] = {}
+
 
 def get_limit_for_hint(truncate_hint: Optional[str]) -> int:
     """
     Return the appropriate truncation limit for a given hint.
     
-    If truncate_hint is None (generic debug), use TM_DEBUG_TRUNCATE_LENGTH.
+    If truncate_hint is None (generic debug), use debug_fallback.
     For structured data hints, return the corresponding type-specific limit.
+    Uses the runtime truncation limits dict which can be updated at runtime.
     """
     if truncate_hint is None:
-        return TM_DEBUG_TRUNCATE_LENGTH
-    
-    mapping = {
-        "tool_arguments": TM_TOOL_ARGUMENTS_TRUNCATE,
-        "tool_result": TM_TOOL_RESULT_TRUNCATE,
-        "raw_response": TM_RAW_RESPONSE_TRUNCATE,
-        "console_data": TM_CONSOLE_DATA_TRUNCATE,
-        "conversation_content": TM_CONVERSATION_CONTENT_TRUNCATE,
-        "docker_output": TM_DOCKER_OUTPUT_TRUNCATE,
-    }
-    return mapping.get(truncate_hint, TM_DEBUG_TRUNCATE_LENGTH)
+        return _runtime_truncation_limits.get("debug_fallback", DEFAULT_TRUNCATE_LENGTH)
+    return _runtime_truncation_limits.get(truncate_hint, _runtime_truncation_limits.get("debug_fallback", DEFAULT_TRUNCATE_LENGTH))
 
 
 # Global fallback truncation
@@ -304,21 +313,8 @@ def _truncate_data(data: Any, truncate_hint: Optional[str] = None) -> Any:
     if data is None or truncate_hint is None:
         return data
     
-    limit = None
-    if truncate_hint == "tool_arguments":
-        limit = TM_TOOL_ARGUMENTS_TRUNCATE
-    elif truncate_hint == "tool_result":
-        limit = TM_TOOL_RESULT_TRUNCATE
-    elif truncate_hint == "raw_response":
-        limit = TM_RAW_RESPONSE_TRUNCATE
-    elif truncate_hint == "console_data":
-        limit = TM_CONSOLE_DATA_TRUNCATE
-    elif truncate_hint == "conversation_content":
-        limit = TM_CONVERSATION_CONTENT_TRUNCATE
-    elif truncate_hint == "docker_output":
-        limit = TM_DOCKER_OUTPUT_TRUNCATE
-    
-    if limit is None or limit <= 0:
+    limit = _runtime_truncation_limits.get(truncate_hint, 0)
+    if limit <= 0:
         return data
     
     # Special handling for tool arguments (JSON)
@@ -353,18 +349,21 @@ def set_logger(logger):
     _logger = logger
 
 
-def set_log_level(level: Union[str, LogLevel]) -> None:
+def set_log_level(level: Union[str, LogLevel]) -> str:
     """
     Change the minimum log level at runtime.
 
     Accepts either a string ("DEBUG", "INFO", etc.) or a LogLevel enum.
     Affects console output filtering; JSONL file logging is unaffected.
 
+    Returns the previous log level string.
+
     Example:
-        set_log_level("DEBUG")
+        old_level = set_log_level("DEBUG")
         set_log_level(LogLevel.WARNING)
     """
     global CURRENT_LOG_LEVEL
+    previous = CURRENT_LOG_LEVEL.value
     if isinstance(level, str):
         try:
             CURRENT_LOG_LEVEL = LogLevel(level.upper())
@@ -372,9 +371,10 @@ def set_log_level(level: Union[str, LogLevel]) -> None:
             print(f"[LOGGING] Invalid log level: {level}. Keeping {CURRENT_LOG_LEVEL.value}.", file=sys.stderr)
     else:
         CURRENT_LOG_LEVEL = level
+    return previous
 
 
-def set_log_tags(tags: Union[str, List[str]]) -> None:
+def set_log_tags(tags: Union[str, List[str]]) -> List[str]:
     """
     Change the tag filter at runtime.
 
@@ -384,13 +384,16 @@ def set_log_tags(tags: Union[str, List[str]]) -> None:
       - An empty string or list to restore default (WARNING+ only)
       - "*" to show all tags
 
+    Returns the previous list of tag patterns.
+
     Example:
-        set_log_tags("core.*,tools.file_editor")
+        old_tags = set_log_tags("core.*,tools.file_editor")
         set_log_tags(["core.session", "llm.stepfun"])
         set_log_tags("*")  # firehose
         set_log_tags("")   # back to default (WARNING+ only)
     """
     global _LOG_TAGS
+    previous = list(_LOG_TAGS)
     if isinstance(tags, str):
         if tags.strip():
             _LOG_TAGS = [t.strip() for t in tags.split(",") if t.strip()]
@@ -398,35 +401,77 @@ def set_log_tags(tags: Union[str, List[str]]) -> None:
             _LOG_TAGS = []
     else:
         _LOG_TAGS = list(tags)
+    return previous
+
+
+def set_truncation_limits(limits: Dict[str, int]) -> Dict[str, int]:
+    """
+    Update truncation limits at runtime.
+
+    Accepts a partial dict — only the keys provided will be updated.
+    All keys must be valid truncation hint names.
+
+    Returns the previous limits dict for reference.
+
+    Example:
+        set_truncation_limits({"tool_arguments": 500, "tool_result": 1000})
+    """
+    global _runtime_truncation_limits
+    previous = dict(_runtime_truncation_limits)
+    valid_keys = {"tool_arguments", "tool_result", "raw_response", "console_data",
+                  "conversation_content", "docker_output", "debug_fallback"}
+    for key, value in limits.items():
+        if key in valid_keys:
+            _runtime_truncation_limits[key] = int(value)
+    return previous
+
+
+def get_truncation_limits() -> Dict[str, int]:
+    """Return a copy of the current truncation limits."""
+    return dict(_runtime_truncation_limits)
+
+
+def get_log_config(session_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Return a snapshot of the current logging configuration.
+
+    If session_id is provided, session-specific overrides are merged
+    on top of the global configuration.
+
+    Returns:
+        dict with keys: log_level, log_tags, truncation_limits, available_tags, session_id
+    """
+    config: Dict[str, Any] = {
+        "log_level": CURRENT_LOG_LEVEL.value,
+        "log_tags": list(_LOG_TAGS),
+        "truncation_limits": dict(_runtime_truncation_limits),
+        "available_tags": sorted(_seen_tags),
+        "session_id": session_id,
+    }
+    if session_id and session_id in _session_configs:
+        # Merge session-specific overrides on top
+        session_overrides = _session_configs[session_id]
+        if "log_level" in session_overrides:
+            config["log_level"] = session_overrides["log_level"]
+        if "log_tags" in session_overrides:
+            config["log_tags"] = list(session_overrides["log_tags"])
+        if "truncation_limits" in session_overrides:
+            merged_limits = dict(config["truncation_limits"])
+            merged_limits.update(session_overrides["truncation_limits"])
+            config["truncation_limits"] = merged_limits
+    return config
 
 
 def show_log_config() -> Dict[str, Any]:
     """
     Return a snapshot of the current logging configuration as a dict.
 
-    Useful for debugging filters or including in diagnostic output.
+    Backward-compatible alias for get_log_config().
 
     Returns:
-        dict with keys: log_level, log_tags, truncation_settings, env_vars
+        dict with keys: log_level, log_tags, truncation_limits, available_tags
     """
-    return {
-        "log_level": CURRENT_LOG_LEVEL.value,
-        "log_tags": list(_LOG_TAGS),
-        "truncation": {
-            "tool_arguments": TM_TOOL_ARGUMENTS_TRUNCATE,
-            "tool_result": TM_TOOL_RESULT_TRUNCATE,
-            "raw_response": TM_RAW_RESPONSE_TRUNCATE,
-            "console_data": TM_CONSOLE_DATA_TRUNCATE,
-            "conversation_content": TM_CONVERSATION_CONTENT_TRUNCATE,
-            "docker_output": TM_DOCKER_OUTPUT_TRUNCATE,
-            "debug_fallback": TM_DEBUG_TRUNCATE_LENGTH,
-        },
-        "env_vars": {
-            "TM_LOG_LEVEL": os.environ.get("TM_LOG_LEVEL", ""),
-            "TM_LOG_TAGS": os.environ.get("TM_LOG_TAGS", ""),
-            "THOUGHTMACHINE_DEBUG": os.environ.get("THOUGHTMACHINE_DEBUG", ""),
-        },
-    }
+    return get_log_config(session_id=None)
 
 
 def _get_logger() -> Optional[object]:
@@ -465,6 +510,10 @@ def log(
     # Validate level
     if level_enum not in LogLevel:
         level_enum = LogLevel.INFO
+    
+    # Track seen tags for config queries
+    if tag:
+        _seen_tags.add(tag)
     
     # Apply early truncation to data
     truncated_data = None
