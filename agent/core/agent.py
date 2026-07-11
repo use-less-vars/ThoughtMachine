@@ -114,7 +114,7 @@ class Agent:
         except Exception as e:
             log('WARNING', 'core.agent', f"Failed to start MCP background registration: {e}")
         self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
-        self.tool_executor = ToolExecutor(self.tool_classes, config, None, self.logger, self.security_available, agent=self, event_bus=event_bus or global_event_bus)
+        self.tool_executor = ToolExecutor(self.tool_classes, config, None, self.logger, self.security_available, agent=self, event_bus=event_bus or global_event_bus, is_worker_context=config.worker_mode)
         self.provider = self.llm_client.provider
         from session.models import RuntimeParams
         self.runtime_params = RuntimeParams(temperature=config.temperature, top_p=None)
@@ -349,7 +349,8 @@ class Agent:
             self.tool_executor.close()
             self.tool_executor = ToolExecutor(
                 self.tool_classes, new_config, None, self.logger,
-                self.security_available, agent=self
+                self.security_available, agent=self,
+                is_worker_context=new_config.worker_mode,
             )
             self.tool_executor.state = self.state
             changed.append(f'enabled_tools={", ".join(new_config.enabled_tools)}')
@@ -449,7 +450,7 @@ class Agent:
             # Rebuild tool_classes and tool_definitions
             self.tool_classes = new_config.get_filtered_tool_classes()
             self.tool_definitions = [model_to_openai_tool(cls) for cls in self.tool_classes]
-            self.tool_executor = ToolExecutor(self.tool_classes, new_config, self.state, old_logger, self.security_available, agent=self)
+            self.tool_executor = ToolExecutor(self.tool_classes, new_config, self.state, old_logger, self.security_available, agent=self, is_worker_context=new_config.worker_mode)
 
             # Rebuild context builder
             self.context_builder = self.llm_client.create_context_builder()

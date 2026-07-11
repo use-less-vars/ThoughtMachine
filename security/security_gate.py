@@ -28,7 +28,7 @@ from thoughtmachine.workspace_capabilities import (
     load_workspace_capabilities,
 )
 from thoughtmachine.security import SessionPermissions, _pending_security_requests, _pending_requests_lock, resolve_security_prompt
-from agent.events import SecurityPromptEvent, EventType, NullEventBus
+from agent.events import SecurityPromptEvent, EventType
 
 # ── Pending-prompt registry ──────────────────────────────────────────────
 
@@ -290,10 +290,11 @@ def check_required_categories(
     tool_name: str,
     tool_args: Dict[str, Any],
     description: str,
-    event_bus: Any,
+    event_bus: Any = None,
     agent_id: str = "0",
     session_id: str = "",
     worker_permissions: Optional[Dict[str, Any]] = None,
+    is_worker_context: bool = False,
 ) -> Tuple[bool, str]:
     """
     Check a tool's required categories against the effective permission dict.
@@ -326,6 +327,9 @@ def check_required_categories(
             which returns the more restrictive of the effective and
             worker value.  If a key exists in *worker_permissions* but
             not in *effective*, the worker value is used as-is.
+        is_worker_context:
+            If True, the call originates from a worker where no interactive
+            user is available — deny immediately without prompting.
 
     Returns:
         ``(True, "")`` if all checks pass.
@@ -371,8 +375,8 @@ def check_required_categories(
     if not prompts_needed:
         return True, ""
 
-    # ── Null / worker event bus: deny immediately without blocking ──────
-    if event_bus is None or isinstance(event_bus, NullEventBus):
+    # ── Worker context (no interactive user): deny immediately without blocking ──
+    if event_bus is None or is_worker_context:
         return False, (
             f"Permission denied: {', '.join(ask_categories)} required by "
             f"'{tool_name}' — no interactive user available for worker prompt approval."

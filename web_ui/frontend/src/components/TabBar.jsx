@@ -32,7 +32,7 @@ function _tabStatusClass(status) {
   }
 }
 
-export default function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onNewTab, onCogwheelClick, runningStates = {} }) {
+export default function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onNewTab, onCogwheelClick, onLoggingClick, runningStates = {} }) {
   if (tabs.length === 0) {
     return null
   }
@@ -64,9 +64,14 @@ export default function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onN
           +
         </button>
       </div>
-      <button className="tab-cogwheel-btn" onClick={onCogwheelClick} title="Session actions">
-        ⚙️
-      </button>
+      <div className="tab-actions">
+        <button className="tab-action-btn" onClick={onCogwheelClick} title="Save session">
+          Save
+        </button>
+        <button className="tab-action-btn" onClick={onLoggingClick} title="Toggle logging panel">
+          Logging
+        </button>
+      </div>
     </div>
   )
 }

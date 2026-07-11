@@ -59,9 +59,11 @@ class AgentConfig(BaseModel):
         'timeout_seconds': HOT_SWAPPABLE,
         'time_monitor_enabled': HOT_SWAPPABLE,
         'time_warning_threshold': HOT_SWAPPABLE,
+        'worker_mode': HOT_SWAPPABLE,
     }
 
     api_key: str = Field(default='', exclude=True)
+    worker_mode: bool = False
     base_url: str = 'https://api.deepseek.com'
     model: str = 'deepseek-reasoner'
     # NOTE: str (not Literal) so that provider plugins registered via

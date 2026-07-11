@@ -646,17 +646,8 @@ export default function App() {
         onNewTab={handleNewTab}
         runningStates={tabRunningStates}
         onCogwheelClick={handleCogwheelClick}
+        onLoggingClick={() => setShowLoggingPanel(prev => !prev)}
       />
-
-      <div className="logging-toolbar">
-        <button
-          className={`logging-toggle-btn ${showLoggingPanel ? 'active' : ''}`}
-          onClick={() => setShowLoggingPanel(prev => !prev)}
-          title="Toggle logging panel"
-        >
-          📋 Logging
-        </button>
-      </div>
 
       <div className="app-main">
         {/* All tabs stay mounted; inactive ones hidden with display:none */}

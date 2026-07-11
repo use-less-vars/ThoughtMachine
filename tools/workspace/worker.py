@@ -87,10 +87,9 @@ except ImportError:
     _NULL_EVENT_BUS = None
 
 try:
-    from agent.events import global_event_bus, create_event, EventType
-    _WORKER_EVENT_BUS = global_event_bus
+    from agent.events import EventBus, create_event, EventType
 except ImportError:
-    _WORKER_EVENT_BUS = None
+    EventBus = None
     create_event = None
     EventType = None
 
@@ -319,12 +318,20 @@ class WorkerThread(threading.Thread):
         self._worker_ctx: Optional[Any] = None
         self._initial_context: Optional[Dict[str, Any]] = None
 
+        # Per-worker EventBus (created lazily in run() before Agent)
+        self._event_bus: Optional[Any] = None
+
         # Inter-thread communication
         self._input_queue: queue.Queue = queue.Queue()
         self._output_queue: queue.Queue = queue.Queue()
         self._stop_event = threading.Event()
 
     # ── public API called from the tool thread ─────────────────────
+
+    @property
+    def event_bus(self):
+        """Return the per-worker EventBus instance."""
+        return self._event_bus
 
     @property
     def max_context_tokens(self) -> int:
@@ -526,6 +533,9 @@ class WorkerThread(threading.Thread):
         if "workspace_path" not in worker_cfg and self._project_root:
             worker_cfg["workspace_path"] = self._project_root
 
+        # Mark config as running inside a worker for security context
+        worker_cfg["worker_mode"] = True
+
         log('DEBUG', 'core.token', f"Worker agent config: token_monitor_warning_threshold={worker_cfg.get('token_monitor_warning_threshold', 'NOT SET')} token_monitor_critical_threshold={worker_cfg.get('token_monitor_critical_threshold', 'NOT SET')} max_turns={worker_cfg.get('max_turns', 'NOT SET')} timeout_seconds={worker_cfg.get('timeout_seconds', 'NOT SET')}")
 
         return AgentConfig(**worker_cfg)
@@ -657,31 +667,6 @@ class WorkerThread(threading.Thread):
                             "token_count": token_count,
                         },
                     )
-                    # Forward to global EventBus so the bridge can send to frontend
-                    if _WORKER_EVENT_BUS is not None:
-                        try:
-                            from agent.events import TokenWarningEvent, EventMetadata, EventType
-                            log('DEBUG', 'tools.worker', f"[TOKEN] Worker publishing TokenWarningEvent: worker_name={self.worker_name} session_id={self.session_id} token_count={token_count}")
-                            _WORKER_EVENT_BUS.publish(TokenWarningEvent(
-                                type=EventType.TOKEN_WARNING,
-                                metadata=EventMetadata(
-                                    source=f"worker:{self.worker_name}",
-                                    session_id=self.session_id,
-                                ),
-                                data={
-                                    "session_id": self.session_id,
-                                    "worker_name": self.worker_name,
-                                    "token_count": token_count,
-                                    "warning_message": str(message)[:500],
-                                    "old_state": "",
-                                    "new_state": "",
-                                },
-                            ))
-                        except Exception:
-                            logger.debug(
-                                "Failed to publish token warning event for worker '%s'",
-                                self.worker_name,
-                            )
 
                 # Log turn warnings as system notifications
                 if event_type == "turn_warning":
@@ -841,10 +826,11 @@ class WorkerThread(threading.Thread):
                         })
                         self._output_queue.put(reply)
                         break
+                    self._event_bus = EventBus()
                     self._agent = Agent(
                         config=agent_cfg,
                         session=self._worker_ctx,
-                        event_bus=_NULL_EVENT_BUS,
+                        event_bus=self._event_bus,
                     )
 
                 # ── Fix 1.2: Set busy before processing query ───────────
@@ -1023,10 +1009,10 @@ class WorkerThread(threading.Thread):
 
     def _publish_event(self, event_type: str, data: dict) -> None:
         """
-        Publish a typed event to the global_event_bus for real-time forwarding
+        Publish a typed event to the worker's own EventBus for real-time forwarding
         to WebSocket clients via the bridge subscriber.
         """
-        if _WORKER_EVENT_BUS is None or create_event is None or EventType is None:
+        if self._event_bus is None or create_event is None or EventType is None:
             return
         try:
             evt_type = EventType(event_type)
@@ -1036,7 +1022,7 @@ class WorkerThread(threading.Thread):
                 source=f'worker:{self.worker_name}',
                 session_id=self.session_id,
             )
-            _WORKER_EVENT_BUS.publish(evt)
+            self._event_bus.publish(evt)
         except Exception as exc:
             logger.debug("Failed to publish worker event '%s': %s", event_type, exc)
 
@@ -1208,8 +1194,8 @@ class Worker(ToolBase):
             tool_name="Worker",
             tool_args={"action": self.action, "worker_name": self.worker_name},
             description=f"Spawn worker '{self.worker_name}'",
-            event_bus=_NULL_EVENT_BUS,
             worker_permissions=worker_perms,
+            is_worker_context=True,
         )
 
         if not ok:
@@ -1395,8 +1381,8 @@ class Worker(ToolBase):
                             f"Worker '{self.worker_name}' footprint validation"
                             f" for {tool_name}"
                         ),
-                        event_bus=_NULL_EVENT_BUS,
                         worker_permissions=worker_perms,
+                        is_worker_context=True,
                     )
                     if not ok:
                         missing_tools.append(

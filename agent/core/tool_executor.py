@@ -61,7 +61,7 @@ DEFAULT_SESSION_PERMISSIONS = {
 class ToolExecutor:
     """Handles tool execution, JSON repair, and tool result processing."""
 
-    def __init__(self, tool_classes, config, state, logger=None, security_available=False, agent=None, event_bus=None):
+    def __init__(self, tool_classes, config, state, logger=None, security_available=False, agent=None, event_bus=None, is_worker_context=False):
         """
         Initialize tool executor.
         
@@ -72,6 +72,7 @@ class ToolExecutor:
             logger: Optional logger instance.
             security_available: Whether security module is available.
             agent: Optional Agent instance for token update callbacks.
+            is_worker_context: Whether this executor runs inside a worker (no interactive user).
         """
         self.tool_classes = tool_classes
         self.config = config
@@ -80,6 +81,7 @@ class ToolExecutor:
         self.security_available = security_available
         self.agent = agent
         self._event_bus = event_bus
+        self._is_worker_context = is_worker_context
 
     def execute_tool_calls(self, tool_calls: List[Dict[str, Any]], add_to_conversation_func, update_token_func=None, agent_id: int = 0, session_id: str = "", turn_transaction: Optional[TurnTransaction]=None) -> Tuple[List[Dict[str, Any]], bool, Optional[Dict[str, Any]], Optional[str], Optional[int]]:
         """
@@ -245,6 +247,7 @@ class ToolExecutor:
                     event_bus=self._event_bus or global_event_bus,
                     agent_id=str(agent_id),
                     session_id=session_id,
+                    is_worker_context=self._is_worker_context,
                 )
                 if not ok:
                     return {'result': error_msg, 'tool_type': 'normal'}
