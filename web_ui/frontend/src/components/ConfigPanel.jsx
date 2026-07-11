@@ -842,11 +842,9 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
             setIsApplying(true);
             setApplyError(null);
             setProviderVersion(0);
-            const prevWorkspacePath = lastAppliedConfig?.workspace_path;
+            // Just send apply_config — the backend detects workspace_path changes
+            // and handles the full project switch internally.
             sendCommand('apply_config', { config: draft });
-            if (draft.workspace_path && prevWorkspacePath !== draft.workspace_path) {
-              sendCommand('set_project', { project: draft.workspace_path });
-            }
           }}
           disabled={!wsConnected || isApplying}
           style={{

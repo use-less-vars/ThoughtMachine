@@ -391,6 +391,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
         if getattr(ws, '_closed', False):
             return
         try:
+
             await ws.send_json(event)
         except (RuntimeError, ConnectionError, AssertionError) as exc:
             # Expected during shutdown or websockets race — mark closed
@@ -565,30 +566,203 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         })
                         continue
 
-                    if bridge is None:
+                    # Detect workspace_path change — the frontend no longer sends
+                    # a separate set_project command; apply_config handles the full
+                    # project switch internally to avoid race conditions.
+                    new_workspace_path = config.get("workspace_path", "") or ""
+                    workspace_changed = (
+                        bool(new_workspace_path)
+                        and new_workspace_path != _project_path
+                    )
+
+                    if workspace_changed:
+                        # ── Full project switch ────────────────────────────────────────────
+                        # The user changed the workspace folder. Save and stop the current
+                        # bridge, resolve the new workspace, then update the EXISTING
+                        # session's workspace_id so the conversation is preserved (no new
+                        # session created, no session_loaded sent to frontend).
+
+                        # 0. Grab reference to the existing session BEFORE stopping the bridge
+                        existing_session = None
+                        if bridge is not None:
+                            existing_session = bridge.session  # may be None if never started
+                            if existing_session is None:
+                                existing_session = bridge._loaded_session
+
+                        # 1. Save current session and stop the bridge
+                        if bridge is not None and bridge.session is not None:
+                            bridge.save_session()
+                        if bridge is not None:
+                            bridge.stop()
+
+                        # 2. Update the per-connection project path
+                        _project_path = new_workspace_path
+
+                        # 3. Create fresh bridge + controller
+                        from agent.controller import AgentController
+                        controller = AgentController()
+                        bridge = WebAgentBridge(session_store=session_store)
+                        bridge.set_event_callback(event_callback, key=id(ws))
+                        bridge.register()
+                        bridge.set_controller(controller)
+
+                        # 4. Resolve or auto-register workspace for the new path
+                        workspace_id = None
+                        try:
+                            from web_ui.backend.bridge import _resolve_workspace_id
+                            resolved = _resolve_workspace_id(_project_path)
+                            if resolved:
+                                workspace_id = resolved
+                                bridge._workspace_id = resolved
+                                log('INFO', 'server',
+                                    f"apply_config: resolved workspace {resolved} for {_project_path}")
+                        except Exception as exc:
+                            log('WARNING', 'server',
+                                f"apply_config: resolve error: {exc}")
+
+                        if not workspace_id:
+                            try:
+                                import uuid
+                                import json as _json
+                                from thoughtmachine.workspace_capabilities import (
+                                    ensure_workspace_dirs, _workspace_dir,
+                                )
+                                new_ws_id = uuid.uuid4().hex
+                                ws_dir = _workspace_dir(new_ws_id)
+                                ws_dir.mkdir(parents=True, exist_ok=True)
+                                config_path = ws_dir / "config.json"
+                                config_path.write_text(
+                                    _json.dumps({"root": str(_project_path)}, indent=2),
+                                    encoding="utf-8",
+                                )
+                                ensure_workspace_dirs(new_ws_id)
+                                workspace_id = new_ws_id
+                                bridge._workspace_id = new_ws_id
+                                log('INFO', 'server',
+                                    f"apply_config: auto-registered workspace {new_ws_id} for {_project_path}")
+                            except Exception as exc:
+                                log('WARNING', 'server',
+                                    f"apply_config: auto-register error: {exc}")
+
+                        # 5. Decide session strategy based on whether the existing session
+                        #    has an actual conversation or not.
+                        #
+                        #    - **Existing session with conversation**: create a NEW session,
+                        #      assign the new workspace, and send session_loaded to the frontend
+                        #      so it opens a fresh tab. The old session+tab stays untouched.
+                        #
+                        #    - **Existing session with NO conversation** (empty/fresh tab):
+                        #      update the existing session's workspace_id in-place so the same
+                        #      tab is reused — no new tab created.
+                        #
+                        #    - **No existing session**: create a fresh one.
+                        from session.models import Session
+                        if existing_session is not None and _session_has_conversation(existing_session):
+                            # Session has real conversation — create new session for new workspace
+                            # (opens a new tab on the frontend via session_loaded)
+                            new_session = Session()
+                            new_session.metadata['source'] = 'web_ui'
+                            if workspace_id:
+                                new_session.workspace_id = workspace_id
+                            new_session.ensure_name()
+                            bridge._loaded_session = new_session
+                            _session_bridges[new_session.session_id] = bridge
+                            session_store.save_session(new_session)
+                            session_store.add_open_session(new_session.session_id)
+                            log('INFO', 'server',
+                                f"apply_config: created new session {new_session.session_id} "
+                                f"for workspace {workspace_id} (existing session {existing_session.session_id} "
+                                f"had conversation, preserved intact)")
+
+                            # Send session_loaded to frontend so it opens a new tab
+                            await ws.send_json({
+                                "type": "session_loaded",
+                                "session_id": new_session.session_id,
+                                "session_name": new_session.metadata.get('name', ''),
+                                "message_count": 0,
+                                "workspace_id": workspace_id or '',
+                            })
+                        elif existing_session is not None:
+                            # No conversation (empty/fresh tab) — update workspace_id in-place
+                            existing_session.workspace_id = workspace_id or ''
+                            bridge._loaded_session = existing_session
+                            _session_bridges[existing_session.session_id] = bridge
+                            session_store.save_session(existing_session)
+                            log('INFO', 'server',
+                                f"apply_config: updated existing session {existing_session.session_id} "
+                                f"to workspace {workspace_id} (no conversation — kept same tab)")
+                        else:
+                            # No prior session — create one (rare: first config on a new conn)
+                            new_session = Session()
+                            new_session.metadata['source'] = 'web_ui'
+                            if workspace_id:
+                                new_session.workspace_id = workspace_id
+                            new_session.ensure_name()
+                            bridge._loaded_session = new_session
+                            _session_bridges[new_session.session_id] = bridge
+                            session_store.save_session(new_session)
+                            session_store.add_open_session(new_session.session_id)
+
+                        # 6. Now apply the config to the NEW bridge
+                        backend_config = _translate_frontend_config(config)
+                        result = bridge.apply_config(backend_config)
+
+                        # 7. Send config_changed + status message.
+                        #    session_loaded was already sent above (step 5) if a new session was
+                        #    created for a conversation-bearing session. For empty sessions that
+                        #    were updated in-place, no session_loaded is needed since the tab
+                        #    is reused.
+                        if result.get("success"):
+                            await ws.send_json({
+                                "type": "config_changed",
+                                "config": _frontend_config_from_bridge(bridge),
+                            })
+                            log('INFO', 'server.config',
+                                f"Config applied after project switch to {_project_path}")
+                        else:
+                            # Config apply failed — still send a default config
+                            # so the frontend doesn't hang with stale state
+                            await ws.send_json({
+                                "type": "config_changed",
+                                "config": _default_frontend_config(),
+                            })
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": f"⚠ Config apply had issues: {result.get('error', 'unknown error')}",
+                            })
+
                         await ws.send_json({
                             "type": "status_message",
-                            "text": "⚠ No active session to configure",
+                            "text": f"✅ Switched to project: {_project_path}",
                         })
-                        continue
 
-                    # Translate frontend format → backend AgentConfig format
-                    backend_config = _translate_frontend_config(config)
 
-                    # Apply via bridge (validates, merges, resolves provider, persists)
-                    result = bridge.apply_config(backend_config)
-
-                    if result.get("success"):
-                        await ws.send_json({
-                            "type": "config_changed",
-                            "config": _frontend_config_from_bridge(bridge),
-                        })
-                        log('INFO', 'server.config', "Config applied and persisted via apply_config")
                     else:
-                        await ws.send_json({
-                            "type": "status_message",
-                            "text": f"⚠ Failed to apply config: {result.get('error', 'unknown error')}",
-                        })
+                        # ── Normal config apply (no workspace change) ──────────────
+                        if bridge is None:
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": "⚠ No active session to configure",
+                            })
+                            continue
+
+                        # Translate frontend format → backend AgentConfig format
+                        backend_config = _translate_frontend_config(config)
+
+                        # Apply via bridge (validates, merges, resolves provider, persists)
+                        result = bridge.apply_config(backend_config)
+
+                        if result.get("success"):
+                            await ws.send_json({
+                                "type": "config_changed",
+                                "config": _frontend_config_from_bridge(bridge),
+                            })
+                            log('INFO', 'server.config', "Config applied and persisted via apply_config")
+                        else:
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": f"⚠ Failed to apply config: {result.get('error', 'unknown error')}",
+                            })
 
                 elif command == "set_default_config":
                     """Save config as the global default.
@@ -1214,6 +1388,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # Persist to session store so the SessionTab can load it
                     # via load_session on its own WS connection.
                     session_store.save_session(new_session)
+                    session_store.add_open_session(new_session.session_id)
 
                     await ws.send_json({
                         "type": "session_loaded",
@@ -1334,6 +1509,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     bridge._loaded_session = new_session
                     _session_bridges[new_session.session_id] = bridge
                     session_store.save_session(new_session)
+                    session_store.add_open_session(new_session.session_id)
 
                     # 6. Send session_loaded and state messages
                     await ws.send_json({
@@ -1661,6 +1837,27 @@ async def root():
 # ══════════════════════════════════════════════════════════════════════════════
 #  Helpers
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _session_has_conversation(session) -> bool:
+    """Check if a session has an actual conversation (user or assistant messages).
+
+    Returns True if any message in user_history has a 'role' of 'user' or 'assistant'.
+    System notifications (role='system') alone do NOT count as a conversation.
+    """
+    if session is None:
+        return False
+    try:
+        history = session.user_history
+        if not history:
+            return False
+        for msg in history:
+            role = msg.get('role', '') if isinstance(msg, dict) else ''
+            if role in ('user', 'assistant'):
+                return True
+        return False
+    except Exception:
+        return False
+
 
 def _translate_frontend_config(fe_config: Dict[str, Any]) -> Dict[str, Any]:
     """
