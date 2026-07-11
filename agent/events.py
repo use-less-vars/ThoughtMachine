@@ -65,6 +65,8 @@ class EventType(enum.Enum):
     WORKER_STATUS = 'worker_status'
     WORKER_COMPLETED = 'worker_completed'
     WORKER_ERROR = 'worker_error'
+    WORKER_MESSAGE = 'worker_message'
+
 
 class EventMetadata(BaseModel):
     """Metadata common to all events."""

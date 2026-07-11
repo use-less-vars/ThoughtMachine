@@ -110,7 +110,9 @@ export default function adaptWorkerEvent(evt) {
       return null
 
     // ── Final response (assistant answer) ──────────────────────────
-    case 'final_response': {
+    case 'final_response':
+    // Worker message (sent via WS as worker:worker_message) — same format
+    case 'worker_message': {
       const resp = evt.response || {}
       return {
         _id: eventId(evt),

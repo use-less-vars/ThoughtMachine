@@ -584,16 +584,12 @@ class WorkerThread(threading.Thread):
                 if event_type == "agent_responded":
                     final_content = event.get("content", "")
                     self._last_reasoning = event.get("reasoning")
-                    # Log final_response event
-                    self._log_event(
-                        "final_response",
-                        {},
-                        {
-                            "content": str(final_content)[:1000],
-                            "reasoning_content": str(self._last_reasoning)[:2000] if self._last_reasoning else None,
-                            "response_type": event.get("response_type", "answer"),
-                        },
-                    )
+                    # Also publish to event bus for real-time WS delivery
+                    self._publish_event("worker_message", {
+                        "content": str(final_content)[:1000],
+                        "reasoning_content": str(self._last_reasoning)[:2000] if self._last_reasoning else None,
+                        "response_type": event.get("response_type", "answer"),
+                    })
 
                 elif event_type == "stopped":
                     stop_reason = event.get("stop_reason", "unknown")
@@ -668,6 +664,7 @@ class WorkerThread(threading.Thread):
                                     session_id=self.session_id,
                                 ),
                                 data={
+                                    "session_id": self.session_id,
                                     "worker_name": self.worker_name,
                                     "token_count": token_count,
                                     "warning_message": str(message)[:500],

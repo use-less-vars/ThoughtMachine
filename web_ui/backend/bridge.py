@@ -46,6 +46,8 @@ import traceback
 import uuid
 from typing import Any, Callable, Dict, List, Optional
 
+import datetime
+
 from agent import Agent
 from agent.config import AgentConfig
 from agent.config.provider_profile import ProviderManager
@@ -58,7 +60,7 @@ try:
     from agent.events import (
         global_event_bus, EventType, SecurityPromptEvent,
         WorkerSpawnedEvent, WorkerStatusEvent, WorkerCompletedEvent, WorkerErrorEvent,
-        TokenWarningEvent,
+        TokenWarningEvent, BaseEvent,
     )
     EVENT_SYSTEM_AVAILABLE = True
 except ImportError:
@@ -298,6 +300,7 @@ class WebAgentBridge:
                     'timestamp': event.metadata.timestamp.isoformat(),
                     'data': data,
                 }
+
                 for cb in list(self._event_callbacks.values()):
                     try:
                         cb(event_dict)
@@ -321,27 +324,38 @@ class WebAgentBridge:
         self._worker_token_warning_sub = global_event_bus.subscribe(
             EventType.TOKEN_WARNING, self._on_worker_token_warning
         )
+        self._worker_message_sub = global_event_bus.subscribe(
+            EventType.WORKER_MESSAGE, _make_handler(BaseEvent)
+        )
+
         log('INFO', 'server.bridge', 'Subscribed to worker lifecycle events')
 
     def _on_worker_token_warning(self, event: TokenWarningEvent) -> None:
         """Forward worker token warnings to the frontend."""
+
         if not self._event_callbacks:
             return
         source = event.metadata.source if event.metadata else ""
         if not source.startswith("worker:"):
+
             return  # only handle worker-sourced warnings
         data = event.data or {}
         # Only forward events for this bridge's session
         if data.get('session_id') and data['session_id'] != self._session_id:
+
             return
         event_dict = {
-            'type': 'worker_system_notification',
+            'type': 'worker:system_notification',
             'worker_name': data.get('worker_name', ''),
             'session_id': event.metadata.session_id if event.metadata else None,
-            'message_type': 'token_warning',
-            'token_count': data.get('token_count', 0),
-            'warning_message': data.get('warning_message', ''),
+            'timestamp': datetime.datetime.now().isoformat(),
+            'response': {
+                'type': 'token_warning',
+                'message': data.get('warning_message', ''),
+                'token_count': data.get('token_count', 0),
+            },
         }
+
         for cb in list(self._event_callbacks.values()):
             try:
                 cb(event_dict)
@@ -369,6 +383,7 @@ class WebAgentBridge:
             ('_worker_completed_sub',),
             ('_worker_error_sub',),
             ('_worker_token_warning_sub',),
+            ('_worker_message_sub',),
         ]
         for attr_name, in worker_subs:
             sub = getattr(self, attr_name, None)
