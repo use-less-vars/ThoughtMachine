@@ -394,8 +394,8 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
         try:
 
             await ws.send_json(event)
-        except (RuntimeError, ConnectionError, AssertionError) as exc:
-            # Expected during shutdown or websockets race — mark closed
+        except (RuntimeError, ConnectionError, AssertionError, WebSocketDisconnect) as exc:
+            # Expected during shutdown, websockets race, or client disconnect — mark closed
             log('DEBUG', 'server.ws', f'send_event skipped (ws closed): {exc}')
             ws._closed = True
         except Exception as exc:
@@ -1643,6 +1643,10 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         "type": "status_message",
                         "text": f"⚠ Unknown command: {command}",
                     })
+            except WebSocketDisconnect:
+                # Client disconnected mid-handling — let outer handler clean up
+                ws._closed = True
+                raise
             except Exception as exc:
                 log('ERROR', 'server.ws', f'FATAL WebSocket error: {exc}')
                 traceback.print_exc()
