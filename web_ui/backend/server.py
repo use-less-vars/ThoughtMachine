@@ -125,6 +125,8 @@ def _get_session_store() -> FileSystemSessionStore:
 from web_ui.backend.workspace_routes import router as workspace_router
 from web_ui.backend.config_routes import router as config_router
 from web_ui.backend.logging_routes import router as logging_router
+from web_ui.backend.health_routes import router as health_router
+
 
 # Ensure project root is on sys.path
 _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -172,6 +174,17 @@ except ImportError:
 async def lifespan(app: FastAPI):
     """Lifespan handler — registers signal handlers for graceful shutdown."""
     log('INFO', 'server', 'ThoughtMachine Web UI server starting ...')
+    # Start EventLogger to persist all events to disk
+    try:
+        from agent.logging.event_logger import EventLogger
+        event_logger = EventLogger()
+        event_logger.start()
+        app.state.event_logger = event_logger
+        log('INFO', 'server', f'EventLogger started: {event_logger.file_path}')
+    except Exception as exc:
+        log('WARNING', 'server', f'EventLogger startup skipped: {exc}')
+        app.state.event_logger = None
+
     # Ensure user ~/.thoughtmachine/ defaults exist before any connection
     try:
         from thoughtmachine.bootstrap import ensure_user_defaults, get_version
@@ -215,6 +228,14 @@ async def lifespan(app: FastAPI):
 
     yield
     log('INFO', 'server', 'Server shutting down.')
+    # Stop EventLogger
+    try:
+        el = getattr(app.state, 'event_logger', None)
+        if el is not None:
+            el.stop()
+            log('INFO', 'server', 'EventLogger stopped.')
+    except Exception as exc:
+        log('WARNING', 'server', f'EventLogger shutdown error: {exc}')
 
 
 # ── Graceful shutdown: save open sessions on Ctrl+C / SIGTERM ───────────────
@@ -714,6 +735,15 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         #    were updated in-place, no session_loaded is needed since the tab
                         #    is reused.
                         if result.get("success"):
+                            # Capture config snapshot for debugging
+                            try:
+                                from agent.logging.config_snapshot import ConfigSnapshot
+                                snapshotter = ConfigSnapshot(_project_path)
+                                cfg = bridge.get_config()
+                                if cfg is not None:
+                                    snapshotter.capture(cfg, label="apply_config_switch")
+                            except Exception:
+                                pass
                             await ws.send_json({
                                 "type": "config_changed",
                                 "config": _frontend_config_from_bridge(bridge),
@@ -754,6 +784,15 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         result = bridge.apply_config(backend_config)
 
                         if result.get("success"):
+                            # Capture config snapshot for debugging
+                            try:
+                                from agent.logging.config_snapshot import ConfigSnapshot
+                                snapshotter = ConfigSnapshot(_project_path)
+                                cfg = bridge.get_config()
+                                if cfg is not None:
+                                    snapshotter.capture(cfg, label="apply_config")
+                            except Exception:
+                                pass
                             await ws.send_json({
                                 "type": "config_changed",
                                 "config": _frontend_config_from_bridge(bridge),
@@ -1695,6 +1734,8 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
 # ── Register REST routers ────────────────────────────────────────────────
 app.include_router(workspace_router)
 app.include_router(config_router)
+app.include_router(health_router)
+
 app.include_router(logging_router)
 
 
