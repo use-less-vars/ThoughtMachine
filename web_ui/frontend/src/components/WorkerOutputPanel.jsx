@@ -418,10 +418,18 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
     if (atBottom) setHasNewEvents(false);
   }, []);
 
-  // Auto-scroll on new events if user was at bottom
+  // Auto-scroll on new events if user was at bottom.
+  // Use double requestAnimationFrame to ensure DOM layout (async syntax highlighting)
+  // is fully settled before measuring scrollHeight.
   useEffect(() => {
     if (isAtBottomRef.current && scrollRef.current && events.length > 0) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (scrollRef.current) {
+            scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+          }
+        });
+      });
     }
   }, [events]);
 
