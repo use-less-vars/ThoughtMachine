@@ -432,6 +432,7 @@ class WebAgentBridge:
         Forward worker spawned event to frontend and subscribe to
         the per-worker EventBus for detailed events.
         """
+        print(f"[BRIDGE DEBUG] _on_worker_spawned CALLED with data: {event.data}", flush=True)
         if not self._event_callbacks:
             return
         data = event.data or {}

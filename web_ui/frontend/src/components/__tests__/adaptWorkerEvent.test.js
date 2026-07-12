@@ -20,7 +20,12 @@ function makeEvent(overrides = {}) {
 }
 
 function eventId(evt) {
-  return (evt.timestamp || '') + (evt.event || '');
+  const parts = [];
+  if (evt.session_id) parts.push(evt.session_id);
+  if (evt.worker_name) parts.push(evt.worker_name);
+  if (evt.timestamp) parts.push(evt.timestamp);
+  parts.push(evt.event || '');
+  return parts.join('_');
 }
 
 // ==========================================================================
@@ -694,10 +699,10 @@ describe('unknown event type', () => {
 // Edge cases: _id generation
 // ==========================================================================
 describe('_id generation', () => {
-  it('concatenates timestamp and event name', () => {
+  it('concatenates timestamp and event name with underscore separator', () => {
     const evt = makeEvent({ event: 'started' });
     const result = adaptWorkerEvent(evt);
-    expect(result._id).toBe('2026-07-09T12:00:00.000Zstarted');
+    expect(result._id).toBe('2026-07-09T12:00:00.000Z_started');
   });
 
   it('handles missing timestamp', () => {
@@ -711,5 +716,26 @@ describe('_id generation', () => {
     const evt = makeEvent({ event: 'started', timestamp: '' });
     const result = adaptWorkerEvent(evt);
     expect(result._id).toBe('started');
+  });
+
+  it('includes session_id and worker_name when present', () => {
+    const evt = makeEvent({
+      event: 'worker_message',
+      session_id: 'sess_abc123',
+      worker_name: 'my-worker',
+      response: { content: 'Hello' },
+    });
+    const result = adaptWorkerEvent(evt);
+    expect(result._id).toBe('sess_abc123_my-worker_2026-07-09T12:00:00.000Z_worker_message');
+  });
+
+  it('includes only session_id when worker_name is absent', () => {
+    const evt = makeEvent({
+      event: 'tool_call',
+      session_id: 'sess_xyz',
+      request: { tool: 'read' },
+    });
+    const result = adaptWorkerEvent(evt);
+    expect(result._id).toBe('sess_xyz_2026-07-09T12:00:00.000Z_tool_call');
   });
 });

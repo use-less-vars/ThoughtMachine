@@ -31,8 +31,8 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Optional
-from pydantic import Field
+from typing import Any, ClassVar, Dict, List, Optional, Union
+from pydantic import Field, field_validator
 
 from tools.base import ToolBase
 from tools.utils import model_to_openai_tool
@@ -884,21 +884,20 @@ class WorkerThread(threading.Thread):
                     # Signal bridge via global bus so it can subscribe to per-worker bus
                     if global_event_bus is not None and EventType is not None and create_event is not None:
                         try:
-                            from agent.events import EventMetadata
+                            print(f"[WORKER DEBUG] About to publish WORKER_SPAWNED to global bus: session_id={self.session_id}, worker_name={self.worker_name}", flush=True)
                             evt = create_event(
                                 EventType.WORKER_SPAWNED,
-                                metadata=EventMetadata(
-                                    source=f"worker:{self.worker_name}",
-                                    session_id=self.session_id or "",
-                                ),
+                                source=f"worker:{self.worker_name}",
+                                session_id=self.session_id or "",
                                 data={
                                     "session_id": self.session_id or "",
                                     "worker_name": self.worker_name,
                                 },
                             )
                             global_event_bus.publish(evt)
-                        except Exception:
-                            pass
+                            print(f"[WORKER DEBUG] WORKER_SPAWNED published successfully", flush=True)
+                        except Exception as exc:
+                            print(f"[WORKER DEBUG] FAILED to publish WORKER_SPAWNED: {exc}", flush=True)
                     self._agent = Agent(
                         config=agent_cfg,
                         session=self._worker_ctx,
@@ -1205,13 +1204,14 @@ class Worker(ToolBase):
         "BLOCKS until the worker responds.",
     )
 
-    context: Optional[Dict] = Field(
+    context: Optional[Union[Dict, str]] = Field(
         default=None,
         description="Optional context dict passed only on action='spawn'. "
         "If this dict includes a 'query' key (e.g., {'query': 'Review src/'}), "
         "the worker executes that task immediately and the spawn call BLOCKS "
         "until the worker finishes. The 'query' value becomes the worker's "
-        "first instruction. Other keys (e.g., config) are passed as metadata.",
+        "first instruction. Other keys (e.g., config) are passed as metadata. "
+        "You may also pass a plain string, which will be treated as the query.",
     )
 
     timeout_seconds: Optional[int] = Field(
@@ -1233,6 +1233,15 @@ class Worker(ToolBase):
     skip_output_truncation: ClassVar[bool] = True
 
     VALID_ACTIONS: ClassVar[list[str]] = ["list", "spawn", "check", "query", "stop"]
+
+    # ── Pydantic v2 validator: coerce plain string context to {"query": ...} ──
+    @field_validator('context', mode='before')
+    @classmethod
+    def coerce_context(cls, v: Any) -> Any:
+        """If the LLM passes a plain string as context, wrap it as a query dict."""
+        if isinstance(v, str):
+            return {"query": v}
+        return v
 
     # ------------------------------------------------------------------
     def execute(self) -> str:

@@ -20,11 +20,17 @@ const WORKER_STOPPED_TEXT = '⏹ Worker stopped'
 const UNKNOWN_EVENT_TEXT = 'Unknown event: '
 
 /**
- * Build a unique ID for deduplication, matching the pattern used in
- * WorkerOutputPanel's fetchEvents (timestamp + event).
+ * Build a unique ID for deduplication.
+ * Includes session_id and worker_name when available so events from
+ * different spawns / workers don't collide.
  */
 function eventId(evt) {
-  return (evt.timestamp || '') + (evt.event || '')
+  const parts = []
+  if (evt.session_id) parts.push(evt.session_id)
+  if (evt.worker_name) parts.push(evt.worker_name)
+  if (evt.timestamp) parts.push(evt.timestamp)
+  parts.push(evt.event || '')
+  return parts.join('_')
 }
 
 /**

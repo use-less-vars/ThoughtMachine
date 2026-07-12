@@ -180,27 +180,16 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
   // ── Merge incoming WS events (from bridge via SessionTab) ────────────
   // Filter by worker name so cross-session WS events are correctly routed
   useEffect(() => {
-    // DIAG: log all incoming events, even empty
-    console.warn('[DIAG WorkerOutputPanel] incomingEvents useEffect fired:', {
-      incomingEventsCount: incomingEvents?.length,
-      workerName,
-      workspaceId,
-      sessionId,
-    })
     if (!incomingEvents || incomingEvents.length === 0) {
-      console.warn('[DIAG WorkerOutputPanel] incomingEvents is empty, skipping')
       return
     }
 
-    console.warn('[DIAG WorkerOutputPanel] incomingEvents types:', incomingEvents.map(e => e.type))
     const relevantEvents = incomingEvents.filter(e => {
       const evtWorkerName = e.worker_name || e.response?.worker_name
       return !evtWorkerName || evtWorkerName === workerName
     })
 
-    console.warn('[DIAG WorkerOutputPanel] relevantEvents after filter:', relevantEvents.length, 'for worker', workerName)
     if (relevantEvents.length === 0) return
-    console.log('[WorkerOutputPanel] WS incomingEvents:', relevantEvents.length, 'events for', workerName, relevantEvents.map(e=>e.type).join(','));
 
     // Also update live workerInfo status from WS events (instant, no poll lag)
     for (const e of relevantEvents) {
@@ -234,7 +223,13 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
     }
 
     setEvents(prev => {
-      const existingKeys = new Set(prev.map(e => e.event + (e.timestamp || '')))
+      // Build dedup key from stored events, mapping stored event names back
+      // to incoming event types (e.g. 'worker_message' -> 'assistant_message')
+      // so that WS events don't get added twice when the bridge re-sends them.
+      const existingKeys = new Set(prev.map(e => {
+        const mappedEvent = e.event === 'worker_message' ? 'assistant_message' : e.event
+        return mappedEvent + (e.timestamp || '')
+      }))
       const newOnes = relevantEvents
         .filter(e => !existingKeys.has((e.type?.replace('worker:', '') || '') + (e.timestamp || '')))
         .map(e => {
@@ -328,8 +323,15 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
         if (Array.isArray(data) && data.length > 0) {
           console.log('[WorkerOutputPanel] fetched', data.length, 'events for', workerName, 'types:', data.map(e=>e.event).join(','));
           setEvents((prev) => {
-            const existingTimestamps = new Set(prev.map((e) => e.timestamp + e.event));
-            const newEntries = data.filter((e) => !existingTimestamps.has(e.timestamp + e.event));
+            // Normalise event names for dedup: 'worker_message' (WS) and 'final_response' (fetch)
+            // represent the same logical event. Map both to a common key to avoid duplication.
+            const normalizeEvent = (event) => {
+              if (event === 'worker_message') return 'final_response'
+              if (event === 'final_response') return 'final_response'
+              return event
+            }
+            const existingTimestamps = new Set(prev.map((e) => e.timestamp + normalizeEvent(e.event)));
+            const newEntries = data.filter((e) => !existingTimestamps.has(e.timestamp + normalizeEvent(e.event)));
             if (newEntries.length === 0) return prev;
             // Only mark "has new events" if user is not at bottom
             if (!isAtBottomRef.current) setHasNewEvents(true);
@@ -555,7 +557,9 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
               }
             }
             if (!msg) return null;  // suppress events like user_message / query
-            const key = msg._id || (evt.timestamp + evt.event + idx);
+            // Use a robust unique key: _id (or fallback) + index + a session counter
+            // This ensures no duplicate key warnings even if dedup misses.
+            const key = (msg._id || evt.timestamp + '_' + evt.event) + '_' + idx;
             return (
               <div key={key} className="worker-event-row">
                 <span className="worker-event-timestamp">

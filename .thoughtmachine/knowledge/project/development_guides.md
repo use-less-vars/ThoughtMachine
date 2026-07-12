@@ -908,3 +908,30 @@ Every new event type must be added to every layer of the pipeline. Missing any s
 - If `status="ready"` and `alive=True`, the worker is ready for a follow-up `query`
 - If `status="stopped"` or `alive=False`, need to `spawn` fresh
 
+
+## 2026-07-12 — ## 2026-07-12: Backend Startup Issue Fixed
+
+**Problem:** Fas...
+
+## 2026-07-12: Backend Startup Issue Fixed
+
+**Problem:** FastAPI backend (web_ui/backend/server.py) was not running. Frontend (Vite on :5173) showed:
+1. WebSocket connection failure to ws://localhost:8000/ws
+2. CORS error on GET /api/logging/config (actually caused by backend being unreachable)
+3. "Backend seems not running" - this was correct
+
+**Root Cause:** Backend process was not started. Missing Python dependencies (`fast_json_repair`, `libcst`, `tiktoken` and many others from requirements.txt).
+
+**Fix Applied:**
+1. Installed all missing dependencies: `pip3 install -r requirements.txt`
+2. Started backend: `python3 -m web_ui.backend.server --host 0.0.0.0 --port 8000`
+
+**Verification:**
+- Server listening on 0.0.0.0:8000 (confirmed via /proc/net/tcp)
+- GET /api/logging/config → HTTP 200 with proper response
+- CORS headers properly configured (allow_origins=["*"]), verified returning `access-control-allow-origin: http://localhost:5173`
+- WebSocket route @app.websocket("/ws") is properly defined in server.py
+- Vite proxy config correctly proxies /ws and /api to localhost:8000
+
+**Note:** The CORS error "CORS request did not succeed" was misleading — it was actually a connection refused error because no server was listening on port 8000.
+
