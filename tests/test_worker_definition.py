@@ -35,7 +35,7 @@ class TestTemplates:
         data = json.loads((TEMPLATE_DIR / "default.json").read_text())
         wd = WorkerDefinition.model_validate(data)
         assert wd.name == "default"
-        assert wd.worker_permissions == {}
+        assert wd.permission_footprint == {}
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +50,7 @@ def valid_kwargs() -> dict:
         "description": "Reviews pull requests for style and correctness.",
         "system_prompt": "You are a code reviewer. Be concise.\n",
         "tools": ["FileEditor", "GlobTool", "Respond"],
-        "worker_permissions": {"filesystem": "read"},
+        "permission_footprint": {"filesystem": "read"},
     }
 
 
@@ -66,7 +66,7 @@ class TestValidInstantiation:
         assert wd.description == "Reviews pull requests for style and correctness."
         assert wd.system_prompt == "You are a code reviewer. Be concise.\n"
         assert wd.tools == ["FileEditor", "GlobTool", "Respond"]
-        assert wd.worker_permissions == {"filesystem": "read"}
+        assert wd.permission_footprint == {"filesystem": "read"}
 
     def test_all_optional_fields_default_to_none(self, valid_kwargs):
         """Optional fields not provided default to None."""

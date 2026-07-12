@@ -293,7 +293,7 @@ def check_required_categories(
     event_bus: Any = None,
     agent_id: str = "0",
     session_id: str = "",
-    worker_permissions: Optional[Dict[str, Any]] = None,
+    permission_footprint: Optional[Dict[str, Any]] = None,
     is_worker_context: bool = False,
 ) -> Tuple[bool, str]:
     """
@@ -318,14 +318,14 @@ def check_required_categories(
             Agent identifier string (for prompt context).
         session_id:
             Session identifier (for prompt context).
-        worker_permissions:
+        permission_footprint:
             Optional dict of worker-level permission overrides using the
             same string hierarchy as session/workspace permissions
             (e.g. ``{"network": "read", "filesystem": "banned"}``).
             Each value is a string level (``"banned"``, ``"read"``,
             ``"write"``, ``"full"``).  Applied via ``_min_permission``
             which returns the more restrictive of the effective and
-            worker value.  If a key exists in *worker_permissions* but
+            worker value.  If a key exists in *permission_footprint* but
             not in *effective*, the worker value is used as-is.
         is_worker_context:
             If True, the call originates from a worker where no interactive
@@ -338,8 +338,8 @@ def check_required_categories(
     PROMPT_TIMEOUT = 120.0
 
     # ── Apply worker-level restrictions ─────────────────────────────────
-    if worker_permissions is not None:
-        for category, worker_val in worker_permissions.items():
+    if permission_footprint is not None:
+        for category, worker_val in permission_footprint.items():
             if category in effective:
                 effective[category] = _min_permission(
                     effective[category], worker_val

@@ -224,7 +224,7 @@ class TestWorkerPermissionsMergeIntegration:
         session_perms = {"container": True, "filesystem": "write"}
         definition = {
             "name": "test-worker",
-            "worker_permissions": {"filesystem": "read", "execution": "deny"},
+            "permission_footprint": {"filesystem": "read", "execution": "deny"},
         }
         wt = make_worker_thread(definition, session_perms)
 
@@ -239,8 +239,8 @@ class TestWorkerPermissionsMergeIntegration:
             "execution": "deny",
         }, f"Expected filesystem=read (worker stricter), got {merged}"
 
-    def test_worker_permissions_key(self, _mock_agent_config):
-        """'worker_permissions' key is used when 'permission_footprint' not present."""
+    def test_backward_compat_worker_permissions_key(self, _mock_agent_config):
+        """'worker_permissions' key (backward compat) is used when 'permission_footprint' not present."""
         session_perms = {"container": False, "filesystem": "read"}
         definition = {
             "name": "test-worker",
@@ -259,8 +259,8 @@ class TestWorkerPermissionsMergeIntegration:
             "execution": "deny",
         }, f"Expected filesystem=none (worker stricter), got {merged}"
 
-    def test_no_worker_permissions(self, _mock_agent_config):
-        """When worker has neither key, session permissions pass through unchanged."""
+    def test_no_permission_footprint(self, _mock_agent_config):
+        """When worker has neither permission_footprint nor worker_permissions, session permissions pass through unchanged."""
         session_perms = {"container": False, "filesystem": "read"}
         definition = {"name": "test-worker"}
         wt = make_worker_thread(definition, session_perms)
@@ -280,7 +280,7 @@ class TestWorkerPermissionsMergeIntegration:
         session_perms = {"filesystem": "read"}
         definition = {
             "name": "test-worker",
-            "worker_permissions": {"execution": "allow"},
+            "permission_footprint": {"execution": "allow"},
         }
         wt = make_worker_thread(definition, session_perms)
 

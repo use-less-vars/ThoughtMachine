@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class WorkerDefinition(BaseModel):
@@ -21,6 +21,8 @@ class WorkerDefinition(BaseModel):
     ``max_turns``, etc.) default to ``None``, meaning the value is inherited
     from the spawning session at spawn time.
     """
+
+    model_config = ConfigDict(populate_by_name=True)
 
     name: str = Field(
         description="Unique name for this worker definition."
@@ -34,7 +36,8 @@ class WorkerDefinition(BaseModel):
     tools: list[str] = Field(
         description="List of tool names this worker is allowed to call."
     )
-    worker_permissions: dict[str, str] = Field(
+    permission_footprint: dict[str, str] = Field(
+        alias="worker_permissions",
         description=(
             'Permission categories required by this worker, e.g. '
             '``{"filesystem": "read"}``.'

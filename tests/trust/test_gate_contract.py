@@ -288,16 +288,16 @@ class TestGetExpectedContainerConfig:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  Worker-permissions overlay on check_required_categories
+#  Permission-footprint overlay on check_required_categories
 # ══════════════════════════════════════════════════════════════════════════
 
 
-class TestCheckRequiredCategoriesWorkerPermissions:
+class TestCheckRequiredCategoriesPermissionFootprint:
     """
-    Verify that the optional ``worker_permissions`` dict further restricts
+    Verify that the optional ``permission_footprint`` dict further restricts
     the effective permission dict using string-level permission values.
 
-    ``worker_permissions`` uses the same string hierarchy as session/workspace
+    ``permission_footprint`` uses the same string hierarchy as session/workspace
     permissions (``"banned"``, ``"read"``, ``"write"``, ``"full"``).
     ``_min_permission`` compares levels and returns the more restrictive one.
     """
@@ -316,7 +316,7 @@ class TestCheckRequiredCategoriesWorkerPermissions:
             {},
             "",
             None,
-            worker_permissions={"network": "read"},
+            permission_footprint={"network": "read"},
         )
         assert ok is True, f"network:read should still be allowed: {msg}"
 
@@ -328,12 +328,12 @@ class TestCheckRequiredCategoriesWorkerPermissions:
             {},
             "",
             None,
-            worker_permissions={"network": "read"},
+            permission_footprint={"network": "read"},
         )
         assert ok2 is False, msg2
         assert "denied" in msg2.lower()
 
-        # filesystem:write should still pass (not in worker_permissions)
+        # filesystem:write should still pass (not in permission_footprint)
         ok3, _ = check_required_categories(
             ["filesystem:write"],
             {"network": "write", "filesystem": "write"},
@@ -341,7 +341,7 @@ class TestCheckRequiredCategoriesWorkerPermissions:
             {},
             "",
             None,
-            worker_permissions={"network": "read"},
+            permission_footprint={"network": "read"},
         )
         assert ok3 is True
 
@@ -357,7 +357,7 @@ class TestCheckRequiredCategoriesWorkerPermissions:
             {},
             "",
             None,
-            worker_permissions={"filesystem": "banned"},
+            permission_footprint={"filesystem": "banned"},
         )
         assert ok is False
         assert "denied" in msg.lower()
@@ -373,7 +373,7 @@ class TestCheckRequiredCategoriesWorkerPermissions:
             {},
             "",
             None,
-            worker_permissions={"filesystem": "write"},
+            permission_footprint={"filesystem": "write"},
         )
         assert ok is True
 
@@ -385,7 +385,7 @@ class TestCheckRequiredCategoriesWorkerPermissions:
             {},
             "",
             None,
-            worker_permissions={"filesystem": "read"},
+            permission_footprint={"filesystem": "read"},
         )
         assert ok2 is True
 
@@ -402,19 +402,19 @@ class TestCheckRequiredCategoriesWorkerPermissions:
 
         # network:read still allowed
         ok, _ = check_required_categories(
-            ["network:read"], eff, "Tool", {}, "", None, worker_permissions=wp
+            ["network:read"], eff, "Tool", {}, "", None, permission_footprint=wp
         )
         assert ok is True
 
         # network:write denied (read < write)
         ok2, msg2 = check_required_categories(
-            ["network:write"], eff, "Tool", {}, "", None, worker_permissions=wp
+            ["network:write"], eff, "Tool", {}, "", None, permission_footprint=wp
         )
         assert ok2 is False, msg2
 
         # filesystem:read denied (banned)
         ok3, msg3 = check_required_categories(
-            ["filesystem:read"], eff, "Tool", {}, "", None, worker_permissions=wp
+            ["filesystem:read"], eff, "Tool", {}, "", None, permission_footprint=wp
         )
         assert ok3 is False, msg3
 
@@ -433,19 +433,19 @@ class TestCheckRequiredCategoriesWorkerPermissions:
 
         # filesystem:write still passes (not in worker)
         ok, _ = check_required_categories(
-            ["filesystem:write"], eff, "Tool", {}, "", None, worker_permissions=wp
+            ["filesystem:write"], eff, "Tool", {}, "", None, permission_footprint=wp
         )
         assert ok is True
 
         # network:true still passes
         ok2, _ = check_required_categories(
-            ["network:true"], eff, "Tool", {}, "", None, worker_permissions=wp
+            ["network:true"], eff, "Tool", {}, "", None, permission_footprint=wp
         )
         assert ok2 is True
 
         # execution:write now denied (worker narrowed to read)
         ok3, msg3 = check_required_categories(
-            ["execution:write"], eff, "Tool", {}, "", None, worker_permissions=wp
+            ["execution:write"], eff, "Tool", {}, "", None, permission_footprint=wp
         )
         assert ok3 is False, msg3
         assert "denied" in msg3.lower()

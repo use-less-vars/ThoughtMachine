@@ -184,10 +184,10 @@ class TestNullEventBusIntegration:
         assert "filesystem:write" in msg
         assert "network:true" in msg
 
-    def test_worker_permissions_still_apply_before_null_bus_check(self):
+    def test_permission_footprint_still_apply_before_null_bus_check(self):
         """
         Worker permissions are applied *before* the NullEventBus early-exit,
-        so if worker_permissions make the required access impossible, the
+        so if permission_footprint makes the required access impossible, the
         gate returns a plain deny (not the NullEventBus message).
         """
         eff = {"network": "write"}  # normally fine
@@ -200,7 +200,7 @@ class TestNullEventBusIntegration:
             {},
             "",
             bus,
-            worker_permissions={"network": "read"},
+            permission_footprint={"network": "read"},
         )
         # network:write is narrowed to read → denied straight away
         assert ok is False

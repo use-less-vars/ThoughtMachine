@@ -57,7 +57,7 @@ def _valid_default_entry() -> Dict[str, Any]:
         "description": "Default general-purpose worker with no restrictions.",
         "system_prompt": "You are a capable autonomous sub-agent.\n",
         "tools": [],
-        "worker_permissions": {},
+        "permission_footprint": {},
     }
 
 
@@ -94,7 +94,7 @@ class TestGetTemplates:
             assert wd.description is not None
             assert wd.system_prompt is not None
             assert wd.tools is not None
-            assert wd.worker_permissions is not None
+            assert wd.permission_footprint is not None
 
     def test_returns_valid_jsons_only_skips_invalid(self, client, tmp_path):
         """When the user directory contains a mix of valid and invalid JSON,
