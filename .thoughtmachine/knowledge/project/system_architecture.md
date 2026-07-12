@@ -3509,3 +3509,153 @@ The system has **two completely separate event paths** that converge at the Brid
 **Risk:** If WebSocket events are lost, polling may show stale data. If both paths deliver the same data, the frontend may show duplicates.
 **Suggestion:** Document when polling is activated and ensure deduplication logic exists.
 
+## Worker System Architecture
+
+## 2026-07-12 — ## Worker Context Accumulation — Investigation (2026-07-12)
+...
+
+## Worker Context Accumulation — Investigation (2026-07-12)
+
+**Bug report context was lost during summarization.** Re-investigated the worker system to understand how context persists across queries.
+
+### Architecture Summary
+
+**File:** `tools/workspace/worker.py` (1,935 lines, ~82KB)
+
+1. **Worker class (ToolBase)** — Lines 1207-1935. Registered in `TOOL_CLASSES`. Actions: spawn, check, query, stop, list.
+
+2. **WorkerThread class** — Lines 507-1200. A `threading.Thread` with a persistent event loop:
+   - `run()` (line ~1030): loops on `_input_queue.get(timeout=2.0)`
+   - Creates Agent lazily on first query (reused for subsequent queries)
+   - Uses `WorkerContext` (from `agent/core/worker_context.py`) as a Session surrogate
+   - Persists context to `<workspace_dir>/workers/<name>/context.json`
+
+3. **Spawn flow** (`_action_spawn`, line 1458):
+   - Creates `WorkerThread`, sets `_initial_context`, starts thread
+   - When `context` is provided: deletes stale `context.json` (lines 1620-1623) for a fresh start
+   - If context has `"query"` key: auto-queues it and waits for response (lines 1650-1678)
+   - Registers thread in `_worker_registry` with key `(session_key, worker_name)`
+
+4. **Query flow** (`_action_query`, line 1759):
+   - Looks up thread by `(session_key, worker_name)` in `_worker_registry`
+   - Calls `thread.send_query()` → puts query on `_input_queue` → blocks on `_output_queue`
+   - Thread's event loop picks up query, processes it with the SAME Agent + WorkerContext
+
+5. **Context persistence:**
+   - `_load_context()` (line 1055): reads `context.json` → `WorkerContext.from_persistable_dict()`
+   - `_save_context()` (line 1113): writes to `context.json` atomically (temp file + rename)
+   - Context saved at end of `run()` in `finally` block and on `stop()`
+
+### Key Finding: Context Accumulates Across Queries
+
+When the main agent calls:
+1. `Worker(action="spawn", worker_name="default", context={"query": "do X"})` → spawns thread, fresh WorkerContext, processes query, thread stays alive
+2. `Worker(action="query", worker_name="default", worker_query="now do Y")` → **same thread**, **same Agent**, **same WorkerContext** → context accumulates
+
+The registry key `(session_id, worker_name)` prevents duplicate spawns sharing the same key.
+
+### Not Yet Investigated
+- How `agent/core/agent.py` processes queries with WorkerContext (the actual context accumulation mechanism at the Agent level)
+- The specific bug from the original report (text was lost during summarization)
+- Whether CheckSystem uses a different worker mechanism
+
+
+## 2026-07-12 — ## System Notification Event Flow
+
+### Agent-side (agent/cor...
+
+## System Notification Event Flow
+
+### Agent-side (agent/core/agent.py)
+The agent does **NOT** yield `system_notification` type events from `process_query()`. Instead, system notifications are injected as `Message` objects with:
+- `role='user'`
+- `content='[SYSTEM NOTIFICATION] ...'`
+- `is_system_notification=True` (dict key)
+
+**Injection sites:**
+1. **Token warnings** (line 671): Buffered in `_pending_warnings`, flushed after `turn_transaction.commit()` (line 1183-1186)
+2. **Turn warnings** (line 890): Direct `_add_to_conversation()` call during turn state update
+3. **Time warnings** (line 872): Direct `_add_to_conversation()` call during time state update
+4. **Config changes** (line 299): Direct `_add_to_conversation()` call
+5. **Config change failures** (line 780): Direct `_add_to_conversation()` call
+6. **LLM errors** (lines 1037, 1055, 1070, 1083): In error handlers for token_limit, rate_limit, provider_error, unexpected_error
+7. **Post-summarization** (lines 1328, 1380): `context_cleared_msg` appended to user_history
+
+### Worker-side (tools/workspace/worker.py)
+Worker uses typed EventBus events:
+- **Per-worker EventBus**: tool_call, tool_result, token_warning, worker_message, assistant_message
+- **Global EventBus**: WORKER_SPAWNED, WORKER_STATUS, WORKER_COMPLETED, WORKER_ERROR, TOKEN_WARNING, WORKER_MESSAGE, SECURITY_PROMPT
+- TOKEN_WARNING on global bus is forwarded as `worker:system_notification` if source starts with 'worker:'
+
+### Bridge (web_ui/backend/bridge.py)
+Two event paths:
+1. **Main Agent**: Generator iteration → `_map_and_emit()` → re-reads Session.user_history → sends `conversation_changed` events
+2. **Worker Agent**: EventBus subscriptions → typed event handlers → `_emit()` → sends `worker:{type}` events
+
+### Frontend (SessionTab.jsx)
+Detects `'worker:*'` prefix → dispatches to WorkerOutputPanel. Handles: tool_call, tool_result, token_warning, turn_warning, time_warning, assistant_message, worker_spawned, worker_status, worker_completed, worker_error, system_notification, user_message, worker_message.
+
+## 2026-07-12 — ## Worker Lifecycle — Complete End-to-End Flow
+
+### Architec...
+
+## Worker Lifecycle — Complete End-to-End Flow
+
+### Architecture Overview
+The worker system has **3 layers**:
+1. **Frontend (React):** Sends `start_session`/`continue_session` — NEVER sends `worker:spawn`/`worker:query` directly
+2. **Backend Bridge + Server:** Handles WS commands, creates Agent session, subscribes to worker events from global_event_bus
+3. **Worker Tool + WorkerThread:** The main agent's `Worker` tool (in tools/workspace/worker.py) spawns/checks/queries worker threads
+
+### Data Flow
+```
+User types message
+  → QueryBar.jsx: sends 'start_session' or 'continue_session' via WebSocket
+  → server.py: routes to bridge.start() or bridge.continue_session()
+  → bridge.py: creates AgentController + Agent, runs process_query()
+  → Agent (main agent): when it decides to delegate, calls Worker tool
+  → Worker.execute() (tools/workspace/worker.py):
+      - action="spawn": creates WorkerThread, registers in _worker_registry
+      - action="query": thread.send_query() blocks until response
+  → WorkerThread.run(): creates its own Agent in a daemon thread
+      - Uses own WorkerContext persisted to <workspace_dir>/workers/<session_id>/<name>/context.json
+      - Runs _run_tool_loop() for each query
+      - Publishes events to per-worker EventBus + global_event_bus
+  → bridge.py: subscribed to global_event_bus, forwards worker:* events to frontend
+  → WorkerOutputPanel.jsx: displays worker output events
+```
+
+### Key Components
+
+**WorkerThread (tools/workspace/worker.py):**
+- Daemon thread with its own Agent instance
+- Inter-thread communication: `_input_queue` (receive queries) + `_output_queue` (return responses)
+- Lifecycle: ready → busy → ready (per query), or → completed/error
+- Context persisted at `<workspace_dir>/workers/<session_id>/<name>/context.json`
+- On `run()`: loads context from disk, creates WorkerContext, merges _initial_context
+- Agent created lazily on first query
+- Publishes WORKER_SPAWNED, WORKER_STATUS, WORKER_COMPLETED, WORKER_ERROR to global_event_bus
+
+**Worker class (ToolBase subclass):**
+- Actions: list, spawn, check, query, stop
+- `_action_spawn()`: finds definition in workers.json, builds agent config, creates WorkerThread, optionally waits for auto-query result
+- `_action_query()`: calls thread.send_query(), blocks for response
+- Threads registered in `_worker_registry` keyed by `(session_id, worker_name)`
+- Workers excluded from spawning other workers (Worker in blocklist)
+
+**bridge.py:**
+- `_subscribe_to_worker_events()`: subscribes to WORKER_SPAWNED, WORKER_STATUS, WORKER_COMPLETED, WORKER_ERROR, TOKEN_WARNING, WORKER_MESSAGE on global_event_bus
+- Forwards events as worker:* type messages to frontend WebSocket
+- `close_session()` calls `shutdown_workers()` to persist contexts
+
+### Worker Context Persistence
+- Directory: `<workspace_dir>/workers/<session_id>/<worker_name>/`
+- Files: context.json, status.json, command.json (for external stop)
+- _load_context(): reads context.json, deserializes via WorkerContext.from_persistable_dict()
+- _save_context(): atomic write via tempfile+os.replace
+
+### Session ID Flow
+- SessionTab creates a new session_id (or loads existing) via WebSocket
+- Server creates Session model, stores it, passes to bridge
+- Bridge holds _session_id and passes it to Worker tool via session_id field
+- WorkerThread creates directory: workspace_dir/workers/<session_id>/<name>/
