@@ -458,6 +458,12 @@ class WebAgentBridge:
             worker_bus = get_worker_event_bus(session_id, worker_name)
             if worker_bus is not None:
                 self._subscribe_to_worker_bus(worker_name, worker_bus)
+            else:
+                log('WARNING', 'server.bridge',
+                    f'Per-worker EventBus for {worker_name} (session={session_id}) not found '
+                    f'— detailed events (tool_call, tool_result, assistant_message) '
+                    f'will NOT be forwarded to the frontend. '
+                    f'This may be a race condition: worker bus registered before bridge subscribes.')
 
     def _subscribe_to_worker_bus(self, worker_name: str, worker_bus: Any) -> None:
         """
@@ -472,6 +478,9 @@ class WebAgentBridge:
         def _make_bus_handler(original_type: str):
             def _handler(event: Any) -> None:
                 if not self._event_callbacks:
+                    log('WARNING', 'server.bridge',
+                        f'[DIAG] Per-worker bus handler for {worker_name}/{original_type}: '
+                        f'NO event_callbacks registered, dropping event')
                     return
                 data = event.data or {}
                 event_dict = {
@@ -484,6 +493,12 @@ class WebAgentBridge:
                     ),
                     'data': data,
                 }
+                log('WARNING', 'server.bridge',
+                    f'[DIAG] Per-worker bus handler for {worker_name}/{original_type}: '
+                    f'forwarding event_dict type={event_dict.get("type")} '
+                    f'worker_name={event_dict.get("worker_name")} '
+                    f'event_keys={list(data.keys())} '
+                    f'n_callbacks={len(self._event_callbacks)}')
                 for cb in list(self._event_callbacks.values()):
                     try:
                         cb(event_dict)

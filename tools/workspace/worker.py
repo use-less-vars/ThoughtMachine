@@ -669,6 +669,10 @@ class WorkerThread(threading.Thread):
                         {"tool": tool_name, "args": arguments},
                         {},
                     )
+                    self._publish_event("tool_call", {
+                        "tool_name": tool_name,
+                        "arguments": arguments,
+                    })
 
                 # Log tool results (agent yields these after each tool completes)
                 if event_type == "tool_result":
@@ -681,6 +685,12 @@ class WorkerThread(threading.Thread):
                         {"tool": tool_name, "success": success, "error": error},
                         {"result": str(result)[:1000] if result else ""},
                     )
+                    self._publish_event("tool_result", {
+                        "tool_name": tool_name,
+                        "success": success,
+                        "error": error,
+                        "result": str(result)[:1000] if result else "",
+                    })
 
                 # Log token warnings as system notifications
                 if event_type == "token_warning":
@@ -738,6 +748,20 @@ class WorkerThread(threading.Thread):
                             "context_length": context_length,
                         },
                     )
+
+                # Log assistant turn messages (agent's intermediate thoughts / responses)
+                if event_type == "turn":
+                    content = event.get("content", "")
+                    reasoning = event.get("reasoning", "")
+                    self._log_event(
+                        "assistant_message",
+                        {"content": str(content)[:500]},
+                        {},
+                    )
+                    self._publish_event("assistant_message", {
+                        "content": str(content)[:1000],
+                        "reasoning_content": str(reasoning)[:2000] if reasoning else None,
+                    })
 
                 # Cache the agent's authoritative post-prune token count
                 if event_type == "token_update":
@@ -1040,6 +1064,7 @@ class WorkerThread(threading.Thread):
             "max_context_tokens": self.max_context_tokens,
         }
         target = self._worker_dir / "status.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_path_str = tempfile.mkstemp(
             dir=str(target.parent),
             prefix=".status_",
@@ -1082,6 +1107,7 @@ class WorkerThread(threading.Thread):
             "last_heartbeat": self.last_heartbeat,
         }
         target = self._context_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
         # Write to a temp file in the same directory (atomic on same filesystem)
         fd, tmp_path_str = tempfile.mkstemp(
             dir=str(target.parent),

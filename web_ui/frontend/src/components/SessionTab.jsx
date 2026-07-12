@@ -513,6 +513,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
       // ── Worker lifecycle events + per-worker bus events (real-time from bridge) ──
       case 'worker:tool_call':
       case 'worker:tool_result':
+      // worker:token_warning is forwarded as worker:system_notification by the bridge, so this case is a no-op
       case 'worker:token_warning':
       case 'worker:assistant_message':
       case 'worker:worker_spawned':
@@ -521,9 +522,18 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
       case 'worker:worker_error':
       case 'worker:system_notification':
       case 'worker:worker_message':
+        // DIAG: log every worker event received from WebSocket
+        console.warn('[DIAG SessionTab] Worker event received from WebSocket:', {
+          msgType: msg.type,
+          workerName: msg.worker_name,
+          dataKeys: msg.data ? Object.keys(msg.data) : [],
+          timestamp: msg.timestamp,
+          hasCallback: !!onWorkerEventRef.current,
+          currentSessionId: currentSessionIdRef.current || currentSessionId,
+        })
         // Use refs to avoid stale closure (connectSessionWs has [] deps)
-        if (onWorkerEventRef.current && currentSessionIdRef.current) {
-          onWorkerEventRef.current(currentSessionIdRef.current, msg)
+        if (onWorkerEventRef.current) {
+          onWorkerEventRef.current(currentSessionIdRef.current || currentSessionId, msg)
         }
         break
 

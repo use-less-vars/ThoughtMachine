@@ -434,8 +434,13 @@ export default function App() {
     setWorkerEvents(prev => {
       const events = prev[sessionId] || []
       const key = event.type + (event.timestamp || '')
-      if (events.some(e => (e.type + (e.timestamp || '')) === key)) return prev
-      return { ...prev, [sessionId]: [...events, event] }
+      if (events.some(e => (e.type + (e.timestamp || '')) === key)) return prev  // dedup
+      // Cap at 500 events per session (trim oldest)
+      const updated = [...events, event]
+      if (updated.length > 500) {
+        return { ...prev, [sessionId]: updated.slice(-500) }
+      }
+      return { ...prev, [sessionId]: updated }
     })
   }, [])
 
@@ -731,7 +736,7 @@ export default function App() {
               workerName={selectedWorker.name}
               sessionId={activeSessionId}
               onClose={handleCloseWorkerPanel}
-              incomingEvents={Object.values(workerEvents).flat()}
+              incomingEvents={workerEvents[activeSessionId] || []}
             />
           )}
         </div>

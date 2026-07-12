@@ -180,15 +180,25 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
   // ── Merge incoming WS events (from bridge via SessionTab) ────────────
   // Filter by worker name so cross-session WS events are correctly routed
   useEffect(() => {
-    if (!incomingEvents || incomingEvents.length === 0) return
+    // DIAG: log all incoming events, even empty
+    console.warn('[DIAG WorkerOutputPanel] incomingEvents useEffect fired:', {
+      incomingEventsCount: incomingEvents?.length,
+      workerName,
+      workspaceId,
+      sessionId,
+    })
+    if (!incomingEvents || incomingEvents.length === 0) {
+      console.warn('[DIAG WorkerOutputPanel] incomingEvents is empty, skipping')
+      return
+    }
 
-    
+    console.warn('[DIAG WorkerOutputPanel] incomingEvents types:', incomingEvents.map(e => e.type))
     const relevantEvents = incomingEvents.filter(e => {
       const evtWorkerName = e.worker_name || e.response?.worker_name
       return !evtWorkerName || evtWorkerName === workerName
     })
 
-    
+    console.warn('[DIAG WorkerOutputPanel] relevantEvents after filter:', relevantEvents.length, 'for worker', workerName)
     if (relevantEvents.length === 0) return
     console.log('[WorkerOutputPanel] WS incomingEvents:', relevantEvents.length, 'events for', workerName, relevantEvents.map(e=>e.type).join(','));
 
