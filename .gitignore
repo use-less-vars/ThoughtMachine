@@ -114,3 +114,6 @@ worker_live_test.txt
 
 # Workspace auto-generated files
 .thoughtmachine/workers.json
+
+# Node.js binary distribution (vendored)
+node-bin/
