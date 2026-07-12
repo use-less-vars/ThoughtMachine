@@ -133,32 +133,6 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
   const [workerError, setWorkerError] = useState('');
   const [stopError, setStopError] = useState('');
 
-  const fetchWorkerInfo = useCallback(() => {
-    if (!workspaceId || !workerName) return;
-    fetch(`/api/workspace/${workspaceId}/workers`)
-      .then(async (res) => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        if (Array.isArray(data)) {
-          const found = data.find((w) => w.name === workerName);
-          if (found) {
-            setWorkerInfo(prev => {
-              if (!prev) return found;
-              return { ...found, ...prev, runtime_status: prev.runtime_status ?? found.runtime_status };
-            });
-            setWorkerError('');
-          } else {
-            // Worker might have not appeared yet; only set error
-            // if we've never had any data (check via ref, not state)
-            if (!workerInfoRef.current) setWorkerError('Worker not found');
-          }
-        }
-      })
-      .catch((err) => {
-        if (!workerInfoRef.current) setWorkerError(err.message);
-      });
-  }, [workspaceId, workerName, sessionId]);
-
   const workerInfoRef = useRef(null);
   workerInfoRef.current = workerInfo;
 

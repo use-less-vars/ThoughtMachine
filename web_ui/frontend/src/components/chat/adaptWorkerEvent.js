@@ -104,10 +104,24 @@ export default function adaptWorkerEvent(evt) {
     // ── Query (user's request to the worker) ─────────────────────
     case 'user_message': {
       const req = evt.request || {}
+      // The query may arrive JSON-wrapped if the delegation system
+      // serializes the full context (e.g. '{"query":"Verify..."}').
+      // Detect and unwrap so the user sees plain text.
+      let query = req.query || '(empty query)'
+      if (typeof query === 'string' && query.trim().startsWith('{')) {
+        try {
+          const parsed = JSON.parse(query)
+          if (parsed && typeof parsed.query === 'string') {
+            query = parsed.query
+          }
+        } catch (_) {
+          // Not valid JSON — use raw value as-is
+        }
+      }
       return {
         _id: eventId(evt),
         role: 'user',
-        content: req.query || '(empty query)',
+        content: query,
         is_worker_query: true,
       }
     }

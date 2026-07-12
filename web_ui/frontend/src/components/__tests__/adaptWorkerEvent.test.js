@@ -81,6 +81,72 @@ describe('user_message', () => {
     const result = adaptWorkerEvent(evt);
     expect(result.content).toBe('(empty query)');
   });
+
+  it('unwraps JSON-wrapped query from delegation system', () => {
+    const evt = makeEvent({
+      event: 'user_message',
+      request: { query: '{"query":"Verify the current state of all changes"}' },
+    });
+    const result = adaptWorkerEvent(evt);
+    expect(result.content).toBe('Verify the current state of all changes');
+    expect(result.is_worker_query).toBe(true);
+  });
+
+  it('unwraps when JSON has extra whitespace', () => {
+    const evt = makeEvent({
+      event: 'user_message',
+      request: { query: '  { "query": "Run analysis on data" }  ' },
+    });
+    const result = adaptWorkerEvent(evt);
+    expect(result.content).toBe('Run analysis on data');
+  });
+
+  it('keeps raw query when JSON has no query key', () => {
+    const evt = makeEvent({
+      event: 'user_message',
+      request: { query: '{"other_key":"hello"}' },
+    });
+    const result = adaptWorkerEvent(evt);
+    // Valid JSON but no 'query' string key — keep as-is
+    expect(result.content).toBe('{"other_key":"hello"}');
+  });
+
+  it('keeps raw query when query is plain text that starts with {', () => {
+    const evt = makeEvent({
+      event: 'user_message',
+      request: { query: '{just some text that looks like JSON but isnt}' },
+    });
+    const result = adaptWorkerEvent(evt);
+    expect(result.content).toBe('{just some text that looks like JSON but isnt}');
+  });
+
+  it('keeps raw query when parsed query field is not a string', () => {
+    const evt = makeEvent({
+      event: 'user_message',
+      request: { query: '{"query":123}' },
+    });
+    const result = adaptWorkerEvent(evt);
+    // 'query' key exists but value is not a string — keep raw
+    expect(result.content).toBe('{"query":123}');
+  });
+
+  it('keeps raw query when parsed query value is null', () => {
+    const evt = makeEvent({
+      event: 'user_message',
+      request: { query: '{"query":null}' },
+    });
+    const result = adaptWorkerEvent(evt);
+    expect(result.content).toBe('{"query":null}');
+  });
+
+  it('keeps plain text queries unchanged', () => {
+    const evt = makeEvent({
+      event: 'user_message',
+      request: { query: 'What files are in the project?' },
+    });
+    const result = adaptWorkerEvent(evt);
+    expect(result.content).toBe('What files are in the project?');
+  });
 });
 
 // ==========================================================================

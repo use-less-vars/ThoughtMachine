@@ -17,7 +17,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-
 logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
@@ -39,9 +38,7 @@ from agent.models.worker_definition import WorkerDefinition
 
 router = APIRouter(prefix="/api/workspace")
 
-
 # ── GET /api/workspace/templates ────────────────────────────────────────────────
-
 
 @router.get("/templates")
 async def get_worker_templates() -> List[Dict[str, Any]]:
@@ -87,16 +84,12 @@ async def get_worker_templates() -> List[Dict[str, Any]]:
 
     return results
 
-
 # ── Pydantic models ──────────────────────────────────────────────────────────
-
 
 class DomainAllowlistBody(BaseModel):
     domains: List[str]
 
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
-
 
 def _atomic_write_json(data: Any, file_path: Path, retries: int = 3) -> None:
     """Atomically write *data* as JSON to *file_path*, with Windows-safe retries.
@@ -139,7 +132,6 @@ def _atomic_write_json(data: Any, file_path: Path, retries: int = 3) -> None:
 
             time.sleep(0.2 * attempt)
 
-
 def _atomic_write_text(data: str, file_path: Path, retries: int = 3) -> None:
     """Atomically write a plain-text string to *file_path*, with Windows-safe retries.
 
@@ -179,7 +171,6 @@ def _atomic_write_text(data: str, file_path: Path, retries: int = 3) -> None:
 
             time.sleep(0.2 * attempt)
 
-
 def _load_session_permissions(session_id: str) -> Optional[Dict[str, Any]]:
     """Load session permissions from a saved session's metadata.
 
@@ -203,9 +194,7 @@ def _load_session_permissions(session_id: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
-
 # ── GET /api/workspace/{ws_id}/dockerfile ────────────────────────────────────
-
 
 @router.get("/{ws_id}/dockerfile", response_class=PlainTextResponse)
 async def get_dockerfile(ws_id: str):
@@ -219,9 +208,7 @@ async def get_dockerfile(ws_id: str):
         )
     return PlainTextResponse(path.read_text(encoding="utf-8"))
 
-
 # ── GET /api/workspace/{ws_id}/domain_allowlist ──────────────────────────────
-
 
 @router.get("/{ws_id}/domain_allowlist")
 async def get_domain_allowlist(ws_id: str):
@@ -236,9 +223,7 @@ async def get_domain_allowlist(ws_id: str):
     except (json.JSONDecodeError, OSError):
         return []
 
-
 # ── PUT /api/workspace/{ws_id}/domain_allowlist ──────────────────────────────
-
 
 @router.put("/{ws_id}/domain_allowlist")
 async def put_domain_allowlist(ws_id: str, body: DomainAllowlistBody):
@@ -248,9 +233,7 @@ async def put_domain_allowlist(ws_id: str, body: DomainAllowlistBody):
     _atomic_write_json(body.domains, path)
     return {"domains": body.domains}
 
-
 # ── GET /api/workspace/{ws_id}/workers ───────────────────────────────────────
-
 
 @router.get("/{ws_id}/workers")
 async def get_workers(
@@ -390,9 +373,7 @@ async def get_workers(
 
     return result
 
-
 # ── POST /api/workspace/{ws_id}/workers ───────────────────────────────────────
-
 
 @router.post("/{ws_id}/workers", status_code=status.HTTP_201_CREATED)
 async def create_worker(ws_id: str, request: Request):
@@ -428,9 +409,7 @@ async def create_worker(ws_id: str, request: Request):
     _atomic_write_json(existing, path)
     return JSONResponse(status_code=status.HTTP_201_CREATED, content=worker.model_dump())
 
-
 # ── PUT /api/workspace/{ws_id}/workers/{name} ──────────────────────────────
-
 
 @router.put("/{ws_id}/workers/{name}")
 async def update_worker(ws_id: str, name: str, request: Request):
@@ -470,9 +449,7 @@ async def update_worker(ws_id: str, name: str, request: Request):
     _atomic_write_json(existing, path)
     return updated_worker.model_dump()
 
-
 # ── DELETE /api/workspace/{ws_id}/workers/{name} ───────────────────────────
-
 
 @router.delete("/{ws_id}/workers/{name}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_worker(ws_id: str, name: str):
@@ -498,9 +475,7 @@ async def delete_worker(ws_id: str, name: str):
     _atomic_write_json(filtered, path)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-
 # ── PUT /api/workspace/{ws_id}/dockerfile ──────────────────────────────────
-
 
 @router.put("/{ws_id}/dockerfile")
 async def put_dockerfile(ws_id: str, request: Request):
@@ -516,9 +491,7 @@ async def put_dockerfile(ws_id: str, request: Request):
     _atomic_write_text(text, path)
     return {"status": "ok", "workspace_id": ws_id}
 
-
 # ── GET /api/workspace/{ws_id}/mcp_servers ───────────────────────────────────
-
 
 @router.get("/{ws_id}/mcp_servers")
 async def get_mcp_servers(ws_id: str):
@@ -533,9 +506,7 @@ async def get_mcp_servers(ws_id: str):
     except (json.JSONDecodeError, OSError):
         return []
 
-
 # ── GET /api/workspace/{ws_id}/effective_permissions ─────────────────────────
-
 
 @router.get("/{ws_id}/effective_permissions")
 async def get_effective_permissions(
@@ -604,77 +575,7 @@ async def get_effective_permissions(
 
 # ── GET /api/workspace/{ws_id}/workers/{name}/events ─────────────────────
 
-
-@router.get("/{ws_id}/workers/{name}/events")
-async def get_worker_events(
-    ws_id: str,
-    name: str,
-    limit: Optional[int] = Query(None, description="Max number of events to return (most recent)"),
-    since: Optional[str] = Query(None, description="ISO-8601 timestamp \u2014 return only events after this time"),
-):
-    """Return the event log for a specific worker as a JSON array.
-
-    Events are read from ``workers/events.jsonl`` (flat path, legacy) or
-    ``workers/<session_id>/events.jsonl`` (session-scoped) and filtered by
-    the worker's ``name`` field (present on every event line).
-
-    Query parameters:
-      - ``limit``: max number of events to return (most recent)
-      - ``since``: ISO-8601 timestamp \u2014 return only events after this time
-    """
-    ensure_workspace_dirs(ws_id)
-    workers_dir = _workspace_dir(ws_id) / "workers"
-
-    # Collect all candidate events.jsonl paths
-    candidates: List[Path] = []
-
-    # 1. Flat path: workers/events.jsonl (legacy, no session_id)
-    flat_path = workers_dir / "events.jsonl"
-    if flat_path.exists():
-        candidates.append(flat_path)
-
-    # 2. Session-scoped paths: workers/<session_id>/events.jsonl
-    if workers_dir.is_dir():
-        for subdir in workers_dir.iterdir():
-            if not subdir.is_dir():
-                continue
-            session_events = subdir / "events.jsonl"
-            if session_events.exists():
-                candidates.append(session_events)
-
-    events = []
-    for events_path in candidates:
-        try:
-            with open(events_path, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                        if event.get("worker_name") != name:
-                            continue
-                        # Apply ?since= filter
-                        if since is not None:
-                            ts = event.get("timestamp", "")
-                            if ts < since:
-                                continue
-                        events.append(event)
-                    except json.JSONDecodeError:
-                        continue
-        except OSError:
-            pass
-
-    # Apply ?limit= (most recent N)
-    if limit is not None and limit > 0 and len(events) > limit:
-        events = events[-limit:]
-
-    return events
-
-
-
 # ── POST /api/workspace/{ws_id}/workers/{name}/stop ────────────────────────
-
 
 @router.post("/{ws_id}/workers/{name}/stop")
 async def stop_worker(ws_id: str, name: str):
