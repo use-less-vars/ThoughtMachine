@@ -96,7 +96,10 @@ class CheckSystem(ToolBase):
                       "'dockerfile' (container environment), 'mcp_servers' (external tool servers), "
                       "'effective_permissions' (session × workspace permissions), "
                       "'container_status' (Docker status), 'workspace_info' (workspace metadata), "
-                      "'network_diagnostics' (connectivity checks).",
+                      "'network_diagnostics' (connectivity checks), "
+                      "'event_bus_status' (EventBus subscriber info), "
+                      "'event_log' (tail recent EventLogger entries), "
+                      "'config_snapshot' (last saved config snapshot).",
     )
 
     skip_output_truncation: ClassVar[bool] = True
@@ -125,6 +128,9 @@ class CheckSystem(ToolBase):
                 "capabilities": lambda: self._query_capabilities(ws_id),
                 "dockerfile": lambda: self._query_dockerfile(ws_id),
                 "mcp_servers": lambda: self._query_mcp_servers(ws_id),
+                "event_bus_status": lambda: self._query_event_bus_status(),
+                "event_log": lambda: self._query_event_log(),
+                "config_snapshot": lambda: self._query_config_snapshot(),
             }
 
             handler = handler_map.get(self.query)
@@ -135,6 +141,8 @@ class CheckSystem(ToolBase):
                 })
 
             result = handler()
+            if isinstance(result, str):
+                return result
             return json.dumps(result, indent=2, default=str)
         except Exception as exc:
             logger.exception("CheckSystem failed")
@@ -410,6 +418,60 @@ class CheckSystem(ToolBase):
             return {"available": True, "content": content}
         except OSError as e:
             return {"available": False, "error": str(e)}
+
+    def _query_event_bus_status(self) -> dict:
+        """Return EventBus subscriber info for diagnostics."""
+        try:
+            from agent.events import global_event_bus
+            with global_event_bus._lock:
+                subscribers = {k.value: len(v) for k, v in global_event_bus._subscribers.items()}
+                wildcard_count = len(global_event_bus._wildcard_subscribers)
+            return {
+                "subscribers_by_type": subscribers,
+                "wildcard_subscribers": wildcard_count,
+                "total_subscriber_types": len(subscribers),
+            }
+        except Exception as e:
+            return {"error": f"Failed to get event bus status: {e}"}
+
+    def _query_config_snapshot(self) -> dict:
+        """Return the last saved config snapshot from disk."""
+        try:
+            from agent.logging.config_snapshot import ConfigSnapshot
+            snapshotter = ConfigSnapshot(self.workspace_path)
+            data = snapshotter.load()
+            if data is None:
+                return {"available": False, "error": "No config snapshot found"}
+            return {"available": True, "snapshot": data}
+        except Exception as e:
+            return {"available": False, "error": str(e)}
+
+    def _query_event_log(self) -> str:
+        """Tail the EventLogger JSONL file and return a formatted string."""
+        try:
+            from agent.logging.event_logger import EventLogger
+            file_path = EventLogger.instance().file_path
+            if not os.path.exists(file_path):
+                return f"[event_log] No log file found at: {file_path}"
+
+            import subprocess
+            result = subprocess.run(
+                ["tail", "-n", "50", file_path],
+                capture_output=True, text=True, timeout=5,
+            )
+            lines = result.stdout.strip().split("\n") if result.stdout.strip() else []
+
+            parts = [f"Event log ({len(lines)} recent entries):", f"Path: {file_path}", ""]
+            for i, line in enumerate(lines, 1):
+                try:
+                    parsed = json.loads(line)
+                    parts.append(f"  #{i}: [{parsed.get('event_type', '?')}] {parsed.get('source', '?')} \u2014 {json.dumps(parsed.get('data', {}), default=str)[:200]}")
+                except json.JSONDecodeError:
+                    parts.append(f"  #{i}: {line[:200]}")
+
+            return "\n".join(parts)
+        except Exception as e:
+            return f"[event_log] Error: {e}"
 
     def _query_mcp_servers(self, ws_id: Optional[str]) -> dict:
         """Return list of configured MCP servers."""

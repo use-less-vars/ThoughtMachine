@@ -94,7 +94,6 @@ except ImportError:
     EventType = None
     global_event_bus = None
 
-
 logger = logging.getLogger(__name__)
 
 # Tools excluded from workers for safety reasons
@@ -126,7 +125,6 @@ from tools import TOOL_CLASSES as _TOOL_CLASSES_LIST
 _TOOL_REGISTRY: dict[str, type["ToolBase"]] = {
     cls.__name__: cls for cls in _TOOL_CLASSES_LIST
 }
-
 
 # ---------------------------------------------------------------------------
 # Shutdown helper  (exposed for bridge integration)
@@ -160,10 +158,8 @@ def shutdown_workers(timeout: float = 5.0) -> None:
             except Exception:
                 logger.exception("Error saving context for worker '%s' during shutdown", worker_label)
 
-
 # Register atexit handler
 atexit.register(shutdown_workers)
-
 
 def register_worker_event_bus(session_id: str, worker_name: str, event_bus: Any) -> None:
     """
@@ -174,20 +170,17 @@ def register_worker_event_bus(session_id: str, worker_name: str, event_bus: Any)
     with _bus_registry_lock:
         _worker_event_bus_registry[key] = event_bus
 
-
 def unregister_worker_event_bus(session_id: str, worker_name: str) -> None:
     """Unregister a worker's per-worker EventBus."""
     key = (session_id or "", worker_name)
     with _bus_registry_lock:
         _worker_event_bus_registry.pop(key, None)
 
-
 def get_worker_event_bus(session_id: str, worker_name: str) -> Any:
     """Get a worker's per-worker EventBus, or None if not registered."""
     key = (session_id or "", worker_name)
     with _bus_registry_lock:
         return _worker_event_bus_registry.get(key)
-
 
 # ---------------------------------------------------------------------------
 # Module-level worker registry  (persists across tool calls)
@@ -220,7 +213,6 @@ _PERMISSION_ORDER: dict[str, dict[str, int]] = {
     "execution": {"deny": 0, "allow": 1},
     "network": {"deny": 0, "allow": 1},
 }
-
 
 def _restrictive_merge(
     session_perms: dict[str, Any],
@@ -268,9 +260,6 @@ def _restrictive_merge(
             result[key] = s_val if s_rank <= w_rank else w_val
     return result
 
-
-
-
 # ---------------------------------------------------------------------------
 # Worker thread
 # ---------------------------------------------------------------------------
@@ -316,7 +305,7 @@ class WorkerThread(threading.Thread):
         # Session permissions for gate-checking tool calls
         self._session_permissions: Dict[str, Any] = session_permissions or {}
         # Worker-level permission footprint from definition
-        self._worker_permissions: Dict[str, Any] = definition.get("worker_permissions") or definition.get("permission_footprint", {})
+        self._permission_footprint: Dict[str, Any] = definition.get("permission_footprint") or definition.get("worker_permissions", {})
 
         # Project root from the session (resolved from workspace config)
         self._project_root: Optional[str] = project_root
@@ -547,7 +536,7 @@ class WorkerThread(threading.Thread):
         worker_cfg["stop_check"] = self._stop_event.is_set
 
         # ── Inject session permissions (restrictive merge — session is ceiling) ──
-        merged = _restrictive_merge(self._session_permissions, self._worker_permissions)
+        merged = _restrictive_merge(self._session_permissions, self._permission_footprint)
         worker_cfg["session_permissions"] = merged
 
         # ── Safety net: inject workspace_path if missing ────────────────
@@ -564,8 +553,6 @@ class WorkerThread(threading.Thread):
         log('DEBUG', 'core.token', f"Worker agent config: token_monitor_warning_threshold={worker_cfg.get('token_monitor_warning_threshold', 'NOT SET')} token_monitor_critical_threshold={worker_cfg.get('token_monitor_critical_threshold', 'NOT SET')} max_turns={worker_cfg.get('max_turns', 'NOT SET')} timeout_seconds={worker_cfg.get('timeout_seconds', 'NOT SET')}")
 
         return AgentConfig(**worker_cfg)
-
-
 
     def _run_tool_loop(
         self,
@@ -585,11 +572,6 @@ class WorkerThread(threading.Thread):
         _start = time.monotonic()
 
         # Log the user query as a user_message event
-        self._log_event(
-            "user_message",
-            {"query": query[:500]},
-            {},
-        )
         self._publish_event("user_message", {"query": query})
 
         # Check stop before starting tool loop
@@ -629,17 +611,6 @@ class WorkerThread(threading.Thread):
                         "reasoning_content": str(self._last_reasoning)[:2000] if self._last_reasoning else None,
                         "response_type": event.get("response_type", "answer"),
                     })
-                    # Log to events.jsonl for HTTP polling path
-                    self._log_event(
-                        "worker_message",
-                        {},
-                        {
-                            "content": str(final_content)[:1000],
-                            "reasoning_content": str(self._last_reasoning)[:2000] if self._last_reasoning else None,
-                            "response_type": event.get("response_type", "answer"),
-                        },
-                    )
-
                 elif event_type == "stopped":
                     stop_reason = event.get("stop_reason", "unknown")
                     if stop_reason == "timeout":
@@ -671,11 +642,6 @@ class WorkerThread(threading.Thread):
                 if event_type == "tool_call":
                     tool_name = event.get("tool_name", "")
                     arguments = event.get("arguments", {})
-                    self._log_event(
-                        "tool_call",
-                        {"tool": tool_name, "args": arguments},
-                        {},
-                    )
                     self._publish_event("tool_call", {
                         "tool_name": tool_name,
                         "arguments": arguments,
@@ -687,11 +653,6 @@ class WorkerThread(threading.Thread):
                     result = event.get("result", "")
                     success = event.get("success", True)
                     error = event.get("error")
-                    self._log_event(
-                        "tool_result",
-                        {"tool": tool_name, "success": success, "error": error},
-                        {"result": str(result)[:1000] if result else ""},
-                    )
                     self._publish_event("tool_result", {
                         "tool_name": tool_name,
                         "success": success,
@@ -704,15 +665,6 @@ class WorkerThread(threading.Thread):
                     log('DEBUG', 'tools.worker', f"[TOKEN] Worker received token_warning event: message={event.get('message','?')} token_count={event.get('token_count','?')}")
                     message = event.get("message", "") or event.get("warning_message", "")
                     token_count = event.get("token_count", 0)
-                    self._log_event(
-                        "system_notification",
-                        {},
-                        {
-                            "type": "token_warning",
-                            "message": str(message)[:500],
-                            "token_count": token_count,
-                        },
-                    )
                     # Publish to per-worker EventBus for real-time WS delivery
                     self._publish_event("token_warning", {
                         "message": str(message)[:500],
@@ -723,15 +675,6 @@ class WorkerThread(threading.Thread):
                 if event_type == "turn_warning":
                     message = event.get("message", "") or event.get("warning", "")
                     turn_count = event.get("turn_count", 0)
-                    self._log_event(
-                        "system_notification",
-                        {},
-                        {
-                            "type": "turn_warning",
-                            "message": str(message)[:500],
-                            "turn_count": turn_count,
-                        },
-                    )
                     # Publish to per-worker EventBus for real-time WS delivery
                     self._publish_event("turn_warning", {
                         "message": str(message)[:500],
@@ -742,15 +685,6 @@ class WorkerThread(threading.Thread):
                 if event_type == "time_warning":
                     message = event.get("message", "") or event.get("warning_message", "")
                     elapsed = event.get("elapsed_seconds", 0)
-                    self._log_event(
-                        "system_notification",
-                        {},
-                        {
-                            "type": "time_warning",
-                            "message": str(message)[:500],
-                            "elapsed_seconds": elapsed,
-                        },
-                    )
                     # Publish to per-worker EventBus for real-time WS delivery
                     self._publish_event("time_warning", {
                         "message": str(message)[:500],
@@ -761,15 +695,6 @@ class WorkerThread(threading.Thread):
                 if event_type == "system_notification":
                     message = event.get("message", "")
                     context_length = event.get("context_length", 0)
-                    self._log_event(
-                        "system_notification",
-                        {},
-                        {
-                            "type": "context_summarized",
-                            "message": str(message)[:500],
-                            "context_length": context_length,
-                        },
-                    )
                     # Publish to per-worker EventBus for real-time WS delivery
                     self._publish_event("system_notification", {
                         "type": "context_summarized",
@@ -781,12 +706,6 @@ class WorkerThread(threading.Thread):
                 if event_type == "turn":
                     content = event.get("content", "")
                     reasoning = event.get("reasoning", "")
-                    self._log_event(
-                        "assistant_message",
-                        {},
-                        {"content": str(content)[:500],
-                         "reasoning_content": str(reasoning)[:2000] if reasoning else None},
-                    )
                     self._publish_event("assistant_message", {
                         "content": str(content)[:1000],
                         "reasoning_content": str(reasoning)[:2000] if reasoning else None,
@@ -805,15 +724,6 @@ class WorkerThread(threading.Thread):
                         if prev_tokens > 2000 and self._cached_context_tokens < prev_tokens * 0.60:
                             log('DEBUG', 'tools.worker',
                                 f'Context summarization detected: {prev_tokens} -> {self._cached_context_tokens} tokens')
-                            self._log_event(
-                                "system_notification",
-                                {},
-                                {
-                                    "type": "context_summarized",
-                                    "message": "Context has been cleared and summarized. You now have a fresh context window with full access to tools.",
-                                    "context_length": self._cached_context_tokens,
-                                },
-                            )
                             self._publish_event("system_notification", {
                                 "type": "context_summarized",
                                 "message": "Context has been cleared and summarized. You now have a fresh context window with full access to tools.",
@@ -825,11 +735,6 @@ class WorkerThread(threading.Thread):
                     tool_name = event.get("tool_name", "")
                     tool_args = event.get("tool_args", {})
                     result = event.get("result", "")
-                    self._log_event(
-                        "tool_call",
-                        {"tool": tool_name, "args": tool_args},
-                        {"result": str(result)[:500] if result else ""},
-                    )
 
         except Exception as exc:
             logger.exception("Worker _run_tool_loop failed")
@@ -927,7 +832,6 @@ class WorkerThread(threading.Thread):
                         self._input_queue.put(initial_query)
 
             self._save_context()
-            self._log_event("started", {}, {})
 
             while not self._stop_event.is_set():
                 # Check for command.json before blocking on input queue
@@ -963,6 +867,12 @@ class WorkerThread(threading.Thread):
                         break
                     self._event_bus = EventBus()
                     register_worker_event_bus(self.session_id or "", self.worker_name, self._event_bus)
+                    # Attach EventLogger to this worker's per-worker bus
+                    try:
+                        from agent.logging.event_logger import EventLogger
+                        EventLogger.instance().attach_worker_bus(self.worker_name, self._event_bus)
+                    except Exception:
+                        pass
                     # Signal bridge via global bus so it can subscribe to per-worker bus
                     if global_event_bus is not None and EventType is not None and create_event is not None:
                         try:
@@ -1060,7 +970,6 @@ class WorkerThread(threading.Thread):
                 self._output_queue.put_nowait(error_json)
             except queue.Full:
                 pass
-            self._log_event("error", {}, {"error": str(exc)})
             self._publish_event('worker_error', {'error': str(exc)})
             # Also publish to global_event_bus so the bridge receives it
             if global_event_bus is not None and EventType is not None and create_event is not None:
@@ -1083,7 +992,6 @@ class WorkerThread(threading.Thread):
         else:
             self.status = "completed"
             self._write_status_file()
-            self._log_event("completed", {}, {})
             self._publish_event('worker_completed', {'status': 'completed'})
             # Also publish to global_event_bus so the bridge receives it
             if global_event_bus is not None and EventType is not None and create_event is not None:
@@ -1116,8 +1024,6 @@ class WorkerThread(threading.Thread):
     def _context_path(self) -> Path:
         return self._worker_dir / "context.json"
 
-    def _events_path(self) -> Path:
-        return self._worker_dir.parent / "events.jsonl"
 
     def _load_context(self) -> Optional[WorkerContext]:
         """Load WorkerContext from disk, if present. Returns None if not found."""
@@ -1223,24 +1129,6 @@ class WorkerThread(threading.Thread):
                 pass
         self._write_status_file()
 
-    def _log_event(self, event_type: str, request: Any, response: Any) -> None:
-        """Append a timestamped event to the workspace events.jsonl."""
-        event = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "worker_name": self.worker_name,
-            "event": event_type,
-            "request": request,
-            "response": response,
-            "current_context_tokens": self.get_current_context_tokens(),
-            "max_context_tokens": self.max_context_tokens,
-        }
-        events_path = self._events_path()
-        try:
-            with open(events_path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(event, default=str) + "\n")
-        except OSError as exc:
-            logger.error("Failed to log worker event: %s", exc)
-
     def _publish_event(self, event_type: str, data: dict) -> None:
         """
         Publish a typed event to the worker's own EventBus for real-time forwarding
@@ -1265,7 +1153,6 @@ class WorkerThread(threading.Thread):
             self._event_bus.publish(evt)
         except Exception as exc:
             logger.debug("Failed to publish worker event '%s': %s", event_type, exc)
-
 
 # ---------------------------------------------------------------------------
 # Tool
@@ -1418,7 +1305,6 @@ class Worker(ToolBase):
             return None
         return _workspace_dir(ws_id)
 
-
     def _check_worker_permissions(
         self,
         definition: dict,
@@ -1436,7 +1322,7 @@ class Worker(ToolBase):
         if not required:
             return None
 
-        worker_perms = definition.get("worker_permissions") or definition.get("permission_footprint", {})
+        worker_perms = definition.get("permission_footprint") or definition.get("worker_permissions", {})
 
         ok, error_msg = check_required_categories(
             required=required,
@@ -1444,7 +1330,7 @@ class Worker(ToolBase):
             tool_name="Worker",
             tool_args={"action": self.action, "worker_name": self.worker_name},
             description=f"Spawn worker '{self.worker_name}'",
-            worker_permissions=worker_perms,
+            permission_footprint=worker_perms,
             is_worker_context=True,
         )
 
@@ -1483,7 +1369,6 @@ class Worker(ToolBase):
             return None
         return cls
 
-
     def _find_all_worker_threads(self, worker_name: str) -> list[tuple[str, Any]]:
         """
         Search the entire ``_worker_registry`` for all entries matching
@@ -1497,7 +1382,6 @@ class Worker(ToolBase):
                 if wname == worker_name:
                     results.append((sid, thread))
         return results
-
 
     # -- action implementations --------------------------------------
 
@@ -1608,7 +1492,7 @@ class Worker(ToolBase):
         tool_classes: Dict[str, type[ToolBase]] = {}
         missing_tools: list[str] = []
         tool_names = definition.get("tools", [])
-        worker_perms = definition.get("worker_permissions") or definition.get("permission_footprint", {})
+        worker_perms = definition.get("permission_footprint") or definition.get("worker_permissions", {})
         if tool_names:
             for tool_name in tool_names:
                 if tool_name in _WORKER_BLOCKLIST:
@@ -1631,7 +1515,7 @@ class Worker(ToolBase):
                             f"Worker '{self.worker_name}' footprint validation"
                             f" for {tool_name}"
                         ),
-                        worker_permissions=worker_perms,
+                        permission_footprint=worker_perms,
                         is_worker_context=True,
                     )
                     if not ok:
