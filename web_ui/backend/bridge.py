@@ -387,6 +387,7 @@ class WebAgentBridge:
             except Exception as exc:
                 log('ERROR', 'server.bridge',
                     f'Failed to forward worker token warning: {exc}')
+                continue
 
     def _unsubscribe_security_events(self) -> None:
         """Unsubscribe from security events."""
@@ -506,14 +507,18 @@ class WebAgentBridge:
                     except Exception as exc:
                         log('ERROR', 'server.bridge',
                             f'Failed to forward worker bus event: {exc}')
+                        continue
             return _handler
 
         # Subscribe to detailed event types on the per-worker bus.
-        # Note: 'token_warning' is NOT subscribed here because it is already
-        # handled via the global_event_bus subscription (_on_worker_token_warning)
-        # to avoid duplicate forwarding.
+        # Note: 'token_warning' is handled here via the per-worker bus because
+        # workers publish warnings to their own bus, not the global bus.
+        # The global bus handler (_on_worker_token_warning) only catches
+        # warnings from the main agent, not worker sub-agents.
         for evt_type in ['tool_call', 'tool_result',
-                         'worker_message', 'assistant_message']:
+                         'worker_message', 'assistant_message',
+                         'token_warning', 'turn_warning', 'time_warning',
+                         'user_message', 'system_notification']:
             try:
                 evt_enum = EventType(evt_type)
                 handler_fn = _make_bus_handler(evt_type)

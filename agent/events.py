@@ -61,12 +61,14 @@ class EventType(enum.Enum):
     RATE_LIMIT_WARNING = 'rate_limit_warning'
     TOOL_CALL_LEGACY = 'tool_call'
     TOOL_RESULT_LEGACY = 'tool_result'
+    SYSTEM_NOTIFICATION = 'system_notification'
     WORKER_SPAWNED = 'worker_spawned'
     WORKER_STATUS = 'worker_status'
     WORKER_COMPLETED = 'worker_completed'
     WORKER_ERROR = 'worker_error'
     WORKER_MESSAGE = 'worker_message'
     ASSISTANT_MESSAGE = 'assistant_message'
+    USER_MESSAGE = 'user_message'
 
 
 class EventMetadata(BaseModel):
