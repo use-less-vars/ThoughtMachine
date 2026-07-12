@@ -513,14 +513,17 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
       // ── Worker lifecycle events + per-worker bus events (real-time from bridge) ──
       case 'worker:tool_call':
       case 'worker:tool_result':
-      // worker:token_warning is forwarded as worker:system_notification by the bridge, so this case is a no-op
+      // worker:token_warning/turn_warning/time_warning now come via per-worker bus (not global bus)
       case 'worker:token_warning':
+      case 'worker:turn_warning':
+      case 'worker:time_warning':
       case 'worker:assistant_message':
       case 'worker:worker_spawned':
       case 'worker:worker_status':
       case 'worker:worker_completed':
       case 'worker:worker_error':
       case 'worker:system_notification':
+      case 'worker:user_message':
       case 'worker:worker_message':
         // DIAG: log every worker event received from WebSocket
         console.warn('[DIAG SessionTab] Worker event received from WebSocket:', {

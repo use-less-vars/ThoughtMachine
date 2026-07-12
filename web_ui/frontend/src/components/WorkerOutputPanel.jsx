@@ -172,10 +172,31 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
     setWorkerError('');
     setStopError('');
     setEvents([]);
-    setLastFetchTime(null);
-    lastFetchTimeRef.current = null;
     eventsRef.current = [];
+    seenEventKeysRef.current = new Set();
   }, [workspaceId, workerName]);
+
+  // ── Shared dedup key computation ──────────────────────────────────────
+  // Events are received via WebSocket incomingEvents prop (no polling).
+  // Normalize all assistant-message-like event names to a single canonical key
+  // so that different WS event name variants representing the same logical event
+  // are correctly deduplicated against each other.
+  const seenEventKeysRef = useRef(new Set());
+
+  // Helper: compute a dedup key for any event (either stored internal format
+  // or raw incoming WS event).  Returns a string that is the same for any
+  // event name variant of the same logical event at the same timestamp.
+  const makeDedupKey = (eventName, timestamp) => {
+    // Assistant-message-like events all map to the same canonical key
+    const canonical = (
+      eventName === 'worker_message' ||
+      eventName === 'final_response' ||
+      eventName === 'assistant_message' ||
+      eventName === 'worker:worker_message' ||
+      eventName === 'worker:assistant_message'
+    ) ? 'final_response' : eventName
+    return canonical + '|' + (timestamp || '')
+  }
 
   // ── Merge incoming WS events (from bridge via SessionTab) ────────────
   // Filter by worker name so cross-session WS events are correctly routed
@@ -184,17 +205,36 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
       return
     }
 
+    console.warn('[RAW INCOMING EVENTS] count:', incomingEvents.length, 'events:', incomingEvents.map(e => ({type: e.type, timestamp: e.timestamp, dataPreview: JSON.stringify(e.data || {}).slice(0, 100)})));
+
     const relevantEvents = incomingEvents.filter(e => {
       const evtWorkerName = e.worker_name || e.response?.worker_name
       return !evtWorkerName || evtWorkerName === workerName
     })
 
-    if (relevantEvents.length === 0) return
+    if (relevantEvents.length === 0) {
+      console.log('[WorkerOutputPanel] incomingEvents: none relevant (workerName=' + workerName + ')');
+      return
+    }
+    console.log('[WorkerOutputPanel] incomingEvents: processing', relevantEvents.length, 'events types:', relevantEvents.map(e=>e.type).join(','));
 
     // Also update live workerInfo status from WS events (instant, no poll lag)
     for (const e of relevantEvents) {
       const eventType = e.type?.replace('worker:', '')
       const status = e.data?.runtime_status || e.data?.status
+      // Extract token info from event data if present (always included after backend fix)
+      const tokensUpdate = {}
+      if (e.data?.current_context_tokens !== undefined) tokensUpdate.current_context_tokens = e.data.current_context_tokens
+      if (e.data?.max_context_tokens !== undefined) tokensUpdate.max_context_tokens = e.data.max_context_tokens
+
+      // Always apply token updates to workerInfo (any event type may carry them)
+      if (Object.keys(tokensUpdate).length > 0) {
+        setWorkerInfo(prev => {
+          if (!prev) return { ...tokensUpdate };
+          return { ...prev, ...tokensUpdate };
+        })
+      }
+
       if (eventType === 'worker_spawned' && (status === 'ready' || status === 'busy')) {
         setWorkerInfo(prev => {
           const update = { runtime_status: status };
@@ -222,139 +262,150 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
       }
     }
 
+    // ═══ DEDUP FILTERING — OUTSIDE setEvents, in the effect body ═══
+    const newOnes = relevantEvents
+      .filter(e => {
+        const rawType = e.type?.replace('worker:', '') || ''
+        const key = makeDedupKey(rawType, e.timestamp)
+        console.warn('[DEDUP CHECK] rawType:', rawType, 'timestamp:', e.timestamp, 'key:', key, 'alreadySeen:', seenEventKeysRef.current.has(key));
+        return !seenEventKeysRef.current.has(key)
+      })
+      .map(e => {
+        const eventType = e.type?.replace('worker:', '') || 'unknown'
+        let request = e.request || {}
+        let response = e.response || {}
+
+        switch (eventType) {
+          case 'tool_call': {
+            const data = e.data || {}
+            let args = {}
+            try {
+              if (data.arguments) {
+                args = typeof data.arguments === 'string' ? JSON.parse(data.arguments) : data.arguments
+              }
+            } catch (_) { /* ignore parse errors */ }
+            request = { tool: data.tool_name || 'unknown', args }
+            break
+          }
+          case 'tool_result': {
+            const data = e.data || {}
+            request = { tool: data.tool_name || 'unknown', success: data.success !== false }
+            response = { result: data.result || '' }
+            break
+          }
+          case 'assistant_message': {
+            const data = e.data || {}
+            // Map to worker_message since adaptWorkerEvent handles that case
+            // Preserve response_type so Respond tool output (with response_type='answer'/'question')
+            // gets the correct 'final'/'question' styling via adaptWorkerEvent's is_final flag.
+            response = {
+              content: data.content || '',
+              reasoning_content: data.reasoning_content || undefined,
+              response_type: data.response_type || undefined,
+            }
+            return {
+              event: 'worker_message',
+              timestamp: e.timestamp,
+              request: {},
+              response,
+            }
+          }
+          case 'token_warning': {
+            const data = e.data || {}
+            response = { type: 'token_warning', message: data.message || '', token_count: data.token_count }
+            return {
+              event: 'system_notification',
+              timestamp: e.timestamp,
+              request: {},
+              response,
+            }
+          }
+          case 'turn_warning': {
+            const data = e.data || {}
+            response = { type: 'turn_warning', message: data.message || '', turn_count: data.turn_count }
+            return {
+              event: 'system_notification',
+              timestamp: e.timestamp,
+              request: {},
+              response,
+            }
+          }
+          case 'time_warning': {
+            const data = e.data || {}
+            response = { type: 'time_warning', message: data.message || '', elapsed_seconds: data.elapsed_seconds }
+            return {
+              event: 'system_notification',
+              timestamp: e.timestamp,
+              request: {},
+              response,
+            }
+          }
+          case 'user_message': {
+            // Preserve user query text
+            const data = e.data || {}
+            request = { query: e.request?.query || data.query || '' }
+            response = { content: data.content || e.request?.query || '' }
+            break
+          }
+          case 'system_notification': {
+            const data = e.data || {}
+            response = {
+              type: data.type || 'system_notification',
+              message: data.message || data.warning_message || '',
+              token_count: data.token_count || 0,
+              ...data
+            }
+            return {
+              event: 'system_notification',
+              session_id: sessionId || e.session_id || '',
+              timestamp: e.timestamp || new Date().toISOString(),
+              response,
+            }
+          }
+          default:
+            // For lifecycle events (worker_spawned, worker_status, etc.), keep existing behavior
+            if (!e.request && !e.response) {
+              request = {}
+              response = { ...(e.data || {}), worker_name: e.worker_name || '' }
+            }
+            break
+        }
+
+        return {
+          event: eventType,
+          timestamp: e.timestamp,
+          request,
+          response,
+          current_context_tokens: e.data?.current_context_tokens,
+          max_context_tokens: e.data?.max_context_tokens,
+        }
+      })
+
+    // ═══ Register dedup keys for new events — in the effect body ═══
+    for (const evt of newOnes) {
+      seenEventKeysRef.current.add(makeDedupKey(evt.event, evt.timestamp))
+    }
+
+    // ═══ Bailout if nothing new ═══
+    if (newOnes.length === 0) {
+      console.warn('[DEDUP BAILOUT] All incoming events were deduplicated. incomingEvents:', incomingEvents, 'computed dedup keys:', relevantEvents.map(e => makeDedupKey(e.type?.replace('worker:', '') || '', e.timestamp)));
+      return
+    }
+
+    // ═══ PURE state update — NO side effects ═══
     setEvents(prev => {
-      // Build dedup key from stored events, mapping stored event names back
-      // to incoming event types (e.g. 'worker_message' -> 'assistant_message')
-      // so that WS events don't get added twice when the bridge re-sends them.
-      const existingKeys = new Set(prev.map(e => {
-        const mappedEvent = e.event === 'worker_message' ? 'assistant_message' : e.event
-        return mappedEvent + (e.timestamp || '')
-      }))
-      const newOnes = relevantEvents
-        .filter(e => !existingKeys.has((e.type?.replace('worker:', '') || '') + (e.timestamp || '')))
-        .map(e => {
-          const eventType = e.type?.replace('worker:', '') || 'unknown'
-          let request = e.request || {}
-          let response = e.response || {}
-
-          switch (eventType) {
-            case 'tool_call': {
-              const data = e.data || {}
-              let args = {}
-              try {
-                if (data.arguments) {
-                  args = typeof data.arguments === 'string' ? JSON.parse(data.arguments) : data.arguments
-                }
-              } catch (_) { /* ignore parse errors */ }
-              request = { tool: data.tool_name || 'unknown', args }
-              break
-            }
-            case 'tool_result': {
-              const data = e.data || {}
-              request = { tool: data.tool_name || 'unknown', success: data.success !== false }
-              response = { result: data.result || '' }
-              break
-            }
-            case 'assistant_message': {
-              const data = e.data || {}
-              // Map to worker_message since adaptWorkerEvent handles that case
-              response = { content: data.content || '', reasoning_content: data.reasoning_content || undefined }
-              return {
-                event: 'worker_message',
-                timestamp: e.timestamp,
-                request: {},
-                response,
-              }
-            }
-            case 'token_warning': {
-              const data = e.data || {}
-              response = { type: 'token_warning', message: data.warning_message || '', token_count: data.token_count }
-              return {
-                event: 'system_notification',
-                timestamp: e.timestamp,
-                request: {},
-                response,
-              }
-            }
-            default:
-              // For lifecycle events (worker_spawned, worker_status, etc.), keep existing behavior
-              if (!e.request && !e.response) {
-                request = {}
-                response = e.data || { error: e.error, status: e.status, worker_name: e.worker_name }
-              }
-              break
-          }
-
-          return {
-            event: eventType,
-            timestamp: e.timestamp,
-            request,
-            response,
-          }
-        })
-      if (newOnes.length === 0) return prev
       const updated = [...prev, ...newOnes]
       eventsRef.current = updated
       return updated
     })
   }, [incomingEvents, workerName])
 
-  // ── Events fetching with polling ──────────────────────────────────────
+  // ── Events state ──────────────────────────────────────────────────────
   const [events, setEvents] = useState([]);
-  const [eventsError, setEventsError] = useState('');
-  const [lastFetchTime, setLastFetchTime] = useState(null);
   const [hasNewEvents, setHasNewEvents] = useState(false);
   const scrollRef = useRef(null);
   const isAtBottomRef = useRef(true);
-  const lastFetchTimeRef = useRef(null);
   const eventsRef = useRef([]);
-
-  const fetchEvents = useCallback(() => {
-    if (!workspaceId || !workerName) return;
-    const params = new URLSearchParams();
-    params.set('limit', '50');
-    if (lastFetchTimeRef.current) params.set('since', lastFetchTimeRef.current);
-    console.log('[WorkerOutputPanel] fetchEvents called for', workerName, 'limit=50', params.toString());
-
-    fetch(`/api/workspace/${workspaceId}/workers/${encodeURIComponent(workerName)}/events?${params}`)
-      .then(async (res) => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        if (Array.isArray(data) && data.length > 0) {
-          console.log('[WorkerOutputPanel] fetched', data.length, 'events for', workerName, 'types:', data.map(e=>e.event).join(','));
-          setEvents((prev) => {
-            // Normalise event names for dedup: 'worker_message' (WS) and 'final_response' (fetch)
-            // represent the same logical event. Map both to a common key to avoid duplication.
-            const normalizeEvent = (event) => {
-              if (event === 'worker_message') return 'final_response'
-              if (event === 'final_response') return 'final_response'
-              return event
-            }
-            const existingTimestamps = new Set(prev.map((e) => e.timestamp + normalizeEvent(e.event)));
-            const newEntries = data.filter((e) => !existingTimestamps.has(e.timestamp + normalizeEvent(e.event)));
-            if (newEntries.length === 0) return prev;
-            // Only mark "has new events" if user is not at bottom
-            if (!isAtBottomRef.current) setHasNewEvents(true);
-            const updated = [...prev, ...newEntries];
-            eventsRef.current = updated;
-            return updated;
-          });
-          const lastTs = data[data.length - 1].timestamp;
-          if (lastTs) {
-            lastFetchTimeRef.current = lastTs;
-            setLastFetchTime(lastTs);
-          }
-        } else {
-          console.log('[WorkerOutputPanel] no new events for', workerName);
-        }
-        setEventsError('');
-      })
-      .catch((err) => {
-        if (eventsRef.current.length === 0) setEventsError(err.message);
-      });
-  }, [workspaceId, workerName]); // stable deps only — no cascading re-fetches
-
-  // Events are received via WebSocket incomingEvents prop (no polling)
 
   // ── Smart scroll ──────────────────────────────────────────────────────
   // Track whether user is at bottom
@@ -449,14 +500,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
 
   // ── Render ────────────────────────────────────────────────────────────
 
-  // Build a set of all final (worker_message) content strings for dedup
-  const finalContentSet = new Set()
-  events.forEach(evt => {
-    if (evt.event === 'worker_message') {
-      const content = evt.response?.content || ''
-      if (content) finalContentSet.add(content.trim())
-    }
-  })
+  // (finalContentSet removed — was unused dead code)
 
   return (
     <div className="worker-output-wrapper">
@@ -513,50 +557,28 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
           onScroll={handleScroll}
           className="worker-output-scroll"
         >
-          {events.length === 0 && !eventsError && (
+          {events.length === 0 && (
             <div className="worker-output-empty">
               {workerError || 'No events yet.'}
             </div>
           )}
 
-          {events.length === 0 && eventsError && (
-            <div className="worker-output-error">
-              Events unavailable.
-            </div>
-          )}
-
-          {/* Dedup: content strings from worker_message events */}
           {events.map((evt, idx) => {
             const msg = adaptWorkerEvent(evt);
-            // Skip lifecycle events (worker_spawned, worker_status,
-            // worker_completed, worker_error) from filesystem polling.
-            // These come in real-time via WebSocket (incomingEvents) and
-            // should NOT be duplicated from the events.jsonl file.
-            if (msg && msg.is_worker_event) {
+            if (!msg) {
+              console.log('[WorkerOutputPanel] render: adaptWorkerEvent returned null for event', evt.event || 'unknown');
+              return null;  // suppress events like user_message / query
+            }
+
+            // Skip empty assistant messages that have neither content nor reasoning_content.
+            // The main ChatPanel handles this upstream — WorkerOutputPanel must filter
+            // inline because raw events (especially WS-delivered) can arrive with empty
+            // content before the full response is ready, producing invisible empty bubbles.
+            if (!msg.content && !msg.reasoning_content && !msg.is_system_notification) {
+              console.warn('[EMPTY EVENT FILTER] Event filtered due to empty content. evt:', evt, 'msg:', msg);
               return null;
             }
-            // Dedup: skip tool_call/tool_result events if their content
-            // matches content already shown in a worker_message (final response)
-            if (msg && (evt.event === 'tool_result' || evt.event === 'tool_call')) {
-              const msgContent = msg.content || msg.tool_input || msg.result || ''
-              if (msgContent && typeof msgContent === 'string') {
-                const trimmed = msgContent.trim()
-                if (trimmed) {
-                  let isRedundant = false
-                  for (const finalContent of finalContentSet) {
-                    if (finalContent.includes(trimmed) || trimmed.includes(finalContent)) {
-                      isRedundant = true
-                      break
-                    }
-                  }
-                  if (isRedundant) {
-                    console.log('[WorkerOutputPanel] dedup: skipping', evt.event, 'as its content appears in worker_message')
-                    return null
-                  }
-                }
-              }
-            }
-            if (!msg) return null;  // suppress events like user_message / query
+
             // Use a robust unique key: _id (or fallback) + index + a session counter
             // This ensures no duplicate key warnings even if dedup misses.
             const key = (msg._id || evt.timestamp + '_' + evt.event) + '_' + idx;

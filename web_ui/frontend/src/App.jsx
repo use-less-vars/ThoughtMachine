@@ -433,8 +433,25 @@ export default function App() {
     if (!sessionId) return
     setWorkerEvents(prev => {
       const events = prev[sessionId] || []
-      const key = event.type + (event.timestamp || '')
-      if (events.some(e => (e.type + (e.timestamp || '')) === key)) return prev  // dedup
+      // Use canonical dedup key: normalize worker_message/assistant_message/final_response
+      // variants to 'final_response' so the same logical event arriving with different
+      // WS type values (e.g. worker:assistant_message vs worker:worker_message) is caught.
+      const rawType = event.type?.replace('worker:', '') || ''
+      const canonicalType = (
+        rawType === 'worker_message' ||
+        rawType === 'final_response' ||
+        rawType === 'assistant_message'
+      ) ? 'final_response' : rawType
+      const key = canonicalType + '|' + (event.timestamp || '')
+      if (events.some(e => {
+        const eRawType = e.type?.replace('worker:', '') || ''
+        const eCanonicalType = (
+          eRawType === 'worker_message' ||
+          eRawType === 'final_response' ||
+          eRawType === 'assistant_message'
+        ) ? 'final_response' : eRawType
+        return (eCanonicalType + '|' + (e.timestamp || '')) === key
+      })) return prev  // dedup
       // Cap at 500 events per session (trim oldest)
       const updated = [...events, event]
       if (updated.length > 500) {
