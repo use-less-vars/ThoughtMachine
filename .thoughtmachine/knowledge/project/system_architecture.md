@@ -3659,3 +3659,321 @@ User types message
 - Server creates Session model, stores it, passes to bridge
 - Bridge holds _session_id and passes it to Worker tool via session_id field
 - WorkerThread creates directory: workspace_dir/workers/<session_id>/<name>/
+
+## 2026-07-12 — ## Token Warning Event Pipeline (Bridge → Frontend)
+
+### Pip...
+
+## Token Warning Event Pipeline (Bridge → Frontend)
+
+### Pipeline Overview
+
+The `token_warning` event reaches the frontend through **three independent paths**, depending on context:
+
+### Path 1: Standalone Agent Loop (`_run_loop` → `_map_and_emit`)
+- **File:** `web_ui/backend/bridge.py`, lines 1804-1871
+- Agent yields raw event dicts from `process_query()` in the bridge's background thread (`_run_loop`)
+- Each raw event is passed to `_map_and_emit()` (line 1833)
+- `_map_and_emit` (line 1729) checks: `if event_type in ("token_warning", "turn_warning")`
+- Triggers: `conversation_changed` event with full session history snapshot
+- **Final frontend type:** `conversation_changed`
+
+### Path 2: Controller Mode (`_on_controller_event` → `_map_and_emit`)
+- **File:** `web_ui/backend/bridge.py`, lines 1622-1665
+- When bridge uses `AgentController`, the controller sends events via `_on_controller_event`
+- Same `_map_and_emit()` is called (line 1665)
+- Identical mapping as Path 1
+- Also captures session ID and propagates session object from controller's agent
+
+### Path 3: Event Bus → Worker Token Warning
+- **Global bus handler** (`_on_worker_token_warning`, line ~1189): Subscribes to `EventType.TOKEN_WARNING` on the global event bus
+- Filters: only handles events with `metadata.source.startswith("worker:")`
+- Forwards as: `worker:system_notification` with `response.type='token_warning'`
+- **Final frontend type:** `worker:system_notification` (with nested `response.type='token_warning'`)
+
+### Path 4: Event Bus → Per-Worker Bus (Detailed Worker Events)
+- **Per-worker bus subscription** (`_subscribe_to_worker_bus`, line ~1300): When a worker is spawned, bridge subscribes to the worker's per-worker EventBus
+- Subscribed event types include: `token_warning`, `turn_warning`, `time_warning`, `tool_call`, `tool_result`, etc.
+- Handler (`_make_bus_handler`) forwards as `worker:{original_type}` (e.g., `worker:token_warning`)
+- **Final frontend type:** `worker:token_warning`
+
+### Key Difference: Paths 3 vs 4
+- Path 3 (`_on_worker_token_warning` + global bus): Only captures **worker-sourced** warnings (source starts with "worker:"). Emits as `worker:system_notification` with structured `response` payload.
+- Path 4 (per-worker bus): Captures **all** token warnings from the worker's own bus. Emits directly as `worker:token_warning`.
+
+### Cross-Session Filtering
+All event bus handlers (Paths 3 and 4) check `data.get('session_id') != self._session_id` to avoid forwarding events from other sessions.
+
+## Same vs Different — Main Agent vs Worker Scaffolding
+
+## 2026-07-12 — ## Same vs Different — Main Agent vs Worker Scaffolding (202...
+
+## Same vs Different — Main Agent vs Worker Scaffolding (2026-07-12)
+
+### Overview
+This document compares the event propagation architecture of the **Main Agent** (the chat-bridge agent) versus the **Worker Agent** (worker-thread agent). Both run the **identical Agent core** (`agent/core/agent.py`), but differ entirely in how events are forwarded to the frontend.
+
+---
+
+### 1. The Shared Core (IDENTICAL)
+
+Both main agent and worker agents go through the same `Agent.process_query()` generator (agent/core/agent.py:748-1274), which yields these event types:
+
+| Event Type | When Yielded | Line |
+|---|---|---|
+| `token_update` | After adding user query, at turn start, after summary pruning | 760, 900, 1213 |
+| `user_query` | After config is applied | 796-800 |
+| `execution_state_change` | READY→RUNNING transition | 822-825 |
+| `time_warning` | Each turn, if elapsed > warning threshold | 883-885 |
+| `turn_warning` | Each turn, if turn count >= max_turns-3 | 895-897 |
+| `token_warning` | Each turn, if token count > threshold | 901-911 |
+| `turn` | Assistant response content (text/tool_calls) | 1150-1156 |
+| `tool_call` | For each executed tool | 1173-1176 |
+| `tool_result` | Result of each tool execution | 1177-1180 |
+| `agent_responded` | When Respond tool or "Final" detected | 1191-1204 |
+| `system_notification` | N/A — NOT yielded by process_query() | — |
+| `stopped` | If stop_check() returns True | 859-861 |
+| `error` | Provider errors, unexpected errors | 1038-1086 |
+| `rate_limit_warning` | Rate limit exceeded | 1050-1052 |
+
+**Key insight:** `system_notification` is **never yielded** by `process_query()`. The `context_summarized` notification is injected into the conversation (as a message dict) but never yielded as an event. Workers detect it via the `token_update` handler by checking for a ≥40% token drop.
+
+**State management** (agent/core/state.py) is also identical:
+- `update_token_state(total_tokens)` — yields `token_warning` when crossing thresholds
+- `update_turn_state(turn)` — yields `turn_warning` when near max turns
+- `update_time_state(elapsed)` — yields `time_warning` when runtime exceeds warning
+- All set `restrictions_active=True` at critical levels, restricting available tools
+
+---
+
+### 2. The Event Propagation Path (COMPLETELY DIFFERENT)
+
+#### 2A. Main Agent Path
+
+```
+Agent.process_query()  (runs in bridge thread)
+    │
+    ▼ yields event dicts
+_map_and_emit(raw_event)  (bridge.py:1729-1800)
+    │
+    ├── token_update  →  'tokens_updated' + 'context_updated'
+    ├── token_warning →  'conversation_changed' (full history sync)
+    ├── turn_warning  →  'conversation_changed'
+    ├── time_warning  →  'conversation_changed'
+    ├── agent_responded → 'conversation_changed' + 'state_changed: WAITING_FOR_USER'
+    ├── user_query    →  'conversation_changed'
+    ├── tool_call     →  'conversation_changed'
+    ├── tool_result   →  'conversation_changed'
+    ├── turn          →  'conversation_changed'
+    ├── error         →  'status_message' + 'conversation_changed'
+    └── session_stop  →  'state_changed: IDLE'
+    │
+    ▼
+WebSocket → frontend Hub WS → SessionTab webSocket
+    │
+    ▼
+session.handleEvent()  →  chat ends up in the conversation via message endpoint HTTP calls
+```
+
+**Key characteristics:**
+- Single-threaded: the bridge thread calls `process_query()` and handles events synchronously
+- No EventBus involved for agent events (main agent uses EventBus only for security prompts and worker lifecycle)
+- Token warnings are NOT sent as dedicated events — they trigger a `conversation_changed` sync, which means the frontend re-reads the full conversation via HTTP
+- The warning text must already be in `session.user_history` (as a system message) for it to appear
+
+#### 2B. Worker Agent Path
+
+```
+Agent.process_query()  (runs in worker thread)
+    │
+    ▼ yields event dicts
+WorkerThread._run_tool_loop()  (worker.py:570-841)
+    │
+    ├── token_warning  →  _publish_event('token_warning', {message, token_count})
+    │                   →  _log_event('system_notification', {type:'token_warning', ...})
+    ├── turn_warning   →  _publish_event('turn_warning', {message, turn_count})
+    │                   →  _log_event('system_notification', {type:'turn_warning', ...})
+    ├── time_warning   →  _publish_event('time_warning', {message, elapsed_seconds})
+    │                   →  _log_event('system_notification', {type:'time_warning', ...})
+    ├── system_notification → NOT YIELDED BY AGENT (detected via token_update handler)
+    │                   →  _publish_event('system_notification', {type:'context_summarized'})
+    │                   →  _log_event('system_notification', {type:'context_summarized'})
+    ├── agent_responded →  _publish_event('worker_message', {content, response_type})
+    │                   →  _log_event('worker_message', {content, response_type})
+    ├── tool_call      →  _publish_event('tool_call', {tool_name, arguments})
+    │                   →  _log_event('tool_call', {tool_name, arguments})
+    ├── tool_result    →  _publish_event('tool_result', {tool_name, success, result})
+    │                   →  _log_event('tool_result', {tool_name, success, result})
+    ├── turn           →  _publish_event('assistant_message', {content})
+    │                   →  _log_event('assistant_message', {content})
+    ├── user_message   →  _publish_event('user_message', {query})
+    │  (logged at start) →  _log_event('user_message', {query})
+    └── token_update   →  _log_event('system_notification') if ≥40% token drop detected
+                           _publish_event('system_notification') if ≥40% token drop detected
+    │
+    ▼
+    ├── _log_event() → events.jsonl (HTTP polling fallback)
+    │
+    └── _publish_event() → per-worker EventBus
+                            │
+                            ▼
+                    Bridge subscriber (_subscribe_to_worker_bus)
+                            │
+                            ▼  {type: 'worker:token_warning', data: {message, token_count}}
+                    WebSocket → WorkerOutputPanel incomingEvents
+                            │
+                            ▼
+                    Normalize: 'worker:token_warning' → {event: 'system_notification', response: {type:'token_warning', message, token_count}}
+                            │
+                            ▼
+                    adaptWorkerEvent() → {role:'user', is_system_notification:true, content:'⚠️ ...'}
+                            │
+                            ▼
+                    MessageBubble → effectiveRole='system' → 'message-system-as-user' class → rendered
+```
+
+**Key characteristics:**
+- Multi-threaded: worker runs in its own daemon thread
+- Uses per-worker EventBus for all event forwarding
+- Each event type maps to a **dedicated** WebSocket event type (e.g., `worker:token_warning`)
+- Dual publication: both `_log_event()` (HTTP polling) and `_publish_event()` (WebSocket)
+- Worker's `_publish_event` and `_log_event` are SEPARATE if-blocks (NOT `elif`), so same event can trigger both
+- `context_summarized` is detected heuristically in the `token_update` handler (≥40% token drop)
+
+---
+
+### 3. EventBus Architecture (DIFFERENT)
+
+| Aspect | Main Agent | Worker Agent |
+|---|---|---|
+| **Uses EventBus?** | Only for security prompts, worker lifecycle, and container rebuild events | Yes — per-worker EventBus for ALL events |
+| **Which EventBus?** | Global singleton `global_event_bus` | Private per-worker `EventBus` instance |
+| **Who subscribes?** | Bridge subscribes to security + worker lifecycle on global bus | Bridge subscribes to per-worker bus in `_subscribe_to_worker_bus()` |
+| **When subscribed?** | At bridge init (`__init__`) | When worker spawns (`_on_worker_spawned`) |
+| **What events?** | TOKEN_WARNING, WORKER_MESSAGE, security events | tool_call, tool_result, token_warning, turn_warning, time_warning, system_notification, worker_message, assistant_message, user_message |
+
+---
+
+### 4. Bridge Handler Comparison
+
+| Event | Main Agent Handler | Worker Handler (Per-Worker Bus) | Worker Handler (Global Bus) |
+|---|---|---|---|
+| `token_warning` | `_map_and_emit` → `conversation_changed` (full history) | `_make_bus_handler('token_warning')` → `worker:token_warning` | `_on_worker_token_warning` → `worker:system_notification` with `response.type:'token_warning'` |
+| `turn_warning` | `_map_and_emit` → `conversation_changed` (full history) | `_make_bus_handler('turn_warning')` → `worker:turn_warning` | Not subscribed on global bus |
+| `time_warning` | `_map_and_emit` → `conversation_changed` (full history) | `_make_bus_handler('time_warning')` → `worker:time_warning` | Not subscribed on global bus |
+| `system_notification` | Not applicable (not yielded) | `_make_bus_handler('system_notification')` → `worker:system_notification` | Not subscribed on global bus |
+| `agent_responded` | `_map_and_emit` → `conversation_changed` + `state_changed` | `_make_bus_handler('worker_message')` → `worker:worker_message` | Via `WORKER_MESSAGE` global bus → `worker:worker_message` |
+| `tool_call` | `_map_and_emit` → `conversation_changed` | `_make_bus_handler('tool_call')` → `worker:tool_call` | Not subscribed on global bus |
+
+**Critical finding:** The main agent's `token_warning` is delivered via `conversation_changed` (full history sync). But the worker's `token_warning` is delivered via `_publish_event()` → per-worker EventBus → `worker:token_warning` WebSocket event. Both paths end up in the frontend, but through completely different mechanisms.
+
+---
+
+### 5. Frontend Rendering (DIFFERENT)
+
+| Aspect | Main Agent Chat | Worker Panel (WorkerOutputPanel) |
+|---|---|---|
+| **Data source** | Hub WebSocket `conversation_changed` + HTTP `/messages` endpoints | Per-worker WebSocket events (`worker:token_warning`, etc.) + HTTP `/workers` polling |
+| **Event types received** | `conversation_changed`, `state_changed`, `tokens_updated`, etc. | `worker:token_warning`, `worker:turn_warning`, `worker:tool_call`, etc. |
+| **Message format** | Full `user_history` message objects from session | Normalized internal format → `adaptWorkerEvent()` → MessageBubble props |
+| **Token warning display** | Shows as system message in conversation (from history) | Shows as `⚠️ Token usage warning: ... (Tokens: N)` via `tokenWarningMsg()` |
+| **Dedup mechanism** | React key on message IDs | `seenEventKeysRef` Map with canonical event names |
+| **Rendering component** | `MessageBubble` in chat list | `MessageBubble` in `WorkerOutputPanel` (reuses same component) |
+
+---
+
+### 6. Identified Gaps and Differences
+
+#### Gap 1: Race Condition on Per-Worker Bus Subscription (MOST LIKELY)
+
+**Location:** `worker.py:889-896` (auto-queued initial query) and `worker.py:964` (EventBus creation) vs `bridge.py:_on_worker_spawned` (subscription)
+
+**The problem:** The worker's `run()` method:
+1. Lines 889-896: Auto-queues the initial query (from `_initial_context`) — puts it in `self._pending_queries`
+2. Line 964: Creates the EventBus and registers it via `register_worker_event_bus()`
+3. Lines 967-984: Publishes WORKER_SPAWNED to the global EventBus
+4. Line ~990+: The while loop picks up the query and calls `_run_tool_loop()`
+
+Meanwhile, the bridge:
+1. Receives WORKER_SPAWNED
+2. Calls `_on_worker_spawned()`
+3. Looks up the per-worker bus via `get_worker_event_bus()`
+4. Calls `_subscribe_to_worker_bus()`
+
+**If step 4 hasn't completed before the worker starts processing, all events from the first query are lost.** This includes token_warning events that occur during the first turn.
+
+**Impact:** Affects ALL per-worker bus events (tool_call, tool_result, token_warning, etc.)
+
+#### Gap 2: No `system_notification` Event from Agent Core
+
+**Location:** `agent/core/agent.py` — nowhere in `process_query()` does it yield `system_notification`
+
+**The problem:** The `context_summarized` notification is injected into the conversation as a message dict (`[SYSTEM NOTIFICATION] Context has been summarized...`), but never yielded as an event. The main agent shows it via conversation polling (it's in user_history). Workers detect it by monitoring `token_update` events for a ≥40% token drop — a heuristic, not a reliable detection.
+
+**Fix applied (2026-07-12):** Worker's token_update handler now detects the token drop and publishes `system_notification` with `type: 'context_summarized'`. This was confirmed working.
+
+#### Gap 3: Global Bus Handler for Worker Token Warnings is Dead Code
+
+**Location:** `bridge.py:_on_worker_token_warning`
+
+**The problem:** The bridge subscribes to TOKEN_WARNING on the global EventBus with a handler that checks `source.startswith("worker:")`. But workers publish token_warnings to the **per-worker** EventBus, not the global bus. The only code path that publishes TOKEN_WARNING to the global bus is... unclear. This handler is effectively dead code.
+
+**Additionally:** The global bus handler uses `data.get('warning_message', '')` while the per-worker bus handler uses `data.get('message', '')`. This `warning_message` vs `message` key mismatch means even if the dead code path fired, it would produce empty messages.
+
+#### Gap 4: Token Warning Display vs Context Summarized Display
+
+Both end up as `system_notification` events in the frontend, but through different paths:
+
+- `context_summarized`: Detected in `token_update` handler → `_publish_event('system_notification', {type:'context_summarized'})` → `worker:system_notification` → mapped directly to `system_notification` event
+- `token_warning`: From `process_query()` yield → `_publish_event('token_warning', ...)` → `worker:token_warning` → normalized to `system_notification` event
+
+Both are rendered via `adaptWorkerEvent()` → `MessageBubble` with `effectiveRole='system'`.
+
+#### Gap 5: Dedup Key Mismatch (Minor)
+
+**Location:** `WorkerOutputPanel.jsx`
+
+The dedup **filter** uses `rawType` (`'token_warning'`) but the dedup **registration** uses `evt.event` (`'system_notification'`). This means:
+- First event: filter checks `seenEventKeysRef` for `'token_warning|timestamp'` → not found → passes → normalized → `'system_notification|timestamp'` registered
+- Second identical event: filter checks `'token_warning|timestamp'` again → still not found → passes → **DUPLICATE**
+
+This causes potential duplicates rather than drops.
+
+---
+
+### 7. Summary Table
+
+| Feature | Main Agent | Worker Agent | Same/Different |
+|---|---|---|---|
+| Agent core (process_query) | `agent/core/agent.py:748` | `agent/core/agent.py:748` | **IDENTICAL** |
+| Token state machine | `agent/core/state.py:update_token_state` | Same | **IDENTICAL** |
+| Turn state machine | `agent/core/state.py:update_turn_state` | Same | **IDENTICAL** |
+| Time state machine | `agent/core/state.py:update_time_state` | Same | **IDENTICAL** |
+| Conversation storage | Session.user_history (ObservableList) | WorkerContext.conversation (plain list) + context.json | **DIFFERENT** |
+| Event consumer | Bridge `_map_and_emit()` | `WorkerThread._run_tool_loop()` | **DIFFERENT** |
+| Event forwarding | Direct callback to WebSocket via `_event_callbacks` | Per-worker EventBus → Bridge subscriber → WebSocket | **DIFFERENT** |
+| Token warning delivery | Via `conversation_changed` (full history sync) | Via dedicated `worker:token_warning` WS event | **DIFFERENT** |
+| Turn warning delivery | Via `conversation_changed` (full history sync) | Via dedicated `worker:turn_warning` WS event | **DIFFERENT** |
+| Time warning delivery | Via `conversation_changed` (full history sync) | Via dedicated `worker:time_warning` WS event | **DIFFERENT** |
+| System notification delivery | Via conversation (message dict in user_history) | Via dedicated `worker:system_notification` WS event | **DIFFERENT** |
+| Context persistence | Session serialization (session store) | `context.json` at `<workspace>/workers/<name>/` | **DIFFERENT** |
+| Execution environment | Bridge thread (single-threaded loop) | Daemon thread (per-worker) | **DIFFERENT** |
+| Tool restrictions enforcement | Same state machine | Same state machine | **IDENTICAL** |
+
+---
+
+### 8. Diagnostic Recommendations
+
+To diagnose why token warnings don't appear in the worker panel:
+
+1. **Check if worker is generating token_warnings at all:** Look at `events.jsonl` for entries with `"event": "system_notification"` and `"response": {"type": "token_warning"}` — this would confirm the `_log_event()` side works.
+
+2. **Check bridge subscription timing:** Add a 200ms delay in `worker.py:run()` between registering the EventBus and processing the first query, OR add a subscription-confirmation handshake.
+
+3. **Check per-worker bus subscription success:** The bridge logs `'Per-worker EventBus for {name} not found'` if `get_worker_event_bus()` returns None. Check server logs for this warning.
+
+4. **Check WebSocket delivery:** Add a debug log in `_make_bus_handler` to confirm the handler fires when token_warning is published.
+
+5. **Check frontend normalization:** Add a console.log in `WorkerOutputPanel.jsx` in the `incomingEvents` useEffect to see what events arrive and how they're normalized.
+
+
