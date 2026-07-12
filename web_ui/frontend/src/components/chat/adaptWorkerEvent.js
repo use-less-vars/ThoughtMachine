@@ -122,12 +122,13 @@ export default function adaptWorkerEvent(evt) {
     // Assistant message (from per-worker EventBus via WebSocket)
     case 'assistant_message': {
       const resp = evt.response || {}
+      const hasResponseType = resp.response_type != null
       return {
         _id: eventId(evt),
         role: 'assistant',
         content: resp.content || '',
         reasoning_content: resp.reasoning_content || undefined,
-        is_final: true,
+        is_final: hasResponseType,
         response_type: resp.response_type || 'answer',
       }
     }

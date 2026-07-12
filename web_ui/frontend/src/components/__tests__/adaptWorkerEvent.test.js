@@ -121,7 +121,7 @@ describe('final_response', () => {
     const result = adaptWorkerEvent(evt);
     expect(result.content).toBe('');
     expect(result.reasoning_content).toBeUndefined();
-    expect(result.is_final).toBe(true);
+    expect(result.is_final).toBe(false);
     expect(result.response_type).toBe('answer');
   });
 
@@ -151,6 +151,84 @@ describe('final_response', () => {
     });
     const result = adaptWorkerEvent(evt);
     expect(result.response_type).toBe('error');
+  });
+});
+
+// ==========================================================================
+// 4b. worker_message
+// ==========================================================================
+describe('worker_message', () => {
+  it('sets is_final: true when response_type is present (final answer)', () => {
+    const evt = makeEvent({
+      event: 'worker_message',
+      response: { content: 'Final result', reasoning_content: 'thinking...', response_type: 'answer' },
+    });
+    const result = adaptWorkerEvent(evt);
+    expect(result.role).toBe('assistant');
+    expect(result.content).toBe('Final result');
+    expect(result.reasoning_content).toBe('thinking...');
+    expect(result.is_final).toBe(true);
+    expect(result.response_type).toBe('answer');
+  });
+
+  it('sets is_final: false when response_type is missing (intermediate message)', () => {
+    const evt = makeEvent({
+      event: 'worker_message',
+      response: { content: 'Intermediate update' },
+    });
+    const result = adaptWorkerEvent(evt);
+    expect(result.role).toBe('assistant');
+    expect(result.content).toBe('Intermediate update');
+    expect(result.reasoning_content).toBeUndefined();
+    expect(result.is_final).toBe(false);
+    expect(result.response_type).toBe('answer');
+  });
+
+  it('sets is_final: false when response is missing', () => {
+    const evt = makeEvent({ event: 'worker_message' });
+    delete evt.response;
+    const result = adaptWorkerEvent(evt);
+    expect(result.content).toBe('');
+    expect(result.is_final).toBe(false);
+  });
+});
+
+// ==========================================================================
+// 4c. assistant_message
+// ==========================================================================
+describe('assistant_message', () => {
+  it('sets is_final: true when response_type is present (final answer)', () => {
+    const evt = makeEvent({
+      event: 'assistant_message',
+      response: { content: 'Final answer', reasoning_content: 'Step by step...', response_type: 'answer' },
+    });
+    const result = adaptWorkerEvent(evt);
+    expect(result.role).toBe('assistant');
+    expect(result.content).toBe('Final answer');
+    expect(result.reasoning_content).toBe('Step by step...');
+    expect(result.is_final).toBe(true);
+    expect(result.response_type).toBe('answer');
+  });
+
+  it('sets is_final: false when response_type is missing (intermediate message)', () => {
+    const evt = makeEvent({
+      event: 'assistant_message',
+      response: { content: 'Working on it...' },
+    });
+    const result = adaptWorkerEvent(evt);
+    expect(result.role).toBe('assistant');
+    expect(result.content).toBe('Working on it...');
+    expect(result.reasoning_content).toBeUndefined();
+    expect(result.is_final).toBe(false);
+    expect(result.response_type).toBe('answer');
+  });
+
+  it('sets is_final: false when response is missing', () => {
+    const evt = makeEvent({ event: 'assistant_message' });
+    delete evt.response;
+    const result = adaptWorkerEvent(evt);
+    expect(result.content).toBe('');
+    expect(result.is_final).toBe(false);
   });
 });
 

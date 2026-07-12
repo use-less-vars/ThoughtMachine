@@ -203,7 +203,7 @@ function MessageContent({ msg }) {
 const MessageBubble = React.memo(
   function MessageBubble({ msg, index }) {
   /* ── System notifications are stored as 'user' role with is_system_notification flag ── */
-  const effectiveRole = msg.is_final
+  const effectiveRole = (msg.is_final && !msg.is_system_notification)
     ? (msg.response_type === 'question' ? 'question' : 'final')
     : (msg.is_summary ? 'summary' : (msg.is_system_notification ? 'system' : msg.role))
   const style = ROLE_STYLE[effectiveRole] || ROLE_STYLE.system
