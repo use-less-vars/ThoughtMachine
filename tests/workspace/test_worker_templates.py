@@ -1,7 +1,7 @@
 """
 Tests for worker template merging during workspace bootstrap.
 
-Verifies that ``ensure_workspace_dirs()`` correctly merges echo + template workers
+Verifies that ``ensure_workspace_dirs()`` correctly bootstraps template workers
 into ``workers.json``.
 """
 
@@ -17,7 +17,6 @@ import pytest
 
 from thoughtmachine.workspace_capabilities import (
     _build_default_workers,
-    _default_echo_worker,
     _load_template_workers,
     _user_dir,
     ensure_workspace_dirs,
@@ -47,7 +46,7 @@ def with_template_dir(temp_user_dir):
             "description": "Default general-purpose worker",
             "system_prompt": "You are a capable autonomous sub-agent.",
             "tools": [],
-            "worker_permissions": {},
+            "permission_footprint": {},
             "timeout_seconds": 120,
             "temperature": 0.2,
         },
@@ -163,26 +162,24 @@ class TestEnsureWorkspaceDirsMerged:
         assert len(workers) == 1
 
     def test_idempotent_does_not_overwrite_existing(self, with_template_dir):
-        """Existing workers are preserved; the default template is merged in if missing."""
+        """Existing workers.json is NOT modified by ensure_workspace_dirs."""
         ensure_workspace_dirs("test-ws-merged-2")
         path = _user_dir() / "workspaces" / "test-ws-merged-2" / "workers.json"
 
         # Modify the file to only have a custom worker
+        custom_data = [{"name": "custom", "system_prompt": "custom", "description": "custom", "tools": [], "permission_footprint": {}}]
         path.write_text(
-            json.dumps([{"name": "custom", "system_prompt": "custom", "description": "custom", "tools": [], "worker_permissions": {}}], indent=2),
+            json.dumps(custom_data, indent=2),
             encoding="utf-8",
         )
 
-        # Call again — should NOT overwrite existing, but should merge in missing default template
+        # Call again — should NOT overwrite or modify existing workers.json
         ensure_workspace_dirs("test-ws-merged-2")
 
         workers = json.loads(path.read_text(encoding="utf-8"))
-        assert len(workers) == 2  # custom preserved + default merged in
-        names = {w["name"] for w in workers}
-        assert "custom" in names  # existing worker untouched
-        assert "default" in names  # default template merged in
-        custom = [w for w in workers if w["name"] == "custom"][0]
-        assert custom["system_prompt"] == "custom"  # untouched
+        assert workers == custom_data  # completely untouched
+        assert len(workers) == 1
+        assert workers[0]["name"] == "custom"
 
     def test_atomic_write_leaves_no_tmp_file(self, with_template_dir):
         """The .tmp file is cleaned up after writing workers.json."""

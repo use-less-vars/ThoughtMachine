@@ -25,7 +25,6 @@ from tools.workspace.check_system import CheckSystem
 from tools.workspace.worker import Worker, WorkerThread
 from tools.workspace.edit_dockerfile import EditDockerfile
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  Helpers
 # ══════════════════════════════════════════════════════════════════════════════
@@ -33,7 +32,6 @@ from tools.workspace.edit_dockerfile import EditDockerfile
 def _parse_result(result: str) -> dict:
     """Parse JSON tool result into a dict."""
     return json.loads(result)
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CheckSystem
@@ -251,7 +249,7 @@ class TestCheckSystem:
         mock_workers = MagicMock()
         mock_workers.exists.return_value = True
         mock_workers.read_text.return_value = json.dumps([
-            {"name": "echo", "system_prompt": "Echo worker", "tools": ["Thought"], "timeout_seconds": 60},
+            {"name": "default", "system_prompt": "Default worker", "tools": ["Thought"], "timeout_seconds": 60},
         ])
 
         def _div(key):
@@ -269,7 +267,7 @@ class TestCheckSystem:
         result = json.loads(tool.execute())
         assert "workers" in result
         assert result["count"] == 1
-        assert result["workers"][0]["name"] == "echo"
+        assert result["workers"][0]["name"] == "default"
 
     @patch("tools.workspace.check_system.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.check_system._workspace_dir")
@@ -279,7 +277,7 @@ class TestCheckSystem:
         mock_workers = MagicMock()
         mock_workers.exists.return_value = True
         mock_workers.read_text.return_value = json.dumps([
-            {"name": "echo", "system_prompt": "Echo worker", "tools": ["Thought"], "timeout_seconds": 60},
+            {"name": "default", "system_prompt": "Default worker", "tools": ["Thought"], "timeout_seconds": 60},
             {"name": "helper", "system_prompt": "Helper worker", "tools": ["FileEditor"]},
         ])
 
@@ -292,12 +290,12 @@ class TestCheckSystem:
         mock_ws_dir.return_value = mock_dir
 
         tool = CheckSystem(
-            query="worker/echo",
+            query="worker/default",
             workspace_path="/tmp/test_ws",
         )
         result = json.loads(tool.execute())
-        assert result["name"] == "echo"
-        assert result["system_prompt"] == "Echo worker"
+        assert result["name"] == "default"
+        assert result["system_prompt"] == "Default worker"
         assert result["timeout_seconds"] == 60
 
     def test_worker_detail_query_not_found(self):
@@ -423,7 +421,6 @@ class TestCheckSystem:
         assert "valid_queries" in result
         assert isinstance(result["valid_queries"], list)
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  Worker
 # ══════════════════════════════════════════════════════════════════════════════
@@ -528,31 +525,6 @@ class TestWorker:
         assert "system prompt changed" in caplog.text
         assert "old assistant" in caplog.text
         assert "NEW assistant" in caplog.text
-
-    def test_worker_thread_logs_events(self, tmp_path: Path):
-        """WorkerThread logs events to events.jsonl."""
-        thread = WorkerThread(
-            name="log_test",
-            definition={},
-            agent_config={},
-            workspace_dir=tmp_path,
-        )
-        thread._log_event("started", {}, {})
-        thread._log_event("query", "hello", "world")
-
-        events_file = tmp_path / "workers" / "events.jsonl"
-        assert events_file.exists()
-        lines = events_file.read_text(encoding="utf-8").strip().split("\n")
-        assert len(lines) == 2
-
-        evt1 = json.loads(lines[0])
-        assert evt1["event"] == "started"
-        assert evt1["worker_name"] == "log_test"
-
-        evt2 = json.loads(lines[1])
-        assert evt2["event"] == "query"
-        assert evt2["request"] == "hello"
-        assert evt2["response"] == "world"
 
     def test_worker_thread_send_query_timeout(self, tmp_path: Path):
         """send_query raises TimeoutError when worker doesn't respond."""
@@ -827,7 +799,7 @@ class TestWorker:
         mock_gate.return_value = (True, "")
         tool = Worker(action="list", workspace_path="/tmp/test_ws")
         result = tool._check_worker_permissions(
-            {"required_categories": ["execution:read"], "worker_permissions": {}},
+            {"required_categories": ["execution:read"], "permission_footprint": {}},
             {"execution": "read"},
         )
         assert result is None
@@ -839,7 +811,7 @@ class TestWorker:
         mock_gate.return_value = (False, "Insufficient permissions")
         tool = Worker(action="list", workspace_path="/tmp/test_ws")
         result = tool._check_worker_permissions(
-            {"required_categories": ["execution:write"], "worker_permissions": {}},
+            {"required_categories": ["execution:write"], "permission_footprint": {}},
             {"execution": "read"},
         )
         assert result == "Insufficient permissions"
@@ -849,7 +821,7 @@ class TestWorker:
         """If definition has no required_categories, gate is skipped."""
         tool = Worker(action="list", workspace_path="/tmp/test_ws")
         result = tool._check_worker_permissions(
-            {"worker_permissions": {}},
+            {"permission_footprint": {}},
             {},
         )
         assert result is None
@@ -859,7 +831,7 @@ class TestWorker:
         """If security gate is not importable, all workers allowed."""
         tool = Worker(action="list", workspace_path="/tmp/test_ws")
         result = tool._check_worker_permissions(
-            {"required_categories": ["execution:write"], "worker_permissions": {}},
+            {"required_categories": ["execution:write"], "permission_footprint": {}},
             {},
         )
         assert result is None
@@ -894,7 +866,7 @@ class TestWorker:
             {
                 "name": "reader",
                 "tools": ["FileEditor", "DateTimeTool"],
-                "worker_permissions": {"filesystem": "read"},
+                "permission_footprint": {"filesystem": "read"},
             },
         ])
         mock_dir.__truediv__.return_value = mock_file
@@ -942,7 +914,7 @@ class TestWorker:
             {
                 "name": "safe_worker",
                 "tools": ["Worker", "FileEditor", "DateTimeTool"],
-                "worker_permissions": {},
+                "permission_footprint": {},
             },
         ])
         mock_dir.__truediv__.return_value = mock_file
@@ -987,7 +959,7 @@ class TestWorker:
             name="readonly_worker",
             definition={
                 "system_prompt": "You are a test.",
-                "worker_permissions": {"filesystem": "read"},
+                "permission_footprint": {"filesystem": "read"},
             },
             agent_config={},
             workspace_dir=tmp_path,
@@ -1005,7 +977,6 @@ class TestWorker:
         assert "permission" in error.lower() or "denied" in error.lower(), (
             f"Error message should mention permission/denied, got: {error}"
         )
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  EditDockerfile

@@ -279,7 +279,7 @@ class TestMultipleWorkspaces:
         ws_id_a = _simulate_auto_register(root_a)
         ws_id_b = _simulate_auto_register(root_b)
 
-        expected_workers = {"coder", "reviewer", "researcher", "echo"}
+        expected_workers = {"coder", "reviewer", "researcher"}
         assert _worker_names_in(ws_id_a) == expected_workers
         assert _worker_names_in(ws_id_b) == expected_workers
 

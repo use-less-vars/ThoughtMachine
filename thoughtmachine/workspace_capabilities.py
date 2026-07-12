@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # Minimal validation for template workers (avoids circular import via agent.__init__)
-_REQUIRED_WORKER_FIELDS = {"name", "description", "system_prompt", "tools", "worker_permissions"}
+_REQUIRED_WORKER_FIELDS = {"name", "description", "system_prompt", "tools", "permission_footprint"}
 
 
 def _validate_worker_dict(data: dict) -> dict | None:
@@ -28,7 +28,7 @@ def _validate_worker_dict(data: dict) -> dict | None:
         return None
     if not isinstance(data.get("tools"), list):
         return None
-    if not isinstance(data.get("worker_permissions"), dict):
+    if not isinstance(data.get("permission_footprint"), dict):
         return None
     return data
 
@@ -303,33 +303,6 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
         _atomic_write_json(workers_path, workers_data)
         created.append(str(workers_path))
 
-    # ── Migration: Clean up existing workers.json ──
-    #  1. Strip echo worker (legacy)
-    #  2. Merge in the default template worker
-    if workers_path.exists():
-        try:
-            existing = json.loads(workers_path.read_text(encoding="utf-8"))
-            if isinstance(existing, list):
-                # Strip echo
-                cleaned = [w for w in existing if w.get("name") != "echo"]
-                # Merge missing template workers
-                existing_names = {w.get("name") for w in cleaned if w.get("name")}
-                templates = _build_default_workers()
-                for tmpl in templates:
-                    if tmpl["name"] not in existing_names:
-                        cleaned.append(tmpl)
-                        existing_names.add(tmpl["name"])
-                # Write back if anything changed
-                if len(cleaned) != len(existing) or any(
-                    w.get("name") == "echo" for w in existing
-                ):
-                    _atomic_write_json(workers_path, cleaned)
-                    logging.getLogger(__name__).info(
-                        "Migrated workers.json: removed echo, merged template workers"
-                    )
-        except (json.JSONDecodeError, OSError):
-            pass
-
     # ── mcp_servers.json (empty array) ────────────────────────────────────
     mcp_servers_path = base / "mcp_servers.json"
     if not mcp_servers_path.exists():
@@ -343,22 +316,6 @@ def ensure_workspace_dirs(workspace_id: str) -> List[str]:
 
 
 # ── Worker template helpers ───────────────────────────────────────────────────
-
-
-def _default_echo_worker() -> dict:
-    """Return the echo test worker dict (always included in workers.json)."""
-    return {
-        "name": "echo",
-        "system_prompt": (
-            "You are Echo, a simple test worker. "
-            "Respond concisely and directly to any query."
-        ),
-        "required_categories": [],
-        "worker_permissions": {},
-        "permission_footprint": {},
-        "description": "Simple test worker for verifying the delegation loop",
-        "tools": ["FilePreviewTool"],
-    }
 
 
 def _load_template_workers() -> list[dict]:
@@ -412,9 +369,7 @@ def _build_default_workers() -> list[dict]:
     """
     Build the default workers list for a freshly bootstrapped workspace.
 
-    Loads the default template worker from worker_templates/.
-    The echo test worker is NOT included by default;
-    it is available via ``_default_echo_worker()`` for manual use.
+    Loads the default template workers from worker_templates/.
     """
     result: list[dict] = []
     existing_names: set[str] = set()
