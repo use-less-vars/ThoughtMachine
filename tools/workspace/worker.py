@@ -307,11 +307,7 @@ class WorkerThread(threading.Thread):
         self.definition = definition
         self._agent_config_dict = agent_config
         self.session_id = session_id
-        session_subdir = session_id or ""
-        if session_subdir:
-            self._worker_dir = workspace_dir / "workers" / session_subdir / name
-        else:
-            self._worker_dir = workspace_dir / "workers" / name
+        self._worker_dir = workspace_dir / "workers" / name
         self._worker_dir.mkdir(parents=True, exist_ok=True)
 
         # Tool classes available to this worker (name -> class)
@@ -594,6 +590,7 @@ class WorkerThread(threading.Thread):
             {"query": query[:500]},
             {},
         )
+        self._publish_event("user_message", {"query": query})
 
         # Check stop before starting tool loop
         if self._stop_event.is_set():
@@ -632,6 +629,16 @@ class WorkerThread(threading.Thread):
                         "reasoning_content": str(self._last_reasoning)[:2000] if self._last_reasoning else None,
                         "response_type": event.get("response_type", "answer"),
                     })
+                    # Log to events.jsonl for HTTP polling path
+                    self._log_event(
+                        "worker_message",
+                        {},
+                        {
+                            "content": str(final_content)[:1000],
+                            "reasoning_content": str(self._last_reasoning)[:2000] if self._last_reasoning else None,
+                            "response_type": event.get("response_type", "answer"),
+                        },
+                    )
 
                 elif event_type == "stopped":
                     stop_reason = event.get("stop_reason", "unknown")
@@ -706,6 +713,11 @@ class WorkerThread(threading.Thread):
                             "token_count": token_count,
                         },
                     )
+                    # Publish to per-worker EventBus for real-time WS delivery
+                    self._publish_event("token_warning", {
+                        "message": str(message)[:500],
+                        "token_count": token_count,
+                    })
 
                 # Log turn warnings as system notifications
                 if event_type == "turn_warning":
@@ -720,6 +732,11 @@ class WorkerThread(threading.Thread):
                             "turn_count": turn_count,
                         },
                     )
+                    # Publish to per-worker EventBus for real-time WS delivery
+                    self._publish_event("turn_warning", {
+                        "message": str(message)[:500],
+                        "turn_count": turn_count,
+                    })
 
                 # Log time warnings as system notifications
                 if event_type == "time_warning":
@@ -734,6 +751,11 @@ class WorkerThread(threading.Thread):
                             "elapsed_seconds": elapsed,
                         },
                     )
+                    # Publish to per-worker EventBus for real-time WS delivery
+                    self._publish_event("time_warning", {
+                        "message": str(message)[:500],
+                        "elapsed_seconds": elapsed,
+                    })
 
                 # Log system notifications emitted by the agent (e.g., context summarization)
                 if event_type == "system_notification":
@@ -748,6 +770,12 @@ class WorkerThread(threading.Thread):
                             "context_length": context_length,
                         },
                     )
+                    # Publish to per-worker EventBus for real-time WS delivery
+                    self._publish_event("system_notification", {
+                        "type": "context_summarized",
+                        "message": str(message)[:500],
+                        "context_length": context_length,
+                    })
 
                 # Log assistant turn messages (agent's intermediate thoughts / responses)
                 if event_type == "turn":
@@ -755,8 +783,9 @@ class WorkerThread(threading.Thread):
                     reasoning = event.get("reasoning", "")
                     self._log_event(
                         "assistant_message",
-                        {"content": str(content)[:500]},
                         {},
+                        {"content": str(content)[:500],
+                         "reasoning_content": str(reasoning)[:2000] if reasoning else None},
                     )
                     self._publish_event("assistant_message", {
                         "content": str(content)[:1000],
@@ -764,10 +793,32 @@ class WorkerThread(threading.Thread):
                     })
 
                 # Cache the agent's authoritative post-prune token count
+                # and detect context summarization inline (token drop threshold)
                 if event_type == "token_update":
                     context_length = event.get("context_length")
                     if context_length is not None:
+                        prev_tokens = self._cached_context_tokens or 0
                         self._cached_context_tokens = int(context_length)
+
+                        # Detect summarization: significant token drop indicates
+                        # the agent just called _apply_summary_pruning()
+                        if prev_tokens > 2000 and self._cached_context_tokens < prev_tokens * 0.60:
+                            log('DEBUG', 'tools.worker',
+                                f'Context summarization detected: {prev_tokens} -> {self._cached_context_tokens} tokens')
+                            self._log_event(
+                                "system_notification",
+                                {},
+                                {
+                                    "type": "context_summarized",
+                                    "message": "Context has been cleared and summarized. You now have a fresh context window with full access to tools.",
+                                    "context_length": self._cached_context_tokens,
+                                },
+                            )
+                            self._publish_event("system_notification", {
+                                "type": "context_summarized",
+                                "message": "Context has been cleared and summarized. You now have a fresh context window with full access to tools.",
+                                "context_length": self._cached_context_tokens,
+                            })
 
                 # Keep legacy tool_execution handler for backward compatibility
                 if event_type == "tool_execution":
@@ -844,6 +895,37 @@ class WorkerThread(threading.Thread):
                         )
                         self._input_queue.put(initial_query)
 
+            else:
+                # ── Context loaded from disk: merge initial_context if provided ──
+                # When context.json exists, we preserve the loaded conversation and
+                # merge _initial_context into it rather than replacing it.
+                if self._initial_context:
+                    # Add initial context as a system message for continuity
+                    ctx_msg = {
+                        "role": "system",
+                        "content": f"Initial context: {json.dumps(self._initial_context, default=str)}",
+                    }
+                    # Check if this initial_context was already injected (avoid duplicates
+                    # on repeated spawn calls)
+                    already_present = any(
+                        msg.get("content", "") == ctx_msg["content"]
+                        for msg in self._worker_ctx.user_history
+                    )
+                    if not already_present:
+                        self._worker_ctx.user_history.append(ctx_msg)
+                        logger.debug(
+                            "Merged initial_context into loaded context for worker '%s'",
+                            self.worker_name,
+                        )
+                    # Auto-queue the query if present
+                    initial_query = self._initial_context.get("query")
+                    if initial_query:
+                        logger.debug(
+                            "Auto-queueing initial query for worker '%s' (loaded context)",
+                            self.worker_name,
+                        )
+                        self._input_queue.put(initial_query)
+
             self._save_context()
             self._log_event("started", {}, {})
 
@@ -892,6 +974,8 @@ class WorkerThread(threading.Thread):
                                 data={
                                     "session_id": self.session_id or "",
                                     "worker_name": self.worker_name,
+                                    "current_context_tokens": self.get_current_context_tokens(),
+                                    "max_context_tokens": self.max_context_tokens,
                                 },
                             )
                             global_event_bus.publish(evt)
@@ -918,6 +1002,8 @@ class WorkerThread(threading.Thread):
                                 "worker_name": self.worker_name,
                                 "status": "busy",
                                 "current_task": self.current_task,
+                                "current_context_tokens": self.get_current_context_tokens(),
+                                "max_context_tokens": self.max_context_tokens,
                             },
                             source=f"worker:{self.worker_name}",
                             session_id=self.session_id or "",
@@ -939,6 +1025,8 @@ class WorkerThread(threading.Thread):
                                 "session_id": self.session_id or "",
                                 "worker_name": self.worker_name,
                                 "status": "ready",
+                                "current_context_tokens": self.get_current_context_tokens(),
+                                "max_context_tokens": self.max_context_tokens,
                             },
                             source=f"worker:{self.worker_name}",
                             session_id=self.session_id or "",
@@ -983,6 +1071,8 @@ class WorkerThread(threading.Thread):
                             "session_id": self.session_id or "",
                             "worker_name": self.worker_name,
                             "error": str(exc),
+                            "current_context_tokens": self.get_current_context_tokens(),
+                            "max_context_tokens": self.max_context_tokens,
                         },
                         source=f"worker:{self.worker_name}",
                         session_id=self.session_id or "",
@@ -1004,6 +1094,8 @@ class WorkerThread(threading.Thread):
                             "session_id": self.session_id or "",
                             "worker_name": self.worker_name,
                             "status": "completed",
+                            "current_context_tokens": self.get_current_context_tokens(),
+                            "max_context_tokens": self.max_context_tokens,
                         },
                         source=f"worker:{self.worker_name}",
                         session_id=self.session_id or "",
@@ -1160,7 +1252,13 @@ class WorkerThread(threading.Thread):
             evt_type = EventType(event_type)
             evt = create_event(
                 evt_type,
-                data={**data, 'worker_name': self.worker_name, 'session_id': self.session_id},
+                data={
+                    **data,
+                    'worker_name': self.worker_name,
+                    'session_id': self.session_id,
+                    'current_context_tokens': self.get_current_context_tokens(),
+                    'max_context_tokens': self.max_context_tokens,
+                },
                 source=f'worker:{self.worker_name}',
                 session_id=self.session_id,
             )
@@ -1579,21 +1677,11 @@ class Worker(ToolBase):
         if self.context is not None and isinstance(self.context, dict):
             thread._initial_context = self.context
 
-        # ── Fix 1: Delete stale persistence when fresh context is provided ──
-        # WorkerThread.run() calls _load_context() which reads context.json
-        # from disk. If context.json exists from a previous run, the old
-        # conversation is loaded and _initial_context is silently dropped.
-        # By deleting context.json here when we set _initial_context, we
-        # ensure _load_context() returns None and the fresh context branch
-        # in run() is entered.
-        if thread._initial_context is not None:
-            ctx_path = thread._worker_dir / "context.json"
-            if ctx_path.exists():
-                ctx_path.unlink(missing_ok=True)
-                logger.debug(
-                    "Deleted stale context.json for worker '%s' due to fresh spawn context",
-                    self.worker_name,
-                )
+        # Context is always preserved — context.json is never deleted on spawn.
+        # If context.json exists from a previous run, it is loaded in run()
+        # and _initial_context is merged into the loaded context rather than
+        # replacing it. This ensures worker conversation state persists across
+        # spawn/query boundaries.
 
         # ── Fix 1.1A: Clean up stale command.json before starting ──
         cmd_path = thread._worker_dir / "command.json"
