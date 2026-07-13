@@ -432,30 +432,22 @@ class WebAgentBridge:
         """
         Forward worker spawned event to frontend and subscribe to
         the per-worker EventBus for detailed events.
-        """
-        print(f"[BRIDGE DEBUG] _on_worker_spawned CALLED with data: {event.data}", flush=True)
-        if not self._event_callbacks:
-            return
-        data = event.data or {}
-        # Only forward events for this bridge's session
-        if data.get('session_id') and data['session_id'] != self._session_id:
-            return
-        event_dict = {
-            'type': f'worker:{event.type.value}',
-            'worker_name': data.get('worker_name', ''),
-            'timestamp': event.metadata.timestamp.isoformat(),
-            'data': data,
-        }
-        for cb in list(self._event_callbacks.values()):
-            try:
-                cb(event_dict)
-            except Exception as exc:
-                log('ERROR', 'server.bridge',
-                    f'Failed to forward worker event: {exc}')
 
-        # Subscribe to per-worker EventBus for detailed events
+        Subscription to the per-worker bus happens *before* the
+        event_callbacks guard so that detailed events are captured
+        even if no WebSocket client is connected yet (race condition fix).
+        """
+        data = event.data or {}
+
+        # Only handle events for this bridge's session
         worker_name = data.get('worker_name', '')
         session_id = data.get('session_id', self._session_id or '')
+        if data.get('session_id') and data['session_id'] != self._session_id:
+            return
+
+        # Subscribe to per-worker EventBus for detailed events
+        # This must happen regardless of _event_callbacks to avoid
+        # a race where the event arrives before any WebSocket client connects.
         if worker_name and WORKER_BUS_AVAILABLE and get_worker_event_bus is not None:
             worker_bus = get_worker_event_bus(session_id, worker_name)
             if worker_bus is not None:
@@ -466,6 +458,22 @@ class WebAgentBridge:
                     f'— detailed events (tool_call, tool_result, assistant_message) '
                     f'will NOT be forwarded to the frontend. '
                     f'This may be a race condition: worker bus registered before bridge subscribes.')
+
+        # Forward the event to frontend callbacks (if any)
+        if not self._event_callbacks:
+            return
+        event_dict = {
+            'type': f'worker:{event.type.value}',
+            'worker_name': worker_name,
+            'timestamp': event.metadata.timestamp.isoformat(),
+            'data': data,
+        }
+        for cb in list(self._event_callbacks.values()):
+            try:
+                cb(event_dict)
+            except Exception as exc:
+                log('ERROR', 'server.bridge',
+                    f'Failed to forward worker event: {exc}')
 
     def _subscribe_to_worker_bus(self, worker_name: str, worker_bus: Any) -> None:
         """
@@ -495,7 +503,7 @@ class WebAgentBridge:
                     ),
                     'data': data,
                 }
-                log('WARNING', 'server.bridge',
+                log('DEBUG', 'server.bridge',
                     f'[DIAG] Per-worker bus handler for {worker_name}/{original_type}: '
                     f'forwarding event_dict type={event_dict.get("type")} '
                     f'worker_name={event_dict.get("worker_name")} '
@@ -1831,6 +1839,15 @@ class WebAgentBridge:
                         if self._stop_event.is_set():
                             break
                         self._map_and_emit(raw_event)
+
+                        # Publish raw event to global event bus for EventLogger
+                        if EVENT_SYSTEM_AVAILABLE and global_event_bus is not None:
+                            try:
+                                from agent.events import convert_from_legacy_format
+                                typed_event = convert_from_legacy_format(raw_event)
+                                global_event_bus.publish(typed_event)
+                            except Exception:
+                                pass
 
                         # Check pause after each event
                         if not self._pause_event.is_set():

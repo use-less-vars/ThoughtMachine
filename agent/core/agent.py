@@ -105,6 +105,7 @@ class Agent:
         self.conversation_manager = ConversationManager(session, None, self.logger)
         self.debug_context = DebugContext(self.logger)
         self._pending_warnings = []  # Buffer for token warnings, flushed after turn commit
+        self._pending_warning_events = []  # Buffer for token warning events, yielded after turn commit
         self.tool_classes = config.get_filtered_tool_classes()
         # Register MCP tools in background (non-blocking, no startup delay)
         # MCP tools become available later once background registration completes.
@@ -572,9 +573,15 @@ class Agent:
         For warning events, inject warning message into conversation.
         """
         if event.get('type') == 'token_warning':
-            pass
+            if self.logger:
+                pass
+            self._add_conversation_data_to_event(event)
+            yield event
         elif event.get('type') == 'turn_warning':
-            pass
+            if self.logger:
+                log('DEBUG', 'core.token', f'Turn warning event: {event.get("warning_message", "")}')
+            self._add_conversation_data_to_event(event)
+            yield event
         elif event.get('type') == 'execution_state_change':
             old_state = event.get('old_state')
             new_state = event.get('new_state')
@@ -668,8 +675,11 @@ class Agent:
             if event['type'] == 'token_warning':
                 # Buffer the warning instead of injecting immediately — it will be flushed
                 # after turn_transaction.commit() so it lands in correct chronological order.
-                warning_msg = Message(role='user', content=f'[SYSTEM NOTIFICATION] {event.get("message", event.get("warning", ""))}', is_system_notification=True)
+                warning_msg = Message(role='user', content=f'[SYSTEM NOTIFICATION] {event.get("warning_message", event.get("message", event.get("warning", "")))}', is_system_notification=True)
                 self._pending_warnings.append(warning_msg)
+                # Also buffer the raw event for yielding to event stream subscribers
+                self._add_conversation_data_to_event(event)
+                self._pending_warning_events.append(event)
                 log('DEBUG', 'core.token', f"warning buffered: state={self.state.token_state.value if hasattr(self.state, 'token_state') else 'N/A'}, count={len(self._pending_warnings)}")
                 warning_tokens = self._estimate_tokens(warning_msg)
                 self.state.current_conversation_tokens += warning_tokens
@@ -760,16 +770,16 @@ class Agent:
             yield self._create_token_update_event()
             self._display_turn = getattr(self, '_display_turn', 0) + 1
             log('DEBUG', 'core.agent', f"User query added: turn={self._display_turn}")
-
+    
             # Apply any pending configuration update BEFORE yielding user_query,
             # so the [SYSTEM NOTIFICATION] is already in user_history when the
             # bridge syncs the conversation for the frontend.
             config_applied = self._apply_pending_config()
-
+    
             if not config_applied:
                 error_detail = self._last_config_error or 'Unknown error'
                 log('ERROR', 'core.agent', f'Configuration update failed: {error_detail}')
-
+    
                 # Add a visible system notification to the conversation
                 error_message = (
                     '[SYSTEM NOTIFICATION] Configuration change failed: '
@@ -779,7 +789,7 @@ class Agent:
                 )
                 notif_msg = Message(role='user', content=error_message, is_system_notification=True)
                 self._add_to_conversation(notif_msg)
-
+    
                 event_dict = {
                     'type': 'error',
                     'error_type': 'invalid_config',
@@ -790,7 +800,7 @@ class Agent:
                 self._add_conversation_data_to_event(event_dict)
                 yield event_dict
                 return
-
+    
             # Now yield user_query — the bridge syncs the conversation, and any
             # config-change notification from _apply_pending_config is already visible.
             event_dict = {'type': 'user_query', 'content': query, 'turn': self._display_turn}
@@ -798,7 +808,7 @@ class Agent:
             if 'timestamp' not in event_dict:
                 event_dict['timestamp'] = event_dict.get('created_at', time.time())
             yield event_dict
-
+    
             pause_debug(f"process_query called with query: '{query[:50]}...'")
             pause_debug(f'Current execution state: {self.state.execution_state}')
             pause_debug(f'Conversation length after adding query: {len(self.conversation)}')
@@ -883,16 +893,16 @@ class Agent:
                         event_dict = {'type': event['type'], 'message': event.get('message', event.get('warning_message', '')), 'elapsed_seconds': event.get('elapsed_seconds', elapsed), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                         self._add_conversation_data_to_event(event_dict)
                         yield event_dict
-
+    
                 turn_events = self.state.update_turn_state(turn)
                 for event in turn_events:
                     if event['type'] == 'turn_warning':
-                        warning_msg = Message(role='user', content='[SYSTEM NOTIFICATION] ' + event.get('message', event.get('warning', '')), is_system_notification=True)
+                        warning_msg = Message(role='user', content='[SYSTEM NOTIFICATION] ' + event.get('warning_message', event.get('message', event.get('warning', ''))), is_system_notification=True)
                         self._add_to_conversation(warning_msg)
                         warning_tokens = self._estimate_tokens(warning_msg)
                         self.state.current_conversation_tokens += warning_tokens
                         yield self._create_token_update_event()
-                    event_dict = {'type': event['type'], 'message': event.get('message', event.get('warning', '')), 'turn_count': event.get('turn_count', turn), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                    event_dict = {'type': event['type'], 'message': event.get('warning_message', event.get('message', event.get('warning', ''))), 'turn_count': event.get('turn_count', turn), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                     self._add_conversation_data_to_event(event_dict)
                     yield event_dict
                 # Don't recalculate full estimate here - truth-based current_conversation_tokens
@@ -901,14 +911,14 @@ class Agent:
                 token_events = self.state.update_token_state(self.state.current_conversation_tokens)
                 for event in token_events:
                     if event['type'] == 'token_warning':
-                        warning_msg = Message(role='user', content='[SYSTEM NOTIFICATION] ' + event.get('message', event.get('warning', '')), is_system_notification=True)
+                        warning_msg = Message(role='user', content='[SYSTEM NOTIFICATION] ' + event.get('warning_message', event.get('message', event.get('warning', ''))), is_system_notification=True)
                         self._add_to_conversation(warning_msg)
                         warning_tokens = self._estimate_tokens(warning_msg)
                         self.state.current_conversation_tokens += warning_tokens
                         yield self._create_token_update_event()
-                    event_dict = {'type': event['type'], 'message': event.get('message', event.get('warning', '')), 'token_count': event.get('token_count', self.state.current_conversation_tokens), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
-                    self._add_conversation_data_to_event(event_dict)
-                    yield event_dict
+                    # Yield the original event (not reconstructed) to preserve all fields
+                    self._add_conversation_data_to_event(event)
+                    yield event
                 for msg in self.conversation:
                     if msg.get('role') == 'assistant' and 'tool_calls' in msg:
                         if msg.get('reasoning_content') is None:
@@ -1182,8 +1192,11 @@ class Agent:
                     # so they land chronologically after tool results in user_history
                     for warning in self._pending_warnings:
                         self._add_to_conversation(warning)
-                    log('DEBUG', 'core.token', f"warning flushed (tool path): count={len(self._pending_warnings)}")
+                    # Yield token_warning events to event stream subscribers (worker, EventLogger, etc.)
+                    for warning_event in self._pending_warning_events:
+                        yield warning_event
                     self._pending_warnings.clear()
+                    self._pending_warning_events.clear()
                     log('DEBUG', 'core.agent', f"[TOOL LOOP] conversation length now {len(self.conversation)}, last 3 roles: {[m.get('role') for m in self.conversation[-3:]]}")
                     if final_detected:
                         # Unified respond event — carries response_type so consumers
@@ -1237,8 +1250,11 @@ class Agent:
                     # Flush any buffered token warnings (unlikely here, but be safe)
                     for warning in self._pending_warnings:
                         self._add_to_conversation(warning)
-                    log('DEBUG', 'core.token', f"warning flushed (no-tool path): count={len(self._pending_warnings)}")
+                    # Yield token_warning events to event stream subscribers
+                    for warning_event in self._pending_warning_events:
+                        yield warning_event
                     self._pending_warnings.clear()
+                    self._pending_warning_events.clear()
                     if self.logger:
                         self.logger.log_system_resources()
                         self.logger.log_agent_end('completed', 'Assistant provided direct answer with no tool calls')
@@ -1251,7 +1267,7 @@ class Agent:
                     self._add_conversation_data_to_event(final_event)
                     yield final_event
                     return
-
+    
             # Max turns reached - loop exhausted naturally
             log('WARNING', 'core.agent', f'Max turns ({self.config.max_turns}) reached - loop exhausted')
             if self.logger:
@@ -1268,7 +1284,7 @@ class Agent:
             self._add_conversation_data_to_event(max_turns_event)
             yield max_turns_event
             return
-
+    
         finally:
             self.state.execution_state = ExecutionState.READY
             log('DEBUG', 'core.agent', 'process_query finished, reset execution_state to READY')
@@ -1454,7 +1470,7 @@ class Agent:
         for tool_cls in SIMPLIFIED_TOOL_CLASSES:
             if tool_cls.__name__ in preset_tool_names:
                 tool_classes.append(tool_cls)
-        config_data = {'api_key': api_key or '', 'base_url': base_url, 'model': preset.model, 'temperature': preset.temperature, 'enabled_tools': list(preset_tool_names), 'system_prompt': preset.system_prompt, 'provider_type': 'openai_compatible', 'max_turns': overrides.get('max_turns', 100), 'detail': overrides.get('detail', 'normal'), 'workspace_path': overrides.get('workspace_path'), 'tool_output_token_limit': overrides.get('tool_output_token_limit', 10000), 'token_monitor_warning_threshold': overrides.get('token_monitor_warning_threshold', 35000), 'token_monitor_critical_threshold': overrides.get('token_monitor_critical_threshold', 50000), 'turn_monitor_enabled': overrides.get('turn_monitor_enabled', True), 'enable_logging': overrides.get('enable_logging', True), 'log_dir': overrides.get('log_dir', './logs'), 'log_level': overrides.get('log_level', 'INFO'), 'enable_file_logging': overrides.get('enable_file_logging', True), 'jsonl_format': overrides.get('jsonl_format', True), 'log_categories': overrides.get('log_categories', ['SESSION', 'LLM', 'TOOLS']), 'max_file_size_mb': overrides.get('max_file_size_mb', 10)}
+        config_data = {'api_key': api_key or '', 'base_url': base_url, 'model': preset.model, 'temperature': preset.temperature, 'enabled_tools': list(preset_tool_names), 'system_prompt': preset.system_prompt, 'provider_type': 'openai_compatible', 'max_turns': overrides.get('max_turns', 100), 'detail': overrides.get('detail', 'normal'), 'workspace_path': overrides.get('workspace_path'), 'tool_output_token_limit': overrides.get('tool_output_token_limit', 10000), 'token_monitor_warning_threshold': overrides.get('token_monitor_warning_threshold', 65000), 'token_monitor_critical_threshold': overrides.get('token_monitor_critical_threshold', 80000), 'turn_monitor_enabled': overrides.get('turn_monitor_enabled', True), 'enable_logging': overrides.get('enable_logging', True), 'log_dir': overrides.get('log_dir', './logs'), 'log_level': overrides.get('log_level', 'INFO'), 'enable_file_logging': overrides.get('enable_file_logging', True), 'jsonl_format': overrides.get('jsonl_format', True), 'log_categories': overrides.get('log_categories', ['SESSION', 'LLM', 'TOOLS']), 'max_file_size_mb': overrides.get('max_file_size_mb', 10)}
         config_data.update(overrides)
         from agent.config import AgentConfig
         config = AgentConfig(**config_data)

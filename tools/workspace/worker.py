@@ -94,6 +94,7 @@ except ImportError:
     EventType = None
     global_event_bus = None
 
+
 logger = logging.getLogger(__name__)
 
 # Tools excluded from workers for safety reasons
@@ -583,7 +584,7 @@ class WorkerThread(threading.Thread):
 
         try:
             for event in self._agent.process_query(query):
-                # Fix 1.1B: Poll for stop command on every event
+                                # Fix 1.1B: Poll for stop command on every event
                 self._poll_command()
 
                 # Log heartbeat for liveliness checks and flush to disk
@@ -601,6 +602,7 @@ class WorkerThread(threading.Thread):
 
                 event_type = event.get("type", "")
 
+                
                 # Capture final response content and reasoning
                 if event_type == "agent_responded":
                     final_content = event.get("content", "")
@@ -666,9 +668,13 @@ class WorkerThread(threading.Thread):
                     message = event.get("message", "") or event.get("warning_message", "")
                     token_count = event.get("token_count", 0)
                     # Publish to per-worker EventBus for real-time WS delivery
+                    # Include all fields required by TokenWarningEvent validator
                     self._publish_event("token_warning", {
                         "message": str(message)[:500],
-                        "token_count": token_count,
+                        "warning_message": event.get("warning_message", "") or str(message)[:500],
+                        "token_count": token_count or event.get("token_count", 0),
+                        "old_state": event.get("old_state", "unknown"),
+                        "new_state": event.get("new_state", "warning"),
                     })
 
                 # Log turn warnings as system notifications
@@ -676,9 +682,13 @@ class WorkerThread(threading.Thread):
                     message = event.get("message", "") or event.get("warning", "")
                     turn_count = event.get("turn_count", 0)
                     # Publish to per-worker EventBus for real-time WS delivery
+                    # Must include fields required by TurnWarningEvent validation:
+                    # old_state, new_state, turn_count, warning_message
                     self._publish_event("turn_warning", {
-                        "message": str(message)[:500],
+                        "old_state": event.get("old_state", "unknown"),
+                        "new_state": event.get("new_state", "unknown"),
                         "turn_count": turn_count,
+                        "warning_message": str(message)[:500],
                     })
 
                 # Log time warnings as system notifications
@@ -763,6 +773,36 @@ class WorkerThread(threading.Thread):
             self.status = "ready"
             self.error = None
             self._write_status_file()
+            # Create per-worker EventBus early so _publish_event below works
+            self._event_bus = EventBus()
+            register_worker_event_bus(self.session_id or "", self.worker_name, self._event_bus)
+            # Attach EventLogger to this worker's per-worker bus
+            try:
+                from agent.logging.event_logger import EventLogger
+                EventLogger.instance().attach_worker_bus(self.worker_name, self._event_bus)
+            except Exception:
+                pass
+            # Publish WORKER_SPAWNED to the global bus so the bridge can
+            # discover and subscribe to this worker's per-worker EventBus
+            # immediately, rather than waiting for the first query.
+            if global_event_bus is not None and EventType is not None and create_event is not None:
+                try:
+                    evt = create_event(
+                        EventType.WORKER_SPAWNED,
+                        source=f"worker:{self.worker_name}",
+                        session_id=self.session_id or "",
+                        data={
+                            "session_id": self.session_id or "",
+                            "worker_name": self.worker_name,
+                            "current_context_tokens": self.get_current_context_tokens(),
+                            "max_context_tokens": self.max_context_tokens,
+                            "status": "ready",
+                        },
+                    )
+                    global_event_bus.publish(evt)
+                except Exception:
+                    pass
+            # Also publish to the per-worker bus for local subscribers
             self._publish_event('worker_spawned', {'status': 'ready'})
             if self._worker_ctx is None:
                 # Load system prompt from definition
@@ -865,33 +905,9 @@ class WorkerThread(threading.Thread):
                         })
                         self._output_queue.put(reply)
                         break
-                    self._event_bus = EventBus()
-                    register_worker_event_bus(self.session_id or "", self.worker_name, self._event_bus)
-                    # Attach EventLogger to this worker's per-worker bus
-                    try:
-                        from agent.logging.event_logger import EventLogger
-                        EventLogger.instance().attach_worker_bus(self.worker_name, self._event_bus)
-                    except Exception:
-                        pass
-                    # Signal bridge via global bus so it can subscribe to per-worker bus
-                    if global_event_bus is not None and EventType is not None and create_event is not None:
-                        try:
-                            print(f"[WORKER DEBUG] About to publish WORKER_SPAWNED to global bus: session_id={self.session_id}, worker_name={self.worker_name}", flush=True)
-                            evt = create_event(
-                                EventType.WORKER_SPAWNED,
-                                source=f"worker:{self.worker_name}",
-                                session_id=self.session_id or "",
-                                data={
-                                    "session_id": self.session_id or "",
-                                    "worker_name": self.worker_name,
-                                    "current_context_tokens": self.get_current_context_tokens(),
-                                    "max_context_tokens": self.max_context_tokens,
-                                },
-                            )
-                            global_event_bus.publish(evt)
-                            print(f"[WORKER DEBUG] WORKER_SPAWNED published successfully", flush=True)
-                        except Exception as exc:
-                            print(f"[WORKER DEBUG] FAILED to publish WORKER_SPAWNED: {exc}", flush=True)
+
+                    # Publish WORKER_SPAWNED is now handled earlier in run() —
+                    # no need for a duplicate lazy publish here.
                     self._agent = Agent(
                         config=agent_cfg,
                         session=self._worker_ctx,
@@ -992,7 +1008,7 @@ class WorkerThread(threading.Thread):
         else:
             self.status = "completed"
             self._write_status_file()
-            self._publish_event('worker_completed', {'status': 'completed'})
+            self._publish_event('worker_completed', {'status': 'completed', 'worker_name': self.worker_name})
             # Also publish to global_event_bus so the bridge receives it
             if global_event_bus is not None and EventType is not None and create_event is not None:
                 try:
@@ -1136,23 +1152,24 @@ class WorkerThread(threading.Thread):
         """
         if self._event_bus is None or create_event is None or EventType is None:
             return
+
         try:
-            evt_type = EventType(event_type)
-            evt = create_event(
-                evt_type,
-                data={
-                    **data,
-                    'worker_name': self.worker_name,
-                    'session_id': self.session_id,
-                    'current_context_tokens': self.get_current_context_tokens(),
-                    'max_context_tokens': self.max_context_tokens,
-                },
-                source=f'worker:{self.worker_name}',
-                session_id=self.session_id,
+            if isinstance(event_type, str):
+                try:
+                    resolved_type = EventType(event_type)
+                except ValueError:
+                    log('WARNING', 'tools.worker', f"Unknown event type: {event_type}")
+                    return
+
+            event = create_event(
+                event_type=resolved_type,
+                data=data,
+                source="worker",
+                session_id=self.session_id or self.worker_name,
             )
-            self._event_bus.publish(evt)
-        except Exception as exc:
-            logger.debug("Failed to publish worker event '%s': %s", event_type, exc)
+            self._event_bus.publish(event)
+        except Exception as e:
+            log('ERROR', 'tools.worker', f"Failed to publish event {event_type}: {e}")
 
 # ---------------------------------------------------------------------------
 # Tool

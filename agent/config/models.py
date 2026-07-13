@@ -78,8 +78,8 @@ class AgentConfig(BaseModel):
     max_turns: int = 100
     stop_check: Optional[Callable[[], bool]] = Field(default=None, description='Runtime stop-check callback. Called periodically during agent execution to check if processing should be aborted. Return True to signal stop. Not serialised to/from JSON config.')
     system_prompt: Optional[str] = None
-    token_monitor_warning_threshold: int = Field(default=35000, description='Token count threshold for warning (user)')
-    token_monitor_critical_threshold: int = Field(default=50000, description='Token count threshold for critical warning (user)')
+    token_monitor_warning_threshold: int = Field(default=65000, description='Token count threshold for warning state')
+    token_monitor_critical_threshold: int = Field(default=80000, description='Token count threshold for critical warning state')
     turn_monitor_enabled: bool = Field(default=True, description='Enable automatic turn limit warnings')
 
     enable_logging: bool = Field(default=True, description='Enable agent logging')

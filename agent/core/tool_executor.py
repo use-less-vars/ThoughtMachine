@@ -269,6 +269,8 @@ class ToolExecutor:
                     'base_url': getattr(self.config, 'base_url', None),
                     'model': getattr(self.config, 'model', None),
                     'tool_output_token_limit': getattr(self.config, 'tool_output_token_limit', None),
+                    'token_monitor_warning_threshold': getattr(self.config, 'token_monitor_warning_threshold', None),
+                    'token_monitor_critical_threshold': getattr(self.config, 'token_monitor_critical_threshold', None),
                 }
             else:
                 tool_args['agent_config'] = None
