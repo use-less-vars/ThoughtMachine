@@ -281,12 +281,14 @@ class StateBridge:
         if self.current_session:
             self.current_session.total_input_tokens = input_tokens
             self.current_session.total_output_tokens = output_tokens
+        log('DEBUG', 'pipeline.token_update', f"update_token_totals: input={input_tokens}, output={output_tokens}")
 
     def update_context_length(self, context_length: int) -> None:
         """Update context length and sync with current session."""
         self.context_length = context_length
         if self.current_session:
             self.current_session.context_length = context_length
+        log('DEBUG', 'pipeline.token_update', f"update_context_length: context_length={context_length}")
 
     @property
     def user_history(self) -> List[Dict[str, Any]]:

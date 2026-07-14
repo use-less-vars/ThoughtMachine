@@ -1,0 +1,9 @@
+agent/presenter/state_bridge.py:284:        log('DEBUG', 'pipeline.token_update', f"update_token_totals: input={input_tokens}, output={output_tokens}")
+agent/presenter/state_bridge.py:291:        log('DEBUG', 'pipeline.token_update', f"update_context_length: context_length={context_length}")
+agent/presenter/event_processor.py:55:            if event_type != 'token_update':
+agent/presenter/event_processor.py:59:                log('DEBUG', 'presenter.event_processor', f'Skipping token_update event (handled separately)')
+agent/presenter/event_processor.py:64:        elif event_type == 'token_update':
+agent/presenter/event_processor.py:65:            self._process_token_update_event(event)
+agent/presenter/event_processor.py:111:    def _process_token_update_event(self, event: Dict[str, Any]) -> None:
+agent/presenter/event_processor.py:113:        log('DEBUG', 'presenter.event_processor', f'_process_token_update_event: context_length={event.get("context_length")}')
+agent/presenter/event_processor.py:114:        log('DEBUG', 'pipeline.token_update', f"received: context_length={event.get('context_length')}, total_input={event.get('total_input')}, total_output={event.get('total_output')}")

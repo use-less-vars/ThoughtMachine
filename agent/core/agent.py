@@ -681,6 +681,7 @@ class Agent:
                 self._add_conversation_data_to_event(event)
                 self._pending_warning_events.append(event)
                 log('DEBUG', 'core.token', f"warning buffered: state={self.state.token_state.value if hasattr(self.state, 'token_state') else 'N/A'}, count={len(self._pending_warnings)}")
+                log('DEBUG', '**pipeline.warning**', f"Warning buffered in _update_tokens_after_tool: state={self.state.token_state.value if hasattr(self.state, 'token_state') else 'N/A'}, count={len(self._pending_warnings)}")
                 warning_tokens = self._estimate_tokens(warning_msg)
                 self.state.current_conversation_tokens += warning_tokens
     @property
@@ -767,6 +768,7 @@ class Agent:
             self._add_to_conversation(user_msg)
             estimated_tokens = self._estimate_tokens(user_msg)
             self.state.current_conversation_tokens += estimated_tokens
+            log('DEBUG', '**pipeline.token_update**', f"Token update after user query: tokens={self.state.current_conversation_tokens}, input={self.total_input_tokens}, output={self.total_output_tokens}")
             yield self._create_token_update_event()
             self._display_turn = getattr(self, '_display_turn', 0) + 1
             log('DEBUG', 'core.agent', f"User query added: turn={self._display_turn}")
@@ -884,6 +886,7 @@ class Agent:
                             self._add_to_conversation(warning_msg)
                             warning_tokens = self._estimate_tokens(warning_msg)
                             self.state.current_conversation_tokens += warning_tokens
+                            log('DEBUG', '**pipeline.token_update**', f"Token update after time_warning: tokens={self.state.current_conversation_tokens}")
                             yield self._create_token_update_event()
                             # If time is critical, log it but don't stop — soft restriction
                             if self.state.time_state == TimeState.CRITICAL:
@@ -901,12 +904,14 @@ class Agent:
                         self._add_to_conversation(warning_msg)
                         warning_tokens = self._estimate_tokens(warning_msg)
                         self.state.current_conversation_tokens += warning_tokens
+                        log('DEBUG', '**pipeline.token_update**', f"Token update after turn_warning: tokens={self.state.current_conversation_tokens}")
                         yield self._create_token_update_event()
                     event_dict = {'type': event['type'], 'message': event.get('warning_message', event.get('message', event.get('warning', ''))), 'turn_count': event.get('turn_count', turn), 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                     self._add_conversation_data_to_event(event_dict)
                     yield event_dict
                 # Don't recalculate full estimate here - truth-based current_conversation_tokens
                 # is maintained by LLM prompt_tokens + estimated additions for new content
+                log('DEBUG', '**pipeline.token_update**', f"Token update after turn state: tokens={self.state.current_conversation_tokens}, turn={self._display_turn}")
                 yield self._create_token_update_event()
                 token_events = self.state.update_token_state(self.state.current_conversation_tokens)
                 for event in token_events:
@@ -915,6 +920,7 @@ class Agent:
                         self._add_to_conversation(warning_msg)
                         warning_tokens = self._estimate_tokens(warning_msg)
                         self.state.current_conversation_tokens += warning_tokens
+                        log('DEBUG', '**pipeline.token_update**', f"Token update after token_warning: tokens={self.state.current_conversation_tokens}")
                         yield self._create_token_update_event()
                     # Yield the original event (not reconstructed) to preserve all fields
                     self._add_conversation_data_to_event(event)
@@ -1156,6 +1162,7 @@ class Agent:
                 # doesn't lose the assistant's tool_calls data from user_history.
                 if turn_transaction and turn_transaction.has_assistant_message():
                     turn_transaction.commit_assistant_only()
+                log('DEBUG', '**pipeline.token_update**', f"Token update after assistant commit: tokens={self.state.current_conversation_tokens}")
                 yield self._create_token_update_event()
                 turn_event = {'type': 'turn', 'content': content, 'assistant_content': content, 'tool_calls': [], 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                 if reasoning is not None:
@@ -1190,6 +1197,7 @@ class Agent:
                         yield event_dict
                     # Flush any buffered token warnings after the turn is committed
                     # so they land chronologically after tool results in user_history
+                    log('DEBUG', '**pipeline.warning**', f"Flushing {len(self._pending_warnings)} buffered warnings after tool execution")
                     for warning in self._pending_warnings:
                         self._add_to_conversation(warning)
                     # Yield token_warning events to event stream subscribers (worker, EventLogger, etc.)
@@ -1223,6 +1231,7 @@ class Agent:
                     if summary_text is not None:
                         log('DEBUG', 'core.summary', f'Processing summary request: summary length={len(summary_text)}, keep_recent_turns={summary_keep_recent_turns}')
                         self._apply_summary_pruning(summary_text, summary_keep_recent_turns)
+                        log('DEBUG', '**pipeline.token_update**', f"Token update after summary pruning: tokens={self.state.current_conversation_tokens}")
                         yield self._create_token_update_event()
                 pause_debug(f'Checking pause request after turn processing: _pause_requested={self._pause_requested}')
                 log('DEBUG', 'core.pause', f'PAUSE CHECKPOINT [3] after_turn: _pause_requested={self._pause_requested}')
@@ -1248,6 +1257,7 @@ class Agent:
                     if turn_transaction and turn_transaction.has_assistant_message():
                         turn_transaction.commit()
                     # Flush any buffered token warnings (unlikely here, but be safe)
+                    log('DEBUG', '**pipeline.warning**', f"Flushing {len(self._pending_warnings)} buffered warnings in non-tool branch")
                     for warning in self._pending_warnings:
                         self._add_to_conversation(warning)
                     # Yield token_warning events to event stream subscribers

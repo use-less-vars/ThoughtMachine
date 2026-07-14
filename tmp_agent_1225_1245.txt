@@ -1,0 +1,21 @@
+                        yield respond_event
+                        turn_duration = time.time() - turn_start_time
+                        if self.logger:
+                            self.logger.log_system_resources()
+                            self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
+                        return
+                    if summary_text is not None:
+                        log('DEBUG', 'core.summary', f'Processing summary request: summary length={len(summary_text)}, keep_recent_turns={summary_keep_recent_turns}')
+                        self._apply_summary_pruning(summary_text, summary_keep_recent_turns)
+                        log('DEBUG', '**pipeline.token_update**', f"Token update after summary pruning: tokens={self.state.current_conversation_tokens}")
+                        yield self._create_token_update_event()
+                pause_debug(f'Checking pause request after turn processing: _pause_requested={self._pause_requested}')
+                log('DEBUG', 'core.pause', f'PAUSE CHECKPOINT [3] after_turn: _pause_requested={self._pause_requested}')
+                if self._pause_requested:
+                    log('DEBUG', 'core.pause', 'PAUSE CHECKPOINT [3] after_turn: DETECTED')
+                    pause_debug(f'Pause detected after turn processing! Transitioning to PAUSING')
+                    events = self.state.set_execution_state(ExecutionState.PAUSING)
+                    for event in events:
+                        for yielded_event in self._handle_state_event(event):
+                            yield yielded_event
+                    pause_debug(f'Clearing _pause_requested after pause (after turn processing)')

@@ -3997,3 +3997,176 @@ Read and analysed:
 6. **agent/events.py** — EventType enum, TokenWarningEvent/TurnWarningEvent/TimeWarningEvent, EventBus, `create_event()`, `convert_to_legacy_format()`.
 
 Full research written to `research_2_state_tokens_warnings.md`.
+
+## 2026-07-14 — Complete Token Warning Pipeline Investigation (all 8 tasks c...
+
+Complete Token Warning Pipeline Investigation (all 8 tasks completed)
+
+## Task 1: Full AgentState class (`agent/core/state.py`)
+- **TokenState enum**: `LOW` (0) → `WARNING` (1) → `CRITICAL` (2)
+- **Thresholds** (from `config.token_monitor_warning_threshold` default 65000, `config.token_monitor_critical_threshold` default 80000):
+  - `total_tokens < warning_threshold` → `LOW`
+  - `total_tokens < critical_threshold` → `WARNING`
+  - `else` → `CRITICAL`
+- **Warning message generated only on UPWARD transitions**: uses `state_order` dict (LOW=0, WARNING=1, CRITICAL=2), only emits warning if `state_order[new_state] > state_order[current_state]`
+- **`restrictions_active`** set to `True` when entering CRITICAL
+- **Other state enums**: ExecutionState (READY/RUNNING/PAUSING/ERROR), SessionState (NEW/CONTINUING/CLOSED), TimeState (LOW/WARNING/CRITICAL), TurnState (LOW/WARNING/CRITICAL)
+
+## Task 2: 7 primary assignments to `current_conversation_tokens`
+1. **state.py:86** — `update_token_state(self, total_tokens)`: `self.current_conversation_tokens = total_tokens` (set-and-trigger)
+2. **state.py:294** — `reset()`: sets to 0
+3. **agent.py:622** — `_update_conversation_token_estimate()`: overwrites with estimated_tokens from context builder
+4. **agent.py:999** — `process_query()`: `self.state.current_conversation_tokens = input_tokens` (LLM prompt_tokens overwrite — ground truth)
+5. **agent.py:670** — `_update_tokens_after_tool()`: `+= tool_tokens` 
+6. **agent.py:686** — `_update_tokens_after_tool()`: `+= warning_tokens` (estimated tokens of warning SYSTEM NOTIFICATION)
+7. **agent.py:770** — `process_query()`: `+= estimated_tokens` (user query message estimate)
+
+**Secondary assignments** (warning message estimates in turn loop):
+- agent.py:888 — time_warning `+= warning_tokens`
+- agent.py:906 — turn_warning `+= warning_tokens`  
+- agent.py:922 — token_warning (turn loop) `+= warning_tokens`
+
+## Task 3: `_update_tokens_after_tool` (agent.py:659-686)
+- Signature: `def _update_tokens_after_tool(self, tool_tokens=None)`
+- Adds tool_tokens to `current_conversation_tokens`
+- Calls `self.state.update_token_state(self.state.current_conversation_tokens)`
+- **Buffers** resulting warning messages into `_pending_warnings` and `_pending_warning_events` instead of injecting immediately
+- Also adds `warning_tokens` (estimate of warning message) to `current_conversation_tokens`
+- **No `_update_tokens_after_llm` method exists.** LLM response tokens handled inline in process_query (line 999: overwrites with `input_tokens` = `response.usage['prompt_tokens']`)
+
+## Task 4: Agent Loop (`process_query`, agent.py:759-1300)
+1. Add user query to conversation; estimate & add tokens; yield user_query event
+2. Apply pending config (hot-swap or restart)
+3. Set ExecutionState to RUNNING
+4. For `turn in range(max_turns)` (line 852):
+   - Check stop/pause signals
+   - Time monitoring (update_time_state)
+   - Turn monitoring (update_turn_state)
+   - Token monitoring (update_token_state at turn level)
+   - Build context via context_builder
+   - Call LLM (`chat_completion`)
+   - **Overwrite** `current_conversation_tokens` with LLM-reported `prompt_tokens` (ground truth)
+   - Handle response (tool_calls or final answer)
+   - If tool_calls: execute tools → commit → flush warnings
+   - If no tool_calls: commit → flush warnings → return final
+5. Max turns reached → yield stop_reason event
+
+## Task 5: Warning Flush Mechanism
+Warnings are buffered in two lists:
+- **`_pending_warnings`** (List[dict]): warning Message objects to add to conversation
+- **`_pending_warning_events`** (List[dict]): raw event dicts to yield to event stream
+
+**Flush happens in two branches** after each turn:
+1. **Tool branch** (lines 1198-1207): after `turn_transaction.commit()` (which persists tool results to user_history), flush warnings so they land chronologically AFTER tool results
+2. **No-tool branch** (lines 1259-1267): after `turn_transaction.commit()`, flush warnings before yielding final event
+
+Both branches: iterate `_pending_warnings` → `_add_to_conversation(warning)`, then yield `_pending_warning_events`, then clear both lists.
+
+## Task 6: Debug Logging Environment Variables
+No special `DEBUG_TOKEN` or `TOKEN_DEBUG` env vars exist. Standard logging controls:
+- **`TM_LOG_LEVEL`** — default INFO (DEBUG for granular token tracking)
+- **`TM_LOG_TAGS`** — default empty, `*` for all tags; `core.token`, `**pipeline.token_update**`, `**pipeline.warning**`, `core.agent` are relevant tags
+- **`THOUGHTMACHINE_DEBUG=1`** — backward compat, sets level to DEBUG and tags to `*`
+- **`AGENT_LOG_CATEGORIES`** — filter log categories
+- **`TM_LOG_FILE_LEVEL`** — file log level override
+- **`TM_DEBUG_TRUNCATE_LENGTH`** — truncation length for debug output
+
+Key log tags used in token pipeline:
+- `core.token` — detailed token state transitions, estimates, drift detection
+- `**pipeline.token_update**` — every token count change with before/after values
+- `**pipeline.warning**` — warning buffer operations (buffering, flushing, counts)
+- `core.agent` — general agent flow debug
+
+## Additional Findings
+- Token drift detection at agent.py:1001-1016: compares pre-call estimate vs LLM-reported prompt_tokens, warns if drift > 5%
+- Summary pruning (agent.py:1301+) re-evaluates token state after summarization
+- `state.py` `update_token_state` is called from multiple places — each call potentially generates warnings, but the transition check prevents duplicate warnings
+- The `_add_conversation_data_to_event` helper (agent.py:731) adds `created_at`, `timestamp`, `seq`, conversation_id, conversation_tokens, conversation_turns to every event
+
+## Token Warning Pipeline — Worker Panel Flow
+
+## 2026-07-14 — ## Complete Token Warning Pipeline: Agent → Worker → Bridge ...
+
+## Complete Token Warning Pipeline: Agent → Worker → Bridge → Frontend
+
+### 9. WORKER PANEL: How token warnings reach the WorkerOutputPanel
+
+#### 9A. Agent (core) — Event Generation
+- `agent/core/agent.py`: `TokenCounter` detects token thresholds in `_update_tokens_after_tool()`.
+- Token warnings are **buffered** in `self._pending_warnings` (Message objects) and `self._pending_warning_events` (event dicts).
+- They are flushed **after turn_transaction.commit()** so they land in correct chronological order after tool results.
+- The agent yields `token_warning` event dicts from `process_query()`.
+
+#### 9B. Worker Thread — Event Relaying (worker.py)
+- `WorkerThread._run_tool_loop()` iterates `self._agent.process_query(query)` events.
+- On `event_type == "token_warning"`, it calls `self._publish_event("token_warning", {...})`.
+- The published data includes: `message`, `warning_message`, `token_count`, `old_state`, `new_state`.
+
+#### 9C. _publish_event() — Per-worker EventBus (worker.py:1148)
+```python
+def _publish_event(self, event_type: str, data: dict) -> None:
+    # Auto-injects worker_name
+    resolved_type = EventType(event_type)  # EventType("token_warning")
+    event = create_event(event_type=resolved_type, data=data, source="worker", session_id=...)
+    self._event_bus.publish(event)  # Per-worker EventBus
+```
+- The per-worker EventBus is created in `run()` (`self._event_bus = EventBus()`).
+- Registered via `register_worker_event_bus(session_id, worker_name, self._event_bus)`.
+- Also publishes WORKER_SPAWNED to the **global** event bus so bridge can discover it.
+
+#### 9D. Bridge — Subscription & Forwarding (bridge.py)
+- **Global bus listener**: `_subscribe_to_worker_events()` subscribes to `EventType.WORKER_SPAWNED` via `_on_worker_spawned`.
+- **On WORKER_SPAWNED**: `_on_worker_spawned()` calls `get_worker_event_bus(session_id, worker_name)` to get the per-worker bus, then calls `_subscribe_to_worker_bus(worker_name, worker_bus)`.
+- **Per-worker bus subscriptions**: `_subscribe_to_worker_bus()` subscribes to event types: `tool_call`, `tool_result`, `worker_message`, `assistant_message`, **`token_warning`**, `turn_warning`, `time_warning`, `user_message`, `system_notification`.
+- **Handler**: `_make_bus_handler(original_type)` creates a Handler that wraps the event dict with `type: 'worker:{original_type}'` (e.g., `'worker:token_warning'`) and calls all registered `event_callbacks`.
+- **Global bus TOKEN_WARNING handler**: `_on_worker_token_warning()` also catches token warnings from the global bus, but only for events with `source.startswith("worker:")`.
+
+#### 9E. Server → WebSocket — Event Delivery (server.py)
+- The bridge's `event_callbacks` are registered by the WebSocket handler in `server.py`.
+- When the bridge callback fires, `server.py` packages the event dict as a JSON message and sends it over the WebSocket connection.
+
+#### 9F. Frontend — Reception (SessionTab.jsx)
+- `SessionTab.jsx` receives WebSocket messages and routes by `msg.type`.
+- Worker bus events arrive with type `'worker:token_warning'`, `'worker:turn_warning'`, `'worker:time_warning'`, etc.
+- All handled in the same switch branch (lines 514-527):
+  ```javascript
+  case 'worker:token_warning':
+  case 'worker:turn_warning':
+  case 'worker:time_warning':
+  case 'worker:assistant_message':
+  case 'worker:worker_spawned':
+  case 'worker:worker_status':
+  case 'worker:worker_completed':
+  case 'worker:worker_error':
+  case 'worker:system_notification':
+  case 'worker:user_message':
+  case 'worker:worker_message':
+      // logged and forwarded to WorkerOutputPanel via setWorkerEvents()
+  ```
+- Events are stored in `workerEvents` state (keyed by sessionId) via `setWorkerEvents()`.
+- Deduplication is done by stripping `'worker:'` prefix and normalizing to canonical event type + timestamp.
+
+#### 9G. WorkerOutputPanel — Display
+- `WorkerOutputPanel.jsx` receives `incomingEvents` prop (filtered from parent's `workerEvents`).
+- Events are processed in a `useEffect` hook:
+  - Strips `'worker:'` prefix: `event.type?.replace('worker:', '')`
+  - Deduplicates via `makeDedupKey()` using canonical event name + timestamp
+  - Maps events to a unified format with `event`, `timestamp`, `request`, `response` fields
+- **token_warning case** (line 287):
+  ```javascript
+  case 'token_warning': {
+      const data = e.data || {}
+      response = { type: 'token_warning', message: data.warning_message || data.message || '', token_count: data.token_count }
+      return { event: 'system_notification', timestamp: e.timestamp, request: {}, response }
+  }
+  ```
+- Token warnings map to `event: 'system_notification'` with `response.type: 'token_warning'`.
+- The `system_notification` case (line 324) also handles direct system_notification events with `response.type` from data.
+- These are displayed in the worker output panel as system notification entries.
+- The main ChatPanel `MessageBubble.jsx` also shows token warnings with a yellow/orange banner style for messages containing "token" or "⚠️" that have `is_system_notification: true`.
+
+#### 9H. Two Paths for Token Warnings from Workers
+1. **Per-worker bus path** (primary for worker sub-agents): Worker → `_publish_event("token_warning")` → per-worker EventBus → bridge per-worker bus subscription → `'worker:token_warning'` WS message → WorkerOutputPanel.
+2. **Global bus path** (for main agent token warnings): Main agent's process_query yields `token_warning` → bridge's `_on_worker_token_warning()` catches it (only if source starts with "worker:") → `'worker:system_notification'` WS message.
+
+

@@ -84,8 +84,8 @@ class AgentState:
         Returns list of events (e.g., warnings) that should be yielded.
         """
         self.current_conversation_tokens = total_tokens
+        log('DEBUG', 'pipeline.warning', f'ENTER update_token_state: total_tokens={total_tokens}, current_state={self.token_state.value}, warning_threshold={self.config.token_monitor_warning_threshold}, critical_threshold={self.config.token_monitor_critical_threshold}')
         log('DEBUG', 'core.token', f'total_tokens={total_tokens}, warning_threshold={self.config.token_monitor_warning_threshold}, critical_threshold={self.config.token_monitor_critical_threshold}')
-        log('WARNING', 'core.token', f"update_token_state: total_tokens={total_tokens} threshold={self.config.token_monitor_warning_threshold if hasattr(self.config, 'token_monitor_warning_threshold') else 'N/A'}")
         if total_tokens < self.config.token_monitor_warning_threshold:
             new_state = TokenState.LOW
         elif total_tokens < self.config.token_monitor_critical_threshold:
@@ -97,6 +97,7 @@ class AgentState:
         events = []
         state_order = {TokenState.LOW: 0, TokenState.WARNING: 1, TokenState.CRITICAL: 2}
         if state_order[new_state] > state_order[old_state] and self.last_token_warning_state != new_state and (new_state in (TokenState.WARNING, TokenState.CRITICAL)):
+            log('DEBUG', 'pipeline.warning', f'WARNING DETECTED: transitioning {old_state.value} -> {new_state.value} at {total_tokens} tokens')
             if new_state == TokenState.WARNING:
                 formatted = self._format_tokens(total_tokens)
                 critical_formatted = self._format_tokens(self.config.token_monitor_critical_threshold)
@@ -116,6 +117,7 @@ class AgentState:
             self.last_token_warning_state = new_state
             if self.logger:
                 self.logger.log_token_warning(old_state.value, new_state.value, total_tokens, warning)
+            log('DEBUG', 'pipeline.warning', f'CREATED token_warning event: old={old_state.value}, new={new_state.value}, count={total_tokens}')
             token_warning_data = {'old_state': old_state.value, 'new_state': new_state.value, 'token_count': total_tokens, 'warning_message': warning, 'state': new_state.value}
             events.append(self._create_event('token_warning', token_warning_data))
         # Immediate restriction activation: no grace turn
@@ -147,6 +149,7 @@ class AgentState:
 
         timeout = getattr(self.config, 'timeout_seconds', self.timeout_seconds)
         warning_at = getattr(self.config, 'time_warning_threshold', self.time_warning_threshold)
+        log('DEBUG', 'pipeline.warning', f'ENTER update_time_state: elapsed={elapsed_seconds:.1f}s, timeout={timeout}, warning_at={warning_at}')
 
         # Defensive: if warning_at >= timeout, skip WARNING and go straight to CRITICAL
         if warning_at >= timeout:
@@ -167,6 +170,7 @@ class AgentState:
 
         state_order = {TimeState.LOW: 0, TimeState.WARNING: 1, TimeState.CRITICAL: 2}
         if state_order[new_state] > state_order[old_state] and self.last_time_warning_state != new_state:
+            log('DEBUG', 'pipeline.warning', f'WARNING: time warning at {elapsed_seconds:.1f}s, new_state={new_state.value}')
             if new_state == TimeState.WARNING:
                 remaining = timeout - elapsed_seconds
                 warning = (
@@ -193,6 +197,7 @@ class AgentState:
             if self.logger:
                 self.logger.log_time_warning(old_state.value, new_state.value, elapsed_seconds, warning)
 
+            log('DEBUG', 'pipeline.warning', f'CREATED time_warning event: old={old_state.value}, new={new_state.value}, elapsed={elapsed_seconds:.1f}s')
             time_warning_data = {
                 'old_state': old_state.value,
                 'new_state': new_state.value,
@@ -221,6 +226,7 @@ class AgentState:
             self.turn_state = TurnState.LOW
             return []
         max_turns = self.config.max_turns
+        log('DEBUG', 'pipeline.warning', f'ENTER update_turn_state: current_turn={current_turn}, max_turns={max_turns}')
         warning_turn = max_turns - 3
         if warning_turn < 0 or current_turn < warning_turn:
             new_state = TurnState.LOW
@@ -230,6 +236,7 @@ class AgentState:
         self.turn_state = new_state
         events = []
         if new_state == TurnState.WARNING and old_state != TurnState.WARNING and self.last_turn_warning_state != TurnState.WARNING:
+            log('DEBUG', 'pipeline.warning', f'WARNING: turn warning fired at {current_turn}/{max_turns}')
             self.restrictions_active = True
             self.restrictions_pending = False
             self.restriction_reason = 'turn'
@@ -244,6 +251,7 @@ class AgentState:
             self.last_turn_warning_state = TurnState.WARNING
             if self.logger:
                 self.logger.log_turn_warning(old_state.value, new_state.value, current_turn, warning)
+            log('DEBUG', 'pipeline.warning', f'CREATED turn_warning event: old={old_state.value}, new={new_state.value}, count={current_turn}')
             turn_warning_data = {'old_state': old_state.value, 'new_state': new_state.value, 'turn_count': current_turn, 'warning_message': warning, 'state': new_state.value}
             events.append(self._create_event('turn_warning', turn_warning_data))
         if new_state == TurnState.LOW:

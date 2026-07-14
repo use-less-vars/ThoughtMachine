@@ -518,6 +518,7 @@ class AgentController:
         event['session_id'] = self.current_session_id
         self.event_queue.put(event)
         log('DEBUG', 'core.controller', f"Emitting event_occurred: {event.get('type')}")
+        log('DEBUG', 'pipeline.controller', f"_emit_event: type={event.get('type')}, session_id={self.current_session_id}")
         # Plain callback path (works without Qt — used by Web UI)
         for cb in self._event_callbacks:
             try:
@@ -681,6 +682,7 @@ class AgentController:
                             log('DEBUG', 'core.controller', "[CONTROLLER _run] agent has NO conversation attribute")
                         for event in local_agent.process_query(query):
                             log('DEBUG', 'core.pause', f"POST-YIELD: event_type={event['type']}")
+                            log('DEBUG', 'pipeline.controller', f"process_query_yield: type={event.get('type')}, turn={event.get('turn')}, stop_reason={event.get('stop_reason')}")
                             self._emit_event(event)
                             if event.get('stop_reason'):
                                 log('DEBUG', 'core.controller', f"Stop reason: {event['stop_reason']}, breaking loop")

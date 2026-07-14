@@ -1,0 +1,21 @@
+                    assistant_msg['reasoning_content'] = ''
+                if tool_calls:
+                    assistant_msg['tool_calls'] = tool_calls
+                turn_transaction.add_assistant_message(assistant_msg)
+                log('DEBUG', 'core.agent', f'Added assistant message to turn_transaction: has_tool_calls={bool(tool_calls)}, content_len={len(content)}')
+                # Commit assistant message to user_history BEFORE yielding ANY event
+                # (token_update, turn, tool_call, tool_result) so a pause between yields
+                # doesn't lose the assistant's tool_calls data from user_history.
+                if turn_transaction and turn_transaction.has_assistant_message():
+                    turn_transaction.commit_assistant_only()
+                log('DEBUG', '**pipeline.token_update**', f"Token update after assistant commit: tokens={self.state.current_conversation_tokens}")
+                yield self._create_token_update_event()
+                turn_event = {'type': 'turn', 'content': content, 'assistant_content': content, 'tool_calls': [], 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                if reasoning is not None:
+                    turn_event['reasoning'] = reasoning
+                elif tool_calls:
+                    turn_event['reasoning'] = ''
+                self._add_conversation_data_to_event(turn_event)
+                yield turn_event
+                if tool_calls:
+                    executed_tools, final_detected, respond_result, summary_text, summary_keep_recent_turns = self.tool_executor.execute_tool_calls(tool_calls, add_to_conversation_func=self._add_to_conversation, agent_id=0, session_id=self.session_id, turn_transaction=turn_transaction)

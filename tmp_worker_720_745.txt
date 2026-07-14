@@ -1,0 +1,26 @@
+                        "content": str(content)[:1000],
+                        "reasoning_content": str(reasoning)[:2000] if reasoning else None,
+                    })
+
+                # Cache the agent's authoritative post-prune token count
+                # and detect context summarization inline (token drop threshold)
+                if event_type == "token_update":
+                    context_length = event.get("context_length")
+                    if context_length is not None:
+                        prev_tokens = self._cached_context_tokens or 0
+                        self._cached_context_tokens = int(context_length)
+
+                        # Detect summarization: significant token drop indicates
+                        # the agent just called _apply_summary_pruning()
+                        if prev_tokens > 2000 and self._cached_context_tokens < prev_tokens * 0.60:
+                            log('DEBUG', 'tools.worker',
+                                f'Context summarization detected: {prev_tokens} -> {self._cached_context_tokens} tokens')
+                            self._publish_event("system_notification", {
+                                "type": "context_summarized",
+                                "message": "Context has been cleared and summarized. You now have a fresh context window with full access to tools.",
+                                "context_length": self._cached_context_tokens,
+                            })
+
+                # Keep legacy tool_execution handler for backward compatibility
+                if event_type == "tool_execution":
+                    tool_name = event.get("tool_name", "")

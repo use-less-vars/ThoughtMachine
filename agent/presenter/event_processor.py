@@ -40,6 +40,7 @@ class EventProcessor:
         event_type = typed_event.type.value
         log('DEBUG', 'presenter.event_processor', f"event: type={event_type}")
         log('DEBUG', 'presenter.event_processor', f'Processing event: {event_type}')
+        log('DEBUG', 'pipeline.event_processor', f"entry: type={event_type}, session_id={event.get('session_id')}")
         state_event_types = ['error', 'paused', 'stopped', 'thread_finished', 'max_turns', 'user_interaction_requested', 'rate_limit_warning', 'token_warning', 'turn_warning', 'user_query']
         if event_type not in state_event_types:
             event_session_id = event.get('session_id')
@@ -110,6 +111,7 @@ class EventProcessor:
     def _process_token_update_event(self, event: Dict[str, Any]) -> None:
         """Process a token update event."""
         log('DEBUG', 'presenter.event_processor', f'_process_token_update_event: context_length={event.get("context_length")}')
+        log('DEBUG', 'pipeline.token_update', f"received: context_length={event.get('context_length')}, total_input={event.get('total_input')}, total_output={event.get('total_output')}")
         input_tokens, output_tokens = self._extract_token_counts(event)
         if input_tokens is not None and output_tokens is not None:
             self.state_bridge.update_token_totals(input_tokens, output_tokens)
@@ -244,6 +246,7 @@ class EventProcessor:
         """Process token warning event."""
         warning_message = event.get('warning_message', 'Token usage warning')
         token_count = event.get('token_count', 0)
+        log('DEBUG', 'pipeline.warning', f"token_warning_received: message={warning_message}, token_count={token_count}")
         if self.gui_integration:
             self.gui_integration.emit_status_message(f'Token warning: {warning_message}')
             if hasattr(self.gui_integration, 'emit_warning'):
@@ -253,6 +256,7 @@ class EventProcessor:
         """Process turn warning event."""
         warning_message = event.get('warning_message', 'Turn limit warning')
         turn_count = event.get('turn_count', 0)
+        log('DEBUG', 'pipeline.warning', f"turn_warning_received: message={warning_message}, turn_count={turn_count}")
         if self.gui_integration:
             self.gui_integration.emit_status_message(f'Turn warning: {warning_message}')
             if hasattr(self.gui_integration, 'emit_warning'):
