@@ -1354,6 +1354,14 @@ class WebAgentBridge:
                 "type": "context_updated",
                 "context_length": self._session.context_length,
             })
+            # Also emit initial token counts so the frontend status bar shows
+            # the correct values immediately (not stuck at 0/0).
+            self._emit({
+                "type": "tokens_updated",
+                "input": getattr(self._session, 'total_input_tokens', 0),
+                "output": getattr(self._session, 'total_output_tokens', 0),
+            })
+
             log('INFO', 'server.bridge', f"Session loaded: {session_id} ({session.metadata.get('name')}) — {len(session.user_history)} messages")
 
             # Register this session as an open session (persists to open_sessions.json)
