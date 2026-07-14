@@ -286,7 +286,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
           }
           case 'token_warning': {
             const data = e.data || {}
-            response = { type: 'token_warning', message: data.message || '', token_count: data.token_count }
+            response = { type: 'token_warning', message: data.warning_message || data.message || '', token_count: data.token_count }
             return {
               event: 'system_notification',
               timestamp: e.timestamp,
@@ -296,7 +296,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
           }
           case 'turn_warning': {
             const data = e.data || {}
-            response = { type: 'turn_warning', message: data.message || '', turn_count: data.turn_count }
+            response = { type: 'turn_warning', message: data.warning_message || data.message || '', turn_count: data.turn_count }
             return {
               event: 'system_notification',
               timestamp: e.timestamp,
@@ -306,7 +306,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
           }
           case 'time_warning': {
             const data = e.data || {}
-            response = { type: 'time_warning', message: data.message || '', elapsed_seconds: data.elapsed_seconds }
+            response = { type: 'time_warning', message: data.warning_message || data.message || '', elapsed_seconds: data.elapsed_seconds }
             return {
               event: 'system_notification',
               timestamp: e.timestamp,
@@ -322,7 +322,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
             break
           }
           case 'system_notification': {
-            const data = e.data || {}
+            const data = e.response || e.data || {}
             response = {
               type: data.type || 'system_notification',
               message: data.message || data.warning_message || '',

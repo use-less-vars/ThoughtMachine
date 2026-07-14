@@ -1149,7 +1149,14 @@ class WorkerThread(threading.Thread):
         """
         Publish a typed event to the worker's own EventBus for real-time forwarding
         to WebSocket clients via the bridge subscriber.
+
+        Auto-injects ``worker_name`` from ``self.worker_name`` so that call sites
+        don't need to include it — many events (WorkerSpawnedEvent,
+        WorkerMessageEvent, AssistantMessageEvent, etc.) validate that
+        ``worker_name`` is present in the data dict.
         """
+        if "worker_name" not in data:
+            data = {**data, "worker_name": self.worker_name}
         if self._event_bus is None or create_event is None or EventType is None:
             return
 

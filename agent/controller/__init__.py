@@ -514,7 +514,7 @@ class AgentController:
                 self.agent._pause_requested = False
 
     def _emit_event(self, event):
-        """Emit event to queue and plain callbacks."""
+        """Emit event to queue, plain callbacks, and global event bus."""
         event['session_id'] = self.current_session_id
         self.event_queue.put(event)
         log('DEBUG', 'core.controller', f"Emitting event_occurred: {event.get('type')}")
@@ -525,6 +525,14 @@ class AgentController:
             except Exception:
                 import traceback as _tb
                 _tb.print_exc()
+        # Publish to global event bus so EventLogger and other subscribers see it
+        try:
+            from agent.events import global_event_bus, convert_from_legacy_format
+            if global_event_bus is not None:
+                typed_event = convert_from_legacy_format(event)
+                global_event_bus.publish(typed_event)
+        except Exception:
+            pass  # Best-effort: don't crash the agent thread if event bus publish fails
 
     def _run(self):
         """Internal method that runs in the background thread."""

@@ -139,10 +139,9 @@ export default function LoggingPanel({ config, onSaveConfig, onClose, configErro
     setSaveError(null)
     try {
       const payload = {
-        log_level: localConfig.log_level,
-        log_tags: localConfig.log_tags || [],
+        level: localConfig.log_level,
+        tags: Array.isArray(localConfig.log_tags) ? localConfig.log_tags.join(', ') : (localConfig.log_tags || ''),
         truncation_limits: localConfig.truncation_limits || {},
-        tag_levels: localConfig.tag_levels || {},
       }
       if (onSaveConfig) {
         await onSaveConfig(payload)

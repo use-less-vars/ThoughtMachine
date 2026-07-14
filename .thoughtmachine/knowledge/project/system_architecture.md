@@ -3977,3 +3977,23 @@ To diagnose why token warnings don't appear in the worker panel:
 5. **Check frontend normalization:** Add a console.log in `WorkerOutputPanel.jsx` in the `incomingEvents` useEffect to see what events arrive and how they're normalized.
 
 
+
+## 2026-07-13 — ## Research Task 2/5: State Machine, Token/Warning System — ...
+
+## Research Task 2/5: State Machine, Token/Warning System — Complete
+
+Read and analysed:
+
+1. **agent/core/state.py** — AgentState dataclass, TokenState/TurnState/TimeState enums, warning dedup via `last_*_warning_state`, restriction logic (immediate on CRITICAL, turn-based on WARNING), `_pending_events`, `get_allowed_tools()`, `is_tool_allowed()`, `reset()`.
+
+2. **agent/core/token_counter.py** — TokenCounter with `estimate_tokens()` (tiktoken cl100k_base), `estimate_request_tokens()`, `get_model_context_window()`, `format_tokens()`.
+
+3. **agent/core/tool_executor.py** — `execute_tool_calls()` calls `update_token_func` (agent._update_tokens_after_tool) after each tool result. TurnTransaction buffering support.
+
+4. **agent/core/agent.py** — `_update_tokens_after_tool()` buffers warnings, flushed after turn_transaction.commit(). `_handle_state_event()` generator. process_query() main loop with config apply, LLM call, tool execution, turn commit, warning flush, summarization flow. `_apply_summary_pruning()` inserts summary into append-only history with metadata.
+
+5. **agent/core/conversation_manager.py** — `add_message()` delegates to context_builder or falls back to session.user_history.append.
+
+6. **agent/events.py** — EventType enum, TokenWarningEvent/TurnWarningEvent/TimeWarningEvent, EventBus, `create_event()`, `convert_to_legacy_format()`.
+
+Full research written to `research_2_state_tokens_warnings.md`.
