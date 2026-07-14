@@ -4170,3 +4170,35 @@ def _publish_event(self, event_type: str, data: dict) -> None:
 2. **Global bus path** (for main agent token warnings): Main agent's process_query yields `token_warning` → bridge's `_on_worker_token_warning()` catches it (only if source starts with "worker:") → `'worker:system_notification'` WS message.
 
 
+
+## 2026-07-14 — ## Worker Unified Presenter Pipeline (2026-07-14)
+
+### Probl...
+
+## Worker Unified Presenter Pipeline (2026-07-14)
+
+### Problem
+Worker panel's token counter got stuck because `token_update` events from the agent were cached internally by `WorkerThread._run_tool_loop()` but **never published** to the per-worker EventBus. The 12-branch if/elif chain had `token_update` as the sole event type handled only for internal caching — not forwarded to the frontend.
+
+### Solution: WorkerBusAdapter + EventProcessor integration
+Gave each worker its own presenter pipeline, mirroring the main agent's architecture:
+
+**New components** (in `tools/workspace/worker.py`):
+1. **`WorkerBusAdapter`** — Drop-in for `GUIIntegration` (Qt signals → per-worker EventBus). Implements all `emit_*` methods that `EventProcessor` calls, including `emit_tokens_updated()` and `emit_context_updated()` which publish `token_update` events to the per-worker bus.
+
+2. **`WorkerSessionLifecycle`** — Minimal stub satisfying `EventProcessor`'s dependency (just `state` property + `_restarting` + `auto_save_current_session()`).
+
+**Wiring** (in `WorkerThread._run_tool_loop()`):
+- Lazy-initialized on first query: `StateBridge` + `WorkerBusAdapter` + `WorkerSessionLifecycle` + `EventProcessor`
+- Every agent event is fed through `event_processor.process_event(event)` **before** the existing forwarding chain
+- `WorkerBusAdapter` publishes `token_update` events to the per-worker EventBus → bridge forwards to frontend → token counter updates live
+
+**`get_current_context_tokens()`** updated to prefer `StateBridge.context_length` (live from EventProcessor) over `_cached_context_tokens`.
+
+### What changed
+- **`tools/workspace/worker.py`**: +3 classes, ~80 lines added, ~10 lines modified
+- **Tests**: Zero regressions (all existing tests pass)
+
+### Remaining work
+- The 12-branch if/elif chain in `_run_tool_loop()` still exists alongside the presenter. Future cleanup: replace manual forwarding with presenter-based publishing entirely.
+- Bug A (state machine warning reset) to be triaged after pipeline is stable.

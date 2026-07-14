@@ -69,6 +69,16 @@ except ImportError:
 # WorkerThread._build_agent_config() to avoid a circular import with
 # agent/core/agent.py which imports from tools (TOOL_CLASSES).
 
+# Presenter components for per-worker event processing
+try:
+    from agent.presenter.state_bridge import StateBridge
+    from agent.presenter.event_processor import EventProcessor
+    from agent.core.state import ExecutionState
+except ImportError:
+    StateBridge = None
+    EventProcessor = None
+    ExecutionState = None
+
 # Optional: security gate for worker permission checks
 try:
     from security.security_gate import check_required_categories
@@ -93,6 +103,178 @@ except ImportError:
     create_event = None
     EventType = None
     global_event_bus = None
+
+
+class WorkerBusAdapter:
+    """Drop-in replacement for GUIIntegration that publishes to per-worker EventBus.
+
+    Provides the same interface as GUIIntegration (state property, emit_* methods)
+    but publishes events to the worker's EventBus instead of emitting Qt signals.
+    """
+
+    def __init__(self, event_bus, worker_name: str):
+        self._event_bus = event_bus
+        self.worker_name = worker_name
+        self._state = ExecutionState.READY if ExecutionState else None
+
+    @property
+    def state(self):
+        return self._state
+
+    @state.setter
+    def state(self, new_state):
+        if self._state != new_state:
+            old_state = self._state
+            self._state = new_state
+            if self._event_bus is not None and create_event is not None and EventType is not None:
+                try:
+                    evt = create_event(
+                        EventType.WORKER_STATUS,
+                        data={
+                            "worker_name": self.worker_name,
+                            "execution_state": new_state.value if hasattr(new_state, 'value') else str(new_state),
+                            "old_execution_state": old_state.value if hasattr(old_state, 'value') else str(old_state),
+                        },
+                        source="worker",
+                        session_id="",
+                    )
+                    self._event_bus.publish(evt)
+                except Exception:
+                    pass
+
+    def emit_tokens_updated(self, total_input: int, total_output: int) -> None:
+        self._publish("tokens_updated", {"total_input": total_input, "total_output": total_output})
+
+    def emit_context_updated(self, context_length: int) -> None:
+        self._publish("context_updated", {"context_length": context_length})
+
+    def emit_status_message(self, message: str) -> None:
+        self._publish("status_message", {"message": str(message)[:500]})
+
+    def emit_error_occurred(self, error: str, traceback_str: str) -> None:
+        self._publish("error_occurred", {"error": str(error)[:500], "traceback": str(traceback_str)[:2000]})
+
+    def emit_config_changed(self, config: dict) -> None:
+        self._publish("config_changed", {"config": config})
+
+    def emit_conversation_changed(self) -> None:
+        self._publish("conversation_changed", {})
+
+    def forward_agent_event(self, event: dict) -> None:
+        """Publish an agent event to the per-worker EventBus for frontend consumption."""
+        event_type = event.get("type", "")
+
+        if event_type == "agent_responded":
+            content = event.get("content", "") or event.get("data", {}).get("content", "")
+            reasoning = event.get("reasoning_content", "") or event.get("data", {}).get("reasoning_content", "")
+            response_type = event.get("response_type", event.get("data", {}).get("response_type", "answer"))
+            self._publish("worker_message", {
+                "content": str(content)[:1000],
+                "reasoning_content": str(reasoning)[:2000] if reasoning else None,
+                "response_type": response_type,
+            })
+
+        elif event_type == "tool_call":
+            self._publish("tool_call", {
+                "tool_name": event.get("tool_name", ""),
+                "arguments": event.get("arguments", {}),
+            })
+
+        elif event_type == "tool_result":
+            result = event.get("result", "") or event.get("data", {}).get("result", "")
+            self._publish("tool_result", {
+                "tool_name": event.get("tool_name", ""),
+                "success": event.get("success", True),
+                "error": event.get("error", "") or "",
+                "result": str(result)[:1000] if result else "",
+            })
+
+        elif event_type == "token_warning":
+            self._publish("token_warning", {
+                "message": (event.get("message", "") or event.get("data", {}).get("message", ""))[:500],
+                "warning_message": (event.get("warning_message", "") or event.get("data", {}).get("warning_message", ""))[:500],
+                "token_count": event.get("token_count", 0),
+                "old_state": str(event.get("old_state", "")),
+                "new_state": str(event.get("new_state", "")),
+            })
+
+        elif event_type == "turn_warning":
+            message = event.get("message", "") or event.get("data", {}).get("message", "")
+            self._publish("turn_warning", {
+                "old_state": str(event.get("old_state", "")),
+                "new_state": str(event.get("new_state", "")),
+                "turn_count": event.get("turn_count", 0),
+                "warning_message": str(message)[:500],
+            })
+
+        elif event_type == "time_warning":
+            self._publish("time_warning", {
+                "message": (event.get("message", "") or event.get("data", {}).get("message", ""))[:500],
+                "elapsed_seconds": event.get("elapsed_seconds", 0),
+            })
+
+        elif event_type == "turn":
+            content = event.get("content", "") or event.get("data", {}).get("content", "")
+            reasoning = event.get("reasoning_content", "") or event.get("data", {}).get("reasoning_content", "")
+            self._publish("assistant_message", {
+                "content": str(content)[:1000],
+                "reasoning_content": str(reasoning)[:2000] if reasoning else None,
+            })
+
+        elif event_type == "system_notification":
+            self._publish("system_notification", {
+                "type": event.get("type_detail", event.get("notification_type", "general")),
+                "message": (event.get("message", "") or event.get("data", {}).get("message", ""))[:500],
+                "context_length": event.get("context_length", 0),
+            })
+
+        elif event_type == "user_message" or event_type == "user_interaction_requested":
+            pass
+
+    def _publish(self, event_type: str, data: dict) -> None:
+        if self._event_bus is None or create_event is None or EventType is None:
+            return
+        try:
+            if isinstance(event_type, str):
+                try:
+                    resolved_type = EventType(event_type)
+                except ValueError:
+                    return
+            event = create_event(
+                event_type=resolved_type,
+                data={**data, "worker_name": self.worker_name},
+                source="worker",
+                session_id="",
+            )
+            self._event_bus.publish(event)
+        except Exception:
+            pass
+
+
+class WorkerSessionLifecycle:
+    """Minimal SessionLifecycle stub for worker event processing.
+
+    Provides the state property and setter that EventProcessor expects,
+    without session persistence or GUI callback registration.
+    """
+
+    def __init__(self):
+        self._state = ExecutionState.READY if ExecutionState else None
+
+    @property
+    def state(self):
+        return self._state
+
+    @state.setter
+    def state(self, new_state):
+        if self._state != new_state:
+            self._state = new_state
+
+    def mark_clean(self) -> None:
+        pass
+
+    def has_unsaved_changes(self) -> bool:
+        return False
 
 
 logger = logging.getLogger(__name__)
@@ -336,6 +518,10 @@ class WorkerThread(threading.Thread):
         # Per-worker EventBus (created lazily in run() before Agent)
         self._event_bus: Optional[Any] = None
 
+        # Presenter components (created lazily in _run_tool_loop)
+        self._state_bridge: Optional[Any] = None
+        self._event_processor: Optional[Any] = None
+
         # Inter-thread communication
         self._input_queue: queue.Queue = queue.Queue()
         self._output_queue: queue.Queue = queue.Queue()
@@ -383,14 +569,17 @@ class WorkerThread(threading.Thread):
         """
         Return the current conversation's token count.
 
-        Uses the authoritative post-prune count cached from the agent's
-        ``token_update`` events when available. Falls back to estimation
-        via ``WorkerContext.estimated_context_tokens()`` if no
-        ``token_update`` event has been received yet.
+        Prefers the authoritative value from ``StateBridge.context_length``
+        (updated by ``EventProcessor`` from ``token_update`` events). Falls
+        back to the legacy ``_cached_context_tokens`` (still written by the
+        summarization-detection code), then estimation via
+        ``WorkerContext.estimated_context_tokens()``.
 
         Returns:
             Token count (int).
         """
+        if self._state_bridge is not None and self._state_bridge.context_length > 0:
+            return self._state_bridge.context_length
         if self._cached_context_tokens is not None:
             return self._cached_context_tokens
         if self._worker_ctx is not None:
@@ -572,6 +761,18 @@ class WorkerThread(threading.Thread):
         final_content = ""
         _start = time.monotonic()
 
+        # Lazy-init presenter components for event processing
+        if self._state_bridge is None and StateBridge is not None and ExecutionState is not None:
+            self._state_bridge = StateBridge(config_path=None)
+            bus_adapter = WorkerBusAdapter(self._event_bus, self.worker_name)
+            self._worker_bus_adapter = bus_adapter
+            session_lifecycle = WorkerSessionLifecycle()
+            self._event_processor = EventProcessor(
+                state_bridge=self._state_bridge,
+                session_lifecycle=session_lifecycle,
+                gui_integration=bus_adapter,
+            )
+
         # Log the user query as a user_message event
         self._publish_event("user_message", {"query": query})
 
@@ -602,17 +803,28 @@ class WorkerThread(threading.Thread):
 
                 event_type = event.get("type", "")
 
-                
+                # Feed each event through the EventProcessor BEFORE the existing chain
+                if self._event_processor is not None:
+                    try:
+                        self._event_processor.process_event(event)
+                    except Exception as exc:
+                        log('WARNING', 'tools.worker', f"EventProcessor failed for {event_type}: {exc}")
+
+                # Forward event to the per-worker EventBus via the bus adapter
+                # (replaces the old manual self._publish_event() calls for
+                #  tool_call, tool_result, token_warning, turn_warning,
+                #  time_warning, system_notification, turn)
+                if self._worker_bus_adapter is not None:
+                    try:
+                        self._worker_bus_adapter.forward_agent_event(event)
+                    except Exception as exc:
+                        log('WARNING', 'tools.worker', f"forward_agent_event failed for {event_type}: {exc}")
+
                 # Capture final response content and reasoning
                 if event_type == "agent_responded":
                     final_content = event.get("content", "")
                     self._last_reasoning = event.get("reasoning")
-                    # Also publish to event bus for real-time WS delivery
-                    self._publish_event("worker_message", {
-                        "content": str(final_content)[:1000],
-                        "reasoning_content": str(self._last_reasoning)[:2000] if self._last_reasoning else None,
-                        "response_type": event.get("response_type", "answer"),
-                    })
+
                 elif event_type == "stopped":
                     stop_reason = event.get("stop_reason", "unknown")
                     if stop_reason == "timeout":
@@ -638,89 +850,6 @@ class WorkerThread(threading.Thread):
                     final_content = json.dumps({"error": error_msg})
                     break
 
-                # --- Rich event logging for worker output panel ---
-
-                # Log tool calls (agent yields these before executing each tool)
-                if event_type == "tool_call":
-                    tool_name = event.get("tool_name", "")
-                    arguments = event.get("arguments", {})
-                    self._publish_event("tool_call", {
-                        "tool_name": tool_name,
-                        "arguments": arguments,
-                    })
-
-                # Log tool results (agent yields these after each tool completes)
-                if event_type == "tool_result":
-                    tool_name = event.get("tool_name", "")
-                    result = event.get("result", "")
-                    success = event.get("success", True)
-                    error = event.get("error")
-                    self._publish_event("tool_result", {
-                        "tool_name": tool_name,
-                        "success": success,
-                        "error": error,
-                        "result": str(result)[:1000] if result else "",
-                    })
-
-                # Log token warnings as system notifications
-                if event_type == "token_warning":
-                    log('DEBUG', 'tools.worker', f"[TOKEN] Worker received token_warning event: message={event.get('message','?')} token_count={event.get('token_count','?')}")
-                    message = event.get("message", "") or event.get("warning_message", "")
-                    token_count = event.get("token_count", 0)
-                    # Publish to per-worker EventBus for real-time WS delivery
-                    # Include all fields required by TokenWarningEvent validator
-                    self._publish_event("token_warning", {
-                        "message": str(message)[:500],
-                        "warning_message": event.get("warning_message", "") or str(message)[:500],
-                        "token_count": token_count or event.get("token_count", 0),
-                        "old_state": event.get("old_state", "unknown"),
-                        "new_state": event.get("new_state", "warning"),
-                    })
-
-                # Log turn warnings as system notifications
-                if event_type == "turn_warning":
-                    message = event.get("message", "") or event.get("warning", "")
-                    turn_count = event.get("turn_count", 0)
-                    # Publish to per-worker EventBus for real-time WS delivery
-                    # Must include fields required by TurnWarningEvent validation:
-                    # old_state, new_state, turn_count, warning_message
-                    self._publish_event("turn_warning", {
-                        "old_state": event.get("old_state", "unknown"),
-                        "new_state": event.get("new_state", "unknown"),
-                        "turn_count": turn_count,
-                        "warning_message": str(message)[:500],
-                    })
-
-                # Log time warnings as system notifications
-                if event_type == "time_warning":
-                    message = event.get("message", "") or event.get("warning_message", "")
-                    elapsed = event.get("elapsed_seconds", 0)
-                    # Publish to per-worker EventBus for real-time WS delivery
-                    self._publish_event("time_warning", {
-                        "message": str(message)[:500],
-                        "elapsed_seconds": elapsed,
-                    })
-
-                # Log system notifications emitted by the agent (e.g., context summarization)
-                if event_type == "system_notification":
-                    message = event.get("message", "")
-                    context_length = event.get("context_length", 0)
-                    # Publish to per-worker EventBus for real-time WS delivery
-                    self._publish_event("system_notification", {
-                        "type": "context_summarized",
-                        "message": str(message)[:500],
-                        "context_length": context_length,
-                    })
-
-                # Log assistant turn messages (agent's intermediate thoughts / responses)
-                if event_type == "turn":
-                    content = event.get("content", "")
-                    reasoning = event.get("reasoning", "")
-                    self._publish_event("assistant_message", {
-                        "content": str(content)[:1000],
-                        "reasoning_content": str(reasoning)[:2000] if reasoning else None,
-                    })
-
                 # Cache the agent's authoritative post-prune token count
                 # and detect context summarization inline (token drop threshold)
                 if event_type == "token_update":
@@ -734,11 +863,6 @@ class WorkerThread(threading.Thread):
                         if prev_tokens > 2000 and self._cached_context_tokens < prev_tokens * 0.60:
                             log('DEBUG', 'tools.worker',
                                 f'Context summarization detected: {prev_tokens} -> {self._cached_context_tokens} tokens')
-                            self._publish_event("system_notification", {
-                                "type": "context_summarized",
-                                "message": "Context has been cleared and summarized. You now have a fresh context window with full access to tools.",
-                                "context_length": self._cached_context_tokens,
-                            })
 
                 # Keep legacy tool_execution handler for backward compatibility
                 if event_type == "tool_execution":
