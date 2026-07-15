@@ -875,6 +875,7 @@ class Agent:
             for turn in range(self.config.max_turns):
                 turn_start_time = time.time()
                 log('DEBUG', 'core.agent', f'process_query: starting turn {turn}/{self.config.max_turns}, conversation length={len(self.conversation)}')
+
                 if self.logger:
                     self.logger.log_turn_start(turn)
                     if turn % 5 == 0:
@@ -1261,6 +1262,7 @@ class Agent:
                             recovery_event['type'] = 'context_cleared'
                             self._add_conversation_data_to_event(recovery_event)
                             yield recovery_event
+
                         # Continue the turn loop — summary frees context, agent keeps working
                         turn_duration = time.time() - turn_start_time
                         if self.logger:
@@ -1313,6 +1315,7 @@ class Agent:
                     yield final_event
                     return
     
+
             # Max turns reached - loop exhausted naturally
             log('WARNING', 'core.agent', f'Max turns ({self.config.max_turns}) reached - loop exhausted')
             if self.logger:
