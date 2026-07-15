@@ -6,49 +6,104 @@
  * Each role gets a distinct CSS class and alignment.
  *
  * Props: messages — array of { role, content, reasoning_content? } objects
+ *
+ * Auto-scroll logic:
+ *   - Tracks whether the user is "at the bottom" of the scroll container.
+ *   - On message APPEND (count increases), if user was at bottom, scroll to
+ *     new bottom via useLayoutEffect + double requestAnimationFrame.
+ *   - Uses a programmaticScrollRef to suppress the onScroll handler during
+ *     programmatic scroll events, preventing false "not at bottom" detection
+ *     when async content (syntax highlighting, markdown) expands scrollHeight
+ *     between the scroll assignment and the scroll event delivery.
+ *   - A ResizeObserver on the container handles async content expansion
+ *     while the user is at bottom, keeping the view anchored to the latest
+ *     content even as images / code blocks load asynchronously.
  */
 
-import React, { useEffect, useRef, useCallback } from 'react'
+import React, { useEffect, useLayoutEffect, useRef, useCallback } from 'react'
 import { MessageBubble } from './chat/MessageBubble'
 
 /* ── Main panel ── */
 function ChatPanel({ messages, loadMore, hasMore }) {
   const chatRef = useRef(null)
   const isAtBottomRef = useRef(true)
+  const programmaticScrollRef = useRef(false)
+  const prevCountRef = useRef(0)
 
-  // On scroll, determine if user is at bottom
+  // ── Scroll handler — suppress updates during programmatic scroll ──
   const handleScroll = useCallback(() => {
+    if (programmaticScrollRef.current) {
+      // This scroll event was triggered by our own programmatic scroll;
+      // reset the guard for the next user-initiated scroll.
+      programmaticScrollRef.current = false
+      return
+    }
     const el = chatRef.current
     if (!el) return
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 20
     isAtBottomRef.current = atBottom
   }, [])
 
-  // After messages update, scroll if user was at bottom.
-  // Use double requestAnimationFrame so DOM layout (including async
-  // syntax highlighting and markdown rendering) is fully settled before
-  // measuring scrollHeight.  A single rAF can fire before async content
-  // has expanded the DOM, leaving the user looking at old content.
-  useEffect(() => {
-    if (isAtBottomRef.current && chatRef.current && messages.length > 0) {
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          if (chatRef.current) {
-            chatRef.current.scrollTop = chatRef.current.scrollHeight
-          }
-        })
-      })
+  // ── Programmatic scroll helper (sets guard flag) ──
+  const scrollToBottom = useCallback(() => {
+    const el = chatRef.current
+    if (!el) return
+    programmaticScrollRef.current = true
+    el.scrollTop = el.scrollHeight
+    isAtBottomRef.current = true
+  }, [])
+
+  // ── Auto-scroll on message append ──
+  // Runs synchronously after DOM mutations (useLayoutEffect) but double-rAF
+  // ensures async rendering (syntax highlighting, markdown) has settled.
+  useLayoutEffect(() => {
+    const currentCount = messages ? messages.length : 0
+    const prevCount = prevCountRef.current
+    prevCountRef.current = currentCount
+
+    // Only auto-scroll when content was APPENDED (count increased),
+    // user is at bottom, and container exists.
+    if (
+      !isAtBottomRef.current ||
+      !chatRef.current ||
+      currentCount <= prevCount ||
+      currentCount === 0
+    ) {
+      return
     }
+
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (chatRef.current) {
+          programmaticScrollRef.current = true
+          chatRef.current.scrollTop = chatRef.current.scrollHeight
+        }
+      })
+    })
   }, [messages])
 
-  const scrollToBottom = () => {
-    if (chatRef.current) {
-      chatRef.current.scrollTop = chatRef.current.scrollHeight
-      isAtBottomRef.current = true
-    }
-  }
+  // ── ResizeObserver — keep anchored at bottom during async expansion ──
+  useEffect(() => {
+    const el = chatRef.current
+    if (!el) return
 
-  // Scroll to the previous user query above the current viewport
+    const observer = new ResizeObserver(() => {
+      // Only intervene if user is at bottom and we're not already
+      // in the middle of a programmatic scroll.
+      if (isAtBottomRef.current && !programmaticScrollRef.current) {
+        if (el.scrollHeight - el.scrollTop - el.clientHeight > 1) {
+          // Content expanded below the fold while user was at bottom.
+          programmaticScrollRef.current = true
+          el.scrollTop = el.scrollHeight
+        }
+      }
+    })
+
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [])
+
+  // ── Scroll to previous user query (jump up) ──
   const jumpToPrevQuery = () => {
     const el = chatRef.current
     if (!el) return

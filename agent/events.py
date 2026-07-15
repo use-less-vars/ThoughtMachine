@@ -72,6 +72,14 @@ class EventType(enum.Enum):
     WEBSOCKET_CONNECT = 'websocket_connect'
     WEBSOCKET_DISCONNECT = 'websocket_disconnect'
     CONFIG_LOADED = 'config_loaded'
+    # Worker-specific status/notification event types (for WorkerBusAdapter)
+    TOKENS_UPDATED = 'tokens_updated'
+    CONTEXT_UPDATED = 'context_updated'
+    STATUS_MESSAGE = 'status_message'
+    ERROR_OCCURRED = 'error_occurred'
+    CONFIG_CHANGED = 'config_changed'
+    CONVERSATION_CHANGED = 'conversation_changed'
+    WORKER_STATE_SYNC = 'worker_state_sync'
 
 
 class EventMetadata(BaseModel):
@@ -338,7 +346,7 @@ def create_event(event_type: Union[EventType, str], data: Dict[str, Any], source
         except ValueError:
             event_type = _map_legacy_event_type(event_type)
     metadata = EventMetadata(source=source, session_id=session_id, turn=turn)
-    event_class_map = {EventType.AGENT_START: AgentStartEvent, EventType.AGENT_END: AgentEndEvent, EventType.TOOL_CALL: ToolCallEvent, EventType.TOOL_RESULT: ToolResultEvent, EventType.TOKEN_WARNING: TokenWarningEvent, EventType.TURN_WARNING: TurnWarningEvent, EventType.ERROR: ErrorEvent, EventType.TURN: TurnEvent, EventType.CAPABILITY_CHECK: BaseEvent, EventType.SECURITY_PROMPT: SecurityPromptEvent, EventType.SECURITY_RESPONSE: SecurityResponseEvent, EventType.FINAL: BaseEvent, EventType.MAX_TURNS: BaseEvent, EventType.STOPPED: BaseEvent, EventType.PAUSED: BaseEvent, EventType.THREAD_FINISHED: BaseEvent, EventType.USER_INTERACTION_REQUESTED: BaseEvent, EventType.RATE_LIMIT_WARNING: BaseEvent, EventType.TOKEN_UPDATE: BaseEvent, EventType.EXECUTION_STATE_CHANGE: BaseEvent, EventType.SESSION_STATE_CHANGE: BaseEvent, EventType.WORKER_SPAWNED: WorkerSpawnedEvent, EventType.WORKER_STATUS: WorkerStatusEvent, EventType.WORKER_COMPLETED: WorkerCompletedEvent, EventType.WORKER_ERROR: WorkerErrorEvent, EventType.WORKER_MESSAGE: WorkerMessageEvent, EventType.ASSISTANT_MESSAGE: AssistantMessageEvent,
+    event_class_map = {EventType.AGENT_START: AgentStartEvent, EventType.AGENT_END: AgentEndEvent, EventType.TOOL_CALL: ToolCallEvent, EventType.TOOL_RESULT: ToolResultEvent, EventType.TOKEN_WARNING: TokenWarningEvent, EventType.TURN_WARNING: TurnWarningEvent, EventType.ERROR: ErrorEvent, EventType.TURN: TurnEvent, EventType.CAPABILITY_CHECK: BaseEvent, EventType.SECURITY_PROMPT: SecurityPromptEvent, EventType.SECURITY_RESPONSE: SecurityResponseEvent, EventType.FINAL: BaseEvent, EventType.MAX_TURNS: BaseEvent, EventType.STOPPED: BaseEvent, EventType.PAUSED: BaseEvent, EventType.THREAD_FINISHED: BaseEvent, EventType.USER_INTERACTION_REQUESTED: BaseEvent, EventType.RATE_LIMIT_WARNING: BaseEvent, EventType.TOKEN_UPDATE: BaseEvent, EventType.TOKEN_RECOVERY: BaseEvent, EventType.CONTEXT_CLEARED: BaseEvent, EventType.EXECUTION_STATE_CHANGE: BaseEvent, EventType.SESSION_STATE_CHANGE: BaseEvent, EventType.WORKER_SPAWNED: WorkerSpawnedEvent, EventType.WORKER_STATUS: WorkerStatusEvent, EventType.WORKER_COMPLETED: WorkerCompletedEvent, EventType.WORKER_ERROR: WorkerErrorEvent, EventType.WORKER_MESSAGE: WorkerMessageEvent, EventType.ASSISTANT_MESSAGE: AssistantMessageEvent,
     EventType.WEBSOCKET_CONNECT: BaseEvent,
     EventType.WEBSOCKET_DISCONNECT: BaseEvent,
     EventType.CONFIG_LOADED: BaseEvent,}
@@ -427,10 +435,16 @@ def _map_legacy_event_type(event_type_str: str) -> EventType:
     """Map legacy event type strings to standardized EventType."""
     import os
     log('DEBUG', 'core.events', f"_map_legacy_event_type: '{event_type_str}'")
-    mapping = {'tool_call': EventType.TOOL_CALL, 'tool_result': EventType.TOOL_RESULT, 'token_warning': EventType.TOKEN_WARNING, 'turn_warning': EventType.TURN_WARNING, 'time_warning': EventType.TIME_WARNING, 'agent_responded': EventType.AGENT_RESPONDED, 'final': EventType.FINAL, 'stopped': EventType.STOPPED, 'max_turns': EventType.MAX_TURNS, 'thread_finished': EventType.THREAD_FINISHED, 'paused': EventType.PAUSED, 'error': EventType.ERROR, 'turn': EventType.TURN, 'token_update': EventType.TOKEN_UPDATE, 'user_interaction_requested': EventType.USER_INTERACTION_REQUESTED, 'user_query': EventType.USER_QUERY, 'rate_limit_warning': EventType.RATE_LIMIT_WARNING, 'execution_state_change': EventType.EXECUTION_STATE_CHANGE, 'session_state_change': EventType.SESSION_STATE_CHANGE, 'worker_spawned': EventType.WORKER_SPAWNED, 'worker_status': EventType.WORKER_STATUS, 'worker_completed': EventType.WORKER_COMPLETED, 'worker_error': EventType.WORKER_ERROR,
+    mapping = {'tool_call': EventType.TOOL_CALL, 'tool_result': EventType.TOOL_RESULT, 'token_warning': EventType.TOKEN_WARNING, 'turn_warning': EventType.TURN_WARNING, 'time_warning': EventType.TIME_WARNING, 'agent_responded': EventType.AGENT_RESPONDED, 'final': EventType.FINAL, 'stopped': EventType.STOPPED, 'max_turns': EventType.MAX_TURNS, 'thread_finished': EventType.THREAD_FINISHED, 'paused': EventType.PAUSED, 'error': EventType.ERROR, 'turn': EventType.TURN, 'token_update': EventType.TOKEN_UPDATE, 'token_recovery': EventType.TOKEN_RECOVERY, 'context_cleared': EventType.CONTEXT_CLEARED, 'user_interaction_requested': EventType.USER_INTERACTION_REQUESTED, 'user_query': EventType.USER_QUERY, 'rate_limit_warning': EventType.RATE_LIMIT_WARNING, 'execution_state_change': EventType.EXECUTION_STATE_CHANGE, 'session_state_change': EventType.SESSION_STATE_CHANGE, 'worker_spawned': EventType.WORKER_SPAWNED, 'worker_status': EventType.WORKER_STATUS, 'worker_completed': EventType.WORKER_COMPLETED, 'worker_error': EventType.WORKER_ERROR,
     'websocket_connect': EventType.WEBSOCKET_CONNECT,
     'websocket_disconnect': EventType.WEBSOCKET_DISCONNECT,
-    'config_loaded': EventType.CONFIG_LOADED,}
+    'config_loaded': EventType.CONFIG_LOADED,
+    'tokens_updated': EventType.TOKENS_UPDATED,
+    'context_updated': EventType.CONTEXT_UPDATED,
+    'status_message': EventType.STATUS_MESSAGE,
+    'error_occurred': EventType.ERROR_OCCURRED,
+    'config_changed': EventType.CONFIG_CHANGED,
+    'conversation_changed': EventType.CONVERSATION_CHANGED,}
     result = mapping.get(event_type_str)
     if result is None:
         log('DEBUG', 'core.events', f"No mapping for '{event_type_str}', attempting direct EventType creation")

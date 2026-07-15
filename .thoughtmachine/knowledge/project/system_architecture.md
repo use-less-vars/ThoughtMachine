@@ -4202,3 +4202,241 @@ Gave each worker its own presenter pipeline, mirroring the main agent's architec
 ### Remaining work
 - The 12-branch if/elif chain in `_run_tool_loop()` still exists alongside the presenter. Future cleanup: replace manual forwarding with presenter-based publishing entirely.
 - Bug A (state machine warning reset) to be triaged after pipeline is stable.
+
+## 2026-07-14 — ## Phase 3c Verification (Completed 2025-07-14)
+
+**Scope:** ...
+
+## Phase 3c Verification (Completed 2025-07-14)
+
+**Scope:** Full import chain and integration test for `tools/workspace/worker.py` refactoring.
+
+**Changes verified:**
+1. ✅ `WorkerBusAdapter.forward_agent_event()` — exists with proper event type handling (tool_call, tool_result, token_warning, turn_warning, time_warning, system_notification, turn)
+2. ✅ `self._worker_bus_adapter = bus_adapter` — set in lazy-init block
+3. ✅ `self._worker_bus_adapter: Optional[Any] = None` — initialized at line 519
+4. ✅ Event loop simplified — `forward_agent_event()` replaces all manual `self._publish_event()` calls
+
+**Full import chain (all 11 checks passed):**
+1. `agent.events` (EventBus, EventType, BaseEvent, ToolCallEvent, ToolResultEvent) — OK
+2. `agent.core.state` (ExecutionState) — OK
+3. `agent.presenter.state_bridge` (StateBridge) — OK
+4. `agent.presenter.event_processor` (EventProcessor) — OK
+5. `tools.workspace.worker` (WorkerBusAdapter, WorkerSessionLifecycle, WorkerThread) — OK
+6. WorkerBusAdapter.forward_agent_event() — OK
+7. All emit_* methods (tokens_updated, context_updated, status_message, error_occurred, config_changed, conversation_changed) — OK
+8. WorkerBusAdapter._publish() — OK
+9. WorkerSessionLifecycle (state, has_unsaved_changes, mark_clean) — OK
+10. StateBridge (update_config, save_config, bind_session) — OK
+11. EventProcessor(state_bridge, session_lifecycle, gui_integration) — OK
+
+**Test results:**
+- 1 per-worker EventBus bridge test passed
+- 22 worker permissions tests passed
+- 18 workspace tools worker tests passed (10 pre-existing failures unrelated to changes)
+- StateBridge(None) — OK
+- StateBridge('') — OK
+- EventProcessor init — OK
+
+## 2026-07-15 — ## 2026-07-15 — Comprehensive Architecture Deep-Dive (Curren...
+
+## 2026-07-15 — Comprehensive Architecture Deep-Dive (Current Codebase State)
+
+### Context
+This entry documents the findings from a thorough analysis of the current codebase as of 2026-07-15, following a fresh workspace setup and file-by-file inspection of the core system. It captures the actual on-disk structure and component relationships, complementing the historical record above.
+
+### Three-Tier Architecture (Verified)
+
+```
+┌─────────────────────────────────────────────────────────┐
+│              React/Vite Frontend (:5173)                 │
+│  SessionTab.jsx  ·  ConfigPanel.jsx  ·  ProviderPanel   │
+│  (Zustand-less — each tab owns its own WebSocket)       │
+└──────────────────────────────┬──────────────────────────┘
+                               │ JSON over WebSocket (ws://host:8000/ws)
+                               ▼
+┌─────────────────────────────────────────────────────────┐
+│              FastAPI WebSocket Server (:8000)            │
+│  server.py  ·  /ws endpoint                             │
+│  Routes: start_session, continue_session, pause/stop,   │
+│  get_config, get_conversation, save/load/delete session, │
+│  update_config/apply_config, get_providers, etc.        │
+│  Per-connection: WebAgentBridge instance                 │
+└──────────────────────────────┬──────────────────────────┘
+                               │ calls into
+                               ▼
+┌─────────────────────────────────────────────────────────┐
+│              Agent Core (agent/core/)                    │
+│  agent.py (facade/coordinator)                           │
+│  ├─ TokenCounter         — token estimation              │
+│  ├─ LLMClient            — LLM API calls                 │
+│  ├─ ConversationManager  — history + pruning             │
+│  ├─ ToolExecutor         — tool execution + permissions  │
+│  └─ DebugContext         — conditional debug logging     │
+│  state.py                — AgentState state machine      │
+│  events.py               — EventBus + EventType enum     │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Agent Core Components (Detailed)
+
+**agent.py** (the coordinator):
+- `process_query()` — main loop (~500+ lines): token check → LLM call → tool execution loop → event emission
+- `_handle_state_event()` — pre-LLM state updates (token warnings, turn warnings, system notifications)
+- `_apply_summary_pruning()` — inserts summary system messages at turn boundaries
+- `_update_tokens_after_tool()` — post-tool token recalc + warnings
+- `_add_to_conversation()` — appends to user_history
+- Uses TurnTransaction for turn lifecycle management
+
+**state.py** — AgentState dataclass:
+- Five sub-states: TokenState, TurnState, TimeState, ExecutionState, SessionState
+- Enums with transition logic (e.g., TokenState: NORMAL → SOFT_WARNING → CRITICAL → RESTRICTED)
+- `update_token_state()` — generates token warnings based on thresholds
+- `update_turn_state()` — generates turn warnings
+- Generates state_changed events consumed by bridge → frontend
+
+**events.py** — Event system:
+- `EventType` enum: 30+ types (AGENT_STATE_CHANGED, TOKENS_UPDATED, WORKER_SPAWNED, WORKER_STATUS, WORKER_COMPLETED, WORKER_ERROR, TOOL_EXECUTION, etc.)
+- `EventBus` class: pub/sub pattern with subscriber lists per event type
+- `BaseEvent` schema: standard event envelope
+- Used by both main agent and worker agents (per-worker EventBus instances)
+
+**conversation_manager.py**:
+- `add_message()` — adds to user_history with metadata (seq, created_at, is_system_notification)
+- `prune_history()` — removes messages when history exceeds limits
+- `_group_messages_into_turns()` — groups messages by turn boundaries for context building
+
+### Bridge Layer (web_ui/backend/bridge.py)
+
+**WebAgentBridge** — wraps Agent for WebSocket frontend:
+- Thread-safe: uses locks for concurrent access
+- Manages Agent lifecycle: start, continue, pause, resume, stop
+- Translates WebSocket commands to AgentController calls
+- Handles config apply from frontend
+- Emits events back over WebSocket via state_bridge
+
+### Event Pipeline Architecture
+
+```
+Agent (process_query)
+  │
+  ├─► AgentState.update_*() ──► state_changed events
+  ├─► EventBus.publish()    ──► EventProcessor
+  │                               ├─► state_bridge (WebSocket → frontend)
+  │                               └─► gui_integration (PyQt6 GUI, legacy path)
+  └─► ConversationManager   ──► user_history (source of truth)
+```
+
+### Worker System (tools/workspace/worker.py)
+
+**WorkerThread** — isolated execution environment:
+- Each worker has its own EventBus (per-worker, not shared with main agent)
+- StateBridge: translates worker state to WebSocket-friendly messages
+- EventProcessor: dispatches events to state_bridge + gui_integration
+- Workers run inside Docker sandbox with workspace path resolution
+- Worker status reporting via IPC pattern (worker:* events → bridge → frontend)
+
+### WebSocket Protocol (server.py)
+
+**Client → Server commands** (27 commands):
+- Session lifecycle: start_session, continue_session, pause_session, resume_session, stop_session, new_session
+- Session persistence: save_session, load_session, delete_session, rename_session, list_sessions
+- Config: get_config, update_config, apply_config
+- Conversation: get_conversation, load_more_messages
+- Providers: get_providers, save_provider, delete_provider
+- Other: get_available_tools, get_open_sessions, close_session, set_project, security_response, get_workspace_capabilities, bootstrap_workspace
+
+**Server → Client event types** (20+):
+- state_changed, tokens_updated, context_updated, conversation_changed, more_messages
+- config_changed, status_message, sessions_list, session_saved/loaded/deleted/renamed
+- open_sessions_list, session_closed, session_cleared
+- providers_list, provider_saved, provider_deleted
+- tools_list, security_prompt
+- worker:worker_spawned, worker:worker_status, worker:worker_completed, worker:worker_error
+
+### Frontend Architecture (web_ui/frontend/)
+
+**SessionTab.jsx** — main interactive component:
+- Independent WebSocket per tab (no Zustand/global state)
+- Local React state via useState/useReducer
+- Handles: message display, config editing, provider management, session persistence
+- Worker panel: shows spawned workers with status updates
+- MessageRenderer: special styling for system notifications, tool calls, errors
+- ConfigPanel.jsx: permission toggles, provider config, tool output limits
+- ProviderPanel: LLM provider management UI
+
+### Security Architecture
+
+- **Three-layer model**: ToolExecutor category checks → Docker sandbox → Container permissions
+- **SessionPermissions**: network (banned/none/bridge), filesystem (read/write), container (bool), execution (banned/read)
+- **Docker sandbox**: containers.run() with network=none, volumes=ro workspace, tmpfs for /tmp and /home/agent, .git masked
+- **Security prompts**: tool execution can trigger user approval via security_response command
+- **Default permissions**: network=banned, filesystem=read, container=False, execution=banned (server enforce)
+
+### Key Design Patterns
+
+1. **Event-Driven Pipeline**: All state changes flow through EventBus → EventProcessor → bridge → frontend (or GUI)
+2. **State Machine**: AgentState manages 5 sub-states with explicit transitions; events emitted on every change
+3. **user_history = Source of Truth**: Append-only message list; LLM context is a derived sliding window
+4. **Summarization**: SummarizeTool inserts summary at turn boundaries; token warnings use metadata flag (is_system_notification) for correct placement
+5. **Per-Worker Isolation**: Workers have their own EventBus, StateBridge, and EventProcessor — fully decoupled from main agent
+6. **Thread-Safe Bridge**: WebAgentBridge uses locks for concurrent WebSocket → Agent access
+7. **Lazy Imports**: docker_executor and security modules use lazy imports to avoid circular dependencies
+8. **Debug Gates**: DEBUG_CONTEXT env var controls extensive debug logging across multiple modules
+
+### Key File Locations
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| Agent coordinator | agent/core/agent.py | Main process_query loop, coordination |
+| State machine | agent/core/state.py | AgentState with 5 sub-states |
+| Event system | agent/events.py | EventBus, EventType, BaseEvent |
+| Conversation mgr | agent/core/conversation_manager.py | History management |
+| Token counter | agent/core/token_counter.py | Token estimation |
+| Tool executor | agent/core/tool_executor.py | Tool orchestration + permissions |
+| LLM client | agent/core/llm_client.py | LLM API communication |
+| WebSocket server | web_ui/backend/server.py | FastAPI /ws endpoint |
+| Bridge | web_ui/backend/bridge.py | WebAgentBridge |
+| Config models | agent/config/models.py | AgentConfig Pydantic |
+| Frontend tab | web_ui/frontend/src/components/SessionTab.jsx | Main UI component |
+| Worker thread | tools/workspace/worker.py | WorkerThread |
+| Event processor | agent/presenter/event_processor.py | Event dispatch |
+| Docker executor | docker_executor.py | Container management |
+| Session store | session/store.py | SQLite persistence |
+| Security gate | thoughtmachine/security.py | Sandbox validation |
+| Provider profiles | agent/config/provider_profiles.py | LLM provider definitions |
+| Debug context | agent/core/debug_context.py | Conditional debug logging |
+
+
+## 2026-07-15 — ## worker_state_sync Frontend Pipeline
+
+### Event Flow
+1. **...
+
+## worker_state_sync Frontend Pipeline
+
+### Event Flow
+1. **Backend**: `WorkerBusAdapter.emit_state_sync()` → EventBus (`type='worker_state_sync'`, payload: `{context_length, token_state, warning_message, critical_threshold, worker_name}`)
+2. **Bridge**: `_make_bus_handler` subscribes → forwards as `type='worker:worker_state_sync'` via WebSocket with nested `data` payload
+3. **SessionTab.jsx** (line 546-547): Case `'worker:worker_state_sync'` → forwards to `onWorkerEvent(sessionId, msg)`
+4. **App.jsx** (line 285-313): `handleWorkerEvent` stores in `workerEvents[sessionId]` with dedup (canonical type + timestamp key)
+5. **WorkerOutputPanel.jsx**: Receives `incomingEvents={workerEvents[activeSessionId]}`
+
+### Two Processing Phases in WorkerOutputPanel
+- **Phase A — workerInfo state** (lines 228-268): Updates header context counter and warning banner immediately
+- **Phase B — Event list** (lines 411-430): Maps to display event with `event: 'worker_state_sync'`, `response: {context_length, token_state, warning_message, critical_threshold}`
+
+### Three Visual Touchpoints
+1. **Header** (line 546-549): `ctx: X / Y` using `latestEvent?.current_context_tokens ?? workerInfo?.current_context_tokens`
+2. **Warning banner** (lines 552-565): Conditional on `workerInfo?.token_state === 'WARNING' || 'CRITICAL'`
+3. **Event log** (lines 568-608): Each event via `adaptWorkerEvent()` → `MessageBubble`
+
+### adaptWorkerEvent.js handler (line 248-280)
+- `LOW`/`OK`: ✅ Token state: LOW (X tokens) — `role: 'system'`
+- `WARNING`: ⚠️ Token state: WARNING — message (X / Y max) — `role: 'user', is_system_notification: true`
+- `CRITICAL`: 🔴 Token state: CRITICAL — message (X / Y max) — `role: 'user', is_system_notification: true`
+
+### Dedup Strategy
+- In `App.handleWorkerEvent`: Canonical type `'worker_state_sync'` + timestamp as dedup key
+- In `WorkerOutputPanel`: `seenEventKeysRef` with `makeDedupKey(rawType, timestamp)` — worker_state_sync maps to canonical = `'worker_state_sync'` (not mapped to `system_notification`)
+- Backend state machine guarantees one-shot escalation per level (WARNING → CRITICAL), preventing duplicate banner renders

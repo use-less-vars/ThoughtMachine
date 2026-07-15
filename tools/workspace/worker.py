@@ -70,13 +70,13 @@ except ImportError:
 # agent/core/agent.py which imports from tools (TOOL_CLASSES).
 
 # Presenter components for per-worker event processing
+StateBridge = None  # lazy-imported in _run_tool_loop
+
+EventProcessor = None  # lazy-imported in _run_tool_loop
+
 try:
-    from agent.presenter.state_bridge import StateBridge
-    from agent.presenter.event_processor import EventProcessor
     from agent.core.state import ExecutionState
 except ImportError:
-    StateBridge = None
-    EventProcessor = None
     ExecutionState = None
 
 # Optional: security gate for worker permission checks
@@ -112,9 +112,10 @@ class WorkerBusAdapter:
     but publishes events to the worker's EventBus instead of emitting Qt signals.
     """
 
-    def __init__(self, event_bus, worker_name: str):
+    def __init__(self, event_bus, worker_name: str, state_bridge=None):
         self._event_bus = event_bus
         self.worker_name = worker_name
+        self._state_bridge = state_bridge
         self._state = ExecutionState.READY if ExecutionState else None
 
     @property
@@ -143,26 +144,101 @@ class WorkerBusAdapter:
                     pass
 
     def emit_tokens_updated(self, total_input: int, total_output: int) -> None:
+        log('DEBUG', 'pipeline.worker_bus',
+            f"[TOKEN_PIPELINE] WorkerBusAdapter.emit_tokens_updated: "
+            f"worker={self.worker_name} total_input={total_input} total_output={total_output}")
         self._publish("tokens_updated", {"total_input": total_input, "total_output": total_output})
 
     def emit_context_updated(self, context_length: int) -> None:
+        log('DEBUG', 'pipeline.worker_bus',
+            f"[TOKEN_PIPELINE] WorkerBusAdapter.emit_context_updated: "
+            f"worker={self.worker_name} context_length={context_length}")
         self._publish("context_updated", {"context_length": context_length})
 
     def emit_status_message(self, message: str) -> None:
+        log('DEBUG', 'pipeline.worker_bus',
+            f"[TOKEN_PIPELINE] WorkerBusAdapter.emit_status_message: "
+            f"worker={self.worker_name} message={str(message)[:100]!r}")
         self._publish("status_message", {"message": str(message)[:500]})
 
     def emit_error_occurred(self, error: str, traceback_str: str) -> None:
+        log('DEBUG', 'pipeline.worker_bus',
+            f"[TOKEN_PIPELINE] WorkerBusAdapter.emit_error_occurred: "
+            f"worker={self.worker_name} error={str(error)[:100]!r}")
         self._publish("error_occurred", {"error": str(error)[:500], "traceback": str(traceback_str)[:2000]})
 
     def emit_config_changed(self, config: dict) -> None:
+        log('DEBUG', 'pipeline.worker_bus',
+            f"[TOKEN_PIPELINE] WorkerBusAdapter.emit_config_changed: "
+            f"worker={self.worker_name} config_keys={list(config.keys())}")
         self._publish("config_changed", {"config": config})
 
     def emit_conversation_changed(self) -> None:
+        log('DEBUG', 'pipeline.worker_bus',
+            f"[TOKEN_PIPELINE] WorkerBusAdapter.emit_conversation_changed: "
+            f"worker={self.worker_name}")
         self._publish("conversation_changed", {})
+
+    def emit_state_sync(self) -> None:
+        """
+        Publish a worker_state_sync event carrying current context/token/warning info
+        so the frontend can update its live display without polling.
+
+        Reads all state from ``self._state_bridge`` (the single source of truth):
+        - ``context_length`` from ``state_bridge.context_length``
+        - ``critical_threshold`` from ``state_bridge.current_config.token_monitor_critical_threshold``
+        - ``warning_threshold`` from ``state_bridge.current_config.token_monitor_warning_threshold``
+        - ``token_state`` derived by comparing ``context_length`` against thresholds
+        - ``warning_message`` constructed from the derived state
+        """
+        log('DEBUG', 'pipeline.hops',
+            f"[PIPELINE:HOPS] WorkerBusAdapter.emit_state_sync: worker={self.worker_name} "
+            f"state_bridge={'SET' if self._state_bridge else 'NONE'}")
+        context_length = getattr(self._state_bridge, 'context_length', 0) or 0
+        critical_threshold = 0
+        warning_threshold = 0
+        if self._state_bridge is not None and hasattr(self._state_bridge, 'current_config'):
+            cfg = self._state_bridge.current_config
+            if hasattr(cfg, 'token_monitor_critical_threshold'):
+                critical_threshold = cfg.token_monitor_critical_threshold or 0
+            if hasattr(cfg, 'token_monitor_warning_threshold'):
+                warning_threshold = cfg.token_monitor_warning_threshold or 0
+
+        # Derive token_state from context_length vs thresholds
+        if critical_threshold > 0 and context_length >= critical_threshold:
+            token_state = 'CRITICAL'
+        elif warning_threshold > 0 and context_length >= warning_threshold:
+            token_state = 'WARNING'
+        else:
+            token_state = 'LOW'
+
+        # Construct warning message from the derived state
+        if token_state == 'CRITICAL':
+            warning_message = f"Token usage CRITICAL: {context_length} tokens (limit {critical_threshold})"
+        elif token_state == 'WARNING':
+            warning_message = f"Token usage warning: {context_length} tokens approaching limit ({warning_threshold})"
+        else:
+            warning_message = ''
+
+        data = {
+            "context_length": context_length,
+            "token_state": token_state,
+            "warning_message": warning_message,
+            "critical_threshold": critical_threshold,
+        }
+        log('DEBUG', 'pipeline.worker_bus',
+            f"[TOKEN_PIPELINE] WorkerBusAdapter.emit_state_sync: "
+            f"worker={self.worker_name} context_length={context_length} "
+            f"token_state={token_state} warning={warning_message} threshold={critical_threshold}")
+        self._publish("worker_state_sync", data)
 
     def forward_agent_event(self, event: dict) -> None:
         """Publish an agent event to the per-worker EventBus for frontend consumption."""
         event_type = event.get("type", "")
+        log('DEBUG', 'pipeline.worker_bus',
+            f"[TOKEN_PIPELINE] WorkerBusAdapter.forward_agent_event: "
+            f"worker={self.worker_name} event_type={event_type!r} "
+            f"session_id={event.get('session_id', 'N/A')}")
 
         if event_type == "agent_responded":
             content = event.get("content", "") or event.get("data", {}).get("content", "")
@@ -175,6 +251,9 @@ class WorkerBusAdapter:
             })
 
         elif event_type == "tool_call":
+            log('DEBUG', 'pipeline.worker_bus',
+                f"[TOKEN_PIPELINE] WorkerBusAdapter.forward_agent_event: tool_call "
+                f"[worker={self.worker_name}] tool={event.get('tool_name', '?')}")
             self._publish("tool_call", {
                 "tool_name": event.get("tool_name", ""),
                 "arguments": event.get("arguments", {}),
@@ -182,6 +261,10 @@ class WorkerBusAdapter:
 
         elif event_type == "tool_result":
             result = event.get("result", "") or event.get("data", {}).get("result", "")
+            log('DEBUG', 'pipeline.worker_bus',
+                f"[TOKEN_PIPELINE] WorkerBusAdapter.forward_agent_event: tool_result "
+                f"[worker={self.worker_name}] tool={event.get('tool_name', '?')} "
+                f"success={event.get('success', True)}")
             self._publish("tool_result", {
                 "tool_name": event.get("tool_name", ""),
                 "success": event.get("success", True),
@@ -190,6 +273,9 @@ class WorkerBusAdapter:
             })
 
         elif event_type == "token_warning":
+            log('DEBUG', 'pipeline.worker_bus',
+                f"[TOKEN_PIPELINE] WorkerBusAdapter.forward_agent_event: token_warning "
+                f"[worker={self.worker_name}] token_count={event.get('token_count', 0)}")
             self._publish("token_warning", {
                 "message": (event.get("message", "") or event.get("data", {}).get("message", ""))[:500],
                 "warning_message": (event.get("warning_message", "") or event.get("data", {}).get("warning_message", ""))[:500],
@@ -200,6 +286,9 @@ class WorkerBusAdapter:
 
         elif event_type == "turn_warning":
             message = event.get("message", "") or event.get("data", {}).get("message", "")
+            log('DEBUG', 'pipeline.worker_bus',
+                f"[TOKEN_PIPELINE] WorkerBusAdapter.forward_agent_event: turn_warning "
+                f"[worker={self.worker_name}] turn_count={event.get('turn_count', 0)}")
             self._publish("turn_warning", {
                 "old_state": str(event.get("old_state", "")),
                 "new_state": str(event.get("new_state", "")),
@@ -208,6 +297,9 @@ class WorkerBusAdapter:
             })
 
         elif event_type == "time_warning":
+            log('DEBUG', 'pipeline.worker_bus',
+                f"[TOKEN_PIPELINE] WorkerBusAdapter.forward_agent_event: time_warning "
+                f"[worker={self.worker_name}] elapsed_seconds={event.get('elapsed_seconds', 0)}")
             self._publish("time_warning", {
                 "message": (event.get("message", "") or event.get("data", {}).get("message", ""))[:500],
                 "elapsed_seconds": event.get("elapsed_seconds", 0),
@@ -216,12 +308,20 @@ class WorkerBusAdapter:
         elif event_type == "turn":
             content = event.get("content", "") or event.get("data", {}).get("content", "")
             reasoning = event.get("reasoning_content", "") or event.get("data", {}).get("reasoning_content", "")
+            log('DEBUG', 'pipeline.worker_bus',
+                f"[TOKEN_PIPELINE] WorkerBusAdapter.forward_agent_event: assistant_message "
+                f"[worker={self.worker_name}] content_len={len(str(content))} "
+                f"reasoning={bool(reasoning)}")
             self._publish("assistant_message", {
                 "content": str(content)[:1000],
                 "reasoning_content": str(reasoning)[:2000] if reasoning else None,
             })
 
         elif event_type == "system_notification":
+            log('DEBUG', 'pipeline.worker_bus',
+                f"[TOKEN_PIPELINE] WorkerBusAdapter.forward_agent_event: system_notification "
+                f"[worker={self.worker_name}] "
+                f"type_detail={event.get('type_detail', event.get('notification_type', 'N/A'))}")
             self._publish("system_notification", {
                 "type": event.get("type_detail", event.get("notification_type", "general")),
                 "message": (event.get("message", "") or event.get("data", {}).get("message", ""))[:500],
@@ -229,26 +329,37 @@ class WorkerBusAdapter:
             })
 
         elif event_type == "user_message" or event_type == "user_interaction_requested":
+            # DIAG: user_message/user_interaction_requested deliberately NOT forwarded
+            # (these come from the old _publish_event path instead)
+            log('DEBUG', 'pipeline.worker_bus',
+                f"forward_agent_event -> SKIPPED {event_type} [worker={self.worker_name}]")
             pass
 
     def _publish(self, event_type: str, data: dict) -> None:
-        if self._event_bus is None or create_event is None or EventType is None:
+        log('DEBUG', 'pipeline.worker_bus',
+            f"_publish [worker={self.worker_name}]: event_type={event_type!r}, "
+            f"data_keys={list(data.keys())}, event_bus={'SET' if self._event_bus else 'NONE'}, "
+            f"EventType={'AVAILABLE' if EventType else 'UNAVAILABLE'}")
+        if self._event_bus is None or EventType is None:
+            log('DEBUG', 'pipeline.worker_bus',
+                f"_publish SKIPPED [worker={self.worker_name}]: "
+                f"event_bus={'None' if self._event_bus is None else 'set'}, "
+                f"EventType={'None' if EventType is None else 'set'}")
             return
         try:
-            if isinstance(event_type, str):
-                try:
-                    resolved_type = EventType(event_type)
-                except ValueError:
-                    return
-            event = create_event(
-                event_type=resolved_type,
+            from agent.events import BaseEvent, EventMetadata
+            evt = EventType(event_type) if isinstance(event_type, str) else event_type
+            event = BaseEvent(
+                type=evt,
+                metadata=EventMetadata(source="worker", session_id=""),
                 data={**data, "worker_name": self.worker_name},
-                source="worker",
-                session_id="",
             )
             self._event_bus.publish(event)
-        except Exception:
-            pass
+            log('DEBUG', 'pipeline.worker_bus',
+                f"_publish SUCCESS [worker={self.worker_name}]: event_type={event_type!r}, "
+                f"subscribers_count={len(self._event_bus._subscribers.get(evt, [])) if hasattr(self._event_bus, '_subscribers') else 'N/A'}")
+        except Exception as exc:
+            log('WARNING', 'tools.worker', f"WorkerBusAdapter._publish failed for {event_type}: {exc}")
 
 
 class WorkerSessionLifecycle:
@@ -521,6 +632,7 @@ class WorkerThread(threading.Thread):
         # Presenter components (created lazily in _run_tool_loop)
         self._state_bridge: Optional[Any] = None
         self._event_processor: Optional[Any] = None
+        self._worker_bus_adapter: Optional[Any] = None
 
         # Inter-thread communication
         self._input_queue: queue.Queue = queue.Queue()
@@ -762,16 +874,34 @@ class WorkerThread(threading.Thread):
         _start = time.monotonic()
 
         # Lazy-init presenter components for event processing
-        if self._state_bridge is None and StateBridge is not None and ExecutionState is not None:
-            self._state_bridge = StateBridge(config_path=None)
-            bus_adapter = WorkerBusAdapter(self._event_bus, self.worker_name)
-            self._worker_bus_adapter = bus_adapter
-            session_lifecycle = WorkerSessionLifecycle()
-            self._event_processor = EventProcessor(
-                state_bridge=self._state_bridge,
-                session_lifecycle=session_lifecycle,
-                gui_integration=bus_adapter,
-            )
+        if self._state_bridge is None:
+            try:
+                from agent.presenter.state_bridge import StateBridge
+            except ImportError:
+                log('WARNING', 'tools.worker', 'Failed to lazy-import StateBridge')
+                StateBridge = None
+            try:
+                from agent.presenter.event_processor import EventProcessor
+            except ImportError:
+                log('WARNING', 'tools.worker', 'Failed to lazy-import EventProcessor')
+                EventProcessor = None
+            if StateBridge is not None and ExecutionState is not None:
+                log('DEBUG', 'pipeline.worker',
+                    f"Lazy-init presenter [worker={self.worker_name}]: creating WorkerBusAdapter "
+                    f"with event_bus={'SET' if self._event_bus else 'NONE'}")
+                self._state_bridge = StateBridge(config_path=None)
+                bus_adapter = WorkerBusAdapter(self._event_bus, self.worker_name, state_bridge=self._state_bridge)
+                self._worker_bus_adapter = bus_adapter
+                session_lifecycle = WorkerSessionLifecycle()
+                self._event_processor = EventProcessor(
+                    state_bridge=self._state_bridge,
+                    session_lifecycle=session_lifecycle,
+                    gui_integration=bus_adapter,
+                )
+                log('DEBUG', 'pipeline.worker',
+                    f"Lazy-init complete [worker={self.worker_name}]: "
+                    f"worker_bus_adapter={'SET' if self._worker_bus_adapter else 'NONE'}, "
+                    f"event_processor={'SET' if self._event_processor else 'NONE'}")
 
         # Log the user query as a user_message event
         self._publish_event("user_message", {"query": query})
@@ -813,12 +943,23 @@ class WorkerThread(threading.Thread):
                 # Forward event to the per-worker EventBus via the bus adapter
                 # (replaces the old manual self._publish_event() calls for
                 #  tool_call, tool_result, token_warning, turn_warning,
-                #  time_warning, system_notification, turn)
                 if self._worker_bus_adapter is not None:
                     try:
                         self._worker_bus_adapter.forward_agent_event(event)
                     except Exception as exc:
                         log('WARNING', 'tools.worker', f"forward_agent_event failed for {event_type}: {exc}")
+
+                # Emit state sync event after every event so the frontend
+                # gets real-time context/token/warning updates without polling.
+                # [PIPELINE:HOPS] Emit state sync after every event
+                if self._worker_bus_adapter is not None:
+                    log('DEBUG', 'pipeline.hops',
+                        f"[PIPELINE:HOPS] Calling emit_state_sync after event_type={event_type}: "
+                        f"worker={self.worker_name}")
+                    try:
+                        self._worker_bus_adapter.emit_state_sync()
+                    except Exception as exc:
+                        log('WARNING', 'tools.worker', f"emit_state_sync failed for {event_type}: {exc}")
 
                 # Capture final response content and reasoning
                 if event_type == "agent_responded":
@@ -850,9 +991,15 @@ class WorkerThread(threading.Thread):
                     final_content = json.dumps({"error": error_msg})
                     break
 
-                # Cache the agent's authoritative post-prune token count
+                # [PIPELINE:HOPS] Cache the agent's authoritative post-prune token count
                 # and detect context summarization inline (token drop threshold)
                 if event_type == "token_update":
+                    log('DEBUG', 'pipeline.hops',
+                        f"[PIPELINE:HOPS] Received token_update event: "
+                        f"worker={self.worker_name} "
+                        f"context_length={event.get('context_length', '?')} "
+                        f"total_input={event.get('total_input', '?')} "
+                        f"total_output={event.get('total_output', '?')}")
                     context_length = event.get("context_length")
                     if context_length is not None:
                         prev_tokens = self._cached_context_tokens or 0

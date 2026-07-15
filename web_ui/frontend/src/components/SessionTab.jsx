@@ -367,14 +367,30 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         break
 
       case 'tokens_updated':
+        console.log('[TOKEN_PIPELINE] SessionTab: tokens_updated arrived', { type: msg.type, input: msg.input, output: msg.output, source: msg.source })
         update({
           tokensIn: msg.input ?? 0,
           tokensOut: msg.output ?? 0,
         })
+        // Forward to worker panel if this is a worker-sourced token update
+        // IMPORTANT: Use currentSessionIdRef to avoid stale closure (connectSessionWs has [] deps)
+        if (msg.source === 'worker') {
+          const effectiveSessionId = currentSessionIdRef.current || sessionId
+          console.log('[TOKEN_PIPELINE] SessionTab: forwarding tokens_updated to worker panel', { sessionId: effectiveSessionId })
+          onWorkerEventRef.current?.(effectiveSessionId, msg)
+        }
         break
 
       case 'context_updated':
+        console.log('[TOKEN_PIPELINE] SessionTab: context_updated arrived', { context_length: msg.context_length, source: msg.source, worker_name: msg.worker_name })
         update({ contextLength: msg.context_length ?? 0 })
+        // Forward to worker panel if this is a worker-sourced context update
+        // IMPORTANT: Use currentSessionIdRef to avoid stale closure (connectSessionWs has [] deps)
+        if (msg.source === 'worker') {
+          const effectiveSessionId = currentSessionIdRef.current || sessionId
+          console.log('[TOKEN_PIPELINE] SessionTab: forwarding context_updated to worker panel', { sessionId: effectiveSessionId, worker_name: msg.worker_name })
+          onWorkerEventRef.current?.(effectiveSessionId, msg)
+        }
         break
 
       case 'conversation_changed':
@@ -525,6 +541,19 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
       case 'worker:system_notification':
       case 'worker:user_message':
       case 'worker:worker_message':
+      case 'worker:tokens_updated':
+      case 'worker:context_updated':
+      case 'worker:worker_state_sync':
+        console.log('[TOKEN_PIPELINE] SessionTab: worker_state_sync received', msg);
+        // For worker:tokens_updated, also update the token counter display
+        // (belt-and-suspenders — the bridge should flatten to 'tokens_updated',
+        //  but if it doesn't, this ensures the counter still updates).
+        if (msg.type === 'worker:tokens_updated') {
+          update({
+            tokensIn: msg.data?.total_input ?? 0,
+            tokensOut: msg.data?.total_output ?? 0,
+          })
+        }
         // DIAG: log every worker event received from WebSocket
         console.warn('[DIAG SessionTab] Worker event received from WebSocket:', {
           msgType: msg.type,

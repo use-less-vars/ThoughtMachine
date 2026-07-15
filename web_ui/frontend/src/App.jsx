@@ -430,7 +430,12 @@ export default function App() {
 
   // ── Handle worker lifecycle events from SessionTab WS ────────────────
   const handleWorkerEvent = useCallback((sessionId, event) => {
-    if (!sessionId) return
+    console.log('[PIPELINE:HOPS] App.handleWorkerEvent: called', { type: event.type, sessionId, context_length: event.context_length, source: event.source })
+    console.log('[TOKEN_PIPELINE] App.handleWorkerEvent: called', { type: event.type, sessionId, context_length: event.context_length, source: event.source })
+    if (!sessionId) {
+      console.warn('[TOKEN_PIPELINE] App.handleWorkerEvent: DROPPED — sessionId is falsy')
+      return
+    }
     setWorkerEvents(prev => {
       const events = prev[sessionId] || []
       // Use canonical dedup key: normalize worker_message/assistant_message/final_response
@@ -451,12 +456,17 @@ export default function App() {
           eRawType === 'assistant_message'
         ) ? 'final_response' : eRawType
         return (eCanonicalType + '|' + (e.timestamp || '')) === key
-      })) return prev  // dedup
+      })) {
+        console.log('[TOKEN_PIPELINE] App.handleWorkerEvent: DEDUPED event', { type: event.type, key })
+        return prev  // dedup
+      }
       // Cap at 500 events per session (trim oldest)
       const updated = [...events, event]
       if (updated.length > 500) {
         return { ...prev, [sessionId]: updated.slice(-500) }
       }
+      console.log('[PIPELINE:HOPS] App.handleWorkerEvent: stored event', { type: event.type, sessionId, count: updated.length })
+      console.log('[TOKEN_PIPELINE] App.handleWorkerEvent: stored event', { type: event.type, sessionId, count: updated.length })
       return { ...prev, [sessionId]: updated }
     })
   }, [])

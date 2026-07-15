@@ -318,8 +318,16 @@ class WebAgentBridge:
                 if not self._event_callbacks:
                     return
                 data = event.data or {}
+                log('DEBUG', 'pipeline.bridge',
+                    f"[TOKEN_PIPELINE] bridge global bus handler: type={event.type.value!r}, "
+                    f"worker_name={data.get('worker_name', '?')}, "
+                    f"session_id={data.get('session_id', '?')}, "
+                    f"bridge_session_id={self._session_id}")
                 # Only forward events for this bridge's session
                 if data.get('session_id') and data['session_id'] != self._session_id:
+                    log('DEBUG', 'pipeline.bridge',
+                        f"Global bus handler: SKIPPING event for different session "
+                        f"(event={data.get('session_id')}, bridge={self._session_id})")
                     return
                 event_dict = {
                     'type': f'worker:{event.type.value}',
@@ -358,12 +366,20 @@ class WebAgentBridge:
         log('INFO', 'server.bridge', 'Subscribed to worker lifecycle events')
 
     def _on_worker_token_warning(self, event: TokenWarningEvent) -> None:
-        """Forward worker token warnings to the frontend."""
+        """Forward non-worker token warnings to the frontend as system notifications.
+
+        Worker-sourced token warnings (source='worker') are already forwarded
+        via the per-worker EventBus subscription (Path A in _make_bus_handler)
+        as 'worker:token_warning' events.  This global bus handler (Path B)
+        only forwards token warnings from the main agent (non-worker context)
+        so they render as 'worker:system_notification'.  Skipping worker-sourced
+        events eliminates the duplicate bubble problem.
+        """
         if not self._event_callbacks:
             return
         source = event.metadata.source if event.metadata else ""
-        if not source.startswith("worker:"):
-            return  # only handle worker-sourced warnings
+        if source == "worker":
+            return  # worker-sourced → already forwarded via per-worker bus
         data = event.data or {}
         # Only forward events for this bridge's session
         if data.get('session_id') and data['session_id'] != self._session_id:
@@ -442,7 +458,17 @@ class WebAgentBridge:
         # Only handle events for this bridge's session
         worker_name = data.get('worker_name', '')
         session_id = data.get('session_id', self._session_id or '')
+        log('DEBUG', 'pipeline.bridge',
+            f"[TOKEN_PIPELINE] bridge._on_worker_spawned: worker_name={worker_name!r}, "
+            f"event_session_id={data.get('session_id', 'N/A')!r}, "
+            f"bridge_session_id={self._session_id!r}, "
+            f"resolved_session_id={session_id!r}, "
+            f"n_callbacks={len(self._event_callbacks)}, "
+            f"WORKER_BUS_AVAILABLE={WORKER_BUS_AVAILABLE}, "
+            f"get_worker_event_bus={'SET' if get_worker_event_bus is not None else 'NONE'}")
         if data.get('session_id') and data['session_id'] != self._session_id:
+            log('DEBUG', 'pipeline.bridge',
+                f"_on_worker_spawned: SKIPPING (session mismatch)")
             return
 
         # Subscribe to per-worker EventBus for detailed events
@@ -451,6 +477,9 @@ class WebAgentBridge:
         if worker_name and WORKER_BUS_AVAILABLE and get_worker_event_bus is not None:
             worker_bus = get_worker_event_bus(session_id, worker_name)
             if worker_bus is not None:
+                log('DEBUG', 'pipeline.bridge',
+                    f"_on_worker_spawned: found per-worker bus for {worker_name}, "
+                    f"subscribing to detailed events")
                 self._subscribe_to_worker_bus(worker_name, worker_bus)
             else:
                 log('WARNING', 'server.bridge',
@@ -458,9 +487,17 @@ class WebAgentBridge:
                     f'— detailed events (tool_call, tool_result, assistant_message) '
                     f'will NOT be forwarded to the frontend. '
                     f'This may be a race condition: worker bus registered before bridge subscribes.')
+                # DIAG: additional diagnostics for missing bus
+                log('WARNING', 'pipeline.bridge',
+                    f"_on_worker_spawned: worker_bus is None for {worker_name} "
+                    f"(session_id={session_id!r}). Check that register_worker_event_bus() "
+                    f"was called BEFORE the WORKER_SPAWNED event was published.")
 
         # Forward the event to frontend callbacks (if any)
         if not self._event_callbacks:
+            log('DEBUG', 'pipeline.bridge',
+                f"_on_worker_spawned: no event_callbacks, skipping frontend forward "
+                f"(worker_bus subscription still happened if bus was found)")
             return
         event_dict = {
             'type': f'worker:{event.type.value}',
@@ -481,34 +518,90 @@ class WebAgentBridge:
         events (tool_call, tool_result, token_warning, worker_message, etc.).
         """
         if not EVENT_SYSTEM_AVAILABLE or EventType is None:
+            log('DEBUG', 'pipeline.bridge',
+                f"_subscribe_to_worker_bus: cannot subscribe for {worker_name}, "
+                f"EVENT_SYSTEM_AVAILABLE={EVENT_SYSTEM_AVAILABLE}, EventType={'SET' if EventType else 'NONE'}")
             return
+
+        # DIAG: Log what event types we plan to subscribe to
+        subscribed_types = ['tool_call', 'tool_result',
+                            'worker_message', 'assistant_message',
+                            'tokens_updated', 'context_updated',
+                            'token_warning', 'turn_warning', 'time_warning',
+                            'user_message', 'system_notification',
+                            'worker_state_sync']
+        log('DEBUG', 'pipeline.bridge',
+            f"_subscribe_to_worker_bus [worker={worker_name}]: "
+            f"subscribing to {len(subscribed_types)} event types: {subscribed_types}")
 
         subs = {}
 
         def _make_bus_handler(original_type: str):
             def _handler(event: Any) -> None:
                 if not self._event_callbacks:
-                    log('WARNING', 'server.bridge',
-                        f'[DIAG] Per-worker bus handler for {worker_name}/{original_type}: '
-                        f'NO event_callbacks registered, dropping event')
+                    # DIAG: Change from WARNING to DEBUG - transient condition during startup
+                    log('DEBUG', 'pipeline.bridge',
+                        f"Per-worker bus handler for {worker_name}/{original_type}: "
+                        f"NO event_callbacks registered, dropping event")
                     return
                 data = event.data or {}
-                event_dict = {
-                    'type': f'worker:{original_type}',
-                    'worker_name': data.get('worker_name', worker_name),
-                    'timestamp': (
-                        event.metadata.timestamp.isoformat()
-                        if hasattr(event, 'metadata') and event.metadata
-                        else datetime.datetime.now().isoformat()
-                    ),
-                    'data': data,
-                }
-                log('DEBUG', 'server.bridge',
-                    f'[DIAG] Per-worker bus handler for {worker_name}/{original_type}: '
-                    f'forwarding event_dict type={event_dict.get("type")} '
-                    f'worker_name={event_dict.get("worker_name")} '
-                    f'event_keys={list(data.keys())} '
-                    f'n_callbacks={len(self._event_callbacks)}')
+                # [PIPELINE:HOPS] Per-worker bus handler entry
+                log('DEBUG', 'pipeline.hops',
+                    f"[PIPELINE:HOPS] bridge._make_bus_handler entry [worker={worker_name}]: "
+                    f"original_type={original_type!r}, "
+                    f"data_keys={list(data.keys())}, "
+                    f"n_callbacks={len(self._event_callbacks)}")
+                # Special handling for tokens_updated - flatten to top-level
+                # so the frontend's existing 'tokens_updated' handler picks it up.
+                if original_type == 'tokens_updated':
+                    event_dict = {
+                        'type': 'worker:tokens_updated',
+                        'input': data.get('total_input', 0),
+                        'output': data.get('total_output', 0),
+                        'source': 'worker',
+                        'worker_name': data.get('worker_name', worker_name),
+                    }
+                elif original_type == 'context_updated':
+                    log('DEBUG', 'pipeline.hops',
+                        f"[PIPELINE:HOPS] bridge forwarding context_updated: "
+                        f"worker={worker_name} "
+                        f"context_length={data.get('context_length', '?')}")
+                    event_dict = {
+                        'type': 'worker:context_updated',
+                        'context_length': data.get('context_length', 0),
+                        'source': 'worker',
+                        'worker_name': data.get('worker_name', worker_name),
+                    }
+                else:
+                    event_dict = {
+                        'type': f'worker:{original_type}',
+                        'worker_name': data.get('worker_name', worker_name),
+                        'timestamp': (
+                            event.metadata.timestamp.isoformat()
+                            if hasattr(event, 'metadata') and event.metadata
+                            else datetime.datetime.now().isoformat()
+                        ),
+                        'data': data,
+                    }
+                # [TOKEN_PIPELINE] bridge log worker_state_sync payload before sending
+                if original_type == 'worker_state_sync':
+                    log('DEBUG', 'pipeline.bridge',
+                        f"[TOKEN_PIPELINE] bridge sending worker_state_sync: "
+                        f"type={event_dict.get('type')} "
+                        f"worker_name={data.get('worker_name', worker_name)} "
+                        f"context_length={data.get('context_length', '?')} "
+                        f"token_state={data.get('token_state', '?')}")
+                log('DEBUG', 'pipeline.bridge',
+                    f"[TOKEN_PIPELINE] bridge per-worker bus handler [{worker_name}/{original_type}]: "
+                    f"forwarding type={event_dict.get('type')}, "
+                    f"worker={event_dict.get('worker_name', 'N/A')}, "
+                    f"data_keys={list(data.keys())}, "
+                    f"n_callbacks={len(self._event_callbacks)}, "
+                    f"bridge_session_id={self._session_id}")
+                # [PIPELINE:HOPS] Dispatching event to WebSocket callbacks
+                log('DEBUG', 'pipeline.hops',
+                    f"[PIPELINE:HOPS] bridge dispatching to {len(self._event_callbacks)} callbacks: "
+                    f"type={event_dict.get('type')} worker={event_dict.get('worker_name', 'N/A')}")
                 for cb in list(self._event_callbacks.values()):
                     try:
                         cb(event_dict)
@@ -523,15 +616,20 @@ class WebAgentBridge:
         # workers publish warnings to their own bus, not the global bus.
         # The global bus handler (_on_worker_token_warning) only catches
         # warnings from the main agent, not worker sub-agents.
-        for evt_type in ['tool_call', 'tool_result',
-                         'worker_message', 'assistant_message',
-                         'token_warning', 'turn_warning', 'time_warning',
-                         'user_message', 'system_notification']:
+        # NOTE: tokens_updated and context_updated ARE now subscribed to enable
+        # real-time token count updates in the Web UI for worker sub-agents.
+        # The following event types remain intentionally NOT subscribed:
+        #   status_message, error_occurred, config_changed, conversation_changed
+        # These are emitted by WorkerBusAdapter.emit_*() methods but have NO frontend subscriber.
+        # If you need them forwarded, add the event type string to the list below.
+        for evt_type in subscribed_types:
             try:
                 evt_enum = EventType(evt_type)
                 handler_fn = _make_bus_handler(evt_type)
                 worker_bus.subscribe(evt_enum, handler_fn)
                 subs[evt_enum] = (evt_enum, handler_fn)
+                log('DEBUG', 'pipeline.bridge',
+                    f"Subscribed to {evt_type!r} on per-worker bus for {worker_name}")
             except (ValueError, Exception) as exc:
                 log('DEBUG', 'server.bridge',
                     f'Could not subscribe to {evt_type} for {worker_name}: {exc}')
@@ -539,6 +637,15 @@ class WebAgentBridge:
         self._worker_bus_subs[worker_name] = subs
         log('INFO', 'server.bridge',
             f'Subscribed to per-worker bus for {worker_name} ({len(subs)} event types)')
+        log('DEBUG', 'pipeline.bridge',
+            f"_subscribe_to_worker_bus complete [worker={worker_name}]: "
+            f"{len(subs)}/{len(subscribed_types)} subscriptions successful")
+        if len(subs) < len(subscribed_types):
+            missing = [t for t in subscribed_types
+                       if EventType(t) not in subs]
+            log('WARNING', 'pipeline.bridge',
+                f"_subscribe_to_worker_bus [worker={worker_name}]: "
+                f"FAILED to subscribe to: {missing}")
 
     def _unsubscribe_worker_bus(self, worker_name: str) -> None:
         """Unsubscribe all per-worker bus subscriptions for a worker."""
@@ -579,10 +686,22 @@ class WebAgentBridge:
     def _forward_worker_event(self, event: Any) -> None:
         """Forward a worker lifecycle event to frontend (shared handler logic)."""
         if not self._event_callbacks:
+            log('DEBUG', 'pipeline.bridge',
+                f"_forward_worker_event: no callbacks, dropping "
+                f"type={event.type.value if hasattr(event, 'type') else '?'}")
             return
         data = event.data or {}
+        log('DEBUG', 'pipeline.bridge',
+            f"[TOKEN_PIPELINE] bridge._forward_worker_event: type={event.type.value if hasattr(event, 'type') else '?'}, "
+            f"worker_name={data.get('worker_name', '?')}, "
+            f"event_session_id={data.get('session_id', '?')}, "
+            f"bridge_session_id={self._session_id}, "
+            f"n_callbacks={len(self._event_callbacks)}")
         # Only forward events for this bridge's session
         if data.get('session_id') and data['session_id'] != self._session_id:
+            log('DEBUG', 'pipeline.bridge',
+                f"_forward_worker_event: SKIPPING event for different session "
+                f"(event={data.get('session_id')}, bridge={self._session_id})")
             return
         event_dict = {
             'type': f'worker:{event.type.value}',
@@ -1728,18 +1847,27 @@ class WebAgentBridge:
         elif event_type == "token_update":
             tokens_in = raw_event.get("total_input", 0)
             tokens_out = raw_event.get("total_output", 0)
+            log('DEBUG', 'pipeline.hops',
+                f"[PIPELINE:HOPS] bridge processing token_update from main agent: "
+                f"tokens_in={tokens_in} tokens_out={tokens_out} "
+                f"context_length={raw_event.get('context_length', '?')}")
             self._emit({
                 "type": "tokens_updated",
                 "input": tokens_in,
                 "output": tokens_out,
+                "agent_type": "main",
             })
             ctx = raw_event.get("context_length", 0)
             if ctx is not None:
                 if self._session is not None:
                     self._session.context_length = ctx
+                log('DEBUG', 'pipeline.hops',
+                    f"[PIPELINE:HOPS] bridge emitting context_updated for main agent: "
+                    f"context_length={ctx}")
                 self._emit({
                     "type": "context_updated",
                     "context_length": ctx,
+                    "agent_type": "main",
                 })
 
         elif event_type in ("token_warning", "turn_warning"):

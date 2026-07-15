@@ -1074,6 +1074,56 @@ body {
   padding: 1rem;
 }
 
+/* ── Token state warning banner ──────────────────────────────────────── */
+.worker-output-warning-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 1rem;
+  font-size: 0.82rem;
+  font-family: var(--font-sans);
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.worker-output-warning-banner-warning {
+  background: rgba(249, 226, 175, 0.12);
+  color: #f9e2af;
+  border-bottom-color: rgba(249, 226, 175, 0.3);
+}
+
+.worker-output-warning-banner-critical {
+  background: rgba(243, 139, 168, 0.12);
+  color: #f38ba8;
+  border-bottom-color: rgba(243, 139, 168, 0.3);
+}
+
+.worker-output-warning-banner-icon {
+  font-size: 1rem;
+  flex-shrink: 0;
+}
+
+.worker-output-warning-banner-text {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.worker-output-warning-banner-text strong {
+  font-weight: 700;
+}
+
+.worker-output-warning-banner-ctx {
+  font-size: 0.78rem;
+  font-family: var(--font-mono);
+  opacity: 0.8;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+
+
 /* ──────────────────────────────────────────────────────────────────────────
    Scrollbar (Webkit)
    ────────────────────────────────────────────────────────────────────────── */

@@ -51,6 +51,7 @@ class AgentState:
     restrictions_pending: bool = False
     restrictions_active: bool = False
     last_token_warning_state: TokenState = TokenState.LOW
+    _token_warning_has_fired: bool = False
     last_turn_warning_state: TurnState = TurnState.LOW
     last_time_warning_state: TimeState = TimeState.LOW
     last_token_warning: Optional[str] = None
@@ -96,30 +97,60 @@ class AgentState:
         self.token_state = new_state
         events = []
         state_order = {TokenState.LOW: 0, TokenState.WARNING: 1, TokenState.CRITICAL: 2}
-        if state_order[new_state] > state_order[old_state] and self.last_token_warning_state != new_state and (new_state in (TokenState.WARNING, TokenState.CRITICAL)):
-            log('DEBUG', 'pipeline.warning', f'WARNING DETECTED: transitioning {old_state.value} -> {new_state.value} at {total_tokens} tokens')
-            if new_state == TokenState.WARNING:
-                formatted = self._format_tokens(total_tokens)
-                critical_formatted = self._format_tokens(self.config.token_monitor_critical_threshold)
-                warning = (
-                    f'**Token usage warning: Conversation is nearing context window limits** ({formatted} tokens). '
-                    f'Critical threshold is at {critical_formatted} tokens. '
-                    f'This is not a problem: simply use SummarizeTool to summarize the session and keep a number of recent turns. '
-                    f'The summary will free up the context window and you can continue working smoothly. '
-                    f'Tip: For long-running tasks, store intermediate results and subtask status in KnowledgeBase '
-                    f'to avoid losing context when summarizing.'
-                )
-            else:
-                formatted = self._format_tokens(total_tokens)
-                warning = f'Token usage is at the critical threshold ({formatted} tokens). Please summarize to reduce context size or complete work. Only Respond and SummarizeTool are available.'
-            self.last_token_warning = warning
-            self.last_token_warning_count = total_tokens
-            self.last_token_warning_state = new_state
-            if self.logger:
-                self.logger.log_token_warning(old_state.value, new_state.value, total_tokens, warning)
-            log('DEBUG', 'pipeline.warning', f'CREATED token_warning event: old={old_state.value}, new={new_state.value}, count={total_tokens}')
-            token_warning_data = {'old_state': old_state.value, 'new_state': new_state.value, 'token_count': total_tokens, 'warning_message': warning, 'state': new_state.value}
-            events.append(self._create_event('token_warning', token_warning_data))
+        
+        # ── Upward transitions: fire warning/critical events ──
+        if state_order[new_state] > state_order[old_state] and (new_state in (TokenState.WARNING, TokenState.CRITICAL)):
+            should_fire = False
+            if new_state == TokenState.CRITICAL:
+                # CRITICAL always fires regardless of previous WARNING,
+                # but not if we already fired a CRITICAL event.
+                should_fire = (self.last_token_warning_state != TokenState.CRITICAL)
+            elif new_state == TokenState.WARNING:
+                # WARNING fires only if no warning/critical has fired yet in this cycle
+                should_fire = not self._token_warning_has_fired
+            
+            if should_fire:
+                log('DEBUG', 'pipeline.warning', f'WARNING DETECTED: transitioning {old_state.value} -> {new_state.value} at {total_tokens} tokens')
+                if new_state == TokenState.WARNING:
+                    formatted = self._format_tokens(total_tokens)
+                    critical_formatted = self._format_tokens(self.config.token_monitor_critical_threshold)
+                    warning = (
+                        f'**Token usage warning: Conversation is nearing context window limits** ({formatted} tokens). '
+                        f'Critical threshold is at {critical_formatted} tokens. '
+                        f'This is not a problem: simply use SummarizeTool to summarize the session and keep a number of recent turns. '
+                        f'The summary will free up the context window and you can continue working smoothly. '
+                        f'Tip: For long-running tasks, store intermediate results and subtask status in KnowledgeBase '
+                        f'to avoid losing context when summarizing.'
+                    )
+                else:
+                    formatted = self._format_tokens(total_tokens)
+                    warning = f'Token usage is at the critical threshold ({formatted} tokens). Please summarize to reduce context size or complete work. Only Respond and SummarizeTool are available.'
+                self.last_token_warning = warning
+                self.last_token_warning_count = total_tokens
+                self.last_token_warning_state = new_state
+                self._token_warning_has_fired = True
+                if self.logger:
+                    self.logger.log_token_warning(old_state.value, new_state.value, total_tokens, warning)
+                log('DEBUG', 'pipeline.warning', f'CREATED token_warning event: old={old_state.value}, new={new_state.value}, count={total_tokens}')
+                log('DEBUG', 'pipeline.hops', f'[PIPELINE:HOPS] CREATED token_warning event: old={old_state.value}, new={new_state.value}, count={total_tokens}')
+                token_warning_data = {'old_state': old_state.value, 'new_state': new_state.value, 'token_count': total_tokens, 'warning_message': warning, 'state': new_state.value}
+                events.append(self._create_event('token_warning', token_warning_data))
+
+        # ── Downward transition: recovery event when tokens drop back to safe level ──
+        if new_state == TokenState.LOW and old_state in (TokenState.WARNING, TokenState.CRITICAL) and self._token_warning_has_fired:
+            recovery_message = 'Token usage has returned to safe levels after summarization.'
+            log('DEBUG', 'pipeline.warning', f'TOKEN RECOVERY: transitioning {old_state.value} -> {new_state.value} at {total_tokens} tokens')
+            log('DEBUG', 'pipeline.hops', f'[PIPELINE:HOPS] CREATED token_recovery event: old={old_state.value}, new={new_state.value}, count={total_tokens}')
+            self.last_token_warning_state = TokenState.LOW
+            self._token_warning_has_fired = False
+            token_recovery_data = {
+                'old_state': old_state.value,
+                'new_state': new_state.value,
+                'token_count': total_tokens,
+                'recovery_message': recovery_message,
+            }
+            events.append(self._create_event('token_recovery', token_recovery_data))
+
         # Immediate restriction activation: no grace turn
         if self.token_state == TokenState.CRITICAL:
             self.restrictions_active = True
@@ -130,7 +161,7 @@ class AgentState:
             self.restrictions_active = False
             self.restriction_reason = None
 
-        if new_state == TokenState.LOW:
+        if new_state == TokenState.LOW and not self._token_warning_has_fired:
             self.last_token_warning_state = TokenState.LOW
         return events
 
@@ -293,6 +324,7 @@ class AgentState:
         self.token_state = TokenState.LOW
         self.current_conversation_tokens = 0
         self.last_token_warning_state = TokenState.LOW
+        self._token_warning_has_fired = False
         self.last_token_warning = None
         self.last_token_warning_count = 0
         self.restrictions_pending = False

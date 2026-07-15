@@ -215,19 +215,17 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
       const tokensUpdate = {}
       if (e.data?.current_context_tokens !== undefined) tokensUpdate.current_context_tokens = e.data.current_context_tokens
       if (e.data?.max_context_tokens !== undefined) tokensUpdate.max_context_tokens = e.data.max_context_tokens
-      // Handle flat tokens_updated from bridge (input/output at top level, no data wrapper)
-      if (e.type === 'tokens_updated' && e.input !== undefined) {
-        console.log('[TRACE:tokens_updated] processing in WorkerOutputPanel', JSON.stringify({input: e.input, output: e.output}))
-        tokensUpdate.current_context_tokens = e.input
-      }
-      // Handle flat context_updated from bridge (context_length at top level)
-      if (e.type === 'context_updated' && e.context_length !== undefined) {
-        console.log('[TRACE:context_updated] processing in WorkerOutputPanel', JSON.stringify({context_length: e.context_length, worker_name: e.worker_name, source: e.source, timestamp: e.timestamp, prevCtx: tokensUpdate.current_context_tokens}))
-        tokensUpdate.current_context_tokens = e.context_length
-      }
+      // Note: tokens_updated and context_updated are intentionally NOT handled here.
+      // worker_state_sync is now the single source of truth for token display.
+      // The backend's emit_state_sync() reads from StateBridge and publishes
+      // the canonical context_length, token_state, warning_message, and critical_threshold.
       // Handle worker_state_sync from per-worker bus (real-time context/warning sync)
       if (eventType === 'worker_state_sync' && e.data) {
-        console.log('[STATE_SYNC_TRACE] WorkerOutputPanel updating ctx display', {
+        console.log('[PIPELINE:HOPS] WorkerOutputPanel: worker_state_sync received', {
+          context_length: e.data.context_length,
+          token_state: e.data.token_state,
+        })
+        console.log('[TOKEN_PIPELINE] WorkerOutputPanel: worker_state_sync received', {
           context_length: e.data.context_length,
           token_state: e.data.token_state,
           warning_message: e.data.warning_message,
@@ -269,6 +267,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
       }
       // Always apply token updates to workerInfo (any event type may carry them)
       if (Object.keys(tokensUpdate).length > 0) {
+        console.log('[PIPELINE:HOPS] WorkerOutputPanel: applying tokensUpdate to workerInfo', tokensUpdate)
         setWorkerInfo(prev => {
           if (!prev) return { ...tokensUpdate };
           return { ...prev, ...tokensUpdate };
@@ -276,24 +275,28 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
       }
 
       if (eventType === 'worker_spawned' && (status === 'ready' || status === 'busy')) {
+        console.log('[PIPELINE:HOPS] WorkerOutputPanel: setWorkerInfo worker_spawned', { status })
         setWorkerInfo(prev => {
           const update = { runtime_status: status };
           if (!prev) return update;
           return { ...prev, ...update };
         })
       } else if (eventType === 'worker_status' && status) {
+        console.log('[PIPELINE:HOPS] WorkerOutputPanel: setWorkerInfo worker_status', { status })
         setWorkerInfo(prev => {
           const update = { runtime_status: status, current_task: e.data?.current_task || prev?.current_task };
           if (!prev) return update;
           return { ...prev, ...update };
         })
       } else if (eventType === 'worker_completed') {
+        console.log('[PIPELINE:HOPS] WorkerOutputPanel: setWorkerInfo worker_completed')
         setWorkerInfo(prev => {
           const update = { runtime_status: 'ready' };
           if (!prev) return update;
           return { ...prev, ...update };
         })
       } else if (eventType === 'worker_error') {
+        console.log('[PIPELINE:HOPS] WorkerOutputPanel: setWorkerInfo worker_error', { error: e.data?.error })
         setWorkerInfo(prev => {
           const update = { runtime_status: 'error', error: e.data?.error || '' };
           if (!prev) return update;
@@ -388,28 +391,26 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
             break
           }
           case 'tokens_updated':
-            console.log('[TRACE:tokens_updated] mapping to display event', JSON.stringify({input: e.input}))
+            console.log('[TOKEN_PIPELINE] WorkerOutputPanel: tokens_updated mapped to display event', { input: e.input })
             return {
               event: 'tokens_updated',
               timestamp: e.timestamp,
               request: {},
               response: {},
               current_context_tokens: e.input ?? 0,
-              max_context_tokens: 0,
             }
           case 'context_updated':
-            console.log('[TRACE:context_updated] mapping to display event', JSON.stringify({context_length: e.context_length, worker_name: e.worker_name, timestamp: e.timestamp}))
+            console.log('[TOKEN_PIPELINE] WorkerOutputPanel: context_updated mapped to display event', { context_length: e.context_length, worker_name: e.worker_name })
             return {
               event: 'context_updated',
               timestamp: e.timestamp,
               request: {},
               response: {},
               current_context_tokens: e.context_length ?? 0,
-              max_context_tokens: 0,
             }
 
           case 'worker_state_sync':
-            console.log('[STATE_SYNC_TRACE] WorkerOutputPanel mapping worker_state_sync to display event', {
+            console.log('[TOKEN_PIPELINE] WorkerOutputPanel: worker_state_sync mapped to display event', {
               context_length: e.data?.context_length,
               token_state: e.data?.token_state,
               warning_message: e.data?.warning_message,
@@ -627,8 +628,6 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
     );
   }
 
-  const latestEvent = events.length > 0 ? events[events.length - 1] : null;
-
   // ── Render ────────────────────────────────────────────────────────────
 
   // (finalContentSet removed — was unused dead code)
@@ -663,7 +662,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
             Worker: {workerName}
           </span>
           <span className="worker-output-header-ctx">
-            ctx: {(workerInfo || events.length > 0) ? `${formatTokens(latestEvent?.current_context_tokens ?? workerInfo?.current_context_tokens ?? 0)} / ${formatTokens(latestEvent?.max_context_tokens ?? workerInfo?.max_context_tokens ?? 0)}` : '—'}
+            ctx: {workerInfo && workerInfo.max_context_tokens > 0 ? `${formatTokens(workerInfo.current_context_tokens ?? 0)} / ${formatTokens(workerInfo.max_context_tokens)}` : '—'}
           </span>
           <div style={{ flex: 1 }} />
           {workerInfo?.current_task && (
@@ -683,6 +682,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
         </div>
 
         {/* ── Warning banner (token state WARNING/CRITICAL) ───────────── */}
+        {console.log('[PIPELINE:HOPS] WorkerOutputPanel: warning banner render', { token_state: workerInfo?.token_state, current_context_tokens: workerInfo?.current_context_tokens })}
         {(workerInfo?.token_state === 'WARNING' || workerInfo?.token_state === 'CRITICAL') && (
           <div className={'worker-output-warning-banner ' + (workerInfo.token_state === 'CRITICAL' ? 'worker-output-warning-banner-critical' : 'worker-output-warning-banner-warning')}>
             <span className="worker-output-warning-banner-icon">
