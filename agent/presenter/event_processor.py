@@ -109,14 +109,7 @@ class EventProcessor:
                 self.gui_integration.emit_context_updated(context_length)
 
     def _process_token_update_event(self, event: Dict[str, Any]) -> None:
-        elif event_type == 'token_warning':
-            self._process_token_warning_event(event)
-        elif event_type == 'turn_warning':
-            self._process_turn_warning_event(event)
-        elif event_type == 'context_cleared':
-            self._process_context_cleared_event(event)
-        elif event_type == 'token_recovery':
-            self._process_token_recovery_event(event)
+        """Process token update event — update token counts and context length."""
         log('DEBUG', 'presenter.event_processor', f'_process_token_update_event: context_length={event.get("context_length")}')
         log('DEBUG', 'pipeline.token_update', f"received: context_length={event.get('context_length')}, total_input={event.get('total_input')}, total_output={event.get('total_output')}")
         input_tokens, output_tokens = self._extract_token_counts(event)
@@ -170,39 +163,24 @@ class EventProcessor:
         log('DEBUG', 'presenter.event_processor', f'_process_terminal_event: type={event_type}, turn={event.get("turn")}')
         if event_type == 'agent_responded':
             self.session_lifecycle.state = ExecutionState.READY
-    def _process_context_cleared_event(self, event: Dict[str, Any]) -> None:
-        """Process context cleared event after summarization."""
-        log('DEBUG', 'presenter.event_processor', f'_process_context_cleared_event: tokens={event.get("token_count", 0)}')
         if self.gui_integration:
-            self.gui_integration.emit_status_message('Context summarized - restrictions cleared')
-
-
-    def _process_token_recovery_event(self, event: Dict[str, Any]) -> None:
-        """Process token recovery event."""
-        recovery_message = event.get('recovery_message', 'Token usage returned to safe levels')
-        log('DEBUG', 'presenter.event_processor', f'_process_token_recovery_event: {recovery_message}')
-        if self.gui_integration:
-            self.gui_integration.emit_status_message(f'Token recovery: {recovery_message}')
-
-
-    def _extract_token_counts(self, event: Dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
-                self.gui_integration.emit_status_message('Completed successfully')
-            content = event.get('content')
-            reasoning = event.get('reasoning')
-            timestamp_str = event.get('created_at') or event.get('timestamp')
-            timestamp = None
-            if timestamp_str:
-                try:
-                    timestamp = datetime.fromisoformat(timestamp_str)
-                except (ValueError, TypeError):
-                    timestamp = datetime.now()
-            else:
+            self.gui_integration.emit_status_message('Completed successfully')
+        content = event.get('content')
+        reasoning = event.get('reasoning')
+        timestamp_str = event.get('created_at') or event.get('timestamp')
+        timestamp = None
+        if timestamp_str:
+            try:
+                timestamp = datetime.fromisoformat(timestamp_str)
+            except (ValueError, TypeError):
                 timestamp = datetime.now()
-            if content and self.state_bridge.current_session:
-                self.state_bridge.current_session.final_content = content
-                self.state_bridge.current_session.final_reasoning = reasoning
-                self.state_bridge.current_session.final_timestamp = timestamp
-        elif event_type == 'max_turns':
+        else:
+            timestamp = datetime.now()
+        if content and self.state_bridge.current_session:
+            self.state_bridge.current_session.final_content = content
+            self.state_bridge.current_session.final_reasoning = reasoning
+            self.state_bridge.current_session.final_timestamp = timestamp
+        if event_type == 'max_turns':
             self.session_lifecycle.state = ExecutionState.READY
             if self.gui_integration:
                 self.gui_integration.emit_status_message('Max turns reached')
@@ -214,6 +192,19 @@ class EventProcessor:
                 message = 'Stopped' if event_type == 'stopped' else 'Thread finished'
                 self.gui_integration.emit_status_message(message)
         self.session_lifecycle.auto_save_current_session()
+
+    def _process_context_cleared_event(self, event: Dict[str, Any]) -> None:
+        """Process context cleared event after summarization."""
+        log('DEBUG', 'presenter.event_processor', f'_process_context_cleared_event: tokens={event.get("token_count", 0)}')
+        if self.gui_integration:
+            self.gui_integration.emit_status_message('Context summarized - restrictions cleared')
+
+    def _process_token_recovery_event(self, event: Dict[str, Any]) -> None:
+        """Process token recovery event."""
+        recovery_message = event.get('recovery_message', 'Token usage returned to safe levels')
+        log('DEBUG', 'presenter.event_processor', f'_process_token_recovery_event: {recovery_message}')
+        if self.gui_integration:
+            self.gui_integration.emit_status_message(f'Token recovery: {recovery_message}')
 
     def _process_error_event(self, event: Dict[str, Any]) -> None:
         """Process error event."""
@@ -300,7 +291,6 @@ class EventProcessor:
             self.gui_integration.emit_status_message(f'Rate limit: {message}')
             if hasattr(self.gui_integration, 'emit_warning'):
                 self.gui_integration.emit_warning(f'Rate limit exceeded, waiting {wait_time}s')
-
 
     def _extract_token_counts(self, event: Dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
         """Extract token counts from event."""
