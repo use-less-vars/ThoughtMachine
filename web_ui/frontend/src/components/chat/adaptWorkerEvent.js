@@ -245,41 +245,18 @@ export default function adaptWorkerEvent(evt) {
       }
     }
     // ── Worker state sync (real-time token/context warnings from per-worker bus) ────────
-    case 'worker_state_sync': {
-      const wssResp = evt.response || {}
-      const tokenState = wssResp.token_state || 'LOW'
-      const warningMsg = wssResp.warning_message || ''
-      const ctxLength = wssResp.context_length ?? 0
-      const criticalThreshold = wssResp.critical_threshold ?? 0
-
-      if (tokenState === 'LOW' || tokenState === 'OK') {
-        // Token state is healthy — no warning to show
-        return {
-          _id: eventId(evt),
-          role: 'system',
-          content: `✅ Token state: ${tokenState} (${ctxLength} tokens)`,
-          is_system_notification: true,
-          is_worker_event: true,
-        }
-      }
-
-      // WARNING or CRITICAL — render a prominent notification
-      let emoji = tokenState === 'CRITICAL' ? '🔴' : '⚠️'
-      let content = `${emoji} Token state: ${tokenState}`
-      if (warningMsg) content += ` — ${warningMsg}`
-      content += ` (${ctxLength} tokens`
-      if (criticalThreshold > 0) content += ` / ${criticalThreshold} max`
-      content += ')'
-
+    // Return a placeholder msg that keeps the event in the pipeline (so side-channel
+    // updates to workerInfo still flow) but produces no visible bubble: empty content
+    // and no is_system_notification flag mean the EMPTY EVENT FILTER in the render
+    // loop (WorkerOutputPanel.jsx) suppresses this during rendering.
+    case 'worker_state_sync':
       return {
         _id: eventId(evt),
-        role: 'user',
-        content,
-        is_system_notification: true,
+        role: 'system',
+        content: '',
         is_worker_event: true,
-        token_state: tokenState,  // pass through so MessageBubble can style if needed
+        data: evt.data || evt,  // Pass through original data for status bar
       }
-    }
 
     // ── Worker lifecycle events (from WebSocket bridge ONLY) ────────────
     // These events are published to the global_event_bus by worker.py and

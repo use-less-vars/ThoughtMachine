@@ -4440,3 +4440,58 @@ Agent (process_query)
 - In `App.handleWorkerEvent`: Canonical type `'worker_state_sync'` + timestamp as dedup key
 - In `WorkerOutputPanel`: `seenEventKeysRef` with `makeDedupKey(rawType, timestamp)` — worker_state_sync maps to canonical = `'worker_state_sync'` (not mapped to `system_notification`)
 - Backend state machine guarantees one-shot escalation per level (WARNING → CRITICAL), preventing duplicate banner renders
+
+## 2026-07-15 — ## 2026-07-15 — Progress: Comprehensive Event Pipeline Full ...
+
+## 2026-07-15 — Progress: Comprehensive Event Pipeline Full Trace (Partial)
+
+### Files Fully Read:
+1. **agent/core/state.py** (18,923 bytes) — Complete. TokenState machine fully documented.
+2. **agent/presenter/event_processor.py** (18,460 bytes) — Already read from previous session.
+3. **agent/logging/unified.py** (21,589 bytes) — Already read from previous session.
+4. **tools/workspace/worker.py** (~96,786 bytes) — Full read: WorkerBusAdapter, WorkerSessionLifecycle, WorkerThread (all methods incl. run(), _run_tool_loop()), _restrictive_merge, shutdown_workers, registries.
+5. **agent/core/agent.py** (1,516 lines) — Pages 1-3 fully read up to ~line 850 (process_query method). Need to read: process_query completion, _flush_warnings_after_commit, SummarizeTool integration, context_cleared events.
+
+### Files Still to Read:
+- **session/history_provider.py** — Event dispatch to frontend
+- **web_ui/backend/bridge.py** — Bridge handling of worker events
+- **web_ui/backend/server.py** — WebSocket event dispatch to frontend
+
+## 2026-07-15 — ## 2026-07-15 — agent/core/agent.py Complete (1,516 lines)
+
+...
+
+## 2026-07-15 — agent/core/agent.py Complete (1,516 lines)
+
+Fully read all methods. Key findings for event pipeline audit:
+- **process_query()** (lines ~620-1337): Core event-yielding generator. Turn loop yields: token_update → turn → tool_call → tool_result → agent_responded. Warnings buffered in _pending_warnings/_pending_warning_events then flushed after turn commit.
+- **_update_tokens_after_tool()** (lines ~700-770): Processes state.update_token_state() events, buffers token_warning and token_recovery. Warnings become [SYSTEM NOTIFICATION] messages.
+- **_handle_state_event()** (lines ~560-610): Yields events for token_warning, turn_warning, execution_state_change, session_state_change, token_recovery, context_cleared. Adds conversation metadata.
+- **_flush_warnings_after_commit()**: Actually happening inline in process_query() at lines 1222-1231 (tool branch) and lines 1296-1304 (non-tool branch).
+- **_apply_summary_pruning()** (lines 1338-1415): Inserts summary msg into user_history with metadata (pruning_keep_recent_turns, pruning_insertion_idx), appends [SYSTEM NOTIFICATION] context_cleared message, updates token estimate, returns token_recovery events.
+- **config hot-swap/restart**: Full mailbox pattern with _pending_config, _can_hot_swap, _hot_swap, _restart_with_config, _has_api_key, restart().
+
+Still to read: session/history_provider.py, web_ui/backend/bridge.py, web_ui/backend/server.py
+
+## 2026-07-15 — ## Bug Investigation Progress
+
+### Bug 1: emit_state_sync fl...
+
+## Bug Investigation Progress
+
+### Bug 1: emit_state_sync flood
+- Found in tools/workspace/worker.py at line 183 — `WorkerBusAdapter.emit_state_sync()`
+- Called from `WorkerThread._run_tool_loop()` at line 986 after every event
+- Frontend handles it in `WorkerOutputPanel.jsx` — renders token_state badge and warning messages
+- Fix plan: Add `_last_published_state` dict to dedup within `emit_state_sync()`
+
+### Bug 2: Old critical warning persists after summary
+- `state.py` line 140-145: Already has token_recovery event when transitioning CRITICAL→LOW, resets `_token_warning_has_fired = False`
+- `agent.py` line 1392-1400: `_apply_summary_pruning()` appends `[SYSTEM NOTIFICATION] Context has been summarized...` message
+- The issue: After summary, `update_token_state()` IS called in `_apply_summary_pruning()` at line 1405, which SHOULD trigger recovery
+- Need to check: Is `emit_state_sync()` called AFTER summary completes in the worker pipeline?
+- Also need to check `_run_tool_loop()` in worker.py to see the full event handling flow
+
+### Files still to read
+- tools/workspace/worker.py: _run_tool_loop method (near line 981+), rest of emit_state_sync
+- agent/presenter/event_processor.py

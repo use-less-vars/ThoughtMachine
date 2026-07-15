@@ -572,6 +572,11 @@ class WebAgentBridge:
                         'context_length': data.get('context_length', 0),
                         'source': 'worker',
                         'worker_name': data.get('worker_name', worker_name),
+                        'timestamp': (
+                            event.metadata.timestamp.isoformat()
+                            if hasattr(event, 'metadata') and event.metadata
+                            else datetime.datetime.now().isoformat()
+                        ),
                     }
                 else:
                     event_dict = {

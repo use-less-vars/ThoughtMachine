@@ -113,7 +113,17 @@ class EventProcessor:
                 self.gui_integration.emit_context_updated(context_length)
 
     def _process_token_update_event(self, event: Dict[str, Any]) -> None:
-        """Process a token update event."""
+        """Process token update event — update token counts and context length."""
+        event_type = event.get('type')
+        if event_type == 'token_warning':
+            self._process_token_warning_event(event)
+        elif event_type == 'turn_warning':
+            self._process_turn_warning_event(event)
+        elif event_type == 'context_cleared':
+            self._process_context_cleared_event(event)
+        elif event_type == 'token_recovery':
+            self._process_token_recovery_event(event)
+
         log('DEBUG', 'presenter.event_processor', f'_process_token_update_event: context_length={event.get("context_length")}')
         log('DEBUG', 'pipeline.token_update', f"received: context_length={event.get('context_length')}, total_input={event.get('total_input')}, total_output={event.get('total_output')}")
         input_tokens, output_tokens = self._extract_token_counts(event)

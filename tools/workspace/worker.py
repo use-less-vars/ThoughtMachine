@@ -179,60 +179,6 @@ class WorkerBusAdapter:
             f"worker={self.worker_name}")
         self._publish("conversation_changed", {})
 
-    def emit_state_sync(self) -> None:
-        """
-        Publish a worker_state_sync event carrying current context/token/warning info
-        so the frontend can update its live display without polling.
-
-        Reads all state from ``self._state_bridge`` (the single source of truth):
-        - ``context_length`` from ``state_bridge.context_length``
-        - ``critical_threshold`` from ``state_bridge.current_config.token_monitor_critical_threshold``
-        - ``warning_threshold`` from ``state_bridge.current_config.token_monitor_warning_threshold``
-        - ``token_state`` derived by comparing ``context_length`` against thresholds
-        - ``warning_message`` constructed from the derived state
-        """
-        log('DEBUG', 'pipeline.hops',
-            f"[PIPELINE:HOPS] WorkerBusAdapter.emit_state_sync: worker={self.worker_name} "
-            f"state_bridge={'SET' if self._state_bridge else 'NONE'}")
-        context_length = getattr(self._state_bridge, 'context_length', 0) or 0
-        critical_threshold = 0
-        warning_threshold = 0
-        if self._state_bridge is not None and hasattr(self._state_bridge, 'current_config'):
-            cfg = self._state_bridge.current_config
-            if hasattr(cfg, 'token_monitor_critical_threshold'):
-                critical_threshold = cfg.token_monitor_critical_threshold or 0
-            if hasattr(cfg, 'token_monitor_warning_threshold'):
-                warning_threshold = cfg.token_monitor_warning_threshold or 0
-
-        # Derive token_state from context_length vs thresholds
-        if critical_threshold > 0 and context_length >= critical_threshold:
-            token_state = 'CRITICAL'
-        elif warning_threshold > 0 and context_length >= warning_threshold:
-            token_state = 'WARNING'
-        else:
-            token_state = 'LOW'
-
-        # Construct warning message from the derived state
-        if token_state == 'CRITICAL':
-            warning_message = f"Token usage CRITICAL: {context_length} tokens (limit {critical_threshold})"
-        elif token_state == 'WARNING':
-            warning_message = f"Token usage warning: {context_length} tokens approaching limit ({warning_threshold})"
-        else:
-            warning_message = ''
-
-        data = {
-            "context_length": context_length,
-            "token_state": token_state,
-            "warning_message": warning_message,
-            "critical_threshold": critical_threshold,
-        }
-        log('DEBUG', 'pipeline.worker_bus',
-            f"[TOKEN_PIPELINE] WorkerBusAdapter.emit_state_sync: "
-            f"worker={self.worker_name} context_length={context_length} "
-            f"token_state={token_state} warning={warning_message} threshold={critical_threshold} "
-            f"recovered={recovered}")
-        self._publish("worker_state_sync", data)
-
     def forward_agent_event(self, event: dict) -> None:
         """Publish an agent event to the per-worker EventBus for frontend consumption."""
         event_type = event.get("type", "")
@@ -327,6 +273,28 @@ class WorkerBusAdapter:
                 "type": event.get("type_detail", event.get("notification_type", "general")),
                 "message": (event.get("message", "") or event.get("data", {}).get("message", ""))[:500],
                 "context_length": event.get("context_length", 0),
+            })
+
+        elif event_type == "context_cleared":
+            log('DEBUG', 'pipeline.worker_bus',
+                f"forward_agent_event: context_cleared [worker={self.worker_name}] "
+                f"token_count={event.get('token_count', 0)}")
+            self._publish("context_cleared", {
+                "token_count": event.get("token_count", 0),
+                "old_state": str(event.get("old_state", "")),
+                "new_state": str(event.get("new_state", "")),
+                "recovery_message": str(event.get("recovery_message", "") or "")[:500],
+            })
+
+        elif event_type == "token_recovery":
+            log('DEBUG', 'pipeline.worker_bus',
+                f"forward_agent_event: token_recovery [worker={self.worker_name}] "
+                f"token_count={event.get('token_count', 0)}")
+            self._publish("token_recovery", {
+                "token_count": event.get("token_count", 0),
+                "old_state": str(event.get("old_state", "")),
+                "new_state": str(event.get("new_state", "")),
+                "recovery_message": str(event.get("recovery_message", "") or "")[:500],
             })
 
         elif event_type == "user_message" or event_type == "user_interaction_requested":
@@ -945,22 +913,11 @@ class WorkerThread(threading.Thread):
                 # (replaces the old manual self._publish_event() calls for
                 #  tool_call, tool_result, token_warning, turn_warning,
                 if self._worker_bus_adapter is not None:
+                    log('TRACE', '[WORKER_EVENT_OBSERVE]', f"event: type={event.get('type')}, yielding to presenter")
                     try:
                         self._worker_bus_adapter.forward_agent_event(event)
                     except Exception as exc:
                         log('WARNING', 'tools.worker', f"forward_agent_event failed for {event_type}: {exc}")
-
-                # Emit state sync event after every event so the frontend
-                # gets real-time context/token/warning updates without polling.
-                # [PIPELINE:HOPS] Emit state sync after every event
-                if self._worker_bus_adapter is not None:
-                    log('DEBUG', 'pipeline.hops',
-                        f"[PIPELINE:HOPS] Calling emit_state_sync after event_type={event_type}: "
-                        f"worker={self.worker_name}")
-                    try:
-                        self._worker_bus_adapter.emit_state_sync()
-                    except Exception as exc:
-                        log('WARNING', 'tools.worker', f"emit_state_sync failed for {event_type}: {exc}")
 
                 # Capture final response content and reasoning
                 if event_type == "agent_responded":

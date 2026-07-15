@@ -163,6 +163,8 @@ class AgentState:
 
         if new_state == TokenState.LOW and not self._token_warning_has_fired:
             self.last_token_warning_state = TokenState.LOW
+        log('DEBUG', '[STATE_OBSERVE]', f"token low-no-recovery: last_token_warning_state reset to LOW (has_fired={self._token_warning_has_fired})")
+        log('DEBUG', '[STATE_OBSERVE]', f"token: {old_state.value}→{new_state.value} | tokens={total_tokens} | thresholds=({self.config.token_monitor_warning_threshold},{self.config.token_monitor_critical_threshold}) | event={'token_warning' if any(e.get('type')=='token_warning' for e in events) else 'token_recovery' if any(e.get('type')=='token_recovery' for e in events) else 'none'} | has_fired={self._token_warning_has_fired}")
         return events
 
     def update_time_state(self, elapsed_seconds: float) -> List[Dict[str, Any]]:
@@ -242,6 +244,7 @@ class AgentState:
             self.last_time_warning_state = TimeState.LOW
             self.restriction_reason = None
 
+        log('DEBUG', '[STATE_OBSERVE_TIME]', f"time: {old_state.value}→{new_state.value} | elapsed={elapsed_seconds} | timeout={self.config.timeout_seconds} | event={'time_warning' if events else 'none'}")
         return events
 
     def update_turn_state(self, current_turn: int) -> List[Dict[str, Any]]:

@@ -1257,11 +1257,18 @@ class Agent:
                         recovery_events = self._apply_summary_pruning(summary_text, summary_keep_recent_turns)
                         log('DEBUG', '**pipeline.token_update**', f"Token update after summary pruning: tokens={self.state.current_conversation_tokens}")
                         yield self._create_token_update_event()
-                        # Yield context_cleared events so the frontend knows to refresh
+                        # Yield the original recovery events (token_recovery) unchanged,
+                        # followed by a context_cleared event so the frontend knows to
+                        # refresh.  Previously the type was overwritten, which meant
+                        # EventProcessor._process_token_recovery_event was never called
+                        # and the recovery message was lost.
                         for recovery_event in (recovery_events or []):
-                            recovery_event['type'] = 'context_cleared'
                             self._add_conversation_data_to_event(recovery_event)
                             yield recovery_event
+                            # Also yield a context_cleared variant for frontend refresh
+                            cleared_event = dict(recovery_event)
+                            cleared_event['type'] = 'context_cleared'
+                            yield cleared_event
 
                         # Continue the turn loop — summary frees context, agent keeps working
                         turn_duration = time.time() - turn_start_time

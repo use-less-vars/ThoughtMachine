@@ -194,6 +194,8 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
       return
     }
 
+    console.log('[TOKEN_PIPELINE] WorkerOutputPanel: incomingEvents raw count=' + incomingEvents.length + ', total=', incomingEvents.map(e => ({type: e.type, worker_name: e.worker_name, context_length: e.context_length, critical_threshold: e.critical_threshold})));
+
     const relevantEvents = incomingEvents.filter(e => {
       const evtWorkerName = e.worker_name || e.response?.worker_name
       // REQUIRE a worker_name — events without one are main-agent events, not worker events
@@ -202,6 +204,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
 
     if (relevantEvents.length === 0) {
       console.log('[WorkerOutputPanel] incomingEvents: none relevant (workerName=' + workerName + ')');
+      console.log('[TOKEN_PIPELINE] WorkerOutputPanel: ZERO relevant events — worker_name mismatch or absent');
       return
     }
     console.log('[WorkerOutputPanel] incomingEvents: processing', relevantEvents.length, 'events types:', relevantEvents.map(e=>e.type).join(','));
@@ -228,40 +231,29 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
         tokensUpdate.warning_message = e.data.warning_message
         tokensUpdate.critical_threshold = e.data.critical_threshold
         tokensUpdate.max_context_tokens = e.data.critical_threshold
-        // Inject system notification when token_state is WARNING or CRITICAL
-        // Warning displayed from worker_state_sync — state machine guarantees one-shot escalation
+        // Update warning_active flag for header badge (no synthetic event injection)
         if (e.data.token_state === 'WARNING' || e.data.token_state === 'CRITICAL') {
-          // Inject a synthetic system_notification event so the event log renders it
-          // The dedup key uses 'system_notification' + timestamp so it only shows once per level
-          const notifEvent = {
-            type: 'worker:system_notification',
-            worker_name: e.worker_name,
-            timestamp: e.timestamp,
-            response: {
-              type: 'token_warning',
-              message: e.data.warning_message || `Token state: ${e.data.token_state}`,
-              token_count: e.data.context_length,
-            },
-            data: {
-              type: 'token_warning',
-              warning_message: e.data.warning_message || `Token state: ${e.data.token_state}`,
-              token_count: e.data.context_length,
-            },
-          }
-          // Push directly to incomingEvents (the parent will pick it up)
-          // We add it to the array being iterated via a ref trick — but simpler:
-          // just update workerInfo.warning_active to flag the header to show a badge
           tokensUpdate.warning_active = true
         } else if (e.data.token_state === 'LOW') {
           tokensUpdate.warning_active = false
         }
       }
+            if (eventType === 'context_updated' && e.context_length != null) {
+              tokensUpdate.current_context_tokens = e.context_length;
+              tokensUpdate.max_context_tokens = e.critical_threshold ?? tokensUpdate.max_context_tokens ?? 80000;
+              console.log('[TOKEN_PIPELINE] WorkerOutputPanel: context_updated processing', {
+                eventType, context_length: e.context_length, critical_threshold: e.critical_threshold,
+                effective_max: tokensUpdate.max_context_tokens, worker_name: e.worker_name,
+              });
+            }
       // Always apply token updates to workerInfo (any event type may carry them)
       if (Object.keys(tokensUpdate).length > 0) {
         console.log('[PIPELINE:HOPS] WorkerOutputPanel: applying tokensUpdate to workerInfo', tokensUpdate)
+        console.log('[TOKEN_PIPELINE] WorkerOutputPanel: calling setWorkerInfo with tokensUpdate', tokensUpdate)
         setWorkerInfo(prev => {
-          if (!prev) return { ...tokensUpdate };
-          return { ...prev, ...tokensUpdate };
+          const next = prev ? { ...prev, ...tokensUpdate } : { ...tokensUpdate };
+          console.log('[TOKEN_PIPELINE] WorkerOutputPanel: setWorkerInfo result', { prev, next });
+          return next;
         })
       }
 
@@ -654,6 +646,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
           </span>
           <span className="worker-output-header-ctx">
             ctx: {workerInfo && workerInfo.max_context_tokens > 0 ? `${formatTokens(workerInfo.current_context_tokens ?? 0)} / ${formatTokens(workerInfo.max_context_tokens)}` : '—'}
+            {(() => { console.log('[TOKEN_PIPELINE] WorkerOutputPanel: RENDER header ctx', { workerInfo, max_gt_0: workerInfo?.max_context_tokens > 0, current: workerInfo?.current_context_tokens, max: workerInfo?.max_context_tokens }); return null; })()}
           </span>
           <div style={{ flex: 1 }} />
           {workerInfo?.current_task && (
@@ -671,23 +664,6 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
             </button>
           )}
         </div>
-
-        {/* ── Warning banner (token state WARNING/CRITICAL) ───────────── */}
-        {console.log('[PIPELINE:HOPS] WorkerOutputPanel: warning banner render', { token_state: workerInfo?.token_state, current_context_tokens: workerInfo?.current_context_tokens })}
-        {(workerInfo?.token_state === 'WARNING' || workerInfo?.token_state === 'CRITICAL') && (
-          <div className={'worker-output-warning-banner ' + (workerInfo.token_state === 'CRITICAL' ? 'worker-output-warning-banner-critical' : 'worker-output-warning-banner-warning')}>
-            <span className="worker-output-warning-banner-icon">
-              {workerInfo.token_state === 'CRITICAL' ? '🔴' : '⚠️'}
-            </span>
-            <span className="worker-output-warning-banner-text">
-              <strong>{workerInfo.token_state}:</strong>{' '}
-              Token count: {formatTokens(workerInfo.current_context_tokens ?? 0)}
-            </span>
-            <span className="worker-output-warning-banner-ctx">
-              {formatTokens(workerInfo.current_context_tokens ?? 0)} / {formatTokens(workerInfo.critical_threshold ?? 0)} tokens
-            </span>
-          </div>
-        )}
 
         {/* ── Conversation stream ────────────────────────────────────── */}
         <div
