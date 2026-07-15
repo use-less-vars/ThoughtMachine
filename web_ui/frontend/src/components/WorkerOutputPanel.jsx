@@ -246,6 +246,10 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
                 effective_max: tokensUpdate.max_context_tokens, worker_name: e.worker_name,
               });
             }
+      if (eventType === 'context_updated') {
+        // context_updated events update the header only; do not render as a message
+        continue;
+      }
       // Always apply token updates to workerInfo (any event type may carry them)
       if (Object.keys(tokensUpdate).length > 0) {
         console.log('[PIPELINE:HOPS] WorkerOutputPanel: applying tokensUpdate to workerInfo', tokensUpdate)
@@ -292,6 +296,11 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
     const newOnes = relevantEvents
       .filter(e => {
         const rawType = e.type?.replace('worker:', '') || ''
+        // context_updated events are header-only; never render as messages
+        if (rawType === 'context_updated') {
+          console.log('[WorkerOutputPanel] Filtering out context_updated (header-only event)');
+          return false;
+        }
         const key = makeDedupKey(rawType, e.timestamp)
         console.warn('[DEDUP CHECK] rawType:', rawType, 'timestamp:', e.timestamp, 'key:', key, 'alreadySeen:', seenEventKeysRef.current.has(key));
         return !seenEventKeysRef.current.has(key)
@@ -390,6 +399,18 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
               request: {},
               response: {},
               current_context_tokens: e.context_length ?? 0,
+            }
+
+          case 'context_cleared':
+            console.log('[TOKEN_PIPELINE] WorkerOutputPanel: context_cleared mapped to display event', { worker_name: e.worker_name })
+            return {
+              event: 'system_notification',
+              timestamp: e.timestamp,
+              request: {},
+              response: {
+                type: 'context_cleared',
+                message: e.message || 'Context freed \u2014 worker memory cleared.',
+              },
             }
 
           case 'worker_state_sync':

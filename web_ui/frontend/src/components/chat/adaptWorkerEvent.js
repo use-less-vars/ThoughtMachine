@@ -207,6 +207,15 @@ export default function adaptWorkerEvent(evt) {
       }
     }
 
+    // ── Context cleared ───────────────────────────────────────────
+    case 'context_cleared':
+      return {
+        _id: `context_cleared_${evt.timestamp || Date.now()}`,
+        role: 'system',
+        content: evt.response?.message || evt.message || 'Context freed \u2014 worker memory cleared.',
+        is_system_notification: true,
+      }
+
     // ── Lifecycle events ──────────────────────────────────────────
     case 'started':
       return {

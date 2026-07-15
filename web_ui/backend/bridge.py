@@ -526,7 +526,7 @@ class WebAgentBridge:
         # DIAG: Log what event types we plan to subscribe to
         subscribed_types = ['tool_call', 'tool_result',
                             'worker_message', 'assistant_message',
-                            'tokens_updated', 'context_updated',
+                            'tokens_updated', 'context_updated', 'context_cleared',
                             'token_warning', 'turn_warning', 'time_warning',
                             'user_message', 'system_notification',
                             'worker_state_sync',
@@ -577,6 +577,18 @@ class WebAgentBridge:
                             if hasattr(event, 'metadata') and event.metadata
                             else datetime.datetime.now().isoformat()
                         ),
+                    }
+                elif original_type == 'context_cleared':
+                    event_dict = {
+                        'type': 'worker:context_cleared',
+                        'worker_name': data.get('worker_name', worker_name),
+                        'message': 'Context freed \u2014 worker memory cleared.',
+                        'timestamp': (
+                            event.metadata.timestamp.isoformat()
+                            if hasattr(event, 'metadata') and event.metadata
+                            else datetime.datetime.now().isoformat()
+                        ),
+                        'data': data,
                     }
                 else:
                     event_dict = {
