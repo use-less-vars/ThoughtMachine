@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useLayoutEffect } from 'react';
 import { MessageBubble } from './chat/MessageBubble';
 import adaptWorkerEvent from './chat/adaptWorkerEvent';
 
@@ -162,13 +162,28 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
   // event name variant of the same logical event at the same timestamp.
   const makeDedupKey = (eventName, timestamp) => {
     // Assistant-message-like events all map to the same canonical key
-    const canonical = (
+    let canonical
+    if (
       eventName === 'worker_message' ||
       eventName === 'final_response' ||
       eventName === 'assistant_message' ||
       eventName === 'worker:worker_message' ||
       eventName === 'worker:assistant_message'
-    ) ? 'final_response' : eventName
+    ) {
+      canonical = 'final_response'
+    } else if (
+      // Token warnings arrive via two backend paths:
+      //   Path A (per-worker bus): worker:token_warning  → rawType='token_warning'
+      //   Path B (global bus):     worker:system_notification → rawType='system_notification'
+      // Both represent the same logical warning; canonicalize to the same key
+      // so the second arrival is deduplicated away.
+      eventName === 'token_warning' ||
+      eventName === 'system_notification'
+    ) {
+      canonical = 'system_notification'
+    } else {
+      canonical = eventName
+    }
     return canonical + '|' + (timestamp || '')
   }
 
@@ -200,7 +215,58 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
       const tokensUpdate = {}
       if (e.data?.current_context_tokens !== undefined) tokensUpdate.current_context_tokens = e.data.current_context_tokens
       if (e.data?.max_context_tokens !== undefined) tokensUpdate.max_context_tokens = e.data.max_context_tokens
-
+      // Handle flat tokens_updated from bridge (input/output at top level, no data wrapper)
+      if (e.type === 'tokens_updated' && e.input !== undefined) {
+        console.log('[TRACE:tokens_updated] processing in WorkerOutputPanel', JSON.stringify({input: e.input, output: e.output}))
+        tokensUpdate.current_context_tokens = e.input
+      }
+      // Handle flat context_updated from bridge (context_length at top level)
+      if (e.type === 'context_updated' && e.context_length !== undefined) {
+        console.log('[TRACE:context_updated] processing in WorkerOutputPanel', JSON.stringify({context_length: e.context_length, worker_name: e.worker_name, source: e.source, timestamp: e.timestamp, prevCtx: tokensUpdate.current_context_tokens}))
+        tokensUpdate.current_context_tokens = e.context_length
+      }
+      // Handle worker_state_sync from per-worker bus (real-time context/warning sync)
+      if (eventType === 'worker_state_sync' && e.data) {
+        console.log('[STATE_SYNC_TRACE] WorkerOutputPanel updating ctx display', {
+          context_length: e.data.context_length,
+          token_state: e.data.token_state,
+          warning_message: e.data.warning_message,
+          critical_threshold: e.data.critical_threshold,
+        })
+        // Update live context tokens in workerInfo
+        tokensUpdate.current_context_tokens = e.data.context_length
+        tokensUpdate.token_state = e.data.token_state
+        tokensUpdate.warning_message = e.data.warning_message
+        tokensUpdate.critical_threshold = e.data.critical_threshold
+        tokensUpdate.max_context_tokens = e.data.critical_threshold
+        // Inject system notification when token_state is WARNING or CRITICAL
+        // Warning displayed from worker_state_sync — state machine guarantees one-shot escalation
+        if (e.data.token_state === 'WARNING' || e.data.token_state === 'CRITICAL') {
+          // Inject a synthetic system_notification event so the event log renders it
+          // The dedup key uses 'system_notification' + timestamp so it only shows once per level
+          const notifEvent = {
+            type: 'worker:system_notification',
+            worker_name: e.worker_name,
+            timestamp: e.timestamp,
+            response: {
+              type: 'token_warning',
+              message: e.data.warning_message || `Token state: ${e.data.token_state}`,
+              token_count: e.data.context_length,
+            },
+            data: {
+              type: 'token_warning',
+              warning_message: e.data.warning_message || `Token state: ${e.data.token_state}`,
+              token_count: e.data.context_length,
+            },
+          }
+          // Push directly to incomingEvents (the parent will pick it up)
+          // We add it to the array being iterated via a ref trick — but simpler:
+          // just update workerInfo.warning_active to flag the header to show a badge
+          tokensUpdate.warning_active = true
+        } else if (e.data.token_state === 'LOW') {
+          tokensUpdate.warning_active = false
+        }
+      }
       // Always apply token updates to workerInfo (any event type may carry them)
       if (Object.keys(tokensUpdate).length > 0) {
         setWorkerInfo(prev => {
@@ -321,6 +387,48 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
             response = { content: data.content || e.request?.query || '' }
             break
           }
+          case 'tokens_updated':
+            console.log('[TRACE:tokens_updated] mapping to display event', JSON.stringify({input: e.input}))
+            return {
+              event: 'tokens_updated',
+              timestamp: e.timestamp,
+              request: {},
+              response: {},
+              current_context_tokens: e.input ?? 0,
+              max_context_tokens: 0,
+            }
+          case 'context_updated':
+            console.log('[TRACE:context_updated] mapping to display event', JSON.stringify({context_length: e.context_length, worker_name: e.worker_name, timestamp: e.timestamp}))
+            return {
+              event: 'context_updated',
+              timestamp: e.timestamp,
+              request: {},
+              response: {},
+              current_context_tokens: e.context_length ?? 0,
+              max_context_tokens: 0,
+            }
+
+          case 'worker_state_sync':
+            console.log('[STATE_SYNC_TRACE] WorkerOutputPanel mapping worker_state_sync to display event', {
+              context_length: e.data?.context_length,
+              token_state: e.data?.token_state,
+              warning_message: e.data?.warning_message,
+            })
+            return {
+              event: 'worker_state_sync',
+              timestamp: e.timestamp,
+              request: {},
+              response: {
+                context_length: e.data?.context_length ?? 0,
+                token_state: e.data?.token_state ?? 'LOW',
+                warning_message: e.data?.warning_message || '',
+                critical_threshold: e.data?.critical_threshold ?? 0,
+              },
+              current_context_tokens: e.data?.context_length ?? 0,
+              max_context_tokens: e.data?.critical_threshold ?? 0,
+              token_state: e.data?.token_state ?? 'LOW',
+            }
+
           case 'system_notification': {
             const data = e.response || e.data || {}
             response = {
@@ -379,11 +487,19 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
   const [hasNewEvents, setHasNewEvents] = useState(false);
   const scrollRef = useRef(null);
   const isAtBottomRef = useRef(true);
+  const programmaticScrollRef = useRef(false);
+  const prevCountRef = useRef(0);
   const eventsRef = useRef([]);
 
   // ── Smart scroll ──────────────────────────────────────────────────────
-  // Track whether user is at bottom
+  // Track whether user is at bottom (suppressed during programmatic scroll)
   const handleScroll = useCallback(() => {
+    if (programmaticScrollRef.current) {
+      // This scroll event was triggered by programmatic scroll;
+      // reset the guard and bail out.
+      programmaticScrollRef.current = false;
+      return;
+    }
     const el = scrollRef.current;
     if (!el) return;
     const threshold = 50;
@@ -393,22 +509,55 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
   }, []);
 
   // Auto-scroll on new events if user was at bottom.
-  // Use double requestAnimationFrame to ensure DOM layout (async syntax highlighting)
-  // is fully settled before measuring scrollHeight.
-  useEffect(() => {
-    if (isAtBottomRef.current && scrollRef.current && events.length > 0) {
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          if (scrollRef.current) {
-            scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-          }
-        });
-      });
+  // Use useLayoutEffect + double requestAnimationFrame to ensure DOM layout
+  // (async syntax highlighting) is fully settled before measuring scrollHeight.
+  // Only auto-scroll when event COUNT increases (append), not on array reference
+  // changes (e.g., during session restore or restructuring).
+  useLayoutEffect(() => {
+    const currentCount = events.length
+    const prevCount = prevCountRef.current
+    prevCountRef.current = currentCount
+
+    if (
+      !isAtBottomRef.current ||
+      !scrollRef.current ||
+      currentCount <= prevCount ||
+      currentCount === 0
+    ) {
+      return
     }
+
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (scrollRef.current) {
+          programmaticScrollRef.current = true;
+          scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+        }
+      });
+    });
   }, [events]);
+
+  // ResizeObserver — keep anchored at bottom during async expansion
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+
+    const observer = new ResizeObserver(() => {
+      if (isAtBottomRef.current && !programmaticScrollRef.current) {
+        if (el.scrollHeight - el.scrollTop - el.clientHeight > 1) {
+          programmaticScrollRef.current = true;
+          el.scrollTop = el.scrollHeight;
+        }
+      }
+    });
+
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
 
   const scrollToBottom = () => {
     if (scrollRef.current) {
+      programmaticScrollRef.current = true;
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
     setHasNewEvents(false);
@@ -532,6 +681,22 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
             </button>
           )}
         </div>
+
+        {/* ── Warning banner (token state WARNING/CRITICAL) ───────────── */}
+        {(workerInfo?.token_state === 'WARNING' || workerInfo?.token_state === 'CRITICAL') && (
+          <div className={'worker-output-warning-banner ' + (workerInfo.token_state === 'CRITICAL' ? 'worker-output-warning-banner-critical' : 'worker-output-warning-banner-warning')}>
+            <span className="worker-output-warning-banner-icon">
+              {workerInfo.token_state === 'CRITICAL' ? '🔴' : '⚠️'}
+            </span>
+            <span className="worker-output-warning-banner-text">
+              <strong>{workerInfo.token_state}:</strong>{' '}
+              {workerInfo.warning_message || `Token usage is at ${workerInfo.token_state} level`}
+            </span>
+            <span className="worker-output-warning-banner-ctx">
+              {formatTokens(workerInfo.current_context_tokens ?? 0)} / {formatTokens(workerInfo.critical_threshold ?? 0)} tokens
+            </span>
+          </div>
+        )}
 
         {/* ── Conversation stream ────────────────────────────────────── */}
         <div
