@@ -194,11 +194,10 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
       return
     }
 
-    console.warn('[RAW INCOMING EVENTS] count:', incomingEvents.length, 'events:', incomingEvents.map(e => ({type: e.type, timestamp: e.timestamp, dataPreview: JSON.stringify(e.data || {}).slice(0, 100)})));
-
     const relevantEvents = incomingEvents.filter(e => {
       const evtWorkerName = e.worker_name || e.response?.worker_name
-      return !evtWorkerName || evtWorkerName === workerName
+      // REQUIRE a worker_name — events without one are main-agent events, not worker events
+      return evtWorkerName && evtWorkerName === workerName
     })
 
     if (relevantEvents.length === 0) {
@@ -211,20 +210,12 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
     for (const e of relevantEvents) {
       const eventType = e.type?.replace('worker:', '')
       const status = e.data?.runtime_status || e.data?.status
-      // Extract token info from event data if present (always included after backend fix)
-      const tokensUpdate = {}
-      if (e.data?.current_context_tokens !== undefined) tokensUpdate.current_context_tokens = e.data.current_context_tokens
-      if (e.data?.max_context_tokens !== undefined) tokensUpdate.max_context_tokens = e.data.max_context_tokens
-      // Note: tokens_updated and context_updated are intentionally NOT handled here.
-      // worker_state_sync is now the single source of truth for token display.
+      // Token display data is set exclusively by worker_state_sync below.
       // The backend's emit_state_sync() reads from StateBridge and publishes
       // the canonical context_length, token_state, warning_message, and critical_threshold.
+      const tokensUpdate = {}
       // Handle worker_state_sync from per-worker bus (real-time context/warning sync)
       if (eventType === 'worker_state_sync' && e.data) {
-        console.log('[PIPELINE:HOPS] WorkerOutputPanel: worker_state_sync received', {
-          context_length: e.data.context_length,
-          token_state: e.data.token_state,
-        })
         console.log('[TOKEN_PIPELINE] WorkerOutputPanel: worker_state_sync received', {
           context_length: e.data.context_length,
           token_state: e.data.token_state,
