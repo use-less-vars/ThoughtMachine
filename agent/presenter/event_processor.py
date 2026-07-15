@@ -91,6 +91,10 @@ class EventProcessor:
             self._process_token_warning_event(event)
         elif event_type == 'turn_warning':
             self._process_turn_warning_event(event)
+        elif event_type == 'context_cleared':
+            self._process_context_cleared_event(event)
+        elif event_type == 'token_recovery':
+            self._process_token_recovery_event(event)
         if self.gui_integration:
             self.gui_integration.emit_status_message(f'Event: {event_type}')
 
@@ -109,7 +113,7 @@ class EventProcessor:
                 self.gui_integration.emit_context_updated(context_length)
 
     def _process_token_update_event(self, event: Dict[str, Any]) -> None:
-        """Process token update event — update token counts and context length."""
+        """Process a token update event."""
         log('DEBUG', 'presenter.event_processor', f'_process_token_update_event: context_length={event.get("context_length")}')
         log('DEBUG', 'pipeline.token_update', f"received: context_length={event.get('context_length')}, total_input={event.get('total_input')}, total_output={event.get('total_output')}")
         input_tokens, output_tokens = self._extract_token_counts(event)
@@ -163,24 +167,24 @@ class EventProcessor:
         log('DEBUG', 'presenter.event_processor', f'_process_terminal_event: type={event_type}, turn={event.get("turn")}')
         if event_type == 'agent_responded':
             self.session_lifecycle.state = ExecutionState.READY
-        if self.gui_integration:
-            self.gui_integration.emit_status_message('Completed successfully')
-        content = event.get('content')
-        reasoning = event.get('reasoning')
-        timestamp_str = event.get('created_at') or event.get('timestamp')
-        timestamp = None
-        if timestamp_str:
-            try:
-                timestamp = datetime.fromisoformat(timestamp_str)
-            except (ValueError, TypeError):
+            if self.gui_integration:
+                self.gui_integration.emit_status_message('Completed successfully')
+            content = event.get('content')
+            reasoning = event.get('reasoning')
+            timestamp_str = event.get('created_at') or event.get('timestamp')
+            timestamp = None
+            if timestamp_str:
+                try:
+                    timestamp = datetime.fromisoformat(timestamp_str)
+                except (ValueError, TypeError):
+                    timestamp = datetime.now()
+            else:
                 timestamp = datetime.now()
-        else:
-            timestamp = datetime.now()
-        if content and self.state_bridge.current_session:
-            self.state_bridge.current_session.final_content = content
-            self.state_bridge.current_session.final_reasoning = reasoning
-            self.state_bridge.current_session.final_timestamp = timestamp
-        if event_type == 'max_turns':
+            if content and self.state_bridge.current_session:
+                self.state_bridge.current_session.final_content = content
+                self.state_bridge.current_session.final_reasoning = reasoning
+                self.state_bridge.current_session.final_timestamp = timestamp
+        elif event_type == 'max_turns':
             self.session_lifecycle.state = ExecutionState.READY
             if self.gui_integration:
                 self.gui_integration.emit_status_message('Max turns reached')

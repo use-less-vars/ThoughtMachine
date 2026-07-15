@@ -690,7 +690,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
             </span>
             <span className="worker-output-warning-banner-text">
               <strong>{workerInfo.token_state}:</strong>{' '}
-              {workerInfo.warning_message || `Token usage is at ${workerInfo.token_state} level`}
+              Token count: {formatTokens(workerInfo.current_context_tokens ?? 0)}
             </span>
             <span className="worker-output-warning-banner-ctx">
               {formatTokens(workerInfo.current_context_tokens ?? 0)} / {formatTokens(workerInfo.critical_threshold ?? 0)} tokens

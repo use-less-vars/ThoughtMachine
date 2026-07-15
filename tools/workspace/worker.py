@@ -229,7 +229,8 @@ class WorkerBusAdapter:
         log('DEBUG', 'pipeline.worker_bus',
             f"[TOKEN_PIPELINE] WorkerBusAdapter.emit_state_sync: "
             f"worker={self.worker_name} context_length={context_length} "
-            f"token_state={token_state} warning={warning_message} threshold={critical_threshold}")
+            f"token_state={token_state} warning={warning_message} threshold={critical_threshold} "
+            f"recovered={recovered}")
         self._publish("worker_state_sync", data)
 
     def forward_agent_event(self, event: dict) -> None:

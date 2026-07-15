@@ -529,7 +529,8 @@ class WebAgentBridge:
                             'tokens_updated', 'context_updated',
                             'token_warning', 'turn_warning', 'time_warning',
                             'user_message', 'system_notification',
-                            'worker_state_sync']
+                            'worker_state_sync',
+                            ]
         log('DEBUG', 'pipeline.bridge',
             f"_subscribe_to_worker_bus [worker={worker_name}]: "
             f"subscribing to {len(subscribed_types)} event types: {subscribed_types}")

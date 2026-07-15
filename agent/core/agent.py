@@ -644,12 +644,7 @@ class Agent:
 
     def _add_to_conversation(self, message):
         """Add a message via conversation_manager (ensures cache invalidation)."""
-        # FORENSIC: Log every SYSTEM NOTIFICATION addition with its warning_id
-        if message.get('is_system_notification') and message.get('content', '').startswith('[SYSTEM NOTIFICATION]'):
-            wid = message.get('metadata', {}).get('warning_id', 'NO_ID')
-            import traceback as _tb
-            log('WARN', 'pipeline.forensic',
-                f"ADD_TO_CONVERSATION: warning_id={wid}, stack={'|'.join([f'{f.filename}:{f.lineno}' for f in _tb.extract_stack()[-6:-1]])}")
+
         updated = self.conversation_manager.add_message(message, self.conversation)
         self.conversation = updated
         # Validation: flag consistency check
@@ -693,19 +688,6 @@ class Agent:
             self.state.current_conversation_tokens += tool_tokens
             log('DEBUG', 'core.token', f'Tool result: +{tool_tokens} tokens, total={self.state.current_conversation_tokens}')
 
-        # Process any warnings or state changes from the token update
-        for event in self.state.update_token_state(self.state.current_conversation_tokens):
-            if event['type'] == 'token_warning':
-                # Buffer the warning instead of injecting immediately — it will be flushed
-                # after turn_transaction.commit() so it lands in correct chronological order.
-                warning_msg = Message(role='user', content=f'[SYSTEM NOTIFICATION] {event.get("warning_message", event.get("message", event.get("warning", "")))}', is_system_notification=True, metadata={'warning_id': str(uuid.uuid4())})
-                self._pending_warnings.append(warning_msg)
-                # Also buffer the raw event for yielding to event stream subscribers
-                self._add_conversation_data_to_event(event)
-                self._pending_warning_events.append(event)
-                log('DEBUG', 'core.token', f"warning buffered: state={self.state.token_state.value if hasattr(self.state, 'token_state') else 'N/A'}, count={len(self._pending_warnings)}")
-                log('DEBUG', '**pipeline.warning**', f"Warning buffered in _update_tokens_after_tool: state={self.state.token_state.value if hasattr(self.state, 'token_state') else 'N/A'}, count={len(self._pending_warnings)}")
-                warning_tokens = self._estimate_tokens(warning_msg)
         # Process any warnings or state changes from the token update
         for event in self.state.update_token_state(self.state.current_conversation_tokens):
             if event['type'] == 'token_warning':
@@ -1279,26 +1261,13 @@ class Agent:
                             recovery_event['type'] = 'context_cleared'
                             self._add_conversation_data_to_event(recovery_event)
                             yield recovery_event
-                        # Unified respond event — carries response_type so consumers
-                        # can distinguish 'answer' (no reply needed) from 'question' (waiting for user).
-                        respond_event = {
-                            'response_type': respond_result['response_type'] if respond_result else 'answer',
-                            'content': respond_result['content'] if respond_result else content,
-                            'turn': self._display_turn,
-                            'context_length': self.state.current_conversation_tokens,
-                            'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}
-                        }
-                        if reasoning is not None:
-                            respond_event['reasoning'] = reasoning
-                        elif tool_calls:
-                            respond_event['reasoning'] = ''
-                        self._add_conversation_data_to_event(respond_event)
-                        yield respond_event
+                        # Continue the turn loop — summary frees context, agent keeps working
                         turn_duration = time.time() - turn_start_time
                         if self.logger:
                             self.logger.log_system_resources()
                             self.logger.log_turn_complete(turn, {'input': last_input_tokens, 'output': last_output_tokens, 'duration_ms': turn_duration * 1000, 'context_tokens': self.state.current_conversation_tokens})
-                        return
+                        # Skip the 'if not tool_calls' check since we had tools (SummarizeTool)
+                        continue
                 pause_debug(f'Checking pause request after turn processing: _pause_requested={self._pause_requested}')
                 log('DEBUG', 'core.pause', f'PAUSE CHECKPOINT [3] after_turn: _pause_requested={self._pause_requested}')
                 if self._pause_requested:
@@ -1442,31 +1411,6 @@ class Agent:
         self._emergency_retries = 0
         return [ev for ev in token_events if ev['type'] == 'token_recovery']
 
-        # Phase 4 logging: after summarization
-        log('DEBUG', 'core.pruning', f'Conversation length after summarization: {len(self.conversation) if self.conversation else 0}')
-        if self.conversation:
-            dump_messages(self.conversation, "Conversation after summarization")
-        if hasattr(self, 'context_builder') and self.context_builder is not None and hasattr(self.context_builder, '_cached_context'):
-            self.context_builder._cached_context = None
-            log('DEBUG', 'core.context_builder', f'_apply_summary_pruning: cleared _cached_context')
-        if self.logger:
-            self.logger.log_conversation_prune(len(user_history) - 1, len(user_history), 'summary_pruning_append_only')
-        log('DEBUG', 'core.summary', f'Added summary to append-only history: kept {kept_turns_count} turns, inserted at index {insertion_idx}')
-        if self.logger and hasattr(self.logger, 'py_logger'):
-            log('INFO', 'core.agent', f'[PRUNING] Added summary to append-only history: kept {kept_turns_count} turns, inserted summary at index {insertion_idx}, history length: {len(user_history)} messages')
-        old_token_count = self.state.current_conversation_tokens
-        self._update_conversation_token_estimate()
-        # Immediately re-evaluate token state to clear restrictions if below critical
-        self.state.update_token_state(self.state.current_conversation_tokens)
-        log('INFO', 'core.token', f"post-summary: tokens={self.state.current_conversation_tokens}, token_state={self.state.token_state.value if hasattr(self.state, 'token_state') else 'N/A'}, turn_state={self.state.turn_state.value if hasattr(self.state, 'turn_state') else 'N/A'}, restrictions_active={self.state.restrictions_active}")
-        log('DEBUG', 'core.pruning', f'Summary pruning token change: {old_token_count} -> {self.state.current_conversation_tokens}, summary_idx={insertion_idx}, kept_turns={kept_turns_count}')
-        if self.logger and hasattr(self.logger, 'py_logger'):
-            log('INFO', 'core.agent', f'[PRUNING] Updated token estimate: {self.state.current_conversation_tokens} tokens (was {old_token_count})')
-        log('DEBUG', 'core.pruning', f'_apply_summary_pruning completed. History length: {len(user_history)} messages')
-        log('DEBUG', 'core.session_history', f'session.summary exists: {self.session.summary is not None}')
-        # Reset emergency mode after a successful summary
-        self.context_builder.emergency_mode = False
-        self._emergency_retries = 0
 
     def _apply_summary_pruning_fallback(self, summary: str, keep_recent_turns: int):
         """Fallback pruning for when no session is available (legacy behavior).
