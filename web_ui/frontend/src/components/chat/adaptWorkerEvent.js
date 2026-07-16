@@ -208,20 +208,27 @@ export default function adaptWorkerEvent(evt) {
     }
 
     // ── Context updated (live context token display) ────────────────────────
-    case 'context_updated': {
-      const ctxLen = evt.current_context_tokens
-      let content = `📊 Context: ${ctxLen != null ? (ctxLen >= 1000 ? (ctxLen / 1000).toFixed(1) + 'K' : String(ctxLen)) : '—'}`
-      if (evt.max_context_tokens) {
-        const maxDisplay = evt.max_context_tokens >= 1000 ? (evt.max_context_tokens / 1000).toFixed(1) + 'K' : String(evt.max_context_tokens)
-        content += ` / ${maxDisplay}`
-      }
+    // Suppressed — token count is already shown in the header via context_updated/tokens_updated
+    case 'context_updated':
+      return null
+
+    // ── Context cleared (worker memory freed) ───────────────────────
+    case 'context_cleared': {
+      const resp = evt.response || {}
       return {
         _id: eventId(evt),
         role: 'system',
-        content,
-        is_system_notification: false,
+        content: `🧹 Context freed — ${resp.message || 'worker memory cleared'}`,
+        is_system_notification: true,
       }
     }
+
+    // ── Tokens updated (live token count updates for the header only) ────
+    // Return null (no bubble) since context_updated already shows the context display.
+    // Token count changes are propagated via the header ctx: display, not as bubbles.
+    case 'tokens_updated':
+      return null
+
 
     // ── Token recovery (warning cleared) ───────────────────────
     case 'token_recovery': {

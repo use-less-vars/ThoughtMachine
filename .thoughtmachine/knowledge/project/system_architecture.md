@@ -4495,3 +4495,30 @@ Still to read: session/history_provider.py, web_ui/backend/bridge.py, web_ui/bac
 ### Files still to read
 - tools/workspace/worker.py: _run_tool_loop method (near line 981+), rest of emit_state_sync
 - agent/presenter/event_processor.py
+
+## 2026-07-16 — ## Event Pipeline Complete Trace — 5 Event Types
+
+### Key So...
+
+## Event Pipeline Complete Trace — 5 Event Types
+
+### Key Source Files Analyzed:
+- `agent/events.py` — All event types, EventBus, create_event(), event_class_map
+- `agent/core/state.py` — AgentState, update_token_state() with WARNING/CRITICAL/LOW transitions, update_turn_state()
+- `agent/core/agent.py` — process_query(), _update_tokens_after_tool(), _handle_state_event(), _create_token_update_event(), _apply_summary_pruning()
+- `agent/presenter/event_processor.py` — process_event() with all sub-processors, emit_* methods
+- `agent/presenter/state_bridge.py` — StateBridge with context_length/token tracking
+- `tools/workspace/worker.py` — WorkerThread._run_tool_loop(), WorkerBusAdapter (all emit_* and forward_agent_event), WorkerSessionLifecycle
+- `web_ui/backend/bridge.py` — _make_bus_handler(), _subscribe_to_worker_bus(), WebSocket forwarding
+- `web_ui/frontend/src/components/chat/adaptWorkerEvent.js` — Frontend event dispatch switch
+
+### Architecture Summary:
+Agent.process_query() is a generator that yields event dicts. These are consumed by either:
+- **Main agent path**: WebAgentBridge._agent_task() in bridge.py iterates process_query() and dispatches each event to WebSocket callbacks
+- **Worker path**: WorkerThread._run_tool_loop() in worker.py iterates process_query() and forwards selected events via WorkerBusAdapter → per-worker EventBus → bridge._make_bus_handler() → WebSocket
+
+### Insights:
+- Warnings are **buffered** in _pending_warning_events and flushed after turn_transaction.commit() so they appear chronologically after tool results and before the next assistant message
+- Worker events flow through **two parallel bus mechanisms**: the global EventBus (lifecycle events like WORKER_SPAWNED, WORKER_STATUS) and per-worker EventBus (detailed events like tool_call, token_warning)
+- The bridge deduplicates worker:context_updated events by comparing formatted display strings (e.g., "12.3K")
+- Worker-sourced token warnings are only forwarded via per-worker bus (Path A); global bus handler (Path B) skips source="worker" to avoid duplicates

@@ -286,6 +286,17 @@ class WorkerBusAdapter:
                 "recovery_message": str(event.get("recovery_message", "") or "")[:500],
             })
 
+        elif event_type == "context_summarized":
+            log('DEBUG', 'pipeline.worker_bus',
+                f"forward_agent_event: context_summarized [worker={self.worker_name}] "
+                f"message={event.get('message', '')[:100]}")
+            self._publish("context_summarized", {
+                "token_count": event.get("token_count", 0),
+                "message": str(event.get("message", "") or "")[:500],
+                "old_state": str(event.get("old_state", "")),
+                "new_state": str(event.get("new_state", "")),
+            })
+
         elif event_type == "token_recovery":
             log('DEBUG', 'pipeline.worker_bus',
                 f"forward_agent_event: token_recovery [worker={self.worker_name}] "
@@ -444,6 +455,21 @@ def get_worker_event_bus(session_id: str, worker_name: str) -> Any:
     key = (session_id or "", worker_name)
     with _bus_registry_lock:
         return _worker_event_bus_registry.get(key)
+
+
+def get_worker_event_buses_for_session(session_id: str) -> Dict[str, Any]:
+    """Return dict of {worker_name: EventBus} for all registered workers in a session.
+
+    Used by late-arriving bridges to discover already-running workers
+    whose WORKER_SPAWNED event was published before the bridge subscribed.
+    """
+    result: Dict[str, Any] = {}
+    with _bus_registry_lock:
+        for (sid, wname), bus in _worker_event_bus_registry.items():
+            if sid == (session_id or ""):
+                result[wname] = bus
+    return result
+
 
 # ---------------------------------------------------------------------------
 # Module-level worker registry  (persists across tool calls)
@@ -950,7 +976,6 @@ class WorkerThread(threading.Thread):
                     break
 
                 # [PIPELINE:HOPS] Cache the agent's authoritative post-prune token count
-                # and detect context summarization inline (token drop threshold)
                 if event_type == "token_update":
                     log('DEBUG', 'pipeline.hops',
                         f"[PIPELINE:HOPS] Received token_update event: "
@@ -960,18 +985,11 @@ class WorkerThread(threading.Thread):
                         f"total_output={event.get('total_output', '?')}")
                     context_length = event.get("context_length")
                     if context_length is not None:
-                        prev_tokens = self._cached_context_tokens or 0
                         self._cached_context_tokens = int(context_length)
 
                         # Emit to per-worker bus so the bridge forwards to frontend
                         if self._worker_bus_adapter is not None:
                             self._worker_bus_adapter.emit_context_updated(int(context_length))
-
-                        # Detect summarization: significant token drop indicates
-                        # the agent just called _apply_summary_pruning()
-                        if prev_tokens > 2000 and self._cached_context_tokens < prev_tokens * 0.60:
-                            log('DEBUG', 'tools.worker',
-                                f'Context summarization detected: {prev_tokens} -> {self._cached_context_tokens} tokens')
 
                 # Keep legacy tool_execution handler for backward compatibility
                 if event_type == "tool_execution":

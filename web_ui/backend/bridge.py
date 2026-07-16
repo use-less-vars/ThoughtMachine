@@ -236,6 +236,8 @@ class WebAgentBridge:
         self._worker_message_sub = None
         # Per-worker EventBus subscriptions (worker_name -> {event_type: sub_handle})
         self._worker_bus_subs: Dict[str, Dict[Any, Any]] = {}
+        # Track last context_length sent per worker for context_updated dedup
+        self._last_context_updated: Dict[str, str] = {}
         self._subscribe_to_security_events()
         self._subscribe_to_worker_events()
 
@@ -365,6 +367,39 @@ class WebAgentBridge:
 
         log('INFO', 'server.bridge', 'Subscribed to worker lifecycle events')
 
+        # Discover already-running workers (late-arriving bridge guard)
+        # This handles the case where workers were spawned before this bridge
+        # subscribed to WORKER_SPAWNED (e.g., second tab, reconnection).
+        if self._session_id:
+            self._discover_existing_workers(self._session_id)
+
+    def _discover_existing_workers(self, session_id: str) -> None:
+        """Discover and subscribe to per-worker EventBuses for already-running workers.
+
+        Handles late-arriving bridge: second tab, reconnection, or deferred bridge start
+        where WORKER_SPAWNED events were already published before this bridge existed.
+        Workers discovered here are subscribed the same way as via _on_worker_spawned.
+        """
+        if not session_id:
+            return
+        try:
+            from tools.workspace.worker import get_worker_event_buses_for_session
+            buses = get_worker_event_buses_for_session(session_id)
+            for worker_name, bus in buses.items():
+                if worker_name in self._worker_bus_subs:
+                    log('DEBUG', 'pipeline.bridge',
+                        f"[DISCOVERY] Already subscribed to {worker_name}, skipping")
+                    continue
+                log('INFO', 'server.bridge',
+                    f"[DISCOVERY] Found existing worker: {worker_name} \u2014 subscribing to per-worker bus")
+                self._subscribe_to_worker_bus(worker_name, bus)
+        except ImportError:
+            log('DEBUG', 'server.bridge',
+                "[DISCOVERY] get_worker_event_buses_for_session not available")
+        except Exception as e:
+            log('WARNING', 'server.bridge',
+                f"[DISCOVERY] Failed to discover existing workers: {e}")
+
     def _on_worker_token_warning(self, event: TokenWarningEvent) -> None:
         """Forward non-worker token warnings to the frontend as system notifications.
 
@@ -471,27 +506,34 @@ class WebAgentBridge:
                 f"_on_worker_spawned: SKIPPING (session mismatch)")
             return
 
-        # Subscribe to per-worker EventBus for detailed events
-        # This must happen regardless of _event_callbacks to avoid
-        # a race where the event arrives before any WebSocket client connects.
-        if worker_name and WORKER_BUS_AVAILABLE and get_worker_event_bus is not None:
-            worker_bus = get_worker_event_bus(session_id, worker_name)
-            if worker_bus is not None:
-                log('DEBUG', 'pipeline.bridge',
-                    f"_on_worker_spawned: found per-worker bus for {worker_name}, "
-                    f"subscribing to detailed events")
-                self._subscribe_to_worker_bus(worker_name, worker_bus)
-            else:
-                log('WARNING', 'server.bridge',
-                    f'Per-worker EventBus for {worker_name} (session={session_id}) not found '
-                    f'— detailed events (tool_call, tool_result, assistant_message) '
-                    f'will NOT be forwarded to the frontend. '
-                    f'This may be a race condition: worker bus registered before bridge subscribes.')
-                # DIAG: additional diagnostics for missing bus
-                log('WARNING', 'pipeline.bridge',
-                    f"_on_worker_spawned: worker_bus is None for {worker_name} "
-                    f"(session_id={session_id!r}). Check that register_worker_event_bus() "
-                    f"was called BEFORE the WORKER_SPAWNED event was published.")
+        # Guard against duplicate subscriptions — if already subscribed for this
+        # worker, skip re-subscribing to avoid duplicate events on the frontend.
+        if worker_name in self._worker_bus_subs:
+            log('DEBUG', 'pipeline.bridge',
+                f"_on_worker_spawned: already subscribed for {worker_name}, "
+                f"skipping duplicate subscription")
+        else:
+            # Subscribe to per-worker EventBus for detailed events
+            # This must happen regardless of _event_callbacks to avoid
+            # a race where the event arrives before any WebSocket client connects.
+            if worker_name and WORKER_BUS_AVAILABLE and get_worker_event_bus is not None:
+                worker_bus = get_worker_event_bus(session_id, worker_name)
+                if worker_bus is not None:
+                    log('DEBUG', 'pipeline.bridge',
+                        f"_on_worker_spawned: found per-worker bus for {worker_name}, "
+                        f"subscribing to detailed events")
+                    self._subscribe_to_worker_bus(worker_name, worker_bus)
+                else:
+                    log('WARNING', 'server.bridge',
+                        f'Per-worker EventBus for {worker_name} (session={session_id}) not found '
+                        f'— detailed events (tool_call, tool_result, assistant_message) '
+                        f'will NOT be forwarded to the frontend. '
+                        f'This may be a race condition: worker bus registered before bridge subscribes.')
+                    # DIAG: additional diagnostics for missing bus
+                    log('WARNING', 'pipeline.bridge',
+                        f"_on_worker_spawned: worker_bus is None for {worker_name} "
+                        f"(session_id={session_id!r}). Check that register_worker_event_bus() "
+                        f"was called BEFORE the WORKER_SPAWNED event was published.")
 
         # Forward the event to frontend callbacks (if any)
         if not self._event_callbacks:
@@ -526,8 +568,8 @@ class WebAgentBridge:
         # DIAG: Log what event types we plan to subscribe to
         subscribed_types = ['tool_call', 'tool_result',
                             'worker_message', 'assistant_message',
-                            'tokens_updated', 'context_updated', 'context_cleared',
-                            'token_warning', 'turn_warning', 'time_warning',
+                            'context_updated', 'context_cleared', 'context_summarized',
+                            'token_recovery', 'token_warning', 'turn_warning', 'time_warning',
                             'user_message', 'system_notification',
                             'worker_state_sync',
                             ]
@@ -563,13 +605,28 @@ class WebAgentBridge:
                         'worker_name': data.get('worker_name', worker_name),
                     }
                 elif original_type == 'context_updated':
+                    context_length_val = data.get('context_length', 0)
+                    # Format to match frontend display: X.XK for values >= 1000
+                    if context_length_val >= 1000:
+                        display_str = f"{context_length_val / 1000:.1f}K"
+                    else:
+                        display_str = str(context_length_val)
+                    # Event-level dedup: skip if same formatted display string already forwarded
+                    last_display = self._last_context_updated.get(worker_name)
+                    if last_display is not None and display_str == last_display:
+                        log('DEBUG', 'pipeline.bridge',
+                            f"Dedup context_updated for {worker_name}: "
+                            f"skipping duplicate context_length={context_length_val} "
+                            f"(display={display_str!r})")
+                        return
+                    self._last_context_updated[worker_name] = display_str
                     log('DEBUG', 'pipeline.hops',
                         f"[PIPELINE:HOPS] bridge forwarding context_updated: "
                         f"worker={worker_name} "
                         f"context_length={data.get('context_length', '?')}")
                     event_dict = {
                         'type': 'worker:context_updated',
-                        'context_length': data.get('context_length', 0),
+                        'context_length': context_length_val,
                         'source': 'worker',
                         'worker_name': data.get('worker_name', worker_name),
                         'timestamp': (
@@ -583,6 +640,18 @@ class WebAgentBridge:
                         'type': 'worker:context_cleared',
                         'worker_name': data.get('worker_name', worker_name),
                         'message': 'Context freed \u2014 worker memory cleared.',
+                        'timestamp': (
+                            event.metadata.timestamp.isoformat()
+                            if hasattr(event, 'metadata') and event.metadata
+                            else datetime.datetime.now().isoformat()
+                        ),
+                        'data': data,
+                    }
+                elif original_type == 'context_summarized':
+                    event_dict = {
+                        'type': 'worker:context_summarized',
+                        'worker_name': data.get('worker_name', worker_name),
+                        'message': data.get('message', 'Context has been summarized'),
                         'timestamp': (
                             event.metadata.timestamp.isoformat()
                             if hasattr(event, 'metadata') and event.metadata
@@ -668,6 +737,8 @@ class WebAgentBridge:
     def _unsubscribe_worker_bus(self, worker_name: str) -> None:
         """Unsubscribe all per-worker bus subscriptions for a worker."""
         subs = self._worker_bus_subs.pop(worker_name, {})
+        # Clean up context_updated dedup tracking
+        self._last_context_updated.pop(worker_name, None)
         if not subs:
             return
         for evt_type_key, (stored_evt_type, callback_fn) in subs.items():
@@ -1508,6 +1579,11 @@ class WebAgentBridge:
                 self._session_store.add_open_session(session_id)
             except Exception as e:
                 log('WARNING', 'server.bridge', f"Could not register open session: {e}")
+
+            # Discover already-running workers for this session
+            # (late-arriving bridge guard: workers may have been spawned
+            # between bridge.__init__ and load_session).
+            self._discover_existing_workers(session_id)
 
             return True
         except Exception as e:

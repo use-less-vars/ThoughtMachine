@@ -1269,6 +1269,12 @@ class Agent:
                             cleared_event = dict(recovery_event)
                             cleared_event['type'] = 'context_cleared'
                             yield cleared_event
+                            # Yield a context_summarized event so the frontend can show
+                            # the actual system notification text in the worker output panel.
+                            summarized_event = dict(recovery_event)
+                            summarized_event['type'] = 'context_summarized'
+                            summarized_event['message'] = 'Context has been summarized. You now have a fresh context window and full access to tools.'
+                            yield summarized_event
 
                         # Continue the turn loop — summary frees context, agent keeps working
                         turn_duration = time.time() - turn_start_time

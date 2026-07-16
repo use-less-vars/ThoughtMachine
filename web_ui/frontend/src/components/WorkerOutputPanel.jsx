@@ -298,19 +298,26 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
     }
 
     // ═══ DEDUP FILTERING — OUTSIDE setEvents, in the effect body ═══
-    const newOnes = relevantEvents
-      .filter(e => {
-        const rawType = e.type?.replace('worker:', '') || ''
-        // context_cleared events are synthetic noise; suppress them
-        if (rawType === 'context_cleared') {
-          console.log('[WorkerOutputPanel] Filtering out context_cleared (synthetic message)');
-          return false;
-        }
-        const key = makeDedupKey(rawType, e.timestamp)
-        console.warn('[DEDUP CHECK] rawType:', rawType, 'timestamp:', e.timestamp, 'key:', key, 'alreadySeen:', seenEventKeysRef.current.has(key));
-        return !seenEventKeysRef.current.has(key)
-      })
-      .map(e => {
+    // First, filter by dedup key (using raw event type).
+    const firstTimers = relevantEvents.filter(e => {
+      const rawType = e.type?.replace('worker:', '') || ''
+      // context_cleared events should be displayed in the worker output
+      if (rawType === 'context_cleared') {
+        console.log('[WorkerOutputPanel] context_cleared event passing through filter');
+      }
+      const key = makeDedupKey(rawType, e.timestamp)
+      console.warn('[DEDUP CHECK] rawType:', rawType, 'timestamp:', e.timestamp, 'key:', key, 'alreadySeen:', seenEventKeysRef.current.has(key));
+      return !seenEventKeysRef.current.has(key)
+    })
+
+    // ── Register dedup keys using the SAME rawType as the filter ──
+    for (const e of firstTimers) {
+      const rawType = e.type?.replace('worker:', '') || ''
+      seenEventKeysRef.current.add(makeDedupKey(rawType, e.timestamp))
+    }
+
+    // ── Transform filtered events to display format ──
+    const newOnes = firstTimers.map(e => {
         const eventType = e.type?.replace('worker:', '') || 'unknown'
         let request = e.request || {}
         let response = e.response || {}
@@ -380,6 +387,16 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
               response,
             }
           }
+          case 'token_recovery': {
+            const data = e.data || {}
+            response = { type: 'token_recovery', message: data.recovery_message || data.message || 'Token usage returned to safe levels' }
+            return {
+              event: 'token_recovery',
+              timestamp: e.timestamp,
+              request: {},
+              response,
+            }
+          }
           case 'user_message': {
             // Preserve user query text
             const data = e.data || {}
@@ -396,6 +413,30 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
               response: {},
               current_context_tokens: e.input ?? 0,
             }
+          case 'context_cleared':
+            console.log('[WorkerOutputPanel] context_cleared mapped to display event', { worker_name: e.worker_name })
+            return {
+              event: 'context_cleared',
+              timestamp: e.timestamp,
+              request: {},
+              response: {
+                message: e.message || 'Context freed — worker memory cleared',
+              },
+            }
+          case 'context_summarized': {
+            const data = e.data || {}
+            console.log('[WorkerOutputPanel] context_summarized mapped to display event', { message: e.message })
+            return {
+              event: 'system_notification',
+              timestamp: e.timestamp,
+              request: {},
+              response: {
+                type: 'context_summarized',
+                message: e.message || 'Context has been summarized. You now have a fresh context window and full access to tools.',
+                context_length: data.context_length || data.token_count || null,
+              },
+            }
+          }
           case 'context_updated':
             console.log('[TOKEN_PIPELINE] WorkerOutputPanel: context_updated mapped to display event', { context_length: e.context_length, worker_name: e.worker_name })
             return {
@@ -462,10 +503,8 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
         }
       })
 
-    // ═══ Register dedup keys for new events — in the effect body ═══
-    for (const evt of newOnes) {
-      seenEventKeysRef.current.add(makeDedupKey(evt.event, evt.timestamp))
-    }
+    // Dedup keys were registered above using rawType (matching the filter check).
+    // No separate registration loop needed here.
 
     // ═══ Bailout if nothing new ═══
     if (newOnes.length === 0) {
