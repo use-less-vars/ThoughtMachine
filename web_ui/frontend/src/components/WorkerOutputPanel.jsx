@@ -253,10 +253,8 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
                 return next;
               });
             }
-      if (eventType === 'context_updated') {
-        // context_updated events update the header only; do not render as a message
-        continue;
-      }
+      // context_updated events now render as message bubbles (see the .filter and .map sections below)
+      // The header update above still runs for live ctx: counter updates.
       // Always apply token updates to workerInfo (any event type may carry them)
       if (Object.keys(tokensUpdate).length > 0) {
         console.log('[PIPELINE:HOPS] WorkerOutputPanel: applying tokensUpdate to workerInfo', tokensUpdate)
@@ -303,9 +301,9 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
     const newOnes = relevantEvents
       .filter(e => {
         const rawType = e.type?.replace('worker:', '') || ''
-        // context_updated events are header-only; never render as messages
-        if (rawType === 'context_updated') {
-          console.log('[WorkerOutputPanel] Filtering out context_updated (header-only event)');
+        // context_cleared events are synthetic noise; suppress them
+        if (rawType === 'context_cleared') {
+          console.log('[WorkerOutputPanel] Filtering out context_cleared (synthetic message)');
           return false;
         }
         const key = makeDedupKey(rawType, e.timestamp)
@@ -408,17 +406,6 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
               current_context_tokens: e.context_length ?? 0,
             }
 
-          case 'context_cleared':
-            console.log('[TOKEN_PIPELINE] WorkerOutputPanel: context_cleared mapped to display event', { worker_name: e.worker_name })
-            return {
-              event: 'system_notification',
-              timestamp: e.timestamp,
-              request: {},
-              response: {
-                type: 'context_cleared',
-                message: e.message || 'Context freed \u2014 worker memory cleared.',
-              },
-            }
 
           case 'worker_state_sync':
             console.log('[TOKEN_PIPELINE] WorkerOutputPanel: worker_state_sync mapped to display event', {

@@ -207,14 +207,32 @@ export default function adaptWorkerEvent(evt) {
       }
     }
 
-    // ── Context cleared ───────────────────────────────────────────
-    case 'context_cleared':
+    // ── Context updated (live context token display) ────────────────────────
+    case 'context_updated': {
+      const ctxLen = evt.current_context_tokens
+      let content = `📊 Context: ${ctxLen != null ? (ctxLen >= 1000 ? (ctxLen / 1000).toFixed(1) + 'K' : String(ctxLen)) : '—'}`
+      if (evt.max_context_tokens) {
+        const maxDisplay = evt.max_context_tokens >= 1000 ? (evt.max_context_tokens / 1000).toFixed(1) + 'K' : String(evt.max_context_tokens)
+        content += ` / ${maxDisplay}`
+      }
       return {
-        _id: `context_cleared_${evt.timestamp || Date.now()}`,
+        _id: eventId(evt),
         role: 'system',
-        content: evt.response?.message || evt.message || 'Context freed \u2014 worker memory cleared.',
+        content,
+        is_system_notification: false,
+      }
+    }
+
+    // ── Token recovery (warning cleared) ───────────────────────
+    case 'token_recovery': {
+      const resp = evt.response || {}
+      return {
+        _id: eventId(evt),
+        role: 'system',
+        content: `✅ Token usage recovered: ${resp.message || 'Warning cleared'}`,
         is_system_notification: true,
       }
+    }
 
     // ── Lifecycle events ──────────────────────────────────────────
     case 'started':
