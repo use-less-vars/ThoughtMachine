@@ -963,6 +963,9 @@ class WorkerThread(threading.Thread):
                         prev_tokens = self._cached_context_tokens or 0
                         self._cached_context_tokens = int(context_length)
 
+                        # Emit to per-worker bus so the bridge forwards to frontend
+                        self._bus.emit_context_updated(int(context_length))
+
                         # Detect summarization: significant token drop indicates
                         # the agent just called _apply_summary_pruning()
                         if prev_tokens > 2000 and self._cached_context_tokens < prev_tokens * 0.60:
