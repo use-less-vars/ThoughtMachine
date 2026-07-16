@@ -13,7 +13,6 @@
  * (user_message / query are already shown in the main ChatPanel).
  */
 
-const SYSTEM_NOTIFICATION_EMOJI = '⚠️'
 const WORKER_STARTED_TEXT = '⬤ Worker started'
 const WORKER_COMPLETED_TEXT = '■ Worker completed'
 const WORKER_STOPPED_TEXT = '⏹ Worker stopped'
@@ -38,12 +37,8 @@ function eventId(evt) {
  */
 function tokenWarningMsg(evt) {
   const resp = evt.response || {}
-  const message = resp.message || ''
-  const tokenCount = resp.token_count
-  let content = `${SYSTEM_NOTIFICATION_EMOJI} ${message}`
-  if (tokenCount != null) {
-    content += ` (Tokens: ${tokenCount})`
-  }
+  // Use the original core message verbatim — the panel is a live view into the kernel
+  const content = resp.message || resp.warning_message || ''
   return {
     _id: eventId(evt),
     role: 'user',
@@ -57,12 +52,8 @@ function tokenWarningMsg(evt) {
  */
 function turnWarningMsg(evt) {
   const resp = evt.response || {}
-  const message = resp.message || ''
-  const turnCount = resp.turn_count
-  let content = `${SYSTEM_NOTIFICATION_EMOJI} ${message}`
-  if (turnCount !== undefined) {
-    content += ` (Turns: ${turnCount})`
-  }
+  // Use original core message verbatim
+  const content = resp.message || ''
   return {
     _id: eventId(evt),
     role: 'user',
@@ -76,12 +67,8 @@ function turnWarningMsg(evt) {
  */
 function timeWarningMsg(evt) {
   const resp = evt.response || {}
-  const message = resp.message || ''
-  const elapsed = resp.elapsed_seconds
-  let content = `${SYSTEM_NOTIFICATION_EMOJI} ${message}`
-  if (elapsed !== undefined) {
-    content += ` (Elapsed: ${elapsed}s)`
-  }
+  // Use original core message verbatim
+  const content = resp.message || ''
   return {
     _id: eventId(evt),
     role: 'user',
@@ -186,15 +173,11 @@ export default function adaptWorkerEvent(evt) {
       if (type === 'turn_warning') return turnWarningMsg(evt)
       if (type === 'time_warning') return timeWarningMsg(evt)
       if (type === 'context_summarized') {
-        const ctxLen = resp.context_length
-        let content = `${SYSTEM_NOTIFICATION_EMOJI} ${resp.message || 'Context summarized'}`
-        if (ctxLen !== undefined && ctxLen !== null) {
-          content += ` (Tokens: ${ctxLen})`
-        }
+        // Use original core message verbatim
         return {
           _id: eventId(evt),
           role: 'user',
-          content: content.trim(),
+          content: (resp.message || 'Context has been summarized. You now have a fresh context window and full access to tools.').trim(),
           is_system_notification: true,
         }
       }
@@ -202,7 +185,7 @@ export default function adaptWorkerEvent(evt) {
       return {
         _id: eventId(evt),
         role: 'user',
-        content: `${SYSTEM_NOTIFICATION_EMOJI} ${resp.message || 'System notification'}`,
+        content: (resp.message || 'System notification').trim(),
         is_system_notification: true,
       }
     }
@@ -227,7 +210,7 @@ export default function adaptWorkerEvent(evt) {
       return {
         _id: eventId(evt),
         role: 'system',
-        content: `✅ Token usage recovered: ${resp.message || 'Warning cleared'}`,
+        content: resp.message || 'Token usage has returned to safe levels after summarization.',
         is_system_notification: true,
       }
     }
@@ -406,7 +389,7 @@ export default function adaptWorkerEvent(evt) {
  * // → {
  * //     _id: '2026-07-01T12:02:00.000Zsystem_notification',
  * //     role: 'user',
- * //     content: '⚠️ Approaching context limit (Tokens: 120000)',
+ * //     content: 'Approaching context limit',
  * //     is_system_notification: true,
  * //   }
  *

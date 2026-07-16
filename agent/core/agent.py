@@ -1265,16 +1265,15 @@ class Agent:
                         for recovery_event in (recovery_events or []):
                             self._add_conversation_data_to_event(recovery_event)
                             yield recovery_event
-                            # Yield a context_summarized event so the frontend can show
-                            # the actual system notification text in the worker output panel.
-                            # Context_summarized is the canonical event; the old
-                            # context_cleared event was removed to avoid triple-notification
-                            # storms (token_recovery + context_cleared + context_summarized
-                            # for a single summary action).
-                            summarized_event = dict(recovery_event)
-                            summarized_event['type'] = 'context_summarized'
-                            summarized_event['message'] = 'Context has been summarized. You now have a fresh context window and full access to tools.'
-                            yield summarized_event
+
+                        # Yield a context_summarized event so the frontend can show
+                        # the actual system notification text in the worker output panel.
+                        # Context_summarized is the canonical event; the old
+                        # context_cleared event was removed to avoid triple-notification
+                        # storms (token_recovery + context_cleared + context_summarized
+                        # for a single summary action).
+                        summarized_event = {'type': 'context_summarized', 'message': 'Context has been summarized. You now have a fresh context window and full access to tools.'}
+                        yield summarized_event
 
                         # Continue the turn loop — summary frees context, agent keeps working
                         turn_duration = time.time() - turn_start_time
