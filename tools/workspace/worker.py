@@ -275,17 +275,6 @@ class WorkerBusAdapter:
                 "context_length": event.get("context_length", 0),
             })
 
-        elif event_type == "context_cleared":
-            log('DEBUG', 'pipeline.worker_bus',
-                f"forward_agent_event: context_cleared [worker={self.worker_name}] "
-                f"token_count={event.get('token_count', 0)}")
-            self._publish("context_cleared", {
-                "token_count": event.get("token_count", 0),
-                "old_state": str(event.get("old_state", "")),
-                "new_state": str(event.get("new_state", "")),
-                "recovery_message": str(event.get("recovery_message", "") or "")[:500],
-            })
-
         elif event_type == "context_summarized":
             log('DEBUG', 'pipeline.worker_bus',
                 f"forward_agent_event: context_summarized [worker={self.worker_name}] "

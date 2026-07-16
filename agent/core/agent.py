@@ -1258,19 +1258,19 @@ class Agent:
                         log('DEBUG', '**pipeline.token_update**', f"Token update after summary pruning: tokens={self.state.current_conversation_tokens}")
                         yield self._create_token_update_event()
                         # Yield the original recovery events (token_recovery) unchanged,
-                        # followed by a context_cleared event so the frontend knows to
-                        # refresh.  Previously the type was overwritten, which meant
-                        # EventProcessor._process_token_recovery_event was never called
-                        # and the recovery message was lost.
+                        # followed by a context_summarized event so the frontend can show
+                        # the meaningful notification text.  The context_summarized event
+                        # replaces the old context_cleared event (which was redundant
+                        # since context_summarized carries a richer message).
                         for recovery_event in (recovery_events or []):
                             self._add_conversation_data_to_event(recovery_event)
                             yield recovery_event
-                            # Also yield a context_cleared variant for frontend refresh
-                            cleared_event = dict(recovery_event)
-                            cleared_event['type'] = 'context_cleared'
-                            yield cleared_event
                             # Yield a context_summarized event so the frontend can show
                             # the actual system notification text in the worker output panel.
+                            # Context_summarized is the canonical event; the old
+                            # context_cleared event was removed to avoid triple-notification
+                            # storms (token_recovery + context_cleared + context_summarized
+                            # for a single summary action).
                             summarized_event = dict(recovery_event)
                             summarized_event['type'] = 'context_summarized'
                             summarized_event['message'] = 'Context has been summarized. You now have a fresh context window and full access to tools.'

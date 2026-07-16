@@ -212,16 +212,7 @@ export default function adaptWorkerEvent(evt) {
     case 'context_updated':
       return null
 
-    // ── Context cleared (worker memory freed) ───────────────────────
-    case 'context_cleared': {
-      const resp = evt.response || {}
-      return {
-        _id: eventId(evt),
-        role: 'system',
-        content: `🧹 Context freed — ${resp.message || 'worker memory cleared'}`,
-        is_system_notification: true,
-      }
-    }
+
 
     // ── Tokens updated (live token count updates for the header only) ────
     // Return null (no bubble) since context_updated already shows the context display.

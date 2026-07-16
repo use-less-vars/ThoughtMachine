@@ -301,10 +301,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
     // First, filter by dedup key (using raw event type).
     const firstTimers = relevantEvents.filter(e => {
       const rawType = e.type?.replace('worker:', '') || ''
-      // context_cleared events should be displayed in the worker output
-      if (rawType === 'context_cleared') {
-        console.log('[WorkerOutputPanel] context_cleared event passing through filter');
-      }
+
       const key = makeDedupKey(rawType, e.timestamp)
       console.warn('[DEDUP CHECK] rawType:', rawType, 'timestamp:', e.timestamp, 'key:', key, 'alreadySeen:', seenEventKeysRef.current.has(key));
       return !seenEventKeysRef.current.has(key)
@@ -413,17 +410,9 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
               response: {},
               current_context_tokens: e.input ?? 0,
             }
-          case 'context_cleared':
-            console.log('[WorkerOutputPanel] context_cleared mapped to display event', { worker_name: e.worker_name })
-            return {
-              event: 'context_cleared',
-              timestamp: e.timestamp,
-              request: {},
-              response: {
-                message: e.message || 'Context freed — worker memory cleared',
-              },
-            }
+
           case 'context_summarized': {
+            console.log('[TRACE:context_summarized] arrived in WorkerOutputPanel', e);
             const data = e.data || {}
             console.log('[WorkerOutputPanel] context_summarized mapped to display event', { message: e.message })
             return {

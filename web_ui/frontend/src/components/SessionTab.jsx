@@ -543,7 +543,6 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
       case 'worker:worker_message':
       case 'worker:tokens_updated':
       case 'worker:context_updated':
-      case 'worker:context_cleared':
       case 'worker:token_recovery':
       case 'worker:worker_state_sync':
         console.log('[TOKEN_PIPELINE] SessionTab: worker_state_sync received', msg);

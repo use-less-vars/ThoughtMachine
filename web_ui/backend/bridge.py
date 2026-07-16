@@ -635,18 +635,6 @@ class WebAgentBridge:
                             else datetime.datetime.now().isoformat()
                         ),
                     }
-                elif original_type == 'context_cleared':
-                    event_dict = {
-                        'type': 'worker:context_cleared',
-                        'worker_name': data.get('worker_name', worker_name),
-                        'message': 'Context freed \u2014 worker memory cleared.',
-                        'timestamp': (
-                            event.metadata.timestamp.isoformat()
-                            if hasattr(event, 'metadata') and event.metadata
-                            else datetime.datetime.now().isoformat()
-                        ),
-                        'data': data,
-                    }
                 elif original_type == 'context_summarized':
                     event_dict = {
                         'type': 'worker:context_summarized',
