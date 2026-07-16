@@ -964,7 +964,8 @@ class WorkerThread(threading.Thread):
                         self._cached_context_tokens = int(context_length)
 
                         # Emit to per-worker bus so the bridge forwards to frontend
-                        self._bus.emit_context_updated(int(context_length))
+                        if self._worker_bus_adapter is not None:
+                            self._worker_bus_adapter.emit_context_updated(int(context_length))
 
                         # Detect summarization: significant token drop indicates
                         # the agent just called _apply_summary_pruning()

@@ -245,6 +245,13 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
                 eventType, context_length: e.context_length, critical_threshold: e.critical_threshold,
                 effective_max: tokensUpdate.max_context_tokens, worker_name: e.worker_name,
               });
+              // Apply token updates to workerInfo BEFORE the continue
+              // so the ctx: header updates live. The continue below only
+              // prevents rendering context_updated as a message bubble.
+              setWorkerInfo(prev => {
+                const next = prev ? { ...prev, ...tokensUpdate } : { ...tokensUpdate };
+                return next;
+              });
             }
       if (eventType === 'context_updated') {
         // context_updated events update the header only; do not render as a message
