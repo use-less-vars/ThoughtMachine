@@ -1226,6 +1226,114 @@ class TestWorkerConfigForwarding:
         assert perms.network == 'banned'
         assert perms.execution == 'banned'
 
+    def test_worker_overrides_warning_threshold(
+        self, tmp_path: Path
+    ) -> None:
+        """Worker definition warning_threshold_tokens should propagate as
+        token_monitor_warning_threshold in the worker's AgentConfig.
+        When not set, falls back to parent config value."""
+        from tools.workspace.worker import WorkerThread
+
+        # --- Test: explicit override ---
+        wt = WorkerThread(
+            name="test-warning-threshold",
+            definition={
+                "warning_threshold_tokens": 30000,
+            },
+            agent_config={
+                "provider": "scripted",
+                "model": "mock-model",
+                "api_key": "sk-test",
+                "token_monitor_warning_threshold": 65000,
+            },
+            workspace_dir=tmp_path,
+            tool_classes={},
+            session_permissions={},
+            project_root=None,
+            timeout_seconds=30,
+        )
+        agent_cfg = wt._build_agent_config()
+        assert agent_cfg is not None
+        assert agent_cfg.token_monitor_warning_threshold == 30000, (
+            f"Expected 30000, got {agent_cfg.token_monitor_warning_threshold}"
+        )
+
+        # --- Test: no override, falls back to parent config ---
+        wt2 = WorkerThread(
+            name="test-no-warning-override",
+            definition={},  # no warning_threshold_tokens
+            agent_config={
+                "provider": "scripted",
+                "model": "mock-model",
+                "api_key": "sk-test",
+                "token_monitor_warning_threshold": 50000,
+            },
+            workspace_dir=tmp_path,
+            tool_classes={},
+            session_permissions={},
+            project_root=None,
+            timeout_seconds=30,
+        )
+        agent_cfg2 = wt2._build_agent_config()
+        assert agent_cfg2 is not None
+        assert agent_cfg2.token_monitor_warning_threshold == 50000, (
+            f"Expected 50000 (fallback), got {agent_cfg2.token_monitor_warning_threshold}"
+        )
+
+    def test_worker_overrides_critical_threshold(
+        self, tmp_path: Path
+    ) -> None:
+        """Worker definition critical_threshold_tokens should propagate as
+        token_monitor_critical_threshold in the worker's AgentConfig.
+        When not set, falls back to parent config value."""
+        from tools.workspace.worker import WorkerThread
+
+        # --- Test: explicit override ---
+        wt = WorkerThread(
+            name="test-critical-threshold",
+            definition={
+                "critical_threshold_tokens": 120000,
+            },
+            agent_config={
+                "provider": "scripted",
+                "model": "mock-model",
+                "api_key": "sk-test",
+                "token_monitor_critical_threshold": 80000,
+            },
+            workspace_dir=tmp_path,
+            tool_classes={},
+            session_permissions={},
+            project_root=None,
+            timeout_seconds=30,
+        )
+        agent_cfg = wt._build_agent_config()
+        assert agent_cfg is not None
+        assert agent_cfg.token_monitor_critical_threshold == 120000, (
+            f"Expected 120000, got {agent_cfg.token_monitor_critical_threshold}"
+        )
+
+        # --- Test: no override, falls back to parent config ---
+        wt2 = WorkerThread(
+            name="test-no-critical-override",
+            definition={},  # no critical_threshold_tokens
+            agent_config={
+                "provider": "scripted",
+                "model": "mock-model",
+                "api_key": "sk-test",
+                "token_monitor_critical_threshold": 90000,
+            },
+            workspace_dir=tmp_path,
+            tool_classes={},
+            session_permissions={},
+            project_root=None,
+            timeout_seconds=30,
+        )
+        agent_cfg2 = wt2._build_agent_config()
+        assert agent_cfg2 is not None
+        assert agent_cfg2.token_monitor_critical_threshold == 90000, (
+            f"Expected 90000 (fallback), got {agent_cfg2.token_monitor_critical_threshold}"
+        )
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # Token estimation tests

@@ -3085,6 +3085,31 @@ agent = Agent(config, session=ctx, event_bus=NullEventBus())
   3. After final event
 - When paused, yields 'paused' event and returns control to consumer.
 
+## 2026-07-17 — ## 2026-07-17 — Worker-Level Pause/Resume Implementation
+
+Th...
+
+## 2026-07-17 — Worker-Level Pause/Resume Implementation
+
+The worker-level pause/resume system wraps the agent-level `request_pause()` in a full lifecycle managed by `WorkerThread` (`tools/workspace/worker.py`):
+
+**Two-layer signalling:**
+1. **In-memory fast path:** `threading.Event` objects (`_pause_event`, `_resume_event`) for instant signalling within the same process
+2. **Cross-process file path:** `command.json` with `{"action":"pause"}` or `{"action":"resume"}` for web UI → worker communication
+
+**Checkpoints in the worker run loop (`run()`):**
+- After `_run_tool_loop()` returns, checks `_pause_event.is_set()`
+- If paused: saves context, sends response, blocks in `_resume_event.wait(1.0)` loop
+- If stopped during pause: breaks outer loop (stop wins over pause)
+- If resumed: sets status to "ready", clears resume event, continues loop
+
+**API endpoints** in `workspace_routes.py`:
+- `POST .../pause` — writes command.json + status.json, calls `thread.pause()`
+- `POST .../resume` — writes command.json + status.json, calls `thread.resume()`
+
+The full lifecycle is documented in the "Cooperative Pause/Resume" section of this KB.
+
+
 ## Q8: Error Handling
 
 **File: agent/core/agent.py (process_query lines ~1020-1081)**
@@ -4522,3 +4547,433 @@ Agent.process_query() is a generator that yields event dicts. These are consumed
 - Worker events flow through **two parallel bus mechanisms**: the global EventBus (lifecycle events like WORKER_SPAWNED, WORKER_STATUS) and per-worker EventBus (detailed events like tool_call, token_warning)
 - The bridge deduplicates worker:context_updated events by comparing formatted display strings (e.g., "12.3K")
 - Worker-sourced token warnings are only forwarded via per-worker bus (Path A); global bus handler (Path B) skips source="worker" to avoid duplicates
+
+## 2026-07-17 — ## Cooperative Pause/Resume — Full Codebase Analysis
+
+### Ke...
+
+## Cooperative Pause/Resume — Full Codebase Analysis
+
+### Key Files
+- **`tools/workspace/worker.py`** (2140 lines): WorkerThread class (lines 545-1420)
+  - `__init__()` (560-624): Has `self._stop_event = threading.Event()` at line 624
+  - `stop()` (716-726): Sets `_stop_event`, writes `command.json` with `{"action": "stop"}`, unblocks `_input_queue`
+  - `_poll_command()` (728-750): Checks `command.json` for `"action": "stop"`, sets `_stop_event`, unblocks queue
+  - `_run_tool_loop()` (843-996): Polls `_poll_command()` on each event, checks `_stop_event.is_set()`, calls `self._agent.request_pause()`, breaks
+  - `run()` (1000-1277): Main loop - polls command before blocking on input queue, creates Agent lazily, processes queries. On exception sets `status="error"`. On else/normal exit sets `status="completed"`. No pause handling yet.
+  - `status` field: `"ready" | "busy" | "completed" | "error"` (line 599)
+  
+- **`web_ui/backend/workspace_routes.py`** (659 lines): REST API
+  - `stop_worker()` (580-658): Finds worker dir, writes `command.json` with `{"action": "stop"}`, immediately writes `status.json` with `runtime_status: "completed"`, fast-path signals in-memory thread via `thread.stop()`
+
+- **`web_ui/backend/PAUSE_PROPAGATION_DESIGN.md`**: Existing design doc (file-based approach)
+
+### Design Decision: threading.Event-based Approach
+Instead of file-based `command.json` approach (which relies on 2-second polling latency), use a dedicated `threading.Event` for pause signalling:
+- Add `self._pause_event = threading.Event()` to `__init__()` - clean, instant, race-condition-free
+- `_poll_command()`: handle `"action": "pause"` → set `_pause_event` instead of `_stop_event`
+- New `pause()` method: set `_pause_event`, write `command.json` for cross-process, unblock `_input_queue`
+- New `resume()` method: clear `_pause_event`, write status as `"ready"`
+- `_run_tool_loop()`: check both `_pause_event` and `_stop_event`
+- `run()`: preserve `"paused"` status in except/else blocks
+- API endpoint: `POST /{ws_id}/workers/{name}/pause` and `POST /{ws_id}/workers/{name}/resume`
+
+
+## 2026-07-17 — ## 2026-07-17 — Implementation Details (Post-Review)
+
+### Wo...
+
+## 2026-07-17 — Implementation Details (Post-Review)
+
+### WorkerThread Changes (`tools/workspace/worker.py`)
+
+**New fields** (all `threading.Event`):
+- `self._pause_event = threading.Event()` — set when pause is requested, cleared on resume
+- `self._resume_event = threading.Event()` — set on resume, cleared on pause
+
+**New methods:**
+- `pause()` — sets `_pause_event`, clears `_resume_event`, writes `{"action":"pause"}` to `command.json`, unblocks `_input_queue` so the run loop can detect the event
+- `resume()` — clears `_pause_event`, sets `_resume_event`, sets `self.status = "ready"`, writes status file
+
+**Modified `_poll_command()`** — now handles `"action": "pause"` (same pattern as stop):
+  ```python
+  elif action == "pause":
+      cmd_path.unlink(missing_ok=True)
+      self._pause_event.set()
+      self._input_queue.put(None)
+  ```
+
+**Modified `_run_tool_loop()` (line ~947):** — after the tool loop body, checks `_pause_event.is_set()`:
+  1. Calls `self._agent.request_pause()` to signal the agent to yield
+  2. Sets `self.status = "paused"`
+  3. Writes status file (optimistic UI)
+  4. Publishes `worker_paused` event via `_publish_event()`
+  5. Returns a pause response JSON to the caller
+
+**Modified `run()` (line ~1222):** — after `_run_tool_loop` returns, if paused:
+  1. Preserves `"paused"` status (does NOT overwrite with `"ready"`)
+  2. Writes status file
+  3. Publishes `worker_paused` event to per-worker AND global event bus
+  4. Saves conversation context via `_save_context()`
+  5. Sends pause response to `_output_queue`
+  6. **Blocks** in a wait loop: `while self._pause_event.is_set() and not self._stop_event.is_set(): self._resume_event.wait(1.0)`
+  7. If stopped during pause → loop breaks
+  8. If resumed → sets `status = "ready"`, clears `_resume_event`, publishes `worker_resumed` event, continues outer loop
+
+**When NOT paused:** existing flow unchanged (status → `"ready"`, saves context, sends reply, continues loop)
+
+### API Endpoints (`web_ui/backend/workspace_routes.py`)
+
+**`POST /api/workspace/{ws_id}/workers/{name}/pause`** (line 663):
+  - Resolves worker directory in both `session/{session_id}/workers/{name}/` and `workers/{name}/` layouts
+  - Atomic-writes `{"action":"pause"}` to `command.json`
+  - Immediately writes status.json with `runtime_status: "paused"` (optimistic UI)
+  - Fast path: if thread found in registry, calls `thread.pause()` directly
+  
+**`POST /api/workspace/{ws_id}/workers/{name}/resume`** (line 741):
+  - Same directory resolution
+  - Atomic-writes `{"action":"resume"}` to `command.json` (for consistency; resume uses in-memory path)
+  - Immediately writes status.json with `runtime_status: "ready"`
+  - Fast path: calls `thread.resume()` directly
+
+### Status Values
+The worker status enum now supports: `"ready" | "busy" | "paused" | "completed" | "error"`
+
+### Lifecycle Flow
+```
+                     pause()
+ready ──── query ────► busy ────► paused ──── resume() ────► ready
+                        │                                      ▲
+                        └── stop() ────► completed              │
+                        └── error ────► error                   │
+                                                                └── spawn again
+```
+- Pause is *cooperative*: the agent finishes its current tool call/turn before yielding
+- While paused, the worker blocks in the `run()` loop's wait loop, checking `_resume_event` every 1s
+- Stop takes priority: if stop is requested while paused, the break condition exits the wait loop
+- Context is saved before entering the pause wait, so paused state survives process restart
+- Cross-process signalling via `command.json` enables pause/resume from the web UI
+
+
+## 2026-07-17 — ## Chunk 1 — Forensics Complete: Pause & Stop Button Deep Di...
+
+## Chunk 1 — Forensics Complete: Pause & Stop Button Deep Dive
+
+### Q1: Main Panel Pause Button — End-to-End Trace
+
+**START → QueryBar.jsx (lines 23–65)**
+- `handleToggle()` called when user clicks "⏸ Pause" button (rendered at line 102 when `status === 'RUNNING'`)
+- Line 55: `sendCommand('pause_session', {})` — empty object payload
+
+**WebSocket transport:**
+- QueryBar's `sendCommand` prop is passed down from SessionTab
+- SessionTab owns a session-scoped WebSocket to `ws://host:8000/ws`
+- sendCommand serializes to JSON `{"command": "pause_session"}` and sends via the WS
+
+**server.py handler (lines 548–552):**
+```python
+elif command == "pause_session":
+    if bridge is not None:
+        bridge.pause()
+        await ws.send_json({"type": "status_message", "text": "⏸ Paused."})
+```
+
+**bridge.py — WebAgentBridge.pause() (lines 1056–1073):**
+Three actions:
+1. **V2 Controller**: `self._controller.pause()` if controller exists
+2. **Legacy agent**: `self._agent.request_pause()` + clears `_pause_event`
+3. **ALL session workers**: Iterates `_worker_registry` for matching `session_id`, calls `thread.pause()` on each
+
+**Key insight**: Session-wide pause — main agent AND all sub-workers pause cooperatively.
+
+---
+
+### Q2: Worker Stop Button — End-to-End Trace (two locations)
+
+**Location A — WorkerManagementPanel.jsx (lines 586–617):**
+- `handleStop(name)` via REST: `POST /api/workspace/{ws_id}/workers/{name}/stop`
+- Optimistic state: sets `runtime_status` to `'stopped'` immediately
+- List rows have stop buttons enabled when status is `busy`, `ready`, or falsy
+
+**Location B — WorkerOutputPanel.jsx (lines 610–633 + 813–817):**
+- Same REST POST to `/api/workspace/{ws_id}/workers/{name}/stop`
+- Has cross-session guard: blocks stop if `workerInfo.session_id !== sessionId`
+- `canStop = runtimeStatus === 'busy' || runtimeStatus === 'ready'`
+- Stop button rendered in bottom bar: `<button className="worker-output-stop-btn">⏹ Stop</button>`
+
+**workspace_routes.py — stop_worker() (line 580+):**
+1. Writes `{"action": "stop"}` to worker's `command.json` (file-based signal, polled by worker thread)
+2. Writes `status.json` with `runtime_status: "completed"` for immediate UI feedback
+3. Falls back to in-memory stop via thread registry if available
+
+**bridge.py — WebAgentBridge.stop() (lines 1096–1104):**
+- Unregisters bridge, unsubscribes security & worker events
+- Sets `_stop_event` and `_pause_event` (unblocks if paused)
+
+---
+
+### Q3: Purpose Comparison — Pause vs Stop
+
+| Aspect | Main Pause (`pause_session`) | Worker Stop (REST API) |
+|---|---|---|
+| Transport | WebSocket (bidirectional) | HTTP POST (request-response) |
+| Scope | Session-wide (agent + ALL workers) | Single named worker |
+| Semantics | COOPERATIVE — requests pause after current turn | TERMINAL — file signal + thread kill |
+| Resumable? | YES — via `continue_session` / `resume_session` | NO — terminal stop |
+| UI location | QueryBar "⏸ Pause" button | WorkerManagementPanel rows + WorkerOutputPanel bottom bar |
+| Worker registry | Iterates all workers for this session_id | Only the named worker by name |
+
+**Conclusion:** They serve completely different purposes. `pause_session` is a cooperative, resumable suspension of the entire session (agent + workers). Worker stop is a terminal shutdown of a single worker, used when a specific sub-worker is misbehaving or no longer needed.
+
+## 2026-07-17 — ## Chunk 2 — Backend Signal Routing (Complete)
+
+### Q4: Main...
+
+## Chunk 2 — Backend Signal Routing (Complete)
+
+### Q4: Main pause signal routing
+
+**bridge.py pause() — lines 1061-1076 (full method):**
+```python
+def pause(self) -> None:
+    if self._controller is not None:
+        self._controller.pause()       # V2 path
+    else:
+        if not self.is_running:
+            return
+        self._pause_event.clear()       # Legacy: block the main loop
+        if self._agent is not None:
+            self._agent.request_pause() # Legacy: tell agent to pause
+    # ALWAYS runs (after either branch) — pauses ALL workers for this session:
+    if WORKER_BUS_AVAILABLE and _worker_registry is not None:
+        with _registry_lock:
+            for (sid, wname), thread in list(_worker_registry.items()):
+                if sid == self._session_id:
+                    thread.pause()
+```
+
+**Three actions AFTER the if/else:**
+1. Worker iteration via `_worker_registry` (same `(session_id, worker_name)` tuple keys)
+2. Guarded by `WORKER_BUS_AVAILABLE and _worker_registry is not None`
+3. Matches by `sid == self._session_id` → calls `thread.pause()` on all matching
+
+**Import is FIXED — bridge.py lines 86-99:**
+```python
+try:
+    from tools.workspace.worker import (
+        shutdown_workers, get_worker_event_bus, register_worker_event_bus,
+        unregister_worker_event_bus, _worker_registry, _registry_lock
+    )
+    WORKER_BUS_AVAILABLE = True
+except ImportError:
+    ...
+    _worker_registry = None
+    _registry_lock = None
+    WORKER_BUS_AVAILABLE = False
+```
+`_worker_registry` is successfully imported from `tools.workspace.worker`, where it's defined at line 467-468 as `_worker_registry: dict = {}` and `_registry_lock = threading.Lock()`. Keys are `(session_id, worker_name)` tuples — consistent with the iteration in `pause()`.
+
+**self._controller is AgentController** from `/workspace/agent/controller/__init__.py`:
+- Line 14: `class AgentController`
+- Line 475-502: `pause()` and `resume()` methods
+- `controller.pause()` (line 475-496): Clears `pause_event`, sets `_pause_requested = True`, emits `execution_state_change` event with `PAUSING`, calls `self.agent.request_pause()`, cleans orphaned tool messages. **DOES NOT touch worker registry** — worker pausing is only in bridge.pause().
+- `controller.resume()` (line 502-514): Sets `pause_event`, clears `_pause_requested`, clears `agent._pause_requested`. **No worker logic.**
+
+**Legacy `self._agent.request_pause()`** — called in the else branch of bridge.pause(). Also the V2 path `controller.pause()` calls `self.agent.request_pause()` internally. Both signal the agent to pause after current turn.
+
+### Q5: Worker stop signal routing
+
+**workspace_routes.py stop_worker() — lines 580-658:**
+1. **Finds worker directory** — session-scoped (`workers/<session_id>/<name>/`) or legacy (`workers/<name>/`)
+2. **Writes `command.json`** with `{"action": "stop"}` — file signal polled by worker thread
+3. **Writes `status.json`** with `{"runtime_status": "completed", "current_task": null, ...}` — immediate UI visual update
+4. **Calls `thread.stop()`** on matching registry entries (matched by `wname == name`)
+
+```python
+with _registry_lock:
+    for (sid, wname), thread in list(_worker_registry.items()):
+        if wname == name:
+            thread.stop()
+```
+
+Note: Matches on `wname` only (not session_id), so it can stop workers across sessions.
+
+**WorkerThread.stop() — worker.py lines 719-728:**
+```python
+def stop(self) -> None:
+    self._stop_event.set()
+    try:
+        cmd_path = self._worker_dir / "command.json"
+        cmd_path.write_text(json.dumps({"action": "stop"}), encoding="utf-8")
+    except OSError:
+        pass
+    self._input_queue.put(None)
+```
+- Sets `_stop_event`
+- Writes `command.json {"action": "stop"}` (belt-and-suspenders with file-based signaling)
+- Unblocks input queue by putting None
+- **Does NOT touch `_pause_event`** — it's a terminal stop, not a resume-from-pause
+
+**WorkerThread.pause() — worker.py lines 731-742:**
+```python
+def pause(self) -> None:
+    self._pause_event.set()
+    self._resume_event.clear()
+    try:
+        cmd_path = self._worker_dir / "command.json"
+        cmd_path.write_text(json.dumps({"action": "pause"}), encoding="utf-8")
+    except OSError:
+        pass
+    self._input_queue.put(None)
+```
+
+**WorkerThread.resume() — worker.py lines 744-749:**
+```python
+def resume(self) -> None:
+    self._pause_event.clear()
+    self._resume_event.set()
+    self.status = "ready"
+    self._write_status_file()
+```
+
+**Polling loop — `_poll_command()` worker.py lines 756-778:**
+Reads `command.json`, handles `"stop"` and `"pause"` actions (deletes file, sets events, unblocks queue).
+
+### Q6: Why aren't they unified?
+
+**1. bridge.pause() DOES now call thread.pause() on workers.** The import is fixed. The code:
+```python
+if WORKER_BUS_AVAILABLE and _worker_registry is not None:
+    with _registry_lock:
+        for (sid, wname), thread in list(_worker_registry.items()):
+            if sid == self._session_id:
+                thread.pause()
+```
+This correctly pauses all workers in the session. ✅
+
+**2. Worker stop is a TERMINAL (HARD) stop.** It sets `_stop_event` and `command.json {"action": "stop"}`. The worker thread loop checks `_stop_event` on every iteration and breaks out. It does NOT set `_pause_event` — no resumption path. It's a one-way door: once stopped, the worker thread exits permanently.
+
+**3. Is there a gap?** The main pause button (`bridge.pause()`) now correctly pauses workers via `thread.pause()` — this is the RESUMPTIVE path. Worker stop (`thread.stop()`) is the TERMINAL path. They are architecturally distinct by design:
+- **Pause** = cooperative suspension (set `_pause_event`, clear `_resume_event`, write `command.json {"action": "pause"}`)
+- **Stop** = terminal exit (set `_stop_event`, write `command.json {"action": "stop"}`)
+- They are NOT redundant and should NOT be unified — they serve different session lifecycle phases.
+
+## 2026-07-17 — ## Chunk 3 — Complete Forensic Investigation
+
+### Q7: proces...
+
+## Chunk 3 — Complete Forensic Investigation
+
+### Q7: process_query() pause checkpoints (3 locations)
+
+**Checkpoint [1] — turn_start (agent.py ~line 883-897):**
+```python
+# At top of each turn loop iteration
+if self.stop_check and self.stop_check():
+    events = self.state.set_execution_state(ExecutionState.PAUSING)
+    for event in events:
+        for yielded_event in self._handle_state_event(event):
+            yield yielded_event
+    # yields 'stopped' event, returns
+```
+- Uses `self.stop_check` callable (config.stop_check — set externally by controller)
+- Conversation untouched: no turn has started, nothing committed
+- Yields: `execution_state_change` (from _handle_state_event) + `stopped`
+
+**Checkpoint [2] — after_llm (agent.py ~line 1138-1179):**
+```python
+if self._pause_requested:
+    if tool_calls:
+        # DEFER: _pause_requested stays True, checkpoint [3] catches it later
+    else:
+        # GRACE TURN: commit assistant message BEFORE pausing
+        assistant_msg = {'role': 'assistant', 'content': content, ...}  # no tool_calls
+        grace_tx = TurnTransaction(session, context_builder, conversation)
+        grace_tx.add_assistant_message(assistant_msg)
+        grace_tx.commit()  # → extends session.user_history immediately
+        events = self.state.set_execution_state(ExecutionState.PAUSING)
+        # yields execution_state_change + paused events, returns
+```
+- **No tool_calls**: Grace turn committed (assistant message saved to user_history)
+- **Has tool_calls**: Deferred — _pause_requested stays True, will be caught at [3]
+
+**Checkpoint [3] — after_turn (agent.py ~line 1277-1300):**
+```python
+if self._pause_requested:
+    events = self.state.set_execution_state(ExecutionState.PAUSING)
+    # yields execution_state_change + paused events, returns
+```
+- At this point `turn_transaction.commit()` already called (tool results + assistant in conversation)
+- Full turn data already saved
+
+### Q8: Complete event stream (typical turn with tool calls)
+
+```
+user_query (from process_query start)
+token_update (after user msg estimate)
+[if time warning] time_warning + token_update
+[if turn warning] turn_warning + token_update
+token_update (after turn state checks)
+[if token warning] token_warning + token_update
+turn (carries content + tool_calls metadata)
+  ── LLM call happens here ──
+  [checkpoint 2: pause check]
+token_update (after commit_assistant_only)
+  ── tool_executor.execute_tool_calls() runs ──
+  turn_transaction.commit() (all tool results committed to history)
+  for each tool: tool_call event
+  for each tool: tool_result event
+  [flush pending warnings]
+  [if final_detected] agent_responded
+  [if summary_text] context_summarized
+  [checkpoint 3: pause check]
+  [if no tool_calls] agent_responded
+```
+
+### Q9: Conversation state when pause is yielded
+
+**Pause at [1] (turn_start via stop_check):**
+- Conversation is EXACTLY as it was at end of last turn
+- NO new messages added — this check is at the very top of the loop
+- Event yields: `execution_state_change` (PAUSING) → `stopped`
+
+**Pause at [2] (after_LLM, no tool_calls):**
+- Conversation has: last turn's messages + user query for this turn + assistant response (saved via grace_tx.commit())
+- Grace turn: assistant_msg = {'role': 'assistant', 'content': content} — NO tool_calls
+- Event yields: state events → `execution_state_change` (PAUSING) → `paused`
+
+**Pause at [3] (after_turn, had tool_calls):**
+- Conversation has: all messages from full turn (assistant with tool_calls + tool results)
+- `turn_transaction.commit()` already called before checkpoint check
+- Event yields: state events → `execution_state_change` (PAUSING) → `paused`
+
+**Pause at [2] deferred (had tool_calls):**
+- Same as [3] — full turn committed before yielding pause
+
+### TurnTransaction atomic buffer (turn_transaction.py)
+
+- **Buffered**: assistant_message + tool_calls_buffer (list of tool call/result msgs)
+- **Two-phase commit** for tool turns:
+  1. `commit_assistant_only()` — commits assistant message immediately after LLM call (before any events)
+  2. `commit()` — commits tool results (or everything if assistant not pre-committed)
+- **Rollback**: clears buffer; cannot rollback committed transaction
+- On pause at [2] (no tools): `commit()` called on grace_tx (assistant only)
+- On pause at [3]: normal `commit()` already called before checkpoint
+
+### _add_to_conversation (agent.py ~line 645)
+```
+def _add_to_conversation(self, message):
+    updated = self.conversation_manager.add_message(message, self.conversation)
+    self.conversation = updated
+    # validates is_system_notification flag consistency
+    # invalidates context_builder._cached_context
+```
+- Delegates to conversation_manager.add_message()
+- Updates conversation property (which for session assigns back to session.user_history)
+- Validates system notification flags
+- Invalidates context_builder cache
+
+### conversation property (agent.py ~line 536-560)
+- Getter: returns session.user_history when session exists, else _conversation
+- Setter: replaces session.user_history contents in-place and calls _on_conversation_changed()
+- Ensures HistoryProvider cache is invalidated on mutation

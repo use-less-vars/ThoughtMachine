@@ -602,15 +602,14 @@ class Agent:
                 log('DEBUG', 'core.token', f'Token recovery event: {event.get("recovery_message", "")}')
             self._add_conversation_data_to_event(event)
             yield event
+        elif event.get('type') == 'context_summarized':
+            if self.logger:
+                log('DEBUG', 'core.token', 'Context summarized event after summarization')
+            self._add_conversation_data_to_event(event)
+            yield event
         elif event.get('type') == 'context_cleared':
             if self.logger:
                 log('DEBUG', 'core.token', 'Context cleared event after summarization')
-            self._add_conversation_data_to_event(event)
-            yield event
-            old_state = event.get('old_state')
-            new_state = event.get('new_state')
-            if self.logger:
-                log('DEBUG', 'core.agent', f'Session state change: {old_state} -> {new_state}')
             self._add_conversation_data_to_event(event)
             yield event
     def _update_conversation_token_estimate(self):
