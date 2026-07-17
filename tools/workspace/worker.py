@@ -1290,6 +1290,21 @@ class WorkerThread(threading.Thread):
                         except Exception:
                             pass
 
+                    # Drain stale None/unblock signals from input queue.
+                    # These are left behind by pause() or _poll_command()
+                    # when the worker was busy in _run_tool_loop.  Without
+                    # this drain, the main loop interprets them as stop
+                    # signals (line 1172) and exits immediately after resume.
+                    try:
+                        while True:
+                            item = self._input_queue.get_nowait()
+                            if item is not None:
+                                # Real query — put it back in front
+                                self._input_queue.put(item)
+                                break
+                    except queue.Empty:
+                        pass
+
                     # Continue the outer loop to wait for next query
                     continue
 
@@ -1830,13 +1845,70 @@ class Worker(ToolBase):
 
         # Prevent duplicate spawns (session-scoped key)
         session_key = self.session_id or ""
+        resume_paused_worker = None
         with _registry_lock:
             existing = _worker_registry.get((session_key, self.worker_name))
             if existing is not None and existing.is_alive():
-                return {
-                    "error": f"Worker '{self.worker_name}' is already running",
-                    "status": existing.status,
-                }
+                if existing.status == "paused":
+                    # Paused worker — auto-resume and re-route the new query.
+                    # This allows the main agent to seamlessly re-query a
+                    # paused worker without manual stop/resume steps.
+                    resume_paused_worker = existing
+                else:
+                    return {
+                        "error": f"Worker '{self.worker_name}' is already running",
+                        "status": existing.status,
+                    }
+
+        if resume_paused_worker is not None:
+            # Resume the paused worker and send the new query.
+            # We do this outside the registry lock to avoid holding it
+            # while waiting for the output queue (which can take minutes).
+            query = (
+                self.context.get("query", "")
+                if isinstance(self.context, dict)
+                else str(self.context or "")
+            )
+            resume_paused_worker.resume()
+
+            # Drain stale None signals left by pause() in the input queue.
+            # The worker thread will pick up our real query below.
+            try:
+                while True:
+                    item = resume_paused_worker._input_queue.get_nowait()
+                    if item is not None:
+                        # Real query queued by someone else — put it back,
+                        # then append ours after it.
+                        resume_paused_worker._input_queue.put(item)
+                        break
+            except queue.Empty:
+                pass
+
+            resume_paused_worker._input_queue.put(query)
+            effective_timeout = (
+                self.timeout_seconds
+                if self.timeout_seconds is not None
+                else 600
+            )
+            try:
+                final_result = resume_paused_worker._output_queue.get(timeout=effective_timeout)
+            except queue.Empty:
+                final_result = json.dumps({
+                    "error": f"Worker '{self.worker_name}' did not respond within {effective_timeout}s",
+                    "note": "Worker timed out. The paused worker was resumed but did not produce a response.",
+                })
+            try:
+                parsed = json.loads(final_result) if final_result else {}
+            except (json.JSONDecodeError, TypeError):
+                parsed = {"response": final_result}
+            if not isinstance(parsed, dict):
+                parsed = {"response": str(parsed)}
+            parsed.setdefault("worker_name", self.worker_name)
+            parsed.setdefault("spawned", True)
+            elapsed = resume_paused_worker._last_elapsed()
+            if elapsed is not None:
+                parsed["elapsed_seconds"] = round(elapsed, 1)
+            return parsed
 
         # Permission gate check
         gate_error = self._check_worker_permissions(
