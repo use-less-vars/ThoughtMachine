@@ -12,6 +12,7 @@ const STATUS_DOT = {
   completed: { bg: '#6c7086', label: 'Completed' }, /* muted grey — done */
   error: { bg: '#f38ba8', label: 'Error' },       /* red — failed */
   stopped: { bg: '#313244', label: 'Stopped' },   /* dark/off — not spawned */
+  paused: { bg: '#f0ad4e', label: 'Paused' },      /* amber — paused by user */
 };
 
 function statusDotColor(status) {
@@ -291,6 +292,20 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
         console.log('[PIPELINE:HOPS] WorkerOutputPanel: setWorkerInfo worker_error', { error: e.data?.error })
         setWorkerInfo(prev => {
           const update = { runtime_status: 'error', error: e.data?.error || '' };
+          if (!prev) return update;
+          return { ...prev, ...update };
+        })
+      } else if (eventType === 'worker_paused') {
+        console.log('[PIPELINE:HOPS] WorkerOutputPanel: setWorkerInfo worker_paused')
+        setWorkerInfo(prev => {
+          const update = { runtime_status: 'paused' };
+          if (!prev) return update;
+          return { ...prev, ...update };
+        })
+      } else if (eventType === 'worker_resumed') {
+        console.log('[PIPELINE:HOPS] WorkerOutputPanel: setWorkerInfo worker_resumed')
+        setWorkerInfo(prev => {
+          const update = { runtime_status: 'ready' };
           if (!prev) return update;
           return { ...prev, ...update };
         })

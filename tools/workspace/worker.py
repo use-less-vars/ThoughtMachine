@@ -551,10 +551,11 @@ class WorkerThread(threading.Thread):
     Lifecycle
     ---------
     ready  ──spawn──▶  ready  ──query──▶  busy  ──done──▶  ready
-      ▲                    │                                  │
-      │                    ├──stop──▶  completed               │
-      │                    └──error──▶  error                  │
-      └───────────────────────────  spawn again  ◄─────────────┘
+      ▲                    │            │                   │
+      │                    ├──stop──▶  completed            │
+      │                    ├──pause──▶ paused ──resume──▶  ready
+      │                    └──error──▶  error               │
+      └───────────────────────────  spawn again  ◄──────────┘
     """
 
     def __init__(
@@ -596,7 +597,7 @@ class WorkerThread(threading.Thread):
         )
 
         # Runtime state
-        self.status: str = "ready"      # ready | busy | completed | error
+        self.status: str = "ready"      # ready | busy | paused | completed | error
         self.current_task: Optional[str] = None
         self.error: Optional[str] = None
         self.last_heartbeat: Optional[str] = None
@@ -622,6 +623,8 @@ class WorkerThread(threading.Thread):
         self._input_queue: queue.Queue = queue.Queue()
         self._output_queue: queue.Queue = queue.Queue()
         self._stop_event = threading.Event()
+        self._pause_event = threading.Event()
+        self._resume_event = threading.Event()
 
     # ── public API called from the tool thread ─────────────────────
 
@@ -725,6 +728,26 @@ class WorkerThread(threading.Thread):
         # Unblock the input queue wait
         self._input_queue.put(None)
 
+    def pause(self) -> None:
+        """Signal the worker to pause after completing its current task."""
+        self._pause_event.set()
+        self._resume_event.clear()
+        # Write command file for cross-process signalling
+        try:
+            cmd_path = self._worker_dir / "command.json"
+            cmd_path.write_text(json.dumps({"action": "pause"}), encoding="utf-8")
+        except OSError:
+            pass
+        # Unblock the input queue wait so it can check the pause event
+        self._input_queue.put(None)
+
+    def resume(self) -> None:
+        """Resume a paused worker."""
+        self._pause_event.clear()
+        self._resume_event.set()
+        self.status = "ready"
+        self._write_status_file()
+
     def _poll_command(self) -> None:
         """
         Check for a ``command.json`` file in the worker's directory.
@@ -738,9 +761,14 @@ class WorkerThread(threading.Thread):
             return
         try:
             data = json.loads(cmd_path.read_text(encoding="utf-8"))
-            if data.get("action") == "stop":
+            action = data.get("action")
+            if action == "stop":
                 cmd_path.unlink(missing_ok=True)
                 self._stop_event.set()
+                self._input_queue.put(None)
+            elif action == "pause":
+                cmd_path.unlink(missing_ok=True)
+                self._pause_event.set()
                 self._input_queue.put(None)
         except (json.JSONDecodeError, OSError):
             # Corrupted file — delete and ignore
@@ -808,6 +836,11 @@ class WorkerThread(threading.Thread):
         worker_cfg["max_turns"] = self.definition.get(
             "max_turns", cfg.get("max_turns", 100)
         )
+        # Override token monitor warning threshold from worker definition
+        warning_threshold = self.definition.get("warning_threshold_tokens", None)
+        if warning_threshold is not None:
+            worker_cfg["token_monitor_warning_threshold"] = warning_threshold
+
         # Override token monitor critical threshold from worker definition
         critical_threshold = self.definition.get("critical_threshold_tokens", None)
         if critical_threshold is not None:
@@ -912,6 +945,18 @@ class WorkerThread(threading.Thread):
                     final_content = json.dumps({
                         "status": "stopped",
                         "message": "Worker stopped by user",
+                    })
+                    break
+
+                # Check pause signal
+                if self._pause_event.is_set():
+                    self._agent.request_pause()
+                    self.status = "paused"
+                    self._write_status_file()
+                    self._publish_event('worker_paused', {'status': 'paused', 'worker_name': self.worker_name})
+                    final_content = json.dumps({
+                        "status": "paused",
+                        "message": "Worker paused by user",
                     })
                     break
 
@@ -1178,7 +1223,77 @@ class WorkerThread(threading.Thread):
                     except Exception:
                         pass
                 reply = self._run_tool_loop(query)
-                # Back to ready after query completes
+
+                # Check if worker was paused during the tool loop
+                if self._pause_event.is_set():
+                    # Preserve paused status — don't overwrite with "ready"
+                    self.status = "paused"
+                    self._write_status_file()
+                    self._publish_event('worker_paused', {'status': 'paused', 'worker_name': self.worker_name})
+                    # Also publish to global_event_bus so the bridge receives it
+                    if global_event_bus is not None and EventType is not None and create_event is not None:
+                        try:
+                            evt = create_event(
+                                EventType.WORKER_STATUS,
+                                data={
+                                    "session_id": self.session_id or "",
+                                    "worker_name": self.worker_name,
+                                    "status": "paused",
+                                    "current_context_tokens": self.get_current_context_tokens(),
+                                    "max_context_tokens": self.max_context_tokens,
+                                },
+                                source=f"worker:{self.worker_name}",
+                                session_id=self.session_id or "",
+                            )
+                            global_event_bus.publish(evt)
+                        except Exception:
+                            pass
+
+                    self.current_task = None
+                    self.last_heartbeat = datetime.now(timezone.utc).isoformat()
+
+                    # Persist context before blocking
+                    if self._worker_ctx is not None:
+                        self._worker_ctx.compact_after_summary()
+                    self._save_context()
+
+                    # Send the pause response back to the waiting tool call
+                    self._output_queue.put(reply)
+
+                    # Block until resumed (or stopped)
+                    while self._pause_event.is_set() and not self._stop_event.is_set():
+                        self._resume_event.wait(1.0)
+
+                    if self._stop_event.is_set():
+                        break
+
+                    # Resume — transition back to ready
+                    self.status = "ready"
+                    self._resume_event.clear()
+                    self._write_status_file()
+                    self._publish_event('worker_resumed', {'status': 'ready', 'worker_name': self.worker_name})
+                    if global_event_bus is not None and EventType is not None and create_event is not None:
+                        try:
+                            evt = create_event(
+                                EventType.WORKER_STATUS,
+                                data={
+                                    "session_id": self.session_id or "",
+                                    "worker_name": self.worker_name,
+                                    "status": "ready",
+                                    "current_context_tokens": self.get_current_context_tokens(),
+                                    "max_context_tokens": self.max_context_tokens,
+                                },
+                                source=f"worker:{self.worker_name}",
+                                session_id=self.session_id or "",
+                            )
+                            global_event_bus.publish(evt)
+                        except Exception:
+                            pass
+
+                    # Continue the outer loop to wait for next query
+                    continue
+
+                # Back to ready after query completes (not paused)
                 self.status = "ready"
                 self._write_status_file()
                 self._publish_event('worker_status', {'status': 'ready'})

@@ -16,6 +16,8 @@
 const WORKER_STARTED_TEXT = '⬤ Worker started'
 const WORKER_COMPLETED_TEXT = '■ Worker completed'
 const WORKER_STOPPED_TEXT = '⏹ Worker stopped'
+const WORKER_PAUSED_TEXT = '⏸ Worker paused'
+const WORKER_RESUMED_TEXT = '▶ Worker resumed'
 const UNKNOWN_EVENT_TEXT = 'Unknown event: '
 
 /**
@@ -237,6 +239,22 @@ export default function adaptWorkerEvent(evt) {
         _id: eventId(evt),
         role: 'system',
         content: WORKER_STOPPED_TEXT,
+        is_system_notification: true,
+      }
+
+    case 'paused':
+      return {
+        _id: eventId(evt),
+        role: 'system',
+        content: WORKER_PAUSED_TEXT,
+        is_system_notification: true,
+      }
+
+    case 'resumed':
+      return {
+        _id: eventId(evt),
+        role: 'system',
+        content: WORKER_RESUMED_TEXT,
         is_system_notification: true,
       }
 

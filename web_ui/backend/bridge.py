@@ -84,13 +84,18 @@ from session.store import FileSystemSessionStore
 
 # Worker lifecycle — graceful shutdown of worker threads on session close
 try:
-    from tools.workspace.worker import shutdown_workers, get_worker_event_bus, register_worker_event_bus, unregister_worker_event_bus
+    from tools.workspace.worker import (
+        shutdown_workers, get_worker_event_bus, register_worker_event_bus,
+        unregister_worker_event_bus, _worker_registry, _registry_lock
+    )
     WORKER_BUS_AVAILABLE = True
 except ImportError:
     shutdown_workers = None  # type: ignore
     get_worker_event_bus = None
     register_worker_event_bus = None
     unregister_worker_event_bus = None
+    _worker_registry = None
+    _registry_lock = None
     WORKER_BUS_AVAILABLE = False
 
 # ── Workspace ID cache ──────────────────────────────────────────────────────
@@ -1049,24 +1054,44 @@ class WebAgentBridge:
         self._query_queue.put(query)
 
     def pause(self) -> None:
-        """Request the agent to pause after the current turn."""
+        """Request the agent to pause after the current turn and pause all workers."""
         if self._controller is not None:
             self._controller.pause()
-            return
-        if not self.is_running:
-            return
-        self._pause_event.clear()
-        if self._agent is not None:
-            self._agent.request_pause()
+        else:
+            if not self.is_running:
+                return
+            self._pause_event.clear()
+            if self._agent is not None:
+                self._agent.request_pause()
+        # Pause all workers for this session
+        if WORKER_BUS_AVAILABLE and _worker_registry is not None:
+            with _registry_lock:
+                for (sid, wname), thread in list(_worker_registry.items()):
+                    if sid == self._session_id:
+                        try:
+                            thread.pause()
+                            log('INFO', 'server.bridge', f'Worker paused: {wname}')
+                        except Exception as exc:
+                            log('WARNING', 'server.bridge', f'Failed to pause worker {wname}: {exc}')
 
     def resume(self) -> None:
-        """Resume a paused agent."""
+        """Resume a paused agent and all its workers."""
         if self._controller is not None:
             self._controller.resume()
-            return
-        self._pause_event.set()
-        if self._agent is not None:
-            self._agent._pause_requested = False
+        else:
+            self._pause_event.set()
+            if self._agent is not None:
+                self._agent._pause_requested = False
+        # Resume all workers for this session
+        if WORKER_BUS_AVAILABLE and _worker_registry is not None:
+            with _registry_lock:
+                for (sid, wname), thread in list(_worker_registry.items()):
+                    if sid == self._session_id:
+                        try:
+                            thread.resume()
+                            log('INFO', 'server.bridge', f'Worker resumed: {wname}')
+                        except Exception as exc:
+                            log('WARNING', 'server.bridge', f'Failed to resume worker {wname}: {exc}')
 
     def stop(self) -> None:
         """Request the agent to stop (finishes current operation then exits)."""

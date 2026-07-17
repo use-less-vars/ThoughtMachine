@@ -55,6 +55,14 @@ class WorkerDefinition(BaseModel):
         default=None,
         description="LLM temperature override for this worker."
     )
+    warning_threshold_tokens: Optional[int] = Field(
+        default=65000,
+        description=(
+            'Token count threshold for warning state. '
+            'Used as ``token_monitor_warning_threshold`` in this '
+            'worker\'s AgentConfig. Defaults to 65000.'
+        )
+    )
     critical_threshold_tokens: Optional[int] = Field(
         default=80000,
         description=(

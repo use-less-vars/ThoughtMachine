@@ -45,6 +45,17 @@
 
 ## Browser DevTools Verification
 
+### 7. Pause / Resume
+- [ ] While a worker is running, trigger pause (via API or internal mechanism)
+- [ ] Verify worker status transitions to "paused"
+- [ ] Verify worker stops processing and waits
+- [ ] While paused, trigger resume
+- [ ] Verify worker status transitions back to "ready"
+- [ ] Verify worker can process new queries after resume
+- [ ] Verify paused worker can be stopped (stop overrides pause)
+- [ ] Verify pause/resume works across WebSocket (status updates reflected in UI)
+
+
 Open browser DevTools > Network > WS (WebSocket) and look for messages to `ws://localhost:8000/ws/{session_id}`.
 
 Expected WebSocket message types for workers:
