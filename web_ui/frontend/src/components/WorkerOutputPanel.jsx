@@ -427,7 +427,6 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
             }
 
           case 'context_summarized': {
-            console.log('[TRACE:context_summarized] arrived in WorkerOutputPanel', e);
             const data = e.data || {}
             console.log('[WorkerOutputPanel] context_summarized mapped to display event', { message: e.message })
             return {
