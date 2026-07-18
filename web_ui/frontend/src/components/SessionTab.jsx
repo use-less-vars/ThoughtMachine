@@ -546,8 +546,6 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
       case 'worker:context_summarized':
       case 'worker:context_cleared':
       case 'worker:token_recovery':
-      case 'worker:worker_state_sync':
-        console.log('[TOKEN_PIPELINE] SessionTab: worker_state_sync received', msg);
         // For worker:tokens_updated, also update the token counter display
         // (belt-and-suspenders — the bridge should flatten to 'tokens_updated',
         //  but if it doesn't, this ensures the counter still updates).

@@ -825,46 +825,6 @@ describe('worker_error', () => {
   });
 });
 
-// ==========================================================================
-// 16. worker_state_sync
-// ==========================================================================
-describe('worker_state_sync', () => {
-  it('returns system msg with empty content and is_worker_event flag', () => {
-    const evt = makeEvent({ event: 'worker_state_sync' });
-    const result = adaptWorkerEvent(evt);
-    expect(result).not.toBeNull();
-    expect(result._id).toBe(eventId(evt));
-    expect(result.role).toBe('system');
-    expect(result.content).toBe('');
-    expect(result.is_worker_event).toBe(true);
-    // Ensure is_system_notification is NOT set so EMPTY EVENT FILTER catches it
-    expect(result.is_system_notification).toBeUndefined();
-  });
-
-  it('includes session_id and worker_name in _id when present', () => {
-    const evt = makeEvent({
-      event: 'worker_state_sync',
-      session_id: 'sess_abc',
-      worker_name: 'my-worker',
-      response: { context_length: 5000, token_state: 'LOW' },
-    });
-    const result = adaptWorkerEvent(evt);
-    expect(result._id).toBe('sess_abc_my-worker_2026-07-09T12:00:00.000Z_worker_state_sync');
-    expect(result.content).toBe('');
-    expect(result.is_worker_event).toBe(true);
-  });
-
-  it('handles missing request and response', () => {
-    const evt = makeEvent({ event: 'worker_state_sync' });
-    delete evt.request;
-    delete evt.response;
-    const result = adaptWorkerEvent(evt);
-    expect(result._id).toBe(eventId(evt));
-    expect(result.role).toBe('system');
-    expect(result.content).toBe('');
-    expect(result.is_worker_event).toBe(true);
-  });
-});
 
 // ==========================================================================
 // 17. default (unknown event)

@@ -270,19 +270,6 @@ export default function adaptWorkerEvent(evt) {
         is_system_notification: true,
       }
     }
-    // ── Worker state sync (real-time token/context warnings from per-worker bus) ────────
-    // Return a placeholder msg that keeps the event in the pipeline (so side-channel
-    // updates to workerInfo still flow) but produces no visible bubble: empty content
-    // and no is_system_notification flag mean the EMPTY EVENT FILTER in the render
-    // loop (WorkerOutputPanel.jsx) suppresses this during rendering.
-    case 'worker_state_sync':
-      return {
-        _id: eventId(evt),
-        role: 'system',
-        content: '',
-        is_worker_event: true,
-        data: evt.data || evt,  // Pass through original data for status bar
-      }
 
     // ── Worker lifecycle events (from WebSocket bridge ONLY) ────────────
     // These events are published to the global_event_bus by worker.py and

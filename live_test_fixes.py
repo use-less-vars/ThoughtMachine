@@ -230,12 +230,10 @@ lines = full_output.split("\n")
 emit_sync_lines = [l for l in lines if "[TOKEN_PIPELINE] WorkerBusAdapter.emit_state_sync:" in l]
 emit_forward_lines = [l for l in lines if "[TOKEN_PIPELINE] WorkerBusAdapter.forward_agent_event:" in l]
 dedup_trace_lines = [l for l in lines if "emit_state_sync SKIPPED" in l]
-publish_lines = [l for l in lines if "_publish SUCCESS" in l and "worker_state_sync" in l]
 
 log("  [TOKEN_PIPELINE] emit_state_sync calls:           " + str(len(emit_sync_lines)))
 log("  [TOKEN_PIPELINE] forward_agent_event calls:       " + str(len(emit_forward_lines)))
 log("  Duplicate skip (dedup) messages:                  " + str(len(dedup_trace_lines)))
-log("  Actual _publish SUCCESS (worker_state_sync):      " + str(len(publish_lines)))
 log("")
 
 # Show key dedup lines

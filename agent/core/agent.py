@@ -1261,7 +1261,6 @@ class Agent:
                         # duplicate "Token usage has returned to safe levels" + "Context has been
                         # summarized" messages in the worker panel.  context_summarized alone
                         # is sufficient: it carries the meaningful user-facing message, while
-                        # worker_state_sync updates the header token display.
                         # (context_cleared was already removed for the same reason)
                         summarized_event = {'type': 'context_summarized', 'message': 'Context has been summarized. You now have a fresh context window and full access to tools.'}
                         yield summarized_event

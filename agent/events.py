@@ -79,7 +79,6 @@ class EventType(enum.Enum):
     ERROR_OCCURRED = 'error_occurred'
     CONFIG_CHANGED = 'config_changed'
     CONVERSATION_CHANGED = 'conversation_changed'
-    WORKER_STATE_SYNC = 'worker_state_sync'
     TOKEN_RECOVERY = 'token_recovery'
     CONTEXT_CLEARED = 'context_cleared'
     CONTEXT_SUMMARIZED = 'context_summarized'

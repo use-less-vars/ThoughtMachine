@@ -79,6 +79,8 @@ except ImportError:
     WorkerMessageEvent = None
     EVENT_SYSTEM_AVAILABLE = False
 
+from thoughtmachine.workspace_registry import WorkspaceRegistry
+
 from session.models import Session
 from session.store import FileSystemSessionStore
 
@@ -107,8 +109,8 @@ _workspace_cache_lock = threading.Lock()
 
 def _build_workspace_id_cache() -> Dict[str, str]:
     """
-    Scan ``~/.thoughtmachine/workspaces/<id>/config.json`` and build a
-    cache of ``normalised_workspace_root → workspace_id``.
+    Build an in-memory cache mapping project roots to workspace IDs
+    by reading from the centralised workspace registry.
 
     Called once on first resolution; subsequent calls return the cached dict.
     """
@@ -116,26 +118,10 @@ def _build_workspace_id_cache() -> Dict[str, str]:
         if _workspace_id_cache:
             return _workspace_id_cache
         try:
-            from pathlib import Path as _Path
-            import json as _json
-            base = _Path("~").expanduser() / ".thoughtmachine" / "workspaces"
-            if not base.is_dir():
-                return _workspace_id_cache
-            for entry in sorted(base.iterdir()):
-                if not entry.is_dir():
-                    continue
-                config_file = entry / "config.json"
-                if not config_file.is_file():
-                    continue
-                try:
-                    data = _json.loads(config_file.read_text(encoding="utf-8"))
-                    root = data.get("root", "")
-                    if not root:
-                        continue
-                    normalised = os.path.abspath(root).replace("\\", "/").rstrip("/")
-                    _workspace_id_cache[normalised] = entry.name
-                except (_json.JSONDecodeError, OSError):
-                    continue
+            registry = WorkspaceRegistry.get_default()
+            for entry in registry.list_workspaces():
+                normalised = os.path.abspath(entry.root_path).replace("\\", "/").rstrip("/")
+                _workspace_id_cache[normalised] = entry.id
         except Exception:
             pass
         return _workspace_id_cache
@@ -143,15 +129,34 @@ def _build_workspace_id_cache() -> Dict[str, str]:
 
 def _resolve_workspace_id(workspace_path: str) -> Optional[str]:
     """
-    Resolve a workspace *workspace_path* to its workspace ID using the
-    in-memory cache.  Builds the cache on first call.
+    Resolve a workspace *workspace_path* to its workspace ID.
 
-    Returns the workspace ID (directory name under ``workspaces/``) or
-    ``None`` if no match is found.
+    Checks the in-memory cache first (built from the registry on first call),
+    then falls back to a direct registry lookup.  Returns the workspace ID
+    or ``None`` if no match is found.
     """
-    cache = _build_workspace_id_cache()
+    if not workspace_path:
+        return None
+
     normalised = os.path.abspath(workspace_path).replace("\\", "/").rstrip("/")
-    return cache.get(normalised)
+
+    # Check cache first (builds it on first call)
+    cache = _build_workspace_id_cache()
+    cached = cache.get(normalised)
+    if cached is not None:
+        return cached
+
+    # Fall back to direct registry lookup (handles race with newly-registered workspaces)
+    try:
+        registry = WorkspaceRegistry.get_default()
+        entry = registry.resolve_by_root(workspace_path)
+        if entry is not None:
+            _workspace_id_cache[normalised] = entry.id
+            return entry.id
+    except Exception:
+        pass
+
+    return None
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Bridge class
@@ -576,7 +581,6 @@ class WebAgentBridge:
                             'context_updated', 'context_cleared', 'context_summarized',
                             'token_recovery', 'token_warning', 'turn_warning', 'time_warning',
                             'user_message', 'system_notification',
-                            'worker_state_sync',
                             ]
         log('DEBUG', 'pipeline.bridge',
             f"_subscribe_to_worker_bus [worker={worker_name}]: "
@@ -663,14 +667,6 @@ class WebAgentBridge:
                         ),
                         'data': data,
                     }
-                # [TOKEN_PIPELINE] bridge log worker_state_sync payload before sending
-                if original_type == 'worker_state_sync':
-                    log('DEBUG', 'pipeline.bridge',
-                        f"[TOKEN_PIPELINE] bridge sending worker_state_sync: "
-                        f"type={event_dict.get('type')} "
-                        f"worker_name={data.get('worker_name', worker_name)} "
-                        f"context_length={data.get('context_length', '?')} "
-                        f"token_state={data.get('token_state', '?')}")
                 log('DEBUG', 'pipeline.bridge',
                     f"[TOKEN_PIPELINE] bridge per-worker bus handler [{worker_name}/{original_type}]: "
                     f"forwarding type={event_dict.get('type')}, "
@@ -1322,7 +1318,7 @@ class WebAgentBridge:
             elif self._loaded_session and self._loaded_session.metadata.get('name'):
                 session.metadata['name'] = self._loaded_session.metadata['name']
             session.ensure_name()
-            self._session_store.save_session(session)
+            self._session_store.save_session(session, workspace_id=session.workspace_id)
             self._loaded_session = session
 
             # ── Load persisted worker contexts for this workspace ──────────
@@ -1468,7 +1464,7 @@ class WebAgentBridge:
         and ``has_more`` to let the frontend fetch older pages.
         """
         try:
-            session = self._session_store.load_session(session_id)
+            session = self._session_store.load_session(session_id, workspace_id=self._workspace_id)
             if session is None:
                 log('WARNING', 'server.bridge', f"Session not found: {session_id}")
                 return False
@@ -1489,7 +1485,7 @@ class WebAgentBridge:
             if repaired:
                 log('WARNING', 'server.bridge',
                     f"Repaired {session_id}: corrected 'tool_result' roles back to 'tool'")
-                self._session_store.save_session(session)
+                self._session_store.save_session(session, workspace_id=session.workspace_id)
 
             self._loaded_session = session
 
@@ -1655,12 +1651,12 @@ class WebAgentBridge:
     def rename_session(self, session_id: str, new_name: str) -> bool:
         """Rename a session in the store."""
         try:
-            session = self._session_store.load_session(session_id)
+            session = self._session_store.load_session(session_id, workspace_id=self._workspace_id)
             if session is None:
                 log('WARNING', 'server.bridge', f"Session not found for rename: {session_id}")
                 return False
             session.metadata['name'] = new_name
-            self._session_store.save_session(session)
+            self._session_store.save_session(session, workspace_id=session.workspace_id)
             # Update loaded session name if it's the one being renamed
             if self._loaded_session and self._loaded_session.session_id == session_id:
                 self._loaded_session.metadata['name'] = new_name

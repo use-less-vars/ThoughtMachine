@@ -214,31 +214,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
     for (const e of relevantEvents) {
       const eventType = e.type?.replace('worker:', '')
       const status = e.data?.runtime_status || e.data?.status
-      // Token display data is set exclusively by worker_state_sync below.
-      // The backend's emit_state_sync() reads from StateBridge and publishes
-      // the canonical context_length, token_state, warning_message, and critical_threshold.
       const tokensUpdate = {}
-      // Handle worker_state_sync from per-worker bus (real-time context/warning sync)
-      if (eventType === 'worker_state_sync' && e.data) {
-        console.log('[TOKEN_PIPELINE] WorkerOutputPanel: worker_state_sync received', {
-          context_length: e.data.context_length,
-          token_state: e.data.token_state,
-          warning_message: e.data.warning_message,
-          critical_threshold: e.data.critical_threshold,
-        })
-        // Update live context tokens in workerInfo
-        tokensUpdate.current_context_tokens = e.data.context_length
-        tokensUpdate.token_state = e.data.token_state
-        tokensUpdate.warning_message = e.data.warning_message
-        tokensUpdate.critical_threshold = e.data.critical_threshold
-        tokensUpdate.max_context_tokens = e.data.critical_threshold
-        // Update warning_active flag for header badge (no synthetic event injection)
-        if (e.data.token_state === 'WARNING' || e.data.token_state === 'CRITICAL') {
-          tokensUpdate.warning_active = true
-        } else if (e.data.token_state === 'LOW') {
-          tokensUpdate.warning_active = false
-        }
-      }
             if (eventType === 'context_updated' && e.context_length != null) {
               tokensUpdate.current_context_tokens = e.context_length;
               tokensUpdate.max_context_tokens = e.critical_threshold ?? tokensUpdate.max_context_tokens ?? 80000;
@@ -451,26 +427,6 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
             }
 
 
-          case 'worker_state_sync':
-            console.log('[TOKEN_PIPELINE] WorkerOutputPanel: worker_state_sync mapped to display event', {
-              context_length: e.data?.context_length,
-              token_state: e.data?.token_state,
-              warning_message: e.data?.warning_message,
-            })
-            return {
-              event: 'worker_state_sync',
-              timestamp: e.timestamp,
-              request: {},
-              response: {
-                context_length: e.data?.context_length ?? 0,
-                token_state: e.data?.token_state ?? 'LOW',
-                warning_message: e.data?.warning_message || '',
-                critical_threshold: e.data?.critical_threshold ?? 0,
-              },
-              current_context_tokens: e.data?.context_length ?? 0,
-              max_context_tokens: e.data?.critical_threshold ?? 0,
-              token_state: e.data?.token_state ?? 'LOW',
-            }
 
           case 'system_notification': {
             const data = e.response || e.data || {}
@@ -633,6 +589,62 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
 
   const canStop = runtimeStatus === 'busy' || runtimeStatus === 'ready';
 
+  // ── Pause / Resume handlers ──────────────────────────────────────────────
+  const handlePause = useCallback(async () => {
+    if (!workspaceId || !workerName) return;
+    // Block control from non-owning sessions
+    if (workerInfo && workerInfo.session_id && workerInfo.session_id !== sessionId) {
+      setStopError('Cannot pause worker from another session');
+      setTimeout(() => setStopError(''), 3000);
+      return;
+    }
+    if (runtimeStatus === 'paused') return;
+    setStopError('');
+    try {
+      const res = await fetch(`/api/workspace/${workspaceId}/workers/${encodeURIComponent(workerName)}/pause`, {
+        method: 'POST',
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.detail?.error || `HTTP ${res.status}`);
+      }
+      // Optimistic update
+      setWorkerInfo((prev) => prev ? { ...prev, runtime_status: 'paused' } : prev);
+    } catch (err) {
+      setStopError(err.message);
+      setTimeout(() => setStopError(''), 3000);
+    }
+  }, [workspaceId, workerName, sessionId, runtimeStatus]);
+
+  const handleResume = useCallback(async () => {
+    if (!workspaceId || !workerName) return;
+    // Block control from non-owning sessions
+    if (workerInfo && workerInfo.session_id && workerInfo.session_id !== sessionId) {
+      setStopError('Cannot resume worker from another session');
+      setTimeout(() => setStopError(''), 3000);
+      return;
+    }
+    setStopError('');
+    try {
+      const res = await fetch(`/api/workspace/${workspaceId}/workers/${encodeURIComponent(workerName)}/resume`, {
+        method: 'POST',
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.detail?.error || `HTTP ${res.status}`);
+      }
+      // Optimistic update
+      setWorkerInfo((prev) => prev ? { ...prev, runtime_status: 'ready' } : prev);
+    } catch (err) {
+      setStopError(err.message);
+      setTimeout(() => setStopError(''), 3000);
+    }
+  }, [workspaceId, workerName, sessionId]);
+
+  const canPause = runtimeStatus === 'busy' || runtimeStatus === 'ready';
+  const canResume = runtimeStatus === 'paused';
+
+
   // ── Compute elapsed time from first event ─────────────────────────────
   const startTime = workerInfo?.started ||
     (events.length > 0 ? events[0].timestamp : null);
@@ -736,6 +748,24 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
 
           {events.map((evt, idx) => {
             const msg = adaptWorkerEvent(evt);
+          {runtimeStatus === 'paused' ? (
+            <button
+              className="worker-output-resume-btn"
+              onClick={handleResume}
+              disabled={!canResume}
+            >
+              ▶ Resume
+            </button>
+          ) : (
+            <button
+              className="worker-output-pause-btn"
+              onClick={handlePause}
+              disabled={!canPause}
+            >
+              ⏸ Pause
+            </button>
+          )}
+
             if (!msg) {
               console.log('[WorkerOutputPanel] render: adaptWorkerEvent returned null for event', evt.event || 'unknown');
               return null;  // suppress events like user_message / query
