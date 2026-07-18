@@ -22,16 +22,37 @@ export default function SessionCreationModal({ show, onCreate, onCancel, isFirst
   const [workspacesLoading, setWorkspacesLoading] = useState(false)
   const [showNewFolder, setShowNewFolder] = useState(false)
   const [newFolderPath, setNewFolderPath] = useState('')
+  const [userSelectedWorkspace, setUserSelectedWorkspace] = useState(false)
 
-  // Fetch workspace list on mount
+  // Fetch workspace list on mount and restore from localStorage
   useEffect(() => {
     if (!show) return
     setWorkspacesLoading(true)
+    // Reset user selection tracking when modal opens fresh
+    setUserSelectedWorkspace(false)
     fetch(`${API_BASE}/api/workspace/list`)
       .then(r => r.json())
       .then(data => {
         const list = data.workspaces || data || []
         setWorkspaces(list)
+        // Try to restore previous selection from localStorage
+        const stored = localStorage.getItem('thoughtmachine_last_workspace')
+        if (stored) {
+          // Check if stored value is a workspace ID
+          const match = list.find(w => w.id === stored)
+          if (match) {
+            setSelectedWorkspaceId(match.id)
+            setUseCustomPath(false)
+            return
+          }
+          // Check if stored value is a path (for custom paths)
+          if (stored.startsWith('/')) {
+            setCustomPath(stored)
+            setUseCustomPath(true)
+            return
+          }
+        }
+        // Fall back to first workspace if nothing stored
         if (list.length > 0 && !selectedWorkspaceId) {
           setSelectedWorkspaceId(list[0].id)
         }
@@ -115,8 +136,10 @@ export default function SessionCreationModal({ show, onCreate, onCancel, isFirst
       if (match) {
         setSelectedWorkspaceId(match.id)
         setUseCustomPath(false)
+        setUserSelectedWorkspace(true)
       } else {
         setUseCustomPath(true)
+        setUserSelectedWorkspace(true)
       }
     }
   }
@@ -127,6 +150,7 @@ export default function SessionCreationModal({ show, onCreate, onCancel, isFirst
       setUseCustomPath(true)
       setShowNewFolder(false)
       setNewFolderPath('')
+      setUserSelectedWorkspace(true)
     }
   }
 
@@ -211,12 +235,14 @@ export default function SessionCreationModal({ show, onCreate, onCancel, isFirst
                 if (val === '__custom__') {
                   setUseCustomPath(true)
                   setShowNewFolder(false)
+                  setUserSelectedWorkspace(true)
                 } else if (val === '__new__') {
-                  // handled by the button, but prevent stray selection
+                  // handled by the button
                 } else {
                   setUseCustomPath(false)
                   setShowNewFolder(false)
                   setSelectedWorkspaceId(val)
+                  setUserSelectedWorkspace(true)
                 }
               }}
               disabled={workspacesLoading}
