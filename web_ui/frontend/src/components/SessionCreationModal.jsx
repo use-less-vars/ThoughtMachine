@@ -20,6 +20,8 @@ export default function SessionCreationModal({ show, onCreate, onCancel, isFirst
   const [error, setError] = useState('')
   const [acknowledgedRisk, setAcknowledgedRisk] = useState(false)
   const [workspacesLoading, setWorkspacesLoading] = useState(false)
+  const [showNewFolder, setShowNewFolder] = useState(false)
+  const [newFolderPath, setNewFolderPath] = useState('')
 
   // Fetch workspace list on mount
   useEffect(() => {
@@ -39,6 +41,31 @@ export default function SessionCreationModal({ show, onCreate, onCancel, isFirst
       })
       .finally(() => setWorkspacesLoading(false))
   }, [show])
+
+  // Sorted workspaces by folder name
+  const sortedWorkspaces = React.useMemo(() => {
+    return [...workspaces].sort((a, b) => {
+      const nameA = (a.label || (a.root ? a.root.split('/').filter(Boolean).pop() : '') || a.id || '').toLowerCase()
+      const nameB = (b.label || (b.root ? b.root.split('/').filter(Boolean).pop() : '') || b.id || '').toLowerCase()
+      return nameA.localeCompare(nameB)
+    })
+  }, [workspaces])
+
+  // Folder name counts for disambiguation
+  const folderNameCounts = React.useMemo(() => {
+    const counts = {}
+    workspaces.forEach(w => {
+      const name = w.label || (w.root ? w.root.split('/').filter(Boolean).pop() : '') || '?'
+      counts[name] = (counts[name] || 0) + 1
+    })
+    return counts
+  }, [workspaces])
+
+  const getOptionLabel = (w) => {
+    const folderName = w.label || (w.root ? w.root.split('/').filter(Boolean).pop() : '') || w.id || '?'
+    const count = folderNameCounts[folderName] || 1
+    return count > 1 ? `${folderName} (${w.id})` : folderName
+  }
 
   // Derived: current workspace path
   const currentWorkspace = useCustomPath
@@ -82,17 +109,24 @@ export default function SessionCreationModal({ show, onCreate, onCancel, isFirst
     }
   }
 
-  const handleBrowseFolder = () => {
-    const path = window.prompt('Enter the absolute path to your workspace folder:')
-    if (path && path.trim()) {
-      setCustomPath(path.trim())
-      const match = workspaces.find(w => path.trim().startsWith(w.root) || w.root.endsWith(path.trim()))
+  const handleUseCustomPath = () => {
+    if (customPath && customPath.trim()) {
+      const match = workspaces.find(w => customPath.trim().startsWith(w.root) || w.root.endsWith(customPath.trim()))
       if (match) {
         setSelectedWorkspaceId(match.id)
         setUseCustomPath(false)
       } else {
         setUseCustomPath(true)
       }
+    }
+  }
+
+  const handleCreateNewFolder = () => {
+    if (newFolderPath && newFolderPath.trim()) {
+      setCustomPath(newFolderPath.trim())
+      setUseCustomPath(true)
+      setShowNewFolder(false)
+      setNewFolderPath('')
     }
   }
 
@@ -169,50 +203,119 @@ export default function SessionCreationModal({ show, onCreate, onCancel, isFirst
             Workspace
           </label>
 
-          <select
-            value={useCustomPath ? '__custom__' : (selectedWorkspaceId || '')}
-            onChange={e => {
-              const val = e.target.value
-              if (val === '__custom__') {
-                setUseCustomPath(true)
-              } else {
-                setUseCustomPath(false)
-                setSelectedWorkspaceId(val)
-              }
-            }}
-            disabled={workspacesLoading}
-            style={{
-              width: '100%',
-              padding: '0.5rem',
-              background: 'var(--bg-primary, #1e1e2e)',
-              color: 'var(--text-primary, #cdd6f4)',
-              border: '1px solid var(--border, #585b70)',
-              borderRadius: '4px',
-              fontSize: '0.85rem',
-              marginBottom: '0.4rem',
-            }}
-          >
-            {workspacesLoading ? (
-              <option>Loading workspaces...</option>
-            ) : workspaces.length === 0 ? (
-              <option value="">No workspaces found</option>
-            ) : (
-              workspaces.map(w => (
-                <option key={w.id} value={w.id}>
-                  {w.label || w.id} ({w.root ? w.root.split('/').pop() : '?'})
-                </option>
-              ))
-            )}
-            {workspaces.length > 0 && <option value="__custom__">\u2500\u2500 Browse custom folder \u2500\u2500</option>}
-          </select>
+          <div style={{ display: 'flex', gap: '0.4rem', marginBottom: '0.4rem' }}>
+            <select
+              value={showNewFolder ? '__new__' : (useCustomPath ? '__custom__' : (selectedWorkspaceId || ''))}
+              onChange={e => {
+                const val = e.target.value
+                if (val === '__custom__') {
+                  setUseCustomPath(true)
+                  setShowNewFolder(false)
+                } else if (val === '__new__') {
+                  // handled by the button, but prevent stray selection
+                } else {
+                  setUseCustomPath(false)
+                  setShowNewFolder(false)
+                  setSelectedWorkspaceId(val)
+                }
+              }}
+              disabled={workspacesLoading}
+              style={{
+                flex: 1,
+                padding: '0.5rem',
+                background: 'var(--bg-primary, #1e1e2e)',
+                color: 'var(--text-primary, #cdd6f4)',
+                border: '1px solid var(--border, #585b70)',
+                borderRadius: '4px',
+                fontSize: '0.85rem',
+              }}
+            >
+              {workspacesLoading ? (
+                <option>Loading workspaces...</option>
+              ) : sortedWorkspaces.length === 0 ? (
+                <option value="">No workspaces found</option>
+              ) : (
+                sortedWorkspaces.map(w => (
+                  <option key={w.id} value={w.id}>
+                    {getOptionLabel(w)}
+                  </option>
+                ))
+              )}
+              {sortedWorkspaces.length > 0 && <option value="__custom__">\u2500\u2500 Browse custom folder \u2500\u2500</option>}
+            </select>
+            <button
+              onClick={() => {
+                setShowNewFolder(!showNewFolder)
+                if (showNewFolder) {
+                  setNewFolderPath('')
+                } else {
+                  setUseCustomPath(false)
+                }
+              }}
+              style={{
+                padding: '0.5rem 0.75rem',
+                background: showNewFolder ? 'var(--danger, #f38ba8)' : 'var(--accent, #89b4fa)',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '0.8rem',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {showNewFolder ? 'Cancel' : '+ New Folder'}
+            </button>
+          </div>
 
-          {useCustomPath ? (
-            <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center', marginTop: '0.4rem' }}>
+          {/* New Folder inline input */}
+          {showNewFolder && (
+            <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center', marginTop: '0.2rem', marginBottom: '0.4rem' }}>
+              <input
+                type="text"
+                value={newFolderPath}
+                onChange={e => setNewFolderPath(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') handleCreateNewFolder() }}
+                placeholder="/home/user/my-new-project"
+                autoFocus
+                style={{
+                  flex: 1,
+                  padding: '0.5rem',
+                  background: 'var(--bg-primary, #1e1e2e)',
+                  color: 'var(--text-primary, #cdd6f4)',
+                  border: '1px solid var(--accent, #89b4fa)',
+                  borderRadius: '4px',
+                  fontSize: '0.85rem',
+                }}
+              />
+              <button
+                onClick={handleCreateNewFolder}
+                disabled={!newFolderPath.trim()}
+                style={{
+                  padding: '0.5rem 0.75rem',
+                  background: 'var(--accent, #89b4fa)',
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: '4px',
+                  cursor: newFolderPath.trim() ? 'pointer' : 'not-allowed',
+                  fontSize: '0.8rem',
+                  whiteSpace: 'nowrap',
+                  opacity: newFolderPath.trim() ? 1 : 0.6,
+                }}
+              >
+                Create & Select
+              </button>
+            </div>
+          )}
+
+          {/* Custom path inline input (when __custom__ selected and not in new folder mode) */}
+          {useCustomPath && !showNewFolder ? (
+            <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center', marginTop: '0.2rem' }}>
               <input
                 type="text"
                 value={customPath}
                 onChange={e => setCustomPath(e.target.value)}
-                placeholder="/path/to/workspace"
+                onKeyDown={e => { if (e.key === 'Enter') handleUseCustomPath() }}
+                placeholder="/home/user/my-new-project"
                 style={{
                   flex: 1,
                   padding: '0.5rem',
@@ -224,7 +327,7 @@ export default function SessionCreationModal({ show, onCreate, onCancel, isFirst
                 }}
               />
               <button
-                onClick={handleBrowseFolder}
+                onClick={handleUseCustomPath}
                 style={{
                   padding: '0.5rem 0.75rem',
                   background: 'var(--accent, #89b4fa)',
@@ -236,10 +339,10 @@ export default function SessionCreationModal({ show, onCreate, onCancel, isFirst
                   whiteSpace: 'nowrap',
                 }}
               >
-                Browse
+                Use this path
               </button>
             </div>
-          ) : currentWorkspace ? (
+          ) : !showNewFolder && currentWorkspace ? (
             <div style={{ fontSize: '0.75rem', color: 'var(--text-muted, #6c7086)', marginTop: '0.2rem' }}>
               \ud83d\udcc1 {currentWorkspace.root || 'Unknown path'}
             </div>
