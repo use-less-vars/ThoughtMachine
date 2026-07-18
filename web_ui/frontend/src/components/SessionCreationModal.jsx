@@ -47,11 +47,16 @@ export default function SessionCreationModal({ show, onCreate, onCancel, isFirst
 
   const workspacePath = currentWorkspace?.root || ''
 
+  function isSensitivePath(path) {
+    const parts = path.replace(/\\/g, '/').split('/').filter(Boolean)
+    return parts.some(p => p === '.thoughtmachine')
+  }
+
   // Sensitive directory check
   const isSensitive = (() => {
     if (!workspacePath) return false
     const lower = workspacePath.toLowerCase()
-    if (lower.includes('.thoughtmachine')) return true
+    if (isSensitivePath(lower)) return true
     if (lower === '/root' || lower.startsWith('/home/') || lower === '/home') return true
     return false
   })()
