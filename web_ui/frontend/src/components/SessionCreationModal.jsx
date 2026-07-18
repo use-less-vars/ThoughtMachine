@@ -251,12 +251,10 @@ export default function SessionCreationModal({ show, onCreate, onCancel, isFirst
             marginBottom: '1rem',
           }}>
             <div style={{ color: '#f9e2af', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.4rem' }}>
-              \u26a0\ufe0f Sensitive Directory Warning
+              ⚠️ ThoughtMachine Config Warning
             </div>
             <p style={{ color: '#fab387', fontSize: '0.8rem', margin: '0 0 0.5rem', lineHeight: 1.4 }}>
-              The selected workspace path appears to be a system or configuration directory
-              (e.g., home directory or .thoughtmachine folder). Running an AI agent here
-              could modify critical system files. This is not recommended.
+              This workspace contains your ThoughtMachine configuration files. The agent will be able to read and modify its own settings, which could be a security risk if combined with internet access or untrusted tools.
             </p>
             <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer', fontSize: '0.8rem', color: '#cdd6f4' }}>
               <input
