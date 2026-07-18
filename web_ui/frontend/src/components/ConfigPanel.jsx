@@ -6,171 +6,6 @@ import WorkspacePanel from './WorkspacePanel';
 const BACKEND_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
 const API_BASE = `http://${window.location.hostname}:${BACKEND_PORT}`;
 
-// ── Directory Browser sub-component ──────────────────────────────────────
-function DirectoryBrowser({ path, entries, loading, error, onNavigate, onSelect, setLoading, setEntries, setError }) {
-  const fetchDir = useCallback(async (dirPath) => {
-    setLoading(true);
-    setError('');
-    try {
-      const url = `${API_BASE}/api/browse?path=${encodeURIComponent(dirPath || '')}`;
-      const res = await fetch(url);
-      const data = await res.json();
-      if (data.success) {
-        setEntries(data.entries || []);
-      } else {
-        setError(data.error || 'Failed to list directory');
-        setEntries([]);
-      }
-    } catch (err) {
-      setError('Network error: ' + err.message);
-      setEntries([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [setLoading, setEntries, setError]);
-
-  const [newFolderName, setNewFolderName] = useState('');
-  const [hoveredFolder, setHoveredFolder] = useState(null);
-  const [creating, setCreating] = useState(false);
-
-  const createFolder = useCallback(async () => {
-    const name = newFolderName.trim();
-    if (!name) return;
-    setCreating(true);
-    try {
-      const url = `${API_BASE}/api/browse/create`;
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ parent_path: path, name }),
-      });
-      const data = await res.json();
-      if (data.success) {
-        setNewFolderName('');
-        fetchDir(path);
-      } else {
-        setError(data.error || 'Failed to create directory');
-      }
-    } catch (err) {
-      setError('Network error: ' + err.message);
-    } finally {
-      setCreating(false);
-    }
-  }, [newFolderName, path, fetchDir, setError]);
-
-  useEffect(() => {
-    fetchDir(path);
-  }, [path, fetchDir]);
-
-  const goUp = () => {
-    const parts = path.replace(/\\/g, '/').replace(/\/$/, '').split('/');
-    parts.pop();
-    const parent = parts.join('/') || '/';
-    onNavigate(parent);
-  };
-
-  const listStyle = {
-    listStyle: 'none',
-    margin: 0,
-    padding: 0,
-    overflowY: 'auto',
-    flex: 1,
-    minHeight: 0,
-  };
-
-  const itemStyle = (isDir, isHovered) => ({
-    padding: '0.3rem 0.5rem',
-    cursor: isDir ? 'pointer' : 'default',
-    borderRadius: '4px',
-    display: 'flex',
-    alignItems: 'center',
-    gap: '0.4rem',
-    fontSize: '0.85rem',
-    color: isDir ? '#89b4fa' : '#cdd6f4',
-    background: isHovered ? '#45475a' : 'transparent',
-    transition: 'background 0.15s',
-  });
-
-  if (loading) {
-    return <div style={{ ...listStyle, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#a6adc8' }}>Loading...</div>;
-  }
-
-  if (error) {
-    return (
-      <div style={{ ...listStyle, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}>
-        <span style={{ color: '#f38ba8', fontSize: '0.85rem' }}>{error}</span>
-        <button onClick={() => fetchDir(path)} style={{
-          background: '#45475a', color: '#cdd6f4', border: '1px solid #585b70',
-          borderRadius: '4px', padding: '0.3rem 0.8rem', cursor: 'pointer', fontSize: '0.8rem'
-        }}>Retry</button>
-      </div>
-    );
-  }
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
-      <div style={{ marginTop: '0.1rem', marginBottom: '0.4rem', display: 'flex', gap: '0.3rem', flexWrap: 'wrap' }}>
-        {path && path !== '/' && (
-          <button onClick={goUp} style={{
-            background: '#45475a', color: '#cdd6f4', border: '1px solid #585b70',
-            borderRadius: '4px', padding: '0.2rem 0.5rem', cursor: 'pointer', fontSize: '0.75rem'
-          }}>↑ Parent</button>
-        )}
-        <div style={{ display: 'flex', gap: '0.3rem', alignItems: 'center' }}>
-          <input
-            type="text"
-            value={newFolderName}
-            onChange={(e) => setNewFolderName(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') createFolder(); }}
-            placeholder="new folder"
-            style={{
-              background: '#1e1e2e', color: '#cdd6f4', border: '1px solid #585b70',
-              borderRadius: '4px', padding: '0.2rem 0.4rem', fontSize: '0.75rem',
-              width: '90px', outline: 'none',
-            }}
-          />
-          <button onClick={createFolder} disabled={creating || !newFolderName.trim()} style={{
-            background: creating ? '#585b70' : '#45475a',
-            color: creating || !newFolderName.trim() ? '#6c7086' : '#a6e3a1',
-            border: '1px solid #585b70',
-            borderRadius: '4px', padding: '0.2rem 0.4rem',
-            cursor: creating || !newFolderName.trim() ? 'not-allowed' : 'pointer',
-            fontSize: '0.75rem', whiteSpace: 'nowrap',
-          }}>{creating ? '…' : '+ Folder'}</button>
-        </div>
-        <button onClick={() => onSelect(path)} style={{
-          background: '#89b4fa', color: '#1e1e2e', border: 'none',
-          borderRadius: '4px', padding: '0.2rem 0.5rem', cursor: 'pointer', fontWeight: 600, fontSize: '0.75rem',
-          marginLeft: 'auto',
-        }}>Select This Folder</button>
-      </div>
-      <ul style={listStyle}>
-        {entries.filter(e => e.is_dir).length === 0 && (
-          <li style={{ padding: '0.5rem', color: '#6c7086', fontSize: '0.8rem', textAlign: 'center' }}>
-            (no subdirectories)
-          </li>
-        )}
-        {entries.filter(e => e.is_dir).map((entry) => (
-          <li
-            key={entry.name}
-            onClick={() => {
-              const newPath = path.replace(/\\/g, '/').replace(/\/$/, '') + '/' + entry.name;
-              onNavigate(newPath);
-            }}
-            onMouseEnter={() => setHoveredFolder(entry.name)}
-            onMouseLeave={() => setHoveredFolder(null)}
-            style={itemStyle(true, hoveredFolder === entry.name)}
-          >
-            <span>📁</span>
-            <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.name}</span>
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-
-
 function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, defaultConfigSaveMessage, onClearDefaultSaveStatus, workspaceId, sessionId, containerRebuildResult, onClearRebuildResult, selectedWorker, onSelectWorker, isActive, activeSessionId, onClearWorker }) {
   const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error'
   const [showManageProviders, setShowManageProviders] = useState(false);
@@ -218,16 +53,6 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
   const [lastAppliedConfig, setLastAppliedConfig] = useState(null);
   const [isApplying, setIsApplying] = useState(false);
   const [applyError, setApplyError] = useState(null);
-
-  const [browserOpen, setBrowserOpen] = useState(false);
-  const [browserPath, setBrowserPath] = useState('');
-  const [browserEntries, setBrowserEntries] = useState([]);
-  const [browserLoading, setBrowserLoading] = useState(false);
-  const [browserError, setBrowserError] = useState('');
-  const handleBrowseNavigate = useCallback((newPath) => {
-    setBrowserPath(newPath);
-    setBrowserError('');
-  }, []);
 
   // ── Sync defaultConfigSaveStatus from backend into local UI state ────
   useEffect(() => {
@@ -383,48 +208,20 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
       {/* ── Workspace Tab ── */}
       {activeTab === 'workspace' && (
         <div>
-          {/* ── Workspace Path Picker ── */}
+          {/* ── Workspace Path (read-only) ── */}
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>Workspace Path</strong></label>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.3rem' }}>
-              {draft.workspace_path ? (
-                <span style={{ color: '#cdd6f4', fontSize: '0.9rem' }}>
-                  📁 {draft.workspace_path.split('/').filter(Boolean).pop() || '/'}
-                </span>
-              ) : (
-                <span style={{ color: '#6c7086', fontSize: '0.85rem', fontStyle: 'italic' }}>
-                  No workspace selected
-                </span>
-              )}
-              <button
-                onClick={async () => {
-                  let initialPath = draft.workspace_path;
-                  if (!initialPath) {
-                    try {
-                      const res = await fetch(`${API_BASE}/api/browse?path=`);
-                      const data = await res.json();
-                      if (data.success && data.current_path) {
-                        initialPath = data.current_path;
-                      }
-                    } catch (_) {}
-                  }
-                  setBrowserPath(initialPath || '/');
-                  setBrowserOpen(true);
-                  setBrowserError('');
-                }}
-                style={{
-                  background: '#45475a',
-                  color: '#cdd6f4',
-                  border: '1px solid #585b70',
-                  borderRadius: '4px',
-                  padding: '0.3rem 0.6rem',
-                  cursor: 'pointer',
-                  fontWeight: 600,
-                  fontSize: '0.8rem',
-                  whiteSpace: 'nowrap',
-                  marginLeft: 'auto',
-                }}
-              >Browse</button>
+            <div style={{
+              marginTop: '0.3rem',
+              padding: '0.4rem 0.6rem',
+              background: '#1e1e2e',
+              borderRadius: '4px',
+              color: '#cdd6f4',
+              fontSize: '0.85rem',
+              fontFamily: 'monospace',
+              wordBreak: 'break-all',
+            }}>
+              {draft.workspace_path || <span style={{ color: '#6c7086', fontStyle: 'italic' }}>Not set</span>}
             </div>
           </div>
 
@@ -772,66 +569,6 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
       {activeTab === 'advanced' && (
         <div>
           <p style={{ color: '#6c7086', fontSize: '0.85rem', fontStyle: 'italic' }}>No advanced options at this time.</p>
-        </div>
-      )}
-
-      {/* ── Directory Browser Overlay ────────────────────────────────── */}
-      {browserOpen && (
-        <div style={{
-          position: 'fixed',
-          top: 0, left: 0, right: 0, bottom: 0,
-          background: 'rgba(0,0,0,0.6)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          zIndex: 1000,
-        }} onClick={() => setBrowserOpen(false)}>
-          <div style={{
-            background: '#313244',
-            border: '1px solid #585b70',
-            borderRadius: '8px',
-            padding: '1rem',
-            width: '400px',
-            maxHeight: '60vh',
-            display: 'flex',
-            flexDirection: 'column',
-            boxShadow: '0 4px 20px rgba(0,0,0,0.4)',
-          }} onClick={(e) => e.stopPropagation()}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
-              <strong style={{ fontSize: '0.9rem' }}>Select Directory</strong>
-              <button onClick={() => setBrowserOpen(false)} style={{
-                background: 'none', border: 'none', color: '#a6adc8', cursor: 'pointer', fontSize: '1.2rem'
-              }}>✕</button>
-            </div>
-            <div style={{
-              background: '#1e1e2e',
-              borderRadius: '4px',
-              padding: '0.65rem 0.7rem',
-              marginBottom: '0.75rem',
-              fontSize: '0.9rem',
-              color: '#cdd6f4',
-              fontFamily: 'monospace',
-              lineHeight: '1.5',
-              flexShrink: 0,
-              overflowX: 'auto',
-              whiteSpace: 'pre',
-              wordBreak: 'keep-all',
-            }}>{browserPath || '~'}</div>
-            <DirectoryBrowser
-              path={browserPath}
-              entries={browserEntries}
-              loading={browserLoading}
-              error={browserError}
-              onNavigate={handleBrowseNavigate}
-              onSelect={(selectedPath) => {
-                setDraft({ ...draft, workspace_path: selectedPath });
-                setBrowserOpen(false);
-              }}
-              setLoading={setBrowserLoading}
-              setEntries={setBrowserEntries}
-              setError={setBrowserError}
-            />
-          </div>
         </div>
       )}
 

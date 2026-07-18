@@ -35,6 +35,7 @@ import TabBar from './components/TabBar'
 import SessionActionsPanel from './components/SessionActionsPanel'
 import WorkerOutputPanel from './components/WorkerOutputPanel'
 import LoggingPanel from './components/LoggingPanel'
+import SessionCreationModal from './components/SessionCreationModal'
 import './styles.css'
 
 const WS_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
@@ -51,6 +52,7 @@ export default function App() {
   const [hubWs, setHubWs] = useState(null)
   const hubHasConnectedOnceRef = useRef(false)   // persist past StrictMode double-mount
   const loadedSessionIdsRef = useRef(new Set())   // robust dedup: track sessions already converted to tabs
+  const firstLaunchHandledRef = useRef(false)
   const [hubReady, setHubReady] = useState(false)
   // ── Worker panel state per session ─────────────────────────────────
   // Map: sessionId -> { name, workspaceId } | null
@@ -65,6 +67,7 @@ export default function App() {
   })
 
   const [sessionPanelOpen, setSessionPanelOpen] = useState(false)
+  const [showCreationModal, setShowCreationModal] = useState(false)
   const [showLoggingPanel, setShowLoggingPanel] = useState(false)
   const [loggingConfig, setLoggingConfig] = useState(null)
   const [loggingConfigError, setLoggingConfigError] = useState(null)
@@ -223,6 +226,11 @@ export default function App() {
     switch (msg.type) {
       case 'sessions_list':
         store.setSessions(msg.sessions ?? [])
+        // First-launch: auto-show creation modal if no sessions exist
+        if (!firstLaunchHandledRef.current && (!msg.sessions || msg.sessions.length === 0)) {
+          firstLaunchHandledRef.current = true
+          setShowCreationModal(true)
+        }
         break
       case 'session_saved':
         // session_saved is never sent to the hub WS (only to tab WSes).
@@ -374,10 +382,45 @@ export default function App() {
   }, [activeTabId])
 
   const handleNewTab = useCallback(() => {
-    // Send new_session via hub WS — the hub WS handler will respond
-    // with session_loaded, which creates the tab with a real sessionId.
-    hubSend('new_session')
-  }, [hubSend])
+    setShowCreationModal(true)
+  }, [])
+
+  const handleCreateSession = useCallback(async (mode, workspaceId, workspacePath) => {
+    try {
+      const payload = { mode }
+      if (workspaceId) payload.workspace_id = workspaceId
+      if (workspacePath) payload.workspace_path = workspacePath
+
+      const response = await fetch('/api/session/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.detail || 'Failed to create session')
+
+      localStorage.setItem('lastSessionMode', mode)
+      if (workspaceId) localStorage.setItem('lastSessionWorkspace', workspaceId)
+      if (workspacePath) localStorage.setItem('lastSessionPath', workspacePath)
+
+      setShowCreationModal(false)
+      loadTab(data.session_id)
+
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ command: 'list_sessions' }))
+      }
+    } catch (err) {
+      console.error('Failed to create session:', err)
+      alert('Failed to create session: ' + err.message)
+    }
+  }, [loadTab])
+
+  const handleQuickContinue = useCallback(async () => {
+    const mode = localStorage.getItem('lastSessionMode') || 'agent'
+    const workspaceId = localStorage.getItem('lastSessionWorkspace') || null
+    const workspacePath = localStorage.getItem('lastSessionPath') || null
+    await handleCreateSession(mode, workspaceId, workspacePath)
+  }, [handleCreateSession])
 
   // Open an existing session in a tab (called from SessionList sidebar)
   const handleOpenTab = useCallback((sessionId) => {
@@ -687,6 +730,43 @@ export default function App() {
           {tabs.length === 0 ? (
             <div className="empty-state">
               <p>Open a session or create a new one to get started.</p>
+              {localStorage.getItem('lastSessionMode') && (
+                <button
+                  className="quick-continue-btn"
+                  onClick={handleQuickContinue}
+                  style={{
+                    background: '#a6e3a1',
+                    color: '#1e1e2e',
+                    border: 'none',
+                    borderRadius: '4px',
+                    padding: '0.5rem 1rem',
+                    cursor: 'pointer',
+                    fontWeight: 600,
+                    fontSize: '0.85rem',
+                    marginTop: '0.5rem',
+                  }}
+                >
+                  Quick Continue (last session)
+                </button>
+              )}
+              <button
+                className="create-session-btn"
+                onClick={() => setShowCreationModal(true)}
+                style={{
+                  background: '#89b4fa',
+                  color: '#1e1e2e',
+                  border: 'none',
+                  borderRadius: '4px',
+                  padding: '0.5rem 1rem',
+                  cursor: 'pointer',
+                  fontWeight: 600,
+                  fontSize: '0.85rem',
+                  marginTop: '0.5rem',
+                  marginLeft: '0.5rem',
+                }}
+              >
+                Create New Session
+              </button>
             </div>
           ) : (
             tabs.map((tab, index) => (
@@ -791,6 +871,13 @@ export default function App() {
           onOpenSession={handleOpenSessionFromPanel}
         />
       )}
+
+      <SessionCreationModal
+        show={showCreationModal}
+        onCreate={handleCreateSession}
+        onCancel={() => setShowCreationModal(false)}
+        isFirstLaunch={tabs.length === 0 && sessions.length === 0 && !localStorage.getItem('lastSessionMode')}
+      />
     </div>
   )
 }
