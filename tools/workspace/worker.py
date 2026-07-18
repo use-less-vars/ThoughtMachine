@@ -75,9 +75,11 @@ StateBridge = None  # lazy-imported in _run_tool_loop
 EventProcessor = None  # lazy-imported in _run_tool_loop
 
 try:
-    from agent.core.state import ExecutionState
+    from agent.core.state import ExecutionState, TurnState, TimeState
 except ImportError:
     ExecutionState = None
+    TurnState = None
+    TimeState = None
 
 # Optional: security gate for worker permission checks
 try:
@@ -1222,6 +1224,21 @@ class WorkerThread(threading.Thread):
                         global_event_bus.publish(evt)
                     except Exception:
                         pass
+                # ── Reset turn/time state per query ────────────────────────
+                # Each query is an isolated unit — reset turn counter and
+                # time tracking so the restriction pipeline starts fresh.
+                if self._agent is not None and hasattr(self._agent, 'state'):
+                    self._agent.state.current_turn = 0
+                    if TurnState is not None:
+                        self._agent.state.turn_state = TurnState.LOW
+                        self._agent.state.last_turn_warning_state = TurnState.LOW
+                    self._agent.state.restrictions_active = False
+                    self._agent.state.restrictions_pending = False
+                    self._agent.state.restriction_reason = None
+                    self._agent.state.time_start = time.monotonic()
+                    if TimeState is not None:
+                        self._agent.state.last_time_warning_state = TimeState.LOW
+
                 reply = self._run_tool_loop(query)
 
                 # Check if worker was paused during the tool loop

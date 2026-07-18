@@ -935,3 +935,57 @@ Every new event type must be added to every layer of the pipeline. Missing any s
 
 **Note:** The CORS error "CORS request did not succeed" was misleading — it was actually a connection refused error because no server was listening on port 8000.
 
+
+## 2026-07-18 — ## Phase 1, Step 1.1 — Workspace Registry
+
+**Files created:*...
+
+## Phase 1, Step 1.1 — Workspace Registry
+
+**Files created:**
+- `thoughtmachine/workspace_registry.py` — persistent workspace registry module
+- `tests/workspace/test_workspace_registry.py` — 27 tests (all passing)
+
+**Module API:**
+- `WorkspaceRegistryEntry` — dataclass with `id`, `root_path`, `label`, `created_at`, `updated_at`, `last_opened`, `metadata`
+- `WorkspaceRegistry` — thread-safe JSON-backed registry at `~/.thoughtmachine/workspace_registry.json`
+  - `list_workspaces()` — sorted by label then id
+  - `get_workspace(id)` — single entry lookup
+  - `register_workspace(id, root_path, label, metadata)` — register new (raises on duplicate)
+  - `unregister_workspace(id)` — remove entry
+  - `update_workspace(id, **updates)` — update label, root_path, last_opened, metadata
+  - `resolve_by_root(path)` — replace for ad-hoc `resolve_workspace_id()`
+  - `get_default()` — cached singleton
+
+**Key design decisions:**
+- Standalone module (no imports from other thoughtmachine modules) to avoid circular deps
+- Uses same `_user_dir()` / `Path.home` patching pattern as `workspace_capabilities.py`
+- Atomic writes via `.tmp` + `os.replace`
+- Thread-safe via `threading.Lock`
+
+## 2026-07-18 — ## SessionCreationModal.jsx — Created
+
+**File:** `web_ui/fro...
+
+## SessionCreationModal.jsx — Created
+
+**File:** `web_ui/frontend/src/components/SessionCreationModal.jsx`
+
+A reusable modal for creating a new session with:
+- **Mode selector** — Agent / Engineer / Custom (card-style buttons with icons + dynamic description below)
+- **Workspace selector** — Toggle between Default / Recent (dropdown) / Custom Path (text input + inline Directory Browser using the `/api/browse` endpoint)
+- **Sensitive directory warning** — Detects patterns like `/etc`, `/root`, `/sys`, `/proc`, `/dev`, `/boot`, `/.ssh`, `/.config`, `/.aws`, `/.kube`, `/.docker` and shows a yellow warning banner
+- **Validation** — Blocks creation if recent workspace is unselected or custom path is empty
+- **Styling** — Matches Catppuccin Mocha theme (`#313244` surface, `#1e1e2e` base, `#89b4fa` accent, `#a6e3a1` green button, `#f38ba8` errors, `#f9e2af` warnings)
+
+**Props:**
+- `onClose` — dismiss callback
+- `onCreate({ mode, workspacePath })` — called with `mode` string ('agent'|'engineer'|'custom') and `workspacePath` (string or undefined for backend default)
+- `recentWorkspaces` — array of `{ path, label }` for the dropdown
+- `apiBase` — base URL for `/api/browse` (auto-derived from VITE_BACKEND_PORT if omitted)
+
+**Integration notes for App.jsx:**
+- Import the modal: `import SessionCreationModal from './components/SessionCreationModal'`
+- Add state: `const [showCreationModal, setShowCreationModal] = useState(false)`
+- Replace `handleNewTab` to open modal instead of directly sending `new_session`
+- The modal's `onCreate` callback should send `new_session` with the selected options

@@ -4977,3 +4977,251 @@ def _add_to_conversation(self, message):
 - Getter: returns session.user_history when session exists, else _conversation
 - Setter: replaces session.user_history contents in-place and calls _on_conversation_changed()
 - Ensures HistoryProvider cache is invalidated on mutation
+
+## 2026-07-18 — ## Workspace UUID Generation — Investigation Results (Partia...
+
+## Workspace UUID Generation — Investigation Results (Partial)
+
+### UUID Algorithm (not UUID4, but SHA-256 hash)
+- Workspace "ID" is NOT a UUID4 — it's the first 16 hex characters of `hashlib.sha256(project_path.encode()).hexdigest()[:16]`
+- Found in `setup_workspace.py` line 24: `ws_id = hashlib.sha256(PROJECT_ROOT.encode()).hexdigest()[:16]`
+- The comment says "same algorithm as thoughtmachine.workspace_capabilities" — but actually `workspace_capabilities.py` does NOT generate IDs, it only has `resolve_workspace_id()` which scans config.json files
+- The auto-registration code in `server.py` `apply_config` confirms: `import uuid; ws_id = hashlib.sha256(...).hexdigest()[:16]`
+
+### Workspace config.json Structure
+- Located at `~/.thoughtmachine/workspaces/{workspace_id}/config.json`
+- Contains: `{"root": PROJECT_ROOT, "capabilities": {}}` (from setup_workspace.py line 32)
+- In tests: `json.dumps({"root": f"/projects/{label}"})`
+
+### bridge.py Cache Mechanism
+- `_workspace_id_cache: Dict[str, str]` — module-level dict mapping normalized workspace path → workspace_id
+- `_build_workspace_id_cache()` — scans `~/.thoughtmachine/workspaces/<id>/config.json`, normalizes root paths (abspath + replace backslash + rstrip /), builds cache
+- `_resolve_workspace_id()` — looks up in cache, builds cache on first call
+- Protected by `_workspace_cache_lock` (threading.Lock())
+- Cache is built once, never invalidated — persistent for bridge instance lifetime
+
+### Dual Resolution Path
+1. **bridge.py cache** (`web_ui/backend/bridge.py`) — Web UI path, caches workspace_id by scanning config.json
+2. **workspace_capabilities.py** (`thoughtmachine/workspace_capabilities.py`) — same algorithm but no caching, scans every call
+
+### Auto-Registration (server.py apply_config)
+When workspace_path changes and no ID is found:
+1. Uses `hashlib.sha256(project_path.encode()).hexdigest()[:16]` to generate deterministic ID
+2. Calls `ensure_workspace_dirs(ws_id)` to bootstrap workspace files
+3. Writes `config.json` with `{"root": workspace_path}`
+4. Calls `_build_workspace_id_cache()` to refresh cache
+
+### No Human-Readable Names
+- Workspace IDs are purely deterministic hashes with no human-readable alias/naming system
+- Frontend receives `workspace_id` as opaque string in `session_loaded` event
+- Sessions have human-readable names (via `rename_session`/`metadata['name']`) but workspaces do not
+
+
+## 2026-07-18 — ## Chunk 1: Core Agent Loop (process_query) - Complete Analy...
+
+## Chunk 1: Core Agent Loop (process_query) - Complete Analysis
+
+### Overall Architecture
+The Agent class (`agent/core/agent.py`, 1519 lines, 39 methods) is a **facade coordinator** that delegates to modular components. It was refactored from a monolithic 1972-line class.
+
+### Key Components
+1. **TokenCounter** (`agent/core/token_counter.py`, 111 lines) - Token estimation using tiktoken
+2. **LLMClient** (`agent/core/llm_client.py`, 172 lines) - Wraps ProviderFactory, handles system prompts, chat completion
+3. **ConversationManager** (`agent/core/conversation_manager.py`, 117 lines) - Message addition with cache invalidation
+4. **ToolExecutor** (`agent/core/tool_executor.py`, 349 lines) - Executes tool calls, handles SummarizeTool specially
+5. **TurnTransaction** (`agent/core/turn_transaction.py`) - Atomic commit/rollback for turn buffering
+6. **AgentState** (`agent/core/state.py`) - State machine with TokenState, TurnState, TimeState, ExecutionState, SessionState
+7. **DebugContext** (`agent/core/debug_context.py`) - Debug logging helper
+8. **message_utils** (`agent/core/message_utils.py`) - Turn grouping utilities
+
+### process_query() Flow (generator, yields dict events)
+1. Add user query to conversation first (never lost on config failure)
+2. Yield token_update event
+3. Apply pending config (mailbox pattern)
+4. If config failed: yield error event, return
+5. Yield user_query event
+6. Set execution state to RUNNING
+7. **Turn loop** (for turn in range(max_turns)):
+   a. Check stop signal (stop_check callback)
+   b. Time monitoring (update_time_state)
+   c. Turn state monitoring (update_turn_state)
+   d. Token state monitoring (update_token_state) - fires warnings
+   e. Build context via context_builder.build()
+   f. Call LLM via llm_client.chat_completion()
+   g. On LLM response:
+      - Use prompt_tokens as ground truth (drift detection)
+      - Handle token_limit_exceeded with emergency retry
+      - Handle RateLimitExceeded with backoff
+   h. Check pause requests at 3 checkpoints
+   i. Create TurnTransaction, add assistant message
+   j. Commit assistant message immediately (prevents data loss on pause)
+   k. Yield token_update, turn events
+   l. If tool_calls: execute via ToolExecutor
+   m. Commit all tool results via turn_transaction.commit()
+   n. Yield tool_call, tool_result events
+   o. Flush buffered token warnings
+   p. If final_detected (Respond tool): yield agent_responded, return
+   q. If SummarizeTool: apply summary pruning, continue loop
+   r. If no tool_calls: commit turn, yield agent_responded, return
+8. **Max turns exhausted**: yield stop_reason event
+
+### Token Management Strategy
+- Truth-based tracking: LLM-reported prompt_tokens = ground truth
+- Pre-call estimates tracked for drift detection (>5% warning)
+- Buffered warnings (flushed after turn commit for correct chronology)
+- Emergency mode: when token_limit_exceeded fires, activation with retries
+- Token state machine: LOW -> WARNING -> CRITICAL thresholds
+
+### Context Summarization Flow
+- SummarizeTool generates summary text and keep_recent_turns
+- _apply_summary_pruning() inserts summary message with metadata
+- _find_summary_insertion_index() uses turn-grouping to find position
+- Fallback path when no session available
+- Post-summary: token estimate reevaluated, restrictions cleared
+- Emergency mode reset after successful summary
+
+## 2026-07-18 — ## Chunk 2: Event System — Complete Analysis
+
+### Event Type...
+
+## Chunk 2: Event System — Complete Analysis
+
+### Event Types (agent/events.py)
+~55 EventType enum values organized into categories:
+- **Agent lifecycle**: AGENT_START, AGENT_END
+- **LLM interaction**: LLM_REQUEST, LLM_RESPONSE, RAW_RESPONSE
+- **Tool execution**: TOOL_CALL, TOOL_RESULT
+- **Conversation**: CONVERSATION_UPDATE, CONVERSATION_PRUNE
+- **State monitoring**: EXECUTION_STATE_CHANGE, SESSION_STATE_CHANGE
+- **Token/Turn/Time warnings**: TOKEN_WARNING, TURN_WARNING, TIME_WARNING
+- **Control flow**: FINAL_DETECTED, FINAL, STOP_SIGNAL, MAX_TURNS, PAUSED, STOPPED
+- **Security**: SECURITY_PROMPT, SECURITY_RESPONSE, FILE_ACCESS, SECURITY_VIOLATION
+- **Worker lifecycle**: WORKER_SPAWNED, WORKER_STATUS, WORKER_COMPLETED, WORKER_ERROR, WORKER_MESSAGE
+- **WorkerBusAdapter**: TOKENS_UPDATED, CONTEXT_UPDATED, STATUS_MESSAGE, ERROR_OCCURRED, WORKER_STATE_SYNC, etc.
+
+### Event Hierarchy (Pydantic v2)
+- **BaseEvent**: type + metadata (EventMetadata with event_id, timestamp, source, session_id, turn) + data dict
+- Typed subclasses: AgentStartEvent, AgentEndEvent, ToolCallEvent, ToolResultEvent, TokenWarningEvent, TurnWarningEvent, ErrorEvent, TurnEvent, SecurityPromptEvent, SecurityResponseEvent, WorkerSpawnedEvent, WorkerStatusEvent, WorkerCompletedEvent, WorkerErrorEvent, WorkerMessageEvent, AssistantMessageEvent
+- Each typed subclass has @validator ensuring required data fields
+- ToolCallEvent/ToolResultEvent normalize both 'name' and 'tool_name' keys for backward compatibility
+
+### EventBus (agent/events.py)
+- Thread-safe pub/sub with threading.Lock
+- Per-type subscriber lists + wildcard subscribers (event_type=None)
+- publish() calls subscribers in order, wrapping each in try/except
+- publish_dict() for legacy dict format
+- NullEventBus: No-op stub for testing/worker contexts (no human), ask() returns "deny" instantly
+- global_event_bus = EventBus() — singleton used throughout
+
+### Event Wiring
+- **Security**: global_event_bus.subscribe(SECURITY_PROMPT) → WebAgentBridge forwards to frontend WebSocket
+- **Worker lifecycle**: global_event_bus.subscribe(WORKER_SPAWNED/WORKER_STATUS/WORKER_COMPLETED/WORKER_ERROR/WORKER_MESSAGE/TOKEN_WARNING) → WebAgentBridge _make_handler() forwards as worker:* events
+- **Per-worker buses**: WorkerBusAdapter creates per-worker EventBus; WebAgentBridge subscribes per-worker for tool_call, tool_result, tokens_updated, context_updated, context_summarized, etc.
+- **Event dedup**: context_updated uses display string dedup per worker_name to avoid flooding frontend
+- **Late-arriving bridge guard**: _discover_existing_workers() on session load finds already-running workers
+
+### Backward Compatibility
+- create_event() factory function maps EventType → typed event class
+- _map_legacy_event_type() maps old string types to enum values
+- convert_to_legacy_format() / convert_from_legacy_format() for interop with legacy dict-based code
+- Token/Turn warnings handle 'message'/'warning'/'warning_message' key normalization
+- ErrorEvent handles various error_type detection from message prefix
+
+## Chunk 3: Worker Architecture — Complete Analysis
+
+### WorkerThread (tools/workspace/worker.py, ~1000 lines)
+- **Runs in daemon thread** with input/output queues (threading.Queue)
+- **Lifecycle**: ready → busy → ready
+- **Control signals**: threading.Event for stop, pause, resume
+- **command.json pattern**: External control via JSON file in worker's state dir
+- **Status publishing**: status_changed callback
+- **Structured output**: output_handler callback
+- **Agent config building**: Builds config from system prompt, tools, permissions
+- **EventBus per worker**: WorkerBusAdapter bridges worker events to global bus + per-worker bus
+- **Cleanup**: shutdown_workers() for graceful teardown
+
+### Worker (tool entry point, ~770 lines)
+- Permission checking (ask policy integration)
+- Agent config building from tool params
+- Context sanitization
+- Delegates to WorkerThread for actual execution
+
+### Key Patterns
+- Workers are spawned as tool calls from the main agent
+- Each worker gets its own EventBus (per-worker bus) for detailed events
+- WorkerBusAdapter publishes to both per-worker bus AND global_event_bus
+- NullEventBus used in worker contexts (no human to answer security prompts)
+- Worker state is persisted in workspace for session resume
+
+## Chunk 4: Session Model — Complete Analysis
+
+### Session (session/models.py)
+- Core dataclass: session_id (UUID), created_at, updated_at, runtime_params (temperature), user_history (ObservableList), total_input/output_tokens, context_length, agent_context, containers, preset_name, version, next_seq, summary, agent_instance, workspace_id, metadata, security_config
+- **ObservableList**: Wraps user_history with mutation callbacks (_on_conversation_changed)
+- **Conversation change tracking**: _conversation_version (int) + conversation_hash (md5 hexdigest)
+- **connect_conversation_changed/disconnect**: External listeners (used by AutosaveMonitor in server.py)
+- **Serialization**: to_persistable_dict() / from_persistable_dict() with backward compat for old 'config' key → metadata['agent_config']
+- **Security config**: merge_security_config + coerce_session_permissions on load
+- **Message normalization**: All messages converted to Message objects on load
+
+### HistoryProvider (session/history_provider.py)
+- Wraps Session.user_history, provides get_context_for_llm()
+- **Cached context**: _cached_context invalidated on add_message()
+- **Delegates context building to SummaryBuilder** (session/context_builder.py)
+- **create_summary()**: Adds summary system message with metadata (pruning_keep_recent_turns, pruning_insertion_idx, timestamp)
+- **_find_latest_summary()**: Searches backward for summary messages
+- **_group_messages_into_turns()**: Groups messages for keep_recent_turns logic
+- **Debug support**: DEBUG_HISTORY_PROVIDER, DEBUG_CONTEXT env vars
+
+### ContextBuilder (session/context_builder.py)
+- SummaryBuilder: Builds LLM context with summary + recent turns
+- _cleanup_orphaned_tool_messages(): Removes tool messages without matching assistant
+- Token estimation methods
+
+### SessionStore (session/store.py)
+- **FileSystemSessionStore**: JSON files in ~/.thoughtmachine/sessions/
+- **Friendly filenames**: {sanitized_name}_{short_id}.json
+- **Atomic writes**: Temp file + rename pattern
+- **File locking**: FileLock for concurrent access safety
+- **Metadata files**: _meta_{session_id}.json for fast sidebar listing
+- **In-memory caches**: _cached_list (60s TTL), _cached_paths (5s TTL) for fast listing
+- **Fast metadata extraction**: _fast_extract_metadata() reads ~8KB head to avoid full JSON parse
+- **Open sessions management**: open_sessions.json, .current_session marker
+- **History pruning**: prune_user_history() removes old summarization cycles on save
+- **Fallback paths**: CWD → system temp if ~/.thoughtmachine unavailable
+
+## Chunk 5: Bridge & Presenter Layer — Complete Analysis
+
+### AgentController (agent/controller/__init__.py, 719 lines)
+- **Thread-based agent runner**: Runs Agent in daemon thread, collects events via callback
+- **State machine**: ExecutionState tracking (IDLE, RUNNING, PAUSED, STOPPING, etc.)
+- **Synchronization**: threading.Event for stop/pause, queue.Queue for query dispatch
+- **Lifecycle**: process_query() → start thread → iterate events → callback → cleanup
+- **Config management**: set_session(), update_config(), get_config()
+- **Global event bus publishing**: Publishes control events (PAUSED, STOPPED, etc.)
+
+### WebAgentBridge (web_ui/backend/bridge.py, 2140 lines)
+- **Thread-safe bridge**: One bridge per tab/session
+- **Agent wrapped in daemon thread**: start(query, config) → thread → process_query()
+- **Event mapping**: Agent events → frontend events (state_changed, tokens_updated, conversation_changed)
+- **Security prompt forwarding**: global_event_bus → WebSocket callback
+- **Worker event forwarding**: Per-worker bus subscription for real-time events
+- **Session persistence**: load/save sessions via FileSystemSessionStore
+- **Multi-tab support**: _active_tab_bridges set, _broadcast_rename()
+- **Cleanup**: cleanly_closed flag prevents data loss on disconnect
+
+### Presenter Layer (agent/presenter/)
+- **RefactoredAgentPresenter**: High-level orchestrator (config, session, agent lifecycle)
+- **EventProcessor**: Processes agent events, delegates to StateBridge/SessionLifecycle
+- **SessionLifecycle**: Session CRUD, start/stop/pause, autosave
+- **StateBridge**: Config management, tool registration, session binding
+- **StateBridge state**: SessionState enum (IDLE, LOADING, ACTIVE, ERROR)
+
+### Server Layer (web_ui/backend/server.py, ~2300 lines)
+- **FastAPI + WebSocket**: Single WebSocket endpoint for all real-time communication
+- **Protocol**: JSON messages with 'type' field routing
+- **Message types**: process_query, pause, resume, stop, update_config, load_session, save_session, rename_session, delete_session, security_response, list_sessions, list_worker_definitions, spawn_worker, worker_command, load_workspace, etc.
+- **Session persistence**: AutosaveMonitor with 2s debounce + manual save on close
+- **Workspace management**: Load/save workspace state, worker contexts
+- **Logging**: Logging routes for real-time log streaming
+- **Health**: Health check endpoint for container orchestration

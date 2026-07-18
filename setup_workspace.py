@@ -1,57 +1,81 @@
 #!/usr/bin/env python3
-"""
-Bootstrap a workspace for the current project so the Worker tool can find it.
+"""One-shot setup script: creates a ThoughtMachine workspace for the current project.
 
-Creates ~/.thoughtmachine/workspaces/<id>/config.json pointing at the project,
-then bootstraps default files including workers.json.
+Usage:
+    python setup_workspace.py
+
+This will:
+1. Register the project root in the workspace registry (generating a human-readable ID).
+2. Create the workspace directory at ~/.thoughtmachine/workspaces/<human_id>/.
+3. Write workspace_identity.json and config.json inside it.
+4. Bootstrap default workspace files via ensure_workspace_dirs().
 """
+
+from __future__ import annotations
+
 import hashlib
 import json
 import os
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
+# Add project root to sys.path so thoughtmachine modules are importable
+_PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 
-def main():
-    thoughtmachine_dir = Path.home() / ".thoughtmachine"
-    workspaces_dir = thoughtmachine_dir / "workspaces"
-    workspaces_dir.mkdir(parents=True, exist_ok=True)
+def _get_deterministic_hash(root_path: str) -> str:
+    """Return a deterministic 16-char hex identifier for a root path."""
+    return hashlib.sha256(root_path.encode()).hexdigest()[:16]
 
-    # Compute workspace ID from project root (same algorithm as thoughtmachine.workspace_capabilities)
-    ws_id = hashlib.sha256(PROJECT_ROOT.encode()).hexdigest()[:16]
-    ws_dir = workspaces_dir / ws_id
+
+def _write_identity_file(ws_dir: Path, root_path: str, human_id: str) -> None:
+    """Write workspace_identity.json inside the workspace directory."""
+    identity = {
+        "deterministic_hash": _get_deterministic_hash(root_path),
+        "root_path": os.path.abspath(root_path),
+        "human_id": human_id,
+    }
     ws_dir.mkdir(parents=True, exist_ok=True)
-
-    # ── Write config.json ────────────────────────────────────────────────
-    config_path = ws_dir / "config.json"
-    if not config_path.exists():
-        config_path.write_text(
-            json.dumps({"root": PROJECT_ROOT, "capabilities": {}}, indent=2),
-            encoding="utf-8",
-        )
-        print(f"✅ Created {config_path}")
-    else:
-        print(f"⏩ Already exists: {config_path}")
-
-    # ── Bootstrap default files (same as ensure_workspace_dirs) ──────────
-    from thoughtmachine.workspace_capabilities import (
-        WorkspaceCapabilities,
-        ensure_workspace_dirs,
+    (ws_dir / "workspace_identity.json").write_text(
+        json.dumps(identity, indent=2), encoding="utf-8"
     )
 
-    created = ensure_workspace_dirs(ws_id)
-    for path in created:
-        print(f"✅ Created {path}")
 
-    # ── Workers already written by ensure_workspace_dirs (templates only, no echo) ─
-    workers_path = ws_dir / "workers.json"
-    if workers_path.exists():
-        print(f"Workers already bootstrapped at {workers_path}")
-    else:
-        print(f"workers.json not found at {workers_path} — ensure_workspace_dirs should create it")
+def _write_config_json(ws_dir: Path, root_path: str) -> None:
+    """Write config.json for backward compatibility with ensure_workspace_dirs and bridge.py."""
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    (ws_dir / "config.json").write_text(
+        json.dumps({"root": os.path.abspath(root_path)}, indent=2), encoding="utf-8"
+    )
+
+
+def main() -> None:
+    from thoughtmachine.workspace_registry import WorkspaceRegistry
+    from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
+
+    root_path = os.path.abspath(_PROJECT_ROOT)
+
+    # 1. Register in the workspace registry (gets or creates human-readable ID)
+    registry = WorkspaceRegistry.get_default()
+    entry = registry.register_by_root(root_path, label=os.path.basename(root_path))
+    human_id = entry.id
+    print(f"Workspace ID: {human_id}")
+    print(f"  Root path:  {root_path}")
+
+    # 2. Create workspace directory
+    ws_dir = Path.home() / ".thoughtmachine" / "workspaces" / human_id
+
+    # 3. Write identity and config files
+    _write_identity_file(ws_dir, root_path, human_id)
+    _write_config_json(ws_dir, root_path)
+
+    # 4. Bootstrap default workspace files
+    ensure_workspace_dirs(human_id)
+    print(f"  Directory:  {ws_dir}")
+    print("Done.")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

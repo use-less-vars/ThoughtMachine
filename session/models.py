@@ -151,6 +151,8 @@ class Session:
     summary: Optional[Dict[str, Any]] = field(default=None, compare=False, repr=False)
     agent_instance: Optional[Any] = field(default=None, compare=False, repr=False)
     workspace_id: Optional[str] = field(default=None, compare=False)
+    mode: str = "agent"  # "agent", "engineer", or "custom"
+    last_active: str = ""  # ISO datetime string, updated on each use
     metadata: Dict[str, Any] = field(default_factory=dict)
     security_config: Dict[str, Any] = field(default_factory=get_default_security_config)
     _conversation_changed_callbacks: List[Any] = field(default_factory=list, compare=False, repr=False)
@@ -205,7 +207,7 @@ class Session:
         """Ensure session has a name for display/persistence.
         
         If metadata doesn't have a 'name' key, generates a default name
-        based on creation timestamp.
+        based on creation timestamp and session mode.
         """
         name = self.metadata.get('name', '')
         if not name or not str(name).strip():
@@ -214,7 +216,12 @@ class Session:
                 timestamp = self.created_at
             else:
                 timestamp = datetime.now()
-            self.metadata['name'] = f'Session {timestamp:%Y-%m-%d %H:%M}'
+            mode_prefix = {
+                "agent": "Agent Session",
+                "engineer": "Engineer Session",
+                "custom": "Custom Session",
+            }.get(self.mode, "Session")
+            self.metadata['name'] = f'{mode_prefix} {timestamp:%Y-%m-%d %H:%M}'
 
     @staticmethod
     def _normalize_conversation_for_hash(conversation: List[Dict[str, Any]]) -> str:
@@ -293,7 +300,7 @@ class Session:
         Convert session to a dictionary suitable for JSON serialization.
         Excludes non-persistable fields like agent_context (derived) and objects.
         """
-        data = {'session_id': self.session_id, 'created_at': self.created_at.isoformat(), 'updated_at': datetime.now().isoformat(), 'user_history': list(self.user_history), 'containers': [c.to_dict() for c in self.containers], 'preset_name': self.preset_name, 'workspace_id': self.workspace_id, 'metadata': self.metadata, 'security_config': self.security_config, 'version': self.version, 'summary': self.summary, 'total_input_tokens': self.total_input_tokens, 'total_output_tokens': self.total_output_tokens, 'context_length': self.context_length}
+        data = {'session_id': self.session_id, 'created_at': self.created_at.isoformat(), 'updated_at': datetime.now().isoformat(), 'user_history': list(self.user_history), 'containers': [c.to_dict() for c in self.containers], 'preset_name': self.preset_name, 'workspace_id': self.workspace_id, 'mode': self.mode, 'last_active': self.last_active, 'metadata': self.metadata, 'security_config': self.security_config, 'version': self.version, 'summary': self.summary, 'total_input_tokens': self.total_input_tokens, 'total_output_tokens': self.total_output_tokens, 'context_length': self.context_length}
         return data
 
     @classmethod
@@ -357,7 +364,10 @@ class Session:
             )
 
         version = data.get('version', 1)
-        session = cls(session_id=str(data.get('session_id', str(uuid.uuid4()))), created_at=created_at, updated_at=updated_at, runtime_params=runtime_params, user_history=user_history, containers=containers, preset_name=data.get('preset_name'), workspace_id=data.get('workspace_id'), metadata=metadata, security_config=security_config, version=version, summary=data.get('summary'), total_input_tokens=data.get('total_input_tokens', 0), total_output_tokens=data.get('total_output_tokens', 0), next_seq=next_seq_value, context_length=data.get('context_length', 0))
+        # Backward compat: mode and last_active (legacy sessions may lack these)
+        mode = data.get('mode', 'agent')
+        last_active = data.get('last_active', '')
+        session = cls(session_id=str(data.get('session_id', str(uuid.uuid4()))), created_at=created_at, updated_at=updated_at, runtime_params=runtime_params, user_history=user_history, containers=containers, preset_name=data.get('preset_name'), workspace_id=data.get('workspace_id'), mode=mode, last_active=last_active, metadata=metadata, security_config=security_config, version=version, summary=data.get('summary'), total_input_tokens=data.get('total_input_tokens', 0), total_output_tokens=data.get('total_output_tokens', 0), next_seq=next_seq_value, context_length=data.get('context_length', 0))
         return session
 
     def update_from_persistable_dict(self, data: Dict[str, Any]) -> None:
@@ -414,6 +424,8 @@ class Session:
             )
 
         version = data.get('version', 1)
+        self.mode = data.get('mode', self.mode)
+        self.last_active = data.get('last_active', self.last_active)
         self.session_id = str(data.get('session_id', str(uuid.uuid4())))
         self.created_at = created_at
         self.updated_at = updated_at

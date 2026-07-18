@@ -414,6 +414,7 @@ def _safeguard_workspace_dir(base: Path) -> None:
         "workers.json",
         "workers",
         "mcp_servers.json",
+        "workspace_identity.json",
     }
     if not base.is_dir():
         return

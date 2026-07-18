@@ -897,6 +897,48 @@ body {
   opacity: 0.85;
 }
 
+.worker-output-pause-btn {
+  background: var(--warning);
+  color: var(--bg-primary);
+  border: none;
+  border-radius: var(--radius);
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  transition: opacity 0.15s;
+}
+.worker-output-pause-btn:disabled {
+  background: var(--border);
+  color: var(--text-secondary);
+  cursor: not-allowed;
+}
+.worker-output-pause-btn:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.worker-output-resume-btn {
+  background: var(--success);
+  color: var(--bg-primary);
+  border: none;
+  border-radius: var(--radius);
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  transition: opacity 0.15s;
+}
+.worker-output-resume-btn:disabled {
+  background: var(--border);
+  color: var(--text-secondary);
+  cursor: not-allowed;
+}
+.worker-output-resume-btn:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
 .worker-output-close-btn {
   background: transparent;
   color: var(--text-secondary);

@@ -23,6 +23,8 @@ from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 
+from thoughtmachine.workspace_registry import WorkspaceRegistry
+
 from thoughtmachine.workspace_capabilities import (
     WorkspaceCapabilities,
     _workspace_dir,
@@ -37,6 +39,29 @@ from agent.models.worker_definition import WorkerDefinition
 # ── Router ───────────────────────────────────────────────────────────────────
 
 router = APIRouter(prefix="/api/workspace")
+
+# ── GET /api/workspace/list ─────────────────────────────────────────────────────
+
+@router.get("/list")
+async def list_workspaces() -> List[Dict[str, Any]]:
+    """List all registered workspaces."""
+    try:
+        registry = WorkspaceRegistry.get_default()
+        entries = registry.list_workspaces()
+        return [
+            {
+                "id": entry.id,
+                "root": entry.root_path,
+                "label": entry.label or entry.id,
+            }
+            for entry in entries
+        ]
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list workspaces: {exc}",
+        )
+
 
 # ── GET /api/workspace/templates ────────────────────────────────────────────────
 
@@ -656,5 +681,151 @@ async def stop_worker(ws_id: str, name: str):
                     pass  # File-based stop will still work
 
     return {"status": "ok", "name": name}
+
+# ── POST /api/workspace/{ws_id}/workers/{name}/pause ───────────────────────
+
+@router.post("/{ws_id}/workers/{name}/pause")
+async def pause_worker(ws_id: str, name: str):
+    """Pause a running worker after it completes its current turn.
+
+    Supports both directory layouts:
+      - ``workers/<session_id>/<name>/`` (session-scoped)
+      - ``workers/<name>/`` (legacy, no session)
+
+    Writes ``{"action": "pause"}`` to the worker's ``command.json`` so that
+    the worker thread (which polls for this file) picks it up within 2 seconds.
+    Also attempts an in-memory pause as a fast path if the thread is in the
+    registry.  Returns immediately — the worker will transition to ``paused``
+    asynchronously.
+
+    Also immediately writes ``status.json`` with ``runtime_status: "paused"``
+    so the web UI's next poll sees the paused state right away.
+
+    Returns:
+        200 with ``{"status": "paused", "name": name}`` on success.
+        404 if the worker directory does not exist.
+    """
+    ensure_workspace_dirs(ws_id)
+    ws_dir = _workspace_dir(ws_id)
+    workers_dir = ws_dir / "workers"
+
+    # ── Find the worker directory (session-scoped first, then legacy) ──
+    worker_dir: Optional[Path] = None
+
+    if workers_dir.is_dir():
+        for subdir in workers_dir.iterdir():
+            if not subdir.is_dir():
+                continue
+            # Check if this is a session directory (contains sub-worker dirs)
+            first_child = next(subdir.iterdir(), None) if subdir.is_dir() else None
+            if first_child is not None and first_child.is_dir():
+                # Session-scoped: workers/<session_id>/<name>/
+                candidate = subdir / name
+                if candidate.is_dir():
+                    worker_dir = candidate
+                    break
+            else:
+                # Legacy: workers/<name>/
+                if subdir.name == name:
+                    worker_dir = subdir
+                    break
+
+    if worker_dir is None or not worker_dir.is_dir():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"status": "not_found", "name": name},
+        )
+
+    # Write the pause command file — the worker thread polls for this
+    _atomic_write_json({"action": "pause"}, worker_dir / "command.json")
+
+    # Immediately write status.json as "paused" so the UI sees it right away
+    _atomic_write_json({
+        "runtime_status": "paused",
+        "current_task": None,
+        "last_heartbeat": datetime.now(timezone.utc).isoformat(),
+        "error": None,
+    }, worker_dir / "status.json")
+
+    # Fast-path: if the thread is in-memory (same process), signal directly.
+    # Registry keys are tuples (session_id, worker_name), so iterate all
+    # entries matching the worker name across all sessions.
+    with _registry_lock:
+        for (sid, wname), thread in list(_worker_registry.items()):
+            if wname == name:
+                try:
+                    thread.pause()
+                except Exception:
+                    pass  # File-based pause will still work
+
+    return {"status": "paused", "name": name}
+
+
+# ── POST /api/workspace/{ws_id}/workers/{name}/resume ──────────────────────
+
+@router.post("/{ws_id}/workers/{name}/resume")
+async def resume_worker(ws_id: str, name: str):
+    """Resume a paused worker.
+
+    Supports both directory layouts:
+      - ``workers/<session_id>/<name>/`` (session-scoped)
+      - ``workers/<name>/`` (legacy, no session)
+
+    Writes ``{"action": "resume"}`` to the worker's ``command.json`` so that
+    the worker thread (which polls for this file) picks it up within 2 seconds.
+    Also attempts an in-memory resume as a fast path if the thread is in the
+    registry.  Returns immediately — the worker will transition back to
+    ``ready``/``busy`` asynchronously.
+
+    Returns:
+        200 with ``{"status": "resumed", "name": name}`` on success.
+        404 if the worker directory does not exist.
+    """
+    ensure_workspace_dirs(ws_id)
+    ws_dir = _workspace_dir(ws_id)
+    workers_dir = ws_dir / "workers"
+
+    # ── Find the worker directory (session-scoped first, then legacy) ──
+    worker_dir: Optional[Path] = None
+
+    if workers_dir.is_dir():
+        for subdir in workers_dir.iterdir():
+            if not subdir.is_dir():
+                continue
+            # Check if this is a session directory (contains sub-worker dirs)
+            first_child = next(subdir.iterdir(), None) if subdir.is_dir() else None
+            if first_child is not None and first_child.is_dir():
+                # Session-scoped: workers/<session_id>/<name>/
+                candidate = subdir / name
+                if candidate.is_dir():
+                    worker_dir = candidate
+                    break
+            else:
+                # Legacy: workers/<name>/
+                if subdir.name == name:
+                    worker_dir = subdir
+                    break
+
+    if worker_dir is None or not worker_dir.is_dir():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"status": "not_found", "name": name},
+        )
+
+    # Write the resume command file — the worker thread polls for this
+    _atomic_write_json({"action": "resume"}, worker_dir / "command.json")
+
+    # Fast-path: if the thread is in-memory (same process), signal directly.
+    with _registry_lock:
+        for (sid, wname), thread in list(_worker_registry.items()):
+            if wname == name:
+                try:
+                    thread.resume()
+                except Exception:
+                    pass  # File-based resume will still work
+
+    return {"status": "resumed", "name": name}
+
+
 
 

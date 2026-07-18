@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from session.store import FileSystemSessionStore
 from session.models import Session
+from thoughtmachine.workspace_registry import WorkspaceRegistry
 
 # ── Router ──────────────────────────────────────────────────────────────────
 
@@ -29,6 +30,8 @@ router = APIRouter(prefix="/api/session")
 class CreateSessionBody(BaseModel):
     name: Optional[str] = None
     workspace_id: Optional[str] = None
+    mode: Optional[str] = None
+    workspace_path: Optional[str] = None
 
 
 class CreateSessionResponse(BaseModel):
@@ -37,6 +40,7 @@ class CreateSessionResponse(BaseModel):
     created_at: str
     updated_at: str
     workspace_id: str = ""
+    mode: str = "agent"
 
 
 class SessionListItem(BaseModel):
@@ -54,6 +58,7 @@ class SessionDetailResponse(BaseModel):
     updated_at: Optional[str] = None
     message_count: int = 0
     workspace_id: str = ""
+    mode: str = "agent"
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -80,11 +85,19 @@ async def create_session(body: CreateSessionBody) -> Dict[str, Any]:
         session.metadata['source'] = 'rest_api'
         if body.name:
             session.metadata['name'] = body.name
-        if body.workspace_id:
+        if body.mode:
+            session.mode = body.mode
+        if body.workspace_path:
+            # Register the path via WorkspaceRegistry, which returns
+            # the existing entry (if already registered) or creates a new one.
+            registry = WorkspaceRegistry.get_default()
+            entry = registry.register_by_root(body.workspace_path)
+            session.workspace_id = entry.id
+        elif body.workspace_id:
             session.workspace_id = body.workspace_id
         session.ensure_name()
 
-        store.save_session(session, workspace_id=body.workspace_id)
+        store.save_session(session, workspace_id=session.workspace_id)
         store.add_open_session(session.session_id)
 
         return {
@@ -92,7 +105,8 @@ async def create_session(body: CreateSessionBody) -> Dict[str, Any]:
             "name": session.metadata.get('name', 'Untitled Session'),
             "created_at": session.created_at.isoformat() if hasattr(session.created_at, 'isoformat') else str(session.created_at),
             "updated_at": session.updated_at.isoformat() if hasattr(session.updated_at, 'isoformat') else str(session.updated_at),
-            "workspace_id": body.workspace_id or "",
+            "workspace_id": session.workspace_id or "",
+            "mode": session.mode,
         }
     except Exception as exc:
         raise HTTPException(
@@ -144,6 +158,7 @@ async def get_session(session_id: str) -> Dict[str, Any]:
             "updated_at": session.updated_at.isoformat() if hasattr(session.updated_at, 'isoformat') else str(session.updated_at),
             "message_count": message_count,
             "workspace_id": session.workspace_id or "",
+            "mode": session.mode,
         }
     except HTTPException:
         raise

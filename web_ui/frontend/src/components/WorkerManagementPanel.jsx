@@ -616,8 +616,60 @@ export default function WorkerManagementPanel({
     [workspaceId]
   );
 
+  const handlePause = useCallback(async (name) => {
+    try {
+      const res = await fetch(
+        `/api/workspace/${workspaceId}/workers/${encodeURIComponent(name)}/pause`,
+        { method: 'POST' }
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.detail?.error || `HTTP ${res.status}`);
+      }
+      setWorkers((prev) =>
+        prev.map((w) => (w.name === name ? { ...w, runtime_status: 'paused' } : w))
+      );
+      setStopErrors((prev) => { const n = { ...prev }; delete n[name]; return n; });
+    } catch (err) {
+      setStopErrors((prev) => ({ ...prev, [name]: err.message }));
+      setTimeout(() => {
+        setStopErrors((prev) => { const n = { ...prev }; delete n[name]; return n; });
+      }, 3000);
+    }
+  }, [workspaceId]);
+
+  const handleResume = useCallback(async (name) => {
+    try {
+      const res = await fetch(
+        `/api/workspace/${workspaceId}/workers/${encodeURIComponent(name)}/resume`,
+        { method: 'POST' }
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.detail?.error || `HTTP ${res.status}`);
+      }
+      setWorkers((prev) =>
+        prev.map((w) => (w.name === name ? { ...w, runtime_status: 'ready' } : w))
+      );
+      setStopErrors((prev) => { const n = { ...prev }; delete n[name]; return n; });
+    } catch (err) {
+      setStopErrors((prev) => ({ ...prev, [name]: err.message }));
+      setTimeout(() => {
+        setStopErrors((prev) => { const n = { ...prev }; delete n[name]; return n; });
+      }, 3000);
+    }
+  }, [workspaceId]);
+
   const canStop = useCallback((status) => {
     return status === 'busy' || status === 'ready' || !status;
+  }, []);
+
+  const canPause = useCallback((status) => {
+    return status === 'busy' || status === 'ready';
+  }, []);
+
+  const canResume = useCallback((status) => {
+    return status === 'paused';
   }, []);
 
   // ── Create / Update worker ───────────────────────────────────────────────
@@ -901,6 +953,54 @@ export default function WorkerManagementPanel({
                       >
                         {w.runtime_status}
                       </span>
+                      {/* Pause / Resume toggle */}
+                      {w.runtime_status === 'paused' ? (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleResume(w.name);
+                          }}
+                          style={{
+                            background: '#a6e3a1',
+                            color: '#1e1e2e',
+                            border: 'none',
+                            borderRadius: '3px',
+                            padding: '0.1rem 0.4rem',
+                            cursor: 'pointer',
+                            fontWeight: 600,
+                            fontSize: '0.65rem',
+                            lineHeight: '1.4',
+                            marginRight: '4px',
+                          }}
+                          title={`Resume ${w.name}`}
+                        >
+                          ▶ Resume
+                        </button>
+                      ) : (
+                        canPause(w.runtime_status) && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handlePause(w.name);
+                            }}
+                            style={{
+                              background: '#f9e2af',
+                              color: '#1e1e2e',
+                              border: 'none',
+                              borderRadius: '3px',
+                              padding: '0.1rem 0.4rem',
+                              cursor: 'pointer',
+                              fontWeight: 600,
+                              fontSize: '0.65rem',
+                              lineHeight: '1.4',
+                              marginRight: '4px',
+                            }}
+                            title={`Pause ${w.name}`}
+                          >
+                            ⏸ Pause
+                          </button>
+                        )
+                      )}
                       {/* Stop button */}
                       {isRunning && (
                         <button

@@ -332,18 +332,10 @@ class ToolExecutor:
             return len(str(text)) // 4
 
     def _create_tool_rejection_message(self, tool_name: str) -> str:
-        """Create rejection message for disallowed tool calls."""
+        """Create concise rejection message for disallowed tool calls."""
         allowed_tools = self.state.get_allowed_tools()
         if allowed_tools:
-            # Dynamically list all allowed tools
-            allowed_list = '\n'.join(f'- {t}' for t in allowed_tools)
-            return (
-                f"❌ TOOL CALL REJECTED ❌"
-                f"\n\nYou attempted to use '{tool_name}', which is currently FORBIDDEN."
-                f"\n\nCurrent state: restrictions_active (limit exceeded)"
-                f"\nWhy: Token or turn limits exceeded."
-                f"\n\nYou may call:\n{allowed_list}"
-                f"\n\nPlease use one of the allowed tools now."
-            )
+            allowed_list = ', '.join(allowed_tools)
+            return f"Tool not allowed. Available tools: {allowed_list}"
         else:
-            return f"❌ TOOL CALL REJECTED ❌\n\nYou attempted to use '{tool_name}', which is currently FORBIDDEN.\n\nCurrent state: token_state={self.state.token_state.value}, turn_state={self.state.turn_state.value}\nPossible reasons: Token or turn limits exceeded with active restrictions.\n\nCheck system warnings for required actions."
+            return f"Tool not allowed. Available tools: none"

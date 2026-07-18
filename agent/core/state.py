@@ -16,6 +16,7 @@ class TurnState(enum.Enum):
     """Turn usage state based on turn count."""
     LOW = 'low'
     WARNING = 'warning'
+    CRITICAL = 'critical'
 
 class ExecutionState(enum.Enum):
     """Unified execution state for agent and GUI."""
@@ -250,8 +251,9 @@ class AgentState:
     def update_turn_state(self, current_turn: int) -> List[Dict[str, Any]]:
         """Update turn state based on current turn count.
 
-        Uses a fixed warning threshold: when current_turn >= max_turns - 3,
-        a single final warning is issued and tool restrictions activate.
+        Two-stage restriction:
+          - WARNING at max_turns-8: agent is warned but tools are NOT restricted.
+          - CRITICAL at max_turns-5: tool restrictions activate (only Respond allowed).
 
         Returns list of events (e.g., warnings) that should be yielded.
         """
@@ -261,24 +263,28 @@ class AgentState:
             return []
         max_turns = self.config.max_turns
         log('DEBUG', 'pipeline.warning', f'ENTER update_turn_state: current_turn={current_turn}, max_turns={max_turns}')
-        warning_turn = max_turns - 3
-        if warning_turn < 0 or current_turn < warning_turn:
-            new_state = TurnState.LOW
-        else:
+
+        # Compute thresholds — guard against small max_turns
+        critical_turn = max(max_turns - 5, max_turns - 1) if max_turns >= 2 else max_turns
+        warning_turn = max(max_turns - 8, 0) if max_turns >= 8 else 0
+
+        if current_turn >= critical_turn:
+            new_state = TurnState.CRITICAL
+        elif current_turn >= warning_turn:
             new_state = TurnState.WARNING
+        else:
+            new_state = TurnState.LOW
+
         old_state = self.turn_state
         self.turn_state = new_state
         events = []
+
+        # ── WARNING: message only, no restrictions ─────────────────────
         if new_state == TurnState.WARNING and old_state != TurnState.WARNING and self.last_turn_warning_state != TurnState.WARNING:
             log('DEBUG', 'pipeline.warning', f'WARNING: turn warning fired at {current_turn}/{max_turns}')
-            self.restrictions_active = True
-            self.restrictions_pending = False
-            self.restriction_reason = 'turn'
             warning = (
                 f'**Turn limit warning**: You are running out of turns ({current_turn}/{max_turns}). '
-                f'You must wait for the user to re-enable your session. Please provide a final answer now '
-                f'so the user can decide if they want to send you further queries or if they are happy '
-                f'with the result you have so far. Only Respond is available.'
+                f'Please finish your work and prepare a final response.'
             )
             self.last_turn_warning = warning
             self.last_turn_warning_count = current_turn
@@ -288,11 +294,34 @@ class AgentState:
             log('DEBUG', 'pipeline.warning', f'CREATED turn_warning event: old={old_state.value}, new={new_state.value}, count={current_turn}')
             turn_warning_data = {'old_state': old_state.value, 'new_state': new_state.value, 'turn_count': current_turn, 'warning_message': warning, 'state': new_state.value}
             events.append(self._create_event('turn_warning', turn_warning_data))
+
+        # ── CRITICAL: restrictions active, only Respond allowed ────────
+        if new_state == TurnState.CRITICAL and old_state != TurnState.CRITICAL:
+            log('DEBUG', 'pipeline.warning', f'CRITICAL: turn critical fired at {current_turn}/{max_turns}')
+            self.restrictions_active = True
+            self.restrictions_pending = False
+            self.restriction_reason = 'turn'
+            warning = (
+                f'**Turn limit critical**: You are at turn {current_turn}/{max_turns}. '
+                f'Tool restrictions are now active. Only Respond is available. '
+                f'Please provide your final answer now.'
+            )
+            self.last_turn_warning = warning
+            self.last_turn_warning_count = current_turn
+            self.last_turn_warning_state = TurnState.CRITICAL
+            if self.logger:
+                self.logger.log_turn_warning(old_state.value, new_state.value, current_turn, warning)
+            log('DEBUG', 'pipeline.warning', f'CREATED turn_warning event (CRITICAL): old={old_state.value}, new={new_state.value}, count={current_turn}')
+            turn_warning_data = {'old_state': old_state.value, 'new_state': new_state.value, 'turn_count': current_turn, 'warning_message': warning, 'state': new_state.value}
+            events.append(self._create_event('turn_warning', turn_warning_data))
+
+        # ── LOW: clear all restrictions ────────────────────────────────
         if new_state == TurnState.LOW:
             self.last_turn_warning_state = TurnState.LOW
             self.restrictions_active = False
             self.restrictions_pending = False
             self.restriction_reason = None
+
         return events
     def set_execution_state(self, new_state: ExecutionState) -> List[Dict[str, Any]]:
         """Transition to a new execution state.
@@ -350,12 +379,17 @@ class AgentState:
     def get_allowed_tools(self) -> List[str]:
         """Get list of allowed tool names based on current states.
 
-        When restrictions_active is True, only Respond (and optionally SummarizeTool) are allowed.
-        For timeout restrictions, only Respond is available (no SummarizeTool).
+        When restrictions_active is True, tool access is limited based on reason:
+        - 'turn': Only Respond is allowed (agent must finish immediately).
+        - 'timeout': Only Respond is allowed (agent exceeded runtime limit).
+        - 'token': Respond + SummarizeTool allowed (SummarizeTool needed to reduce context).
         """
         if self.restrictions_active:
             if self.restriction_reason == 'timeout':
                 return ['Respond']
+            if self.restriction_reason == 'turn':
+                return ['Respond']
+            # 'token' — allow SummarizeTool so agent can reduce context size
             return ['Respond', 'SummarizeTool']
         return []
 

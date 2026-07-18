@@ -32,7 +32,15 @@ from agent.core.state import AgentState, TokenState, TurnState, TimeState
 @pytest.fixture
 def state() -> AgentState:
     """Fresh AgentState with a mock logger."""
-    s = AgentState(logger=MagicMock())
+    mock_config = MagicMock()
+    mock_config.turn_monitor_enabled = True
+    mock_config.max_turns = 100
+    mock_config.token_monitor_warning_threshold = 500
+    mock_config.token_monitor_critical_threshold = 1000
+    mock_config.time_monitor_enabled = True
+    mock_config.timeout_seconds = 300
+    mock_config.time_warning_threshold = 240
+    s = AgentState(config=mock_config, logger=MagicMock())
     s.reset()
     return s
 
@@ -58,12 +66,12 @@ class TestGetAllowedTools:
         allowed = state.get_allowed_tools()
         assert allowed == ['Respond', 'SummarizeTool'], f"Expected ['Respond', 'SummarizeTool'], got {allowed}"
 
-    def test_get_allowed_tools_turn_warning_returns_respond_and_summarize(self, state: AgentState):
-        """When restriction_reason is 'turn', both Respond and SummarizeTool should be allowed."""
+    def test_get_allowed_tools_turn_critical_returns_only_respond(self, state: AgentState):
+        """When restriction_reason is 'turn', only Respond should be allowed."""
         state.restrictions_active = True
         state.restriction_reason = 'turn'
         allowed = state.get_allowed_tools()
-        assert allowed == ['Respond', 'SummarizeTool'], f"Expected ['Respond', 'SummarizeTool'], got {allowed}"
+        assert allowed == ['Respond'], f"Expected ['Respond'], got {allowed}"
 
     def test_get_allowed_tools_no_restrictions_returns_empty(self, state: AgentState):
         """When restrictions are not active, get_allowed_tools() should return []."""
@@ -101,9 +109,9 @@ class TestRestrictionReason:
         )
         assert state.restrictions_active is True
 
-    def test_restriction_reason_set_on_turn_warning(self, state: AgentState):
-        """Turn WARNING state should set restriction_reason to 'turn'."""
-        state.current_turn = 18
+    def test_restriction_reason_set_on_turn_critical(self, state: AgentState):
+        """Turn CRITICAL state should set restriction_reason to 'turn'."""
+        state.current_turn = 19
         state.max_turns = 20
         state.turn_warning_threshold = 15
         events = state.update_turn_state(state.current_turn)
@@ -147,10 +155,9 @@ class TestRestrictionReason:
 
     def test_restriction_reason_cleared_when_turn_returns_to_low(self, state: AgentState):
         """When turn state goes back to LOW, restriction_reason should be cleared."""
-        # First trigger WARNING
-        state.current_turn = 18
-        state.max_turns = 20
-        state.turn_warning_threshold = 15
+        # First trigger CRITICAL (max_turns=100, critical at 95)
+        state.current_turn = 95
+        state.max_turns = 100
         state.update_turn_state(state.current_turn)
         assert state.restriction_reason == 'turn'
 

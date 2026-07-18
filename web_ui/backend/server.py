@@ -106,6 +106,7 @@ from fastapi.staticfiles import StaticFiles
 from agent.logging import log
 from contextlib import asynccontextmanager
 from session.store import FileSystemSessionStore
+from thoughtmachine.workspace_registry import WorkspaceRegistry
 
 # ── Shared session store singleton ────────────────────────────────────────────
 # All WebSocket connections and bridges share ONE FileSystemSessionStore so that
@@ -126,6 +127,7 @@ from web_ui.backend.workspace_routes import router as workspace_router
 from web_ui.backend.config_routes import router as config_router
 from web_ui.backend.logging_routes import router as logging_router
 from web_ui.backend.health_routes import router as health_router
+from web_ui.backend.session_routes import router as session_router
 
 
 # Ensure project root is on sys.path
@@ -165,6 +167,48 @@ try:
 except ImportError:
     pass  # websockets not installed — nothing to patch
 
+# ── Migration helper ───────────────────────────────────────────────────────────
+
+def _migrate_old_workspaces() -> int:
+    """Migrate old-style workspace directories (with ``config.json`` but no
+    ``workspace_identity.json``) into the :class:`WorkspaceRegistry`.
+
+    Scans ``~/.thoughtmachine/workspaces/`` for subdirectories.  For each
+    directory that contains a ``config.json`` with a ``root`` key but does
+    **not** contain a ``workspace_identity.json``, it calls
+    ``WorkspaceRegistry.get_default().register_by_root(root)`` to add it to
+    the registry.
+
+    Returns the number of workspaces migrated.
+    """
+    count = 0
+    base_dir = Path.home() / ".thoughtmachine" / "workspaces"
+    if not base_dir.is_dir():
+        return 0
+
+    registry = WorkspaceRegistry.get_default()
+    for ws_dir in sorted(base_dir.iterdir()):
+        if not ws_dir.is_dir():
+            continue
+        config_path = ws_dir / "config.json"
+        identity_path = ws_dir / "workspace_identity.json"
+        if config_path.exists() and not identity_path.exists():
+            try:
+                cfg = json.loads(config_path.read_text(encoding="utf-8"))
+                root = cfg.get("root")
+                if not root:
+                    continue
+                entry = registry.register_by_root(str(root))
+                log('INFO', 'server',
+                    f"_migrate_old_workspaces: registered {entry.id} for {root} "
+                    f"(was legacy dir {ws_dir.name})")
+                count += 1
+            except Exception as exc:
+                log('WARNING', 'server',
+                    f"_migrate_old_workspaces: error processing {ws_dir.name}: {exc}")
+    return count
+
+
 # ── App + lifespan ──────────────────────────────────────────────────────────
 
 # We import bridge lazily inside the lifespan / endpoint to avoid
@@ -194,6 +238,27 @@ async def lifespan(app: FastAPI):
         log('INFO', 'server', f'ThoughtMachine version {get_version()}')
     except Exception as exc:
         log('WARNING', 'server', f'Could not initialise user defaults: {exc}')
+
+    # ── Migrate old-style workspaces ──
+    try:
+        migrated = _migrate_old_workspaces()
+        if migrated:
+            log('INFO', 'server',
+                f'Migrated {migrated} old workspace(s) to the registry.')
+    except Exception as exc:
+        log('WARNING', 'server', f'Workspace migration error: {exc}')
+
+    # ── Auto-register project root as a default workspace ──────────────
+    try:
+        from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
+
+        registry = WorkspaceRegistry.get_default()
+        entry = registry.register_by_root(str(_project_root), label="default")
+        ensure_workspace_dirs(entry.id)
+        log('INFO', 'server',
+            f'Auto-registered default workspace: {entry.id} at {_project_root}')
+    except Exception as exc:
+        log('WARNING', 'server', f'Could not auto-register default workspace: {exc}')
 
     # ── Startup container integrity check ─────────────────────────────────
     # Scan for any existing agent-exec-* containers and verify they match
@@ -644,24 +709,13 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
 
                         if not workspace_id:
                             try:
-                                import uuid
-                                import json as _json
-                                from thoughtmachine.workspace_capabilities import (
-                                    ensure_workspace_dirs, _workspace_dir,
-                                )
-                                new_ws_id = uuid.uuid4().hex
-                                ws_dir = _workspace_dir(new_ws_id)
-                                ws_dir.mkdir(parents=True, exist_ok=True)
-                                config_path = ws_dir / "config.json"
-                                config_path.write_text(
-                                    _json.dumps({"root": str(_project_path)}, indent=2),
-                                    encoding="utf-8",
-                                )
-                                ensure_workspace_dirs(new_ws_id)
-                                workspace_id = new_ws_id
-                                bridge._workspace_id = new_ws_id
+                                from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
+                                entry = WorkspaceRegistry.get_default().register_by_root(str(_project_path))
+                                workspace_id = entry.id
+                                bridge._workspace_id = entry.id
+                                ensure_workspace_dirs(entry.id)
                                 log('INFO', 'server',
-                                    f"apply_config: auto-registered workspace {new_ws_id} for {_project_path}")
+                                    f"apply_config: registered workspace {entry.id} for {_project_path}")
                             except Exception as exc:
                                 log('WARNING', 'server',
                                     f"apply_config: auto-register error: {exc}")
@@ -689,7 +743,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             new_session.ensure_name()
                             bridge._loaded_session = new_session
                             _session_bridges[new_session.session_id] = bridge
-                            session_store.save_session(new_session)
+                            session_store.save_session(new_session, workspace_id=workspace_id)
                             session_store.add_open_session(new_session.session_id)
                             log('INFO', 'server',
                                 f"apply_config: created new session {new_session.session_id} "
@@ -709,7 +763,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             existing_session.workspace_id = workspace_id or ''
                             bridge._loaded_session = existing_session
                             _session_bridges[existing_session.session_id] = bridge
-                            session_store.save_session(existing_session)
+                            session_store.save_session(existing_session, workspace_id=workspace_id)
                             log('INFO', 'server',
                                 f"apply_config: updated existing session {existing_session.session_id} "
                                 f"to workspace {workspace_id} (no conversation — kept same tab)")
@@ -722,7 +776,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             new_session.ensure_name()
                             bridge._loaded_session = new_session
                             _session_bridges[new_session.session_id] = bridge
-                            session_store.save_session(new_session)
+                            session_store.save_session(new_session, workspace_id=workspace_id)
                             session_store.add_open_session(new_session.session_id)
 
                         # 6. Now apply the config to the NEW bridge
@@ -1251,12 +1305,13 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             log("INFO", "server.config", f"Renamed session {session_id} → {new_name}")
                         else:
                             # Fallback: no bridge active, or bridge.rename_session returned False
-                            session = session_store.load_session(session_id)
+                            ws_id_for_load = bridge.workspace_id if bridge else None
+                            session = session_store.load_session(session_id, workspace_id=ws_id_for_load)
                             if session is None:
                                 await ws.send_json({"type": "status_message", "text": f"⚠ Session not found: {session_id}"})
                                 continue
                             session.metadata['name'] = new_name
-                            session_store.save_session(session)
+                            session_store.save_session(session, workspace_id=session.workspace_id)
                             await ws.send_json({
                                 "type": "session_renamed",
                                 "session_id": session_id,
@@ -1390,24 +1445,13 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # one on the fly so the workspace panel and workers work.
                     if not workspace_id:
                         try:
-                            import uuid
-                            import json as _json
-                            from thoughtmachine.workspace_capabilities import (
-                                ensure_workspace_dirs, _workspace_dir,
-                            )
-                            new_ws_id = uuid.uuid4().hex
-                            ws_dir = _workspace_dir(new_ws_id)
-                            ws_dir.mkdir(parents=True, exist_ok=True)
-                            config_path = ws_dir / "config.json"
-                            config_path.write_text(
-                                _json.dumps({"root": str(_project_path)}, indent=2),
-                                encoding="utf-8",
-                            )
-                            ensure_workspace_dirs(new_ws_id)
-                            workspace_id = new_ws_id
-                            bridge._workspace_id = new_ws_id
+                            from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
+                            entry = WorkspaceRegistry.get_default().register_by_root(str(_project_path))
+                            workspace_id = entry.id
+                            bridge._workspace_id = entry.id
+                            ensure_workspace_dirs(entry.id)
                             log('INFO', 'server',
-                                f"Auto-registered workspace {new_ws_id} for {_project_path}")
+                                f"Auto-registered workspace {entry.id} for {_project_path}")
                         except Exception as exc:
                             log('WARNING', 'server',
                                 f"Could not auto-register workspace: {exc}")
@@ -1427,7 +1471,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     _session_bridges[new_session.session_id] = bridge
                     # Persist to session store so the SessionTab can load it
                     # via load_session on its own WS connection.
-                    session_store.save_session(new_session)
+                    session_store.save_session(new_session, workspace_id=workspace_id)
                     session_store.add_open_session(new_session.session_id)
 
                     await ws.send_json({
@@ -1517,24 +1561,13 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
 
                     if not workspace_id:
                         try:
-                            import uuid
-                            import json as _json
-                            from thoughtmachine.workspace_capabilities import (
-                                ensure_workspace_dirs, _workspace_dir,
-                            )
-                            new_ws_id = uuid.uuid4().hex
-                            ws_dir = _workspace_dir(new_ws_id)
-                            ws_dir.mkdir(parents=True, exist_ok=True)
-                            config_path = ws_dir / "config.json"
-                            config_path.write_text(
-                                _json.dumps({"root": str(_project_path)}, indent=2),
-                                encoding="utf-8",
-                            )
-                            ensure_workspace_dirs(new_ws_id)
-                            workspace_id = new_ws_id
-                            bridge._workspace_id = new_ws_id
+                            from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
+                            entry = WorkspaceRegistry.get_default().register_by_root(str(_project_path))
+                            workspace_id = entry.id
+                            bridge._workspace_id = entry.id
+                            ensure_workspace_dirs(entry.id)
                             log('INFO', 'server',
-                                f"set_project: auto-registered workspace {new_ws_id} for {_project_path}")
+                                f"set_project: registered workspace {entry.id} for {_project_path}")
                         except Exception as exc:
                             log('WARNING', 'server',
                                 f"set_project: auto-register error: {exc}")
@@ -1548,7 +1581,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     new_session.ensure_name()
                     bridge._loaded_session = new_session
                     _session_bridges[new_session.session_id] = bridge
-                    session_store.save_session(new_session)
+                    session_store.save_session(new_session, workspace_id=workspace_id)
                     session_store.add_open_session(new_session.session_id)
 
                     # 6. Send session_loaded and state messages
@@ -1737,6 +1770,8 @@ app.include_router(config_router)
 app.include_router(health_router)
 
 app.include_router(logging_router)
+
+app.include_router(session_router)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

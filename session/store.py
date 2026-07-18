@@ -61,17 +61,17 @@ class SessionStore(ABC):
     """Abstract base class for session storage."""
 
     @abstractmethod
-    def save_session(self, session: Session) -> None:
+    def save_session(self, session: Session, workspace_id: Optional[str] = None) -> None:
         """Save a session to storage."""
         pass
 
     @abstractmethod
-    def load_session(self, session_id: str) -> Optional[Session]:
+    def load_session(self, session_id: str, workspace_id: Optional[str] = None) -> Optional[Session]:
         """Load a session by ID. Returns None if not found."""
         pass
 
     @abstractmethod
-    def list_sessions(self) -> List[Dict[str, Any]]:
+    def list_sessions(self, workspace_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         List all saved sessions with basic metadata.
         Returns a list of dicts with at least: session_id, name, created_at, updated_at.
@@ -79,7 +79,7 @@ class SessionStore(ABC):
         pass
 
     @abstractmethod
-    def delete_session(self, session_id: str) -> bool:
+    def delete_session(self, session_id: str, workspace_id: Optional[str] = None) -> bool:
         """Delete a session. Returns True if deleted, False if not found."""
         pass
 
@@ -158,8 +158,25 @@ class FileSystemSessionStore(SessionStore):
                 # User-provided directory, re-raise the error
                 raise
 
+    @property
+    def _base_dir(self) -> Path:
+        """Root directory for workspace-scoped session storage."""
+        return Path(os.path.expanduser("~")) / ".thoughtmachine"
+
+    def _resolve_session_path(self, session_id: str, workspace_id: Optional[str] = None) -> Path:
+        """Resolve the filesystem path for a session file.
+
+        If workspace_id is given, saves to:
+            ~/.thoughtmachine/workspaces/<ws_id>/sessions/<session_id>.json
+        Otherwise uses the legacy sessions_dir:
+            <sessions_dir>/<session_id>.json
+        """
+        if workspace_id:
+            return self._base_dir / "workspaces" / workspace_id / "sessions" / f"{session_id}.json"
+        return self.sessions_dir / f"{session_id}.json"
+
     def _get_session_path(self, session_id: str) -> Path:
-        """Get the file path for a session ID."""
+        """Get the file path for a session ID (legacy)."""
         return self.sessions_dir / f"{session_id}.json"
 
     def _get_meta_path(self, session_id: str) -> Path:
@@ -169,26 +186,40 @@ class FileSystemSessionStore(SessionStore):
     def _find_session_path(self, session_id: str) -> Optional[Path]:
         """Find the actual file path for a session ID by scanning JSON files.
         Uses an in-memory cache (TTL: 5s) that is invalidated on save/delete.
+
+        Scans both the legacy sessions_dir and any workspace-scoped directories
+        under ~/.thoughtmachine/workspaces/<ws_id>/sessions/.
         """
         # Check cache first (with TTL)
         if session_id in self._cached_paths:
             ts = self._cached_paths_ts.get(session_id, 0)
             if time.time() - ts < self._cache_ttl:
                 return self._cached_paths[session_id]
-        # Scan files
-        for file_path in self.sessions_dir.glob("*.json"):
-            # Skip metadata files (used for fast listing)
-            if file_path.name.startswith("_meta_"):
-                continue
-            try:
-                with open(file_path, 'r') as f:
-                    data = json.load(f)
-                if data.get('session_id') == session_id:
-                    self._cached_paths[session_id] = file_path
-                    self._cached_paths_ts[session_id] = time.time()
-                    return file_path
-            except Exception:
-                continue
+
+        # Collect all candidate directories
+        candidates = [self.sessions_dir]
+        workspaces_root = self._base_dir / "workspaces"
+        if workspaces_root.exists():
+            for ws_dir in workspaces_root.iterdir():
+                ws_sessions = ws_dir / "sessions"
+                if ws_sessions.is_dir():
+                    candidates.append(ws_sessions)
+
+        # Scan files across all candidate directories
+        for sess_dir in candidates:
+            for file_path in sess_dir.glob("*.json"):
+                # Skip metadata files (used for fast listing)
+                if file_path.name.startswith("_meta_"):
+                    continue
+                try:
+                    with open(file_path, 'r') as f:
+                        data = json.load(f)
+                    if data.get('session_id') == session_id:
+                        self._cached_paths[session_id] = file_path
+                        self._cached_paths_ts[session_id] = time.time()
+                        return file_path
+                except Exception:
+                    continue
         self._cached_paths[session_id] = None  # cache as not found
         self._cached_paths_ts[session_id] = time.time()
         return None
@@ -199,14 +230,22 @@ class FileSystemSessionStore(SessionStore):
         filename = _generate_friendly_filename(session.session_id, name)
         return self.sessions_dir / filename
 
-    def _save_session_metadata(self, session: Session) -> None:
+    def _save_session_metadata(self, session: Session, workspace_id: Optional[str] = None) -> None:
         """Write a lightweight metadata file for fast session listing.
 
         The metadata file contains only the fields needed for the sidebar,
         avoiding the need to parse the full session JSON (which can be
         hundreds of messages) just to build the session list.
+
+        When workspace_id is given, the meta file is stored under:
+            ~/.thoughtmachine/workspaces/<ws_id>/sessions/_meta_<session_id>.json
+        Otherwise it uses the legacy sessions_dir.
         """
-        meta_path = self._get_meta_path(session.session_id)
+        if workspace_id:
+            meta_dir = self._base_dir / "workspaces" / workspace_id / "sessions"
+            meta_path = meta_dir / f"_meta_{session.session_id}.json"
+        else:
+            meta_path = self._get_meta_path(session.session_id)
         user_history = session.user_history or []
         preview = self._extract_preview(user_history)
         meta = {
@@ -227,11 +266,19 @@ class FileSystemSessionStore(SessionStore):
                 temp_path.unlink()
             raise
 
-    def save_session(self, session: Session) -> None:
+    def save_session(self, session: Session, workspace_id: Optional[str] = None) -> None:
         """Save a session to a JSON file.
+
+        If workspace_id is provided, saves under the workspace-scoped path:
+            ~/.thoughtmachine/workspaces/<ws_id>/sessions/<name>_<short_id>.json
+        Otherwise uses the legacy sessions_dir.
 
         Acquires an exclusive file lock to prevent concurrent writes.
         """
+        # Resolve workspace_id from session if not explicitly passed
+        if workspace_id is None and session.workspace_id:
+            workspace_id = session.workspace_id
+
         # Invalidate caches
         self._cached_paths.pop(session.session_id, None)
         self._cached_paths_ts.pop(session.session_id, None)
@@ -248,31 +295,41 @@ class FileSystemSessionStore(SessionStore):
             from session.history_pruner import prune_user_history
             pruned = prune_user_history(data['user_history'])
             data['user_history'] = pruned
-        
+
         # Remove external_file_path from metadata if present (legacy concept)
         if 'metadata' in data and 'external_file_path' in data['metadata']:
             del data['metadata']['external_file_path']
-        
-        # Determine the friendly filename
-        new_path = self._get_friendly_path(session)
-        
-        # Find existing file (if any)
+
+        # Determine the target directory and friendly filename
+        if workspace_id:
+            target_dir = self._base_dir / "workspaces" / workspace_id / "sessions"
+            name = session.metadata.get('name', 'Untitled Session')
+            filename = _generate_friendly_filename(session.session_id, name)
+            new_path = target_dir / filename
+            old_path_raw = target_dir / f"{session.session_id}.json"
+        else:
+            target_dir = self.sessions_dir
+            new_path = self._get_friendly_path(session)
+            old_path_raw = None
+
+        # Find existing file (if any, for rename logic)
         old_path = self._find_session_path(session.session_id)
-        
+
         # If there's an existing file and it's different from new_path, rename it
         if old_path is not None and old_path != new_path:
             logger.debug(f"[SessionStore] Renaming session file from {old_path} to {new_path}")
-            # Ensure we don't overwrite another session's file (should not happen due to unique short ID)
             if new_path.exists():
                 logger.warning(f"[SessionStore] Target file {new_path} already exists, overwriting")
             shutil.move(str(old_path), str(new_path))
-        
+
         # Write the session data atomically via temp file
         temp_path = new_path.with_suffix('.tmp')
         logger.debug(f"[SessionStore] Writing to {temp_path} (atomic)")
+        # Ensure the target directory exists BEFORE acquiring the file lock,
+        # because FileLock also creates a .lock file in the same directory.
+        os.makedirs(os.path.dirname(temp_path), exist_ok=True)
         try:
             with FileLock(str(new_path)):
-                os.makedirs(os.path.dirname(temp_path), exist_ok=True)
                 with open(temp_path, 'w') as f:
                     json.dump(data, f, indent=2, default=str)
                 temp_path.replace(new_path)
@@ -281,19 +338,31 @@ class FileSystemSessionStore(SessionStore):
             self._cached_paths.pop(session.session_id, None)
             self._cached_paths_ts.pop(session.session_id, None)
             # Write/update the lightweight metadata file for fast listing
-            self._save_session_metadata(session)
+            self._save_session_metadata(session, workspace_id=workspace_id)
         except Exception:
             # Clean up temp file on failure
             if temp_path.exists():
                 temp_path.unlink()
             raise
 
-    def load_session(self, session_id: str) -> Optional[Session]:
+    def load_session(self, session_id: str, workspace_id: Optional[str] = None) -> Optional[Session]:
         """Load a session from a JSON file.
+
+        If workspace_id is provided, the workspace-scoped path is checked first,
+        falling back to the legacy sessions_dir.
 
         Acquires a file lock to prevent reading a partially-written file.
         """
-        path = self._find_session_path(session_id)
+        if workspace_id:
+            # Try workspace-scoped path first
+            ws_path = self._resolve_session_path(session_id, workspace_id)
+            if ws_path.exists():
+                path = ws_path
+            else:
+                # Fall back to finding by scanning (handles friendly filenames)
+                path = self._find_session_path(session_id)
+        else:
+            path = self._find_session_path(session_id)
         if path is None or not path.exists():
             return None
         try:
@@ -309,7 +378,7 @@ class FileSystemSessionStore(SessionStore):
             logger.error(f"[SessionStore] Error loading session {session_id}: {e}")
             return None
 
-    def load_session_metadata(self, session_id: str) -> Optional[Dict[str, Any]]:
+    def load_session_metadata(self, session_id: str, workspace_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Lightweight metadata load — reads the session JSON file directly and
         extracts only the fields needed for listing, avoiding the expensive
@@ -320,12 +389,15 @@ class FileSystemSessionStore(SessionStore):
         than calling _find_session_path (which also scans but for a different
         purpose), avoiding double-reads of large JSON files.
 
+        If workspace_id is provided, scans only the workspace-scoped directory.
+
         Returns a dict with keys:
             session_id, name, updated_at, message_count
         or None if the session file is not found.
         """
+        target_dir = self._base_dir / "workspaces" / workspace_id / "sessions" if workspace_id else self.sessions_dir
         try:
-            for file_path in self.sessions_dir.glob("*.json"):
+            for file_path in target_dir.glob("*.json"):
                 # Skip metadata files
                 if file_path.name.startswith("_meta_"):
                     continue
@@ -352,7 +424,7 @@ class FileSystemSessionStore(SessionStore):
             logger.error(f"[SessionStore] Error loading session metadata for {session_id}: {e}")
             return None
 
-    def load_sessions_metadata_batch(self, session_ids: List[str]) -> Dict[str, Optional[Dict[str, Any]]]:
+    def load_sessions_metadata_batch(self, session_ids: List[str], workspace_id: Optional[str] = None) -> Dict[str, Optional[Dict[str, Any]]]:
         """
         Batch metadata load — reads ALL session JSON files in a single directory
         scan and returns metadata for all requested session IDs.
@@ -361,6 +433,8 @@ class FileSystemSessionStore(SessionStore):
         because each file is read only once, regardless of how many session IDs
         are requested.
 
+        If workspace_id is provided, scans only the workspace-scoped directory.
+
         Returns a dict mapping session_id -> metadata dict (or None if not found)
         with metadata keys: session_id, name, updated_at, message_count
         """
@@ -368,8 +442,9 @@ class FileSystemSessionStore(SessionStore):
         if not wanted:
             return {}
         results: Dict[str, Optional[Dict[str, Any]]] = {sid: None for sid in session_ids}
+        target_dir = self._base_dir / "workspaces" / workspace_id / "sessions" if workspace_id else self.sessions_dir
         try:
-            for file_path in self.sessions_dir.glob("*.json"):
+            for file_path in target_dir.glob("*.json"):
                 # Skip metadata files
                 if file_path.name.startswith("_meta_"):
                     continue
@@ -400,22 +475,34 @@ class FileSystemSessionStore(SessionStore):
             logger.error(f"[SessionStore] Error in batch metadata load: {e}")
             return results
 
-    def list_sessions(self) -> List[Dict[str, Any]]:
+    def list_sessions(self, workspace_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         List all saved sessions with basic metadata.
+
+        If workspace_id is provided, only sessions in that workspace's directory
+        (~/.thoughtmachine/workspaces/<ws_id>/sessions/) are returned.
+        Otherwise, sessions from the legacy sessions_dir are returned.
+
         Uses an in-memory cache (TTL: 60s) to avoid re-reading all files on every call.
         Skips files that are not valid session objects (e.g. open_sessions.json).
         """
         now = time.time()
-        if self._cached_list is not None:
+        # Only use cache for the default (no workspace_id) case
+        if workspace_id is None and self._cached_list is not None:
             ts, cached = self._cached_list
             if now - ts < self._cache_ttl:
                 return cached
+
+        if workspace_id:
+            target_dir = self._base_dir / "workspaces" / workspace_id / "sessions"
+        else:
+            target_dir = self.sessions_dir
+
         sessions = []
         seen_ids = set()
 
         # Fast path: read lightweight metadata files
-        for meta_path in sorted(self.sessions_dir.glob("_meta_*.json")):
+        for meta_path in sorted(target_dir.glob("_meta_*.json")):
             try:
                 with open(meta_path, 'r') as f:
                     meta = json.load(f)
@@ -426,7 +513,7 @@ class FileSystemSessionStore(SessionStore):
                 continue
 
         # Fallback for sessions without metadata files (migration period)
-        for file_path in self.sessions_dir.glob("*.json"):
+        for file_path in target_dir.glob("*.json"):
             # Skip metadata files and already-processed sessions
             if file_path.name.startswith("_meta_"):
                 continue
@@ -466,7 +553,8 @@ class FileSystemSessionStore(SessionStore):
                 continue
         # Sort by updated_at descending (most recent first)
         sessions.sort(key=lambda s: s.get('updated_at', ''), reverse=True)
-        self._cached_list = (time.time(), sessions)
+        if workspace_id is None:
+            self._cached_list = (time.time(), sessions)
         return sessions
 
     def _extract_preview(self, user_history: List[Dict[str, Any]], max_length: int = 100) -> str:
@@ -588,8 +676,27 @@ class FileSystemSessionStore(SessionStore):
             if temp_path.exists():
                 temp_path.unlink()
 
-    def delete_session(self, session_id: str) -> bool:
-        """Delete a session file."""
+    # ── Singleton access ─────────────────────────────────────────────────────
+
+    _instance: Optional['FileSystemSessionStore'] = None
+
+    @classmethod
+    def get_instance(cls) -> 'FileSystemSessionStore':
+        """Return the singleton FileSystemSessionStore instance.
+
+        Creates one on first call using default settings.  All WebSocket
+        connections and bridges share one store so that the in-memory
+        ``list_sessions()`` cache is coherent across concurrent connections.
+        """
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def delete_session(self, session_id: str, workspace_id: Optional[str] = None) -> bool:
+        """Delete a session file.
+
+        If workspace_id is provided, also deletes the workspace-scoped meta file.
+        """
         # Invalidate caches
         self._cached_paths.pop(session_id, None)
         self._cached_paths_ts.pop(session_id, None)
@@ -598,10 +705,14 @@ class FileSystemSessionStore(SessionStore):
         found = path is not None and path.exists()
         if found:
             path.unlink()
-        # Also delete the metadata file if it exists
+        # Delete metadata file(s) — try both legacy and workspace-scoped
         meta_path = self._get_meta_path(session_id)
         if meta_path.exists():
             meta_path.unlink()
+        if workspace_id:
+            ws_meta_path = self._base_dir / "workspaces" / workspace_id / "sessions" / f"_meta_{session_id}.json"
+            if ws_meta_path.exists():
+                ws_meta_path.unlink()
         return found
 
     def get_session_path(self, session_id: str) -> Path:
