@@ -241,6 +241,10 @@ export default function App() {
       case 'session_renamed':
         wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
         break
+      case 'session_closed':
+        // re-fetch the full session list to keep sidebar in sync
+        wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
+        break
       case 'open_sessions':
         console.log('[Hub WS] open_sessions received:', msg.sessions)
         // Restore previously active tab (by session ID) instead of defaulting

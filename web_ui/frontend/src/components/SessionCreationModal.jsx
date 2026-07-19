@@ -83,7 +83,13 @@ export default function SessionCreationModal({ show, onCreate, onCancel, isFirst
   }, [workspaces])
 
   const getOptionLabel = (w) => {
-    const folderName = w.label || (w.root ? w.root.split('/').filter(Boolean).pop() : '') || w.id || '?'
+    // Use label > root basename > path basename > id
+    const folderName =
+      w.label ||
+      (w.root ? w.root.split('/').filter(Boolean).pop() : '') ||
+      (w.path ? w.path.split('/').filter(Boolean).pop() : '') ||
+      w.id ||
+      '?'
     const count = folderNameCounts[folderName] || 1
     return count > 1 ? `${folderName} (${w.id})` : folderName
   }
