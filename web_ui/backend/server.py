@@ -1503,6 +1503,14 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             log('WARNING', 'server',
                                 f"Could not auto-register workspace: {exc}")
 
+                    # Ensure workspace directories are bootstrapped for this workspace
+                    if workspace_id:
+                        try:
+                            from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
+                            ensure_workspace_dirs(workspace_id)
+                        except Exception:
+                            pass
+
                     # Create a new empty session
                     from session.models import Session
                     new_session = Session()
@@ -1875,6 +1883,12 @@ async def create_directory(body: dict):
         return {"success": False, "error": str(exc)}
     except Exception as exc:
         return {"success": False, "error": str(exc)}
+
+
+@app.get("/api/user-home")
+async def user_home():
+    """Return the user's home directory path."""
+    return {"home": str(Path.home())}
 
 
 @app.get("/health")
