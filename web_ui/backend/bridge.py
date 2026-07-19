@@ -1472,6 +1472,26 @@ class WebAgentBridge:
             self._history_version = session.conversation_version
             self._workspace_id = session.workspace_id
 
+            # ── Backfill workspace_path from the workspace registry ─────
+            # If the session has a workspace_id but the config doesn't have
+            # a workspace_path yet, look it up from the registry so that
+            # downstream code (e.g. server.py fallback blocks) can use it
+            # immediately without needing a separate resolution step.
+            if self._workspace_id and (self._config is None or not self._config.workspace_path):
+                try:
+                    registry = WorkspaceRegistry.get_default()
+                    entry = registry.get_workspace(self._workspace_id)
+                    if entry and entry.root_path:
+                        if self._config is None:
+                            from agent.config import AgentConfig
+                            self._config = AgentConfig()
+                        self._config.workspace_path = entry.root_path
+                        log('INFO', 'server.bridge',
+                            f"Backfilled workspace_path from registry for workspace {self._workspace_id}: {entry.root_path}")
+                except Exception as exc:
+                    log('WARNING', 'server.bridge',
+                        f"Could not backfill workspace_path from registry: {exc}")
+
             # ── Repair: restore corrupted roles ─────────────────────────────
             # Sessions previously saved via a buggy bridge version may have
             # "tool_result" as a role (introduced by in-place frontend normalization).
@@ -1518,6 +1538,12 @@ class WebAgentBridge:
                     if validated is not None:
                         self._config = validated
                         log('INFO', 'server.bridge', f"Loaded agent_config from session metadata: {len(agent_config_raw)} keys")
+                        # Backfill workspace_path from global config if session config lacks it
+                        if not self._config.workspace_path:
+                            global_config = self._build_global_agent_config()
+                            if global_config.workspace_path:
+                                self._config.workspace_path = global_config.workspace_path
+                                log('INFO', 'server.bridge', f"Backfilled workspace_path from global config: {global_config.workspace_path}")
                     else:
                         log('WARNING', 'server.bridge', 'load_session: validate_config returned None, keeping existing _config')
                 except Exception as exc:
