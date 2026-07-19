@@ -1229,6 +1229,26 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             log('WARNING', 'server',
                                 f"load_session: auto-switch project path error: {exc}")
 
+                    # ── Ensure workspace_path is set on bridge config ──
+                    # The auto-switch block above looks for workspace config.json on disk,
+                    # but that file may not exist (only capabilities.json is guaranteed).
+                    # Fall back to the workspace registry which always has root_path.
+                    if bridge.workspace_id and (bridge._config is None or not getattr(bridge._config, 'workspace_path', None)):
+                        try:
+                            entry = WorkspaceRegistry.get_default().get_workspace(bridge.workspace_id)
+                            if entry and entry.root_path:
+                                root_path = entry.root_path
+                                if bridge._config is None:
+                                    from agent.config.models import AgentConfig
+                                    bridge._config = AgentConfig(workspace_path=root_path)
+                                else:
+                                    bridge._config.workspace_path = root_path
+                                log('INFO', 'server',
+                                    f"load_session: set workspace_path from registry: {root_path}")
+                        except Exception as exc:
+                            log('WARNING', 'server',
+                                f"load_session: could not resolve workspace root from registry: {exc}")
+
                     await ws.send_json({
                         "type": "session_loaded",
                         "session_id": session_id,
@@ -1518,6 +1538,31 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     if workspace_id:
                         new_session.workspace_id = workspace_id
                     new_session.ensure_name()
+
+                    # ── Set workspace_path on bridge config from registry ──
+                    if workspace_id and (bridge._config is None or not getattr(bridge._config, 'workspace_path', None)):
+                        try:
+                            entry = WorkspaceRegistry.get_default().get_workspace(workspace_id)
+                            if entry and entry.root_path:
+                                root_path = entry.root_path
+                                if bridge._config is None:
+                                    from agent.config.models import AgentConfig
+                                    bridge._config = AgentConfig(workspace_path=root_path)
+                                else:
+                                    bridge._config.workspace_path = root_path
+                                log('INFO', 'server',
+                                    f"new_session: set workspace_path from registry: {root_path}")
+
+                                # ── Also persist workspace_path in session metadata for reload ──
+                                if 'agent_config' not in new_session.metadata:
+                                    new_session.metadata['agent_config'] = {}
+                                if isinstance(new_session.metadata['agent_config'], dict):
+                                    new_session.metadata['agent_config']['workspace_path'] = root_path
+                                    log('INFO', 'server',
+                                        f"new_session: persisted workspace_path in session metadata: {root_path}")
+                        except Exception as exc:
+                            log('WARNING', 'server',
+                                f"new_session: could not resolve workspace root from registry: {exc}")
 
                     # Store as the loaded session so continue_session picks it up
                     bridge._loaded_session = new_session
