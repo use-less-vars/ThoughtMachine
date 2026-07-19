@@ -369,7 +369,10 @@ def _build_default_workers() -> list[dict]:
     """
     Build the default workers list for a freshly bootstrapped workspace.
 
-    Loads the default template workers from worker_templates/.
+    Loads the default template workers from worker_templates/ first.
+    If that produces nothing (e.g. package resources are not accessible),
+    falls back to a hardcoded default worker definition so the workspace
+    always has at least one usable worker.
     """
     result: list[dict] = []
     existing_names: set[str] = set()
@@ -378,6 +381,25 @@ def _build_default_workers() -> list[dict]:
         if template["name"] not in existing_names:
             result.append(template)
             existing_names.add(template["name"])
+
+    # Hardcoded fallback if template loading produced nothing.
+    # This ensures workers.json is never empty — every workspace
+    # always has at least a default worker.
+    if not result:
+        result.append({
+            "name": "default",
+            "description": "General-purpose worker sub-agent",
+            "system_prompt": (
+                "You are a capable autonomous sub-agent of ThoughtMachine. "
+                "Complete the task given to you thoroughly, using all available tools. "
+                "Think, research, write, edit, test, review. "
+                "When finished, use the Respond tool to return your final result. "
+                "Be concise but complete. "
+                "Do not ask the user for clarification — the main agent already understood the request."
+            ),
+            "tools": [],
+            "permission_footprint": {},
+        })
 
     return result
 

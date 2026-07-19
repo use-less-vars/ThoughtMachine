@@ -20,6 +20,7 @@ from session.store import FileSystemSessionStore
 from session.models import Session
 from session.session_registry import SessionRegistry
 from thoughtmachine.workspace_registry import WorkspaceRegistry
+from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
 
 # ── Router ──────────────────────────────────────────────────────────────────
 
@@ -99,6 +100,7 @@ async def create_session(body: CreateSessionBody) -> Dict[str, Any]:
             registry = WorkspaceRegistry.get_default()
             entry = registry.register_by_root(body.workspace_path)
             session.workspace_id = entry.id
+            ensure_workspace_dirs(entry.id)
         elif body.workspace_id:
             session.workspace_id = body.workspace_id
         session.ensure_name()
