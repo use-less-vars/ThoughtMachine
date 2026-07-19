@@ -32,7 +32,6 @@ import useStore from './store/useStore'
 import SessionTab from './components/SessionTab'
 import SessionList from './components/SessionList'
 import TabBar from './components/TabBar'
-import SessionActionsPanel from './components/SessionActionsPanel'
 import WorkerOutputPanel from './components/WorkerOutputPanel'
 import LoggingPanel from './components/LoggingPanel'
 import SessionCreationModal from './components/SessionCreationModal'
@@ -66,7 +65,7 @@ export default function App() {
     }
   })
 
-  const [sessionPanelOpen, setSessionPanelOpen] = useState(false)
+  const [sessionModes, setSessionModes] = useState({})
   const [showCreationModal, setShowCreationModal] = useState(false)
   const [showLoggingPanel, setShowLoggingPanel] = useState(false)
   const [loggingConfig, setLoggingConfig] = useState(null)
@@ -403,6 +402,7 @@ export default function App() {
       if (workspaceId) localStorage.setItem('lastSessionWorkspace', workspaceId)
       if (workspacePath) localStorage.setItem('lastSessionPath', workspacePath)
 
+      setSessionModes(prev => ({ ...prev, [data.session_id]: mode }))
       setShowCreationModal(false)
       loadTab(data.session_id)
 
@@ -425,23 +425,6 @@ export default function App() {
   // Open an existing session in a tab (called from SessionList sidebar)
   const handleOpenTab = useCallback((sessionId) => {
     loadTab(sessionId)
-  }, [loadTab])
-
-  // ── Session actions panel toggle (shown/hidden via ⚙️ cogwheel) ────────
-  // When a tab is active, opens the slide-in SessionActionsPanel with
-  // Save As… (to name the current session) and Delete Session.
-  // When no tabs are open, toggles the SessionList sidebar instead.
-  const handleCogwheelClick = useCallback(() => {
-    if (tabs.length > 0 && activeTabId) {
-      setSessionPanelOpen((prev) => !prev)
-    } else {
-      setShowSessions((prev) => !prev)
-    }
-  }, [tabs.length, activeTabId])
-
-  const handleOpenSessionFromPanel = useCallback((sessionId) => {
-    loadTab(sessionId)
-    setSessionPanelOpen(false)
   }, [loadTab])
 
   const handleRunningChange = useCallback((tabId, status) => {
@@ -630,12 +613,6 @@ export default function App() {
     hubSend('list_sessions')
   }, [tabs, hubSend, initiateCloseTab])
 
-  // After delete from panel, close the panel
-  const handleDeleteFromPanel = useCallback((sessionId) => {
-    handleDelete(sessionId)
-    setSessionPanelOpen(false)
-  }, [handleDelete])
-
   // ── Derive tab names from sessions list ─────────────────────────────────
   const sessions = useStore((s) => s.sessions)
   const sessionMap = {}
@@ -720,7 +697,6 @@ export default function App() {
         onCloseTab={initiateCloseTab}
         onNewTab={handleNewTab}
         runningStates={tabRunningStates}
-        onCogwheelClick={handleCogwheelClick}
         onLoggingClick={() => setShowLoggingPanel(prev => !prev)}
       />
 
@@ -776,6 +752,7 @@ export default function App() {
                 style={{ display: tab.tabId === activeTabId ? '' : 'none' }}
               >
                 <SessionTab
+                  mode={tab.sessionId ? (sessionModes[tab.sessionId] || null) : null}
                   sessionId={tab.sessionId}
                   sessionName={tab.sessionId ? (sessionMap[tab.sessionId] || '') : ''}
                   tabId={tab.tabId}
@@ -850,28 +827,6 @@ export default function App() {
         </div>
 
       </div>
-
-      {/* Session Actions Panel */}
-      {sessionPanelOpen && activeTab && (
-        <SessionActionsPanel
-          sessionId={activeSessionId}
-          sessionName={activeSessionName}
-          onClose={() => setSessionPanelOpen(false)}
-          onRename={(id, name) => {
-            handleRename(id, name)
-            // Also send save_session to persist name immediately
-            const tabEntry = tabs.find((t) => t.sessionId === id)
-            if (tabEntry) {
-              const actions = tabActionsRef.current[tabEntry.tabId]
-              actions?.sendCommand?.('save_session')
-            }
-            setSessionPanelOpen(false)
-          }}
-          onDelete={handleDeleteFromPanel}
-          sessionsList={sessions}
-          onOpenSession={handleOpenSessionFromPanel}
-        />
-      )}
 
       <SessionCreationModal
         show={showCreationModal}

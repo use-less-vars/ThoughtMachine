@@ -6,7 +6,7 @@ import WorkspacePanel from './WorkspacePanel';
 const BACKEND_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
 const API_BASE = `http://${window.location.hostname}:${BACKEND_PORT}`;
 
-function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, defaultConfigSaveMessage, onClearDefaultSaveStatus, workspaceId, sessionId, containerRebuildResult, onClearRebuildResult, selectedWorker, onSelectWorker, isActive, activeSessionId, onClearWorker }) {
+function ConfigPanel({ mode = null, config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, defaultConfigSaveMessage, onClearDefaultSaveStatus, workspaceId, sessionId, containerRebuildResult, onClearRebuildResult, selectedWorker, onSelectWorker, isActive, activeSessionId, onClearWorker }) {
   const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error'
   const [showManageProviders, setShowManageProviders] = useState(false);
   const [providerVersion, setProviderVersion] = useState(0);  // incremented when a provider is saved
@@ -177,11 +177,37 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
     color: '#a6adc8',
   };
 
-  const TAB_KEYS = ['workspace', 'permissions', 'system_prompt', 'general', 'model', 'tools', 'container', 'advanced'];  // container tab placeholder
+  const isModeLocked = mode && mode !== 'custom'
+
+  const TAB_KEYS = isModeLocked
+    ? ['workspace', 'permissions', 'system_prompt', 'general', 'model', 'container', 'advanced']
+    : ['workspace', 'permissions', 'system_prompt', 'general', 'model', 'tools', 'container', 'advanced'];
   const TAB_LABELS = { workspace: 'Workspace', permissions: 'Permissions', system_prompt: 'Prompt', general: 'General', model: 'Model', tools: 'Tools', container: 'Container', advanced: 'Advanced' };
+
+  const modeBadge = mode === 'agent' ? '🤖 Agent' : mode === 'engineer' ? '⚙️ Engineer' : mode === 'custom' ? '🎨 Custom' : null
+  const modeBadgeColor = mode === 'agent' ? '#89b4fa' : mode === 'engineer' ? '#a6e3a1' : mode === 'custom' ? '#f9e2af' : '#6c7086'
 
   return (
     <div style={{ padding: '1rem', fontFamily: 'sans-serif', background: '#313244', color: '#cdd6f4', width: panelWidth || 280, minWidth: 200, maxWidth: 500, flexShrink: 0, overflowY: 'auto', height: '100%' }}>
+      {/* Mode badge */}
+      {modeBadge && (
+        <div style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: '0.3rem',
+          marginBottom: '0.5rem',
+          padding: '0.2rem 0.5rem',
+          borderRadius: '4px',
+          background: modeBadgeColor + '22',
+          border: `1px solid ${modeBadgeColor}`,
+          color: modeBadgeColor,
+          fontSize: '0.78rem',
+          fontWeight: 600,
+        }}>
+          {modeBadge}
+          {isModeLocked && <span style={{ marginLeft: '0.15rem', opacity: 0.7 }}>🔒</span>}
+        </div>
+      )}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem' }}>
         <h3 style={{ margin: 0 }}>Config</h3>
         <button
@@ -345,7 +371,16 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
       )}
 
       {/* ── Tools Tab ────────────────────────────────────────────────── */}
-      {activeTab === 'tools' && (
+      {activeTab === 'tools' && isModeLocked ? (
+        <div style={{ textAlign: 'center', padding: '1.5rem 0.5rem' }}>
+          <p style={{ color: '#6c7086', fontSize: '0.85rem' }}>
+            🔒 Tools are locked in {mode === 'agent' ? 'Agent' : 'Engineer'} mode.
+          </p>
+          <p style={{ color: '#585b70', fontSize: '0.78rem' }}>
+            Switch to Custom mode to enable tool configuration.
+          </p>
+        </div>
+      ) : activeTab === 'tools' && (
         <div>
           {/* ── Tool Output Token Limit (above tool checkboxes) ───── */}
           <div style={{ marginBottom: '1rem' }}>
@@ -552,11 +587,26 @@ function ConfigPanel({ config, sendCommand, providers, availableTools, panelWidt
       {/* ── System Prompt Tab ──────────────────────────────────────────── */}
       {activeTab === 'system_prompt' && (
         <div>
+          {isModeLocked && (
+            <div style={{
+              background: 'rgba(249,226,175,0.1)',
+              border: '1px solid rgba(249,226,175,0.3)',
+              borderRadius: '4px',
+              padding: '0.5rem 0.6rem',
+              marginBottom: '0.75rem',
+              color: '#f9e2af',
+              fontSize: '0.8rem',
+            }}>
+              🔒 System prompt is locked in {mode === 'agent' ? 'Agent' : 'Engineer'} mode.
+              Switch to Custom mode to edit it.
+            </div>
+          )}
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>System Prompt</strong></label>
             <textarea
               rows={6}
-              style={{ ...inputStyle, fontFamily: 'monospace', resize: 'vertical' }}
+              disabled={isModeLocked}
+              style={{ ...inputStyle, fontFamily: 'monospace', resize: 'vertical', opacity: isModeLocked ? 0.5 : 1 }}
               value={draft.system_prompt || ''}
               onChange={(e) => setDraft({ ...draft, system_prompt: e.target.value })}
               placeholder="Optional system-level instructions for the agent..."

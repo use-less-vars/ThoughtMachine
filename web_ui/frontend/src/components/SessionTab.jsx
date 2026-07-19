@@ -49,7 +49,7 @@ const INITIAL_STATE = {
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
-function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onRunningChange, onSessionRenamed, selectedWorker, onSelectWorker, activeSessionId, onClearWorker, onWorkerEvent, onLoggingConfigChanged, sessionName = '' }) {
+function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onRunningChange, onSessionRenamed, selectedWorker, onSelectWorker, activeSessionId, onClearWorker, onWorkerEvent, onLoggingConfigChanged, sessionName = '' }) {
   const [state, setState] = useState(INITIAL_STATE)
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
   const [displayName, setDisplayName] = useState(sessionName || '')
@@ -747,6 +747,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
       />
       <div className="app-main">
         <ConfigPanel
+          mode={mode}
           config={state.config}
           sendCommand={sendCommand}
           providers={providers}
@@ -803,6 +804,7 @@ export default React.memo(SessionTab, (prevProps, nextProps) => {
   // Ignore changes to callback props (onClose, onRegister, etc.)
   // which create new references on every parent render
   return (
+    prevProps.mode === nextProps.mode &&
     prevProps.sessionId === nextProps.sessionId &&
     prevProps.hubReady === nextProps.hubReady &&
     prevProps.staggerMs === nextProps.staggerMs &&
