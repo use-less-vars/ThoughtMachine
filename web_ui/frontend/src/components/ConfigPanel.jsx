@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import ManageProvidersModal from './ManageProvidersModal';
 import ContainerPanelContent from './ContainerPanel';
 import WorkspacePanel from './WorkspacePanel';
+import PromptLibrary from './PromptLibrary';
 
 const BACKEND_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
 const API_BASE = `http://${window.location.hostname}:${BACKEND_PORT}`;
@@ -140,6 +141,20 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
     setDraft({ ...draft, model: e.target.value })
   }
 
+  // ── Load prompt from library and switch to system_prompt tab ──
+  const handleLoadPromptFromLibrary = useCallback(async (promptName) => {
+    if (!promptName) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/prompts/${promptName}`);
+      if (!res.ok) return;
+      const text = await res.text();
+      setDraft(prev => ({ ...prev, system_prompt: text }));
+      setActiveTab('system_prompt');
+    } catch (e) {
+      // silent
+    }
+  }, []);
+
   if (!config) {
     return (
       <div style={{ padding: '1rem', fontFamily: 'sans-serif', background: '#313244', color: '#cdd6f4', width: panelWidth || 280, minWidth: 200, maxWidth: 500, flexShrink: 0, overflowY: 'auto', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -180,9 +195,9 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   const isModeLocked = mode && mode !== 'custom'
 
   const TAB_KEYS = isModeLocked
-    ? ['workspace', 'permissions', 'system_prompt', 'general', 'model', 'container', 'advanced']
-    : ['workspace', 'permissions', 'system_prompt', 'general', 'model', 'tools', 'container', 'advanced'];
-  const TAB_LABELS = { workspace: 'Workspace', permissions: 'Permissions', system_prompt: 'Prompt', general: 'General', model: 'Model', tools: 'Tools', container: 'Container', advanced: 'Advanced' };
+    ? ['workspace', 'permissions', 'system_prompt', 'general', 'model', 'container', 'advanced', 'prompts']
+    : ['workspace', 'permissions', 'system_prompt', 'general', 'model', 'tools', 'container', 'advanced', 'prompts'];
+  const TAB_LABELS = { workspace: 'Workspace', permissions: 'Permissions', system_prompt: 'Prompt', general: 'General', model: 'Model', tools: 'Tools', container: 'Container', advanced: 'Advanced', prompts: 'Prompts' };
 
   const modeBadge = mode === 'agent' ? '🤖 Agent' : mode === 'engineer' ? '⚙️ Engineer' : mode === 'custom' ? '🎨 Custom' : null
   const modeBadgeColor = mode === 'agent' ? '#89b4fa' : mode === 'engineer' ? '#a6e3a1' : mode === 'custom' ? '#f9e2af' : '#6c7086'
@@ -601,6 +616,27 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               Switch to Custom mode to edit it.
             </div>
           )}
+          {!isModeLocked && (
+            <div style={{ marginBottom: '0.75rem' }}>
+              <button
+                onClick={() => setActiveTab('prompts')}
+                style={{
+                  background: '#45475a',
+                  color: '#89b4fa',
+                  border: '1px solid #89b4fa',
+                  borderRadius: '4px',
+                  padding: '0.35rem 0.75rem',
+                  cursor: 'pointer',
+                  fontSize: '0.8rem',
+                  fontWeight: 500,
+                  width: '100%',
+                  textAlign: 'center',
+                }}
+              >
+                📚 Load from Library
+              </button>
+            </div>
+          )}
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>System Prompt</strong></label>
             <textarea
@@ -612,6 +648,13 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               placeholder="Optional system-level instructions for the agent..."
             />
           </div>
+        </div>
+      )}
+
+      {/* ── Prompts Tab ───────────────────────────────────────────────── */}
+      {activeTab === 'prompts' && (
+        <div>
+          <PromptLibrary onSelectPrompt={handleLoadPromptFromLibrary} />
         </div>
       )}
 
