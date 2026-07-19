@@ -320,6 +320,8 @@ class FileSystemSessionStore(SessionStore):
             logger.debug(f"[SessionStore] Renaming session file from {old_path} to {new_path}")
             if new_path.exists():
                 logger.warning(f"[SessionStore] Target file {new_path} already exists, overwriting")
+            # Ensure the destination directory exists before the move
+            os.makedirs(os.path.dirname(str(new_path)), exist_ok=True)
             shutil.move(str(old_path), str(new_path))
 
         # Write the session data atomically via temp file

@@ -106,6 +106,7 @@ from fastapi.staticfiles import StaticFiles
 from agent.logging import log
 from contextlib import asynccontextmanager
 from session.store import FileSystemSessionStore
+from session.session_registry import SessionRegistry
 from thoughtmachine.workspace_registry import WorkspaceRegistry
 
 # ── Shared session store singleton ────────────────────────────────────────────
@@ -128,6 +129,7 @@ from web_ui.backend.config_routes import router as config_router
 from web_ui.backend.logging_routes import router as logging_router
 from web_ui.backend.health_routes import router as health_router
 from web_ui.backend.session_routes import router as session_router
+from web_ui.backend.prompt_routes import router as prompt_router
 
 
 # Ensure project root is on sys.path
@@ -1068,12 +1070,19 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
 
                 elif command == "list_sessions":
                     try:
-                        sessions = session_store.list_sessions()
+                        registry = SessionRegistry.get_default()
+                        all_sessions = registry.get_all()
+                        sessions = list(all_sessions.values())
+                        # Fall back to disk scan if registry is empty
+                        if not sessions:
+                            registry.rebuild_from_disk()
+                            all_sessions = registry.get_all()
+                            sessions = list(all_sessions.values())
                         await ws.send_json({
                             "type": "sessions_list",
                             "sessions": sessions,
                         })
-                        log("INFO", "server.config", f"Listed {len(sessions)} sessions")
+                        log("INFO", "server.config", f"Listed {len(sessions)} sessions via registry")
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
@@ -1098,6 +1107,14 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 "message_count": len(session.user_history) if session.user_history else 0,
                             },
                         })
+                        # Register in global session registry
+                        registry = SessionRegistry.get_default()
+                        registry.register(
+                            session_id=session.session_id,
+                            workspace_id=session.workspace_id or "",
+                            name=session.metadata.get('name', 'Untitled'),
+                            mode=session.mode,
+                        )
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
@@ -1241,6 +1258,17 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         "config": fe_config,
                     })
                     await ws.send_json({"type": "status_message", "text": f"Session {session_id} loaded. Click Run to continue."})
+                    # Register/update in global session registry
+                    loaded = bridge._session or bridge._loaded_session
+                    if loaded:
+                        registry = SessionRegistry.get_default()
+                        registry.register(
+                            session_id=loaded.session_id,
+                            workspace_id=loaded.workspace_id or "",
+                            name=loaded.metadata.get('name', 'Untitled'),
+                            mode=loaded.mode,
+                        )
+                        registry.set_open(loaded.session_id, is_open=True)
 
                 elif command == "load_more_messages":
                     offset = msg.get("offset", 50)
@@ -1263,11 +1291,16 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
 
                 elif command == "delete_session":
                     session_id = msg.get("session_id", "")
+                    workspace_id = msg.get("workspace_id")
                     if not session_id:
                         await ws.send_json({"type": "status_message", "text": "⚠ session_id is required."})
                         continue
                     try:
-                        session_store.delete_session(session_id)
+                        session_store.delete_session(session_id, workspace_id=workspace_id)
+                        session_store.remove_open_session(session_id)
+                        # Remove from global session registry
+                        registry = SessionRegistry.get_default()
+                        registry.remove(session_id)
                         await ws.send_json({
                             "type": "session_deleted",
                             "session_id": session_id,
@@ -1318,6 +1351,16 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 "new_name": new_name,
                             })
                             log("INFO", "server.config", f"Renamed session {session_id} → {new_name}")
+                        # Update name in global session registry
+                        registry = SessionRegistry.get_default()
+                        entry = registry.get(session_id)
+                        if entry:
+                            registry.register(
+                                session_id=session_id,
+                                workspace_id=entry.get('workspace_id', ''),
+                                name=new_name,
+                                mode=entry.get('mode', 'agent'),
+                            )
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
@@ -1393,6 +1436,10 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             "state": "IDLE",
                             "is_running": False,
                         })
+                        # Mark session as closed in global registry
+                        if session_id:
+                            registry = SessionRegistry.get_default()
+                            registry.set_open(session_id, is_open=False)
                     except Exception as exc:
                         await ws.send_json({
                             "type": "status_message",
@@ -1772,6 +1819,7 @@ app.include_router(health_router)
 app.include_router(logging_router)
 
 app.include_router(session_router)
+app.include_router(prompt_router)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2315,6 +2363,11 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Rebuild global session registry from disk
+    registry = SessionRegistry.get_default()
+    count = registry.rebuild_from_disk()
+    log('INFO', 'server', f'Rebuilt session registry from disk: {count} sessions found')
 
     if args.serve_frontend:
         _setup_frontend_serving()
