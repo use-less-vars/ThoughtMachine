@@ -49,9 +49,14 @@ const INITIAL_STATE = {
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
-function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onRunningChange, onSessionRenamed, selectedWorker, onSelectWorker, activeSessionId, onClearWorker, onWorkerEvent, onLoggingConfigChanged }) {
+function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onRunningChange, onSessionRenamed, selectedWorker, onSelectWorker, activeSessionId, onClearWorker, onWorkerEvent, onLoggingConfigChanged, sessionName = '' }) {
   const [state, setState] = useState(INITIAL_STATE)
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
+  const [displayName, setDisplayName] = useState(sessionName || '')
+  const [isRenaming, setIsRenaming] = useState(false)
+  const renameInputRef = useRef(null)
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
+  const deleteConfirmRef = useRef(null)
   const currentSessionIdRef = useRef(currentSessionId)
   const [providers, setProviders] = useState([])
   const [availableTools, setAvailableTools] = useState([])
@@ -463,6 +468,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           } else {
             // Fresh tab (no sessionId yet) → update currentSessionId
             setCurrentSessionId(msg.session_id)
+            setDisplayName(msg.session_name || displayName)
             // Notify parent that this tab now has a real sessionId
             if (!sessionId) {
               onNewSession?.(msg.session_id, msg.session_name)
@@ -501,6 +507,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         if (msg.session_id) {
           setCurrentSessionId(msg.session_id)
         }
+        setDisplayName(msg.new_name || displayName)
         onSessionRenamed?.(msg.session_id, msg.new_name)
         break
 
@@ -618,6 +625,13 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     sendCommand('load_more_messages', { offset, limit: 20 })
   }, [state.history.length, sendCommand])
 
+  // ── Auto-focus delete confirm button ────────────────────────────────────────
+  useEffect(() => {
+    if (showDeleteConfirm && deleteConfirmRef.current) {
+      deleteConfirmRef.current.focus()
+    }
+  }, [showDeleteConfirm])
+
   // ── Render ───────────────────────────────────────────────────────────────
   // When deferred, show a placeholder instead of the full tab UI
   if (isDeferred) {
@@ -633,6 +647,98 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   // Pass per-tab state to children as props
   return (
     <div className="session-tab-content">
+      {/* ── Inline rename header ──────────────────────── */}
+      <div className="session-header">
+        {currentSessionId ? (
+          isRenaming ? (
+            <input
+              ref={renameInputRef}
+              className="session-header-input"
+              defaultValue={displayName}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  const newName = e.target.value.trim()
+                  if (newName && newName !== displayName) {
+                    sendCommand('rename_session', { session_id: currentSessionId, new_name: newName })
+                    setDisplayName(newName)
+                    onSessionRenamed?.(currentSessionId, newName)
+                  }
+                  setIsRenaming(false)
+                } else if (e.key === 'Escape') {
+                  setIsRenaming(false)
+                }
+              }}
+              onBlur={(e) => {
+                const newName = e.target.value.trim()
+                if (newName && newName !== displayName) {
+                  sendCommand('rename_session', { session_id: currentSessionId, new_name: newName })
+                  setDisplayName(newName)
+                  onSessionRenamed?.(currentSessionId, newName)
+                }
+                setIsRenaming(false)
+              }}
+              autoFocus
+            />
+          ) : (
+            <>
+              <span className="session-header-name">{displayName || 'Untitled'}</span>
+              <button
+                className="session-header-rename-btn"
+                onClick={() => {
+                  setIsRenaming(true)
+                  setTimeout(() => renameInputRef.current?.focus(), 0)
+                }}
+                title="Rename session"
+              >
+                ✏️
+              </button>
+              <div className="session-header-spacer" />
+              <button
+                className="session-header-btn session-header-save-btn"
+                onClick={() => {
+                  sendCommand('save_session')
+                  onSessionSaved?.(currentSessionId)
+                }}
+                title="Save session"
+              >
+                💾 Save
+              </button>
+              {showDeleteConfirm ? (
+                <span className="session-header-delete-confirm">
+                  <span className="session-header-delete-warn">Delete?</span>
+                  <button
+                    ref={deleteConfirmRef}
+                    className="session-header-btn session-header-confirm-delete-btn"
+                    onClick={() => {
+                      sendCommand('delete_session', { session_id: currentSessionId })
+                      setShowDeleteConfirm(false)
+                    }}
+                  >
+                    ✓ Yes
+                  </button>
+                  <button
+                    className="session-header-btn session-header-cancel-btn"
+                    onClick={() => setShowDeleteConfirm(false)}
+                  >
+                    ✕ No
+                  </button>
+                </span>
+              ) : (
+                <button
+                  className="session-header-btn session-header-delete-btn"
+                  onClick={() => {
+                    setShowDeleteConfirm(true)
+                    setTimeout(() => deleteConfirmRef.current?.focus(), 0)
+                  }}
+                  title="Delete session"
+                >
+                  🗑️ Delete
+                </button>
+              )}
+            </>
+          )
+        ) : null}
+      </div>
       <StatusBar
         status={state.status}
         tokensIn={state.tokensIn}

@@ -777,6 +777,7 @@ export default function App() {
               >
                 <SessionTab
                   sessionId={tab.sessionId}
+                  sessionName={tab.sessionId ? (sessionMap[tab.sessionId] || '') : ''}
                   tabId={tab.tabId}
                   hubReady={hubReady}
                   isActive={tab.tabId === activeTabId}
