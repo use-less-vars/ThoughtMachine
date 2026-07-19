@@ -3,6 +3,11 @@
   "description": "Resource deployment manifest for ThoughtMachine — documents every file that bootstrap.py deploys from resources/ to the user's ~/.thoughtmachine/ directory.",
   "files": [
     {
+      "source": "default_system_prompt.txt",
+      "dest": "default_system_prompt.txt",
+      "description": "Default system prompt for agent mode"
+    },
+    {
       "source": "default_config.json",
       "dest": "agent_config.json",
       "description": "Agent configuration overlay (diff from factory defaults — merged with resources/default_config.json at load time)"

@@ -255,7 +255,7 @@ async def lifespan(app: FastAPI):
         from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
 
         registry = WorkspaceRegistry.get_default()
-        entry = registry.register_by_root(str(_project_root), label="default")
+        entry = registry.register_by_root(str(_project_root))
         ensure_workspace_dirs(entry.id)
         log('INFO', 'server',
             f'Auto-registered default workspace: {entry.id} at {_project_root}')

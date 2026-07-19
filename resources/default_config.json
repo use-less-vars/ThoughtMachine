@@ -22,7 +22,7 @@
   ],
   "max_file_size_mb": 10,
   "max_backup_files": 5,
-  "workspace_path": "",
+  "workspace_path": null,
   "session_permissions": {
     "container": true,
     "network": true,

@@ -283,10 +283,18 @@ class WorkspaceRegistry:
         existing = self.resolve_by_root(root_path)
         if existing is not None:
             return existing
+
         ws_id = generate_human_id()
         # Ensure uniqueness in the unlikely event of a collision
         while self.get_workspace(ws_id) is not None:
             ws_id = generate_human_id()
+
+        # ── Derive label from folder name if not explicitly provided ──
+        if not label or label == "default":
+            label = os.path.basename(os.path.abspath(root_path).rstrip("/\\"))
+        if not label:
+            label = ws_id  # fallback to generated ID if basename is empty
+
         return self.register_workspace(ws_id, root_path, label=label, metadata=metadata)
 
     def unregister_workspace(self, workspace_id: str) -> bool:
