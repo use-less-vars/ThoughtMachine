@@ -60,6 +60,7 @@ class AgentConfig(BaseModel):
         'time_monitor_enabled': HOT_SWAPPABLE,
         'time_warning_threshold': HOT_SWAPPABLE,
         'worker_mode': HOT_SWAPPABLE,
+        'mode': RESTART_REQUIRED,
     }
 
     api_key: str = Field(default='', exclude=True)
@@ -77,6 +78,7 @@ class AgentConfig(BaseModel):
     temperature: float = 0.2
     max_turns: int = 100
     stop_check: Optional[Callable[[], bool]] = Field(default=None, description='Runtime stop-check callback. Called periodically during agent execution to check if processing should be aborted. Return True to signal stop. Not serialised to/from JSON config.')
+    mode: str = Field(default="agent", description='Session mode: "agent", "engineer", or "custom". Determines the default system prompt used when no explicit system prompt is provided.')
     system_prompt: Optional[str] = None
     token_monitor_warning_threshold: int = Field(default=65000, description='Token count threshold for warning state')
     token_monitor_critical_threshold: int = Field(default=80000, description='Token count threshold for critical warning state')
@@ -117,7 +119,11 @@ class AgentConfig(BaseModel):
 
         1. ``~/.thoughtmachine/custom_system_prompt.txt`` (if it exists and is non-empty)
         2. Explicit value passed to constructor (if non-empty)
-        3. Fallback to ``resources/default_system_prompt.txt``
+
+        The mode-specific fallback (``resources/default_system_prompt.txt`` for
+        ``"agent"`` mode, ``resources/engineer_system_prompt.txt`` for
+        ``"engineer"`` mode) is handled by ``_apply_mode_system_prompt``
+        after all fields have been validated.
         """
         from pathlib import Path
         # 1. Check custom_system_prompt.txt first
@@ -132,13 +138,8 @@ class AgentConfig(BaseModel):
         # 2. Use the explicit value if non-empty
         if v is not None and (isinstance(v, str) and v.strip() != ''):
             return v
-        # 3. Fallback to factory default
-        prompt_path = Path(__file__).resolve().parent.parent.parent / 'resources' / 'default_system_prompt.txt'
-        try:
-            return prompt_path.read_text(encoding='utf-8')
-        except (FileNotFoundError, IOError) as exc:
-            log.warning('Could not load default system prompt from %s: %s', prompt_path, exc)
-            return 'You are ThoughtMachine, an AI agent.'
+        # 3. Leave as None so the after-validator can apply mode-specific fallback
+        return None
 
     @field_validator('enabled_tools')
     def filter_search_codebase_tool(cls, v, info):
@@ -153,6 +154,40 @@ class AgentConfig(BaseModel):
         if filtered != v:
             return filtered
         return v
+
+    @model_validator(mode='after')
+    def _apply_mode_system_prompt(self):
+        """Apply mode-specific fallback system prompt if none was set.
+
+        If ``system_prompt`` is still ``None`` after the field validator ran
+        (meaning no custom file and no explicit value was provided), load the
+        appropriate default prompt based on ``mode``:
+
+        - ``"agent"``     → ``resources/default_system_prompt.txt``
+        - ``"engineer"``  → ``resources/engineer_system_prompt.txt``
+        - ``"custom"``    → no fallback (user must provide explicitly)
+        """
+        if self.system_prompt is not None:
+            return self
+        resources_dir = Path(__file__).resolve().parent.parent.parent / 'resources'
+        if self.mode == 'agent':
+            prompt_path = resources_dir / 'default_system_prompt.txt'
+            try:
+                text = prompt_path.read_text(encoding='utf-8')
+                if text:
+                    object.__setattr__(self, 'system_prompt', text)
+            except (FileNotFoundError, IOError) as exc:
+                log.warning('Could not load default system prompt from %s: %s', prompt_path, exc)
+        elif self.mode == 'engineer':
+            prompt_path = resources_dir / 'engineer_system_prompt.txt'
+            try:
+                text = prompt_path.read_text(encoding='utf-8')
+                if text:
+                    object.__setattr__(self, 'system_prompt', text)
+            except (FileNotFoundError, IOError) as exc:
+                log.warning('Could not load engineer system prompt from %s: %s', prompt_path, exc)
+        # mode == 'custom': leave as None (no fallback)
+        return self
 
     @model_validator(mode='after')
     def filter_default_enabled_tools(self):

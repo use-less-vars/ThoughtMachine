@@ -80,7 +80,7 @@ class StateBridge:
         log('DEBUG', 'core.config', f'[CONFIG_TRACE] state_bridge update_config after: workspace_path={self.current_config.workspace_path}')
         return self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
 
-    def save_config(self, config: Optional[dict]=None, path: Optional[str]=None) -> bool:
+    def save_config(self, config: Optional[dict]=None, path: Optional[str]=None, mode: Optional[str] = None) -> bool:
         """Save configuration to file as a minimal diff overlay.
 
         Only the keys that differ from the factory defaults are persisted to
@@ -93,6 +93,16 @@ class StateBridge:
         the factory-default prompt from ``resources/default_system_prompt.txt``).
         This keeps the JSON config clean and avoids confusion between the two
         storage locations.
+
+        When ``mode='engineer'``, the custom prompt file is **always** removed
+        (regardless of the system_prompt value) so that the engineer-mode
+        prompt from the resources file is used instead.
+
+        Args:
+            config: Optional dictionary to save. If None, saves current config.
+            path: Optional path to save to. If None, uses default config path.
+            mode: Optional session mode. When ``'engineer'``, the custom prompt
+                file is removed to force use of the engineer prompt resource.
         """
         config_to_save = config or self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
         save_path = path or self.config_path
@@ -100,7 +110,17 @@ class StateBridge:
         # ── Intercept system_prompt ────────────────────────────────────
         system_prompt = config_to_save.pop('system_prompt', None)
         custom_path = Path(config_loader.CUSTOM_SYSTEM_PROMPT_PATH)
-        if system_prompt and system_prompt.strip():
+
+        # Engineer mode always uses its own prompt resource — never save custom prompt
+        if mode == 'engineer':
+            try:
+                custom_path.unlink(missing_ok=True)
+            except (IOError, OSError) as exc:
+                log('WARNING', 'presenter.state_bridge',
+                    f'Could not remove {custom_path}: {exc}')
+            log('DEBUG', 'presenter.state_bridge',
+                f'Engineer mode — removed custom prompt file at {custom_path}')
+        elif system_prompt and system_prompt.strip():
             prompt_stripped = system_prompt.strip()
             # If the prompt matches the factory default, treat it as
             # "reset to default" — delete the custom file so the
@@ -179,7 +199,7 @@ class StateBridge:
         self.current_config = AgentConfig(**config_dict)
         return self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
 
-    def create_agent_config(self, config_dict: Optional[dict]=None, total_input: int=0, total_output: int=0) -> AgentConfig:
+    def create_agent_config(self, config_dict: Optional[dict]=None, total_input: int=0, total_output: int=0, mode: Optional[str] = None) -> AgentConfig:
         """
         Create AgentConfig instance from configuration dictionary.
 
@@ -205,6 +225,11 @@ class StateBridge:
         if provider_id:
             manager = ProviderManager()
             config = manager.resolve_config(config)
+
+        # Apply mode-based tool preset (overrides any tools from saved config)
+        if mode:
+            from session.tool_presets import get_tools_for_mode
+            config['enabled_tools'] = get_tools_for_mode(mode)
 
         api_key = config.get('api_key') or os.getenv('OPENAI_API_KEY') or os.getenv('DEEPSEEK_API_KEY')
         if not api_key:
@@ -235,6 +260,8 @@ class StateBridge:
         base_url = config.get('base_url')
         if base_url:
             agent_kwargs['base_url'] = base_url
+        if mode:
+            agent_kwargs['mode'] = mode
 
         agent_config = AgentConfig(**agent_kwargs)
 

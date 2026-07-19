@@ -97,7 +97,8 @@ class SessionLifecycle:
                 self._cached_config = agent_config
                 self._cached_preset_name = preset_name
             else:
-                agent_config = self.state_bridge.create_agent_config(config, total_input=self.state_bridge.total_input, total_output=self.state_bridge.total_output)
+                session_mode = self.state_bridge.current_session.mode if self.state_bridge.current_session else None
+                agent_config = self.state_bridge.create_agent_config(config, total_input=self.state_bridge.total_input, total_output=self.state_bridge.total_output, mode=session_mode)
                 self._cached_config = agent_config
                 self._cached_preset_name = None
             if self.state_bridge.current_session is None:
@@ -131,7 +132,8 @@ class SessionLifecycle:
         self.auto_save_current_session()
         if self.controller.is_running:
             self.controller.stop()
-        agent_config = self.state_bridge.create_agent_config()
+        session_mode = self.state_bridge.current_session.mode if self.state_bridge.current_session else None
+        agent_config = self.state_bridge.create_agent_config(mode=session_mode)
         ws_path = self.state_bridge.current_config.workspace_path
         metadata = {}
         if name:
@@ -195,7 +197,8 @@ class SessionLifecycle:
         Does NOT automatically start a new session. After restart, state is IDLE.
         """
         try:
-            self._cached_config = self.state_bridge.create_agent_config()
+            session_mode = self.state_bridge.current_session.mode if self.state_bridge.current_session else None
+            self._cached_config = self.state_bridge.create_agent_config(mode=session_mode)
         except Exception as e:
             log('DEBUG', 'presenter.lifecycle', f'Error creating agent config for restart: {e}')
             raise
@@ -483,7 +486,8 @@ class SessionLifecycle:
                 log('DEBUG', 'presenter.lifecycle', f'_build_session_from_current_state: No conversation found and no current session')
                 return None
         try:
-            agent_config = self.state_bridge.create_agent_config()
+            session_mode = self.state_bridge.current_session.mode if self.state_bridge.current_session else None
+            agent_config = self.state_bridge.create_agent_config(mode=session_mode)
         except Exception as e:
             log('DEBUG', 'presenter.lifecycle', f'Error creating agent config: {e}')
             return None

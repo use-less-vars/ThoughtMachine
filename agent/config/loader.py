@@ -19,6 +19,7 @@ LEGACY_SYSTEM_PROMPT_PATH = str(USER_DIR / "system_prompt.txt")
 # ── Factory config ──────────────────────────────────────────────────────────
 FACTORY_CONFIG_PATH = str(Path(__file__).resolve().parent.parent.parent / "resources" / "default_config.json")
 DEFAULT_SYSTEM_PROMPT_PATH = str(Path(__file__).resolve().parent.parent.parent / "resources" / "default_system_prompt.txt")
+ENGINEER_SYSTEM_PROMPT_PATH = str(Path(__file__).resolve().parent.parent.parent / "resources" / "engineer_system_prompt.txt")
 _factory_config_cache: Optional[Dict[str, Any]] = None
 
 
@@ -57,6 +58,26 @@ def load_default_system_prompt_text() -> str:
     except (IOError, OSError) as exc:
         log("WARNING", "config.loader",
             f"Failed to read default system prompt from {DEFAULT_SYSTEM_PROMPT_PATH}: {exc}")
+        return ""
+
+
+def load_engineer_system_prompt_text() -> str:
+    """Load the engineer system prompt from ``resources/engineer_system_prompt.txt``.
+
+    This prompt is used when the session mode is "engineer".
+
+    Returns:
+        The engineer prompt text. If the file cannot be read, returns an empty
+        string so callers can treat it as "no default".
+    """
+    path = Path(ENGINEER_SYSTEM_PROMPT_PATH)
+    try:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""
+    except (IOError, OSError) as exc:
+        log("WARNING", "config.loader",
+            f"Failed to read engineer system prompt from {ENGINEER_SYSTEM_PROMPT_PATH}: {exc}")
         return ""
 
 
