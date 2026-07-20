@@ -1257,7 +1257,8 @@ class WorkerThread(threading.Thread):
                     self._agent.state.restrictions_active = False
                     self._agent.state.restrictions_pending = False
                     self._agent.state.restriction_reason = None
-                    self._agent.state.time_start = time.monotonic()
+                    # wall-clock time; agent.py uses time.time() for consistency
+                    self._agent.state.time_start = time.time()
                     if TimeState is not None:
                         self._agent.state.last_time_warning_state = TimeState.LOW
 
