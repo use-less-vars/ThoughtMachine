@@ -60,9 +60,21 @@ class EditDockerfile(ToolBase):
     # ------------------------------------------------------------------
     def execute(self) -> str:
         try:
+            # Resolve workspace ID from session/registries first
             ws_id = None
-            if resolve_workspace_id and self.workspace_path:
-                ws_id = resolve_workspace_id(self.workspace_path)
+            if getattr(self, 'session_id', None):
+                try:
+                    from session.session_registry import SessionRegistry
+                    session_info = SessionRegistry.get_default().get(self.session_id)
+                    ws_id = session_info.get("workspace_id") if session_info else None
+                except Exception:
+                    pass
+
+            # Fallback: resolve via workspace_path
+            if not ws_id and resolve_workspace_id:
+                ws_path = getattr(self, 'workspace_path', None)
+                if ws_path:
+                    ws_id = resolve_workspace_id(ws_path)
 
             if ws_id is None:
                 return json.dumps({"error": "No active workspace"})

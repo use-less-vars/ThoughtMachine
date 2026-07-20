@@ -241,8 +241,29 @@ class KnowledgeBaseTool(ToolBase):
             kb_root = _get_global_kb_root()
             init_result = None  # global KB is self-initialising
         else:
-            if self.workspace_path:
-                kb_root = Path(self.workspace_path) / ".thoughtmachine" / "knowledge"
+            # === Resolve workspace path from registries (primary) ===
+            ws_path = None
+            if self.session_id:
+                try:
+                    from session.session_registry import SessionRegistry
+                    from thoughtmachine.workspace_registry import WorkspaceRegistry
+                    session_info = SessionRegistry.get_default().get(self.session_id)
+                    ws_id = session_info.get("workspace_id") if session_info else None
+                    if ws_id:
+                        entry = WorkspaceRegistry.get_default().get_workspace(ws_id)
+                        ws_path = entry.root_path if entry else None
+                except Exception:
+                    pass
+
+            # Fallback to deprecated AgentConfig.workspace_path
+            if not ws_path:
+                ws_path = getattr(self, 'workspace_path', None)
+                if ws_path:
+                    self._log_debug(
+                        "KnowledgeBaseTool falling back to deprecated AgentConfig.workspace_path")
+
+            if ws_path:
+                kb_root = Path(ws_path) / ".thoughtmachine" / "knowledge"
             else:
                 kb_root = Path.cwd() / ".thoughtmachine" / "knowledge"
             init_result = self._initialize_kb(kb_root)

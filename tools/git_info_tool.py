@@ -1,6 +1,7 @@
 # tools/git_info_tool.py
 from typing import ClassVar, Literal, Optional, List, Union
 from pydantic import Field
+import logging
 import subprocess
 import os
 from pathlib import Path
@@ -137,9 +138,32 @@ class GitInfoTool(ToolBase):
                 except ValueError as e:
                     return self._truncate_output(f"Error: {e}")
                 repo_root = Path(validated_working_dir).expanduser().resolve()
-            elif self.workspace_path:
-                # workspace_path is already validated by agent
-                repo_root = Path(self.workspace_path).expanduser().resolve()
+            elif getattr(self, 'session_id', None) or getattr(self, 'workspace_path', None):
+                # === Resolve workspace path from registries (primary) ===
+                ws_path = None
+                if self.session_id:
+                    try:
+                        from session.session_registry import SessionRegistry
+                        from thoughtmachine.workspace_registry import WorkspaceRegistry
+                        session_info = SessionRegistry.get_default().get(self.session_id)
+                        ws_id = session_info.get("workspace_id") if session_info else None
+                        if ws_id:
+                            entry = WorkspaceRegistry.get_default().get_workspace(ws_id)
+                            ws_path = entry.root_path if entry else None
+                    except Exception:
+                        pass
+
+                # Fallback to deprecated AgentConfig.workspace_path
+                if not ws_path:
+                    ws_path = getattr(self, 'workspace_path', None)
+                    if ws_path:
+                        logging.warning(
+                            "GitInfoTool falling back to deprecated AgentConfig.workspace_path")
+
+                if ws_path:
+                    repo_root = Path(ws_path).expanduser().resolve()
+                else:
+                    repo_root = Path.cwd()
             else:
                 repo_root = Path.cwd()
             

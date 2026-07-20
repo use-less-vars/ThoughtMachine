@@ -262,10 +262,11 @@ chmod +x "{script_path}"
             ))
 
         # Validate workspace path
-        if self.workspace_path is None:
+        ws_path = self._resolve_registry_workspace()
+        if ws_path is None:
             workspace = os.getcwd()
         else:
-            workspace = self.workspace_path
+            workspace = ws_path
 
         # Build absolute path for working directory
         workdir = "/workspace"

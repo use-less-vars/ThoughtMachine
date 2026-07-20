@@ -39,10 +39,30 @@ class ReadFile(ToolBase):
 
     def execute(self) -> str:
         try:
-            root = self.workspace_path
+            # === Resolve workspace path from registries (primary) ===
+            root = None
+            if self.session_id:
+                try:
+                    from session.session_registry import SessionRegistry
+                    from thoughtmachine.workspace_registry import WorkspaceRegistry
+                    session_info = SessionRegistry.get_default().get(self.session_id)
+                    ws_id = session_info.get("workspace_id") if session_info else None
+                    if ws_id:
+                        entry = WorkspaceRegistry.get_default().get_workspace(ws_id)
+                        root = entry.root_path if entry else None
+                except Exception:
+                    pass
+
+            # Fallback to deprecated AgentConfig.workspace_path
+            if not root:
+                root = getattr(self, 'workspace_path', None)
+                if root:
+                    logging.warning(
+                        "ReadFile falling back to deprecated AgentConfig.workspace_path")
+
             if not root:
                 return json.dumps({
-                    "error": "No workspace_path configured — cannot resolve file path.",
+                    "error": "No workspace path configured — cannot resolve file path.",
                 })
 
             # Resolve the path and prevent directory traversal

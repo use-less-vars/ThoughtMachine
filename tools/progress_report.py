@@ -1,3 +1,5 @@
+import logging
+
 from pydantic import Field
 from typing import ClassVar, List, Optional, Literal
 from datetime import datetime
@@ -30,8 +32,9 @@ class ProgressReport(ToolBase):
     )
 
     def execute(self) -> str:
-        # Ensure reports directory exists
-        base = Path(self.workspace_path) if self.workspace_path else Path(".")
+        # === Resolve workspace path from registries (primary) ===
+        ws_path = self._resolve_registry_workspace()
+        base = Path(ws_path) if ws_path else Path(".")
         reports_dir = base / "reports"
         reports_dir.mkdir(parents=True, exist_ok=True)
         

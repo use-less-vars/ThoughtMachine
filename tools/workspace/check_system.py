@@ -107,9 +107,31 @@ class CheckSystem(ToolBase):
     # ------------------------------------------------------------------
     def execute(self) -> str:
         try:
+            # === Resolve workspace path from registries (primary, always correct) ===
+            workspace_path = None
+            if self.session_id:
+                try:
+                    from session.session_registry import SessionRegistry
+                    session_info = SessionRegistry.get_default().get(self.session_id)
+                    ws_id_from_registry = session_info.get("workspace_id") if session_info else None
+                    if ws_id_from_registry:
+                        from thoughtmachine.workspace_registry import WorkspaceRegistry
+                        entry = WorkspaceRegistry.get_default().get_workspace(ws_id_from_registry)
+                        workspace_path = entry.root_path if entry else None
+                except Exception:
+                    pass
+
+            # Fallback to deprecated self.workspace_path
+            if not workspace_path:
+                workspace_path = getattr(self, 'workspace_path', None)
+                if workspace_path:
+                    logging.warning(
+                        "CheckSystem falling back to deprecated AgentConfig.workspace_path")
+
+            # Resolve workspace ID from the resolved workspace_path
             ws_id = None
-            if resolve_workspace_id and self.workspace_path:
-                ws_id = resolve_workspace_id(self.workspace_path)
+            if workspace_path and resolve_workspace_id:
+                ws_id = resolve_workspace_id(workspace_path)
 
             # Dynamic handlers: worker/<name> needs special handling
             if self.query.startswith("worker/"):
@@ -119,10 +141,10 @@ class CheckSystem(ToolBase):
 
             handler_map = {
                 "effective_permissions": lambda: self._query_permissions(ws_id),
-                "container_status": lambda: self._query_container_status(),
+                "container_status": lambda: self._query_container_status(workspace_path),
                 "workspace_info": lambda: self._query_workspace_info(ws_id),
                 "my_config": lambda: self._query_my_config(),
-                "network_diagnostics": lambda: self._query_network_diagnostics(ws_id),
+                "network_diagnostics": lambda: self._query_network_diagnostics(ws_id, workspace_path),
                 "workers": lambda: self._query_workers(ws_id),
                 "running_workers": lambda: self._query_running_workers(),
                 "capabilities": lambda: self._query_capabilities(ws_id),
@@ -130,7 +152,7 @@ class CheckSystem(ToolBase):
                 "mcp_servers": lambda: self._query_mcp_servers(ws_id),
                 "event_bus_status": lambda: self._query_event_bus_status(),
                 "event_log": lambda: self._query_event_log(),
-                "config_snapshot": lambda: self._query_config_snapshot(),
+                "config_snapshot": lambda: self._query_config_snapshot(workspace_path),
             }
 
             handler = handler_map.get(self.query)
@@ -188,9 +210,9 @@ class CheckSystem(ToolBase):
             "source": "gate" if GATE_AVAILABLE else "session_fallback",
         }
 
-    def _query_container_status(self) -> dict:
+    def _query_container_status(self, ws_path: Optional[str]) -> dict:
         """Return Docker container status for the workspace."""
-        ws_path = self.workspace_path
+        ws_path = ws_path or getattr(self, 'workspace_path', None)
         if not ws_path:
             return {"status": "unavailable", "reason": "No workspace path"}
 
@@ -272,9 +294,9 @@ class CheckSystem(ToolBase):
             return result
         return {"error": "agent_config not available"}
 
-    def _query_network_diagnostics(self, ws_id: Optional[str]) -> dict:
+    def _query_network_diagnostics(self, ws_id: Optional[str], ws_path: Optional[str]) -> dict:
         """Quick connectivity checks, running inside container if available."""
-        ws_path = self.workspace_path
+        ws_path = ws_path or getattr(self, 'workspace_path', None)
         if not ws_path:
             return {"container": False, "message": "No workspace path"}
 
@@ -304,7 +326,12 @@ class CheckSystem(ToolBase):
 
     def _query_workers(self, ws_id: Optional[str]) -> dict:
         """Return all worker definitions from workers.json."""
-        if not CAPABILITIES_AVAILABLE or not _workspace_dir or not ws_id:
+        if not CAPABILITIES_AVAILABLE or not _workspace_dir:
+            return {"workers": [], "count": 0}
+        if not ws_id:
+            scanned = self._scan_workspace_dirs_for_workers()
+            if scanned:
+                return {"workers": scanned, "count": len(scanned)}
             return {"workers": [], "count": 0}
         workers_path = _workspace_dir(ws_id) / "workers.json"
         if not workers_path.exists():
@@ -317,8 +344,14 @@ class CheckSystem(ToolBase):
 
     def _query_worker_detail(self, ws_id: Optional[str], worker_name: str) -> dict:
         """Return full definition of a specific worker by name."""
-        if not CAPABILITIES_AVAILABLE or not _workspace_dir or not ws_id:
+        if not CAPABILITIES_AVAILABLE or not _workspace_dir:
             return {"error": "workspace not available"}
+        if not ws_id:
+            scanned = self._scan_workspace_dirs_for_workers()
+            for w in scanned:
+                if isinstance(w, dict) and w.get("name") == worker_name:
+                    return w
+            return {"error": f"worker '{worker_name}' not found"}
         workers_path = _workspace_dir(ws_id) / "workers.json"
         if not workers_path.exists():
             return {"error": "worker not found"}
@@ -406,6 +439,34 @@ class CheckSystem(ToolBase):
 
         return result
 
+    def _scan_workspace_dirs_for_workers(self) -> list:
+        """
+        Scan ``~/.thoughtmachine/workspaces/<id>/workers.json`` for all workspace
+        directories and return the first valid workers list found.
+
+        This is a fallback when ``ws_id`` cannot be resolved.
+        """
+        import os
+
+        base = Path(os.path.expanduser("~/.thoughtmachine/workspaces"))
+        if not base.is_dir():
+            return []
+
+        for entry in sorted(base.iterdir()):
+            if not entry.is_dir():
+                continue
+            workers_path = entry / "workers.json"
+            if not workers_path.is_file():
+                continue
+            try:
+                data = json.loads(workers_path.read_text(encoding="utf-8"))
+                if data and isinstance(data, list):
+                    return data
+            except (json.JSONDecodeError, OSError):
+                continue
+
+        return []
+
     def _query_dockerfile(self, ws_id: Optional[str]) -> dict:
         """Return current Dockerfile content as a string."""
         if not CAPABILITIES_AVAILABLE or not _workspace_dir or not ws_id:
@@ -434,11 +495,11 @@ class CheckSystem(ToolBase):
         except Exception as e:
             return {"error": f"Failed to get event bus status: {e}"}
 
-    def _query_config_snapshot(self) -> dict:
+    def _query_config_snapshot(self, ws_path: Optional[str]) -> dict:
         """Return the last saved config snapshot from disk."""
         try:
             from agent.logging.config_snapshot import ConfigSnapshot
-            snapshotter = ConfigSnapshot(self.workspace_path)
+            snapshotter = ConfigSnapshot(ws_path or getattr(self, 'workspace_path', None))
             data = snapshotter.load()
             if data is None:
                 return {"available": False, "error": "No config snapshot found"}
