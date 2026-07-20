@@ -332,10 +332,18 @@ class ToolExecutor:
             return len(str(text)) // 4
 
     def _create_tool_rejection_message(self, tool_name: str) -> str:
-        """Create concise rejection message for disallowed tool calls."""
+        """Create concise rejection message for disallowed tool calls.
+        
+        Includes the restriction reason so the LLM understands why the tool
+        was blocked (e.g., 'timeout', 'token', 'turn') rather than retrying
+        the same call blindly.
+        """
         allowed_tools = self.state.get_allowed_tools()
+        restriction_reason = getattr(self.state, 'restriction_reason', None)
         if allowed_tools:
             allowed_list = ', '.join(allowed_tools)
+            if restriction_reason:
+                return f"Tool '{tool_name}' not allowed. Reason: {restriction_reason}. Available tools: {allowed_list}"
             return f"Tool not allowed. Available tools: {allowed_list}"
         else:
             return f"Tool not allowed. Available tools: none"
