@@ -40,6 +40,36 @@ from agent.models.worker_definition import WorkerDefinition
 
 router = APIRouter(prefix="/api/workspace")
 
+# ── POST /api/workspace/resolve ─────────────────────────────────────────────────
+
+
+class ResolvePathBody(BaseModel):
+    path: str
+
+
+@router.post("/resolve")
+async def resolve_workspace_path(body: ResolvePathBody) -> Dict[str, Any]:
+    """Resolve a filesystem path to a workspace ID.
+
+    If the path is already registered, returns the existing workspace ID.
+    Otherwise, registers it as a new workspace and returns the new ID.
+    """
+    try:
+        registry = WorkspaceRegistry.get_default()
+        entry = registry.register_by_root(body.path)
+        if entry:
+            return {"workspace_id": entry.id, "root": entry.root_path}
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to register workspace path",
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to resolve workspace path: {exc}",
+        )
+
+
 # ── GET /api/workspace/list ─────────────────────────────────────────────────────
 
 @router.get("/list")

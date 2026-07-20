@@ -1,134 +1,139 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect } from 'react'
+import FolderBrowser from './FolderBrowser'
+import WorkspaceSessionList from './WorkspaceSessionList'
 
 const API_BASE = ''
 
 const MODES = [
-  { id: 'agent',    label: 'Agent',    desc: 'Full tools, no worker' },
+  { id: 'agent', label: 'Agent', desc: 'Full tools, no worker' },
   { id: 'engineer', label: 'Engineer', desc: 'Delegation only' },
-  { id: 'custom',   label: 'Custom',   desc: 'Your tools, your prompt' },
+  { id: 'custom', label: 'Custom', desc: 'Your tools, your prompt' },
 ]
 
-export default function SessionCreationModal({ show, onCreate, onCancel, isFirstLaunch }) {
+export default function SessionCreationModal({ show, onCreate, onOpen, onCancel, isFirstLaunch }) {
+  const [step, setStep] = useState(1)
   const [mode, setMode] = useState(() => {
     return localStorage.getItem('thoughtmachine_last_mode') || 'engineer'
   })
-  const [workspaces, setWorkspaces] = useState([])
-  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState(null)
-  const [customPath, setCustomPath] = useState('')
-  const [useCustomPath, setUseCustomPath] = useState(false)
+  const [selectedFolderPath, setSelectedFolderPath] = useState(null)
+  const [workspaceId, setWorkspaceId] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [acknowledgedRisk, setAcknowledgedRisk] = useState(false)
-  const [workspacesLoading, setWorkspacesLoading] = useState(false)
-  const [showNewFolder, setShowNewFolder] = useState(false)
-  const [newFolderPath, setNewFolderPath] = useState('')
-  const [userSelectedWorkspace, setUserSelectedWorkspace] = useState(false)
+  const [resolving, setResolving] = useState(false)
+  const [homeDir, setHomeDir] = useState('')
+  const [showModePicker, setShowModePicker] = useState(false)
+  const [currentBrowsePath, setCurrentBrowsePath] = useState(null)
 
-  // Fetch workspace list on mount and restore from localStorage
+  // Fetch home directory for vault warning
   useEffect(() => {
-    if (!show) return
-    setWorkspacesLoading(true)
-    // Reset user selection tracking when modal opens fresh
-    setUserSelectedWorkspace(false)
-    fetch(`${API_BASE}/api/workspace/list`)
+    fetch(`${API_BASE}/api/user-home`)
       .then(r => r.json())
       .then(data => {
-        const list = data.workspaces || data || []
-        setWorkspaces(list)
-        // Try to restore previous selection from localStorage
-        const stored = localStorage.getItem('thoughtmachine_last_workspace')
-        if (stored) {
-          // Check if stored value is a workspace ID
-          const match = list.find(w => w.id === stored)
-          if (match) {
-            setSelectedWorkspaceId(match.id)
-            setUseCustomPath(false)
-            return
-          }
-          // Check if stored value is a path (for custom paths)
-          if (stored.startsWith('/')) {
-            setCustomPath(stored)
-            setUseCustomPath(true)
-            return
-          }
-        }
-        // Fall back to first workspace if nothing stored
-        if (list.length > 0 && !selectedWorkspaceId) {
-          setSelectedWorkspaceId(list[0].id)
-        }
+        if (data.home) setHomeDir(data.home)
       })
-      .catch(() => {
-        setWorkspaces([])
-      })
-      .finally(() => setWorkspacesLoading(false))
+      .catch(() => {})
+  }, [])
+
+  // Reset when modal opens
+  useEffect(() => {
+    if (show) {
+      setStep(1)
+      setWorkspaceId(null)
+      setError('')
+      setAcknowledgedRisk(false)
+      setShowModePicker(false)
+      const stored = localStorage.getItem('thoughtmachine_last_workspace')
+      if (stored && stored.startsWith('/')) {
+        setSelectedFolderPath(stored)
+      } else {
+        setSelectedFolderPath(null)
+      }
+    }
   }, [show])
 
-  // Sorted workspaces by folder name
-  const sortedWorkspaces = React.useMemo(() => {
-    return [...workspaces].sort((a, b) => {
-      const nameA = (a.label || (a.root ? a.root.split('/').filter(Boolean).pop() : '') || a.id || '').toLowerCase()
-      const nameB = (b.label || (b.root ? b.root.split('/').filter(Boolean).pop() : '') || b.id || '').toLowerCase()
-      return nameA.localeCompare(nameB)
-    })
-  }, [workspaces])
+  // Derived
+  const workspacePath = selectedFolderPath || ''
+  const vaultPath = homeDir ? homeDir.replace(/\/+$/, '') + '/.thoughtmachine' : ''
 
-  // Folder name counts for disambiguation
-  const folderNameCounts = React.useMemo(() => {
-    const counts = {}
-    workspaces.forEach(w => {
-      const name = w.label || (w.root ? w.root.split('/').filter(Boolean).pop() : '') || '?'
-      counts[name] = (counts[name] || 0) + 1
-    })
-    return counts
-  }, [workspaces])
-
-  const getOptionLabel = (w) => {
-    // Use label > root basename > path basename > id
-    const folderName =
-      w.label ||
-      (w.root ? w.root.split('/').filter(Boolean).pop() : '') ||
-      (w.path ? w.path.split('/').filter(Boolean).pop() : '') ||
-      w.id ||
-      '?'
-    const count = folderNameCounts[folderName] || 1
-    return count > 1 ? `${folderName} (${w.id})` : folderName
-  }
-
-  // Derived: current workspace path
-  const currentWorkspace = useCustomPath
-    ? { id: null, root: customPath, label: customPath.split('/').filter(Boolean).pop() || customPath }
-    : workspaces.find(w => w.id === selectedWorkspaceId) || null
-
-  const workspacePath = currentWorkspace?.root || ''
-
-  function isSensitivePath(path) {
-    const parts = path.replace(/\\/g, '/').split('/').filter(Boolean)
-    return parts.some(p => p === '.thoughtmachine')
-  }
-
-  // Sensitive directory check
-  const isSensitive = (() => {
-    if (!workspacePath) return false
-    const lower = workspacePath.toLowerCase()
-    if (isSensitivePath(lower)) return true
-    if (lower === '/root' || lower.startsWith('/home/') || lower === '/home') return true
+  // Is a given path sensitive (home dir or vault path)?
+  const isPathSensitive = (path) => {
+    if (!path) return false
+    const normalized = path.replace(/\/+$/, '')
+    if (homeDir && normalized === homeDir.replace(/\/+$/, '')) return true
+    if (vaultPath && normalized === vaultPath.replace(/\/+$/, '')) return true
     return false
-  })()
+  }
+
+  // Sensitive checks
+  const isBrowsedSensitive = isPathSensitive(currentBrowsePath)  // Step 1 warning (dynamic)
+  const isSensitive = isPathSensitive(workspacePath)             // Step 2 mode picker (committed)
 
   // Reset acknowledgment when workspace changes
   useEffect(() => {
     setAcknowledgedRisk(false)
   }, [workspacePath])
 
-  const handleCreate = async () => {
+  // Handle folder selection
+  const handleFolderSelect = async (path) => {
+    setSelectedFolderPath(path)
+    localStorage.setItem('thoughtmachine_last_workspace', path || '')
+    setAcknowledgedRisk(false)
+    setError('')
+
+    // If not sensitive — resolve immediately and go to Step 2
+    if (!isPathSensitive(path)) {
+      setResolving(true)
+      try {
+        const r = await fetch(`${API_BASE}/api/workspace/resolve`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path }),
+        })
+        if (!r.ok) throw new Error('Failed to resolve workspace')
+        const data = await r.json()
+        setWorkspaceId(data.workspace_id)
+        setShowModePicker(false)
+        setStep(2)
+      } catch (err) {
+        setError(err.message || 'Failed to resolve workspace')
+      } finally {
+        setResolving(false)
+      }
+    }
+    // If sensitive — stay in Step 1, warning will appear below
+  }
+
+  // Proceed after acknowledging sensitive warning
+  const handleProceedSensitive = async () => {
+    setResolving(true)
+    setError('')
+    try {
+      const r = await fetch(`${API_BASE}/api/workspace/resolve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: currentBrowsePath }),
+      })
+      if (!r.ok) throw new Error('Failed to resolve workspace')
+      const data = await r.json()
+      setWorkspaceId(data.workspace_id)
+      setSelectedFolderPath(currentBrowsePath)
+      localStorage.setItem('thoughtmachine_last_workspace', currentBrowsePath || '')
+      setShowModePicker(false)
+      setStep(2)
+    } catch (err) {
+      setError(err.message || 'Failed to resolve workspace')
+    } finally {
+      setResolving(false)
+    }
+  }
+
+  const handleCreateNew = async () => {
     setLoading(true)
     setError('')
     try {
-      const workspaceId = useCustomPath ? null : selectedWorkspaceId
-      const workspacePath = useCustomPath ? customPath : null
       localStorage.setItem('thoughtmachine_last_mode', mode)
-      localStorage.setItem('thoughtmachine_last_workspace', selectedWorkspaceId || customPath)
-      await onCreate(mode, workspaceId, workspacePath)
+      await onCreate(mode, workspaceId, selectedFolderPath)
     } catch (err) {
       setError(err.message)
     } finally {
@@ -136,322 +141,398 @@ export default function SessionCreationModal({ show, onCreate, onCancel, isFirst
     }
   }
 
-  const handleUseCustomPath = () => {
-    if (customPath && customPath.trim()) {
-      const match = workspaces.find(w => customPath.trim().startsWith(w.root) || w.root.endsWith(customPath.trim()))
-      if (match) {
-        setSelectedWorkspaceId(match.id)
-        setUseCustomPath(false)
-        setUserSelectedWorkspace(true)
-      } else {
-        setUseCustomPath(true)
-        setUserSelectedWorkspace(true)
-      }
-    }
+  const handleOpenSession = (sessionId) => {
+    if (onOpen) onOpen(sessionId)
   }
 
-  const handleCreateNewFolder = () => {
-    if (newFolderPath && newFolderPath.trim()) {
-      setCustomPath(newFolderPath.trim())
-      setUseCustomPath(true)
-      setShowNewFolder(false)
-      setNewFolderPath('')
-      setUserSelectedWorkspace(true)
-    }
+  const handleBack = () => {
+    setStep(1)
+    setWorkspaceId(null)
+    setShowModePicker(false)
   }
 
   if (!show) return null
 
-  const canCreate = !loading && (!isSensitive || acknowledgedRisk) && (selectedWorkspaceId || customPath)
+  const canCreateFromMode = !loading && (!isSensitive || acknowledgedRisk)
+
+  const overlayStyle = {
+    position: 'fixed',
+    top: 0, left: 0, right: 0, bottom: 0,
+    background: 'rgba(0,0,0,0.6)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 1000,
+  }
+
+  const dialogStyle = {
+    background: 'var(--bg-surface, #313244)',
+    border: '1px solid var(--border, #585b70)',
+    borderRadius: 'var(--radius, 8px)',
+    padding: '1.5rem',
+    width: '500px',
+    maxWidth: '90vw',
+    maxHeight: '80vh',
+    overflowY: 'auto',
+    boxShadow: '0 4px 20px rgba(0,0,0,0.4)',
+  }
+
+  const titleStyle = {
+    margin: '0 0 1rem',
+    color: 'var(--text-primary, #cdd6f4)',
+    fontSize: '1.1rem',
+  }
+
+  const stepIndicatorStyle = {
+    display: 'flex',
+    gap: '0.5rem',
+    marginBottom: '1rem',
+    alignItems: 'center',
+  }
+
+  const stepDotStyle = (active) => ({
+    padding: '0.15rem 0.6rem',
+    borderRadius: '10px',
+    fontSize: '0.7rem',
+    fontWeight: 600,
+    background: active ? 'var(--accent, #89b4fa)' : 'var(--bg-primary, #1e1e2e)',
+    color: active ? '#fff' : 'var(--text-muted, #6c7086)',
+    border: active ? 'none' : '1px solid var(--border, #45475a)',
+  })
+
+  const stepLineStyle = {
+    flex: 1,
+    height: '1px',
+    background: 'var(--border, #45475a)',
+    maxWidth: '40px',
+  }
+
+  const labelStyle = {
+    display: 'block',
+    marginBottom: '0.5rem',
+    color: 'var(--text-secondary, #a6adc8)',
+    fontSize: '0.85rem',
+    fontWeight: 600,
+  }
+
+  const errorBoxStyle = {
+    color: 'var(--danger, #f38ba8)',
+    fontSize: '0.85rem',
+    marginBottom: '0.75rem',
+    padding: '0.4rem 0.6rem',
+    background: 'rgba(243,139,168,0.1)',
+    borderRadius: '4px',
+  }
+
+  const folderPathStyle = {
+    fontSize: '0.75rem',
+    color: 'var(--text-muted, #6c7086)',
+    marginBottom: '0.75rem',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+  }
+
+  const btnBase = {
+    padding: '0.5rem 1rem',
+    borderRadius: '4px',
+    fontSize: '0.85rem',
+    fontWeight: 600,
+    cursor: 'pointer',
+    border: 'none',
+  }
+
+  const switchViewStyle = {
+    display: 'flex',
+    justifyContent: 'flex-end',
+    marginTop: '0.75rem',
+  }
 
   return (
     <div
       className="modal-overlay"
       onClick={() => { if (!isFirstLaunch) onCancel() }}
-      style={{
-        position: 'fixed',
-        top: 0, left: 0, right: 0, bottom: 0,
-        background: 'rgba(0,0,0,0.6)',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        zIndex: 1000,
-      }}
+      style={overlayStyle}
     >
       <div
         className="modal-dialog"
         onClick={e => e.stopPropagation()}
-        style={{
-          background: 'var(--bg-surface, #313244)',
-          border: '1px solid var(--border, #585b70)',
-          borderRadius: 'var(--radius, 8px)',
-          padding: '1.5rem',
-          width: '440px',
-          maxWidth: '90vw',
-          maxHeight: '80vh',
-          overflowY: 'auto',
-          boxShadow: '0 4px 20px rgba(0,0,0,0.4)',
-        }}
+        style={dialogStyle}
       >
-        <h3 style={{ margin: '0 0 1rem', color: 'var(--text-primary, #cdd6f4)', fontSize: '1.1rem' }}>
-          {isFirstLaunch ? 'Welcome! Create your first session' : 'New Session'}
-        </h3>
-
-        {/* Mode selector */}
-        <div style={{ marginBottom: '1.2rem' }}>
-          <label style={{ display: 'block', marginBottom: '0.5rem', color: 'var(--text-secondary, #a6adc8)', fontSize: '0.85rem', fontWeight: 600 }}>
-            Mode
-          </label>
-          <div style={{ display: 'flex', gap: '0.5rem' }}>
-            {MODES.map(m => (
-              <button
-                key={m.id}
-                onClick={() => setMode(m.id)}
-                style={{
-                  flex: 1,
-                  padding: '0.6rem 0.4rem',
-                  border: mode === m.id ? '2px solid var(--accent, #89b4fa)' : '1px solid var(--border, #585b70)',
-                  borderRadius: '6px',
-                  background: mode === m.id ? 'rgba(137,180,250,0.1)' : 'transparent',
-                  color: mode === m.id ? 'var(--accent, #89b4fa)' : 'var(--text-primary, #cdd6f4)',
-                  cursor: 'pointer',
-                  textAlign: 'center',
-                  fontSize: '0.8rem',
-                  lineHeight: 1.3,
-                }}
-              >
-                <div style={{ fontWeight: 600 }}>{m.label}</div>
-                <div style={{ fontSize: '0.7rem', opacity: 0.7, marginTop: '0.15rem' }}>{m.desc}</div>
-              </button>
-            ))}
-          </div>
+        {/* Step indicator */}
+        <div style={stepIndicatorStyle}>
+          <span style={stepDotStyle(step === 1)}>1. Workspace</span>
+          <div style={stepLineStyle} />
+          <span style={stepDotStyle(step === 2)}>2. Session</span>
         </div>
 
-        {/* Workspace selector */}
-        <div style={{ marginBottom: '1.2rem' }}>
-          <label style={{ display: 'block', marginBottom: '0.5rem', color: 'var(--text-secondary, #a6adc8)', fontSize: '0.85rem', fontWeight: 600 }}>
-            Workspace
-          </label>
+        {/* ───────── STEP 1: Browse & Select ───────── */}
+        {step === 1 && (
+          <>
+            <h3 style={titleStyle}>
+              {isFirstLaunch ? 'Welcome! Create your first session' : 'New Session'}
+            </h3>
 
-          <div style={{ display: 'flex', gap: '0.4rem', marginBottom: '0.4rem' }}>
-            <select
-              value={showNewFolder ? '__new__' : (useCustomPath ? '__custom__' : (selectedWorkspaceId || ''))}
-              onChange={e => {
-                const val = e.target.value
-                if (val === '__custom__') {
-                  setUseCustomPath(true)
-                  setShowNewFolder(false)
-                  setUserSelectedWorkspace(true)
-                } else if (val === '__new__') {
-                  // handled by the button
-                } else {
-                  setUseCustomPath(false)
-                  setShowNewFolder(false)
-                  setSelectedWorkspaceId(val)
-                  setUserSelectedWorkspace(true)
-                }
-              }}
-              disabled={workspacesLoading}
-              style={{
-                flex: 1,
-                padding: '0.5rem',
-                background: 'var(--bg-primary, #1e1e2e)',
-                color: 'var(--text-primary, #cdd6f4)',
-                border: '1px solid var(--border, #585b70)',
-                borderRadius: '4px',
-                fontSize: '0.85rem',
-              }}
-            >
-              {workspacesLoading ? (
-                <option>Loading workspaces...</option>
-              ) : sortedWorkspaces.length === 0 ? (
-                <option value="">No workspaces found</option>
-              ) : (
-                sortedWorkspaces.map(w => (
-                  <option key={w.id} value={w.id}>
-                    {getOptionLabel(w)}
-                  </option>
-                ))
+            {/* Workspace folder browser */}
+            <div style={{ marginBottom: '0.5rem' }}>
+              <label style={labelStyle}>Workspace Folder</label>
+              <FolderBrowser
+                onSelect={handleFolderSelect}
+                onNavigate={setCurrentBrowsePath}
+                startPath={selectedFolderPath}
+              />
+            </div>
+
+            {/* Resolving indicator */}
+            {resolving && (
+              <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary, #a6adc8)', marginBottom: '0.75rem' }}>
+                ⟳ Resolving workspace...
+              </div>
+            )}
+
+            {/* Error message */}
+            {error && (
+              <div style={errorBoxStyle}>
+                ⚠ {error}
+              </div>
+            )}
+
+            {/* Vault warning — appears in Step 1 when viewing a sensitive folder */}
+            {isBrowsedSensitive && currentBrowsePath && !resolving && (
+              <div style={{
+                background: 'rgba(249,226,175,0.15)',
+                border: '1px solid rgba(249,226,175,0.4)',
+                borderRadius: '6px',
+                padding: '0.75rem',
+                marginBottom: '1rem',
+              }}>
+                <div style={{ color: '#f9e2af', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.4rem' }}>
+                  ⚠️ ThoughtMachine Config Warning
+                </div>
+                <p style={{ color: '#fab387', fontSize: '0.8rem', margin: '0 0 0.75rem', lineHeight: 1.4 }}>
+                  This workspace contains your ThoughtMachine configuration files. The agent will be able to read and modify its own settings, which could be a security risk if combined with internet access or untrusted tools.
+                </p>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer', fontSize: '0.8rem', color: '#cdd6f4', marginBottom: '0.75rem' }}>
+                  <input
+                    type="checkbox"
+                    checked={acknowledgedRisk}
+                    onChange={e => setAcknowledgedRisk(e.target.checked)}
+                  />
+                  I understand the risks and want to proceed
+                </label>
+                <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+                  <button
+                    onClick={() => {
+                      setSelectedFolderPath(null)
+                      setAcknowledgedRisk(false)
+                    }}
+                    style={{
+                      padding: '0.4rem 0.8rem',
+                      background: 'transparent',
+                      color: 'var(--text-primary, #cdd6f4)',
+                      border: '1px solid var(--border, #585b70)',
+                      borderRadius: '4px',
+                      cursor: 'pointer',
+                      fontSize: '0.8rem',
+                    }}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleProceedSensitive}
+                    disabled={!acknowledgedRisk}
+                    style={{
+                      padding: '0.4rem 0.8rem',
+                      background: acknowledgedRisk ? 'var(--accent, #89b4fa)' : 'var(--text-muted, #6c7086)',
+                      color: '#fff',
+                      border: 'none',
+                      borderRadius: '4px',
+                      cursor: acknowledgedRisk ? 'pointer' : 'not-allowed',
+                      fontSize: '0.8rem',
+                      fontWeight: 600,
+                      opacity: acknowledgedRisk ? 1 : 0.6,
+                    }}
+                  >
+                    Proceed
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Cancel button */}
+            <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+              {!isFirstLaunch && (
+                <button
+                  onClick={onCancel}
+                  disabled={loading || resolving}
+                  style={{
+                    ...btnBase,
+                    background: 'transparent',
+                    color: 'var(--text-primary, #cdd6f4)',
+                    border: '1px solid var(--border, #585b70)',
+                    cursor: (loading || resolving) ? 'not-allowed' : 'pointer',
+                    opacity: (loading || resolving) ? 0.6 : 1,
+                  }}
+                >
+                  Cancel
+                </button>
               )}
-              {sortedWorkspaces.length > 0 && <option value="__custom__">\u2500\u2500 Browse custom folder \u2500\u2500</option>}
-            </select>
-            <button
-              onClick={() => {
-                setShowNewFolder(!showNewFolder)
-                if (showNewFolder) {
-                  setNewFolderPath('')
-                } else {
-                  setUseCustomPath(false)
-                }
-              }}
-              style={{
-                padding: '0.5rem 0.75rem',
-                background: showNewFolder ? 'var(--danger, #f38ba8)' : 'var(--accent, #89b4fa)',
-                color: '#fff',
-                border: 'none',
-                borderRadius: '4px',
-                cursor: 'pointer',
-                fontSize: '0.8rem',
-                whiteSpace: 'nowrap',
-              }}
-            >
-              {showNewFolder ? 'Cancel' : '+ New Folder'}
-            </button>
-          </div>
-
-          {/* New Folder inline input */}
-          {showNewFolder && (
-            <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center', marginTop: '0.2rem', marginBottom: '0.4rem' }}>
-              <input
-                type="text"
-                value={newFolderPath}
-                onChange={e => setNewFolderPath(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter') handleCreateNewFolder() }}
-                placeholder="/home/user/my-new-project"
-                autoFocus
-                style={{
-                  flex: 1,
-                  padding: '0.5rem',
-                  background: 'var(--bg-primary, #1e1e2e)',
-                  color: 'var(--text-primary, #cdd6f4)',
-                  border: '1px solid var(--accent, #89b4fa)',
-                  borderRadius: '4px',
-                  fontSize: '0.85rem',
-                }}
-              />
-              <button
-                onClick={handleCreateNewFolder}
-                disabled={!newFolderPath.trim()}
-                style={{
-                  padding: '0.5rem 0.75rem',
-                  background: 'var(--accent, #89b4fa)',
-                  color: '#fff',
-                  border: 'none',
-                  borderRadius: '4px',
-                  cursor: newFolderPath.trim() ? 'pointer' : 'not-allowed',
-                  fontSize: '0.8rem',
-                  whiteSpace: 'nowrap',
-                  opacity: newFolderPath.trim() ? 1 : 0.6,
-                }}
-              >
-                Create & Select
-              </button>
             </div>
-          )}
-
-          {/* Custom path inline input (when __custom__ selected and not in new folder mode) */}
-          {useCustomPath && !showNewFolder ? (
-            <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center', marginTop: '0.2rem' }}>
-              <input
-                type="text"
-                value={customPath}
-                onChange={e => setCustomPath(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter') handleUseCustomPath() }}
-                placeholder="/home/user/my-new-project"
-                style={{
-                  flex: 1,
-                  padding: '0.5rem',
-                  background: 'var(--bg-primary, #1e1e2e)',
-                  color: 'var(--text-primary, #cdd6f4)',
-                  border: '1px solid var(--border, #585b70)',
-                  borderRadius: '4px',
-                  fontSize: '0.85rem',
-                }}
-              />
-              <button
-                onClick={handleUseCustomPath}
-                style={{
-                  padding: '0.5rem 0.75rem',
-                  background: 'var(--accent, #89b4fa)',
-                  color: '#fff',
-                  border: 'none',
-                  borderRadius: '4px',
-                  cursor: 'pointer',
-                  fontSize: '0.8rem',
-                  whiteSpace: 'nowrap',
-                }}
-              >
-                Use this path
-              </button>
-            </div>
-          ) : !showNewFolder && currentWorkspace ? (
-            <div style={{ fontSize: '0.75rem', color: 'var(--text-muted, #6c7086)', marginTop: '0.2rem' }}>
-              \ud83d\udcc1 {currentWorkspace.root || 'Unknown path'}
-            </div>
-          ) : null}
-        </div>
-
-        {/* Sensitive directory warning */}
-        {isSensitive && (
-          <div style={{
-            background: 'rgba(249,226,175,0.15)',
-            border: '1px solid rgba(249,226,175,0.4)',
-            borderRadius: '6px',
-            padding: '0.75rem',
-            marginBottom: '1rem',
-          }}>
-            <div style={{ color: '#f9e2af', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.4rem' }}>
-              ⚠️ ThoughtMachine Config Warning
-            </div>
-            <p style={{ color: '#fab387', fontSize: '0.8rem', margin: '0 0 0.5rem', lineHeight: 1.4 }}>
-              This workspace contains your ThoughtMachine configuration files. The agent will be able to read and modify its own settings, which could be a security risk if combined with internet access or untrusted tools.
-            </p>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer', fontSize: '0.8rem', color: '#cdd6f4' }}>
-              <input
-                type="checkbox"
-                checked={acknowledgedRisk}
-                onChange={e => setAcknowledgedRisk(e.target.checked)}
-              />
-              I understand the risks and want to proceed
-            </label>
-          </div>
+          </>
         )}
 
-        {/* Error message */}
-        {error && (
-          <div style={{ color: 'var(--danger, #f38ba8)', fontSize: '0.85rem', marginBottom: '0.75rem', padding: '0.4rem 0.6rem', background: 'rgba(243,139,168,0.1)', borderRadius: '4px' }}>
-            \u26a0 {error}
-          </div>
-        )}
+        {/* ───────── STEP 2: Sessions / Mode Picker ───────── */}
+        {step === 2 && (
+          <>
+            {showModePicker ? (
+              /* ── Mode picker view ── */
+              <>
+                <h3 style={titleStyle}>Choose Mode</h3>
 
-        {/* Action buttons */}
-        <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
-          {!isFirstLaunch && (
-            <button
-              onClick={onCancel}
-              disabled={loading}
-              style={{
-                padding: '0.5rem 1rem',
-                background: 'transparent',
-                color: 'var(--text-primary, #cdd6f4)',
-                border: '1px solid var(--border, #585b70)',
-                borderRadius: '4px',
-                cursor: loading ? 'not-allowed' : 'pointer',
-                fontSize: '0.85rem',
-                opacity: loading ? 0.6 : 1,
-              }}
-            >
-              Cancel
-            </button>
-          )}
-          <button
-            onClick={handleCreate}
-            disabled={!canCreate}
-            style={{
-              padding: '0.5rem 1rem',
-              background: canCreate ? 'var(--accent, #89b4fa)' : 'var(--text-muted, #6c7086)',
-              color: '#fff',
-              border: 'none',
-              borderRadius: '4px',
-              cursor: canCreate ? 'pointer' : 'not-allowed',
-              fontSize: '0.85rem',
-              fontWeight: 600,
-              opacity: canCreate ? 1 : 0.6,
-            }}
-          >
-            {loading ? 'Creating...' : 'Create Session'}
-          </button>
-        </div>
+                {/* Selected folder path */}
+                <div style={folderPathStyle}>
+                  📁 {selectedFolderPath}
+                </div>
+
+                {/* Mode selector */}
+                <div style={{ marginBottom: '1.2rem' }}>
+                  <label style={labelStyle}>Mode</label>
+                  <div style={{ display: 'flex', gap: '0.5rem' }}>
+                    {MODES.map(m => (
+                      <button
+                        key={m.id}
+                        onClick={() => setMode(m.id)}
+                        style={{
+                          flex: 1,
+                          padding: '0.6rem 0.4rem',
+                          border: mode === m.id ? '2px solid var(--accent, #89b4fa)' : '1px solid var(--border, #585b70)',
+                          borderRadius: '6px',
+                          background: mode === m.id ? 'rgba(137,180,250,0.1)' : 'transparent',
+                          color: mode === m.id ? 'var(--accent, #89b4fa)' : 'var(--text-primary, #cdd6f4)',
+                          cursor: 'pointer',
+                          textAlign: 'center',
+                          fontSize: '0.8rem',
+                          lineHeight: 1.3,
+                        }}
+                      >
+                        <div style={{ fontWeight: 600 }}>{m.label}</div>
+                        <div style={{ fontSize: '0.7rem', opacity: 0.7, marginTop: '0.15rem' }}>{m.desc}</div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Vault warning (only for home dir or ~/.thoughtmachine) */}
+                {isSensitive && (
+                  <div style={{
+                    background: 'rgba(249,226,175,0.15)',
+                    border: '1px solid rgba(249,226,175,0.4)',
+                    borderRadius: '6px',
+                    padding: '0.75rem',
+                    marginBottom: '1rem',
+                  }}>
+                    <div style={{ color: '#f9e2af', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.4rem' }}>
+                      ⚠️ ThoughtMachine Config Warning
+                    </div>
+                    <p style={{ color: '#fab387', fontSize: '0.8rem', margin: '0 0 0.5rem', lineHeight: 1.4 }}>
+                      This workspace contains your ThoughtMachine configuration files. The agent will be able to read and modify its own settings, which could be a security risk if combined with internet access or untrusted tools.
+                    </p>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer', fontSize: '0.8rem', color: '#cdd6f4' }}>
+                      <input
+                        type="checkbox"
+                        checked={acknowledgedRisk}
+                        onChange={e => setAcknowledgedRisk(e.target.checked)}
+                      />
+                      I understand the risks and want to proceed
+                    </label>
+                  </div>
+                )}
+
+                {error && (
+                  <div style={errorBoxStyle}>
+                    ⚠ {error}
+                  </div>
+                )}
+
+                {/* Action buttons */}
+                <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+                  <button
+                    onClick={() => setShowModePicker(false)}
+                    style={{
+                      ...btnBase,
+                      background: 'transparent',
+                      color: 'var(--text-primary, #cdd6f4)',
+                      border: '1px solid var(--border, #585b70)',
+                    }}
+                  >
+                    Back
+                  </button>
+                  <button
+                    onClick={handleCreateNew}
+                    disabled={!canCreateFromMode}
+                    style={{
+                      ...btnBase,
+                      background: canCreateFromMode ? 'var(--accent, #89b4fa)' : 'var(--text-muted, #6c7086)',
+                      color: '#fff',
+                      cursor: canCreateFromMode ? 'pointer' : 'not-allowed',
+                      opacity: canCreateFromMode ? 1 : 0.6,
+                    }}
+                  >
+                    {loading ? 'Creating...' : 'Create Session'}
+                  </button>
+                </div>
+              </>
+            ) : (
+              /* ── Session list view ── */
+              <>
+                <h3 style={titleStyle}>
+                  Sessions in {workspacePath.split('/').pop() || 'workspace'}
+                </h3>
+
+                {/* Selected folder path */}
+                <div style={folderPathStyle}>
+                  📁 {selectedFolderPath}
+                </div>
+
+                {error && (
+                  <div style={errorBoxStyle}>
+                    ⚠ {error}
+                  </div>
+                )}
+
+                <WorkspaceSessionList
+                  workspaceId={workspaceId}
+                  onOpen={handleOpenSession}
+                  onNewSession={() => {
+                    setShowModePicker(true)
+                    setAcknowledgedRisk(false)
+                    setError('')
+                  }}
+                  onBack={handleBack}
+                />
+
+                {!isFirstLaunch && (
+                  <div style={switchViewStyle}>
+                    <button
+                      onClick={onCancel}
+                      disabled={loading}
+                      style={{
+                        ...btnBase,
+                        background: 'transparent',
+                        color: 'var(--text-primary, #cdd6f4)',
+                        border: '1px solid var(--border, #585b70)',
+                        cursor: loading ? 'not-allowed' : 'pointer',
+                        opacity: loading ? 0.6 : 1,
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
+          </>
+        )}
       </div>
     </div>
   )

@@ -562,15 +562,6 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
             tokensOut: msg.data?.total_output ?? 0,
           })
         }
-        // DIAG: log every worker event received from WebSocket
-        console.warn('[DIAG SessionTab] Worker event received from WebSocket:', {
-          msgType: msg.type,
-          workerName: msg.worker_name,
-          dataKeys: msg.data ? Object.keys(msg.data) : [],
-          timestamp: msg.timestamp,
-          hasCallback: !!onWorkerEventRef.current,
-          currentSessionId: currentSessionIdRef.current || currentSessionId,
-        })
         // Use refs to avoid stale closure (connectSessionWs has [] deps)
         if (onWorkerEventRef.current) {
           onWorkerEventRef.current(currentSessionIdRef.current || currentSessionId, msg)

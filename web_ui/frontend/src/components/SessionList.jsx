@@ -1,259 +1,256 @@
-/*
- * SessionList.jsx
- *
- * Right‑sidebar panel that displays saved sessions.
- * Supports opening (in a new tab), deleting, and renaming sessions.
- *
- * Props:
- *   sessions   — array of { session_id, name, created_at, updated_at, preview }
- *   onNew      — create a new tab
- *   onOpenTab  — called with (sessionId) to open a session in a new tab
- *   onDelete   — called with (sessionId)
- *   onRename   — called with (sessionId, newName)
+import React, { useState } from 'react'
 
- */
+const MODE_LABELS = { agent: 'Agent', engineer: 'Engineer', custom: 'Custom' }
 
-import React, { useState, useEffect, useRef, useMemo } from 'react'
-import { List } from 'react-window'
-
-const ITEM_HEIGHT = 72
-
-/**
- * Row component for react-window v2 List.
- * Receives { index, style } plus spread rowProps (sessions, callbacks, etc.)
- */
-const Row = React.memo(({ index, style, sessions, renamingId, renameValue, onOpenTab, onDelete, startRename, submitRename, cancelRename, setRenameValue, deleteConfirmId, onRequestDelete }) => {
-  const s = sessions && sessions[index]
-  if (!s) return null
-
-  const isRenaming = renamingId === s.session_id
-
-  const handleKeyDown = (e) => {
-    if (e.key === 'Enter') submitRename(s.session_id)
-    if (e.key === 'Escape') cancelRename()
-  }
-
-  return (
-    <div style={style}>
-      <div className={`session-item${isRenaming ? ' session-item-renaming' : ''}`}>
-        {isRenaming ? (
-          <div className="session-rename-form">
-            <input
-              type="text"
-              value={renameValue}
-              onChange={(e) => setRenameValue(e.target.value)}
-              onKeyDown={handleKeyDown}
-              autoFocus
-              className="session-rename-input"
-            />
-            <button className="btn btn-sm" onClick={() => submitRename(s.session_id)}>
-              ✓
-            </button>
-            <button className="btn btn-sm" onClick={cancelRename}>
-              ✗
-            </button>
-          </div>
-        ) : (
-          <>
-            <div
-              className="session-item-info"
-              onClick={() => onOpenTab(s.session_id)}
-              title="Open in new tab"
-            >
-              <div className="session-item-name">
-                {s.name || 'Untitled'}
-              </div>
-              <div className="session-item-meta">
-                {formatDate(s.updated_at || s.created_at)}
-                {s.preview && ` — ${s.preview}`}
-              </div>
-            </div>
-            <div className="session-item-actions">
-              <button
-                className="btn btn-icon"
-                onClick={() => startRename(s.session_id, s.name)}
-                title="Rename"
-              >
-                ✏️
-              </button>
-              <button
-                className={`btn btn-icon${deleteConfirmId === s.session_id ? ' btn-deleting' : ''}`}
-                onClick={() => onRequestDelete(s.session_id)}
-                title="Delete"
-              >
-                🗑️
-              </button>
-            </div>
-          </>
-        )}
-      </div>
-    </div>
-  )
-})
-
-function formatDate(isoStr) {
-  if (!isoStr) return ''
+function timeAgo(isoString) {
+  if (!isoString) return ''
   try {
-    const d = new Date(isoStr)
-    return d.toLocaleDateString(undefined, {
-      month: 'short',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-    })
+    const date = new Date(isoString)
+    if (isNaN(date.getTime())) return ''
+    const diff = Date.now() - date.getTime()
+    const mins = Math.floor(diff / 60000)
+    if (mins < 1) return 'just now'
+    if (mins < 60) return `${mins}m ago`
+    const hrs = Math.floor(mins / 60)
+    if (hrs < 24) return `${hrs}h ago`
+    const days = Math.floor(hrs / 24)
+    return `${days}d ago`
   } catch {
-    return isoStr
+    return ''
   }
 }
 
 export default function SessionList({ sessions, onNew, onOpenTab, onDelete, onRename }) {
-  const [renamingId, setRenamingId] = useState(null)
-  const [renameValue, setRenameValue] = useState('')
-  const [deleteConfirmId, setDeleteConfirmId] = useState(null)
-  const [listHeight, setListHeight] = useState(300)
-  const panelRef = useRef(null)
-  const headerRef = useRef(null)
-  const mountTimerRef = useRef(null)
+  const [editingId, setEditingId] = useState(null)
+  const [editName, setEditName] = useState('')
 
+  const handleStartRename = (sessionId, currentName) => {
+    setEditingId(sessionId)
+    setEditName(currentName || '')
+  }
 
-  // Profile initial render of the virtual list
-  useEffect(() => {
-    if (!mountTimerRef.current) {
-      console.time('SessionList.mount')
-      mountTimerRef.current = true
+  const handleSubmitRename = (sessionId) => {
+    const trimmed = editName.trim()
+    if (trimmed && onRename) {
+      onRename(sessionId, trimmed)
     }
-    return () => { mountTimerRef.current = null }
-  }, [])
-
-  // Measure available height for the virtual list
-  useEffect(() => {
-    const panel = panelRef.current
-    if (!panel) return
-
-    const measure = () => {
-      const headerEl = headerRef.current
-      const headerH = headerEl ? headerEl.offsetHeight : 130
-      const panelStyle = window.getComputedStyle(panel)
-      const padTop = parseFloat(panelStyle.paddingTop) || 0
-      const padBot = parseFloat(panelStyle.paddingBottom) || 0
-      const available = panel.clientHeight - headerH - padTop - padBot
-      setListHeight(Math.max(available, 100))
-    }
-
-    // Use ResizeObserver to catch layout changes (sidebar toggle, etc.)
-    const observer = new ResizeObserver(measure)
-    observer.observe(panel)
-
-    // Also measure on session count change
-    measure()
-
-    return () => observer.disconnect()
-  }, [sessions.length])
-
-  // Profile once list has items and measured height > 0
-  useEffect(() => {
-    if (sessions.length > 0 && listHeight > 0 && mountTimerRef.current) {
-      console.timeEnd('SessionList.mount')
-      mountTimerRef.current = false
-    }
-  }, [sessions.length, listHeight])
-
-  const startRename = (sessionId, currentName) => {
-    setRenamingId(sessionId)
-    setRenameValue(currentName || '')
+    setEditingId(null)
+    setEditName('')
   }
 
-  const onRequestDelete = (sessionId) => {
-    setDeleteConfirmId(sessionId)
+  const handleCancelRename = () => {
+    setEditingId(null)
+    setEditName('')
   }
 
-  const onConfirmDelete = () => {
-    if (deleteConfirmId) {
-      onDelete(deleteConfirmId)
-    }
-    setDeleteConfirmId(null)
+  const sidebarStyle = {
+    display: 'flex',
+    flexDirection: 'column',
+    height: '100%',
+    background: 'var(--bg-surface, #313244)',
   }
 
-  const onCancelDelete = () => {
-    setDeleteConfirmId(null)
+  const headerStyle = {
+    padding: '0.75rem 1rem',
+    borderBottom: '1px solid var(--border, #45475a)',
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
   }
 
-  const submitRename = (sessionId) => {
-    if (renameValue.trim()) {
-      onRename(sessionId, renameValue.trim())
-    }
-    setRenamingId(null)
-    setRenameValue('')
+  const headerTitleStyle = {
+    color: 'var(--text-primary, #cdd6f4)',
+    fontSize: '0.9rem',
+    fontWeight: 700,
   }
 
-  const cancelRename = () => {
-    setRenamingId(null)
-    setRenameValue('')
+  const newBtnStyle = {
+    padding: '0.3rem 0.7rem',
+    background: 'var(--accent, #89b4fa)',
+    color: '#fff',
+    border: 'none',
+    borderRadius: '4px',
+    cursor: 'pointer',
+    fontSize: '0.75rem',
+    fontWeight: 600,
   }
 
-  // Memoize rowProps to avoid unnecessary re-renders of rows
-  const rowProps = useMemo(() => ({
-    sessions,
-    renamingId,
-    renameValue,
-    onOpenTab,
-    onDelete,
-    startRename,
-    submitRename,
-    cancelRename,
-    setRenameValue,
-    deleteConfirmId,
-    onRequestDelete,
-  }), [sessions, renamingId, renameValue, onOpenTab, onDelete, onRename, deleteConfirmId, onRequestDelete])
+  const listStyle = {
+    flex: 1,
+    overflowY: 'auto',
+    padding: '0.5rem 0',
+  }
+
+  const cardStyle = {
+    padding: '0.5rem 0.75rem',
+    margin: '0 0.5rem 0.3rem',
+    borderRadius: '6px',
+    cursor: 'pointer',
+    border: '1px solid transparent',
+    transition: 'background 0.1s, border-color 0.1s',
+  }
+
+  const cardTitleRow = {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: '0.3rem',
+  }
+
+  const nameStyle = {
+    color: 'var(--text-primary, #cdd6f4)',
+    fontSize: '0.8rem',
+    fontWeight: 600,
+    whiteSpace: 'nowrap',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    flex: 1,
+    minWidth: 0,
+  }
+
+  const modeBadgeStyle = {
+    fontSize: '0.6rem',
+    fontWeight: 600,
+    padding: '0.05rem 0.3rem',
+    borderRadius: '3px',
+    background: 'rgba(166,227,161,0.2)',
+    color: '#a6e3a1',
+    whiteSpace: 'nowrap',
+    flexShrink: 0,
+  }
+
+  const previewStyle = {
+    fontSize: '0.7rem',
+    color: 'var(--text-muted, #6c7086)',
+    whiteSpace: 'nowrap',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    marginTop: '0.1rem',
+  }
+
+  const actionsRow = {
+    display: 'flex',
+    gap: '0.25rem',
+    marginTop: '0.25rem',
+  }
+
+  const actionBtnStyle = {
+    background: 'none',
+    border: 'none',
+    color: 'var(--text-muted, #6c7086)',
+    cursor: 'pointer',
+    fontSize: '0.7rem',
+    padding: '0.1rem 0.3rem',
+    borderRadius: '3px',
+  }
+
+  const emptyStyle = {
+    padding: '1rem',
+    textAlign: 'center',
+    color: 'var(--text-muted, #6c7086)',
+    fontSize: '0.8rem',
+  }
+
+  const sortedSessions = [...(sessions || [])].sort((a, b) => {
+    const aTime = a.updated_at || a.created_at || ''
+    const bTime = b.updated_at || b.created_at || ''
+    return bTime.localeCompare(aTime)
+  })
 
   return (
-    <div className="session-list-panel" ref={panelRef}>
-      <div ref={headerRef}>
-        <div className="session-list-header">
-          <h3>Sessions</h3>
-        </div>
-        <div className="session-list-actions">
-        <button className="btn btn-new" onClick={onNew}>
-          ✨ New Session
+    <div style={sidebarStyle}>
+      <div style={headerStyle}>
+        <span style={headerTitleStyle}>Sessions</span>
+        <button style={newBtnStyle} onClick={onNew}>
+          + New
         </button>
       </div>
-      </div>
 
-      {sessions.length === 0 ? (
-        <div className="session-list-empty">
-          <p>No saved sessions yet.</p>
-          <button className="btn btn-new" onClick={onNew} style={{marginTop: '0.75rem'}}>
-            ✨ New Session
-          </button>
-        </div>
-      ) : (
-        <List
-          rowComponent={Row}
-          rowCount={sessions.length}
-          rowHeight={ITEM_HEIGHT}
-          rowProps={rowProps}
-          style={{ height: listHeight }}
-          overscanCount={3}
-
-        />
-      )}
-
-      {/* Delete confirmation overlay */}
-      {deleteConfirmId && (
-        <div className="delete-confirm-overlay" onClick={onCancelDelete}>
-          <div className="delete-confirm-dialog" onClick={(e) => e.stopPropagation()}>
-            <p>Are you sure you want to delete this session?</p>
-            <div className="delete-confirm-actions">
-              <button className="btn btn-sm" onClick={onCancelDelete}>
-                Cancel
-              </button>
-              <button className="btn btn-sm btn-delete-confirm" onClick={onConfirmDelete}>
-                Delete
-              </button>
-            </div>
+      <div style={listStyle}>
+        {sortedSessions.length === 0 ? (
+          <div style={emptyStyle}>
+            No sessions yet.<br />Click <strong>+ New</strong> to begin.
           </div>
-        </div>
-      )}
+        ) : (
+          sortedSessions.map(session => (
+            <div
+              key={session.session_id}
+              style={cardStyle}
+              onClick={() => onOpenTab(session.session_id)}
+              onMouseEnter={e => {
+                e.currentTarget.style.background = 'rgba(137,180,250,0.06)'
+                e.currentTarget.style.borderColor = 'var(--accent, #89b4fa)'
+              }}
+              onMouseLeave={e => {
+                e.currentTarget.style.background = 'transparent'
+                e.currentTarget.style.borderColor = 'transparent'
+              }}
+            >
+              <div style={cardTitleRow}>
+                {editingId === session.session_id ? (
+                  <input
+                    style={{
+                      flex: 1,
+                      background: 'var(--bg-primary, #1e1e2e)',
+                      border: '1px solid var(--accent, #89b4fa)',
+                      borderRadius: '3px',
+                      color: 'var(--text-primary, #cdd6f4)',
+                      fontSize: '0.8rem',
+                      padding: '0.15rem 0.3rem',
+                      outline: 'none',
+                    }}
+                    value={editName}
+                    onChange={e => setEditName(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') handleSubmitRename(session.session_id)
+                      if (e.key === 'Escape') handleCancelRename()
+                    }}
+                    autoFocus
+                    onClick={e => e.stopPropagation()}
+                  />
+                ) : (
+                  <span style={nameStyle} title={session.name}>
+                    {session.name || 'Untitled'}
+                  </span>
+                )}
+                <span style={modeBadgeStyle}>
+                  {MODE_LABELS[session.mode] || session.mode || 'Agent'}
+                </span>
+              </div>
+
+              <div style={previewStyle}>
+                <span style={{ opacity: 0.7 }}>{timeAgo(session.updated_at || session.created_at)}</span>
+                {session.preview && <span> — {session.preview}</span>}
+              </div>
+
+              <div style={actionsRow}>
+                <button
+                  style={actionBtnStyle}
+                  onClick={e => {
+                    e.stopPropagation()
+                    handleStartRename(session.session_id, session.name)
+                  }}
+                  title="Rename"
+                >
+                  ✏️
+                </button>
+                <button
+                  style={{ ...actionBtnStyle, color: 'var(--danger, #f38ba8)' }}
+                  onClick={e => {
+                    e.stopPropagation()
+                    if (window.confirm(`Delete "${session.name || 'Untitled'}"?`)) {
+                      onDelete(session.session_id)
+                    }
+                  }}
+                  title="Delete"
+                >
+                  🗑️
+                </button>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
     </div>
   )
 }

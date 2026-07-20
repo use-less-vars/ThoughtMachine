@@ -53,6 +53,8 @@ class RenameSessionBody(BaseModel):
 class SessionListItem(BaseModel):
     session_id: str
     name: str
+    mode: str = "agent"
+    workspace_id: str = ""
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     preview: str = ""
@@ -103,6 +105,18 @@ async def create_session(body: CreateSessionBody) -> Dict[str, Any]:
             ensure_workspace_dirs(entry.id)
         elif body.workspace_id:
             session.workspace_id = body.workspace_id
+            # Look up root_path from workspace registry and store in metadata
+            # so that when the session is loaded via WebSocket, the bridge can
+            # pick it up from agent_config in session metadata.
+            try:
+                registry = WorkspaceRegistry.get_default()
+                entry = registry.get_workspace(body.workspace_id)
+                if entry and entry.root_path:
+                    if 'agent_config' not in session.metadata:
+                        session.metadata['agent_config'] = {}
+                    session.metadata['agent_config']['workspace_path'] = entry.root_path
+            except Exception:
+                pass
         session.ensure_name()
 
         store.save_session(session, workspace_id=session.workspace_id)
@@ -158,15 +172,24 @@ async def list_sessions(
         if workspace_id:
             sessions = [s for s in sessions if s.get('workspace_id') == workspace_id]
 
+        # Try to get previews from session store for all sessions
+        store = _get_store()
+        session_ids = [s.get("session_id", "") for s in sessions if s.get("session_id")]
+        metadata_batch = store.load_sessions_metadata_batch(session_ids, workspace_id=workspace_id) if workspace_id else {}
+
         # Map registry fields to the expected SessionListItem format
         result = []
         for s in sessions:
+            sid = s.get("session_id", "")
+            meta = metadata_batch.get(sid) if metadata_batch else None
             result.append({
-                "session_id": s.get("session_id", ""),
+                "session_id": sid,
                 "name": s.get("name", "Untitled"),
+                "mode": s.get("mode", "agent"),
+                "workspace_id": s.get("workspace_id", ""),
                 "created_at": s.get("created_at"),
-                "updated_at": s.get("updated_at"),
-                "preview": "",
+                "updated_at": meta.get("updated_at") if meta else s.get("updated_at"),
+                "preview": meta.get("preview", "") if meta else "",
             })
 
         return result

@@ -1240,7 +1240,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 root_path = entry.root_path
                                 if bridge._config is None:
                                     from agent.config.models import AgentConfig
-                                    bridge._config = AgentConfig(workspace_path=root_path)
+                                    global_cfg = bridge._build_global_agent_config()
+                                    bridge._config = AgentConfig(
+                                        **global_cfg.model_dump(exclude={'api_key'}, exclude_none=True),
+                                        workspace_path=root_path
+                                    )
                                 else:
                                     bridge._config.workspace_path = root_path
                                 log('INFO', 'server',
@@ -1389,10 +1393,8 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         log("ERROR", "server.config", f"rename_session failed: {exc}")
 
                 elif command == "get_open_sessions":
-                    log("INFO", "server.config", "get_open_sessions handler reached")
                     try:
                         open_ids = session_store.get_open_sessions()
-                        log("INFO", "server.config", f"get_open_sessions returned {len(open_ids)} ids: {open_ids}")
                         # Batch-load metadata for all open sessions in a single
                         # directory scan — avoids reading each session file N times.
                         all_meta = session_store.load_sessions_metadata_batch(open_ids)
@@ -1408,7 +1410,6 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 })
                         response = {"type": "open_sessions", "sessions": open_sessions}
                         await ws.send_json(response)
-                        log("INFO", "server.config", f"Sent open_sessions with {len(open_sessions)} items")
                     except Exception as e:
                         log("ERROR", "server.config", f"get_open_sessions failed: {e}")
                         await ws.send_json({"type": "error", "message": str(e)})
@@ -1547,7 +1548,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 root_path = entry.root_path
                                 if bridge._config is None:
                                     from agent.config.models import AgentConfig
-                                    bridge._config = AgentConfig(workspace_path=root_path)
+                                    global_cfg = bridge._build_global_agent_config()
+                                    bridge._config = AgentConfig(
+                                        **global_cfg.model_dump(exclude={'api_key'}, exclude_none=True),
+                                        workspace_path=root_path
+                                    )
                                 else:
                                     bridge._config.workspace_path = root_path
                                 log('INFO', 'server',
@@ -1858,9 +1863,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
             elif not bridge._cleanly_closed:
                 try:
                     bridge.save_open_session()
-                except Exception:
-                    pass
+                    # Verify after save
+                    after_ids = session_store.get_open_sessions()
+                except Exception as e:
             bridge.unregister()
+        else:
 
 
 # ══════════════════════════════════════════════════════════════════════════════

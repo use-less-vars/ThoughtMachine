@@ -1216,7 +1216,8 @@ class WebAgentBridge:
         if self._config is not None:
             base = self._config.model_dump(exclude={'api_key'}, exclude_none=True)
         else:
-            base = {}
+            global_config = self._build_global_agent_config()
+            base = global_config.model_dump(exclude={'api_key'}, exclude_none=True)
 
         # Step 3: Merge incoming on top (deep merge — preserves nested dicts)
         from agent.utils import deep_merge
@@ -1298,7 +1299,7 @@ class WebAgentBridge:
                 session_id = self._loaded_session.session_id if self._loaded_session else str(uuid.uuid4())
                 session = Session(
                     session_id=session_id,
-                    user_history=list(self._session.user_history) if self._session else [],
+                    user_history=list(self._loaded_session.user_history) if self._loaded_session else [],
                     workspace_id=self._workspace_id,
                     metadata={
                         'agent_config': self._config.model_dump(exclude={'api_key'}, exclude_none=True) if self._config else {},
@@ -1484,7 +1485,10 @@ class WebAgentBridge:
                     if entry and entry.root_path:
                         if self._config is None:
                             from agent.config import AgentConfig
-                            self._config = AgentConfig()
+                            global_cfg = self._build_global_agent_config()
+                            self._config = AgentConfig(
+                                **global_cfg.model_dump(exclude={'api_key'}, exclude_none=True)
+                            )
                         self._config.workspace_path = entry.root_path
                         log('INFO', 'server.bridge',
                             f"Backfilled workspace_path from registry for workspace {self._workspace_id}: {entry.root_path}")
@@ -1523,7 +1527,8 @@ class WebAgentBridge:
                     if self._config is not None:
                         base = self._config.model_dump(exclude={'api_key'}, exclude_none=True)
                     else:
-                        base = {}
+                        global_config = self._build_global_agent_config()
+                        base = global_config.model_dump(exclude={'api_key'}, exclude_none=True)
                     from agent.utils import deep_merge
                     merged = deep_merge(base, agent_config_raw)
                     # Ensure enabled_tools is always present — merge from global config if missing

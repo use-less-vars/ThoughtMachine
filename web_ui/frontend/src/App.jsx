@@ -340,6 +340,7 @@ export default function App() {
     // of calling setActiveTabId from inside setTabs's updater function.
     if (!preferredSessionId || sessionId === preferredSessionId) {
       setActiveTabId(tabId)
+      // Log the tab count after adding
       // Mark this tab so handleRegisterTab will trigger deferred load
       // once the SessionTab WS connects. Without this, new tabs created
       // via "+" would get stuck in deferred mode (empty placeholder).
@@ -403,8 +404,6 @@ export default function App() {
       if (!response.ok) throw new Error(data.detail || 'Failed to create session')
 
       localStorage.setItem('lastSessionMode', mode)
-      if (workspaceId) localStorage.setItem('lastSessionWorkspace', workspaceId)
-      if (workspacePath) localStorage.setItem('lastSessionPath', workspacePath)
 
       setSessionModes(prev => ({ ...prev, [data.session_id]: mode }))
       setShowCreationModal(false)
@@ -419,15 +418,14 @@ export default function App() {
     }
   }, [loadTab])
 
-  const handleQuickContinue = useCallback(async () => {
-    const mode = localStorage.getItem('lastSessionMode') || 'agent'
-    const workspaceId = localStorage.getItem('lastSessionWorkspace') || null
-    const workspacePath = localStorage.getItem('lastSessionPath') || null
-    await handleCreateSession(mode, workspaceId, workspacePath)
-  }, [handleCreateSession])
-
   // Open an existing session in a tab (called from SessionList sidebar)
   const handleOpenTab = useCallback((sessionId) => {
+    loadTab(sessionId)
+  }, [loadTab])
+
+  // Open session from creation modal (step 2 session list)
+  const handleOpenSession = useCallback((sessionId) => {
+    setShowCreationModal(false)
     loadTab(sessionId)
   }, [loadTab])
 
@@ -710,25 +708,6 @@ export default function App() {
           {tabs.length === 0 ? (
             <div className="empty-state">
               <p>Open a session or create a new one to get started.</p>
-              {localStorage.getItem('lastSessionMode') && (
-                <button
-                  className="quick-continue-btn"
-                  onClick={handleQuickContinue}
-                  style={{
-                    background: '#a6e3a1',
-                    color: '#1e1e2e',
-                    border: 'none',
-                    borderRadius: '4px',
-                    padding: '0.5rem 1rem',
-                    cursor: 'pointer',
-                    fontWeight: 600,
-                    fontSize: '0.85rem',
-                    marginTop: '0.5rem',
-                  }}
-                >
-                  Quick Continue (last session)
-                </button>
-              )}
               <button
                 className="create-session-btn"
                 onClick={() => setShowCreationModal(true)}
@@ -835,6 +814,7 @@ export default function App() {
       <SessionCreationModal
         show={showCreationModal}
         onCreate={handleCreateSession}
+        onOpen={handleOpenSession}
         onCancel={() => setShowCreationModal(false)}
         isFirstLaunch={tabs.length === 0 && sessions.length === 0 && !localStorage.getItem('lastSessionMode')}
       />
