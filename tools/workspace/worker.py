@@ -592,10 +592,15 @@ class WorkerThread(threading.Thread):
         self._project_root: Optional[str] = project_root
 
         # Override timeout (from spawn parameter, else from definition, else 600)
+        # NOTE: definition.get("timeout_seconds", 600) would return None if the
+        # key exists with a null value, so we use "or 600" to catch that case.
+        _def_timeout = definition.get("timeout_seconds")
+        if _def_timeout is None:
+            _def_timeout = 600
         self._timeout_seconds: int = (
             timeout_seconds
             if timeout_seconds is not None
-            else definition.get("timeout_seconds", 600)
+            else _def_timeout
         )
 
         # Runtime state
@@ -835,9 +840,15 @@ class WorkerThread(threading.Thread):
             enabled_tools = [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES
                              if cls.__name__ not in _WORKER_BLOCKLIST]
         worker_cfg["enabled_tools"] = enabled_tools
-        worker_cfg["max_turns"] = self.definition.get(
-            "max_turns", cfg.get("max_turns", 100)
-        )
+        # Resolve max_turns: prefer definition, then parent config (treating
+        # None as absent), then default 100.
+        _inherit_max_turns = cfg.get("max_turns")
+        if _inherit_max_turns is None:
+            _inherit_max_turns = 100
+        _def_max_turns = self.definition.get("max_turns")
+        if _def_max_turns is None:
+            _def_max_turns = _inherit_max_turns
+        worker_cfg["max_turns"] = _def_max_turns
         # Override token monitor warning threshold from worker definition
         warning_threshold = self.definition.get("warning_threshold_tokens", None)
         if warning_threshold is not None:
@@ -850,8 +861,9 @@ class WorkerThread(threading.Thread):
         worker_cfg["timeout_seconds"] = self._timeout_seconds
         # Warn at 80% of timeout (minimum 5s) so CRITICAL triggers before
         # the hard cutoff when using the worker tool's timeout window.
+        _timeout_for_warning = self._timeout_seconds if self._timeout_seconds is not None else 600
         worker_cfg["time_warning_threshold"] = max(
-            5, int(self._timeout_seconds * 0.8)
+            5, int(_timeout_for_warning * 0.8)
         )
         worker_cfg["time_monitor_enabled"] = True
         worker_cfg["stop_check"] = self._stop_event.is_set
@@ -867,6 +879,10 @@ class WorkerThread(threading.Thread):
         # project_root that was resolved from workspace_dir/config.json.
         if "workspace_path" not in worker_cfg and self._project_root:
             worker_cfg["workspace_path"] = self._project_root
+
+        # Safety net: ensure max_turns is a valid int (fall back to 100)
+        if "max_turns" not in worker_cfg or worker_cfg.get("max_turns") is None:
+            worker_cfg["max_turns"] = 100
 
         # Mark config as running inside a worker for security context
         worker_cfg["worker_mode"] = True
@@ -1653,10 +1669,29 @@ class Worker(ToolBase):
                     "error": f"worker_name is required for action '{self.action}'",
                 })
 
-            # Resolve workspace ID
+            # === Resolve workspace ID from registries (primary, always correct) ===
             ws_id = None
-            if resolve_workspace_id and self.workspace_path:
-                ws_id = resolve_workspace_id(self.workspace_path)
+            workspace_path_for_fallback = getattr(self, 'workspace_path', None)
+
+            # 1. Ask SessionRegistry for the session's workspace_id
+            if self.session_id:
+                try:
+                    from session.session_registry import SessionRegistry
+                    session_info = SessionRegistry.get_default().get(self.session_id)
+                    if session_info and session_info.get("workspace_id"):
+                        ws_id = session_info["workspace_id"]
+                except Exception:
+                    pass
+
+            # 2. Fallback to deprecated AgentConfig.workspace_path
+            if not ws_id and workspace_path_for_fallback and CAPABILITIES_AVAILABLE:
+                ws_id = resolve_workspace_id(workspace_path_for_fallback)
+                if ws_id:
+                    import logging
+                    logging.warning(
+                        "Worker tool resolved workspace via deprecated AgentConfig.workspace_path. "
+                        "Consider ensuring session_id is present."
+                    )
 
             workers = self._load_workers(ws_id)
 
@@ -1682,11 +1717,25 @@ class Worker(ToolBase):
         """
         Load workers list from workers.json in workspace dir.
 
-        Falls back to ``_load_template_workers()`` when the file is missing,
-        empty, or fails to parse.
+        Falls back to scanning workspace directories or ``_load_template_workers()``
+        when the file is missing, empty, fails to parse, or when the workspace ID
+        cannot be resolved.
+
+        Template workers are **merged** into the result — any worker template found
+        on disk (in ``resources/worker_templates/``) that is not already present in
+        the workspace's ``workers.json`` is appended automatically.  This ensures
+        newly added templates (e.g. ``coder.json``, ``reviewer.json``) are always
+        available without requiring workspace re-initialisation.
         """
-        if not CAPABILITIES_AVAILABLE or not _workspace_dir or not ws_id:
+        if not CAPABILITIES_AVAILABLE or not _workspace_dir:
             return []
+
+        if not ws_id:
+            scanned = self._scan_workspace_dirs_for_workers()
+            if scanned:
+                return self._merge_template_workers(scanned)
+            logger.info("No workspace ID resolved and no workers.json found in any workspace, falling back to template workers")
+            return _load_template_workers()
 
         workers_path = _workspace_dir(ws_id) / "workers.json"
         if not workers_path.exists():
@@ -1698,10 +1747,69 @@ class Worker(ToolBase):
             if not data:  # empty array
                 logger.info(f"workers.json is empty, falling back to templates")
                 return _load_template_workers()
-            return data
+            return self._merge_template_workers(data)
         except (json.JSONDecodeError, OSError) as e:
             logger.warning(f"Failed to load workers.json: {e}, falling back to templates")
             return _load_template_workers()
+
+    @staticmethod
+    def _merge_template_workers(workers: list) -> list:
+        """
+        Merge template workers from disk into *workers* (in-place of the list
+        object, but returned for chaining).
+
+        Any worker definition found in ``_load_template_workers()`` whose
+        ``name`` is not already present in *workers* is appended.  This lets
+        newly added template files (e.g. ``coder.json``, ``reviewer.json``)
+        become available without requiring workspace re-initialisation.
+
+        Workers from the workspace file take precedence — existing names are
+        never overwritten.
+        """
+        existing_names: set[str] = {
+            w["name"] for w in workers
+            if isinstance(w, dict) and w.get("name")
+        }
+        for template in _load_template_workers():
+            name = template.get("name")
+            if name and name not in existing_names:
+                workers.append(template)
+                existing_names.add(name)
+                logger.info("Merged template worker '%s' into workspace workers", name)
+        return workers
+
+    def _scan_workspace_dirs_for_workers(self) -> list:
+        """
+        Scan ``~/.thoughtmachine/workspaces/<id>/workers.json`` for all workspace
+        directories and return the first valid workers list found.
+
+        This is a fallback when ``ws_id`` cannot be resolved (e.g. when the
+        session's ``workspace_path`` config is not set).
+        """
+        import os
+
+        base = Path(os.path.expanduser("~/.thoughtmachine/workspaces"))
+        if not base.is_dir():
+            return []
+
+        for entry in sorted(base.iterdir()):
+            if not entry.is_dir():
+                continue
+            workers_path = entry / "workers.json"
+            if not workers_path.is_file():
+                continue
+            try:
+                data = json.loads(workers_path.read_text(encoding="utf-8"))
+                if data and isinstance(data, list):
+                    logger.info(
+                        "Loaded %d workers from %s (workspace fallback scan)",
+                        len(data), workers_path,
+                    )
+                    return data
+            except (json.JSONDecodeError, OSError):
+                continue
+
+        return []
 
     def _find_worker(self, workers: list, name: str) -> Optional[dict]:
         """Find a worker by name in the workers list."""
@@ -1764,8 +1872,17 @@ class Worker(ToolBase):
         """
         cfg = self.agent_config or {}
         result = dict(cfg)
-        if self.workspace_path:
-            result["workspace_path"] = self.workspace_path
+
+        # Resolve workspace path from registries (primary)
+        ws_path = self._resolve_registry_workspace()
+        if ws_path:
+            result["workspace_path"] = ws_path
+        else:
+            # Last-resort fallback for worker config propagation
+            legacy_ws = getattr(self, 'workspace_path', None)
+            if legacy_ws:
+                result["workspace_path"] = legacy_ws
+
         return result
 
     def _resolve_tool_class(self, tool_name: str) -> Optional[type[ToolBase]]:
