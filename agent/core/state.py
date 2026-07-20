@@ -159,8 +159,9 @@ class AgentState:
             self.restriction_reason = 'token'
         elif self.token_state != TokenState.CRITICAL and self.turn_state == TurnState.LOW:
             self.restrictions_pending = False
-            self.restrictions_active = False
-            self.restriction_reason = None
+            if self.restriction_reason == 'token':
+                self.restrictions_active = False
+                self.restriction_reason = None
 
         if new_state == TokenState.LOW and not self._token_warning_has_fired:
             self.last_token_warning_state = TokenState.LOW
@@ -315,12 +316,16 @@ class AgentState:
             turn_warning_data = {'old_state': old_state.value, 'new_state': new_state.value, 'turn_count': current_turn, 'warning_message': warning, 'state': new_state.value}
             events.append(self._create_event('turn_warning', turn_warning_data))
 
-        # ── LOW: clear all restrictions ────────────────────────────────
+        # ── LOW: clear restrictions (only if reason is 'turn') ─────────────────
+        # IMPORTANT: Do NOT clear restrictions set by other monitors (e.g.
+        # 'timeout' from time_state, 'token' from token_state). Each monitor
+        # is responsible for clearing its own restrictions only.
         if new_state == TurnState.LOW:
             self.last_turn_warning_state = TurnState.LOW
-            self.restrictions_active = False
-            self.restrictions_pending = False
-            self.restriction_reason = None
+            if self.restriction_reason == 'turn':
+                self.restrictions_active = False
+                self.restrictions_pending = False
+                self.restriction_reason = None
 
         return events
     def set_execution_state(self, new_state: ExecutionState) -> List[Dict[str, Any]]:
