@@ -5225,3 +5225,104 @@ The Agent class (`agent/core/agent.py`, 1519 lines, 39 methods) is a **facade co
 - **Workspace management**: Load/save workspace state, worker contexts
 - **Logging**: Logging routes for real-time log streaming
 - **Health**: Health check endpoint for container orchestration
+
+## 2026-07-19 — ## Workspace & Worker Pipeline Analysis (Complete)
+
+### Conf...
+
+## Workspace & Worker Pipeline Analysis (Complete)
+
+### Config Loading Chain
+1. `resources/default_config.json` has `"workspace_path": ""` (empty string)
+2. `agent/config/loader.py::load_factory_config()` loads this into a dict
+3. `AgentConfig` Pydantic model has `workspace_path: Optional[str] = Field(default=None)`
+4. When loaded from JSON dict, `""` is assigned (not `None`)
+5. `tool_executor.py` line 225: `if self.config.workspace_path:` → `""` is falsy → workspace_path NOT injected into tool args
+
+### Tool Injection Chain
+6. `ToolExecutor._execute_single_tool()` (line 224-226): validates args first, THEN injects workspace_path only if truthy
+7. Worker tool class receives no `workspace_path` → `self.workspace_path` is None/Pydantic default
+8. In `Worker.execute()` (line 1656-1659): `if resolve_workspace_id and self.workspace_path:` → self.workspace_path is falsy → ws_id stays None
+9. `_load_workers(ws_id)` is called with ws_id=None
+10. In the spawn handler (line ~1990-1998): ws_id=None → `ws_dir = None` → returns "Cannot create worker: no workspace directory resolved"
+
+### Web UI Auto-Registration
+11. `server.py` line 136: `_project_root = dirname(dirname(dirname(abspath(__file__))))` → 3 levels up from web_ui/backend/server.py = project root
+12. Startup auto-registration (lines 253-263): `WorkspaceRegistry.get_default().register_by_root(str(_project_root))` + `ensure_workspace_dirs(entry.id)`
+13. `_default_frontend_config()` (line 2210): includes `"workspace_path": _project_root` at line 2109
+14. When user selects a folder in the GUI, server.py handles `set_project`/`apply_config` with path → registers workspace → sets `bridge._config.workspace_path = _project_path`
+
+### Worker Template Loading
+15. `workspace_capabilities.py::_load_template_workers()` checks `~/.thoughtmachine/worker_templates/` first, then `resources/worker_templates/`
+16. `_build_default_workers()` loads templates and falls back to hardcoded "default" worker
+17. Workspace `workers.json` is created by `ensure_workspace_dirs()` on first bootstrap
+
+### Key Design Gap
+- The factory `default_config.json` sets workspace_path="" but AgentConfig model default is None
+- Neither "" nor None triggers workspace_path injection into tool args
+- Worker tool needs workspace_path to resolve ws_id → workspace dir → workers.json
+- Without Web UI (CLI mode), workspace_path is never set → Worker tool always fails
+
+## 2026-07-20 — ## Workspace Path Resolution v2 (Registry-First)
+
+**Date**: ...
+
+## Workspace Path Resolution v2 (Registry-First)
+
+**Date**: 2025-07-18
+**Status**: Applied to Worker tool and CheckSystem tool; remaining tools still use AgentConfig.workspace_path via ToolBase injection
+
+### Problem
+`AgentConfig.workspace_path` was populated at bridge-initialization time, meaning tools that ran before the session bridge had fully initialized would get `None`. This was a timing-dependent bug that caused silent failures.
+
+### Solution
+A registry-first resolution pattern:
+
+1. Tools query **SessionRegistry** by `self.session_id` to get the workspace ID
+2. They then query **WorkspaceRegistry.get_workspace(ws_id)** to get the canonical workspace path
+3. Falls back to `AgentConfig.workspace_path` with a deprecation warning
+
+### Files Modified
+- `tools/workspace/worker.py` — lines 1656-1678: registry-first resolution with CAPABILITIES_AVAILABLE guard
+- `tools/workspace/check_system.py` — execute() resolves at top; passes to 3 methods
+- `agent/config/models.py` — [DEPRECATED] tags on workspace_path field
+
+### Remaining Work
+15+ files still consume `self.workspace_path` from ToolBase. Each should be refactored following the same pattern.
+
+## 2026-07-20 — ## Workspace Path Resolution v2 — Full Tool Suite Refactor
+
+...
+
+## Workspace Path Resolution v2 — Full Tool Suite Refactor
+
+**Date**: 2025-07-18
+**Scope**: All tools in `tools/` directory
+
+### Added to ToolBase (`tools/base.py`)
+- **`_resolve_registry_workspace()`** — new helper method on ToolBase that all tools call instead of reading `self.workspace_path` directly. Queries SessionRegistry → WorkspaceRegistry first, falls back to deprecated AgentConfig.workspace_path with a warning.
+- **`_validate_path()`** — updated to use `_resolve_registry_workspace()` internally, so all path validation goes through registries automatically.
+- **`workspace_path` field** — marked `[DEPRECATED]` in its description.
+
+### Files Refactored (12 files total)
+
+| File | Pattern Used |
+|------|-------------|
+| `tools/base.py` | Added helper, updated _validate_path, deprecated field |
+| `tools/respond.py` | Inline registry resolution in execute() |
+| `tools/git_info_tool.py` | Inline registry resolution in execute() |
+| `tools/knowledge_base.py` | Inline registry resolution in execute() |
+| `tools/read_file_tool.py` | Inline registry resolution in execute() |
+| `tools/progress_report.py` | `self._resolve_registry_workspace()` |
+| `tools/file_search_tool.py` | `self._resolve_registry_workspace()` |
+| `tools/refactor_tool.py` | `self._resolve_registry_workspace()` |
+| `tools/search_codebase.py` | `self._resolve_registry_workspace()` |
+| `tools/docker_code_runner.py` | `self._resolve_registry_workspace()` |
+| `tools/workspace/worker.py` | `self._resolve_registry_workspace()` |
+| `tools/workspace/edit_dockerfile.py` | Registry-first session/workspace resolution |
+| `tools/workspace/check_system.py` | Previously refactored in first pass |
+
+### Files Not Requiring Changes
+- `tools/file_editor.py` — uses `_validate_path()` (inherited from ToolBase, now registry-first)
+- `tools/utils.py` — only references field name in schema string set
+- `tools/workspace/` sub-tools already refactored in first pass
