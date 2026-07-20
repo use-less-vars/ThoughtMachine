@@ -380,6 +380,22 @@ class FileSystemSessionStore(SessionStore):
             logger.error(f"[SessionStore] Error loading session {session_id}: {e}")
             return None
 
+    @staticmethod
+    def _extract_preview(user_history: List[Any], max_chars: int = 80) -> str:
+        """Extract a short preview from the last user message."""
+        if not isinstance(user_history, list) or not user_history:
+            return ""
+        for msg in reversed(user_history):
+            if isinstance(msg, dict) and msg.get('role') == 'user':
+                content = msg.get('content', '')
+                if content:
+                    # Take first line, truncate
+                    first_line = content.split('\n')[0]
+                    if len(first_line) > max_chars:
+                        return first_line[:max_chars] + '…'
+                    return first_line
+        return ""
+
     def load_session_metadata(self, session_id: str, workspace_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Lightweight metadata load — reads the session JSON file directly and
@@ -394,7 +410,7 @@ class FileSystemSessionStore(SessionStore):
         If workspace_id is provided, scans only the workspace-scoped directory.
 
         Returns a dict with keys:
-            session_id, name, updated_at, message_count
+            session_id, name, updated_at, message_count, preview
         or None if the session file is not found.
         """
         target_dir = self._base_dir / "workspaces" / workspace_id / "sessions" if workspace_id else self.sessions_dir
@@ -418,6 +434,7 @@ class FileSystemSessionStore(SessionStore):
                             'name': name,
                             'updated_at': updated_at,
                             'message_count': message_count,
+                            'preview': self._extract_preview(user_history),
                         }
                 except Exception:
                     continue
@@ -428,54 +445,72 @@ class FileSystemSessionStore(SessionStore):
 
     def load_sessions_metadata_batch(self, session_ids: List[str], workspace_id: Optional[str] = None) -> Dict[str, Optional[Dict[str, Any]]]:
         """
-        Batch metadata load — reads ALL session JSON files in a single directory
-        scan and returns metadata for all requested session IDs.
+        Batch metadata load — reads session JSON files across relevant directories
+        and returns metadata for all requested session IDs.
 
         This is far more efficient than calling load_session_metadata() in a loop
         because each file is read only once, regardless of how many session IDs
         are requested.
 
         If workspace_id is provided, scans only the workspace-scoped directory.
+        If workspace_id is None, scans the legacy sessions_dir AND all
+        workspace-scoped directories (mirroring _find_session_path logic).
 
         Returns a dict mapping session_id -> metadata dict (or None if not found)
-        with metadata keys: session_id, name, updated_at, message_count
+        with metadata keys: session_id, name, updated_at, message_count, preview
         """
         wanted = set(session_ids)
         if not wanted:
             return {}
         results: Dict[str, Optional[Dict[str, Any]]] = {sid: None for sid in session_ids}
-        target_dir = self._base_dir / "workspaces" / workspace_id / "sessions" if workspace_id else self.sessions_dir
-        try:
-            for file_path in target_dir.glob("*.json"):
-                # Skip metadata files
-                if file_path.name.startswith("_meta_"):
+
+        # Build list of candidate directories to scan
+        if workspace_id:
+            candidates = [self._base_dir / "workspaces" / workspace_id / "sessions"]
+        else:
+            candidates = [self.sessions_dir]
+            workspaces_root = self._base_dir / "workspaces"
+            if workspaces_root.exists():
+                for ws_dir in workspaces_root.iterdir():
+                    ws_sessions = ws_dir / "sessions"
+                    if ws_sessions.is_dir():
+                        candidates.append(ws_sessions)
+
+        for target_dir in candidates:
+            try:
+                if not target_dir.exists():
                     continue
-                try:
-                    with open(file_path, 'r') as f:
-                        data = json.load(f)
-                    if not isinstance(data, dict):
+                for file_path in target_dir.glob("*.json"):
+                    # Skip metadata files
+                    if file_path.name.startswith("_meta_"):
                         continue
-                    sid = data.get('session_id')
-                    if sid is not None and sid in wanted:
-                        name = data.get('metadata', {}).get('name', 'Untitled Session')
-                        updated_at = data.get('updated_at')
-                        user_history = data.get('user_history', [])
-                        message_count = len(user_history) if isinstance(user_history, list) else 0
-                        results[sid] = {
-                            'session_id': sid,
-                            'name': name,
-                            'updated_at': updated_at,
-                            'message_count': message_count,
-                        }
-                except Exception:
-                    continue
-                # Early exit: all wanted sessions found
-                if all(v is not None for v in results.values()):
-                    break
-            return results
-        except Exception as e:
-            logger.error(f"[SessionStore] Error in batch metadata load: {e}")
-            return results
+                    try:
+                        with open(file_path, 'r') as f:
+                            data = json.load(f)
+                        if not isinstance(data, dict):
+                            continue
+                        sid = data.get('session_id')
+                        if sid is not None and sid in wanted and results.get(sid) is None:
+                            name = data.get('metadata', {}).get('name', 'Untitled Session')
+                            updated_at = data.get('updated_at')
+                            user_history = data.get('user_history', [])
+                            message_count = len(user_history) if isinstance(user_history, list) else 0
+                            results[sid] = {
+                                'session_id': sid,
+                                'name': name,
+                                'updated_at': updated_at,
+                                'message_count': message_count,
+                                'preview': self._extract_preview(user_history),
+                            }
+                    except Exception:
+                        continue
+                    # Early exit: all wanted sessions found
+                    if all(v is not None for v in results.values()):
+                        return results
+            except Exception as e:
+                logger.warning(f"[SessionStore] Error scanning {target_dir} in batch metadata load: {e}")
+                continue
+        return results
 
     def list_sessions(self, workspace_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
