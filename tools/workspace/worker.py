@@ -1010,11 +1010,7 @@ class WorkerThread(threading.Thread):
 
                 elif event_type == "stopped":
                     stop_reason = event.get("stop_reason", "unknown")
-                    if stop_reason == "timeout":
-                        final_content = json.dumps({
-                            "error": "Worker execution timed out",
-                        })
-                    elif stop_reason == "max_turns_reached":
+                    if stop_reason == "max_turns_reached":
                         final_content = json.dumps({
                             "error": "Worker reached max turns",
                         })
