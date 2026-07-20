@@ -1866,8 +1866,8 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # Verify after save
                     after_ids = session_store.get_open_sessions()
                 except Exception as e:
+                    pass
             bridge.unregister()
-        else:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
