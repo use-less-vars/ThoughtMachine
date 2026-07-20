@@ -44,6 +44,12 @@ try:
 except ImportError:
     FileLock = None  # type: ignore
 
+# ── Spawn queue timeout (generous fixed value, NOT tied to agent timeout) ──
+# The agent's internal timeout mechanism (timeout_seconds) enforces time limits
+# via tool restrictions. The spawn Queue.get timeout must be a generous fixed
+# value so it never preempts the agent's own timeout logic.
+SPAWN_QUEUE_TIMEOUT = 600
+
 # ---------------------------------------------------------------------------
 # Optional dependencies
 # ---------------------------------------------------------------------------
@@ -1724,7 +1730,7 @@ class Worker(ToolBase):
         Template workers are **merged** into the result — any worker template found
         on disk (in ``resources/worker_templates/``) that is not already present in
         the workspace's ``workers.json`` is appended automatically.  This ensures
-        newly added templates (e.g. ``coder.json``, ``reviewer.json``) are always
+        newly added templates (e.g. ``default.json``) are always
         available without requiring workspace re-initialisation.
         """
         if not CAPABILITIES_AVAILABLE or not _workspace_dir:
@@ -1760,7 +1766,7 @@ class Worker(ToolBase):
 
         Any worker definition found in ``_load_template_workers()`` whose
         ``name`` is not already present in *workers* is appended.  This lets
-        newly added template files (e.g. ``coder.json``, ``reviewer.json``)
+        newly added template files (e.g. ``default.json``)
         become available without requiring workspace re-initialisation.
 
         Workers from the workspace file take precedence — existing names are
@@ -2019,16 +2025,11 @@ class Worker(ToolBase):
                 pass
 
             resume_paused_worker._input_queue.put(query)
-            effective_timeout = (
-                self.timeout_seconds
-                if self.timeout_seconds is not None
-                else 600
-            )
             try:
-                final_result = resume_paused_worker._output_queue.get(timeout=effective_timeout)
+                final_result = resume_paused_worker._output_queue.get(timeout=SPAWN_QUEUE_TIMEOUT)
             except queue.Empty:
                 final_result = json.dumps({
-                    "error": f"Worker '{self.worker_name}' did not respond within {effective_timeout}s",
+                    "error": f"Worker '{self.worker_name}' did not respond within {SPAWN_QUEUE_TIMEOUT}s",
                     "note": "Worker timed out. The paused worker was resumed but did not produce a response.",
                 })
             try:
@@ -2157,7 +2158,18 @@ class Worker(ToolBase):
         if cmd_path.exists():
             cmd_path.unlink(missing_ok=True)
 
+        # ── Fix 1 (P0.1): Double-checked locking for spawn concurrency ──
+        # Re-check under lock before registering to prevent TOCTOU race:
+        # another thread may have spawned the same worker between the early
+        # check (above) and this registration point.
         with _registry_lock:
+            existing = _worker_registry.get((session_key, self.worker_name))
+            if existing is not None and existing.is_alive():
+                # Another thread won the race — don't overwrite.
+                return {
+                    "error": f"Worker '{self.worker_name}' is already running",
+                    "status": existing.status,
+                }
             _worker_registry[(session_key, self.worker_name)] = thread
 
         thread.start()
@@ -2180,11 +2192,11 @@ class Worker(ToolBase):
         )
         if has_auto_query:
             try:
-                final_result = thread._output_queue.get(timeout=effective_timeout)
+                final_result = thread._output_queue.get(timeout=SPAWN_QUEUE_TIMEOUT)
             except queue.Empty:
                 final_result = json.dumps({
                     "error": f"Worker '{self.worker_name}' did not respond "
-                             f"within {effective_timeout}s",
+                             f"within {SPAWN_QUEUE_TIMEOUT}s",
                     "note": "Worker timed out. The result above is partial work "
                              "completed before timeout. The worker thread is still "
                              "alive — you can query it again via action='query' to "
