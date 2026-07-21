@@ -33,7 +33,7 @@
     {
       "source": "worker_templates",
       "dest": "worker_templates",
-      "description": "Worker role templates (coder, researcher, reviewer)",
+      "description": "Worker role templates (only default.json is deployed)",
       "condition": "dest_empty"
     }
   ],

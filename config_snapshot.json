@@ -1,6 +1,6 @@
 {
   "label": "apply_config",
-  "timestamp": 1784506693.0363157,
+  "timestamp": 1784631513.509826,
   "config": {
     "worker_mode": false,
     "base_url": "https://api.deepseek.com/v1/",
@@ -62,8 +62,7 @@
       "SummarizeTool",
       "Thought",
       "CheckSystem",
-      "Worker",
-      "EditDockerfile"
+      "Worker"
     ],
     "timeout_seconds": 300,
     "time_monitor_enabled": false,
@@ -90,7 +89,6 @@
     "DirectoryCreator",
     "DirectoryTreeTool",
     "DockerCodeRunner",
-    "EditDockerfile",
     "FieldViewer",
     "FileEditor",
     "FileMover",
