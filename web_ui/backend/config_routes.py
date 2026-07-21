@@ -117,22 +117,35 @@ async def reset_config(body: ResetConfigBody) -> Dict[str, Any]:
 async def set_mode(body: ModeSwitchBody) -> Dict[str, str]:
     """Switch the system prompt mode.
 
-    Accepts ``{"mode": "engineer"}`` or ``{"mode": "full"}``.
+    Accepts ``{"mode": "agent"}``, ``{"mode": "engineer"}``, or
+    ``{"mode": "custom"}`` (legacy ``"full"`` is accepted as an alias for
+    ``"agent"``).
 
+    This works at the **file level** by writing or removing
+    ``custom_system_prompt.txt``, which the ``AgentConfig``
+    ``load_default_system_prompt`` validator reads.  The session-level
+    ``mode`` field (set via ``POST /api/session/create``) takes precedence
+    at runtime.
+
+    * **agent** — removes ``custom_system_prompt.txt`` so the default
+      (agent) system prompt is used.
     * **engineer** — copies ``engineer_system_prompt.txt`` to
-      ``custom_system_prompt.txt``, which the system prompt loader
-      (``AgentConfig``) picks up on the next load.
-    * **full** — deletes ``custom_system_prompt.txt`` so the default
-      (full) system prompt is used.
+      ``custom_system_prompt.txt``.
+    * **custom** — leaves ``custom_system_prompt.txt`` as-is (user must
+      have saved their own prompt).
 
     Returns ``{"status": "ok", "mode": "..."}``.
     """
     mode = body.mode.strip().lower()
 
-    if mode not in ("engineer", "full"):
+    # Map legacy "full" to "agent"
+    if mode == "full":
+        mode = "agent"
+
+    if mode not in ("agent", "engineer", "custom"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid mode: '{body.mode}'. Must be 'engineer' or 'full'.",
+            detail=f"Invalid mode: '{body.mode}'. Must be 'agent', 'engineer', or 'custom'.",
         )
 
     try:
@@ -151,9 +164,10 @@ async def set_mode(body: ModeSwitchBody) -> Dict[str, str]:
                 )
             content = engineer_path.read_text(encoding="utf-8")
             custom_path.write_text(content, encoding="utf-8")
-        else:  # mode == "full"
+        elif mode == "agent":
             if custom_path.exists():
                 custom_path.unlink()
+        # mode == "custom": leave custom_system_prompt.txt as-is
 
         return {"status": "ok", "mode": mode}
 
@@ -170,12 +184,14 @@ async def set_mode(body: ModeSwitchBody) -> Dict[str, str]:
 async def get_mode() -> Dict[str, str]:
     """Return the current system prompt mode.
 
-    Returns ``{"mode": "engineer"}`` or ``{"mode": "full"}`` based on
+    Returns ``{"mode": "engineer"}`` or ``{"mode": "agent"}`` based on
     whether ``custom_system_prompt.txt`` exists and is non-empty.
+    Returns ``{"mode": "custom"}`` if ``custom_system_prompt.txt`` exists
+    but is empty or matches none of the factory prompts.
     """
     try:
         active = _is_engineer_mode()
-        return {"mode": "engineer" if active else "full"}
+        return {"mode": "engineer" if active else "agent"}
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

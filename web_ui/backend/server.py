@@ -1325,6 +1325,13 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         # Remove from global session registry
                         registry = SessionRegistry.get_default()
                         registry.remove(session_id)
+                        # Remove from bridge cache so _shutdown_save doesn't re-save it
+                        cached_bridge = _session_bridges.pop(session_id, None)
+                        if cached_bridge is not None:
+                            cached_bridge._cleanly_closed = True
+                            cached_bridge.stop()
+                        # Track as explicitly closed so WS disconnect handler doesn't re-save it
+                        _explicitly_closed_sessions.add(session_id)
                         await ws.send_json({
                             "type": "session_deleted",
                             "session_id": session_id,
@@ -2087,7 +2094,9 @@ def _translate_frontend_config(fe_config: Dict[str, Any]) -> Dict[str, Any]:
     tools_list = cfg.pop("tools", None)
     if isinstance(tools_list, list):
         enabled = [t["name"] for t in tools_list if isinstance(t, dict) and t.get("enabled")]
-        if enabled:
+        # Always set enabled_tools when tools list is present — even empty list
+        # means "all tools explicitly disabled" vs key absent = "not configured".
+        if enabled is not None:
             cfg["enabled_tools"] = enabled
 
     # Remove any keys that start with _
@@ -2103,6 +2112,14 @@ def _translate_frontend_config(fe_config: Dict[str, Any]) -> Dict[str, Any]:
         cfg.get("session_permissions", {}),
     )
 
+    # ── Apply mode-based tool preset ────────────────────────────────────
+    # NOTE: Mode-based tool presets are NOT applied here during translation
+    # because the frontend echoes the current mode back in every config
+    # (start_session, continue_session, apply_config). Applying the preset
+    # here would override any explicit tool choices the user made.
+    #
+    # The mode's system_prompt is applied downstream by
+    # AgentConfig._apply_mode_system_prompt during AgentConfig validation.
     # ── Translate diagnostic log ──────────────────────────────────────
     log('INFO', 'server.config',
         f"[TRANSLATE] frontend config: provider={fe_config.get('provider')}, "
@@ -2243,12 +2260,18 @@ def _backend_to_frontend_config(backend: Dict[str, Any]) -> Dict[str, Any]:
     }
     provider_type = cfg.pop("provider_type", None)
     cfg["provider"] = provider_reverse.get(provider_type, "local")
-    # Map enabled_tools → tools list
-    # If the key is missing, leave tools alone (frontend defaults apply).
-    # If it's an explicit empty list, all tools are disabled.
+    # Map enabled_tools → tools list (bidirectional with _translate_frontend_config)
+    # Emit ALL known tools as [{name, enabled}] so the frontend always sees the
+    # complete list.  A tool is enabled iff its name is in the enabled_tools set.
+    # If enabled_tools key is missing, leave tools alone (frontend defaults).
     if "enabled_tools" in cfg:
-        enabled = cfg.pop("enabled_tools")
-        cfg["tools"] = [{"name": t, "enabled": True} for t in enabled]
+        enabled_set = set(cfg.pop("enabled_tools"))
+        from tools import SIMPLIFIED_TOOL_CLASSES
+        all_tool_names = [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES]
+        cfg["tools"] = [
+            {"name": name, "enabled": name in enabled_set}
+            for name in all_tool_names
+        ]
     # Ensure workspace_path is always present.
     # The bridge config may have workspace_path=None (default), and
     # _config_to_dict uses exclude_none=True which strips it. Without

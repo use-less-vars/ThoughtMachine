@@ -24,7 +24,7 @@ export default function PromptLibrary({ onSelectPrompt }) {
       const res = await fetch(`${API_BASE}/api/prompts`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      setPrompts(Array.isArray(data) ? data : []);
+      setPrompts(Array.isArray(data) ? data : (Array.isArray(data.prompts) ? data.prompts : []));
     } catch (e) {
       setError(e.message || 'Failed to fetch prompts');
     } finally {
@@ -47,8 +47,8 @@ export default function PromptLibrary({ onSelectPrompt }) {
     try {
       const res = await fetch(`${API_BASE}/api/prompts/${encodeURIComponent(name)}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'text/plain' },
-        body: content,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       setIsCreating(false);
@@ -76,8 +76,8 @@ export default function PromptLibrary({ onSelectPrompt }) {
     try {
       const res = await fetch(`${API_BASE}/api/prompts/${encodeURIComponent(editingPrompt.name)}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'text/plain' },
-        body: content,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       setEditingPrompt(null);
@@ -122,10 +122,10 @@ export default function PromptLibrary({ onSelectPrompt }) {
     try {
       const res = await fetch(`${API_BASE}/api/prompts/${encodeURIComponent(name)}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const text = await res.text();
-      setEditingPrompt({ name, text });
+      const data = await res.json();
+      setEditingPrompt({ name, text: data.content });
       setEditName(name);
-      setEditContent(text);
+      setEditContent(data.content);
       setIsCreating(false);
     } catch (e) {
       setError(e.message || 'Failed to load prompt');

@@ -194,10 +194,8 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
 
   const isModeLocked = mode && mode !== 'custom'
 
-  const TAB_KEYS = isModeLocked
-    ? ['workspace', 'permissions', 'system_prompt', 'general', 'model', 'container', 'advanced', 'prompts']
-    : ['workspace', 'permissions', 'system_prompt', 'general', 'model', 'tools', 'container', 'advanced', 'prompts'];
-  const TAB_LABELS = { workspace: 'Workspace', permissions: 'Permissions', system_prompt: 'Prompt', general: 'General', model: 'Model', tools: 'Tools', container: 'Container', advanced: 'Advanced', prompts: 'Prompts' };
+  const TAB_KEYS = ['workspace', 'permissions', 'system_prompt', 'general', 'model', 'tools', 'container', 'advanced'];
+  const TAB_LABELS = { workspace: 'Workspace', permissions: 'Permissions', system_prompt: 'Prompt', general: 'General', model: 'Model', tools: 'Tools', container: 'Container', advanced: 'Advanced' };
 
   const modeBadge = mode === 'agent' ? '🤖 Agent' : mode === 'engineer' ? '⚙️ Engineer' : mode === 'custom' ? '🎨 Custom' : null
   const modeBadgeColor = mode === 'agent' ? '#89b4fa' : mode === 'engineer' ? '#a6e3a1' : mode === 'custom' ? '#f9e2af' : '#6c7086'
@@ -386,17 +384,22 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
       )}
 
       {/* ── Tools Tab ────────────────────────────────────────────────── */}
-      {activeTab === 'tools' && isModeLocked ? (
-        <div style={{ textAlign: 'center', padding: '1.5rem 0.5rem' }}>
-          <p style={{ color: '#6c7086', fontSize: '0.85rem' }}>
-            🔒 Tools are locked in {mode === 'agent' ? 'Agent' : 'Engineer'} mode.
-          </p>
-          <p style={{ color: '#585b70', fontSize: '0.78rem' }}>
-            Switch to Custom mode to enable tool configuration.
-          </p>
-        </div>
-      ) : activeTab === 'tools' && (
+      {activeTab === 'tools' && (
         <div>
+          {isModeLocked && (
+            <div style={{
+              background: 'rgba(249,226,175,0.1)',
+              border: '1px solid rgba(249,226,175,0.3)',
+              borderRadius: '4px',
+              padding: '0.5rem 0.6rem',
+              marginBottom: '0.75rem',
+              color: '#f9e2af',
+              fontSize: '0.8rem',
+            }}>
+              🔒 Tools are locked in {mode === 'agent' ? 'Agent' : 'Engineer'} mode.
+              Switch to Custom mode to enable tool configuration.
+            </div>
+          )}
           {/* ── Tool Output Token Limit (above tool checkboxes) ───── */}
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle} htmlFor="tool_output_token_limit">
@@ -407,10 +410,12 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               type="number"
               min="0"
               step="100"
+              disabled={isModeLocked}
               style={{
                 ...inputStyle,
                 width: '100%',
                 marginTop: '0.3rem',
+                opacity: isModeLocked ? 0.5 : 1,
               }}
               value={draft.tool_output_token_limit ?? 10000}
               onChange={(e) => {
@@ -431,10 +436,11 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               const enabled = toolConfig ? toolConfig.enabled : false;
               return (
                 <div key={toolName} style={{ marginBottom: '0.35rem' }}>
-                  <label style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem' }}>
+                  <label style={{ cursor: isModeLocked ? 'default' : 'pointer', display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem', opacity: isModeLocked ? 0.6 : 1 }}>
                     <input
                       type="checkbox"
                       checked={enabled}
+                      disabled={isModeLocked}
                       onChange={(e) => {
                         const updatedTools = draft.tools?.map(t =>
                           t.name === toolName ? { ...t, enabled: e.target.checked } : t
@@ -446,6 +452,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
                       }}
                     />
                     {toolName}
+                    {isModeLocked && <span style={{ color: '#6c7086', fontSize: '0.7rem', marginLeft: '0.25rem' }}>(read-only)</span>}
                   </label>
                 </div>
               );
@@ -599,62 +606,81 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
         />
       )}
 
-      {/* ── System Prompt Tab ──────────────────────────────────────────── */}
+      {/* ── System Prompt Tab (merged with library) ───────────────────────────────── */}
       {activeTab === 'system_prompt' && (
         <div>
-          {isModeLocked && (
-            <div style={{
-              background: 'rgba(249,226,175,0.1)',
-              border: '1px solid rgba(249,226,175,0.3)',
-              borderRadius: '4px',
-              padding: '0.5rem 0.6rem',
-              marginBottom: '0.75rem',
-              color: '#f9e2af',
-              fontSize: '0.8rem',
-            }}>
-              🔒 System prompt is locked in {mode === 'agent' ? 'Agent' : 'Engineer'} mode.
-              Switch to Custom mode to edit it.
-            </div>
-          )}
-          {!isModeLocked && (
-            <div style={{ marginBottom: '0.75rem' }}>
-              <button
-                onClick={() => setActiveTab('prompts')}
-                style={{
-                  background: '#45475a',
-                  color: '#89b4fa',
-                  border: '1px solid #89b4fa',
-                  borderRadius: '4px',
-                  padding: '0.35rem 0.75rem',
-                  cursor: 'pointer',
+          {isModeLocked ? (
+            /* ── Locked modes: factory prompt preview (read-only) ── */
+            <>
+              {/* Factory prompt badge */}
+              <div style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.3rem',
+                marginBottom: '0.5rem',
+                padding: '0.2rem 0.5rem',
+                borderRadius: '4px',
+                background: mode === 'agent' ? 'rgba(137,180,250,0.15)' : 'rgba(166,227,161,0.15)',
+                border: `1px solid ${mode === 'agent' ? '#89b4fa' : '#a6e3a1'}`,
+                color: mode === 'agent' ? '#89b4fa' : '#a6e3a1',
+                fontSize: '0.75rem',
+                fontWeight: 600,
+              }}>
+                {mode === 'agent' ? '🤖' : '⚙️'} {mode === 'agent' ? 'Agent' : 'Engineer'} Factory Prompt
+                <span style={{ marginLeft: '0.15rem', opacity: 0.6, fontSize: '0.7rem' }}>🔒</span>
+              </div>
+              {/* Read-only preview */}
+              <div style={{ marginBottom: '1rem' }}>
+                <label style={labelStyle}><strong>System Prompt</strong> <span style={{ color: '#6c7086', fontSize: '0.7rem' }}>(read-only — factory default for this mode)</span></label>
+                <div style={{
+                  ...inputStyle,
+                  fontFamily: 'monospace',
                   fontSize: '0.8rem',
-                  fontWeight: 500,
-                  width: '100%',
-                  textAlign: 'center',
-                }}
-              >
-                📚 Load from Library
-              </button>
-            </div>
+                  lineHeight: '1.4',
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  maxHeight: '300px',
+                  overflowY: 'auto',
+                  padding: '0.5rem',
+                  cursor: 'default',
+                  opacity: 0.75,
+                }}>
+                  {draft.system_prompt || <span style={{ color: '#6c7086', fontStyle: 'italic' }}>No factory prompt loaded</span>}
+                </div>
+              </div>
+              {/* Prompt Library — visible but marked read-only */}
+              <div style={{ borderTop: '1px solid #45475a', paddingTop: '0.75rem', marginTop: '0.75rem' }}>
+                <label style={labelStyle}><strong>Prompt Library</strong></label>
+                <p style={{ color: '#6c7086', fontSize: '0.75rem', fontStyle: 'italic', marginTop: '0.25rem', marginBottom: '0.5rem' }}>
+                  Browse prompts — switch to Custom mode to apply them.
+                </p>
+                <div style={{ marginTop: '0.35rem', opacity: 0.6, pointerEvents: 'none' }}>
+                  <PromptLibrary onSelectPrompt={handleLoadPromptFromLibrary} />
+                </div>
+              </div>
+            </>
+          ) : (
+            /* ── Custom mode: editable textarea + library ── */
+            <>
+              <div style={{ marginBottom: '1rem' }}>
+                <label style={labelStyle}><strong>System Prompt</strong></label>
+                <textarea
+                  rows={6}
+                  style={{ ...inputStyle, fontFamily: 'monospace', resize: 'vertical' }}
+                  value={draft.system_prompt || ''}
+                  onChange={(e) => setDraft({ ...draft, system_prompt: e.target.value })}
+                  placeholder="Optional system-level instructions for the agent..."
+                />
+              </div>
+              {/* Prompt Library section — editable in Custom mode */}
+              <div style={{ borderTop: '1px solid #45475a', paddingTop: '0.75rem', marginTop: '0.75rem' }}>
+                <label style={labelStyle}><strong>Prompt Library</strong></label>
+                <div style={{ marginTop: '0.35rem' }}>
+                  <PromptLibrary onSelectPrompt={handleLoadPromptFromLibrary} />
+                </div>
+              </div>
+            </>
           )}
-          <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>System Prompt</strong></label>
-            <textarea
-              rows={6}
-              disabled={isModeLocked}
-              style={{ ...inputStyle, fontFamily: 'monospace', resize: 'vertical', opacity: isModeLocked ? 0.5 : 1 }}
-              value={draft.system_prompt || ''}
-              onChange={(e) => setDraft({ ...draft, system_prompt: e.target.value })}
-              placeholder="Optional system-level instructions for the agent..."
-            />
-          </div>
-        </div>
-      )}
-
-      {/* ── Prompts Tab ───────────────────────────────────────────────── */}
-      {activeTab === 'prompts' && (
-        <div>
-          <PromptLibrary onSelectPrompt={handleLoadPromptFromLibrary} />
         </div>
       )}
 
