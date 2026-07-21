@@ -5326,3 +5326,310 @@ A registry-first resolution pattern:
 - `tools/file_editor.py` — uses `_validate_path()` (inherited from ToolBase, now registry-first)
 - `tools/utils.py` — only references field name in schema string set
 - `tools/workspace/` sub-tools already refactored in first pass
+
+## 2026-07-20 — ## Session File Architecture (R1 Research)
+
+**Date:** 2026-0...
+
+## Session File Architecture (R1 Research)
+
+**Date:** 2026-07-21
+
+**File:** `docs/research/r1-session-file.md`
+
+**Storage locations:**
+- Legacy: `~/.thoughtmachine/sessions/<name>_<short_id>.json`
+- Workspace-scoped: `~/.thoughtmachine/workspaces/<ws_id>/sessions/<name>_<short_id>.json`
+- Lightweight metadata: `_meta_<session_id>.json` alongside session files
+- State files (open sessions, current marker): `~/.thoughtmachine/state/`
+
+**Serialization:** `Session.to_persistable_dict()` → JSON via `json.dump(data, indent=2, default=str)`
+
+**Sysprompt location:** `session.metadata['agent_config']['system_prompt']` — full copy of AgentConfig at save time (excluding api_key). Set in `bridge.py:save_session()` line 1313.
+
+**Key fields persisted:** session_id, created_at, updated_at, user_history (messages), containers, preset_name, workspace_id, mode, last_active, metadata (includes agent_config with sysprompt), security_config, version, summary, total_input_tokens, total_output_tokens, context_length
+
+**Fields NOT persisted (excluded from to_persistable_dict()):** agent_context (derived), agent_instance (runtime), next_seq (reconstructed on load), runtime_params (derived from metadata.agent_config), callbacks, conversation_version
+
+**Atomic writes:** .tmp file + Path.replace() + FileLock for concurrent safety
+
+## 2026-07-20 — ## R6 — Worker Config Value Flow
+
+**Date:** 2025-07-16
+
+**Co...
+
+## R6 — Worker Config Value Flow
+
+**Date:** 2025-07-16
+
+**Complete flow documented in:** `docs/research/r6-worker-config-value-flow.md`
+
+**4-layer chain:**
+1. **ToolExecutor** injects `agent_config` dict (temperature, provider, model, api_key, etc.) into every tool instance
+2. **Worker._build_agent_config()** (ToolBase, line 1860) — shallow-copies the dict, adds workspace_path
+3. **WorkerThread._build_agent_config()** (thread, line 791) — converts dict → AgentConfig, renames provider→provider_type, overrides worker-specific fields (system_prompt, max_turns, token thresholds, timeout) from definition
+4. **Agent(config=agent_cfg_obj)** — worker gets its own Agent with the worker-specific AgentConfig
+
+**Key finding:** Temperature is NOT overridable per worker — always inherited from parent. provider→provider_type rename is fragile. Permission model via `_restrictive_merge()` correctly enforces session as ceiling.
+
+## 2026-07-20 — ## R7: Worker WebSocket Event Routing (Complete Trace)
+
+### ...
+
+## R7: Worker WebSocket Event Routing (Complete Trace)
+
+### Two-Path Architecture
+
+**Path A — Global EventBus (lifecycle events):**
+1. `tools/workspace/worker.py` (WorkerThread.run, ~line 1079): Creates per-worker EventBus → `register_worker_event_bus()` → publishes `WORKER_SPAWNED` to **global_event_bus** (agent/events.py)
+2. `web_ui/backend/bridge.py` (`_subscribe_to_worker_events`): `WebAgentBridge` subscribes to global_event_bus for event types: `WORKER_SPAWNED`, `WORKER_STATUS`, `WORKER_COMPLETED`, `WORKER_ERROR`, `TOKEN_WARNING`, `WORKER_MESSAGE`
+3. Handler functions: `_on_worker_spawned`, `_on_worker_completed`, `_on_worker_error`, plus `_make_handler(WorkerStatusEvent)` and `_make_handler(BaseEvent)` for status/message
+4. Events forwarded to frontend via `self._event_callbacks` dict (cb(event_dict)) with type prefix `worker:` (e.g., `worker:worker_spawned`)
+
+**Path B — Per-worker EventBus (detailed events: tool_call, tool_result, etc.):**
+1. `tools/workspace/worker.py`: Creates `WorkerBusAdapter` which publishes events to per-worker EventBus via `_publish()` method
+2. On `WORKER_SPAWNED`, bridge calls `_subscribe_to_worker_bus(worker_name, worker_bus)` which subscribes to 14+ event types: tool_call, tool_result, worker_message, assistant_message, context_updated, context_cleared, context_summarized, token_recovery, token_warning, turn_warning, time_warning, user_message, system_notification
+3. `_make_bus_handler(original_type)` creates handlers that forward events via `_event_callbacks` with `worker:` prefix
+4. `_on_worker_completed`/`_on_worker_error` call `_unsubscribe_worker_bus(worker_name)` to clean up
+
+**Late-arriving bridge guard:**
+- `_discover_existing_workers(session_id)` called after initial subscriptions, uses `get_worker_event_buses_for_session(session_id)` to find already-running workers
+
+**Server.py WebSocket routing:**
+- `/ws` endpoint creates `WebAgentBridge`, calls `bridge.set_event_callback(event_callback, key=id(ws))` → `send_event` async function → `ws.send_json(event)`
+- Bridge stored in `_session_bridges` dict keyed by session_id
+- Events flow: agent → event bus → bridge handler → _event_callbacks → send_event → ws.send_json
+
+### Frontend event handling:
+- `web_ui/frontend/src/components/chat/adaptWorkerEvent.js`: Pure function transforming worker events (with `worker:` prefix stripped in WorkerOutputPanel) into MessageBubble-compatible format
+- `WorkerOutputPanel.jsx`: Filters events by worker_name, processes context_updated for live token display, uses adaptWorkerEvent for message rendering
+- Per-worker context_updated dedup: same formatted value (e.g., "78.3K") is skipped
+
+### Worker file-based command mechanism:
+- `command.json` in `workers/<session_id>/<name>/command.json` → read by `_poll_command()` in worker.py
+- Currently supports: `{"action": "stop"}` and `{"action": "pause"}` (proposed)
+- `status.json` in same directory → written by worker thread, read by REST API
+
+## R8: Token Threshold Architecture (Complete)
+
+### Defaults: warning=65000, critical=80000 tokens
+
+### Files involved:
+- `agent/config/models.py`: `AgentConfig` fields — `token_monitor_warning_threshold: int = 65000`, `token_monitor_critical_threshold: int = 80000`
+- `agent/config/loader.py`: Legacy mapping — `warning_threshold` → `token_monitor_warning_threshold * 1000`, `critical_threshold` → `token_monitor_critical_threshold * 1000`
+- `agent/core/state.py`: `TokenState` (LOW/WARNING/CRITICAL), `update_token_state()` determines state and yields warning/recovery events
+- `agent/core/agent.py` (line 1514): Worker agent creation overrides defaults with same values
+- `agent/logging/config_snapshot.py`: Captures critical threshold in snapshots
+- `agent/presenter/state_bridge.py`: Reads config from API, maps legacy field names
+- `session/models.py`: Workers get token thresholds from config
+- `agent/models/worker_definition.py`: `critical_threshold_tokens: Optional[int] = 80000`
+- `resources/worker_definition_schema.json`: `critical_threshold_tokens` default=80000
+
+### Token Warning Event Path:
+1. `AgentState.update_token_state()` in `agent/core/state.py` creates `token_warning` events (legacy dict format via `_create_event`)
+2. These events are consumed by `Agent._update_tokens_after_tool()` and the main event loop — both inject [SYSTEM NOTIFICATION] messages into the conversation
+3. For workers: `WorkerBusAdapter.forward_agent_event()` publishes `token_warning` events to the per-worker EventBus
+4. Bridge's `_make_bus_handler('token_warning')` forwards as `worker:token_warning` via callback
+5. Bridge's `_on_worker_token_warning` (global bus handler) catches **main agent** token warnings and forwards as `worker:system_notification` (skips worker-sourced to avoid duplicates)
+6. Frontend `adaptWorkerEvent.js`: `case 'system_notification'` with `resp.type === 'token_warning'` → `tokenWarningMsg(evt)` → renders as system notification
+7. Direct `worker:token_warning` events → handled by `WorkerOutputPanel` case 'token_warning' → displayed with warning styling
+
+### Frontend defaults (ConfigPanel.jsx):
+- warning=35000, critical=50000 (lower than backend defaults — conservative for user config)
+- WorkerOutputPanel.jsx fallback: max_context_tokens=80000
+
+## 2026-07-20 — ## Token Pipeline (Trace Analysis)
+
+### Architecture Overvie...
+
+## Token Pipeline (Trace Analysis)
+
+### Architecture Overview
+The token pipeline has 5 layers that form a reactive state machine:
+
+**Layer 0 - TokenCounter** (`agent/core/token_counter.py`):
+- Estimates tokens per message using tiktoken
+- Used by agent.py `_estimate_tokens()` and `_update_conversation_token_estimate()`
+
+**Layer 1 - Token Tracking** (`agent/core/agent.py`):
+- `self._token_counts = {'input': ..., 'output': ...}` — tracking input/output separately
+- Properties `total_input_tokens` / `total_output_tokens` bridge to Session model
+- `self.state.current_conversation_tokens` — live total conversation tokens
+
+**Layer 2 - State Updates** (`agent/core/state.py`):
+- `AgentState.update_token_state(total_tokens)` compares against thresholds:
+  - `token_monitor_warning_threshold` (default: 65000) → TokenState.WARNING
+  - `token_monitor_critical_threshold` (default: 80000) → TokenState.CRITICAL
+- WARNING fires once per cycle → injected as `[SYSTEM NOTIFICATION]`
+- CRITICAL sets `restrictions_active = True`, `restriction_reason = 'token'`
+
+**Layer 3 - Restriction Levels** (`agent/core/state.py`):
+- `get_allowed_tools()`:
+  - `token` CRITICAL: **Respond + SummarizeTool** (agent can summarize to free context)
+  - `turn` CRITICAL: **Respond only** (agent must finish immediately)
+  - `timeout` CRITICAL: **Respond only** (agent exceeded runtime limit)
+
+**Layer 4 - Enforcement** (`agent/core/tool_executor.py`):
+- Line 125: Before executing any tool call, checks `self.state.is_tool_allowed(tool_name)`
+- Disallowed tools get rejection message via `_create_tool_rejection_message()`
+- Rejection with `Respond` would be a bug — found to be impossible since Respond is always allowed
+
+**Layer 5 - Recovery (Summarization)** (`agent/core/agent.py`):
+- After SummarizeTool → `_apply_summary_pruning()` → `_update_conversation_token_estimate()` → `update_token_state()`
+- If tokens drop below critical → `token_recovery` event → restrictions cleared
+- `context_builder.emergency_mode` reset
+
+### Warning Event Flow
+```
+update_token_state() → [token_warning event]
+    → buffered in _pending_warnings
+    → after turn_transaction.commit()
+    → injected as [SYSTEM NOTIFICATION] Message into conversation
+    → emitted via event bus for GUI
+```
+
+### Turn & Time Monitors (`agent/core/state.py`):
+- **Turn**: WARNING at `max_turns-8`, CRITICAL at `max_turns-5` → `restriction_reason='turn'`
+- **Time**: WARNING at `time_warning_threshold`, CRITICAL at `timeout_seconds` → `restriction_reason='timeout'`
+
+### Provider Key Flow (verified consistent):
+- Frontend sends: `{"provider": "openai"}` (ConfigPanel.jsx line 36)
+- `server.py _translate_frontend_config()`: pops `provider`, sets `provider_type` (line 2080-2082)
+- StateBridge `create_agent_config()`: `provider_type` → AgentConfig Pydantic field (state_bridge.py line 244)
+- Back to frontend: `server.py _frontend_config_from_bridge()`: pops `provider_type`, sets `provider` (line 2244-2245)
+- Worker path: `WorkerThread._build_agent_config()` does same rename (worker.py line 791)
+- **No inconsistency** — the two translation functions handle the mapping correctly
+
+### Threshold Config:
+- Warning: 65k tokens (WorkerDefinition.warning_threshold_tokens)
+- Critical: 80k tokens (WorkerDefinition.critical_threshold_tokens)
+- These map to AgentConfig.token_monitor_warning_threshold/critical_threshold
+
+
+## 2026-07-20 — ## SYSTEM INTEGRATION TEST — SummarizeTool under Timeout Con...
+
+## SYSTEM INTEGRATION TEST — SummarizeTool under Timeout Conditions
+
+**Date:** 2026-07-20
+**Status:** ✅ PASS
+
+**Test:** SummarizeTool was invoked after timeout restrictions (10s) were active. The tool executed successfully, summary was captured with `keep_recent_turns=0`, context was pruned, and a fresh context window was granted to the new agent instance.
+
+**Key learning:** SummarizeTool is usable as a recovery mechanism even when timeout restrictions are theoretically in place. The tool's `skip_output_truncation=True` flag ensures full summary content is preserved.
+
+**Event log reference:** `event_log.jsonl` entries #6–#37
+
+## Mode ↔ Tools Pipeline
+
+## 2026-07-20 — ## Mode ↔ Tools Pipeline — Complete Trace & Remaining Gaps
+
+...
+
+## Mode ↔ Tools Pipeline — Complete Trace & Remaining Gaps
+
+### Verified: PyQt GUI Path (all four lifecycle methods pass mode correctly)
+
+| Caller | File | Line | mode parameter |
+|--------|------|------|---------------|
+| `session_lifecycle.start_session()` | agent/presenter/session_lifecycle.py | 101 | `mode=session_mode` ✓ |
+| `session_lifecycle.new_session()` | agent/presenter/session_lifecycle.py | 136 | `mode=session_mode` ✓ |
+| `session_lifecycle.continue_session()` | agent/presenter/session_lifecycle.py | 201 | `mode=session_mode` ✓ |
+| `session_lifecycle.restart_session()` | agent/presenter/session_lifecycle.py | 490 | `mode=session_mode` ✓ |
+| `_build_session_from_current_state()` | (internal) | — | calls state_bridge directly with mode ✓ |
+
+Where `session_mode = self.state_bridge.current_session.mode` (or None if no session).
+
+### Verified: WebUI Path (mode flows through config_dict + session metadata)
+
+1. **Create session**: `POST /api/session/create` → `body.mode` → `session.mode = body.mode`
+2. **Save session**: `bridge.save_session()` → `session.metadata['agent_config'] = self._config.model_dump()` (includes `mode` field)
+3. **Load session**: `bridge.load_session()` → deep-merges `session.metadata['agent_config']` (includes `mode`) into `self._config`
+4. **Start agent**: `bridge.start(config_dict)` → deep-merges `config_dict` (includes `mode` from frontend) → `AgentConfig(**merged_config)`
+5. All session responses include `mode=session.mode` ✓
+
+### Verified: AgentConfig itself handles mode
+
+- `FIELD_CATEGORIES['mode'] = RESTART_REQUIRED`
+- `_apply_mode_system_prompt` validator loads correct system prompt text based on mode
+- `get_tools_for_mode(mode)` filters `enabled_tools` based on mode presets
+
+### Gap 1: `agent_presenter.create_agent_config()` passthrough (line 298-300)
+
+```python
+def create_agent_config(self) -> AgentConfig:
+    return self.state_bridge.create_agent_config()
+```
+
+Calls `state_bridge.create_agent_config()` WITHOUT passing `mode`. When `mode=None`, `get_tools_for_mode(None)` returns `None` → no filtering → ALL tools enabled.
+
+**Resolution**: This method has **zero callers** in the codebase — it's dead code. Not a real gap.
+
+### Gap 2: `Session.mode` defaults to "agent" and is only set via `CreateSessionBody`
+
+When creating a session through the PyQt GUI (not the WebUI API), the `Session.mode` may not be initialized to anything other than the default "agent". The lifecycle methods check `self.state_bridge.current_session.mode` — but if `current_session` is None, `session_mode` becomes None, and filtering is bypassed.
+
+**Resolution**: The `Session` model has `mode: str = "agent"` default, so it defaults correctly. Edge case: if `state_bridge.current_session` is None, `session_mode` becomes None, but this only happens in `_build_session_from_current_state` which sets `current_session` before these methods are called.
+
+### Gap 3: Bridge `start()` doesn't explicitly set `session.mode`
+
+In `bridge.start()` (line 912), mode flows through `config_dict` from the frontend into `AgentConfig(...)`, but NOT into `self._session.mode`. The session is created at line 994-998:
+
+```python
+if self._loaded_session is not None:
+    session = self._loaded_session
+else:
+    session = Session()
+```
+
+If it's a new session (no loaded session), `session.mode` stays at default `"agent"` regardless of what mode was in `config_dict`. This means the `Session.mode` field can be out of sync with the actual `AgentConfig.mode`.
+
+**Severity**: Low-Medium. The actual tool filtering is driven by `AgentConfig.mode`, not `Session.mode`. The `Session.mode` is only used for display/list purposes in the WebUI. But it IS inconsistent.
+
+
+
+## 2026-07-21 — ## Tools Toggle → Core Propagation Flow (Investigation, Feb ...
+
+## Tools Toggle → Core Propagation Flow (Investigation, Feb 2025)
+
+### The Full Pipeline
+```
+Frontend (tools toggle + Apply)
+  │
+  ▼ apply_config {tools: [{name, enabled}], mode, ...}
+server.py _translate_frontend_config()
+  │
+  ▼ backend_config {enabled_tools: [...]}
+bridge.py apply_config()
+  │
+  ▼ self._controller.request_config_update(validated)
+controller.py request_config_update()
+  │
+  ▼ self.agent.request_config_update(config)  [mailbox: _pending_config]
+agent/core/agent.py
+  │
+  ▼ at next process_query() → _apply_pending_config()
+  │   ├─ _can_hot_swap()?  (temperature, top_p, enabled_tools only)
+  │   │   └─ _hot_swap() — rebuilds tool_classes + tool_definitions + ToolExecutor
+  │   └─ else → _restart_with_config() — full restart
+  │
+  ▼ _notify_config_change() — adds [SYSTEM NOTIFICATION] to conversation
+```
+
+### Two Key Issues Found
+
+**Issue 1 — Mode-based tool preset override (BUG):**
+In `_translate_frontend_config()` (server.py lines 2119-2125):
+```python
+mode = fe_config.get('mode') or cfg.get('mode')
+if mode in ('agent', 'engineer'):
+    from agent.config.presets import get_tools_for_mode
+    cfg['enabled_tools'] = get_tools_for_mode(mode)
+```
+When mode is 'agent' or 'engineer', the frontend's `{tools: [{name, enabled}]}` list is translated to `enabled_tools`, then **immediately overwritten** by the mode preset. The user's toggles are silently discarded. The fix: only apply preset when frontend doesn't send a tools list, or use the preset as a base and apply user's toggles on top.
+
+**Issue 2 — Notification already partially exists:**
+In `agent/core/agent.py`, `_notify_config_change()` already detects `enabled_tools` changes and adds `"[SYSTEM NOTIFICATION] Configuration updated: tools updated, ..."` to the conversation (visible to the LLM). But there's **no dedicated `tools_changed` event** sent to the frontend WebSocket — only the generic `config_changed` event with the full config. If the frontend needs a toast/notification trigger, that would need to be added server-side.
+
+**Issue 3 — Worker tool preset gap:**
+`session/tool_presets.py` only includes `Worker` in `CUSTOM_TOOLS`, not in `AGENT_TOOLS` or `ENGINEER_TOOLS`. Default session mode is `"agent"`, and the UI creates sessions with `mode="agent"`. So workers never show up in agent mode by default.
