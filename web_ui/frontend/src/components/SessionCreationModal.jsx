@@ -21,19 +21,22 @@ export default function SessionCreationModal({ show, onCreate, onOpen, onCancel,
   const [error, setError] = useState('')
   const [acknowledgedRisk, setAcknowledgedRisk] = useState(false)
   const [resolving, setResolving] = useState(false)
-  const [homeDir, setHomeDir] = useState('')
+  const [homeDir, setHomeDir] = useState(null)
   const [showModePicker, setShowModePicker] = useState(false)
   const [currentBrowsePath, setCurrentBrowsePath] = useState(null)
 
-  // Fetch home directory for vault warning
+  // Fetch home directory for vault warning — must resolve before folder browser renders
   useEffect(() => {
+    if (!show) return
     fetch(`${API_BASE}/api/user-home`)
       .then(r => r.json())
       .then(data => {
-        if (data.home) setHomeDir(data.home)
+        setHomeDir(data.home || null)
       })
-      .catch(() => {})
-  }, [])
+      .catch(() => {
+        setHomeDir(null)
+      })
+  }, [show])
 
   // Reset when modal opens
   useEffect(() => {
@@ -273,14 +276,28 @@ export default function SessionCreationModal({ show, onCreate, onOpen, onCancel,
               {isFirstLaunch ? 'Welcome! Create your first session' : 'New Session'}
             </h3>
 
-            {/* Workspace folder browser */}
+            {/* Workspace folder browser — waits for homeDir to avoid warning timing race */}
             <div style={{ marginBottom: '0.5rem' }}>
               <label style={labelStyle}>Workspace Folder</label>
-              <FolderBrowser
-                onSelect={handleFolderSelect}
-                onNavigate={setCurrentBrowsePath}
-                startPath={selectedFolderPath}
-              />
+              {homeDir === null ? (
+                <div style={{
+                  padding: '1.5rem',
+                  textAlign: 'center',
+                  color: 'var(--text-muted, #6c7086)',
+                  fontSize: '0.85rem',
+                  background: 'var(--bg-primary, #1e1e2e)',
+                  border: '1px solid var(--border, #45475a)',
+                  borderRadius: '6px',
+                }}>
+                  ⟳ Loading...
+                </div>
+              ) : (
+                <FolderBrowser
+                  onSelect={handleFolderSelect}
+                  onNavigate={setCurrentBrowsePath}
+                  startPath={selectedFolderPath}
+                />
+              )}
             </div>
 
             {/* Resolving indicator */}
