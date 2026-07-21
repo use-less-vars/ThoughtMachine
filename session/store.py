@@ -730,26 +730,61 @@ class FileSystemSessionStore(SessionStore):
         return cls._instance
 
     def delete_session(self, session_id: str, workspace_id: Optional[str] = None) -> bool:
-        """Delete a session file.
+        """Delete a session file from ALL locations.
 
-        If workspace_id is provided, also deletes the workspace-scoped meta file.
+        Scans both the legacy sessions_dir and every workspace-scoped
+        sessions directory.  Deletes every session JSON file and every
+        associated _meta_ file found — this prevents session resurrection
+        on server restart when duplicate copies exist across directories.
+
+        Returns True if at least one file was deleted.
         """
         # Invalidate caches
         self._cached_paths.pop(session_id, None)
         self._cached_paths_ts.pop(session_id, None)
         self._cached_list = None
-        path = self._find_session_path(session_id)
-        found = path is not None and path.exists()
-        if found:
-            path.unlink()
-        # Delete metadata file(s) — try both legacy and workspace-scoped
-        meta_path = self._get_meta_path(session_id)
-        if meta_path.exists():
-            meta_path.unlink()
-        if workspace_id:
-            ws_meta_path = self._base_dir / "workspaces" / workspace_id / "sessions" / f"_meta_{session_id}.json"
-            if ws_meta_path.exists():
-                ws_meta_path.unlink()
+
+        # Collect ALL candidate directories (legacy + every workspace)
+        candidates = [self.sessions_dir]
+        workspaces_root = self._base_dir / "workspaces"
+        if workspaces_root.exists():
+            for ws_dir in workspaces_root.iterdir():
+                ws_sessions = ws_dir / "sessions"
+                if ws_sessions.is_dir():
+                    candidates.append(ws_sessions)
+
+        found = False
+        deleted_files = []
+
+        for sess_dir in candidates:
+            # Delete session JSON files matching this session_id
+            for file_path in list(sess_dir.glob("*.json")):
+                if file_path.name.startswith("_meta_"):
+                    continue
+                try:
+                    with open(file_path, 'r') as f:
+                        data = json.load(f)
+                    if data.get('session_id') == session_id:
+                        file_path.unlink()
+                        deleted_files.append(str(file_path))
+                        found = True
+                except Exception:
+                    continue
+
+            # Delete metadata file(s) for this session_id in this directory
+            meta_path = sess_dir / f"_meta_{session_id}.json"
+            if meta_path.exists():
+                meta_path.unlink()
+                deleted_files.append(str(meta_path))
+
+        if deleted_files:
+            logger.info(
+                f"[SessionStore] Deleted session {session_id} "
+                f"from {len(deleted_files)} file(s): {deleted_files}"
+            )
+        else:
+            logger.debug(f"[SessionStore] Session {session_id} not found for deletion")
+
         return found
 
     def get_session_path(self, session_id: str) -> Path:

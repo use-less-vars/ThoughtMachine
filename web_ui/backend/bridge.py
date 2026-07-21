@@ -83,6 +83,7 @@ from thoughtmachine.workspace_registry import WorkspaceRegistry
 
 from session.models import Session
 from session.store import FileSystemSessionStore
+from session.session_registry import SessionRegistry
 
 # Worker lifecycle — graceful shutdown of worker threads on session close
 try:
@@ -997,6 +998,9 @@ class WebAgentBridge:
         else:
             session = Session()
             session.metadata['source'] = 'web_ui'
+        # Propagate mode from config to session
+        if self._config and hasattr(self._config, 'mode'):
+            session.mode = self._config.mode
         # Apply workspace_id from bridge if session doesn't already have one
         if self._workspace_id and not session.workspace_id:
             session.workspace_id = self._workspace_id
@@ -1667,11 +1671,24 @@ class WebAgentBridge:
         }
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session from the store."""
+        """Delete a session from the store.
+
+        Cleans up all three locations:
+        1. Session file(s) on disk via session_store.delete_session()
+        2. In-memory SessionRegistry
+        3. open_sessions.json state file
+
+        Matches the pattern used by the WebSocket handler and REST API.
+        """
         try:
             result = self._session_store.delete_session(session_id)
             if result:
                 log('INFO', 'server.bridge', f"Session deleted: {session_id}")
+                # Remove from in-memory session registry
+                registry = SessionRegistry.get_default()
+                registry.remove(session_id)
+                # Remove from open sessions state file
+                self._session_store.remove_open_session(session_id)
             else:
                 log('WARNING', 'server.bridge', f"Session not found for deletion: {session_id}")
             return result
