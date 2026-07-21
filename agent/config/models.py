@@ -157,18 +157,17 @@ class AgentConfig(BaseModel):
 
     @model_validator(mode='after')
     def _apply_mode_system_prompt(self):
-        """Apply mode-specific fallback system prompt if none was set.
+        """Apply mode-specific system prompt.
 
-        If ``system_prompt`` is still ``None`` after the field validator ran
-        (meaning no custom file and no explicit value was provided), load the
-        appropriate default prompt based on ``mode``:
+        Unlike the ``load_default_system_prompt`` field validator (which loads
+        from ``~/.thoughtmachine/custom_system_prompt.txt``), this after-validator
+        ALWAYS applies the mode-specific factory prompt for ``"agent"`` and
+        ``"engineer"`` modes, regardless of what was loaded earlier.
 
         - ``"agent"``     → ``resources/default_system_prompt.txt``
         - ``"engineer"``  → ``resources/engineer_system_prompt.txt``
-        - ``"custom"``    → no fallback (user must provide explicitly)
+        - ``"custom"``    → leave the user-provided prompt intact (no override)
         """
-        if self.system_prompt is not None:
-            return self
         resources_dir = Path(__file__).resolve().parent.parent.parent / 'resources'
         if self.mode == 'agent':
             prompt_path = resources_dir / 'default_system_prompt.txt'
@@ -186,7 +185,7 @@ class AgentConfig(BaseModel):
                     object.__setattr__(self, 'system_prompt', text)
             except (FileNotFoundError, IOError) as exc:
                 log.warning('Could not load engineer system prompt from %s: %s', prompt_path, exc)
-        # mode == 'custom': leave as None (no fallback)
+        # mode == 'custom': leave existing system_prompt unchanged
         return self
 
     @model_validator(mode='after')

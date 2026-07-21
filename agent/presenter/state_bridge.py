@@ -228,7 +228,7 @@ class StateBridge:
 
         # Apply mode-based tool preset (overrides any tools from saved config)
         if mode:
-            from session.tool_presets import get_tools_for_mode
+            from agent.config.presets import get_tools_for_mode
             config['enabled_tools'] = get_tools_for_mode(mode)
 
         api_key = config.get('api_key') or os.getenv('OPENAI_API_KEY') or os.getenv('DEEPSEEK_API_KEY')
