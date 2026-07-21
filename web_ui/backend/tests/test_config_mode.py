@@ -77,22 +77,22 @@ class TestSetMode:
         assert "Write code" in content
         assert "not philosophise" in content
 
-    def test_set_full_mode_clears_custom_prompt(self, mock_thoughtmachine):
-        """Switching to full mode removes ``custom_system_prompt.txt``."""
+    def test_set_agent_mode_clears_custom_prompt(self, mock_thoughtmachine):
+        """Switching to agent mode removes ``custom_system_prompt.txt``."""
         # First set engineer mode so the file exists
         client.post("/api/config/mode", json={"mode": "engineer"})
         assert (
             mock_thoughtmachine / "custom_system_prompt.txt"
         ).exists(), "precondition: custom prompt should exist"
 
-        # Now switch to full
-        response = client.post("/api/config/mode", json={"mode": "full"})
+        # Now switch to agent
+        response = client.post("/api/config/mode", json={"mode": "agent"})
         assert response.status_code == 200, response.text
-        assert response.json() == {"status": "ok", "mode": "full"}
+        assert response.json() == {"status": "ok", "mode": "agent"}
 
         custom_prompt = mock_thoughtmachine / "custom_system_prompt.txt"
         assert not custom_prompt.exists(), (
-            "custom_system_prompt.txt should be removed in full mode"
+            "custom_system_prompt.txt should be removed in agent mode"
         )
 
     def test_invalid_mode_returns_400(self, mock_thoughtmachine):
@@ -104,7 +104,7 @@ class TestSetMode:
         detail = response.json()["detail"].lower()
         assert "invalid" in detail
         assert "engineer" in detail
-        assert "full" in detail
+        assert "custom" in detail
 
     def test_empty_mode_returns_400(self, mock_thoughtmachine):
         """An empty mode string should result in a 400 error."""
@@ -122,15 +122,35 @@ class TestSetMode:
         custom_prompt = mock_thoughtmachine / "custom_system_prompt.txt"
         assert custom_prompt.exists()
 
-    def test_set_full_mode_when_no_custom_prompt(self, mock_thoughtmachine):
-        """Switching to full mode when no custom prompt exists should
+    def test_legacy_full_maps_to_agent(self, mock_thoughtmachine):
+        """Legacy "full" mode value should be accepted and mapped to
+        "agent"."""
+        # First set engineer mode so custom_system_prompt.txt exists
+        client.post("/api/config/mode", json={"mode": "engineer"})
+        assert (
+            mock_thoughtmachine / "custom_system_prompt.txt"
+        ).exists(), "precondition: custom prompt should exist"
+
+        # Send legacy "full" — should be treated as "agent"
+        response = client.post("/api/config/mode", json={"mode": "full"})
+        assert response.status_code == 200, response.text
+        # Response reports the canonical mode name
+        assert response.json() == {"status": "ok", "mode": "agent"}
+
+        custom_prompt = mock_thoughtmachine / "custom_system_prompt.txt"
+        assert not custom_prompt.exists(), (
+            "custom_system_prompt.txt should be removed when mapping full -> agent"
+        )
+
+    def test_set_agent_mode_when_no_custom_prompt(self, mock_thoughtmachine):
+        """Switching to agent mode when no custom prompt exists should
         still succeed (no-op)."""
         custom_prompt = mock_thoughtmachine / "custom_system_prompt.txt"
         assert not custom_prompt.exists(), "precondition: no custom prompt"
 
-        response = client.post("/api/config/mode", json={"mode": "full"})
+        response = client.post("/api/config/mode", json={"mode": "agent"})
         assert response.status_code == 200, response.text
-        assert response.json() == {"status": "ok", "mode": "full"}
+        assert response.json() == {"status": "ok", "mode": "agent"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -141,11 +161,11 @@ class TestSetMode:
 class TestGetMode:
     """Tests for the GET /api/config/mode endpoint."""
 
-    def test_get_mode_returns_full_by_default(self, mock_thoughtmachine):
-        """When no custom prompt exists, GET should return full mode."""
+    def test_get_mode_returns_agent_by_default(self, mock_thoughtmachine):
+        """When no custom prompt exists, GET should return agent mode."""
         response = client.get("/api/config/mode")
         assert response.status_code == 200, response.text
-        assert response.json() == {"mode": "full"}
+        assert response.json() == {"mode": "agent"}
 
     def test_get_mode_returns_engineer_after_set(self, mock_thoughtmachine):
         """After switching to engineer mode, GET should return engineer."""
@@ -154,19 +174,19 @@ class TestGetMode:
         assert response.status_code == 200, response.text
         assert response.json() == {"mode": "engineer"}
 
-    def test_get_mode_returns_full_after_clearing(self, mock_thoughtmachine):
-        """After switching back to full mode, GET should return full."""
+    def test_get_mode_returns_agent_after_clearing(self, mock_thoughtmachine):
+        """After switching back to agent mode, GET should return agent."""
         client.post("/api/config/mode", json={"mode": "engineer"})
-        client.post("/api/config/mode", json={"mode": "full"})
+        client.post("/api/config/mode", json={"mode": "agent"})
         response = client.get("/api/config/mode")
         assert response.status_code == 200, response.text
-        assert response.json() == {"mode": "full"}
+        assert response.json() == {"mode": "agent"}
 
     def test_get_mode_with_empty_custom_prompt(self, mock_thoughtmachine):
         """An empty ``custom_system_prompt.txt`` should be treated as
-        full mode."""
+        agent mode."""
         custom_prompt = mock_thoughtmachine / "custom_system_prompt.txt"
         custom_prompt.write_text("   \n  \n", encoding="utf-8")
         response = client.get("/api/config/mode")
         assert response.status_code == 200, response.text
-        assert response.json() == {"mode": "full"}
+        assert response.json() == {"mode": "agent"}

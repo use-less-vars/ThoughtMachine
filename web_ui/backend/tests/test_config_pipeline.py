@@ -10,7 +10,7 @@ import pytest
 from pathlib import Path
 from agent.config.models import AgentConfig
 from web_ui.backend.bridge import WebAgentBridge
-from web_ui.backend.server import _translate_frontend_config
+from web_ui.backend.server import _translate_frontend_config, _backend_to_frontend_config
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -163,19 +163,23 @@ class TestTranslateFrontendConfig:
         assert "enabled_tools" not in result
 
     def test_translate_frontend_config_empty_tools_list(self):
-        """When tools is an empty list, enabled_tools should not be set."""
+        """When tools is an empty list, enabled_tools should be an empty list
+        (all tools explicitly disabled)."""
         result = _translate_frontend_config({"tools": []})
-        assert "enabled_tools" not in result
+        assert result.get("enabled_tools") == [], \
+            f"Expected enabled_tools=[], got {result.get('enabled_tools')}"
 
     def test_translate_frontend_config_all_disabled_tools(self):
-        """When all tools are disabled, enabled_tools should not be set."""
+        """When all tools are disabled, enabled_tools should be an empty list
+        (all tools explicitly disabled)."""
         result = _translate_frontend_config({
             "tools": [
                 {"name": "bash", "enabled": False},
                 {"name": "file_read", "enabled": False},
             ],
         })
-        assert "enabled_tools" not in result
+        assert result.get("enabled_tools") == [], \
+            f"Expected enabled_tools=[], got {result.get('enabled_tools')}"
 
     def test_translate_frontend_config_strips_private_keys(self):
         """Keys starting with '_' should be stripped from the result."""
@@ -192,3 +196,58 @@ class TestTranslateFrontendConfig:
         """When no provider is given, provider_type should not be set."""
         result = _translate_frontend_config({"temperature": 0.5})
         assert "provider_type" not in result
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tests: _backend_to_frontend_config  (round-trip completeness)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestBackendToFrontendConfig:
+    """Tests for _backend_to_frontend_config()."""
+
+    def test_backend_to_frontend_emits_all_tools(self):
+        """
+        _backend_to_frontend_config should emit ALL known tools from
+        SIMPLIFIED_TOOL_CLASSES, each with enabled: true/false.
+        """
+        result = _backend_to_frontend_config({
+            "enabled_tools": ["FileEditor", "ReadFile"],
+        })
+        tools = result.get("tools", [])
+        # Should be a list; every entry has name + enabled
+        assert isinstance(tools, list)
+        assert len(tools) > 5, (
+            f"Expected many tools from SIMPLIFIED_TOOL_CLASSES, "
+            f"got {len(tools)}: {[t['name'] for t in tools]}"
+        )
+        # FileEditor should be enabled
+        fe = next((t for t in tools if t["name"] == "FileEditor"), None)
+        assert fe is not None, "FileEditor should be in tools list"
+        assert fe["enabled"] is True
+        # Something not in enabled_tools should be disabled
+        disabled = [t for t in tools if not t["enabled"]]
+        assert len(disabled) > 0, (
+            "At least some tools should be disabled (only enabled_tools "
+            "containing FileEditor and ReadFile were passed)"
+        )
+
+    def test_backend_to_frontend_no_enabled_tools_key(self):
+        """
+        When enabled_tools key is absent, tools should remain as-is
+        (or absent), not be populated.
+        """
+        result = _backend_to_frontend_config({"temperature": 0.5})
+        # tools should not be populated from nowhere
+        assert "tools" not in result or result["tools"] is None
+
+    def test_backend_to_frontend_empty_enabled_tools(self):
+        """
+        When enabled_tools is an empty list, all tools should be
+        present with enabled=False.
+        """
+        result = _backend_to_frontend_config({"enabled_tools": []})
+        tools = result.get("tools", [])
+        assert len(tools) > 0, "Should still emit all tools"
+        assert all(t["enabled"] is False for t in tools), (
+            "All tools should be disabled when enabled_tools is empty"
+        )
+
