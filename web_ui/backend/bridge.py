@@ -101,6 +101,22 @@ except ImportError:
     _registry_lock = None
     WORKER_BUS_AVAILABLE = False
 
+# ── Agent/Engineer mode presets and prompts ─────────────────────────────────
+from agent.config.presets import AGENT_TOOLS, ENGINEER_TOOLS
+from agent.config.loader import DEFAULT_SYSTEM_PROMPT_PATH, ENGINEER_SYSTEM_PROMPT_PATH
+
+from pathlib import Path as _Path
+
+try:
+    _AGENT_PROMPT = _Path(DEFAULT_SYSTEM_PROMPT_PATH).read_text().strip()
+except Exception:
+    _AGENT_PROMPT = "You are a helpful AI assistant."
+
+try:
+    _ENGINEER_PROMPT = _Path(ENGINEER_SYSTEM_PROMPT_PATH).read_text().strip()
+except Exception:
+    _ENGINEER_PROMPT = _AGENT_PROMPT
+
 # ── Workspace ID cache ──────────────────────────────────────────────────────
 # Cache mapping workspace path → workspace ID, built once and reused across
 # session load calls within the same bridge instance.
@@ -967,6 +983,21 @@ class WebAgentBridge:
         if not merged_config.get('api_key'):
             log('DEBUG', 'server.bridge', 'No API key resolved from provider profile; Agent will check env vars')
 
+        # ── Agent/Engineer mode enforcement ────────────────────────────────
+        current_mode = None
+        if self._config is not None:
+            current_mode = getattr(self._config, 'mode', None)
+        mode = merged_config.get("mode") or current_mode or "custom"
+        if mode == "agent":
+            merged_config["enabled_tools"] = AGENT_TOOLS
+            merged_config["system_prompt"] = _AGENT_PROMPT
+            merged_config.pop("disabled_tools", None)
+        elif mode == "engineer":
+            merged_config["enabled_tools"] = ENGINEER_TOOLS
+            merged_config["system_prompt"] = _ENGINEER_PROMPT
+            merged_config.pop("disabled_tools", None)
+        # custom: nothing
+
         if self._controller is not None:
             # ── Delegate to controller ──────────────────────────────────
             session_arg = self._loaded_session
@@ -1226,6 +1257,18 @@ class WebAgentBridge:
         # Step 3: Merge incoming on top (deep merge — preserves nested dicts)
         from agent.utils import deep_merge
         merged = deep_merge(base, config_dict)
+
+        # ── Agent/Engineer mode enforcement ────────────────────────────────
+        mode = merged.get("mode") or getattr(self._config, 'mode', None) or "custom"
+        if mode == "agent":
+            merged["enabled_tools"] = AGENT_TOOLS
+            merged["system_prompt"] = _AGENT_PROMPT
+            merged.pop("disabled_tools", None)
+        elif mode == "engineer":
+            merged["enabled_tools"] = ENGINEER_TOOLS
+            merged["system_prompt"] = _ENGINEER_PROMPT
+            merged.pop("disabled_tools", None)
+        # custom: nothing
 
         # Step 4: Validate the merged dict
         validated = validate_config(merged)
