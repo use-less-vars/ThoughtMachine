@@ -101,21 +101,7 @@ except ImportError:
     _registry_lock = None
     WORKER_BUS_AVAILABLE = False
 
-# ── Agent/Engineer mode presets and prompts ─────────────────────────────────
-from agent.config.presets import AGENT_TOOLS, ENGINEER_TOOLS
-from agent.config.loader import DEFAULT_SYSTEM_PROMPT_PATH, ENGINEER_SYSTEM_PROMPT_PATH
-
-from pathlib import Path as _Path
-
-try:
-    _AGENT_PROMPT = _Path(DEFAULT_SYSTEM_PROMPT_PATH).read_text().strip()
-except Exception:
-    _AGENT_PROMPT = "You are a helpful AI assistant."
-
-try:
-    _ENGINEER_PROMPT = _Path(ENGINEER_SYSTEM_PROMPT_PATH).read_text().strip()
-except Exception:
-    _ENGINEER_PROMPT = _AGENT_PROMPT
+from agent.config.session_config import SessionConfig
 
 # ── Workspace ID cache ──────────────────────────────────────────────────────
 # Cache mapping workspace path → workspace ID, built once and reused across
@@ -236,8 +222,9 @@ class WebAgentBridge:
         self._last_state_busy: Optional[bool] = None
 
         # Current config (for get_config / get_conversation)
-        self._config: Optional[AgentConfig] = None
+        self._session_config: Optional[SessionConfig] = None
         self._session_id: Optional[str] = None
+        self._workspace_path: Optional[str] = None
 
         # Track session conversation version for efficient history sync
         self._history_version: int = 0
@@ -926,86 +913,58 @@ class WebAgentBridge:
             # Fall back to minimal AgentConfig with env-var key
             return AgentConfig(api_key='')
 
-    def start(self, query: str,
-              config_dict: Optional[Dict[str, Any]] = None) -> None:
-        """
-        Start a new agent session.
-
-        Configuration is built from these layers (each overriding the previous):
-          1. ``self._config`` (if already set by a prior ``apply_config`` call)
-             *or* global config from ``~/.thoughtmachine/agent_config.json``
-          2. Frontend ``config_dict`` (the caller's runtime overrides)
-
-        If a session was previously loaded via load_session(), the loaded
-        session's conversation is passed to the controller so the agent
-        can continue from that context.  After starting, the loaded-session
-        reference is cleared (the new run owns its own session).
-
-        Args:
-            query: Initial user query string.
-            config_dict: Frontend configuration overrides (see AgentConfig fields).
-                         Applied on top of the existing (or global) config.
-        """
-        # Reset session reference to ensure a clean slate — the correct
-        # session will be resolved and set below.
+    def start(self, query: str, session_config: Optional[SessionConfig] = None) -> None:
+        """Start a new agent session with the given SessionConfig."""
+        log('INFO', 'server.bridge',
+            f'start() called | query={query[:80]!r}... | '
+            f'_controller={self._controller is not None} | '
+            f'_loaded_session={self._loaded_session.session_id if self._loaded_session else None} | '
+            f'is_running={self.is_running} | '
+            f'config_provider={session_config.provider_id if session_config else self._session_config.provider_id if self._session_config else "N/A"}')
+        if session_config is None:
+            session_config = self._session_config
+            if session_config is None:
+                raise RuntimeError("start() called without SessionConfig and no session loaded")
+        # Reset session reference to ensure a clean slate
         self._session = None
 
-        # ── Layer 1: existing config from apply_config, or global config ──
-        if self._config is not None:
-            # A prior apply_config() call already set a validated config.
-            # Use it as the base so that continue_session preserves it.
-            # NOTE: api_key has ``exclude=True`` on AgentConfig, so model_dump()
-            # already strips it. We re-add it explicitly below.
-            merged_config = self._config.model_dump(
-                exclude={'api_key'}, exclude_none=True)
-            merged_config['api_key'] = self._config.api_key
-        else:
-            global_config = self._build_global_agent_config()
-            merged_config = global_config.model_dump(
-                exclude={'api_key'}, exclude_none=True)
-            merged_config['api_key'] = global_config.api_key
+        # Store the SessionConfig and derive AgentConfig
+        self._session_config = session_config
 
-        # ── Layer 2: frontend config_dict (deep merge for nested dicts) ──
-        if config_dict:
-            from agent.utils import deep_merge
-            # Filter out session metadata keys before merging
-            filtered = {k: v for k, v in config_dict.items()
-                        if k not in ('session_id', 'created_at', 'updated_at')}
-            merged_config = deep_merge(merged_config, filtered)
+        # Resolve API key from provider profile if not already set
+        if not session_config.api_key and session_config.provider_id:
+            try:
+                from agent.config.provider_profile import ProviderManager
+                manager = ProviderManager()
+                resolved = manager.resolve_config(session_config.model_dump(exclude_none=True))
+                if "api_key" in resolved:
+                    session_config.api_key = resolved["api_key"]
+            except Exception:
+                pass
 
-        provider_id = merged_config.get('provider_id')
-        if provider_id:
-            # Let any ProviderManager / resolve_config errors propagate — the
-            # caller (server.py) catches them and reports to the frontend.
-            manager = ProviderManager()
-            merged_config = manager.resolve_config(merged_config)
+        agent_config = session_config.to_agent_config()
 
-        if not merged_config.get('api_key'):
-            log('DEBUG', 'server.bridge', 'No API key resolved from provider profile; Agent will check env vars')
+        # If no workspace_id on SessionConfig, try to resolve from bridge state
+        if not session_config.workspace_id and self._workspace_id:
+            session_config.workspace_id = self._workspace_id
 
-        # ── Agent/Engineer mode enforcement ────────────────────────────────
-        current_mode = None
-        if self._config is not None:
-            current_mode = getattr(self._config, 'mode', None)
-        mode = merged_config.get("mode") or current_mode or "custom"
-        if mode == "agent":
-            merged_config["enabled_tools"] = AGENT_TOOLS
-            merged_config["system_prompt"] = _AGENT_PROMPT
-            merged_config.pop("disabled_tools", None)
-        elif mode == "engineer":
-            merged_config["enabled_tools"] = ENGINEER_TOOLS
-            merged_config["system_prompt"] = _ENGINEER_PROMPT
-            merged_config.pop("disabled_tools", None)
-        # custom: nothing
+        # Set workspace_path from workspace registry if available
+        if self._workspace_id and not self._workspace_path:
+            try:
+                from thoughtmachine.workspace_registry import WorkspaceRegistry
+                registry = WorkspaceRegistry.get_default()
+                entry = registry.get_workspace(self._workspace_id)
+                if entry and entry.root_path:
+                    self._workspace_path = entry.root_path
+            except Exception:
+                pass
 
+        # If a controller already exists, delegate to it
         if self._controller is not None:
-            # ── Delegate to controller ──────────────────────────────────
             session_arg = self._loaded_session
-            config = AgentConfig(**merged_config)
-            self._config = config
             self._running = True
             self._session = session_arg
-            self._controller.start(query, config, session=session_arg)
+            self._controller.start(query, agent_config, session=session_arg)
             self._loaded_session = None  # consumed
             return
 
@@ -1018,25 +977,24 @@ class WebAgentBridge:
         self._running = True
         self._processing = False
 
-        # Build AgentConfig from the merged dict
-        config = AgentConfig(**merged_config)
-        self._config = config
-
-        # Create session for this run (no Qt dependency, pure Python)
+        # Create session for this run
         if self._loaded_session is not None:
             session = self._loaded_session
             self._loaded_session = None  # consumed
         else:
             session = Session()
             session.metadata['source'] = 'web_ui'
+
         # Propagate mode from config to session
-        if self._config and hasattr(self._config, 'mode'):
-            session.mode = self._config.mode
+        if self._session_config and hasattr(self._session_config, 'mode'):
+            session.mode = self._session_config.mode
+
         # Apply workspace_id from bridge if session doesn't already have one
         if self._workspace_id and not session.workspace_id:
             session.workspace_id = self._workspace_id
+
         self._session = session
-        self._agent = Agent(config, session=session)
+        self._agent = Agent(agent_config, session=session)
         self._session_id = session.session_id
 
         # Queue the initial query
@@ -1065,11 +1023,13 @@ class WebAgentBridge:
             if result.get("success"):
                 log('INFO', 'server.bridge',
                     f"Config updated during continue_session: "
-                    f"provider={self._config.provider_type}, "
-                    f"model={self._config.model}")
+                    f"provider={self._session_config.provider_id}, "
+                    f"model={self._session_config.model}")
                 # Push to controller so running agent picks it up
                 if self._controller is not None:
-                    self._controller.request_config_update(self._config)
+                    self._controller.request_config_update(
+                        self._session_config.to_agent_config()
+                    )
             else:
                 log('WARNING', 'server.bridge',
                     f"Config update skipped during continue_session: "
@@ -1077,7 +1037,26 @@ class WebAgentBridge:
 
         # ── Submit the query ──────────────────────────────────────────────
         if self._controller is not None:
-            self._controller.continue_session(query)
+            # Defensive health check: the controller object reference may exist
+            # even if its background thread has died (silent death after first
+            # query).  If that happens, create a fresh controller and hand off
+            # via process_query() so the session continues seamlessly.
+            if self._controller.is_running:
+                self._controller.continue_session(query)
+                return
+            # ── Controller is dead — resurrect ──
+            log('WARNING', 'server.bridge',
+                f'continue_session: controller dead (thread died after first query), '
+                f'creating new controller for session {self._session_id}')
+            new_controller = AgentController()
+            new_controller.set_event_callback(self._on_controller_event)
+            if self._session is not None and self._session_config is not None:
+                new_controller.set_session(
+                    self._session,
+                    self._session_config.to_agent_config()
+                )
+                new_controller.process_query(query)
+            self._controller = new_controller
             return
         if not self.is_running:
             raise RuntimeError("Bridge is not running. Start it first.")
@@ -1148,14 +1127,15 @@ class WebAgentBridge:
             return self._normalize_for_frontend(self._session.user_history)
         return None
 
-    def get_config(self) -> Optional[AgentConfig]:
-        if self._controller is not None:
-            return self._controller.get_config() or self._config
-        return self._config
+    def get_config(self) -> Optional[Dict[str, Any]]:
+        """Return the current session config as a serializable dict (no api_key)."""
+        if self._session_config is None:
+            return None
+        return self._session_config.model_dump(exclude={'api_key'})
 
     # ── Controller restart / health check ───────────────────────────────────
 
-    def _restart_controller(self, config: Optional[AgentConfig] = None) -> None:
+    def _restart_controller(self, config: Optional[SessionConfig] = None) -> None:
         """
         Restart the controller thread with an optional new config.
 
@@ -1165,11 +1145,11 @@ class WebAgentBridge:
         is unresponsive, or explicitly to force a full controller restart.
 
         Args:
-            config: Optional new AgentConfig.  If None, the current
-                    self._config is kept.
+            config: Optional new SessionConfig.  If None, the current
+                    self._session_config is kept.
         """
         old_controller = self._controller
-        new_config = config or self._config
+        new_config = config or self._session_config
 
         if old_controller is not None:
             log('INFO', 'server.bridge', '_restart_controller: stopping old controller')
@@ -1180,7 +1160,7 @@ class WebAgentBridge:
         new_controller = AgentController()
         self.set_controller(new_controller)
         self._controller = new_controller
-        self._config = new_config
+        self._session_config = new_config
 
         # Preserve session ID
         if self._session is not None:
@@ -1191,10 +1171,10 @@ class WebAgentBridge:
     # ── Container integrity re-sync ───────────────────────────────────────────
     # Called by apply_config() when session_permissions change.
 
-    def _maybe_re_sync_container(self, config: 'AgentConfig') -> None:
+    def _maybe_re_sync_container(self, workspace_path: str, session_permissions: Any) -> None:
         """Verify container integrity after a config change that may affect permissions.
 
-        If the config includes ``session_permissions`` and a ``workspace_path``,
+        If *session_permissions* and *workspace_path* are both provided,
         this calls ``verify_container_integrity`` so any existing container whose
         network/volume mode no longer matches the new permissions is stopped and
         removed.  The container will be recreated with the correct settings the
@@ -1202,15 +1182,13 @@ class WebAgentBridge:
 
         This is a no-op when Docker is unavailable or no workspace path is known.
         """
-        sp = getattr(config, 'session_permissions', None)
-        ws = getattr(config, 'workspace_path', None)
-        if sp is None or not ws:
+        if session_permissions is None or not workspace_path:
             return
 
-        sp_dict = sp.model_dump() if hasattr(sp, 'model_dump') else sp
+        sp_dict = session_permissions.model_dump() if hasattr(session_permissions, 'model_dump') else session_permissions
         try:
             from docker_executor import verify_container_integrity
-            result = verify_container_integrity(ws, sp_dict)
+            result = verify_container_integrity(workspace_path, sp_dict)
             if result.get('action_taken') == 'removed':
                 log('INFO', 'server.bridge',
                     f'Container re-synced after config change: '
@@ -1224,98 +1202,72 @@ class WebAgentBridge:
                 f'Container re-sync skipped: {exc}')
 
     def apply_config(self, config_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply partial config updates from the frontend.
+
+        SessionConfig enforces mode rules:
+        - agent/engineer mode: tools and prompt are LOCKED (update_tools/update_prompt log warnings and no-op)
+        - custom mode: tools and prompt can be freely changed
+        - Other fields (provider_id, model, temperature, etc.) are always mutable.
         """
-        Apply a full config dict to the session, merging with existing config.
+        if self._session_config is None:
+            log("WARNING", "server.bridge", "apply_config called but no session config exists")
+            return {"success": False, "error": "No active session config"}
 
-        Steps:
-        1. Start with existing self._config as base (if available)
-        2. Merge incoming config_dict on top
-        3. Validate the merged dict via validate_config()
-        4. Resolve provider credentials if provider_id is present
-        5. Store validated config in self._config
-        6. Persist to session via save_session()
+        session_config = self._session_config
 
-        Returns:
-            {"success": True} or {"success": False, "error": "..."}
-        """
-        from agent.config.loader import validate_config
+        # Tool changes (mode-locked: only works in custom mode)
+        if "enabled_tools" in config_dict:
+            session_config.update_tools(config_dict["enabled_tools"])
 
-        # Step 1: Validate non-negative integer fields before merging
-        for field_name in ('token_monitor_warning_threshold', 'token_monitor_critical_threshold'):
-            val = config_dict.get(field_name)
-            if val is not None:
-                if not isinstance(val, int) or val < 0:
-                    return {"success": False, "error": f"{field_name} must be a non-negative integer"}
+        # Prompt changes (mode-locked: only works in custom mode)
+        if "system_prompt" in config_dict:
+            session_config.update_prompt(config_dict["system_prompt"])
 
-        # Step 2: Start with current config as base
-        if self._config is not None:
-            base = self._config.model_dump(exclude={'api_key'}, exclude_none=True)
-        else:
-            global_config = self._build_global_agent_config()
-            base = global_config.model_dump(exclude={'api_key'}, exclude_none=True)
+        # Mutable fields (always allowed regardless of mode)
+        for field in ("provider_id", "model", "base_url", "temperature", "top_p", "max_tokens"):
+            if field in config_dict:
+                setattr(session_config, field, config_dict[field])
 
-        # Step 3: Merge incoming on top (deep merge — preserves nested dicts)
-        from agent.utils import deep_merge
-        merged = deep_merge(base, config_dict)
-
-        # ── Agent/Engineer mode enforcement ────────────────────────────────
-        mode = merged.get("mode") or getattr(self._config, 'mode', None) or "custom"
-        if mode == "agent":
-            merged["enabled_tools"] = AGENT_TOOLS
-            merged["system_prompt"] = _AGENT_PROMPT
-            merged.pop("disabled_tools", None)
-        elif mode == "engineer":
-            merged["enabled_tools"] = ENGINEER_TOOLS
-            merged["system_prompt"] = _ENGINEER_PROMPT
-            merged.pop("disabled_tools", None)
-        # custom: nothing
-
-        # Step 4: Validate the merged dict
-        validated = validate_config(merged)
-        if validated is None:
-            return {"success": False, "error": "Configuration validation failed"}
-
-        # Step 5: Resolve provider if provider_id is present
-        validated_dict = validated.model_dump(exclude={'api_key'}, exclude_none=True)
-        provider_id = validated_dict.get('provider_id')
-        if provider_id:
+        # If provider_id changed, resolve provider credentials
+        if "provider_id" in config_dict and config_dict["provider_id"]:
             try:
                 manager = ProviderManager()
-                validated_dict = manager.resolve_config(validated_dict)
-                validated = AgentConfig(**validated_dict)
+                resolved = manager.resolve_config(session_config.model_dump(exclude_none=True))
+                if "api_key" in resolved:
+                    session_config.api_key = resolved["api_key"]
+                if "base_url" in resolved:
+                    session_config.base_url = resolved["base_url"]
             except Exception as e:
-                log('WARNING', 'server.bridge', f"Provider resolution failed during apply_config: {e}")
+                log("WARNING", "server.bridge", f"Provider resolution failed during apply_config: {e}")
 
-        # Step 6: Store the validated config
-        self._config = validated
+        # Assign back (in case mode-validator updated tools/prompt)
+        self._session_config = session_config
+
+        # Convert to AgentConfig and apply to controller
+        agent_config = session_config.to_agent_config()
+
         if self._controller is not None:
-            # ── Health check: verify controller thread is alive ──────────────
             controller_alive = (
-                hasattr(self._controller, 'thread')
+                hasattr(self._controller, "thread")
                 and self._controller.thread is not None
                 and self._controller.thread.is_alive()
             )
             if not controller_alive:
-                log('WARNING', 'server.bridge',
-                    'apply_config: controller thread is dead — restarting controller')
-                self._restart_controller(validated)
-                # Push the config update into the new controller
-                self._controller._config = validated
-                self._controller.request_config_update(validated)
-            else:
-                self._controller._config = validated
-                self._controller.request_config_update(validated)
+                log("WARNING", "server.bridge",
+                    "apply_config: controller thread is dead — restarting controller")
+                self._restart_controller(session_config)
+            self._controller.request_config_update(agent_config)
 
-        # Step 7: Re-sync container integrity if session_permissions changed
-        self._maybe_re_sync_container(self._config)
+        # Re-sync container
+        self._maybe_re_sync_container(
+            self._workspace_path or "",
+            getattr(agent_config, "session_permissions", None)
+        )
 
-        # Step 8: Persist to session
+        # Persist to disk
         self.save_session()
 
-        # Step 9: Notify frontend — the server handler sends config_changed
-        # in frontend format after this method returns, so no explicit emit needed here.
-
-        log('INFO', 'server.bridge', 'Config applied and persisted via apply_config')
+        log("INFO", "server.bridge", "Config applied and persisted via apply_config")
         return {"success": True}
 
     # ── Session persistence ──────────────────────────────────────────────────
@@ -1349,15 +1301,17 @@ class WebAgentBridge:
                     user_history=list(self._loaded_session.user_history) if self._loaded_session else [],
                     workspace_id=self._workspace_id,
                     metadata={
-                        'agent_config': self._config.model_dump(exclude={'api_key'}, exclude_none=True) if self._config else {},
+                        'session_config': self._session_config.model_dump(exclude={'api_key'}, exclude_none=True) if self._session_config else {},
                         'source': 'web_ui',
                     }
                 )
             else:
                 # Update existing session metadata
-                session.metadata.setdefault('agent_config', {})
-                if self._config:
-                    session.metadata['agent_config'] = self._config.model_dump(exclude={'api_key'}, exclude_none=True)
+                session.metadata.setdefault('session_config', {})
+                if self._session_config:
+                    session.metadata['session_config'] = self._session_config.model_dump(
+                        exclude={'api_key'}, exclude_none=True
+                    )
                 session.metadata.setdefault('source', 'web_ui')
 
             # Apply name: explicit arg > existing loaded session name > generated
@@ -1496,9 +1450,10 @@ class WebAgentBridge:
     def load_session(self, session_id: str, limit: Optional[int] = 50, offset: int = 0) -> bool:
         """Load a session from the store, replacing current conversation.
 
-        Also extracts ``session.metadata['agent_config']`` and merges it into
-        ``self._config`` so that ``get_config()`` returns the saved configuration
-        immediately and ``start()`` uses it as the base config.
+        Also extracts ``session.metadata['session_config']`` (new format) or
+        ``session.metadata['agent_config']`` (legacy fallback) and merges it
+        into ``self._session_config`` so that ``get_config()`` returns the saved
+        configuration immediately and ``start()`` uses it as the base config.
 
         After calling this, the server handler should send ``config_changed``
         (in frontend format) so the frontend controls update.
@@ -1525,18 +1480,17 @@ class WebAgentBridge:
             # a workspace_path yet, look it up from the registry so that
             # downstream code (e.g. server.py fallback blocks) can use it
             # immediately without needing a separate resolution step.
-            if self._workspace_id and (self._config is None or not self._config.workspace_path):
+            if self._workspace_id and not self._workspace_path:
                 try:
                     registry = WorkspaceRegistry.get_default()
                     entry = registry.get_workspace(self._workspace_id)
                     if entry and entry.root_path:
-                        if self._config is None:
-                            from agent.config import AgentConfig
+                        self._workspace_path = entry.root_path
+                        if self._session_config is None:
                             global_cfg = self._build_global_agent_config()
-                            self._config = AgentConfig(
-                                **global_cfg.model_dump(exclude={'api_key'}, exclude_none=True)
+                            self._session_config = SessionConfig.from_agent_config(
+                                global_cfg, workspace_id=self._workspace_id or ''
                             )
-                        self._config.workspace_path = entry.root_path
                         log('INFO', 'server.bridge',
                             f"Backfilled workspace_path from registry for workspace {self._workspace_id}: {entry.root_path}")
                 except Exception as exc:
@@ -1564,49 +1518,48 @@ class WebAgentBridge:
             self._persisted_workers.clear()
             self._load_worker_contexts()
 
-            # ── Extract agent_config from session metadata into self._config ──
-            # This makes self._config the single source of truth so bridge.get_config()
-            # returns the saved config immediately (config_changed broadcasts show correct values).
-            agent_config_raw = session.metadata.get('agent_config', {})
-            if agent_config_raw and isinstance(agent_config_raw, dict):
+            # ── Extract session config from session metadata into self._session_config ──
+            session_config_raw = session.metadata.get('session_config') or session.metadata.get('agent_config')
+            if session_config_raw and isinstance(session_config_raw, dict):
                 try:
-                    from agent.config.loader import validate_config
-                    if self._config is not None:
-                        base = self._config.model_dump(exclude={'api_key'}, exclude_none=True)
-                    else:
-                        global_config = self._build_global_agent_config()
-                        base = global_config.model_dump(exclude={'api_key'}, exclude_none=True)
-                    from agent.utils import deep_merge
-                    merged = deep_merge(base, agent_config_raw)
-                    # Ensure enabled_tools is always present — merge from global config if missing
-                    if 'enabled_tools' not in merged:
-                        try:
-                            global_config = self._build_global_agent_config()
-                            merged['enabled_tools'] = global_config.enabled_tools
-                            log('INFO', 'server.bridge', f"Merged enabled_tools from global config: {len(global_config.enabled_tools)} tools")
-                        except Exception as exc:
-                            log('WARNING', 'server.bridge', f"Could not merge enabled_tools: {exc}")
-                    validated = validate_config(merged)
-                    if validated is not None:
-                        self._config = validated
-                        log('INFO', 'server.bridge', f"Loaded agent_config from session metadata: {len(agent_config_raw)} keys")
-                        # Backfill workspace_path from global config if session config lacks it
-                        if not self._config.workspace_path:
-                            global_config = self._build_global_agent_config()
-                            if global_config.workspace_path:
-                                self._config.workspace_path = global_config.workspace_path
-                                log('INFO', 'server.bridge', f"Backfilled workspace_path from global config: {global_config.workspace_path}")
-                    else:
-                        log('WARNING', 'server.bridge', 'load_session: validate_config returned None, keeping existing _config')
+                    # If mode is missing, default to 'agent' (legacy migration)
+                    if 'mode' not in session_config_raw:
+                        session_config_raw['mode'] = 'agent'
+                        log('INFO', 'server.bridge',
+                            f'Migrated legacy session {session_id}: defaulted mode to "agent"')
+
+                    # Construct SessionConfig — validator applies mode presets
+                    sc = SessionConfig(**session_config_raw)
+
+                    # Re-inject API key from provider resolution (never persisted)
+                    try:
+                        manager = ProviderManager()
+                        resolved = manager.resolve_config({'provider_id': sc.provider_id})
+                        if resolved.get('api_key'):
+                            sc.api_key = resolved['api_key']
+                    except Exception as exc:
+                        log('WARNING', 'server.bridge',
+                            f'Could not resolve API key for provider {sc.provider_id}: {exc}')
+
+                    self._session_config = sc
+                    log('INFO', 'server.bridge',
+                        f'Loaded session_config from metadata: mode={sc.mode}, '
+                        f'provider={sc.provider_id}, model={sc.model}')
+
+                    # Migrate saved config to new format (exclude api_key)
+                    session.metadata['session_config'] = sc.model_dump(exclude={'api_key'})
+                    if 'agent_config' in session.metadata:
+                        del session.metadata['agent_config']
+                    self._session_store.save_session(session, workspace_id=session.workspace_id)
                 except Exception as exc:
-                    log('WARNING', 'server.bridge', f'load_session: config merge failed: {exc}')
+                    log('WARNING', 'server.bridge', f'load_session: config load failed: {exc}')
             else:
-                log('INFO', 'server.bridge', "No agent_config in session metadata")
+                log('INFO', 'server.bridge', 'No session_config in session metadata — session will use defaults')
 
             # ── Fallback: derive workspace_id from config if session has none ──
-            if self._workspace_id is None and self._config is not None and self._config.workspace_path:
+            if self._workspace_id is None and self._workspace_path:
                 try:
-                    resolved = _resolve_workspace_id(self._config.workspace_path)
+                    resolved = _resolve_workspace_id(self._workspace_path)
                     if resolved:
                         self._workspace_id = resolved
                         log('INFO', 'server.bridge',
@@ -1965,7 +1918,11 @@ class WebAgentBridge:
         internally by the controller's Agent and the bridge never receives
         it, causing _map_and_emit to skip conversation_changed events.
         """
-        log('DEBUG', 'server.bridge', f"Bridge received event: {event.get('type')}")
+        log('INFO', 'server.bridge',
+            f'_on_controller_event: type={event.get("type")!r} | '
+            f'_session_id={self._session_id} | '
+            f'_session={self._session is not None} | '
+            f'_controller={self._controller is not None}')
         # Capture session ID from first event that has one
         if self._session_id is None:
             sid = event.get('session_id')
@@ -2001,6 +1958,8 @@ class WebAgentBridge:
         State stream: state_changed, tokens_updated, context_updated, status_message
         Conversation stream: conversation_changed (always sourced from session)
         """
+        log('DEBUG', 'server.bridge',
+            f'_map_and_emit ENTRY: event_type={raw_event.get("type", "unknown")!r}')
         event_type = raw_event.get("type", "")
 
         # ── 1. Sync conversation changes from session ──────────────────────
@@ -2122,7 +2081,13 @@ class WebAgentBridge:
 
         # ── 3. Handle stop signals ────────────────────────────────────────
         if event_type == "session_stop":
-            if raw_event.get("stop_reason"):
+            stop_reason = raw_event.get("stop_reason", "unknown")
+            log('INFO', 'server.bridge',
+                f'_map_and_emit: session_stop received | '
+                f'stop_reason={stop_reason!r} | '
+                f'_is_busy={_is_busy} | '
+                f'controller_running={self._controller.is_running if self._controller else False}')
+            if stop_reason:
                 self._emit({
                     "type": "state_changed",
                     "state": "IDLE",

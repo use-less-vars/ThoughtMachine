@@ -482,11 +482,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
         if getattr(ws, '_closed', False):
             return
         try:
-
+            log('DEBUG', 'server.ws', f'send_event: type={event.get("type","?")!r} state={event.get("state",event.get("text",""))[:60]}')
             await ws.send_json(event)
         except (RuntimeError, ConnectionError, AssertionError, WebSocketDisconnect) as exc:
             # Expected during shutdown, websockets race, or client disconnect — mark closed
-            log('DEBUG', 'server.ws', f'send_event skipped (ws closed): {exc}')
+            log('WARNING', 'server.ws', f'send_event skipped (ws closed): {exc} | event_type={event.get("type","?")}')
             ws._closed = True
         except Exception as exc:
             log('ERROR', 'server.ws', f'send_event failed: {exc}\n{traceback.format_exc()}')
@@ -498,7 +498,9 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
     def event_callback(event: Dict[str, Any]) -> None:
         """Called from agent thread.  Schedule send on the asyncio loop."""
         nonlocal _shutting_down
+        log('INFO', 'server.ws', f'event_callback ENTRY: type={event.get("type","?")!r}')
         if _shutting_down:
+            log('DEBUG', 'server.ws', f'event_callback: discarding (shutting down) type={event.get("type","?")}')
             return
         try:
             if _loop.is_closed():
@@ -557,14 +559,20 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     bridge.register()
                     bridge.set_controller(controller)
 
+                    log('INFO', 'server.ws',
+                        f'start_session: bridge+controller created, calling start() | '
+                        f'query={query[:80]!r}...')
+
                     try:
-                        bridge.start(query, config_dict)
+                        bridge.start(query, SessionConfig(**config_dict))
                     except RuntimeError as exc:
                         # Controller may be stuck from a prior session; stop and retry
+                        log('WARNING', 'server.ws', f'start_session: controller busy, retrying: {exc}')
                         await ws.send_json({"type": "status_message", "text": f"⚠ Controller busy — resetting: {exc}"})
                         bridge.stop()
-                        bridge.start(query, config_dict)
+                        bridge.start(query, SessionConfig(**config_dict))
                     except Exception as exc:
+                        log('ERROR', 'server.ws', f'start_session: failed: {exc}\n{traceback.format_exc()}')
                         await ws.send_json({
                             "type": "status_message",
                             "text": f"⚠ Failed to start: {exc}",
@@ -578,6 +586,15 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         await ws.send_json({"type": "status_message", "text": "⚠ Query cannot be empty."})
                         continue
 
+                    # ── Log full bridge state at entry ──
+                    log('INFO', 'server.ws',
+                        f'continue_session ENTRY: query={query[:80]!r}... | '
+                        f'bridge={bridge is not None} | '
+                        f'_loaded_session={bridge._loaded_session.session_id if bridge and bridge._loaded_session else None} | '
+                        f'agent_is_running={bridge.agent_is_running if bridge else False} | '
+                        f'_controller={bridge._controller is not None if bridge else False} | '
+                        f'_controller.is_running={bridge._controller.is_running if bridge and bridge._controller else False}')
+
                     # Case 1: Bridge has a loaded session (first query for a new session)
                     # Only start if the agent is not already running.
                     if bridge is not None and bridge._loaded_session is not None and not bridge.agent_is_running:
@@ -587,7 +604,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             config_dict = msg.get("config", {})
                             if config_dict:
                                 config_dict = _translate_frontend_config(config_dict)
-                                bridge.start(query, config_dict)
+                                bridge.start(query, SessionConfig(**config_dict))
                             else:
                                 bridge.start(query)
                         except Exception as exc:
@@ -599,12 +616,19 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
 
                     # Case 2: Agent is already running — continue normally
                     if bridge is not None and bridge.agent_is_running:
+                        log('INFO', 'server.ws',
+                            f'continue_session: CASE 2 - bridge is running, calling bridge.continue_session() | '
+                            f'query={query[:80]!r}...')
                         try:
                             config_dict = msg.get("config", {})
                             if config_dict:
                                 config_dict = _translate_frontend_config(config_dict)
                             bridge.continue_session(query, config_dict)
+                            log('INFO', 'server.ws',
+                                f'continue_session: CASE 2 - bridge.continue_session() returned OK')
                         except Exception as exc:
+                            log('ERROR', 'server.ws',
+                                f'continue_session: CASE 2 - Exception: {exc}\n{traceback.format_exc()}')
                             await ws.send_json({
                                 "type": "status_message",
                                 "text": f"⚠ Failed to continue: {exc}",
@@ -612,6 +636,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         continue
 
                     # Case 3: Nothing to continue
+                    log('WARNING', 'server.ws',
+                        f'continue_session: CASE 3 - no active session! | '
+                        f'bridge={bridge is not None} | '
+                        f'_loaded_session={bridge._loaded_session.session_id if bridge and bridge._loaded_session else None} | '
+                        f'agent_is_running={bridge.agent_is_running if bridge else False}')
                     await ws.send_json({"type": "status_message", "text": "No active session — start a new one."})
 
                 elif command == "pause_session":
@@ -1572,6 +1601,9 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
 
                     # Store as the loaded session so continue_session picks it up
                     bridge._loaded_session = new_session
+                    log('INFO', 'server.ws',
+                        f'new_session: bridge created, session_id={new_session.session_id}, '
+                        f'bridge._loaded_session set')
 
                     # Cache bridge by the new session ID so reconnects reuse it
                     _session_bridges[new_session.session_id] = bridge

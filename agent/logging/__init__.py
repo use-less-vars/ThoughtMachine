@@ -23,6 +23,7 @@ CURRENT_SESSION_VERSION = '1.0'
 
 class LogLevel(Enum):
     """Logging verbosity levels."""
+    TRACE = 'TRACE'
     DEBUG = 'DEBUG'
     INFO = 'INFO'
     WARNING = 'WARNING'

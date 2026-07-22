@@ -602,6 +602,9 @@ class AgentController:
                 )
             self._emit_event({'type': 'error', 'error_type': 'AGENT_CREATION_ERROR', 'message': str(e), 'traceback': traceback.format_exc()})
 
+        # Record current thread name for verification
+        thread_name = threading.current_thread().name
+        log('INFO', 'core.controller', f'_run: entering main loop on thread {thread_name}')
         # --- Main processing loop ---
         try:
             while self._keep_alive:
@@ -654,10 +657,18 @@ class AgentController:
                         log('DEBUG', 'core.controller', f'Resumed from pause_event.wait()')
                         continue
                     continue
-                # Before-query_queue log removed (idle polling noise)
+                log('DEBUG', 'core.controller',
+                    f'_run: waiting for next query from queue | '
+                    f'_keep_alive={self._keep_alive} | '
+                    f'thread alive={threading.current_thread().is_alive()} | '
+                    f'agent={self.agent is not None} | '
+                    f'_processing_query={self._processing_query}')
                 try:
                     query = self.query_queue.get(timeout=1.0)
-                    log('DEBUG', 'core.controller', f"Got query from queue: '{query[:50]}...'")
+                    log('INFO', 'core.controller', f"Got query from queue: '{query[:80]}...' (type={type(query).__name__})")
+                    if thread_name != threading.current_thread().name:
+                        log('WARNING', 'core.controller', f'THREAD MISMATCH! Expected={thread_name}, got={threading.current_thread().name}')
+                    log('INFO', 'core.controller', f'_run: thread_name={threading.current_thread().name}, same thread as before={threading.current_thread().name == thread_name}')
                 except queue.Empty:
                     # Queue-empty log removed (idle polling noise)
                     continue
@@ -703,10 +714,15 @@ class AgentController:
                     # triggers a proper ready→running transition.
                     if hasattr(self, 'agent') and self.agent is not None:
                         self.agent.state.set_execution_state(ExecutionState.READY)
-                        log('DEBUG', 'core.controller', 'Resetting agent execution state to READY after query completion')
+                        log('INFO', 'core.controller',
+                            f'Query finished. Agent state reset to READY. '
+                            f'_keep_alive={self._keep_alive} | '
+                            f'_running={self._running} | '
+                            f'thread alive={self.thread.is_alive() if self.thread else False} | '
+                            f'stop_reason={stop_reason!r}')
                     self._emit_event({'type': 'session_stop', 'stop_reason': stop_reason or 'completed'})
                 if not self._keep_alive:
-                    log('DEBUG', 'core.controller', f'_keep_alive=False, breaking outer loop')
+                    log('INFO', 'core.controller', f'_keep_alive=False, breaking outer loop')
                     break
         except Exception as e:
             log('ERROR', 'core.controller', f'Exception in _run: {e}')

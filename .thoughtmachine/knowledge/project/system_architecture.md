@@ -5633,3 +5633,70 @@ In `agent/core/agent.py`, `_notify_config_change()` already detects `enabled_too
 
 **Issue 3 — Worker tool preset gap:**
 `session/tool_presets.py` only includes `Worker` in `CUSTOM_TOOLS`, not in `AGENT_TOOLS` or `ENGINEER_TOOLS`. Default session mode is `"agent"`, and the UI creates sessions with `mode="agent"`. So workers never show up in agent mode by default.
+
+## 2026-07-21 — ## Mode Enforcement Bridge Analysis (2026-07-22)
+
+### Files ...
+
+## Mode Enforcement Bridge Analysis (2026-07-22)
+
+### Files involved:
+- `agent/config/models.py` — AgentConfig mode field + _apply_mode_system_prompt after-validator
+- `agent/config/presets.py` — AGENT_TOOLS/ENGINEER_TOOLS/CUSTOM_TOOLS + get_tools_for_mode()
+- `agent/presenter/state_bridge.py` — PyQt path, DOES enforce mode tools in create_agent_config()
+- `web_ui/backend/bridge.py` — WebUI path, DOES NOT enforce mode tools in start() or apply_config()
+- `web_ui/backend/server.py` — _translate_frontend_config(), applies mode tools ONLY when enabled_tools is empty
+
+### Bugs:
+1. bridge.apply_config() has NO mode enforcement
+2. bridge.start() has NO mode enforcement
+3. server.py only enforces when enabled_tools is empty/falsy, not when mode is explicitly changed
+4. Empty list from frontend ("explicitly disabled all tools") bypasses mode enforcement
+
+## 2026-07-22 — ## SessionConfig integration in bridge.py
+
+`web_ui/backend/b...
+
+## SessionConfig integration in bridge.py
+
+`web_ui/backend/bridge.py` now uses `SessionConfig` as the canonical format for storing session-level configuration in `Session.metadata['session_config']`.
+
+**Storage:** `save_session()` converts the in-memory `AgentConfig` to `SessionConfig` via `SessionConfig.from_agent_config()` and stores it as `metadata['session_config']` (instead of the old raw `AgentConfig.model_dump()` under `metadata['agent_config']`).
+
+**Loading:** `load_session()` reads `metadata['session_config']` (new format) first, with fallback to `metadata['agent_config']` (legacy). The new format reconstructs a `SessionConfig` and calls `to_agent_config()` to get the base `AgentConfig`, then merges with global config for fields outside the session scope.
+
+**Backward compatibility:** Old sessions stored as `metadata['agent_config']` are still loaded correctly via the fallback path. New sessions use `metadata['session_config']`.
+
+**New method:** `SessionConfig.from_agent_config(agent_config, workspace_id='')` in `agent/config/session_config.py` — extracts session-level fields (mode, tools, prompt, provider, model, temperature, etc.) from an `AgentConfig`.
+
+
+## 2026-07-22 — ## Bridge SessionConfig Refactor (in progress)
+
+Refactoring ...
+
+## Bridge SessionConfig Refactor (in progress)
+
+Refactoring `web_ui/backend/bridge.py` to use `SessionConfig` instead of `AgentConfig` for runtime session configuration.
+
+### Changes planned:
+1. **self._config → self._session_config** (type: `SessionConfig`)
+2. **Remove module-level prompt loaders** - SessionConfig handles prompts internally
+3. **Remove import of `AGENT_TOOLS, ENGINEER_TOOLS` and prompt path constants**
+4. **Simplify start()** - Create SessionConfig from incoming data, convert via `.to_agent_config()`
+5. **Simplify apply_config()** - Work with SessionConfig
+6. **get_config()** - Return dict from SessionConfig (update callers in server.py)
+7. **Simplify save_session()** - Store SessionConfig directly
+8. **Simplify load_session()** - Use SessionConfig
+
+## SessionConfig cleanup
+
+## 2026-07-22 — ## 2026-07-22: Removed workspace_path and session_permission...
+
+## 2026-07-22: Removed workspace_path and session_permissions from SessionConfig
+
+- **What changed**: `workspace_path` and `session_permissions` fields removed from `SessionConfig` class in `agent/config/session_config.py`. These fields belong on `AgentConfig` (in `models.py`), not the session-level config.
+- **Also fixed**: Accidentally deleted `mode` and `workspace_id` fields during initial attempt — restored them with the second edit.
+- **Testing**: Validated via Docker import test — `SessionConfig.model_fields` now shows only session-level fields (`mode`, `workspace_id`, `enabled_tools`, `system_prompt`, `provider_id`, `model`, `base_url`, `temperature`, `top_p`, `max_tokens`, `api_key`).
+- **Validator/methods tested**: Mode presets, update_tools, update_prompt, factory method all pass.
+- **⚠️ Downstream impact**: `web_ui/backend/bridge.py` and `web_ui/backend/server.py` access `SessionConfig.workspace_path` directly, which will now fail at runtime (AttributeError). These need updating to get `workspace_path` from `AgentConfig` instead.
+

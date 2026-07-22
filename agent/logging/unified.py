@@ -62,6 +62,7 @@ def _get_agent_logger_classes():
 
 class LogLevel(Enum):
     """Log levels for unified facade."""
+    TRACE = "TRACE"
     DEBUG = "DEBUG"
     INFO = "INFO"
     WARNING = "WARNING"
@@ -248,6 +249,7 @@ def _should_log_to_console(level: LogLevel, tag: str) -> bool:
 
     # Convert level to priority
     level_priority = {
+        LogLevel.TRACE: 5,
         LogLevel.DEBUG: 10,
         LogLevel.INFO: 20,
         LogLevel.WARNING: 30,
@@ -277,6 +279,7 @@ def _should_log_to_console(level: LogLevel, tag: str) -> bool:
 
 # Color codes for console output
 COLORS = {
+    LogLevel.TRACE: "\033[90m",     # Grey
     LogLevel.DEBUG: "\033[36m",     # Cyan
     LogLevel.INFO: "\033[32m",      # Green
     LogLevel.WARNING: "\033[33m",   # Yellow

@@ -43,15 +43,15 @@ class TestApplyConfig:
         result = bridge.apply_config({
             "temperature": 1.5,
             "model": "test-model",
-            "max_turns": 30,
+            "max_tokens": 8192,
         })
 
         # ── Assert: bridge config updated ──────────────────────────────
         assert result == {"success": True}, f"apply_config failed: {result}"
-        assert bridge._config is not None, "bridge._config should not be None after apply_config"
-        assert bridge._config.temperature == 1.5
-        assert bridge._config.model == "test-model"
-        assert bridge._config.max_turns == 30
+        assert bridge._session_config is not None, "bridge._session_config should not be None after apply_config"
+        assert bridge._session_config.temperature == 1.5
+        assert bridge._session_config.model == "test-model"
+        assert bridge._session_config.max_tokens == 8192
 
         # ── Assert: session file written to disk ───────────────────────
         session_files = _find_session_files(temp_session_dir)
@@ -62,13 +62,13 @@ class TestApplyConfig:
         with open(latest, "r") as f:
             session_data = json.load(f)
 
-        agent_config = session_data.get("metadata", {}).get("agent_config", {})
-        assert agent_config.get("temperature") == 1.5, \
-            f"Expected temperature=1.5 in session file, got {agent_config.get('temperature')}"
-        assert agent_config.get("model") == "test-model", \
-            f"Expected model='test-model' in session file, got {agent_config.get('model')}"
-        assert agent_config.get("max_turns") == 30, \
-            f"Expected max_turns=30 in session file, got {agent_config.get('max_turns')}"
+        session_config = session_data.get("metadata", {}).get("session_config", {})
+        assert session_config.get("temperature") == 1.5, \
+            f"Expected temperature=1.5 in session file, got {session_config.get('temperature')}"
+        assert session_config.get("model") == "test-model", \
+            f"Expected model='test-model' in session file, got {session_config.get('model')}"
+        assert session_config.get("max_tokens") == 8192, \
+            f"Expected max_tokens=8192 in session file, got {session_config.get('max_tokens')}"
 
     def test_apply_config_merges_with_existing_config(self, session_store, temp_session_dir):
         """
@@ -82,7 +82,7 @@ class TestApplyConfig:
         bridge.apply_config({
             "temperature": 0.5,
             "model": "initial-model",
-            "max_turns": 10,
+            "max_tokens": 8192,
         })
 
         # Apply a partial update — only temperature changes
@@ -90,10 +90,10 @@ class TestApplyConfig:
             "temperature": 1.0,
         })
 
-        # model and max_turns should be preserved from the initial call
-        assert bridge._config.temperature == 1.0
-        assert bridge._config.model == "initial-model"
-        assert bridge._config.max_turns == 10
+        # model and max_tokens should be preserved from the initial call
+        assert bridge._session_config.temperature == 1.0
+        assert bridge._session_config.model == "initial-model"
+        assert bridge._session_config.max_tokens == 8192
 
     def test_apply_config_invalid_values_return_error(self, session_store):
         """apply_config should return {'success': False} for invalid input."""
