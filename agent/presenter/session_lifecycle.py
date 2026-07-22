@@ -98,7 +98,12 @@ class SessionLifecycle:
                 self._cached_preset_name = preset_name
             else:
                 session_mode = self.state_bridge.current_session.mode if self.state_bridge.current_session else None
-                agent_config = self.state_bridge.create_agent_config(config, total_input=self.state_bridge.total_input, total_output=self.state_bridge.total_output, mode=session_mode)
+                # Convert frontend config dict to SessionConfig via AgentConfig bridge
+                from agent.config.session_config import SessionConfig
+                from agent.config import AgentConfig
+                agent_cfg = AgentConfig(**config) if config else AgentConfig()
+                session_cfg = SessionConfig.from_agent_config(agent_cfg)
+                agent_config = self.state_bridge.create_agent_config(session_cfg, mode=session_mode)
                 self._cached_config = agent_config
                 self._cached_preset_name = None
             if self.state_bridge.current_session is None:

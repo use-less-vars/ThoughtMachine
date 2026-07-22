@@ -20,7 +20,7 @@
 
 import React, { useState, useRef } from 'react'
 
-function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
+function QueryBar({ sendCommand, status, isRunning, config, mode, sessionId }) {
   const [query, setQuery] = useState('')
   const textareaRef = useRef(null)
 
@@ -38,11 +38,11 @@ function QueryBar({ sendCommand, status, isRunning, config, sessionId }) {
       sendCommand('continue_session', {
         query: query.trim(),
         session_id: sessionId,
-        config: config ?? {}
+        config: { ...(config ?? {}), mode }
       })
     } else {
       // Fresh start — create new agent session
-      sendCommand('start_session', { query: query.trim(), config: config ?? {} })
+      sendCommand('start_session', { query: query.trim(), config: { ...(config ?? {}), mode } })
     }
     setQuery('')  // Clear input after sending
     if (textareaRef.current) {

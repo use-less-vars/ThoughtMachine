@@ -5,6 +5,7 @@ from typing import ClassVar, Optional, Callable, List, Any, Dict, Literal
 from pathlib import Path
 from pydantic import BaseModel, Field, field_validator, model_validator, model_serializer, ConfigDict
 from agent.logging import log
+from agent.config.presets import AGENT_TOOLS, ENGINEER_TOOLS
 from tools import SIMPLIFIED_TOOL_CLASSES
 from thoughtmachine.security import SessionPermissions
 
@@ -185,7 +186,12 @@ class AgentConfig(BaseModel):
                     object.__setattr__(self, 'system_prompt', text)
             except (FileNotFoundError, IOError) as exc:
                 log.warning('Could not load engineer system prompt from %s: %s', prompt_path, exc)
-        # mode == 'custom': leave existing system_prompt unchanged
+        # Enforce mode-specific tool presets
+        if self.mode == 'agent':
+            object.__setattr__(self, 'enabled_tools', list(AGENT_TOOLS))
+        elif self.mode == 'engineer':
+            object.__setattr__(self, 'enabled_tools', list(ENGINEER_TOOLS))
+        # mode == 'custom': leave existing enabled_tools unchanged
         return self
 
     @model_validator(mode='after')

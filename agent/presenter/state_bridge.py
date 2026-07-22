@@ -74,7 +74,7 @@ class StateBridge:
         log('DEBUG', 'core.config', f'[CONFIG_TRACE] state_bridge update_config before: workspace_path={self.current_config.workspace_path}')
         log('DEBUG', 'core.config', f'[CONFIG_TRACE] state_bridge update_config incoming: workspace_path={config_updates.get("workspace_path", "KEY_MISSING")}')
         # Merge updates into current config
-        current_dict = self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
+        current_dict = self.current_config.model_dump(exclude_none=True)
         current_dict.update(config_updates)
         self.current_config = AgentConfig(**current_dict)
         log('DEBUG', 'core.config', f'[CONFIG_TRACE] state_bridge update_config after: workspace_path={self.current_config.workspace_path}')
@@ -199,30 +199,42 @@ class StateBridge:
         self.current_config = AgentConfig(**config_dict)
         return self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
 
-    def create_agent_config(self, config_dict: Optional[dict]=None, total_input: int=0, total_output: int=0, mode: Optional[str] = None) -> AgentConfig:
+    def create_agent_config(self, session_config: Optional['SessionConfig'] = None, mode: Optional[str] = None) -> AgentConfig:
         """
-        Create AgentConfig instance from configuration dictionary.
+        Create AgentConfig from a SessionConfig object.
 
-        If the config or current config has a ``provider_id``, the matching
-        profile is resolved via :class:`~agent.config.provider_profile.ProviderManager`
-        to fill in ``provider_type``, ``base_url``, ``api_key``, and ``model``.
+        If session_config is provided, delegates to session_config.to_agent_config()
+        and resolves the provider profile via ProviderManager.
+
+        Falls back to self.current_config for legacy callers that don't pass a SessionConfig.
 
         Args:
-            config_dict: Optional dictionary to override current config
-            total_input: Current total input tokens for initial values
-            total_output: Current total output tokens for initial values
+            session_config: Optional SessionConfig object. When provided, used as source.
+            mode: Optional session mode. Only used in legacy fallback path.
 
         Returns:
             AgentConfig instance ready for use with controller
         """
-        if config_dict is not None:
-            config = {**self.current_config.model_dump(exclude={'api_key'}, exclude_none=True), **config_dict}
-        else:
-            config = self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
+        if session_config is not None:
+            # New path: derive AgentConfig from SessionConfig
+            agent_config = session_config.to_agent_config()
+            # Resolve provider profile if provider_id is present
+            if session_config.provider_id:
+                from agent.config.provider_profile import ProviderManager
+                manager = ProviderManager()
+                config_dict = agent_config.model_dump(exclude_none=True)
+                resolved = manager.resolve_config(config_dict)
+                if resolved:
+                    agent_config = AgentConfig(**resolved)
+            return agent_config
+
+        # Legacy fallback: construct from self.current_config
+        config = self.current_config.model_dump(exclude_none=True)
 
         # Resolve provider profile if provider_id is present
         provider_id = config.get('provider_id')
         if provider_id:
+            from agent.config.provider_profile import ProviderManager
             manager = ProviderManager()
             config = manager.resolve_config(config)
 
@@ -234,11 +246,13 @@ class StateBridge:
         api_key = config.get('api_key') or os.getenv('OPENAI_API_KEY') or os.getenv('DEEPSEEK_API_KEY')
         if not api_key:
             raise ValueError('Neither OPENAI_API_KEY nor DEEPSEEK_API_KEY environment variables are set, and no api_key in config. Please set one of them or add api_key to config.')
+
         enabled_tools = config.get('enabled_tools', [])
         tool_classes = []
         for tool_cls in SIMPLIFIED_TOOL_CLASSES:
             if tool_cls.__name__ in enabled_tools:
                 tool_classes.append(tool_cls)
+
         agent_kwargs = {}
         agent_kwargs['api_key'] = api_key
         direct_mappings = [('model', 'model'), ('provider_type', 'provider_type'), ('provider_config', 'provider_config'), ('temperature', 'temperature'), ('max_turns', 'max_turns'), ('workspace_path', 'workspace_path'), ('detail', 'detail'), ('enabled_tools', 'enabled_tools'), ('turn_monitor_enabled', 'turn_monitor_enabled'), ('system_prompt', 'system_prompt'), ('provider_id', 'provider_id'), ('model_override', 'model_override')]
@@ -264,7 +278,6 @@ class StateBridge:
             agent_kwargs['mode'] = mode
 
         agent_config = AgentConfig(**agent_kwargs)
-
         return agent_config
     def bind_session(self, session: Session) -> None:
         """Bind a Session object as the source of truth for conversation state."""
@@ -283,7 +296,7 @@ class StateBridge:
         # Restore workspace_path from session metadata into the active config
         ws = session.metadata.get('workspace_path')
         if ws:
-            current_dict = self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
+            current_dict = self.current_config.model_dump(exclude_none=True)
             current_dict['workspace_path'] = ws
             self.current_config = AgentConfig(**current_dict)
         external_file_path = session.metadata.get('external_file_path')

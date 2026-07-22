@@ -273,6 +273,9 @@ class CheckSystem(ToolBase):
         """Return the agent-config snapshot injected by ToolExecutor (clean JSON)."""
         if self.agent_config is not None:
             cfg = dict(self.agent_config)
+            # Redact API key to prevent security leak inside raw_config
+            raw_cfg = cfg.copy()
+            raw_cfg["api_key"] = "***" if raw_cfg.get("api_key") else None
             # Ensure key fields are always present
             result = {
                 "provider": cfg.get("provider", cfg.get("provider_type", "")),
@@ -289,7 +292,8 @@ class CheckSystem(ToolBase):
                 "reasoning_effort": cfg.get("reasoning_effort", None),
                 "base_url": cfg.get("base_url", None),
                 "api_key": "***" if cfg.get("api_key") else None,
-                "raw_config": cfg,
+                # Redact API key inside raw_config to prevent security leak
+                "raw_config": raw_cfg,
             }
             return result
         return {"error": "agent_config not available"}

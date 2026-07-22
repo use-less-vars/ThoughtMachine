@@ -107,6 +107,8 @@ from agent.logging import log
 from contextlib import asynccontextmanager
 from session.store import FileSystemSessionStore
 from session.session_registry import SessionRegistry
+from agent.config.presets import get_tools_for_mode
+from agent.config.session_config import SessionConfig
 from thoughtmachine.workspace_registry import WorkspaceRegistry
 
 # ── Shared session store singleton ────────────────────────────────────────────
@@ -797,7 +799,8 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 snapshotter = ConfigSnapshot(_project_path)
                                 cfg = bridge.get_config()
                                 if cfg is not None:
-                                    snapshotter.capture(cfg, label="apply_config_switch")
+                                    from agent.config import AgentConfig
+                                    snapshotter.capture(AgentConfig(**cfg), label="apply_config_switch")
                             except Exception:
                                 pass
                             await ws.send_json({
@@ -846,7 +849,8 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 snapshotter = ConfigSnapshot(_project_path)
                                 cfg = bridge.get_config()
                                 if cfg is not None:
-                                    snapshotter.capture(cfg, label="apply_config")
+                                    from agent.config import AgentConfig
+                                    snapshotter.capture(AgentConfig(**cfg), label="apply_config")
                             except Exception:
                                 pass
                             await ws.send_json({
@@ -874,7 +878,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             cfg_dict = _translate_frontend_config(config_dict)
                         elif bridge is not None:
                             # Fallback: use bridge's currently applied config
-                            cfg_dict = bridge.get_config().model_dump(exclude={'api_key', 'stop_check'}, exclude_none=True)
+                            cfg_dict = bridge.get_config() or {}
                         else:
                             await ws.send_json({
                                 "type": "default_config_saved",
@@ -1047,20 +1051,27 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         })
 
                 elif command == "get_available_tools":
-                    # Return list of available tool definitions
+                    # Return list of available tool definitions, filtered by mode if provided
                     try:
+                        mode = msg.get("mode", "custom")
                         from tools import SIMPLIFIED_TOOL_CLASSES
+                        from agent.config.presets import get_tools_for_mode
+                        if mode != "custom":
+                            mode_tool_names = set(get_tools_for_mode(mode))
+                        else:
+                            mode_tool_names = None
                         tool_defs = []
                         for cls in SIMPLIFIED_TOOL_CLASSES:
-                            tool_defs.append({
-                                "name": cls.__name__,
-                                "description": (cls.__doc__ or "").strip(),
-                            })
+                            if mode_tool_names is None or cls.__name__ in mode_tool_names:
+                                tool_defs.append({
+                                    "name": cls.__name__,
+                                    "description": (cls.__doc__ or "").strip(),
+                                })
                         await ws.send_json({
                             "type": "tools_list",
                             "tools": tool_defs,
                         })
-                        log('INFO', 'server.config', f"Returned {len(tool_defs)} available tools")
+                        log('INFO', 'server.config', f"Returned {len(tool_defs)} available tools for mode={mode}")
                     except Exception as exc:
                         log('ERROR', 'server.config', f"get_available_tools failed: {exc}\n{traceback.format_exc()}")
                         await ws.send_json({
@@ -1216,8 +1227,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                     # Sync workspace_path into bridge config so that
                                     # _frontend_config_from_bridge sends the correct path
                                     # to the frontend (instead of falling back to _project_root).
-                                    if hasattr(bridge, '_config') and bridge._config is not None:
-                                        bridge._config.workspace_path = _project_path
+                                    bridge._workspace_path = _project_path
                                     # Re-resolve workspace_id for the new project path
                                     from web_ui.backend.bridge import _resolve_workspace_id
                                     resolved = _resolve_workspace_id(_project_path)
@@ -1233,20 +1243,12 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # The auto-switch block above looks for workspace config.json on disk,
                     # but that file may not exist (only capabilities.json is guaranteed).
                     # Fall back to the workspace registry which always has root_path.
-                    if bridge.workspace_id and (bridge._config is None or not getattr(bridge._config, 'workspace_path', None)):
+                    if bridge.workspace_id and not bridge._workspace_path:
                         try:
                             entry = WorkspaceRegistry.get_default().get_workspace(bridge.workspace_id)
                             if entry and entry.root_path:
                                 root_path = entry.root_path
-                                if bridge._config is None:
-                                    from agent.config.models import AgentConfig
-                                    global_cfg = bridge._build_global_agent_config()
-                                    bridge._config = AgentConfig(
-                                        **global_cfg.model_dump(exclude={'api_key'}, exclude_none=True),
-                                        workspace_path=root_path
-                                    )
-                                else:
-                                    bridge._config.workspace_path = root_path
+                                bridge._workspace_path = root_path
                                 log('INFO', 'server',
                                     f"load_session: set workspace_path from registry: {root_path}")
                         except Exception as exc:
@@ -1548,20 +1550,12 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     new_session.ensure_name()
 
                     # ── Set workspace_path on bridge config from registry ──
-                    if workspace_id and (bridge._config is None or not getattr(bridge._config, 'workspace_path', None)):
+                    if workspace_id and not bridge._workspace_path:
                         try:
                             entry = WorkspaceRegistry.get_default().get_workspace(workspace_id)
                             if entry and entry.root_path:
                                 root_path = entry.root_path
-                                if bridge._config is None:
-                                    from agent.config.models import AgentConfig
-                                    global_cfg = bridge._build_global_agent_config()
-                                    bridge._config = AgentConfig(
-                                        **global_cfg.model_dump(exclude={'api_key'}, exclude_none=True),
-                                        workspace_path=root_path
-                                    )
-                                else:
-                                    bridge._config.workspace_path = root_path
+                                bridge._workspace_path = root_path
                                 log('INFO', 'server',
                                     f"new_session: set workspace_path from registry: {root_path}")
 
@@ -2066,6 +2060,9 @@ def _translate_frontend_config(fe_config: Dict[str, Any]) -> Dict[str, Any]:
     """
     Translate frontend config format to AgentConfig format.
 
+    This is purely format conversion — no mode-based presets or
+    permissions coersion (SessionConfig handles those centrally).
+
     Frontend sends:
         provider: 'openai' | 'anthropic' | 'local'
         tools: [{name, enabled}, ...]
@@ -2102,24 +2099,6 @@ def _translate_frontend_config(fe_config: Dict[str, Any]) -> Dict[str, Any]:
     # Remove any keys that start with _
     cfg = {k: v for k, v in cfg.items() if not k.startswith("_")}
 
-    # ── Whitelist validation for session_permissions ────────────────────
-    # Delegated to coerce_session_permissions() in thoughtmachine/security.py
-    # which rejects any unknown category or invalid level to prevent a
-    # compromised (or malformed) WebSocket message from injecting dangerous
-    # values such as filesystem="full", container=True, network="write".
-    from thoughtmachine.security import coerce_session_permissions
-    cfg["session_permissions"] = coerce_session_permissions(
-        cfg.get("session_permissions", {}),
-    )
-
-    # ── Apply mode-based tool preset ────────────────────────────────────
-    # NOTE: Mode-based tool presets are NOT applied here during translation
-    # because the frontend echoes the current mode back in every config
-    # (start_session, continue_session, apply_config). Applying the preset
-    # here would override any explicit tool choices the user made.
-    #
-    # The mode's system_prompt is applied downstream by
-    # AgentConfig._apply_mode_system_prompt during AgentConfig validation.
     # ── Translate diagnostic log ──────────────────────────────────────
     log('INFO', 'server.config',
         f"[TRANSLATE] frontend config: provider={fe_config.get('provider')}, "
@@ -2127,25 +2106,27 @@ def _translate_frontend_config(fe_config: Dict[str, Any]) -> Dict[str, Any]:
     log('DEBUG', 'server.config',
         f"[TRANSLATE] full dump: tools_field={fe_config.get('tools')}, "
         f"enabled_tools_after={cfg.get('enabled_tools')}")
-
     return cfg
 
 
 def _frontend_config_from_bridge(bridge) -> Dict[str, Any]:
-    """Convert bridge's AgentConfig back to frontend config format."""
+    """Convert bridge's SessionConfig back to frontend config format."""
     if bridge is None:
         return _default_frontend_config()
     from web_ui.backend.bridge import WebAgentBridge
     cfg = bridge.get_config()
     if cfg is None:
         return _default_frontend_config()
+    # cfg is already a serialized dict — reconstruct AgentConfig for conversion
+    from agent.config import AgentConfig
+    agent_cfg = AgentConfig(**cfg)
     # Check if API key is configured before stripping it
-    api_key = getattr(cfg, 'api_key', '') or ''
+    api_key = cfg.get('api_key', '') or ''
     if not api_key:
         import os
         api_key = os.getenv('OPENAI_API_KEY') or os.getenv('DEEPSEEK_API_KEY') or os.getenv('OPENAI_COMPATIBLE_API_KEY') or ''
     api_key_configured = bool(api_key)
-    raw = _config_to_dict(cfg)
+    raw = _config_to_dict(agent_cfg)
     result = _backend_to_frontend_config(raw)
     result['api_key_configured'] = api_key_configured
     return result
@@ -2196,32 +2177,7 @@ _FALLBACK_FRONTEND_CONFIG = {
         "git": "read",
         "execution": "banned",
     },
-    "enabled_tools": [
-        "FileEditor",
-        "FilePreviewTool",
-        "DirectoryTreeTool",
-        "GlobTool",
-        "FileSearchTool",
-        "ApplyEdits",
-        "CodeModifier",
-        "RefactorTool",
-        "DateTimeTool",
-        "DirectoryCreator",
-        "DockerCodeRunner",
-        "FieldViewer",
-        "FileMover",
-        "FileSummaryTool",
-        "Final",
-        "FinalReport",
-        "GitInfoTool",
-        "KnowledgeBaseTool",
-        "MCPValidator",
-        "PaginateTool",
-        "ProgressReport",
-        "RequestUserInteraction",
-        "SummarizeTool",
-        "Thought"
-    ],
+    "enabled_tools": get_tools_for_mode("agent"),
 }
 
 
@@ -2261,16 +2217,23 @@ def _backend_to_frontend_config(backend: Dict[str, Any]) -> Dict[str, Any]:
     provider_type = cfg.pop("provider_type", None)
     cfg["provider"] = provider_reverse.get(provider_type, "local")
     # Map enabled_tools → tools list (bidirectional with _translate_frontend_config)
-    # Emit ALL known tools as [{name, enabled}] so the frontend always sees the
-    # complete list.  A tool is enabled iff its name is in the enabled_tools set.
+    # For non-custom modes, only tools belonging to that mode's preset are emitted.
+    # For custom mode, all known tools are emitted.
+    # A tool is enabled iff its name is in the enabled_tools set.
     # If enabled_tools key is missing, leave tools alone (frontend defaults).
     if "enabled_tools" in cfg:
         enabled_set = set(cfg.pop("enabled_tools"))
+        mode = cfg.get("mode", "custom")
         from tools import SIMPLIFIED_TOOL_CLASSES
-        all_tool_names = [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES]
+        from agent.config.presets import get_tools_for_mode
+        if mode != "custom":
+            mode_tool_names = set(get_tools_for_mode(mode))
+        else:
+            mode_tool_names = None
         cfg["tools"] = [
-            {"name": name, "enabled": name in enabled_set}
-            for name in all_tool_names
+            {"name": cls.__name__, "enabled": cls.__name__ in enabled_set}
+            for cls in SIMPLIFIED_TOOL_CLASSES
+            if mode_tool_names is None or cls.__name__ in mode_tool_names
         ]
     # Ensure workspace_path is always present.
     # The bridge config may have workspace_path=None (default), and

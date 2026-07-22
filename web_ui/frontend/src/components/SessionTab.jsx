@@ -82,6 +82,7 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
   providersRef.current = providers
   const availableToolsRef = useRef(availableTools)
   availableToolsRef.current = availableTools
+  const availableToolsModeRef = useRef(null)
   const isWsConnectedOrConnecting = () => {
     const ws = wsRef.current
     return ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)
@@ -270,7 +271,10 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
         console.log('[SessionTab] Skipping get_providers (already cached)')
       }
       if (!availableToolsRef.current || availableToolsRef.current.length === 0) {
-        sendCommand('get_available_tools')
+        sendCommand('get_available_tools', { mode: mode || 'custom' })
+        if (mode) {
+          availableToolsModeRef.current = mode
+        }
       } else {
         console.log('[SessionTab] Skipping get_available_tools (already cached)')
       }
@@ -438,6 +442,12 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
         // The backend is now the single source of truth; it always sends
         // a complete frontend-format config (including tools, provider, etc.).
         update({ config: msg.config })
+        // Re-fetch available tools if the mode changed (e.g. session loaded
+        // from disk where mode wasn't known at initial WS connection time).
+        if (msg.config?.mode && msg.config.mode !== (availableToolsModeRef.current || 'custom')) {
+          availableToolsModeRef.current = msg.config.mode
+          sendCommand('get_available_tools', { mode: msg.config.mode })
+        }
         break
 
       case 'rebuild_result':
@@ -780,6 +790,7 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
             status={state.status}
             isRunning={state.isRunning}
             config={state.config}
+            mode={mode}
             sessionId={currentSessionId}
           />
         </div>

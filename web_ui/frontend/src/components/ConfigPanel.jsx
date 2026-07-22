@@ -31,6 +31,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   };
 
   const getSafeDraft = (cfg) => ({
+    mode: cfg?.mode ?? null,
     temperature: cfg?.temperature ?? 0.7,
     max_turns: cfg?.max_turns ?? 10,
     provider: cfg?.provider,
