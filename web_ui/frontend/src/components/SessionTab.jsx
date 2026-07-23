@@ -73,6 +73,7 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
   const [isDeferred, setIsDeferred] = useState(false) // true = load skipped; waiting for activation
   const [totalMessages, setTotalMessages] = useState(0) // total messages in the session
   const [hasMore, setHasMore] = useState(false) // true if older messages are available
+  const [scrollToBottomKey, setScrollToBottomKey] = useState(0) // incremented to force scroll to bottom (R3)
   const loadSentRef = useRef(false) // true once load_session has been sent (by any path)
   const dataReceivedRef = useRef(false) // true once we've received a response to our load
   const isActiveRef = useRef(isActive)
@@ -416,6 +417,16 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
         }));
         const notes = mergedMessages.filter(m => m.is_system_notification);
         if (notes.length > 0) console.log('🔔 SYSTEM NOTIFICATIONS:', notes);
+        // Detect context compaction messages — force scroll to bottom (R3)
+        if (notes.some(m => {
+          const text = (m.content || '').toLowerCase()
+          return text.includes('context now free') ||
+                 text.includes('summar') ||
+                 text.includes('compact') ||
+                 text.includes('messages removed')
+        })) {
+          setScrollToBottomKey(k => k + 1)
+        }
         update({ history: mergedMessages })
         // Pagination metadata from the server
         if (msg.total_count !== undefined) {
@@ -691,19 +702,10 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
                 }}
                 title="Rename session"
               >
-                ✏️
+                Rename
               </button>
               <div className="session-header-spacer" />
-              <button
-                className="session-header-btn session-header-save-btn"
-                onClick={() => {
-                  sendCommand('save_session')
-                  onSessionSaved?.(currentSessionId)
-                }}
-                title="Save session"
-              >
-                💾 Save
-              </button>
+
               {showDeleteConfirm ? (
                 <span className="session-header-delete-confirm">
                   <span className="session-header-delete-warn">Delete?</span>
@@ -715,13 +717,13 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
                       setShowDeleteConfirm(false)
                     }}
                   >
-                    ✓ Yes
+                    Yes
                   </button>
                   <button
                     className="session-header-btn session-header-cancel-btn"
                     onClick={() => setShowDeleteConfirm(false)}
                   >
-                    ✕ No
+                    No
                   </button>
                 </span>
               ) : (
@@ -733,7 +735,7 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
                   }}
                   title="Delete session"
                 >
-                  🗑️ Delete
+                  Delete
                 </button>
               )}
             </>
@@ -784,7 +786,7 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
               onDismiss={() => setSecurityPrompt(null)}
             />
           )}
-          <ChatPanel messages={state.history} loadMore={loadMore} hasMore={hasMore} />
+          <ChatPanel messages={state.history} loadMore={loadMore} hasMore={hasMore} scrollToBottomKey={scrollToBottomKey} />
           <QueryBar
             sendCommand={sendCommand}
             status={state.status}

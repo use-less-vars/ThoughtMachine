@@ -142,8 +142,17 @@ class FileSearchTool(ToolBase):
                 flags = 0 if self.case_sensitive else re.IGNORECASE
                 regex_pattern = re.compile(re.escape(self.pattern), flags)
             
+            # Initialize truncation tracking (MUST be before any truncation checks)
+            truncation_warnings = []
+            line_truncated_files = set()
+            results_truncated = False
+
             # Apply safety limits to parameters
             context_lines = min(self.context_lines, self.MAX_CONTEXT_LINES)
+            if self.context_lines > self.MAX_CONTEXT_LINES:
+                truncation_warnings.append(
+                    "[Output truncated at {} context lines. Use more specific parameters or pagination to read further.]".format(self.MAX_CONTEXT_LINES)
+                )
             max_results = min(self.max_results, self.MAX_RESULTS)
             
             matches = []
@@ -167,6 +176,7 @@ class FileSearchTool(ToolBase):
                     if len(lines) > self.MAX_LINES_PER_FILE:
                         lines = lines[:self.MAX_LINES_PER_FILE]
                         content = ''.join(lines)
+                        line_truncated_files.add(file_path)
                     file_lines_cache[file_path] = lines
                     line_offsets = [0]
                     for line in lines:
@@ -192,8 +202,10 @@ class FileSearchTool(ToolBase):
                         'match_text': match.group()
                     })
                     if len(matches) >= max_results:
+                        results_truncated = True
                         break
                 if len(matches) >= max_results:
+                    results_truncated = True
                     break            
             if not matches:
                 mode = "regex" if self.use_regex else "plain text"
@@ -314,6 +326,19 @@ class FileSearchTool(ToolBase):
                 header += f" in directory '{self.directory}'"
             header += f" (case_sensitive={self.case_sensitive}, max_results={self.max_results}):"
             output = header + "\n" + "\n".join(output_lines)
+
+            # Add truncation warnings
+            if line_truncated_files:
+                truncation_warnings.append(
+                    "[Output truncated at {} lines per file. Use more specific parameters or pagination to read further.]".format(self.MAX_LINES_PER_FILE)
+                )
+            if results_truncated:
+                truncation_warnings.append(
+                    "[Output truncated at {} results. Use more specific parameters or pagination to read further.]".format(max_results)
+                )
+            if truncation_warnings:
+                output += "\n" + "\n".join(truncation_warnings)
+
             return self._truncate_output(output)
             
         except Exception as e:

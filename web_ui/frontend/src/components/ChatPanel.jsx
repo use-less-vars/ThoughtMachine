@@ -24,7 +24,7 @@ import React, { useEffect, useLayoutEffect, useRef, useCallback } from 'react'
 import { MessageBubble } from './chat/MessageBubble'
 
 /* ── Main panel ── */
-function ChatPanel({ messages, loadMore, hasMore }) {
+function ChatPanel({ messages, loadMore, hasMore, scrollToBottomKey = 0 }) {
   const chatRef = useRef(null)
   const isAtBottomRef = useRef(true)
   const programmaticScrollRef = useRef(false)
@@ -44,14 +44,18 @@ function ChatPanel({ messages, loadMore, hasMore }) {
     isAtBottomRef.current = atBottom
   }, [])
 
-  // ── Programmatic scroll helper (sets guard flag) ──
-  const scrollToBottom = useCallback(() => {
+  // ── Centralized programmatic scroll helper ──
+  // All direct scroll-to-bottom calls route through this function.
+  // Pass force=true to scroll regardless of isAtBottomRef state.
+  const scrollToBottomFn = (force = false) => {
+    if (!force && !isAtBottomRef.current) return
     const el = chatRef.current
-    if (!el) return
-    programmaticScrollRef.current = true
-    el.scrollTop = el.scrollHeight
-    isAtBottomRef.current = true
-  }, [])
+    if (el) {
+      programmaticScrollRef.current = true
+      el.scrollTop = el.scrollHeight
+      isAtBottomRef.current = true
+    }
+  }
 
   // ── Auto-scroll on message append ──
   // Runs synchronously after DOM mutations (useLayoutEffect) but double-rAF
@@ -74,10 +78,7 @@ function ChatPanel({ messages, loadMore, hasMore }) {
 
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
-        if (chatRef.current) {
-          programmaticScrollRef.current = true
-          chatRef.current.scrollTop = chatRef.current.scrollHeight
-        }
+        scrollToBottomFn()
       })
     })
   }, [messages])
@@ -93,8 +94,7 @@ function ChatPanel({ messages, loadMore, hasMore }) {
       if (isAtBottomRef.current && !programmaticScrollRef.current) {
         if (el.scrollHeight - el.scrollTop - el.clientHeight > 1) {
           // Content expanded below the fold while user was at bottom.
-          programmaticScrollRef.current = true
-          el.scrollTop = el.scrollHeight
+          scrollToBottomFn()
         }
       }
     })
@@ -102,6 +102,21 @@ function ChatPanel({ messages, loadMore, hasMore }) {
     observer.observe(el)
     return () => observer.disconnect()
   }, [])
+
+  // ── Force scroll to bottom when scrollToBottomKey changes ──
+  // Used for context compaction/summary recovery (R3).
+  useEffect(() => {
+    const el = chatRef.current
+    if (!el) return
+    if (scrollToBottomKey === 0) return  // initial value, no action
+    if (!isAtBottomRef.current) return  // don't yank user from reading position
+
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        scrollToBottomFn(true)
+      })
+    })
+  }, [scrollToBottomKey])
 
   // ── Scroll to previous user query (jump up) ──
   const jumpToPrevQuery = () => {
@@ -142,16 +157,14 @@ function ChatPanel({ messages, loadMore, hasMore }) {
           <MessageBubble key={i} msg={msg} index={i} />
         ))}
       </div>
-      {!isAtBottomRef.current && (
-        <div className="scroll-nav-group">
-          <button className="scroll-prev-btn" onClick={jumpToPrevQuery} title="Jump to previous query">
-            ↑
-          </button>
-          <button className="scroll-bottom-btn" onClick={scrollToBottom} title="Scroll to bottom">
-            ↓
-          </button>
-        </div>
-      )}
+      <div className="scroll-nav-group">
+        <button className="scroll-prev-btn" onClick={jumpToPrevQuery} title="Jump to previous query">
+          ↑
+        </button>
+        <button className="scroll-bottom-btn" onClick={() => scrollToBottomFn(true)} title="Scroll to bottom">
+          ↓
+        </button>
+      </div>
     </div>
   )
 }

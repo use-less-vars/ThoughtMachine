@@ -915,12 +915,16 @@ class WebAgentBridge:
 
     def start(self, query: str, session_config: Optional[SessionConfig] = None) -> None:
         """Start a new agent session with the given SessionConfig."""
+        # Log config source for debugging
+        _sc = session_config or self._session_config
         log('INFO', 'server.bridge',
             f'start() called | query={query[:80]!r}... | '
             f'_controller={self._controller is not None} | '
             f'_loaded_session={self._loaded_session.session_id if self._loaded_session else None} | '
             f'is_running={self.is_running} | '
-            f'config_provider={session_config.provider_id if session_config else self._session_config.provider_id if self._session_config else "N/A"}')
+            f'config_provider={session_config.provider_id if session_config else self._session_config.provider_id if self._session_config else "N/A"} | '
+            f'mode={_sc.mode if _sc else "N/A"} | '
+            f'config_source={"explicit" if session_config else "fallback"}')
         if session_config is None:
             session_config = self._session_config
             if session_config is None:
@@ -932,13 +936,20 @@ class WebAgentBridge:
         self._session_config = session_config
 
         # Resolve API key from provider profile if not already set
-        if not session_config.api_key and session_config.provider_id:
+        if not session_config.api_key:
             try:
                 from agent.config.provider_profile import ProviderManager
                 manager = ProviderManager()
                 resolved = manager.resolve_config(session_config.model_dump(exclude_none=True))
-                if "api_key" in resolved:
+                if "api_key" in resolved and resolved["api_key"]:
                     session_config.api_key = resolved["api_key"]
+                else:
+                    # Fallback: find ANY available provider with an API key
+                    for profile in manager.list_profiles():
+                        if profile.api_key:
+                            session_config.api_key = profile.api_key
+                            session_config.provider_id = profile.id
+                            break
             except Exception:
                 pass
 
@@ -1222,6 +1233,29 @@ class WebAgentBridge:
         # Prompt changes (mode-locked: only works in custom mode)
         if "system_prompt" in config_dict:
             session_config.update_prompt(config_dict["system_prompt"])
+
+        # Mode field — only mutable before session starts (new session initialization)
+        if "mode" in config_dict:
+            new_mode = config_dict["mode"]
+            valid_modes = {"agent", "engineer", "custom"}
+            if new_mode not in valid_modes:
+                log("WARNING", "server.bridge",
+                    f"apply_config: invalid mode '{new_mode}' — must be one of {valid_modes}")
+            elif self._session is not None or self.is_running:
+                log("WARNING", "server.bridge",
+                    f"apply_config: mode change to '{new_mode}' rejected — "
+                    f"mode is immutable after session start")
+            elif new_mode != session_config.mode:
+                # Update mode and re-run mode presets via SessionConfig constructor
+                log("INFO", "server.bridge",
+                    f"apply_config: changing mode from '{session_config.mode}' to '{new_mode}'")
+                old_cfg = session_config.model_dump(exclude={'api_key'}, exclude_none=True)
+                old_cfg['mode'] = new_mode
+                try:
+                    session_config = SessionConfig(**old_cfg)
+                except Exception as e:
+                    log("WARNING", "server.bridge",
+                        f"apply_config: failed to apply mode '{new_mode}': {e}")
 
         # Mutable fields (always allowed regardless of mode)
         for field in ("provider_id", "model", "base_url", "temperature", "top_p", "max_tokens"):
@@ -1531,12 +1565,27 @@ class WebAgentBridge:
                     # Construct SessionConfig — validator applies mode presets
                     sc = SessionConfig(**session_config_raw)
 
+                    # 🛡️ Defensive: if mode is still None after construction, default to 'agent'
+                    # This catches edge cases where session_config_raw has an unrecognized
+                    # mode value or the SessionConfig model changed.
+                    if not sc.mode:
+                        sc.mode = 'agent'
+                        log('WARNING', 'server.bridge',
+                            f'load_session: mode was None after SessionConfig construction — defaulted to "agent"')
+
                     # Re-inject API key from provider resolution (never persisted)
                     try:
                         manager = ProviderManager()
                         resolved = manager.resolve_config({'provider_id': sc.provider_id})
                         if resolved.get('api_key'):
                             sc.api_key = resolved['api_key']
+                        else:
+                            # Fallback: find ANY available provider with an API key
+                            for profile in manager.list_profiles():
+                                if profile.api_key:
+                                    sc.api_key = profile.api_key
+                                    sc.provider_id = profile.id
+                                    break
                     except Exception as exc:
                         log('WARNING', 'server.bridge',
                             f'Could not resolve API key for provider {sc.provider_id}: {exc}')
@@ -2033,7 +2082,16 @@ class WebAgentBridge:
                     "messages": self._normalize_for_frontend(self._session.user_history),
                 })
 
-        elif event_type in ("user_query", "turn", "tool_call", "tool_result"):
+        elif event_type == "tool_call":
+            # Session has been updated by the agent; sync to frontend.
+            if self._session is not None:
+                self._history_version = self._session.conversation_version
+                self._emit({
+                    "type": "conversation_changed",
+                    "messages": self._normalize_for_frontend(self._session.user_history),
+                })
+
+        elif event_type in ("user_query", "turn", "tool_result"):
             # Session has been updated by the agent; sync to frontend.
             if self._session is not None:
                 self._history_version = self._session.conversation_version
@@ -2133,6 +2191,7 @@ class WebAgentBridge:
                     for raw_event in self._agent.process_query(query):
                         if self._stop_event.is_set():
                             break
+
                         self._map_and_emit(raw_event)
 
                         # Publish raw event to global event bus for EventLogger

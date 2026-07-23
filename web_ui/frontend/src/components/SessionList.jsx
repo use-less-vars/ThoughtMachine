@@ -232,7 +232,7 @@ export default function SessionList({ sessions, onNew, onOpenTab, onDelete, onRe
                   }}
                   title="Rename"
                 >
-                  ✏️
+                  Rename
                 </button>
                 <button
                   style={{ ...actionBtnStyle, color: 'var(--danger, #f38ba8)' }}
@@ -244,7 +244,7 @@ export default function SessionList({ sessions, onNew, onOpenTab, onDelete, onRe
                   }}
                   title="Delete"
                 >
-                  🗑️
+                  Delete
                 </button>
               </div>
             </div>

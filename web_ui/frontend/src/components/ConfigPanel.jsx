@@ -11,6 +11,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error'
   const [showManageProviders, setShowManageProviders] = useState(false);
   const [providerVersion, setProviderVersion] = useState(0);  // incremented when a provider is saved
+  const [allTools, setAllTools] = useState([]);
   const normalizeSessionPermissions = (permissions) => {
     const normalized = {
       filesystem: 'read',
@@ -109,6 +110,18 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
     }
   }, [applyError]);
 
+  // Fetch the complete list of all available tools from the backend
+  useEffect(() => {
+    fetch(`${API_BASE}/api/tools`)
+      .then(res => res.json())
+      .then(data => {
+        if (data.tools) setAllTools(data.tools);
+      })
+      .catch(() => {
+        // Ignore — tools tab will just show whatever the session config provides
+      });
+  }, []);
+
   // ── Derived: selected provider object ──────────────────────────────
   // Backend sends 'provider' in config_changed; fall back if 'provider_id' not set.
   const activeProviderId = draft.provider_id || draft.provider || '';
@@ -193,13 +206,15 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
     color: '#a6adc8',
   };
 
-  const isModeLocked = mode && mode !== 'custom'
+  // Fallback: use config?.mode when the mode prop is null (e.g. on session load)
+  const effectiveMode = mode || config?.mode || null;
+  const isModeLocked = effectiveMode && effectiveMode !== 'custom'
 
   const TAB_KEYS = ['workspace', 'permissions', 'system_prompt', 'general', 'model', 'tools', 'container', 'advanced'];
   const TAB_LABELS = { workspace: 'Workspace', permissions: 'Permissions', system_prompt: 'Prompt', general: 'General', model: 'Model', tools: 'Tools', container: 'Container', advanced: 'Advanced' };
 
-  const modeBadge = mode === 'agent' ? '🤖 Agent' : mode === 'engineer' ? '⚙️ Engineer' : mode === 'custom' ? '🎨 Custom' : null
-  const modeBadgeColor = mode === 'agent' ? '#89b4fa' : mode === 'engineer' ? '#a6e3a1' : mode === 'custom' ? '#f9e2af' : '#6c7086'
+  const modeBadge = effectiveMode === 'agent' ? 'Agent' : effectiveMode === 'engineer' ? 'Engineer' : effectiveMode === 'custom' ? 'Custom' : null
+  const modeBadgeColor = effectiveMode === 'agent' ? '#89b4fa' : effectiveMode === 'engineer' ? '#a6e3a1' : effectiveMode === 'custom' ? '#f9e2af' : '#6c7086'
 
   return (
     <div style={{ padding: '1rem', fontFamily: 'sans-serif', background: '#313244', color: '#cdd6f4', width: panelWidth || 280, minWidth: 200, maxWidth: 500, flexShrink: 0, overflowY: 'auto', height: '100%' }}>
@@ -219,7 +234,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           fontWeight: 600,
         }}>
           {modeBadge}
-          {isModeLocked && <span style={{ marginLeft: '0.15rem', opacity: 0.7 }}>🔒</span>}
+          {isModeLocked && <span style={{ marginLeft: '0.15rem', opacity: 0.7, fontSize: '0.7rem' }}>(locked)</span>}
         </div>
       )}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem' }}>
@@ -397,7 +412,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               color: '#f9e2af',
               fontSize: '0.8rem',
             }}>
-              🔒 Tools are locked in {mode === 'agent' ? 'Agent' : 'Engineer'} mode.
+              Tools are locked in {effectiveMode === 'agent' ? 'Agent' : 'Engineer'} mode.
               Switch to Custom mode to enable tool configuration.
             </div>
           )}
@@ -430,34 +445,39 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
             </small>
           </div>
           <div style={{ borderTop: '1px solid #45475a', paddingTop: '0.75rem' }}>
-            <label style={labelStyle}><strong>Tools</strong></label>
-            {availableTools.map((tool) => {
-              const toolName = tool.name || tool;
-              const toolConfig = draft.tools?.find(t => t.name === toolName);
-              const enabled = toolConfig ? toolConfig.enabled : false;
-              return (
-                <div key={toolName} style={{ marginBottom: '0.35rem' }}>
-                  <label style={{ cursor: isModeLocked ? 'default' : 'pointer', display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem', opacity: isModeLocked ? 0.6 : 1 }}>
-                    <input
-                      type="checkbox"
-                      checked={enabled}
-                      disabled={isModeLocked}
-                      onChange={(e) => {
-                        const updatedTools = draft.tools?.map(t =>
-                          t.name === toolName ? { ...t, enabled: e.target.checked } : t
-                        ) || [];
-                        if (!updatedTools.find(t => t.name === toolName)) {
-                          updatedTools.push({ name: toolName, enabled: e.target.checked });
-                        }
-                        setDraft({ ...draft, tools: updatedTools });
-                      }}
-                    />
-                    {toolName}
-                    {isModeLocked && <span style={{ color: '#6c7086', fontSize: '0.7rem', marginLeft: '0.25rem' }}>(read-only)</span>}
-                  </label>
-                </div>
-              );
-            })}
+            <label style={labelStyle}><strong>Tools ({allTools.length} total)</strong></label>
+            {allTools.length > 0 ? (
+              allTools.map((toolName) => {
+                const toolConfig = draft.tools?.find(t => t.name === toolName);
+                const enabled = toolConfig ? toolConfig.enabled : false;
+                return (
+                  <div key={toolName} style={{ marginBottom: '0.35rem' }}>
+                    <label style={{ cursor: isModeLocked ? 'default' : 'pointer', display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem', opacity: isModeLocked ? 0.6 : 1 }}>
+                      <input
+                        type="checkbox"
+                        checked={enabled}
+                        disabled={isModeLocked}
+                        onChange={(e) => {
+                          const updatedTools = draft.tools?.map(t =>
+                            t.name === toolName ? { ...t, enabled: e.target.checked } : t
+                          ) || [];
+                          if (!updatedTools.find(t => t.name === toolName)) {
+                            updatedTools.push({ name: toolName, enabled: e.target.checked });
+                          }
+                          setDraft({ ...draft, tools: updatedTools });
+                        }}
+                      />
+                      {toolName}
+                      {isModeLocked && <span style={{ color: '#6c7086', fontSize: '0.7rem', marginLeft: '0.25rem' }}>(read-only)</span>}
+                    </label>
+                  </div>
+                );
+              })
+            ) : (
+              <div style={{ color: '#6c7086', fontSize: '0.8rem', fontStyle: 'italic', padding: '0.5rem 0' }}>
+                Loading tool list...
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -621,14 +641,14 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
                 marginBottom: '0.5rem',
                 padding: '0.2rem 0.5rem',
                 borderRadius: '4px',
-                background: mode === 'agent' ? 'rgba(137,180,250,0.15)' : 'rgba(166,227,161,0.15)',
-                border: `1px solid ${mode === 'agent' ? '#89b4fa' : '#a6e3a1'}`,
-                color: mode === 'agent' ? '#89b4fa' : '#a6e3a1',
+                background: effectiveMode === 'agent' ? 'rgba(137,180,250,0.15)' : 'rgba(166,227,161,0.15)',
+                border: `1px solid ${effectiveMode === 'agent' ? '#89b4fa' : '#a6e3a1'}`,
+                color: effectiveMode === 'agent' ? '#89b4fa' : '#a6e3a1',
                 fontSize: '0.75rem',
                 fontWeight: 600,
               }}>
-                {mode === 'agent' ? '🤖' : '⚙️'} {mode === 'agent' ? 'Agent' : 'Engineer'} Factory Prompt
-                <span style={{ marginLeft: '0.15rem', opacity: 0.6, fontSize: '0.7rem' }}>🔒</span>
+                {effectiveMode === 'agent' ? 'Agent' : 'Engineer'} Factory Prompt
+                <span style={{ marginLeft: '0.15rem', opacity: 0.6, fontSize: '0.7rem' }}>(locked)</span>
               </div>
               {/* Read-only preview */}
               <div style={{ marginBottom: '1rem' }}>

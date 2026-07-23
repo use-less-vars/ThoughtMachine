@@ -604,7 +604,15 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             config_dict = msg.get("config", {})
                             if config_dict:
                                 config_dict = _translate_frontend_config(config_dict)
-                                bridge.start(query, SessionConfig(**config_dict))
+                                # 🛡️ Preserve mode from loaded session if frontend config doesn't specify it
+                                # Otherwise the frontend config (which may omit mode) would override
+                                # the correct mode loaded from session metadata with None → 'agent' default.
+                                if not config_dict.get('mode') and bridge._session_config and bridge._session_config.mode:
+                                    config_dict['mode'] = bridge._session_config.mode
+                                    log('INFO', 'server.ws',
+                                        f'continue_session: injected mode={bridge._session_config.mode} from loaded session config')
+                                sc = SessionConfig(**config_dict)
+                                bridge.start(query, sc)
                             else:
                                 bridge.start(query)
                         except Exception as exc:
@@ -725,6 +733,9 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         bridge.set_event_callback(event_callback, key=id(ws))
                         bridge.register()
                         bridge.set_controller(controller)
+                        # Initialize _session_config so get_config() returns valid data before start
+                        if bridge._session_config is None:
+                            bridge._session_config = SessionConfig()
 
                         # 4. Resolve or auto-register workspace for the new path
                         workspace_id = None
@@ -1951,6 +1962,21 @@ async def browse_directory(path: str = ""):
         return {"success": False, "error": str(exc), "entries": []}
 
 
+@app.get("/api/tools")
+async def api_get_tools():
+    """Return the complete list of all available tool names."""
+    try:
+        from session.tool_presets import _ALL_TOOLS
+        return {"tools": _ALL_TOOLS}
+    except ImportError:
+        # Fallback: try alternate import path
+        try:
+            from agent.config.presets import _ALL_TOOLS
+            return {"tools": _ALL_TOOLS}
+        except ImportError:
+            return {"tools": [], "error": "Could not load tool list"}
+
+
 @app.post("/api/browse/create")
 async def create_directory(body: dict):
     """Create a new directory for the workspace path browser."""
@@ -2200,6 +2226,7 @@ _FALLBACK_FRONTEND_CONFIG = {
     "kb_enabled": True,
     "kb_path": None,
     "tool_output_token_limit": 10000,
+    "mode": "agent",
     "detail": "normal",
     "session_permissions": {
         "container": False,

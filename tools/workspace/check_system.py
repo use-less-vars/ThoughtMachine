@@ -218,7 +218,7 @@ class CheckSystem(ToolBase):
 
         if DOCKER_EXECUTOR_AVAILABLE and _get_docker_status:
             try:
-                result = _get_docker_status(workspace_path=ws_path, session_permissions=self.session_permissions)
+                result = _get_docker_status(workspace_path=ws_path)
                 return result
             except Exception as e:
                 return {"status": "error", "error": str(e)}

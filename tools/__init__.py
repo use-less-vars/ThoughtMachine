@@ -219,6 +219,12 @@ try:
 except ImportError as e:
     logger.warning(f"Failed to import EditDockerfile: {e}")
 
+try:
+    from .workspace.working_document import WorkingDocument
+    TOOL_CLASSES.append(WorkingDocument)
+except ImportError as e:
+    logger.warning(f"Failed to import WorkingDocument: {e}")
+
 # MCP tools are registered lazily via register_mcp_tools() when the agent starts.
 # Do NOT call register_mcp_tools() here - it starts MCP server subprocesses
 # which can hang if servers are unavailable (see bug #BUG001).

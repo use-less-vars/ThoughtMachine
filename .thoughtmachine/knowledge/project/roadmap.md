@@ -428,3 +428,27 @@ A slide-in panel (similar to VS Code's sidebar) that gives the user full visibil
 - One-click installer for Windows/Mac/Linux
 - First-run wizard: provider key setup, workspace init, guided tour
 - Auto-update mechanism
+
+## 2026-07-22 — ## Task 1 — De-emojify GUI + remove Save button ✅
+- **Config...
+
+## Task 1 — De-emojify GUI + remove Save button ✅
+- **ConfigPanel.jsx**: Mode badges (🤖→Agent, ⚙️→Engineer, 🎨→Custom), lock icons (🔒→(locked)), factory prompt emoji removed
+- **SessionTab.jsx**: Save button removed entirely, Rename (✏️→Rename), Delete (🗑️ Delete→Delete), Yes/No confirm buttons de-emojified
+- **SessionList.jsx**: Rename (✏️→Rename), Delete (🗑️→Delete)
+
+## Task 2 — System prompt audit ✅
+- Traced system_prompt save/load path: apply_config→update_prompt→model_dump→SessionConfig(**raw_dict)
+- No bug found in Custom mode persistence — save/load pipeline is clean
+- Mode-locked prompting in Agent/Engineer is intentional (validator re-reads factory file)
+
+## Task 3 — Tool audit ✅
+- **3a CodeModifier**: Syntax test PASS — py_compile exit code 0. Minor cosmetic formatting quirk (no blank line before decorator) but syntactically valid.
+- **3b Tool call log**: Temporary tool_calls.log added to bridge.py at two dispatch points, then removed in final sweep.
+- **3c Bash equivalence**: Table of 5 tools. Key finding: silent truncation across FileEditor, GlobTool, DirectoryTreeTool — LLMs get incomplete results without notification.
+
+## Task 4 — Chat scroll anchoring ✅
+- **R1 Auto-scroll at bottom**: Already worked (20px threshold in handleScroll + useLayoutEffect)
+- **R2 No yank when reading history**: Already worked (isAtBottomRef guard)
+- **R3 Force scroll after summary**: NEW — SessionTab.jsx detects compaction keywords (context now free, summar, compact, messages removed) and increments scrollToBottomKey prop; ChatPanel.jsx watches it and force-scrolls via double-rAF
+- **R4 Jump buttons always visible**: Fixed — removed conditional `!isAtBottomRef.current` wrapper, buttons render unconditionally
