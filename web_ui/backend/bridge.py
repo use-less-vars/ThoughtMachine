@@ -1262,6 +1262,12 @@ class WebAgentBridge:
             if field in config_dict:
                 setattr(session_config, field, config_dict[field])
 
+        # Session permissions (always mutable — affects agent capabilities, not mode-locked)
+        if "session_permissions" in config_dict:
+            sp = config_dict["session_permissions"]
+            if sp is not None and isinstance(sp, dict):
+                session_config.session_permissions = sp
+
         # If provider_id changed, resolve provider credentials
         if "provider_id" in config_dict and config_dict["provider_id"]:
             try:

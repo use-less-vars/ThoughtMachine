@@ -735,7 +735,13 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         bridge.set_controller(controller)
                         # Initialize _session_config so get_config() returns valid data before start
                         if bridge._session_config is None:
-                            bridge._session_config = SessionConfig()
+                            from agent.config.presets import get_tools_for_mode
+                            bridge._session_config = SessionConfig(
+                                mode="agent",
+                                max_turns=100,
+                                session_permissions={},
+                                enabled_tools=list(get_tools_for_mode("agent")),
+                            )
 
                         # 4. Resolve or auto-register workspace for the new path
                         workspace_id = None
@@ -875,6 +881,19 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 "text": "⚠ No active session to configure",
                             })
                             continue
+
+                        # Initialize _session_config if this is the first config apply
+                        # (bridge may have been created via new_session without a config)
+                        # Use explicit defaults matching AgentConfig expectations so that
+                        # `model_dump()` never produces None for required AgentConfig fields.
+                        if bridge._session_config is None:
+                            from agent.config.presets import get_tools_for_mode
+                            bridge._session_config = SessionConfig(
+                                mode="agent",
+                                max_turns=100,
+                                session_permissions={},
+                                enabled_tools=list(get_tools_for_mode("agent")),
+                            )
 
                         # Translate frontend format → backend AgentConfig format
                         backend_config = _translate_frontend_config(config)
@@ -2175,6 +2194,9 @@ def _frontend_config_from_bridge(bridge) -> Dict[str, Any]:
     cfg = bridge.get_config()
     if cfg is None:
         return _default_frontend_config()
+    # Strip None values so AgentConfig defaults apply — prevents Pydantic
+    # validation errors when session_config fields are unset (None).
+    cfg = {k: v for k, v in cfg.items() if v is not None}
     # cfg is already a serialized dict — reconstruct AgentConfig for conversion
     from agent.config import AgentConfig
     agent_cfg = AgentConfig(**cfg)

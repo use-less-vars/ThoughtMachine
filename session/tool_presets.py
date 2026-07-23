@@ -54,11 +54,12 @@ _ALL_TOOLS = [
     "FieldViewer",
     "MCPValidator",
     "PaginateTool",
+    "WorkingDocument",
 ]
 
 # ── Tool Lists ────────────────────────────────────────────────────────────
 
-# Agent mode — 23 tools focused on code editing, research, and user interaction
+# Agent mode — 24 tools focused on code editing, research, and user interaction
 AGENT_TOOLS = [
     "ApplyEdits",
     "CheckSystem",
@@ -83,9 +84,10 @@ AGENT_TOOLS = [
     "Respond",
     "SummarizeTool",
     "Thought",
+    "WorkingDocument",
 ]
 
-# Engineer mode — 7 tools focused on worker orchestration and agent introspection
+# Engineer mode — 8 tools focused on worker orchestration and agent introspection
 ENGINEER_TOOLS = [
     "Worker",
     "CheckSystem",
@@ -94,9 +96,10 @@ ENGINEER_TOOLS = [
     "ProgressReport",
     "KnowledgeBaseTool",
     "GitInfoTool",
+    "WorkingDocument",
 ]
 
-# Custom mode — all 27 tools (unrestricted)
+# Custom mode — all 28 tools (unrestricted)
 CUSTOM_TOOLS = list(_ALL_TOOLS)
 
 
