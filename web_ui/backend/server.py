@@ -67,7 +67,7 @@ Server → Client (JSON):
     status_message      { "type": "status_message",      "text": "..." }
     sessions_list       { "type": "sessions_list",       "sessions": [...] }
     session_saved       { "type": "session_saved",       "session": {...} }
-    session_loaded      { "type": "session_loaded",      "session_id": "...", "session_name": "...", "message_count": int, "workspace_id": "..." }
+    session_loaded      { "type": "session_loaded",      "session_id": "...", "session_name": "...", "message_count": int, "workspace_id": "...", "workspace_path": "..." }
     session_deleted     { "type": "session_deleted",     "session_id": "..." }
     session_renamed     { "type": "session_renamed",     "session_id": "...", "new_name": "..." }
     open_sessions_list  { "type": "open_sessions_list",  "session_ids": ["..."] }
@@ -751,6 +751,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             if resolved:
                                 workspace_id = resolved
                                 bridge._workspace_id = resolved
+                                bridge._workspace_path = _project_path
                                 log('INFO', 'server',
                                     f"apply_config: resolved workspace {resolved} for {_project_path}")
                         except Exception as exc:
@@ -763,6 +764,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 entry = WorkspaceRegistry.get_default().register_by_root(str(_project_path))
                                 workspace_id = entry.id
                                 bridge._workspace_id = entry.id
+                                bridge._workspace_path = _project_path
                                 ensure_workspace_dirs(entry.id)
                                 log('INFO', 'server',
                                     f"apply_config: registered workspace {entry.id} for {_project_path}")
@@ -807,6 +809,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 "session_name": new_session.metadata.get('name', ''),
                                 "message_count": 0,
                                 "workspace_id": workspace_id or '',
+                                "workspace_path": _project_path,
                             })
                         elif existing_session is not None:
                             # No conversation (empty/fresh tab) — update workspace_id in-place
@@ -1318,6 +1321,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         "type": "session_loaded",
                         "session_id": session_id,
                         "workspace_id": bridge.workspace_id,
+                        "workspace_path": bridge._workspace_path or '',
                     })
                     await ws.send_json({
                         "type": "state_changed",
@@ -1647,6 +1651,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         "session_id": new_session.session_id,
                         "session_name": new_session.metadata.get('name', ''),
                         "workspace_id": bridge._workspace_id,
+                        "workspace_path": bridge._workspace_path or '',
                     })
                     await ws.send_json({
                         "type": "state_changed",
@@ -1758,6 +1763,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         "session_id": new_session.session_id,
                         "session_name": new_session.metadata.get('name', ''),
                         "workspace_id": bridge._workspace_id,
+                        "workspace_path": _project_path,
                     })
                     await ws.send_json({
                         "type": "state_changed",
@@ -2322,7 +2328,7 @@ def _backend_to_frontend_config(backend: Dict[str, Any]) -> Dict[str, Any]:
     # this fallback the frontend never receives workspace_path, the
     # ContainerPanel sends an empty workspace param, and the backend
     # returns "Container status unavailable".
-    cfg.setdefault("workspace_path", _project_root)
+    cfg.setdefault("workspace_path", None)
     return cfg
 
 

@@ -276,7 +276,9 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               fontFamily: 'monospace',
               wordBreak: 'break-all',
             }}>
-              {draft.workspace_path || <span style={{ color: '#6c7086', fontStyle: 'italic' }}>Not set</span>}
+              {draft.workspace_path
+                ? draft.workspace_path
+                : <span style={{ color: '#f38ba8', fontWeight: 'bold' }}>⚠️ No workspace — session is unbound. Set a workspace.</span>}
             </div>
           </div>
 

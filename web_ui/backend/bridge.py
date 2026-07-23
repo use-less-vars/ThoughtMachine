@@ -1650,6 +1650,7 @@ class WebAgentBridge:
                 "session_name": session.metadata.get('name', 'Untitled Session'),
                 "message_count": len(session.user_history),
                 "workspace_id": self.workspace_id,
+                "workspace_path": self._workspace_path or '',
             })
             # Emit initial context_length so the frontend status bar shows
             # the correct value immediately (no need to wait for a live token_update).
