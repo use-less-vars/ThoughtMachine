@@ -21,7 +21,6 @@ from typing import Dict, List
 _ALL_TOOLS = [
     # Core communication
     "Respond",
-    "Thought",
     "CheckSystem",
     # File operations
     "FileEditor",
@@ -47,10 +46,8 @@ _ALL_TOOLS = [
     # Session & agent utilities
     "SummarizeTool",
     "KnowledgeBaseTool",
-    "ProgressReport",
     # Worker & advanced
     "Worker",
-    "EditDockerfile",
     "FieldViewer",
     "MCPValidator",
     "PaginateTool",
@@ -59,7 +56,7 @@ _ALL_TOOLS = [
 
 # ── Tool Lists ────────────────────────────────────────────────────────────
 
-# Agent mode — 24 tools focused on code editing, research, and user interaction
+# Agent mode — 22 tools focused on code editing, research, and user interaction
 AGENT_TOOLS = [
     "ApplyEdits",
     "CheckSystem",
@@ -79,27 +76,24 @@ AGENT_TOOLS = [
     "KnowledgeBaseTool",
     "MCPValidator",
     "PaginateTool",
-    "ProgressReport",
     "ReadFile",
     "Respond",
     "SummarizeTool",
-    "Thought",
     "WorkingDocument",
 ]
 
-# Engineer mode — 8 tools focused on worker orchestration and agent introspection
+# Engineer mode — 7 tools focused on worker orchestration and agent introspection
 ENGINEER_TOOLS = [
     "Worker",
     "CheckSystem",
     "Respond",
     "SummarizeTool",
-    "ProgressReport",
     "KnowledgeBaseTool",
     "GitInfoTool",
     "WorkingDocument",
 ]
 
-# Custom mode — all 28 tools (unrestricted)
+# Custom mode — all 25 tools (unrestricted)
 CUSTOM_TOOLS = list(_ALL_TOOLS)
 
 
