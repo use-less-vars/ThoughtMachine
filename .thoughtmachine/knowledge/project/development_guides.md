@@ -989,3 +989,16 @@ A reusable modal for creating a new session with:
 - Add state: `const [showCreationModal, setShowCreationModal] = useState(false)`
 - Replace `handleNewTab` to open modal instead of directly sending `new_session`
 - The modal's `onCreate` callback should send `new_session` with the selected options
+
+## 2026-07-23 — ## Raw Tool Call Diagnostic Log
+
+**File:** `logs/tool_calls_...
+
+## Raw Tool Call Diagnostic Log
+## Raw Tool Call Diagnostic Log
+
+**File:** `logs/tool_calls_raw_debug.log` (in workspace root)
+**Purpose:** Logs every tool call's raw `arguments` JSON string *before* `json.loads()` parsing, to debug whether empty `{}` args come from the LLM API or from processing.
+**Mechanism:** Patch in `agent/core/tool_executor.py` at the `execute_tool_calls` method (around line 132), intercepts `arguments_str` before `json.loads()`.
+**Size limit:** 2MB max. When exceeded, the file is **truncated** (wiped clean with a timestamp header). No rotated files, no debris.
+**Usage:** When the empty `{}` bug is observed, check `logs/tool_calls_raw_debug.log` immediately — the relevant call will be near the bottom of the file.

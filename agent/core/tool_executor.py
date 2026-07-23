@@ -130,6 +130,24 @@ class ToolExecutor:
                 executed_tools.append({'name': tool_name, 'arguments': {}, 'result': tool_result})
                 continue
             arguments_str = tool_call['function']['arguments']
+            # ── RAW TOOL CALL DIAGNOSTIC ──
+            import os as _os, time as _time
+            _raw_log_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..", "logs")
+            _raw_log_dir = _os.path.normpath(_raw_log_dir)
+            _os.makedirs(_raw_log_dir, exist_ok=True)
+            _raw_log_path = _os.path.join(_raw_log_dir, "tool_calls_raw_debug.log")
+            # Size-limited: max 2MB, single file, no debris
+            _max_bytes = 2048 * 1024  # 2 MB
+            try:
+                if _os.path.isfile(_raw_log_path) and _os.path.getsize(_raw_log_path) >= _max_bytes:
+                    # Truncate — start fresh, no leftover files
+                    with open(_raw_log_path, "w") as _f_trunc:
+                        _f_trunc.write(f"# TRUNCATED at {_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            except OSError:
+                pass  # best-effort
+            with open(_raw_log_path, "a") as _f:
+                _f.write(f"{_time.strftime('%Y-%m-%d %H:%M:%S')} | {tool_name} | {arguments_str}\n")
+            # ────────────────────────────────
             try:
                 arguments = json.loads(arguments_str)
             except json.JSONDecodeError:
