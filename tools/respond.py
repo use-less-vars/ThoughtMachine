@@ -34,6 +34,18 @@ class Respond(ToolBase):
         None,
         description="Title for the report file (only used if report_body is provided)"
     )
+    status: Optional[Literal["final", "progress", "timeout"]] = Field(
+        None,
+        description="'final' = task complete; 'progress' = partial update, more to come; 'timeout' = system-generated on force-stop (not set by worker)"
+    )
+    confidence: Optional[Literal["high", "medium", "low"]] = Field(
+        None,
+        description="Worker's confidence in the response"
+    )
+    meta: Optional[dict] = Field(
+        None,
+        description="Additional metadata: struggles, needs_direction, blocked_by, remaining_work"
+    )
 
     @classmethod
     def get_required_categories(cls, params: dict | None = None) -> list[str]:

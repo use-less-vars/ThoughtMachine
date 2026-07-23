@@ -31,7 +31,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Optional, Union
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
 from pydantic import Field, field_validator
 
 from tools.base import ToolBase
@@ -616,6 +616,12 @@ class WorkerThread(threading.Thread):
         self.last_heartbeat: Optional[str] = None
         self._last_reasoning: Optional[str] = None
 
+        # Telemetry tracking
+        self._tool_call_count: int = 0
+        self._timeout_triggered: bool = False
+        self._final_token_usage: Optional[int] = None
+        self._respond_metadata: Dict[str, Any] = {}  # captures status/confidence/meta from last Respond call
+
         # Cached authoritative token count from agent's token_update events
         self._cached_context_tokens: Optional[int] = None
 
@@ -1007,13 +1013,23 @@ class WorkerThread(threading.Thread):
                 if event_type == "agent_responded":
                     final_content = event.get("content", "")
                     self._last_reasoning = event.get("reasoning")
+                    # Capture Respond metadata
+                    self._respond_metadata = {
+                        "status": event.get("status"),
+                        "confidence": event.get("confidence"),
+                        "meta": event.get("meta"),
+                    }
+
+                # Track tool call count
+                if event_type == "tool_call":
+                    self._tool_call_count += 1
 
                 elif event_type == "stopped":
                     stop_reason = event.get("stop_reason", "unknown")
-                    if stop_reason == "max_turns_reached":
-                        final_content = json.dumps({
-                            "error": "Worker reached max turns",
-                        })
+                    final_content = json.dumps({
+                        "error": f"Worker stopped: {stop_reason}",
+                        "content": f"Worker stopped before producing a final response. Reason: {stop_reason}."
+                    })
                     break
 
                 elif event_type == "stop_reason":
@@ -1058,6 +1074,24 @@ class WorkerThread(threading.Thread):
         self.current_task = None
         # Store elapsed time for inclusion in query result
         self._last_elapsed_val = time.monotonic() - _start
+
+        # Detect timeout
+        if hasattr(self, '_agent') and self._agent is not None:
+            try:
+                agent_state = self._agent.state
+                if (
+                    hasattr(agent_state, 'time_state')
+                    and hasattr(agent_state.time_state, 'value')
+                    and agent_state.time_state.value == "CRITICAL"
+                    and getattr(agent_state, 'restriction_reason', None) == "timeout"
+                ):
+                    self._timeout_triggered = True
+            except Exception:
+                pass
+
+        # Capture final token usage
+        self._final_token_usage = self.get_current_context_tokens()
+
         return final_content
 
     # ── thread run loop ────────────────────────────────────────────
@@ -1379,7 +1413,43 @@ class WorkerThread(threading.Thread):
                 self._save_context()
 
                 # Send the response back to the waiting tool call
-                self._output_queue.put(reply)
+
+                # Build telemetry
+                telemetry = {
+                    "elapsed_seconds": round(self._last_elapsed_val, 1) if self._last_elapsed_val else None,
+                    "tool_call_count": self._tool_call_count,
+                    "timeout_triggered": self._timeout_triggered,
+                    "token_usage": self._final_token_usage,
+                }
+
+                # Determine status for force-stop cases
+                status = self._respond_metadata.get("status")
+                if self._timeout_triggered and not status:
+                    status = "timeout"
+
+                # Build envelope
+                envelope = {
+                    "content": reply if reply else "Worker finished with no output.",
+                    "status": status,
+                    "confidence": self._respond_metadata.get("confidence"),
+                    "meta": self._respond_metadata.get("meta"),
+                    "telemetry": telemetry,
+                }
+
+                # If reply is already JSON (error case), parse and merge
+                if reply:
+                    try:
+                        parsed_reply = json.loads(reply)
+                        if isinstance(parsed_reply, dict):
+                            if "error" in parsed_reply:
+                                envelope["content"] = parsed_reply.get("error", reply)
+                                envelope["status"] = envelope["status"] or ("timeout" if self._timeout_triggered else "error")
+                            else:
+                                envelope["content"] = reply
+                    except (json.JSONDecodeError, TypeError):
+                        envelope["content"] = reply
+
+                self._output_queue.put(json.dumps(envelope, default=str))
 
         except Exception as exc:
             logger.exception("Worker thread %s failed", self.worker_name)
@@ -1643,6 +1713,19 @@ class Worker(ToolBase):
     force: bool = Field(
         default=False,
         description="If True, stop any existing worker instance (across all sessions) before spawning a fresh one.",
+    )
+
+    purpose: Optional[str] = Field(
+        default=None,
+        description="Purpose hint for the worker: 'coding', 'reviewing', 'researching', 'opinion', etc."
+    )
+    style: Optional[Literal["precise", "exploratory"]] = Field(
+        default="precise",
+        description="Worker behaviour: 'precise' = focused, minimal output; 'exploratory' = thorough, may digress"
+    )
+    meta: Optional[dict] = Field(
+        default=None,
+        description="General-purpose metadata dict forwarded to worker context"
     )
 
     skip_output_truncation: ClassVar[bool] = True
@@ -2143,6 +2226,16 @@ class Worker(ToolBase):
         # Store initial context for the thread to pick up in run()
         if self.context is not None and isinstance(self.context, dict):
             thread._initial_context = self.context
+        else:
+            thread._initial_context = {}
+
+        # Merge purpose, style, meta into initial context
+        if self.purpose is not None:
+            thread._initial_context["purpose"] = self.purpose
+        if self.style is not None:
+            thread._initial_context["style"] = self.style
+        if self.meta is not None:
+            thread._initial_context["meta"] = self.meta
 
         # Context is always preserved — context.json is never deleted on spawn.
         # If context.json exists from a previous run, it is loaded in run()
