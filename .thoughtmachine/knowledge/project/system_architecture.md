@@ -5700,3 +5700,117 @@ Refactoring `web_ui/backend/bridge.py` to use `SessionConfig` instead of `AgentC
 - **Validator/methods tested**: Mode presets, update_tools, update_prompt, factory method all pass.
 - **⚠️ Downstream impact**: `web_ui/backend/bridge.py` and `web_ui/backend/server.py` access `SessionConfig.workspace_path` directly, which will now fail at runtime (AttributeError). These need updating to get `workspace_path` from `AgentConfig` instead.
 
+
+## 2026-07-24 — ## 2026-07-23 — Security Architecture Proposal (for TM V2 re...
+
+## 2026-07-23 — Security Architecture Proposal (for TM V2 review)
+
+### Core Principles Adopted
+1. **The Vault Is Sacred** — ~/.thoughtmachine must be off-limits to all agent tools
+2. **No Session Without a Workspace** — every session must be workspace-bound
+3. **Defaults Must Be Restrictive** — ship safe, let users expand
+4. **Defense in Depth** — enforce at tool base, security gate, and Docker layers
+5. **Auditability** — every security decision logged and visible
+
+### Key Findings
+- `resources/default_config.json` has `network: true, container: true, filesystem: "write"` — fully permissive
+- `validate_path()` has NO vault protection — doesn't block `~/.thoughtmachine`
+- Two conflicting `WorkspaceCapabilities` models (Pydantic with `network=False` vs dataclass with `allow_network=True`)
+- `CheckSystem` reads vault files directly
+- `agent_config` (including `api_key`) is injected into all tools
+- Workers inherit full credentials with no isolation
+
+### See full proposal in WorkingDocument c10989c79acd "Proposal"
+
+## 2026-07-27 — ## Session Lifecycle (complete flow)
+
+### Key Components
+1. ...
+
+## Session Lifecycle (complete flow)
+
+### Key Components
+1. **WebAgentBridge** (`web_ui/backend/bridge.py`) - manages one agent session, thread-safe, emits events via callbacks
+2. **Session** (`session/models.py`) - data model with session_id, user_history, metadata, workspace_id
+3. **FileSystemSessionStore** (`session/store.py`) - persistence layer, singleton, JSON files + meta files
+4. **SessionRegistry** (`session/session_registry.py`) - in-memory index rebuilt from disk
+5. **Server** (`web_ui/backend/server.py`) - FastAPI WS endpoint, parses commands, creates/destroys bridges
+6. **SessionConfig** (`agent/config/session_config.py`) - user-configurable settings with mode enforcement
+7. **AgentController** (`agent/controller.py`) - optional controller wrapping the Agent
+
+### Flow: start_session
+1. Frontend sends `{command: "start_session", query: "...", config: {...}}`
+2. server.py translates config via `_translate_frontend_config()`, creates new AgentController + WebAgentBridge
+3. bridge.set_controller(controller) wires them together
+4. bridge.start(query, SessionConfig(**config_dict)):
+   - Resolves API key from ProviderManager if needed
+   - If controller exists: delegates to `controller.start(query, agent_config, session=session)`
+   - Otherwise: creates Agent with config and session, spawns daemon thread running _run_loop
+
+### Flow: continue_session
+1. Frontend sends `{command: "continue_session", query: "...", config?: {...}}`
+2. server.py checks 3 cases:
+   - Case 1: Bridge has _loaded_session (loaded from disk) but not running — starts fresh with session
+   - Case 2: Bridge is running — calls bridge.continue_session(query, config_dict)
+   - Case 3: No active session — error
+3. bridge.continue_session():
+   - Optionally applies config via apply_config()
+   - If using controller: controller.continue_session(query)
+   - If standalone: puts query on _query_queue
+
+### Flow: apply_config (normal, no workspace change)
+1. server.py translates config, calls bridge.apply_config(backend_config)
+2. bridge.apply_config():
+   - Updates mutable fields (provider_id, model, temperature, max_tokens, session_permissions)
+   - Mode-locked: tools/prompt only mutable in 'custom' mode
+   - Mode only mutable before session starts
+   - Resolves provider credentials on provider_id change
+   - Pushes to controller via request_config_update()
+   - Re-syncs Docker container
+   - Saves session to disk
+
+### Flow: apply_config (with workspace change)
+1. server.py detects workspace_path change
+2. Saves current session, stops bridge
+3. Creates fresh bridge + controller for new workspace
+4. Resolves/registers workspace via WorkspaceRegistry
+5. Session strategy:
+   - Existing session with conversation → creates NEW session for new workspace (opens new tab)
+   - Existing session empty/blank → updates workspace_id in-place (reuses tab)
+   - No existing session → creates fresh session
+6. Applies config to new bridge
+
+### Flow: save_session
+1. bridge.save_session(name=None):
+   - Uses active self._session if available
+   - Falls back to building from self._loaded_session
+   - Sets metadata (session_config, source, name)
+   - Calls session_store.save_session(session, workspace_id)
+   - Loads persisted worker contexts
+2. store.save_session() does atomic write via temp file + FileLock
+
+### Flow: save_open_session
+1. bridge.save_open_session(session_id=None):
+   - Calls save_session() first
+   - Then calls session_store.add_open_session(sid)
+   - Used by server's atexit _shutdown_save
+
+### Flow: close_session
+1. bridge.close_session(session_id=None):
+   - Stops bridge (stops agent thread)
+   - Saves session (captures final messages)
+   - Removes from open sessions
+   - Shuts down workers
+   - Clears state
+
+### Flow: load_session
+1. Frontend sends `{command: "load_session", session_id: "...", limit: 50, offset: 0}`
+2. server.py loads from store, creates fresh controller+bridge, sends session_loaded to frontend
+
+### Flow: shutdown (server.py atexit)
+1. _shutdown_save() iterates _session_bridges, saves each open session
+2. atexit + signal handlers (SIGINT/SIGTERM) ensure sessions survive Ctrl+C
+
+### No session_lifecycle.py exists
+- `agent/presenter/session_lifecycle.py` was referenced in summaries but does NOT exist in the codebase
+- All lifecycle logic lives in server.py (WS handler) and bridge.py (bridge class)

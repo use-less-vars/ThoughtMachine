@@ -1236,6 +1236,9 @@ class Agent:
                             'type': 'agent_responded',
                             'response_type': respond_result['response_type'] if respond_result else 'answer',
                             'content': respond_result['content'] if respond_result else content,
+                            'status': respond_result.get('status') if respond_result else None,
+                            'confidence': respond_result.get('confidence') if respond_result else None,
+                            'meta': respond_result.get('meta') if respond_result else None,
                             'turn': self._display_turn,
                             'context_length': self.state.current_conversation_tokens,
                             'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}
@@ -1308,7 +1311,7 @@ class Agent:
                         self.logger.log_system_resources()
                         self.logger.log_agent_end('completed', 'Assistant provided direct answer with no tool calls')
                         self.logger.close()
-                    final_event = {'type': 'agent_responded', 'response_type': 'answer', 'content': content, 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
+                    final_event = {'type': 'agent_responded', 'response_type': 'answer', 'content': content, 'status': None, 'confidence': None, 'meta': None, 'turn': self._display_turn, 'context_length': self.state.current_conversation_tokens, 'usage': {'input': last_input_tokens, 'output': last_output_tokens, 'total_input': self.total_input_tokens, 'total_output': self.total_output_tokens}}
                     if reasoning is not None:
                         final_event['reasoning'] = reasoning
                     elif tool_calls:

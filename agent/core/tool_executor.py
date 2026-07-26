@@ -98,7 +98,7 @@ class ToolExecutor:
             Tuple of:
             - executed_tools: List of executed tool information
             - final_detected: Whether a terminal tool was executed (Respond, Final, etc.)
-            - respond_result: Dict with 'response_type' and 'content' if Respond was executed, else None
+            - respond_result: Dict with 'response_type', 'content', 'status', 'confidence', 'meta' if Respond was executed, else None
             - summary_text: Summary text if SummarizeTool was called
             - summary_keep_recent_turns: Number of turns to keep for summarization
         """
@@ -178,7 +178,10 @@ class ToolExecutor:
                     final_detected = True
                     respond_result = {
                         'response_type': tool_execution_result.get('response_type'),
-                        'content': tool_execution_result.get('content')
+                        'content': tool_execution_result.get('content'),
+                        'status': tool_execution_result.get('status'),
+                        'confidence': tool_execution_result.get('confidence'),
+                        'meta': tool_execution_result.get('meta'),
                     }
                 elif tool_type == 'summary':
                     summary_requested = True
@@ -208,6 +211,9 @@ class ToolExecutor:
             - tool_type: 'normal', 'respond', or 'summary'
             - response_type: if tool_type == 'respond'
             - content: if tool_type == 'respond'
+            - status: if tool_type == 'respond'
+            - confidence: if tool_type == 'respond'
+            - meta: if tool_type == 'respond'
             - summary_text: if tool_type == 'summary'
             - summary_keep_recent_turns: if tool_type == 'summary'
         """
@@ -324,7 +330,15 @@ class ToolExecutor:
             if not tool_instance.skip_output_truncation:
                 tool_result = tool_instance._truncate_output(tool_result)
             if isinstance(tool_instance, Respond):
-                return {'result': tool_result, 'tool_type': 'respond', 'response_type': tool_instance.response_type, 'content': tool_result}
+                return {
+                    'result': tool_result,
+                    'tool_type': 'respond',
+                    'response_type': tool_instance.response_type,
+                    'content': tool_result,
+                    'status': tool_instance.status,
+                    'confidence': tool_instance.confidence,
+                    'meta': tool_instance.meta,
+                }
             elif isinstance(tool_instance, SummarizeTool):
                 return {'result': tool_result, 'tool_type': 'summary', 'summary_text': tool_instance.summary, 'summary_keep_recent_turns': tool_instance.keep_recent_turns}
             else:
