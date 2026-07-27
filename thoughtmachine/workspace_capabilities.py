@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from thoughtmachine.workspace_registry import _normalize_path
+
 # Minimal validation for template workers (avoids circular import via agent.__init__)
 _REQUIRED_WORKER_FIELDS = {"name", "description", "system_prompt", "tools", "permission_footprint"}
 
@@ -199,14 +201,15 @@ def resolve_workspace_id(workspace_path: str) -> Optional[str]:
     Resolve a workspace filesystem path to its workspace ID.
 
     Iterates over ``~/.thoughtmachine/workspaces/<id>/config.json`` files,
-    compares the ``root`` field (normalised) to *workspace_path*, and returns
-    the matching ID.  Returns ``None`` if no match is found.
+    compares the ``root`` field (normalised, case-insensitive on Windows)
+    to *workspace_path*, and returns the matching ID.
+    Returns ``None`` if no match is found.
     """
     base = _user_dir() / "workspaces"
     if not base.is_dir():
         return None
 
-    normalised_input = os.path.abspath(workspace_path).replace("\\", "/").rstrip("/")
+    normalised_input = _normalize_path(workspace_path)
 
     for entry in sorted(base.iterdir()):
         if not entry.is_dir():
@@ -219,7 +222,7 @@ def resolve_workspace_id(workspace_path: str) -> Optional[str]:
             root = data.get("root", "")
             if not root:
                 continue
-            normalised_root = os.path.abspath(root).replace("\\", "/").rstrip("/")
+            normalised_root = _normalize_path(root)
             if normalised_root == normalised_input:
                 return entry.name
         except (json.JSONDecodeError, OSError):

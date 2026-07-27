@@ -66,6 +66,19 @@ def _registry_path() -> Path:
     return _user_dir() / "workspace_registry.json"
 
 
+def _normalize_path(p: str) -> str:
+    """Normalise a filesystem path for case-insensitive comparison.
+
+    Applies ``os.path.abspath`` (resolve to absolute), ``os.path.normcase``
+    (lowercase on Windows, no-op on POSIX), converts backslashes to forward
+    slashes, and strips trailing slashes.
+
+    This ensures Windows paths like ``C:\\Users\\Foo`` and
+    ``c:\\users\\foo`` are treated as equal.
+    """
+    return os.path.normcase(os.path.abspath(p)).replace("\\", "/").rstrip("/")
+
+
 def _now_iso() -> str:
     """Return current UTC time as an ISO 8601 string."""
     return datetime.now(timezone.utc).isoformat()
@@ -250,7 +263,7 @@ class WorkspaceRegistry:
             now = _now_iso()
             entry = WorkspaceRegistryEntry(
                 id=workspace_id,
-                root_path=os.path.abspath(root_path),
+                root_path=_normalize_path(root_path),
                 label=label,
                 created_at=now,
                 updated_at=now,
@@ -339,7 +352,7 @@ class WorkspaceRegistry:
 
             for key, value in updates.items():
                 if key == "root_path":
-                    entry.root_path = os.path.abspath(str(value))
+                    entry.root_path = _normalize_path(str(value))
                 elif key == "label":
                     entry.label = str(value)
                 elif key == "last_opened":
@@ -357,18 +370,17 @@ class WorkspaceRegistry:
     def resolve_by_root(self, root_path: str) -> Optional[WorkspaceRegistryEntry]:
         """Resolve a filesystem path to a workspace entry.
 
-        The *root_path* is normalised via ``os.path.abspath`` before matching.
+        The *root_path* is normalised via :func:`_normalize_path` before
+        matching (case-insensitive on Windows).
         Returns the first matching entry, or ``None``.
         """
-        normalised = os.path.abspath(root_path).replace("\\", "/").rstrip("/")
+        normalised = _normalize_path(root_path)
         with self._lock:
             raw = self._load()
             for raw_entry in raw.values():
                 if not isinstance(raw_entry, dict):
                     continue
-                entry_root = os.path.abspath(
-                    raw_entry.get("root_path", "")
-                ).replace("\\", "/").rstrip("/")
+                entry_root = _normalize_path(raw_entry.get("root_path", ""))
                 if entry_root == normalised:
                     return WorkspaceRegistryEntry.from_dict(raw_entry)
             return None
