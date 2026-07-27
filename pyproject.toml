@@ -37,5 +37,12 @@ thoughtmachine = [
 [tool.setuptools.dynamic]
 version = { file = "resources/.version" }
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+]
+
 [project.urls]
 Homepage = "https://github.com/your-org/thoughtmachine"

@@ -5814,3 +5814,7 @@ Refactoring `web_ui/backend/bridge.py` to use `SessionConfig` instead of `AgentC
 ### No session_lifecycle.py exists
 - `agent/presenter/session_lifecycle.py` was referenced in summaries but does NOT exist in the codebase
 - All lifecycle logic lives in server.py (WS handler) and bridge.py (bridge class)
+
+## 2026-07-27 — 2025-07-22: Docker pipeline trace completed. Key finding: `d...
+
+2025-07-22: Docker pipeline trace completed. Key finding: `docker/requirements-docker.txt` contains ML bloat (sentence-transformers, chromadb, langchain, langchain-community) pulling ~3GB of unnecessary GPU packages (torch, nvidia-cudnn, nvidia-cublas, etc.) into the executor container. The earlier Dockerfile fix (COPY + pip install requirements-docker.txt) fixed the missing fast-json-repair bug but introduced massive bloat because requirements-docker.txt was never cleaned up. Full audit at `docs/infrastructure/docker-pipeline-trace.md`.

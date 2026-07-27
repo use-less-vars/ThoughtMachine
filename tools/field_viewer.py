@@ -8,7 +8,11 @@ import libcst.metadata
 from typing import ClassVar, Dict, List, Optional, Set, Tuple, Any, Union, Literal
 from pydantic import Field
 from .base import ToolBase
-from agent.logging import log
+try:
+    from agent.logging import log
+except ImportError:
+    import logging
+    log = logging.getLogger(__name__)
 import os
 import sys
 import json

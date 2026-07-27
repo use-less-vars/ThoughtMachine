@@ -1,0 +1,11 @@
+{
+  "doc_id": "d94427fde093",
+  "title": "system-notification-styling-changes",
+  "sections": {
+    "changes-made": "[2026-07-27 15:52:21] ## Changes Made\n\n### 1. `web_ui/frontend/src/styles.css` — Two CSS class overhauls\n\n**`.message-system-as-user`** (the outer bubble for all system notifications):\n- **Before:** Reddish/orangish tones — `rgba(255, 100, 100, 0.1)` background, `rgba(255, 100, 100, 0.3)` border, `#c99` text color, `font-style: italic`\n- **After:** Very subtle accent tones — `rgba(137, 180, 250, 0.06)` background, `rgba(137, 180, 250, 0.12)` border, `var(--text-secondary)` text color (#a6adc8, muted), no italic\n\n**`.worker-output-warning-banner-warning`** (warning banner in worker output panel):\n- **Before:** Yellow tones — `rgba(249, 226, 175, 0.12)` background, `#f9e2af` text, `rgba(249, 226, 175, 0.3)` border\n- **After:** Very subtle accent tones matching the muted style — `rgba(137, 180, 250, 0.06)` background, `var(--text-secondary)` text, `rgba(137, 180, 250, 0.12)` border\n\n### 2. `web_ui/frontend/src/components/chat/MessageBubble.jsx` — Token warning inline style removed\n\n**Inline style block** (inside `MessageContent`, the token warning special case):\n- **Before:** A bright yellow/amber banner with inline styles — `background: '#fff3cd'`, `border: '1px solid #ffc107'`, `color: '#856404'`, `fontWeight: 500`, custom padding/radius/font\n- **After:** Returns `<p className=\"system-text\">{msg.content}</p>` — same as other system notifications, matching the now-muted `.message-system-as-user` outer bubble\n",
+    "files-modified": "[2026-07-27 15:52:24] - `web_ui/frontend/src/styles.css` (2 edits)\n- `web_ui/frontend/src/components/chat/MessageBubble.jsx` (1 edit)\n",
+    "summary": ""
+  },
+  "created_at": "2026-07-27T15:52:17.035514",
+  "updated_at": "2026-07-27T15:52:24.512182"
+}

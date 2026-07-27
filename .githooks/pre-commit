@@ -2,7 +2,11 @@
 set -e
 
 # Activate the virtual environment
-source ~/PycharmProjects/ThoughtMachine-dev/.venv/bin/activate
+if [ -f .venv/bin/activate ]; then
+    source .venv/bin/activate
+elif [ -f /workspace/.venv/bin/activate ]; then
+    source /workspace/.venv/bin/activate
+fi
 
 echo "=== Pre-commit: Syntax check ==="
 FILES=$(git diff --cached --name-only --diff-filter=ACM | grep '\.py$' || true)
@@ -24,8 +28,8 @@ print('✅ Critical imports OK')
 " || { echo "❌ Import check failed — machine will not start"; exit 1; }
 
 echo ""
-echo "=== Pre-commit: Unit tests ==="
-python3 -m pytest tests/ -x --tb=short --ignore=tests/integration --deselect tests/presenter/test_token_warning_duplication.py || { echo "❌ Tests failed"; exit 1; }
+echo "=== Pre-commit: Fast tests ==="
+python3 -m pytest -m "not slow" --tb=short -q || { echo "❌ Tests failed"; exit 1; }
 
 echo ""
 echo "✅ All checks passed. Commit allowed."

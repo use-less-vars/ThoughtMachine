@@ -36,7 +36,11 @@ from pydantic import Field, field_validator
 
 from tools.base import ToolBase
 from tools.utils import model_to_openai_tool
-from agent.logging import log
+try:
+    from agent.logging import log
+except ImportError:
+    import logging
+    log = logging.getLogger(__name__)
 
 # File lock for atomic writes (same pattern as FileSystemSessionStore)
 try:
@@ -389,13 +393,18 @@ DEFAULT_WORKER_SYSTEM_PROMPT = (
     "Do not ask the user for clarification — the main agent already understood the request."
 )
 
-# Global tool name → class registry (built from tools.__init__.TOOL_CLASSES)
-# Resolved at import time — tools registered after this module loads
-# (Worker, EditDockerfile) are all in the blocklist, so no gap.
-from tools import TOOL_CLASSES as _TOOL_CLASSES_LIST
-_TOOL_REGISTRY: dict[str, type["ToolBase"]] = {
-    cls.__name__: cls for cls in _TOOL_CLASSES_LIST
-}
+# Global tool name → class registry (built lazily to avoid circular import
+# with tools.__init__ — that module imports this file (Worker) before
+# TOOL_CLASSES is fully populated, so we resolve on first use).
+def _build_tool_registry() -> dict[str, type["ToolBase"]]:
+    from tools import TOOL_CLASSES
+    return {cls.__name__: cls for cls in TOOL_CLASSES}
+
+_TOOL_REGISTRY: dict[str, type["ToolBase"]] = {}
+def _get_tool_registry() -> dict[str, type["ToolBase"]]:
+    if not _TOOL_REGISTRY:
+        _TOOL_REGISTRY.update(_build_tool_registry())
+    return _TOOL_REGISTRY
 
 # ---------------------------------------------------------------------------
 # Shutdown helper  (exposed for bridge integration)
@@ -1974,10 +1983,10 @@ class Worker(ToolBase):
     def _resolve_tool_class(self, tool_name: str) -> Optional[type[ToolBase]]:
         """Resolve a tool name string to its class via _TOOL_REGISTRY.
 
-        Uses the module-level ``_TOOL_REGISTRY`` dict built from
-        ``tools.TOOL_CLASSES`` at import time, so no lazy imports are needed.
+        Uses ``_get_tool_registry()`` which builds the registry lazily
+        on first access to avoid the circular import with ``tools.__init__``.
         """
-        cls = _TOOL_REGISTRY.get(tool_name)
+        cls = _get_tool_registry().get(tool_name)
         if cls is None:
             logger.warning("No known tool class for '%s'", tool_name)
             return None

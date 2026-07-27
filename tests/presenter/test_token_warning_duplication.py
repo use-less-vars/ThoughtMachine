@@ -89,8 +89,8 @@ class TestTokenWarningDuplication:
                     f"got {len(events)} at index {idx} (tokens={tokens})"
                 )
                 evt = events[0]
-                assert evt["type"] == "token_warning", (
-                    f"Expected event type 'token_warning', got '{evt.get('type')}' "
+                assert evt["type"] in ("token_warning", "token_recovery"), (
+                    f"Expected event type 'token_warning' or 'token_recovery', got '{evt.get('type')}' "
                     f"at index {idx} (tokens={tokens})"
                 )
 

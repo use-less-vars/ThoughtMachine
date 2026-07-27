@@ -175,23 +175,9 @@ function MessageContent({ msg }) {
     default:
       /* System notification messages with role 'user' render as system style */
       if (msg.is_system_notification) {
-        /* Token warnings get a distinct yellow/orange banner */
-        if (msg.content && (msg.content.toLowerCase().includes('token') || msg.content.includes('\u26a0\ufe0f'))) {
-          return (
-            <div style={{
-              background: '#fff3cd',
-              border: '1px solid #ffc107',
-              color: '#856404',
-              padding: '10px 14px',
-              borderRadius: '8px',
-              marginBottom: '8px',
-              fontWeight: 500,
-              fontSize: '0.9rem',
-              lineHeight: '1.4',
-            }}>
-              {msg.content}
-            </div>
-          )
+        /* Token warnings use the same muted style as other system notifications */
+        if (msg.content && (msg.content.toLowerCase().includes('token') || msg.content.includes('⚠️'))) {
+          return <p className="system-text">{msg.content}</p>
         }
         return <p className="system-text">{msg.content}</p>
       }

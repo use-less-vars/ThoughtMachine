@@ -1,0 +1,1483 @@
+(.venv) jojo@jojo-Swift-SFG16-71:~/PycharmProjects/ThoughtMachine-dev$ pytest --durations=10 -v --tb=short 2>&1 | tee /tmp/pytest_full_output2.txt
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.0, pluggy-1.6.0 -- /home/jojo/PycharmProjects/ThoughtMachine-dev/.venv/bin/python3.12
+cachedir: .pytest_cache
+rootdir: /home/jojo/PycharmProjects/ThoughtMachine-dev
+configfile: pyproject.toml
+testpaths: tests
+plugins: anyio-4.13.0, timeout-2.4.0
+collecting ... collected 757 items
+
+tests/docker_integration/test_container_integrity.py::TestDockerUnavailable::test_from_env_raises_runtime_error PASSED [  0%]
+tests/docker_integration/test_container_integrity.py::TestDockerUnavailable::test_from_env_raises_import_error PASSED [  0%]
+tests/docker_integration/test_container_integrity.py::TestDockerUnavailable::test_from_env_raises_docker_exception PASSED [  0%]
+tests/docker_integration/test_container_integrity.py::TestNoContainer::test_no_container_found PASSED [  0%]
+tests/docker_integration/test_container_integrity.py::TestNoContainer::test_no_container_with_permissions PASSED [  0%]
+tests/docker_integration/test_container_integrity.py::TestContainerMatches::test_matches_restrictive_defaults PASSED [  0%]
+tests/docker_integration/test_container_integrity.py::TestContainerMatches::test_matches_permissive_config PASSED [  0%]
+tests/docker_integration/test_container_integrity.py::TestContainerMatches::test_container_reload_called PASSED [  1%]
+tests/docker_integration/test_container_integrity.py::TestContainerMismatch::test_network_mismatch_removes_container PASSED [  1%]
+tests/docker_integration/test_container_integrity.py::TestContainerMismatch::test_mount_mode_mismatch_removes_container PASSED [  1%]
+tests/docker_integration/test_container_integrity.py::TestContainerMismatch::test_both_network_and_mode_mismatch PASSED [  1%]
+tests/docker_integration/test_container_integrity.py::TestContainerMismatch::test_stop_failure_reported_as_error PASSED [  1%]
+tests/docker_integration/test_container_integrity.py::TestContainerMismatch::test_remove_failure_reported_as_error PASSED [  1%]
+tests/docker_integration/test_container_integrity.py::TestContainerMismatch::test_container_still_stopped_even_if_remove_fails PASSED [  1%]
+tests/docker_integration/test_container_integrity.py::TestSessionPermissions::test_none_permissions_uses_restrictive_defaults PASSED [  1%]
+tests/docker_integration/test_container_integrity.py::TestSessionPermissions::test_explicit_restrictive_permissions PASSED [  2%]
+tests/docker_integration/test_container_integrity.py::TestSessionPermissions::test_permissive_permissions PASSED [  2%]
+tests/docker_integration/test_container_integrity.py::TestPathNormalisation::test_trailing_slash_stripped PASSED [  2%]
+tests/docker_integration/test_container_integrity.py::TestPathNormalisation::test_relative_path_resolved PASSED [  2%]
+tests/docker_integration/test_container_integrity.py::TestReturnStructure::test_keys_present_when_docker_unavailable PASSED [  2%]
+tests/docker_integration/test_container_integrity.py::TestReturnStructure::test_keys_present_when_no_container PASSED [  2%]
+tests/docker_integration/test_container_integrity.py::TestReturnStructure::test_keys_present_when_matches PASSED [  2%]
+tests/docker_integration/test_container_integrity.py::TestReturnStructure::test_keys_present_when_mismatch PASSED [  3%]
+tests/docker_integration/test_container_integrity.py::TestReturnStructure::test_desired_has_network_and_mode PASSED [  3%]
+tests/docker_integration/test_error_boundaries.py::TestResolveWorkspaceId::test_returns_none_on_import_error PASSED [  3%]
+tests/docker_integration/test_error_boundaries.py::TestResolveWorkspaceId::test_returns_none_on_generic_exception PASSED [  3%]
+tests/docker_integration/test_error_boundaries.py::TestResolveWorkspaceId::test_returns_id_on_success PASSED [  3%]
+tests/docker_integration/test_error_boundaries.py::TestComputeDesiredConfig::test_no_workspace_id_and_no_permissions PASSED [  3%]
+tests/docker_integration/test_error_boundaries.py::TestComputeDesiredConfig::test_workspace_id_but_no_permissions PASSED [  3%]
+tests/docker_integration/test_error_boundaries.py::TestComputeDesiredConfig::test_no_workspace_id_with_permissions_fallback PASSED [  3%]
+tests/docker_integration/test_error_boundaries.py::TestComputeDesiredConfig::test_no_workspace_id_with_banned_permissions PASSED [  4%]
+tests/docker_integration/test_error_boundaries.py::TestComputeDesiredConfig::test_gate_lookup_failure_falls_back_to_restrictive PASSED [  4%]
+tests/docker_integration/test_error_boundaries.py::TestComputeDesiredConfig::test_gate_returns_limited_caps PASSED [  4%]
+tests/docker_integration/test_error_boundaries.py::TestDockerApiErrorBoundaries::test_container_get_raises_api_error PASSED [  4%]
+tests/docker_integration/test_error_boundaries.py::TestDockerApiErrorBoundaries::test_container_reload_raises_api_error PASSED [  4%]
+tests/docker_integration/test_error_boundaries.py::TestDockerApiErrorBoundaries::test_container_attrs_missing_mounts_key PASSED [  4%]
+tests/docker_integration/test_error_boundaries.py::TestDockerApiErrorBoundaries::test_container_attrs_missing_hostconfig PASSED [  4%]
+tests/docker_integration/test_error_boundaries.py::TestDockerApiErrorBoundaries::test_container_with_multiple_mounts PASSED [  5%]
+tests/docker_integration/test_error_boundaries.py::TestDockerApiErrorBoundaries::test_stopped_container_is_still_inspected PASSED [  5%]
+tests/docker_integration/test_error_boundaries.py::TestIdempotency::test_no_container_called_twice PASSED [  5%]
+tests/docker_integration/test_error_boundaries.py::TestIdempotency::test_matching_container_called_twice PASSED [  5%]
+tests/docker_integration/test_startup_check.py::TestServerLifespanScan::test_no_containers_no_error PASSED [  5%]
+tests/docker_integration/test_startup_check.py::TestServerLifespanScan::test_single_container_matches PASSED [  5%]
+tests/docker_integration/test_startup_check.py::TestServerLifespanScan::test_single_container_mismatch_removed PASSED [  5%]
+tests/docker_integration/test_startup_check.py::TestServerLifespanScan::test_multiple_containers_all_scanned PASSED [  5%]
+tests/docker_integration/test_startup_check.py::TestServerLifespanScan::test_container_without_workspace_mount_skipped PASSED [  6%]
+tests/docker_integration/test_startup_check.py::TestServerLifespanScan::test_startup_scan_docker_unavailable PASSED [  6%]
+tests/docker_integration/test_startup_check.py::TestServerLifespanScan::test_verify_raises_logged_and_continues PASSED [  6%]
+tests/docker_integration/test_startup_check.py::TestSessionLoadVerification::test_session_load_triggers_verify PASSED [  6%]
+tests/docker_integration/test_startup_check.py::TestSessionLoadVerification::test_session_load_no_workspace_path_skips PASSED [  6%]
+tests/docker_integration/test_startup_check.py::TestSessionLoadVerification::test_session_load_with_permissions_passed PASSED [  6%]
+tests/docker_integration/test_startup_check.py::TestSessionLoadVerification::test_session_load_verify_raises_swallowed PASSED [  6%]
+tests/docker_integration/test_startup_check.py::TestSessionLoadVerification::test_session_load_removed_container_logged PASSED [  7%]
+tests/docker_integration/test_startup_check.py::TestSessionLoadVerification::test_session_load_no_model_dump_attribute PASSED [  7%]
+tests/integration/test_config_roundtrip.py::TestConfigRoundtrip::test_all_explicit_fields_roundtrip PASSED [  7%]
+tests/integration/test_config_roundtrip.py::TestConfigRoundtrip::test_custom_mode_respects_explicit_values PASSED [  7%]
+tests/integration/test_config_roundtrip.py::TestConfigRoundtrip::test_agent_mode_applies_preset PASSED [  7%]
+tests/integration/test_config_roundtrip.py::TestConfigRoundtrip::test_serialized_json_structure PASSED [  7%]
+tests/integration/test_preset_enforcement.py::TestPresetEnforcement::test_agent_update_tools_is_noop PASSED [  7%]
+tests/integration/test_preset_enforcement.py::TestPresetEnforcement::test_agent_update_prompt_is_noop PASSED [  7%]
+tests/integration/test_preset_enforcement.py::TestPresetEnforcement::test_engineer_excludes_file_editor PASSED [  8%]
+tests/integration/test_preset_enforcement.py::TestPresetEnforcement::test_engineer_includes_worker PASSED [  8%]
+tests/integration/test_preset_enforcement.py::TestPresetEnforcement::test_engineer_update_tools_is_noop PASSED [  8%]
+tests/integration/test_preset_enforcement.py::TestPresetEnforcement::test_custom_add_tool_persists PASSED [  8%]
+tests/integration/test_preset_enforcement.py::TestPresetEnforcement::test_custom_remove_tool_persists PASSED [  8%]
+tests/integration/test_preset_enforcement.py::TestPresetEnforcement::test_custom_update_tools_works PASSED [  8%]
+tests/integration/test_preset_enforcement.py::TestPresetEnforcement::test_custom_update_prompt_works PASSED [  8%]
+tests/integration/test_preset_enforcement.py::TestPresetEnforcement::test_validator_overwrites_tools_for_non_custom PASSED [  8%]
+tests/integration/test_preset_enforcement.py::TestPresetEnforcement::test_validator_overwrites_prompt_for_non_custom PASSED [  9%]
+tests/integration/test_session_lifecycle.py::TestSessionLifecycle::test_session_roundtrip[engineer] PASSED [  9%]
+tests/integration/test_session_lifecycle.py::TestSessionLifecycle::test_session_roundtrip[agent] PASSED [  9%]
+tests/integration/test_session_lifecycle.py::TestSessionLifecycle::test_session_roundtrip[custom] PASSED [  9%]
+tests/integration/test_vault_bootstrap.py::TestVaultBootstrap::test_directories_created PASSED [  9%]
+tests/integration/test_vault_bootstrap.py::TestVaultBootstrap::test_resource_files_deployed PASSED [  9%]
+tests/integration/test_vault_bootstrap.py::TestVaultBootstrap::test_resource_file_content PASSED [  9%]
+tests/integration/test_vault_bootstrap.py::TestVaultBootstrap::test_overwrite_false_skips_existing PASSED [ 10%]
+tests/integration/test_vault_bootstrap.py::TestVaultBootstrap::test_overwrite_true_replaces_existing PASSED [ 10%]
+tests/integration/test_vault_bootstrap.py::TestVaultBootstrap::test_load_user_config_returns_defaults PASSED [ 10%]
+tests/integration/test_vault_bootstrap.py::TestVaultBootstrap::test_load_user_config_falls_back PASSED [ 10%]
+tests/integration/test_vault_bootstrap.py::TestVaultBootstrap::test_session_config_from_bootstrap PASSED [ 10%]
+tests/presenter/test_context_updated_bridge.py::TestMapAndEmit::test_tokens_updated_has_agent_type_main PASSED [ 10%]
+tests/presenter/test_context_updated_bridge.py::TestMapAndEmit::test_context_updated_has_agent_type_main PASSED [ 10%]
+tests/presenter/test_context_updated_bridge.py::TestMapAndEmit::test_context_updated_no_context_length PASSED [ 10%]
+tests/presenter/test_context_updated_bridge.py::TestMapAndEmit::test_event_order_maintains_tokens_before_context PASSED [ 11%]
+tests/presenter/test_context_updated_bridge.py::TestMakeBusHandler::test_context_updated_includes_worker_name PASSED [ 11%]
+tests/presenter/test_context_updated_bridge.py::TestMakeBusHandler::test_context_updated_fallback_worker_name PASSED [ 11%]
+tests/presenter/test_context_updated_bridge.py::TestMakeBusHandler::test_tokens_updated_has_correct_flattening PASSED [ 11%]
+tests/presenter/test_context_updated_bridge.py::TestMakeBusHandler::test_non_special_events_get_worker_prefix PASSED [ 11%]
+tests/presenter/test_context_updated_bridge.py::TestDebugLogging::test_make_bus_handler_has_logging PASSED [ 11%]
+tests/presenter/test_context_updated_bridge.py::TestDebugLogging::test_map_and_emit_has_agent_type_logging PASSED [ 11%]
+tests/presenter/test_context_updated_bridge.py::TestDebugLogging::test_worker_spawned_has_diag_logging PASSED [ 12%]
+tests/presenter/test_context_updated_bridge.py::TestEventFlowIntegration::test_main_agent_token_event_flow PASSED [ 12%]
+tests/presenter/test_context_updated_bridge.py::TestEventFlowIntegration::test_worker_context_updated_flow PASSED [ 12%]
+tests/presenter/test_context_updated_bridge.py::TestEventFlowIntegration::test_dual_stream_no_cross_contamination PASSED [ 12%]
+tests/presenter/test_state_bridge.py::TestSaveConfigSystemPrompt::test_none_prompt_removes_custom_file PASSED [ 12%]
+tests/presenter/test_state_bridge.py::TestSaveConfigSystemPrompt::test_empty_string_prompt_removes_custom_file PASSED [ 12%]
+tests/presenter/test_state_bridge.py::TestSaveConfigSystemPrompt::test_whitespace_prompt_removes_custom_file PASSED [ 12%]
+tests/presenter/test_state_bridge.py::TestSaveConfigSystemPrompt::test_custom_prompt_writes_file PASSED [ 12%]
+tests/presenter/test_state_bridge.py::TestSaveConfigSystemPrompt::test_custom_prompt_overwrites_previous PASSED [ 13%]
+tests/presenter/test_state_bridge.py::TestSaveConfigSystemPrompt::test_factory_default_prompt_removes_custom_file PASSED [ 13%]
+tests/presenter/test_state_bridge.py::TestSaveConfigSystemPrompt::test_factory_default_stripped_variant_removes_custom_file PASSED [ 13%]
+tests/presenter/test_state_bridge.py::TestSaveConfigSystemPrompt::test_near_miss_prompt_writes_file PASSED [ 13%]
+tests/presenter/test_state_bridge.py::TestSaveConfigSystemPrompt::test_prompt_trailing_newline_matches PASSED [ 13%]
+tests/presenter/test_state_bridge.py::TestSaveConfigSystemPrompt::test_reset_config_to_factory_removes_custom_file PASSED [ 13%]
+tests/presenter/test_token_warning_duplication.py::TestTokenWarningDuplication::test_single_warning_across_oscillating_sequence FAILED [ 13%]
+tests/presenter/test_token_warning_duplication.py::TestTokenWarningDuplication::test_no_warning_when_below_threshold PASSED [ 14%]
+tests/presenter/test_token_warning_duplication.py::TestTokenWarningDuplication::test_warning_fires_at_first_crossing_from_clean_state FAILED [ 14%]
+tests/presenter/test_token_warning_duplication.py::TestTokenWarningDuplication::test_rapid_re_entry_after_drop_does_not_fire_again FAILED [ 14%]
+tests/presenter/test_token_warning_duplication.py::TestTokenWarningDuplication::test_internal_warning_flag_not_reset_by_reset_method PASSED [ 14%]
+tests/presenter/test_token_warning_duplication.py::TestTokenWarningDuplication::test_warning_survives_critical_to_low_transition FAILED [ 14%]
+tests/presenter/test_worker_persistence.py::TestLoadWorkerContexts::test_no_workspace_id PASSED [ 14%]
+tests/presenter/test_worker_persistence.py::TestLoadWorkerContexts::test_empty_workers_dir PASSED [ 14%]
+tests/presenter/test_worker_persistence.py::TestLoadWorkerContexts::test_no_workers_dir PASSED [ 14%]
+tests/presenter/test_worker_persistence.py::TestLoadWorkerContexts::test_loads_single_worker PASSED [ 15%]
+tests/presenter/test_worker_persistence.py::TestLoadWorkerContexts::test_loads_multiple_workers PASSED [ 15%]
+tests/presenter/test_worker_persistence.py::TestLoadWorkerContexts::test_skips_empty_subdir PASSED [ 15%]
+tests/presenter/test_worker_persistence.py::TestLoadWorkerContexts::test_skips_bad_json PASSED [ 15%]
+tests/presenter/test_worker_persistence.py::TestLoadWorkerContexts::test_skips_files_not_dirs PASSED [ 15%]
+tests/presenter/test_worker_persistence.py::TestLoadWorkerContexts::test_loads_from_real_directory PASSED [ 15%]
+tests/presenter/test_worker_persistence.py::TestResumeWorker::test_returns_context_for_known_worker PASSED [ 15%]
+tests/presenter/test_worker_persistence.py::TestResumeWorker::test_returns_none_for_unknown PASSED [ 15%]
+tests/presenter/test_worker_persistence.py::TestResumeWorker::test_returns_none_after_clear PASSED [ 16%]
+tests/presenter/test_worker_persistence.py::TestResumeWorker::test_persisted_workers_maintained_after_load PASSED [ 16%]
+tests/presenter/test_worker_persistence.py::TestGetWorkersPersistedContextFlag::test_has_persisted_context_flag PASSED [ 16%]
+tests/presenter/test_worker_persistence.py::TestGetWorkersPersistedContextFlag::test_all_false_when_no_workers_dir PASSED [ 16%]
+tests/presenter/test_worker_persistence.py::TestGetWorkersPersistedContextFlag::test_all_false_when_empty_workers_dir PASSED [ 16%]
+tests/presenter/test_worker_persistence.py::TestGetWorkersPersistedContextFlag::test_true_for_multiple_persisted_workers PASSED [ 16%]
+tests/presenter/test_worker_persistence.py::TestGetWorkersPersistedContextFlag::test_ignores_workers_not_in_config PASSED [ 16%]
+tests/security/test_null_event_bus.py::TestNullEventBusUnit::test_ask_returns_deny PASSED [ 17%]
+tests/security/test_null_event_bus.py::TestNullEventBusUnit::test_ask_is_instant PASSED [ 17%]
+tests/security/test_null_event_bus.py::TestNullEventBusUnit::test_publish_does_not_raise PASSED [ 17%]
+tests/security/test_null_event_bus.py::TestNullEventBusUnit::test_publish_dict_does_not_raise PASSED [ 17%]
+tests/security/test_null_event_bus.py::TestNullEventBusUnit::test_subscribe_does_not_raise PASSED [ 17%]
+tests/security/test_null_event_bus.py::TestNullEventBusUnit::test_unsubscribe_does_not_raise PASSED [ 17%]
+tests/security/test_null_event_bus.py::TestNullEventBusIntegration::test_ask_with_null_event_bus_returns_denied_instantly FAILED [ 17%]
+tests/security/test_null_event_bus.py::TestNullEventBusIntegration::test_ask_with_event_bus_none_returns_denied_instantly PASSED [ 17%]
+tests/security/test_null_event_bus.py::TestNullEventBusIntegration::test_ask_multi_category_with_null_bus FAILED [ 18%]
+tests/security/test_null_event_bus.py::TestNullEventBusIntegration::test_permission_footprint_still_apply_before_null_bus_check PASSED [ 18%]
+tests/security/test_null_event_bus.py::TestNullEventBusIntegration::test_existing_callers_still_work PASSED [ 18%]
+tests/security/test_null_event_bus.py::TestNullEventBusIntegration::test_null_bus_with_no_ask_requirements PASSED [ 18%]
+tests/security/test_security_gate.py::TestWorkspaceCapabilitiesModel::test_defaults PASSED [ 18%]
+tests/security/test_security_gate.py::TestWorkspaceCapabilitiesModel::test_custom_values PASSED [ 18%]
+tests/security/test_security_gate.py::TestGetWorkspaceCapabilities::test_default_when_file_missing PASSED [ 18%]
+tests/security/test_security_gate.py::TestGetWorkspaceCapabilities::test_loads_real_values PASSED [ 19%]
+tests/security/test_security_gate.py::TestGetWorkspaceCapabilities::test_missing_keys_use_defaults PASSED [ 19%]
+tests/security/test_security_gate.py::TestEffectivePermissionsMerge::test_all_max PASSED [ 19%]
+tests/security/test_security_gate.py::TestEffectivePermissionsMerge::test_network_workspace_denied PASSED [ 19%]
+tests/security/test_security_gate.py::TestEffectivePermissionsMerge::test_filesystem_write_downgraded PASSED [ 19%]
+tests/security/test_security_gate.py::TestEffectivePermissionsMerge::test_filesystem_read_unchanged PASSED [ 19%]
+tests/security/test_security_gate.py::TestEffectivePermissionsMerge::test_filesystem_banned_unchanged PASSED [ 19%]
+tests/security/test_security_gate.py::TestEffectivePermissionsMerge::test_filesystem_ask_unchanged PASSED [ 19%]
+tests/security/test_security_gate.py::TestEffectivePermissionsMerge::test_git_ask_workspace_available PASSED [ 20%]
+tests/security/test_security_gate.py::TestEffectivePermissionsMerge::test_git_workspace_denied PASSED [ 20%]
+tests/security/test_security_gate.py::TestEffectivePermissionsMerge::test_container_workspace_denied PASSED [ 20%]
+tests/security/test_security_gate.py::TestEffectivePermissionsMerge::test_container_both_true PASSED [ 20%]
+tests/security/test_security_gate.py::TestEffectivePermissionsMerge::test_system_passthrough PASSED [ 20%]
+tests/security/test_security_gate.py::TestCheckRequiredCategoriesAllow::test_empty_requirements PASSED [ 20%]
+tests/security/test_security_gate.py::TestCheckRequiredCategoriesAllow::test_single_write_allowed PASSED [ 20%]
+tests/security/test_security_gate.py::TestCheckRequiredCategoriesAllow::test_network_true_allowed PASSED [ 21%]
+tests/security/test_security_gate.py::TestCheckRequiredCategoriesAllow::test_container_true_allowed PASSED [ 21%]
+tests/security/test_security_gate.py::TestCheckRequiredCategoriesAllow::test_multiple_all_allowed PASSED [ 21%]
+tests/security/test_security_gate.py::TestCheckRequiredCategoriesDeny::test_banned_filesystem PASSED [ 21%]
+tests/security/test_security_gate.py::TestCheckRequiredCategoriesDeny::test_false_network PASSED [ 21%]
+tests/security/test_security_gate.py::TestCheckRequiredCategoriesDeny::test_false_container PASSED [ 21%]
+tests/security/test_security_gate.py::TestCheckRequiredCategoriesDeny::test_read_not_enough_for_write PASSED [ 21%]
+tests/security/test_security_gate.py::TestCheckRequiredCategoriesDeny::test_unknown_category PASSED [ 21%]
+tests/security/test_security_gate.py::TestCheckRequiredCategoriesAsk::test_ask_approved PASSED [ 22%]
+tests/security/test_security_gate.py::TestCheckRequiredCategoriesAsk::test_ask_denied PASSED [ 22%]
+tests/security/test_security_gate.py::TestCheckRequiredCategoriesAsk::test_ask_timeout PASSED [ 22%]
+tests/security/test_security_gate.py::TestCheckRequiredCategoriesAsk::test_ask_multiple_categories PASSED [ 22%]
+tests/security/test_security_gate.py::TestCheckRequiredCategoriesAsk::test_prompt_cleanup_after_approval PASSED [ 22%]
+tests/security/test_security_gate.py::TestCheckRequiredCategoriesAsk::test_ask_publishes_event_with_description PASSED [ 22%]
+tests/security/test_security_gate.py::TestResolvePrompt::test_resolve_existing PASSED [ 22%]
+tests/security/test_security_gate.py::TestResolvePrompt::test_resolve_nonexistent PASSED [ 22%]
+tests/security/test_security_gate.py::TestResolvePrompt::test_resolve_cleans_up PASSED [ 23%]
+tests/test_api_key_hygiene.py::TestAgentConfigSerialization::test_model_dump_excludes_api_key PASSED [ 23%]
+tests/test_api_key_hygiene.py::TestAgentConfigSerialization::test_model_dump_default_excludes_api_key PASSED [ 23%]
+tests/test_api_key_hygiene.py::TestAgentConfigSerialization::test_model_dump_field_exclude_always_wins PASSED [ 23%]
+tests/test_api_key_hygiene.py::TestStateBridgeApiKeyHygiene::test_get_config_excludes_api_key PASSED [ 23%]
+tests/test_api_key_hygiene.py::TestStateBridgeApiKeyHygiene::test_save_config_overlay_excludes_api_key PASSED [ 23%]
+tests/test_api_key_hygiene.py::TestStateBridgeApiKeyHygiene::test_reset_config_to_factory_excludes_api_key PASSED [ 23%]
+tests/test_api_key_hygiene.py::TestStateBridgeApiKeyHygiene::test_update_config_excludes_api_key PASSED [ 24%]
+tests/test_api_key_hygiene.py::TestStateBridgeApiKeyHygiene::test_load_config_excludes_api_key PASSED [ 24%]
+tests/test_api_key_hygiene.py::TestLoaderSaveConfigHygiene::test_save_config_excludes_api_key PASSED [ 24%]
+tests/test_api_key_hygiene.py::TestLoaderSaveConfigHygiene::test_save_config_does_not_touch_api_key_in_source PASSED [ 24%]
+tests/test_api_key_hygiene.py::TestConfigServiceHygiene::test_create_agent_config_service_excludes_api_key PASSED [ 24%]
+tests/test_api_key_hygiene.py::TestServerConfigToDictHygiene::test_config_to_dict_excludes_api_key PASSED [ 24%]
+tests/test_api_key_hygiene.py::TestPersistedFileHygiene::test_no_api_key_in_saved_overlay PASSED [ 24%]
+tests/test_ask_permission.py::TestToolExecutorAskPermission::test_git_write_tool_goes_through_ask_flow PASSED [ 24%]
+tests/test_ask_permission.py::TestToolExecutorAskPermission::test_git_write_tool_ask_denied PASSED [ 25%]
+tests/test_ask_permission.py::TestToolExecutorAskPermission::test_git_read_tool_with_git_ask_bypasses_prompt PASSED [ 25%]
+tests/test_ask_permission.py::TestToolExecutorAskPermission::test_git_full_bypasses_ask PASSED [ 25%]
+tests/test_ask_permission.py::TestToolExecutorAskPermission::test_git_read_bypasses_ask_with_read PASSED [ 25%]
+tests/test_ask_permission.py::TestResolveSecurityPrompt::test_resolve_places_response_on_queue PASSED [ 25%]
+tests/test_ask_permission.py::TestResolveSecurityPrompt::test_resolve_with_remember PASSED [ 25%]
+tests/test_ask_permission.py::TestResolveSecurityPrompt::test_resolve_unknown_request_id PASSED [ 25%]
+tests/test_bridge_permissions_sync.py::TestBridgePermissionsRoundtrip::test_apply_config_accepts_custom_permissions FAILED [ 26%]
+tests/test_bridge_permissions_sync.py::TestBridgePermissionsRoundtrip::test_roundtrip_preserves_permissions FAILED [ 26%]
+tests/test_bridge_permissions_sync.py::TestPermissionEnforcement::test_file_preview_denied_when_banned PASSED [ 26%]
+tests/test_bridge_permissions_sync.py::TestPermissionEnforcement::test_file_preview_allowed_when_read PASSED [ 26%]
+tests/test_bridge_permissions_sync.py::TestPermissionsHotSwap::test_hot_swap_banned_to_read PASSED [ 26%]
+tests/test_config_layering.py::TestLoadFactoryConfig::test_loads_from_json_file PASSED [ 26%]
+tests/test_config_layering.py::TestLoadFactoryConfig::test_returns_copy PASSED [ 26%]
+tests/test_config_layering.py::TestLoadFactoryConfig::test_caches_result PASSED [ 26%]
+tests/test_config_layering.py::TestLoadFactoryConfig::test_missing_file_falls_back_to_model_defaults PASSED [ 27%]
+tests/test_config_layering.py::TestLoadFactoryConfig::test_cache_cleared_by_fixture PASSED [ 27%]
+tests/test_config_layering.py::TestDeepMergeConfig::test_flat_merge_overwrites PASSED [ 27%]
+tests/test_config_layering.py::TestDeepMergeConfig::test_nested_dict_merge PASSED [ 27%]
+tests/test_config_layering.py::TestDeepMergeConfig::test_nested_dict_new_key PASSED [ 27%]
+tests/test_config_layering.py::TestDeepMergeConfig::test_base_not_mutated PASSED [ 27%]
+tests/test_config_layering.py::TestDeepMergeConfig::test_empty_overlay PASSED [ 27%]
+tests/test_config_layering.py::TestDeepMergeConfig::test_session_permissions_like_merge PASSED [ 28%]
+tests/test_config_layering.py::TestComputeConfigDiff::test_identical_configs PASSED [ 28%]
+tests/test_config_layering.py::TestComputeConfigDiff::test_different_scalar PASSED [ 28%]
+tests/test_config_layering.py::TestComputeConfigDiff::test_new_key_not_in_factory PASSED [ 28%]
+tests/test_config_layering.py::TestComputeConfigDiff::test_nested_dict_diff PASSED [ 28%]
+tests/test_config_layering.py::TestComputeConfigDiff::test_nested_dict_unchanged PASSED [ 28%]
+tests/test_config_layering.py::TestComputeConfigDiff::test_mixed_unchanged_and_changed PASSED [ 28%]
+tests/test_config_layering.py::TestLoadConfigLayering::test_missing_user_config_returns_factory PASSED [ 28%]
+tests/test_config_layering.py::TestLoadConfigLayering::test_empty_user_config_returns_factory PASSED [ 29%]
+tests/test_config_layering.py::TestLoadConfigLayering::test_user_overlay_merges_on_top PASSED [ 29%]
+tests/test_config_layering.py::TestLoadConfigLayering::test_nested_dict_overlay PASSED [ 29%]
+tests/test_config_layering.py::TestLoadConfigLayering::test_full_legacy_config_still_works PASSED [ 29%]
+tests/test_config_layering.py::TestStateBridgeOverlaySave::test_save_writes_minimal_overlay PASSED [ 29%]
+tests/test_config_layering.py::TestStateBridgeOverlaySave::test_save_load_roundtrip PASSED [ 29%]
+tests/test_config_layering.py::TestStateBridgeOverlaySave::test_save_does_not_write_unchanged_keys PASSED [ 29%]
+tests/test_config_layering.py::TestStateBridgeOverlaySave::test_save_system_prompt_handling PASSED [ 29%]
+tests/test_config_layering.py::TestStateBridgeOverlaySave::test_save_empty_system_prompt_removes_custom_file PASSED [ 30%]
+tests/test_config_layering.py::TestResetConfigToFactory::test_reset_clears_overlay_file PASSED [ 30%]
+tests/test_config_layering.py::TestResetConfigToFactory::test_reset_removes_custom_system_prompt PASSED [ 30%]
+tests/test_config_layering.py::TestResetConfigToFactory::test_reset_restores_factory_values PASSED [ 30%]
+tests/test_config_layering.py::TestResetConfigToFactory::test_reset_returns_factory_dict PASSED [ 30%]
+tests/test_config_layering.py::TestLegacyFullConfigMigration::test_legacy_full_config_loads_correctly PASSED [ 30%]
+tests/test_config_layering.py::TestLegacyFullConfigMigration::test_legacy_full_config_save_converts_to_overlay PASSED [ 30%]
+tests/test_config_layering.py::TestFactoryEdgeCases::test_factory_config_cache_reset_between_tests PASSED [ 31%]
+tests/test_config_layering.py::TestFactoryEdgeCases::test_factory_does_not_contain_system_prompt_value PASSED [ 31%]
+tests/test_config_merging.py::TestDeepMerge::test_flat_merge PASSED      [ 31%]
+tests/test_config_merging.py::TestDeepMerge::test_nested_dict_deep_merge PASSED [ 31%]
+tests/test_config_merging.py::TestDeepMerge::test_nested_dict_overlay_has_extra_key PASSED [ 31%]
+tests/test_config_merging.py::TestDeepMerge::test_overlay_none_removes_key PASSED [ 31%]
+tests/test_config_merging.py::TestDeepMerge::test_overlay_none_on_nested_preserves_outer PASSED [ 31%]
+tests/test_config_merging.py::TestDeepMerge::test_base_is_not_mutated PASSED [ 31%]
+tests/test_config_merging.py::TestDeepMerge::test_empty_overlay PASSED   [ 32%]
+tests/test_config_merging.py::TestDeepMerge::test_scalar_overrides_dict PASSED [ 32%]
+tests/test_config_merging.py::TestResolveConfig::test_no_profile_id_returns_unchanged PASSED [ 32%]
+tests/test_config_merging.py::TestResolveConfig::test_unknown_profile_id_returns_unchanged PASSED [ 32%]
+tests/test_config_merging.py::TestResolveConfig::test_provider_fields_overwritten PASSED [ 32%]
+tests/test_config_merging.py::TestResolveConfig::test_model_override_takes_precedence PASSED [ 32%]
+tests/test_config_merging.py::TestResolveConfig::test_user_model_preserved_when_no_override PASSED [ 32%]
+tests/test_config_merging.py::TestResolveConfig::test_default_model_fallback PASSED [ 33%]
+tests/test_config_merging.py::TestResolveConfig::test_switching_providers_overwrites_fields PASSED [ 33%]
+tests/test_config_merging.py::TestResolveConfig::test_model_override_with_switched_provider PASSED [ 33%]
+tests/test_config_merging.py::TestResolveConfig::test_original_dict_not_mutated PASSED [ 33%]
+tests/test_config_merging.py::TestResolveFromProfile::test_resolve_preserves_user_model PASSED [ 33%]
+tests/test_config_merging.py::TestResolveFromProfile::test_resolve_applies_model_override PASSED [ 33%]
+tests/test_config_merging.py::TestResolveFromProfile::test_resolve_falls_back_to_default_model PASSED [ 33%]
+tests/test_config_merging.py::TestUpdateConfig::test_simple_update PASSED [ 33%]
+tests/test_config_merging.py::TestUpdateConfig::test_update_adds_new_key PASSED [ 34%]
+tests/test_config_merging.py::TestUpdateConfig::test_original_not_mutated PASSED [ 34%]
+tests/test_config_merging.py::TestUpdateConfig::test_empty_updates PASSED [ 34%]
+tests/test_config_merging.py::TestUpdateConfig::test_nested_not_deep_merged PASSED [ 34%]
+tests/test_config_merging.py::TestValidateConfig::test_valid_minimal_config PASSED [ 34%]
+tests/test_config_merging.py::TestValidateConfig::test_valid_full_config PASSED [ 34%]
+tests/test_config_merging.py::TestValidateConfig::test_invalid_config_returns_none PASSED [ 34%]
+tests/test_config_merging.py::TestValidateConfig::test_stop_check_string_is_stripped PASSED [ 35%]
+tests/test_config_snapshot.py::TestConfigSnapshot::test_capture_creates_file FAILED [ 35%]
+tests/test_config_snapshot.py::TestConfigSnapshot::test_capture_excludes_api_key PASSED [ 35%]
+tests/test_config_snapshot.py::TestConfigSnapshot::test_capture_excludes_stop_check PASSED [ 35%]
+tests/test_config_snapshot.py::TestConfigSnapshot::test_capture_includes_config_dict PASSED [ 35%]
+tests/test_config_snapshot.py::TestConfigSnapshot::test_load_returns_snapshot PASSED [ 35%]
+tests/test_config_snapshot.py::TestConfigSnapshot::test_load_capture_roundtrip PASSED [ 35%]
+tests/test_config_snapshot.py::TestConfigSnapshot::test_load_no_file PASSED [ 35%]
+tests/test_config_snapshot.py::TestConfigSnapshot::test_capture_default_label PASSED [ 36%]
+tests/test_config_snapshot.py::TestConfigSnapshot::test_corrupted_file_returns_corrupted_data PASSED [ 36%]
+tests/test_config_snapshot.py::TestConfigSnapshot::test_multiple_captures_overwrite PASSED [ 36%]
+tests/test_config_snapshot.py::TestConfigSnapshot::test_timestamp_is_recent PASSED [ 36%]
+tests/test_config_snapshot.py::TestConfigSnapshot::test_non_existent_directory_creates_it PASSED [ 36%]
+tests/test_config_snapshot.py::TestConfigSnapshot::test_config_with_no_enabled_tools FAILED [ 36%]
+tests/test_emergency_mode.py::TestEmergencyModeFlag::test_emergency_mode_defaults_to_false PASSED [ 36%]
+tests/test_emergency_mode.py::TestEmergencyModeFlag::test_emergency_mode_can_be_set_true PASSED [ 36%]
+tests/test_emergency_mode.py::TestEmergencyModeFlag::test_emergency_mode_can_be_toggled PASSED [ 37%]
+tests/test_emergency_mode.py::TestEmergencyModeReduction::test_no_reduction_when_emergency_off PASSED [ 37%]
+tests/test_emergency_mode.py::TestEmergencyModeReduction::test_reduction_when_emergency_on PASSED [ 37%]
+tests/test_emergency_mode.py::TestEmergencyModeReduction::test_most_recent_messages_preserved PASSED [ 37%]
+tests/test_emergency_mode.py::TestEmergencyModeReduction::test_system_prompt_preserved PASSED [ 37%]
+tests/test_emergency_mode.py::TestEmergencyModeReduction::test_summary_preserved PASSED [ 37%]
+tests/test_emergency_mode.py::TestEmergencyModeReduction::test_emergency_with_small_history PASSED [ 37%]
+tests/test_emergency_mode.py::TestEmergencyModeReduction::test_emergency_no_summary_no_system PASSED [ 38%]
+tests/test_emergency_mode.py::TestEmergencyModeReduction::test_emergency_too_few_to_skip PASSED [ 38%]
+tests/test_emergency_mode.py::TestHistoryProviderEmergencyMode::test_provider_emergency_mode_delegates PASSED [ 38%]
+tests/test_emergency_mode.py::TestHistoryProviderEmergencyMode::test_provider_emergency_mode_toggle PASSED [ 38%]
+tests/test_emergency_mode.py::TestHistoryProviderEmergencyMode::test_provider_emergency_reduces_context PASSED [ 38%]
+tests/test_emergency_mode.py::TestHistoryProviderEmergencyMode::test_provider_emergency_off_after_toggle PASSED [ 38%]
+tests/test_event_logger.py::TestEventLogger::test_start_stop PASSED      [ 38%]
+tests/test_event_logger.py::TestEventLogger::test_event_written_to_file PASSED [ 38%]
+tests/test_event_logger.py::TestEventLogger::test_multiple_events PASSED [ 39%]
+tests/test_event_logger.py::TestEventLogger::test_logger_context_manager PASSED [ 39%]
+tests/test_event_logger.py::TestEventLogger::test_new_event_types_work PASSED [ 39%]
+tests/test_event_logger.py::TestEventLogger::test_async_queue_drain PASSED [ 39%]
+tests/test_event_logger.py::TestEventLogger::test_create_event_with_new_types PASSED [ 39%]
+tests/test_first_run.py::test_full_first_run_lifecycle FAILED            [ 39%]
+tests/test_health_endpoint.py::TestHealthEndpoint::test_empty_response FAILED [ 39%]
+tests/test_health_endpoint.py::TestHealthEndpoint::test_legacy_worker_status PASSED [ 40%]
+tests/test_health_endpoint.py::TestHealthEndpoint::test_session_scoped_worker_status PASSED [ 40%]
+tests/test_health_endpoint.py::TestHealthEndpoint::test_session_scoped_fallback_session_id PASSED [ 40%]
+tests/test_health_endpoint.py::TestHealthEndpoint::test_workspace_filter PASSED [ 40%]
+tests/test_health_endpoint.py::TestHealthEndpoint::test_event_log_tail_empty PASSED [ 40%]
+tests/test_health_endpoint.py::TestHealthEndpoint::test_event_log_tail_with_entries PASSED [ 40%]
+tests/test_health_endpoint.py::TestHealthEndpoint::test_both_layouts_simultaneously PASSED [ 40%]
+tests/test_health_endpoint.py::TestHealthEndpoint::test_active_sessions_via_store PASSED [ 40%]
+tests/test_history_pruner.py::TestFindSummaryIndices::test_no_summaries PASSED [ 41%]
+tests/test_history_pruner.py::TestFindSummaryIndices::test_one_summary PASSED [ 41%]
+tests/test_history_pruner.py::TestFindSummaryIndices::test_multiple_summaries PASSED [ 41%]
+tests/test_history_pruner.py::TestFindSummaryIndices::test_summary_without_flag_not_counted PASSED [ 41%]
+tests/test_history_pruner.py::TestIsSystemNotification::test_flag_true PASSED [ 41%]
+tests/test_history_pruner.py::TestIsSystemNotification::test_content_marker PASSED [ 41%]
+tests/test_history_pruner.py::TestIsSystemNotification::test_regular_user PASSED [ 41%]
+tests/test_history_pruner.py::TestIsSystemNotification::test_assistant PASSED [ 42%]
+tests/test_history_pruner.py::TestGroupTurns::test_single_turn PASSED    [ 42%]
+tests/test_history_pruner.py::TestGroupTurns::test_multiple_turns PASSED [ 42%]
+tests/test_history_pruner.py::TestGroupTurns::test_notifications_start_turns_as_user_role PASSED [ 42%]
+tests/test_history_pruner.py::TestGroupTurns::test_dual_signal_grouping PASSED [ 42%]
+tests/test_history_pruner.py::TestPruneNoPruningIfOnlyOneSummary::test_no_summaries_returns_copy PASSED [ 42%]
+tests/test_history_pruner.py::TestPruneNoPruningIfOnlyOneSummary::test_one_summary_unchanged PASSED [ 42%]
+tests/test_history_pruner.py::TestPruneNoPruningIfOnlyOneSummary::test_default_min_is_2 PASSED [ 42%]
+tests/test_history_pruner.py::TestPruneWithTwoSummaries::test_basic_two_summary_pruning PASSED [ 43%]
+tests/test_history_pruner.py::TestPruneWithTwoSummaries::test_old_region_compacted PASSED [ 43%]
+tests/test_history_pruner.py::TestPruneTurnWithFinalTool::test_final_turn_keeps_user_asst_and_result PASSED [ 43%]
+tests/test_history_pruner.py::TestPruneTurnWithFinalTool::test_multi_tool_with_final PASSED [ 43%]
+tests/test_history_pruner.py::TestPruneTurnWithoutFinal::test_plain_assistant_ending PASSED [ 43%]
+tests/test_history_pruner.py::TestPruneTurnWithoutFinal::test_multiple_assistants_no_final PASSED [ 43%]
+tests/test_history_pruner.py::TestPruneTurnWithoutFinal::test_tool_calls_no_final PASSED [ 43%]
+tests/test_history_pruner.py::TestPruneTurnWithoutFinal::test_keep_plain_answer_only_fallback PASSED [ 43%]
+tests/test_history_pruner.py::TestPruneTurnWithoutFinal::test_keep_plain_answer_only_false PASSED [ 44%]
+tests/test_history_pruner.py::TestPruneSystemMessagesAndNotifications::test_system_messages_pass_through PASSED [ 44%]
+tests/test_history_pruner.py::TestPruneSystemMessagesAndNotifications::test_notifications_pass_through PASSED [ 44%]
+tests/test_history_pruner.py::TestPruneSystemMessagesAndNotifications::test_passthrough_preserves_order PASSED [ 44%]
+tests/test_history_pruner.py::TestPruneSystemMessagesAndNotifications::test_notifications_dropped_from_old_region PASSED [ 44%]
+tests/test_history_pruner.py::TestPruneSystemMessagesAndNotifications::test_notifications_kept_in_old_region_with_policy PASSED [ 44%]
+tests/test_history_pruner.py::TestPruneSystemMessagesAndNotifications::test_summaries_remain_in_original_order PASSED [ 44%]
+tests/test_history_pruner.py::TestAssistantStartedTurns::test_compact_no_user_turn_keeps_assistant PASSED [ 45%]
+tests/test_history_pruner.py::TestAssistantStartedTurns::test_compact_no_user_with_tool_calls PASSED [ 45%]
+tests/test_history_pruner.py::TestAssistantStartedTurns::test_pruning_between_user_and_assistant PASSED [ 45%]
+tests/test_history_pruner.py::TestAssistantStartedTurns::test_pruning_with_assistant_starts_in_old_region PASSED [ 45%]
+tests/test_history_pruner.py::TestSeqNumberingPreserved::test_seq_values_untouched PASSED [ 45%]
+tests/test_history_pruner.py::TestMultipleSummarizations::test_three_summaries_prune_oldest PASSED [ 45%]
+tests/test_history_pruner.py::TestMultipleSummarizations::test_two_most_recent_cycles_intact PASSED [ 45%]
+tests/test_history_pruner.py::TestMultipleSummarizations::test_orphans_dropped PASSED [ 45%]
+tests/test_history_pruner.py::TestEmptyOldRegion::test_cut_idx_zero PASSED [ 46%]
+tests/test_history_pruner.py::TestEmptyOldRegion::test_cut_idx_first_message PASSED [ 46%]
+tests/test_history_pruner.py::TestEdgeCaseMissingToolResult::test_final_call_missing_result PASSED [ 46%]
+tests/test_history_pruner.py::TestPruneIdempotent::test_pruning_twice_same_result PASSED [ 46%]
+tests/test_history_pruner.py::TestPruneIdempotent::test_input_not_mutated PASSED [ 46%]
+tests/test_history_pruner.py::TestFinalToolNames::test_all_final_names_defined PASSED [ 46%]
+tests/test_history_pruner.py::TestFinalToolNames::test_no_extra_names PASSED [ 46%]
+tests/test_notification_pipeline.py::TestNotificationPipeline::test_notification_appears_in_context PASSED [ 47%]
+tests/test_notification_pipeline.py::TestNotificationPipeline::test_notification_flag_is_true PASSED [ 47%]
+tests/test_notification_pipeline.py::TestNotificationPipeline::test_non_notification_messages_have_no_flag PASSED [ 47%]
+tests/test_notification_pipeline.py::TestNotificationPipeline::test_notification_in_correct_turn PASSED [ 47%]
+tests/test_notification_pipeline.py::TestNotificationPipeline::test_notification_after_trigger PASSED [ 47%]
+tests/test_notification_pipeline.py::TestNotificationPipeline::test_context_ordering_preserved PASSED [ 47%]
+tests/test_notification_pipeline.py::TestNotificationPipeline::test_notification_survives_context_building PASSED [ 47%]
+tests/test_per_worker_eventbus_bridge.py::test_bridge_subscribes_to_per_worker_bus_on_spawn PASSED [ 47%]
+tests/test_permissions_roundtrip.py::TestSessionPermissionsRoundTrip::test_default_round_trip PASSED [ 48%]
+tests/test_permissions_roundtrip.py::TestSessionPermissionsRoundTrip::test_custom_permissions_round_trip PASSED [ 48%]
+tests/test_permissions_roundtrip.py::TestSessionPermissionsRoundTrip::test_permissive_permissions_round_trip PASSED [ 48%]
+tests/test_permissions_roundtrip.py::TestSessionPermissionsRoundTrip::test_restrictive_permissions_round_trip PASSED [ 48%]
+tests/test_permissions_roundtrip.py::TestSessionPermissionsRoundTrip::test_model_dump_is_serializable PASSED [ 48%]
+tests/test_permissions_roundtrip.py::TestSessionPermissionsRoundTrip::test_exclude_api_key_keeps_permissions PASSED [ 48%]
+tests/test_permissions_roundtrip.py::TestConfigFileRoundTrip::test_default_permissions_survive_file_io PASSED [ 48%]
+tests/test_permissions_roundtrip.py::TestConfigFileRoundTrip::test_custom_permissions_survive_file_io PASSED [ 49%]
+tests/test_permissions_roundtrip.py::TestConfigFileRoundTrip::test_json_file_contents_are_human_readable PASSED [ 49%]
+tests/test_permissions_roundtrip.py::TestConfigFileRoundTrip::test_missing_session_permissions_backfilled_from_defaults FAILED [ 49%]
+tests/test_permissions_roundtrip.py::TestConfigFileRoundTrip::test_partial_permissions_backfilled_from_defaults PASSED [ 49%]
+tests/test_permissions_roundtrip.py::TestSessionSecurityConfigRoundTrip::test_default_security_config_round_trip PASSED [ 49%]
+tests/test_permissions_roundtrip.py::TestSessionSecurityConfigRoundTrip::test_custom_security_config_round_trip PASSED [ 49%]
+tests/test_permissions_roundtrip.py::TestSessionSecurityConfigRoundTrip::test_security_config_isolation PASSED [ 49%]
+tests/test_permissions_roundtrip.py::TestSessionSecurityConfigRoundTrip::test_security_config_json_serializable PASSED [ 49%]
+tests/test_permissions_roundtrip.py::TestToolExecutionAfterConfigCycle::test_permissive_config_allows_write_after_cycle PASSED [ 50%]
+tests/test_permissions_roundtrip.py::TestToolExecutionAfterConfigCycle::test_restrictive_config_denies_after_cycle PASSED [ 50%]
+tests/test_permissions_roundtrip.py::TestToolExecutionAfterConfigCycle::test_multi_requirement_tool_after_cycle PASSED [ 50%]
+tests/test_permissions_roundtrip.py::TestToolExecutionAfterConfigCycle::test_multi_requirement_denied_if_one_missing_after_cycle PASSED [ 50%]
+tests/test_permissions_roundtrip.py::TestSessionConfigDoesNotBridgeToToolExecution::test_session_config_is_independent_of_tool_permissions PASSED [ 50%]
+tests/test_permissions_roundtrip.py::TestSessionConfigDoesNotBridgeToToolExecution::test_session_config_can_be_independently_modified PASSED [ 50%]
+tests/test_permissions_roundtrip.py::TestCancelPendingPrompts::test_cancel_sets_event PASSED [ 50%]
+tests/test_permissions_roundtrip.py::TestCancelPendingPrompts::test_cancel_clears_pending_requests PASSED [ 50%]
+tests/test_permissions_roundtrip.py::TestCancelPendingPrompts::test_cancel_twice_is_idempotent PASSED [ 51%]
+tests/test_permissions_roundtrip.py::TestCancelPendingPrompts::test_thread_exits_with_denial_on_cancel PASSED [ 51%]
+tests/test_security_defaults.py::TestNetworkDefault::test_default_network_is_banned PASSED [ 51%]
+tests/test_security_defaults.py::TestNetworkDefault::test_explicit_network_write_still_works PASSED [ 51%]
+tests/test_security_defaults.py::TestNetworkDefault::test_explicit_network_ask_still_works PASSED [ 51%]
+tests/test_security_defaults.py::TestDefaultPolicy::test_default_policy_is_deny PASSED [ 51%]
+tests/test_security_defaults.py::TestDefaultPolicy::test_explicit_policy_allow_still_works_via_merge PASSED [ 51%]
+tests/test_security_defaults.py::TestDefaultPolicy::test_explicit_policy_deny_still_works PASSED [ 52%]
+tests/test_session_guardrails.py::TestSessionUserHistoryGuardrail::test_user_history_starts_as_observable_list PASSED [ 52%]
+tests/test_session_guardrails.py::TestSessionUserHistoryGuardrail::test_assign_plain_list_auto_wraps PASSED [ 52%]
+tests/test_session_guardrails.py::TestSessionUserHistoryGuardrail::test_assign_empty_plain_list PASSED [ 52%]
+tests/test_session_guardrails.py::TestSessionUserHistoryGuardrail::test_assign_observable_list_preserved PASSED [ 52%]
+tests/test_session_guardrails.py::TestSessionUserHistoryGuardrail::test_content_preserved_after_multiple_assignments PASSED [ 52%]
+tests/test_session_guardrails.py::TestSessionUserHistoryGuardrail::test_conversation_version_not_incremented_by_plain_assign PASSED [ 52%]
+tests/test_session_guardrails.py::TestSessionUserHistoryGuardrail::test_callback_preserved_on_wrap PASSED [ 52%]
+tests/test_session_store.py::TestInit::test_default_dirs_use_thoughtmachine_home PASSED [ 53%]
+tests/test_session_store.py::TestInit::test_custom_sessions_dir PASSED   [ 53%]
+tests/test_session_store.py::TestInit::test_custom_state_dir PASSED      [ 53%]
+tests/test_session_store.py::TestInit::test_directories_created_on_init PASSED [ 53%]
+tests/test_session_store.py::TestOpenSessionsPath::test_path_in_state_dir PASSED [ 53%]
+tests/test_session_store.py::TestOpenSessionsPath::test_path_parent_created PASSED [ 53%]
+tests/test_session_store.py::TestSaveLoadRoundTrip::test_save_and_load PASSED [ 53%]
+tests/test_session_store.py::TestSaveLoadRoundTrip::test_save_updates_timestamp PASSED [ 54%]
+tests/test_session_store.py::TestSaveLoadRoundTrip::test_load_nonexistent_returns_none PASSED [ 54%]
+tests/test_session_store.py::TestSaveLoadRoundTrip::test_double_save_overwrites PASSED [ 54%]
+tests/test_session_store.py::TestSaveLoadRoundTrip::test_multiple_sessions PASSED [ 54%]
+tests/test_session_store.py::TestAtomicSave::test_temp_file_cleaned_up PASSED [ 54%]
+tests/test_session_store.py::TestAtomicSave::test_temp_file_cleaned_up_on_error PASSED [ 54%]
+tests/test_session_store.py::TestAtomicSave::test_file_is_valid_json PASSED [ 54%]
+tests/test_session_store.py::TestCurrentSessionMarker::test_marker_in_state_dir PASSED [ 54%]
+tests/test_session_store.py::TestCurrentSessionMarker::test_marker_not_in_sessions_dir PASSED [ 55%]
+tests/test_session_store.py::TestCurrentSessionMarker::test_get_set_current_session PASSED [ 55%]
+tests/test_session_store.py::TestCurrentSessionMarker::test_clear_marker PASSED [ 55%]
+tests/test_session_store.py::TestListSessions::test_list_empty PASSED    [ 55%]
+tests/test_session_store.py::TestListSessions::test_list_with_sessions PASSED [ 55%]
+tests/test_session_store.py::TestListSessions::test_list_skips_non_session_files PASSED [ 55%]
+tests/test_session_store.py::TestDeleteSession::test_delete_existing PASSED [ 55%]
+tests/test_session_store.py::TestDeleteSession::test_delete_nonexistent PASSED [ 56%]
+tests/test_session_store.py::TestGetSessionPath::test_get_path_for_saved_session PASSED [ 56%]
+tests/test_session_store.py::TestGetSessionPath::test_get_path_for_unsaved_session PASSED [ 56%]
+tests/test_session_store.py::TestCurrentSessionMigration::test_migrates_from_old_location_on_read PASSED [ 56%]
+tests/test_session_store.py::TestCurrentSessionMigration::test_prefers_new_location_over_old PASSED [ 56%]
+tests/test_session_store.py::TestCurrentSessionMigration::test_empty_old_marker_does_not_migrate PASSED [ 56%]
+tests/test_session_store.py::TestOpenSessionsMigration::test_reads_from_new_location_first PASSED [ 56%]
+tests/test_session_store.py::TestOpenSessionsMigration::test_fallback_to_old_location PASSED [ 56%]
+tests/test_session_store.py::TestOpenSessionsMigration::test_list_ignores_old_open_sessions_in_sessions_dir PASSED [ 57%]
+tests/test_state_timeout.py::TestGetAllowedTools::test_get_allowed_tools_timeout_returns_only_respond PASSED [ 57%]
+tests/test_state_timeout.py::TestGetAllowedTools::test_get_allowed_tools_token_critical_returns_respond_and_summarize PASSED [ 57%]
+tests/test_state_timeout.py::TestGetAllowedTools::test_get_allowed_tools_turn_critical_returns_only_respond PASSED [ 57%]
+tests/test_state_timeout.py::TestGetAllowedTools::test_get_allowed_tools_no_restrictions_returns_empty PASSED [ 57%]
+tests/test_state_timeout.py::TestRestrictionReason::test_restriction_reason_set_on_timeout_critical PASSED [ 57%]
+tests/test_state_timeout.py::TestRestrictionReason::test_restriction_reason_set_on_token_critical FAILED [ 57%]
+tests/test_state_timeout.py::TestRestrictionReason::test_restriction_reason_set_on_turn_critical FAILED [ 57%]
+tests/test_state_timeout.py::TestRestrictionReason::test_restriction_reason_cleared_when_time_returns_to_low FAILED [ 58%]
+tests/test_state_timeout.py::TestRestrictionReason::test_restriction_reason_cleared_when_token_returns_to_low FAILED [ 58%]
+tests/test_state_timeout.py::TestRestrictionReason::test_restriction_reason_cleared_when_turn_returns_to_low FAILED [ 58%]
+tests/test_state_timeout.py::TestRestrictionReason::test_restriction_reason_cleared_on_reset PASSED [ 58%]
+tests/test_state_timeout.py::TestTimeoutWarningMessage::test_timeout_warning_message_contains_restriction_hint FAILED [ 58%]
+tests/test_state_timeout.py::TestTimeoutWarningMessage::test_timeout_critical_message_contains_only_respond_hint FAILED [ 58%]
+tests/test_system_prompt.py::TestMigrateLegacySystemPrompt::test_no_legacy_file_does_nothing PASSED [ 58%]
+tests/test_system_prompt.py::TestMigrateLegacySystemPrompt::test_legacy_migrates_to_custom PASSED [ 59%]
+tests/test_system_prompt.py::TestMigrateLegacySystemPrompt::test_both_exist_keeps_custom PASSED [ 59%]
+tests/test_system_prompt.py::TestMigrateLegacySystemPrompt::test_empty_legacy_does_not_create_custom PASSED [ 59%]
+tests/test_system_prompt.py::TestLoadCustomSystemPrompt::test_no_file_returns_none PASSED [ 59%]
+tests/test_system_prompt.py::TestLoadCustomSystemPrompt::test_existing_file_returns_content PASSED [ 59%]
+tests/test_system_prompt.py::TestLoadCustomSystemPrompt::test_empty_file_returns_none PASSED [ 59%]
+tests/test_system_prompt.py::TestMigrateSystemPromptInConfig::test_strips_system_prompt_when_custom_file_exists PASSED [ 59%]
+tests/test_system_prompt.py::TestMigrateSystemPromptInConfig::test_keeps_system_prompt_when_no_custom_file PASSED [ 59%]
+tests/test_system_prompt.py::TestMigrateSystemPromptInConfig::test_handles_config_without_system_prompt PASSED [ 60%]
+tests/test_system_prompt.py::TestAgentConfigSystemPromptValidator::test_custom_file_takes_precedence FAILED [ 60%]
+tests/test_system_prompt.py::TestAgentConfigSystemPromptValidator::test_explicit_value_when_no_custom_file FAILED [ 60%]
+tests/test_system_prompt.py::TestAgentConfigSystemPromptValidator::test_empty_string_falls_to_factory PASSED [ 60%]
+tests/test_system_prompt.py::TestSystemPromptOverlayContamination::test_system_prompt_not_in_overlay PASSED [ 60%]
+tests/test_system_prompt.py::TestSystemPromptOverlayContamination::test_empty_system_prompt_not_in_overlay PASSED [ 60%]
+tests/test_system_prompt.py::TestSystemPromptOverlayContamination::test_factory_matching_system_prompt_not_in_overlay PASSED [ 60%]
+tests/test_tool_executor.py::TestToolExecutorPermissions::test_permissive_tool_runs PASSED [ 61%]
+tests/test_tool_executor.py::TestToolExecutorPermissions::test_container_tool_denied PASSED [ 61%]
+tests/test_tool_executor.py::TestToolExecutorPermissions::test_multiple_requirements PASSED [ 61%]
+tests/test_tool_executor.py::TestToolExecutorPermissions::test_respects_custom_permissions_via_check_permissions PASSED [ 61%]
+tests/test_tool_executor.py::TestToolExecutorPermissions::test_error_returned_as_normal_tool_type PASSED [ 61%]
+tests/test_tool_executor.py::TestDynamicCategories::test_file_editor_read_operation PASSED [ 61%]
+tests/test_tool_executor.py::TestDynamicCategories::test_file_editor_write_operation PASSED [ 61%]
+tests/test_tool_executor.py::TestDynamicCategories::test_respond_without_report_body PASSED [ 61%]
+tests/test_tool_executor.py::TestDynamicCategories::test_respond_with_report_body PASSED [ 62%]
+tests/test_tool_executor.py::TestDynamicCategories::test_static_fallback PASSED [ 62%]
+tests/test_tool_executor.py::TestDynamicCategories::test_no_params_fallback PASSED [ 62%]
+tests/test_tool_executor.py::TestToolExecutorCustomPermissions::test_container_tool_allowed_with_custom_config PASSED [ 62%]
+tests/test_tool_executor.py::TestToolExecutorCustomPermissions::test_container_tool_denied_with_explicit_false PASSED [ 62%]
+tests/test_tool_executor.py::TestToolExecutorCustomPermissions::test_mixed_allowed_and_denied PASSED [ 62%]
+tests/test_tool_executor.py::TestToolExecutorCustomPermissions::test_all_categories_allowed PASSED [ 62%]
+tests/test_tool_executor.py::TestToolExecutorCustomPermissions::test_none_permissions_falls_back_to_default PASSED [ 63%]
+tests/test_tool_executor.py::TestToolExecutorCustomPermissions::test_respond_tool_dynamic_category_integration PASSED [ 63%]
+tests/test_worker_agent_transplant.py::TestSmokeMultiTurnTask::test_smoke_multi_turn_task PASSED [ 63%]
+tests/test_worker_agent_transplant.py::TestResumeWorkerContinuesConversation::test_resume_worker_continues_conversation PASSED [ 63%]
+tests/test_worker_agent_transplant.py::TestTimeoutEnforcesRestrictions::test_timeout_enforces_restrictions FAILED [ 63%]
+tests/test_worker_agent_transplant.py::TestTokenCriticalTriggersSummarisation::test_token_critical_triggers_summarisation PASSED [ 63%]
+tests/test_worker_agent_transplant.py::TestStopFlagGracefulExit::test_stop_flag_graceful_exit PASSED [ 63%]
+tests/test_worker_agent_transplant.py::TestCompactAfterSummary::test_no_summary_returns_false PASSED [ 63%]
+tests/test_worker_agent_transplant.py::TestCompactAfterSummary::test_summary_removes_old_messages PASSED [ 64%]
+tests/test_worker_agent_transplant.py::TestCompactAfterSummary::test_keeps_multiple_leading_system_prompts PASSED [ 64%]
+tests/test_worker_agent_transplant.py::TestCompactAfterSummary::test_keeps_extra_system_msg_before_non_system PASSED [ 64%]
+tests/test_worker_agent_transplant.py::TestCompactAfterSummary::test_only_latest_summary_preserved PASSED [ 64%]
+tests/test_worker_agent_transplant.py::TestCompactAfterSummary::test_empty_history_returns_false PASSED [ 64%]
+tests/test_worker_agent_transplant.py::TestCompactAfterSummary::test_updates_conversation_hash_and_version PASSED [ 64%]
+tests/test_worker_agent_transplant.py::TestGateDenialInstant::test_gate_denial_instant 
+PASSED [ 64%]
+tests/test_worker_agent_transplant.py::TestWorkerTimeoutAndElapsed::test_timeout_override_at_spawn PASSED [ 64%]
+tests/test_worker_agent_transplant.py::TestWorkerTimeoutAndElapsed::test_elapsed_time_returned PASSED [ 65%]
+tests/test_worker_agent_transplant.py::TestWorkerTimeoutAndElapsed::test_timeout_fallback_to_definition PASSED [ 65%]
+tests/test_worker_agent_transplant.py::TestReasoningPassthrough::test_reasoning_passed_to_main_agent PASSED [ 65%]
+tests/test_worker_agent_transplant.py::TestReasoningPassthrough::test_reasoning_is_none_when_not_provided PASSED [ 65%]
+tests/test_worker_agent_transplant.py::TestReasoningPassthrough::test_reasoning_passthrough_with_tool_calls FAILED [ 65%]
+tests/test_worker_agent_transplant.py::TestWorkerConfigForwarding::test_config_forwards_parent_fields PASSED [ 65%]
+tests/test_worker_agent_transplant.py::TestWorkerConfigForwarding::test_worker_overrides_take_precedence FAILED [ 65%]
+tests/test_worker_agent_transplant.py::TestWorkerConfigForwarding::test_session_permissions_forwarded PASSED [ 66%]
+tests/test_worker_agent_transplant.py::TestWorkerConfigForwarding::test_worker_overrides_warning_threshold PASSED [ 66%]
+tests/test_worker_agent_transplant.py::TestWorkerConfigForwarding::test_worker_overrides_critical_threshold PASSED [ 66%]
+tests/test_worker_agent_transplant.py::TestTokenEstimation::test_context_tokens_returns_int PASSED [ 66%]
+tests/test_worker_agent_transplant.py::TestTokenEstimation::test_context_tokens_empty_history PASSED [ 66%]
+tests/test_worker_agent_transplant.py::TestTokenEstimation::test_context_tokens_with_long_content PASSED [ 66%]
+tests/test_worker_agent_transplant.py::TestTokenEstimation::test_worker_thread_token_properties ERROR [ 66%]
+tests/test_worker_agent_transplant.py::TestTokenEstimation::test_max_context_tokens_from_model PASSED [ 66%]
+tests/test_worker_agent_transplant.py::TestSpawnContextFixes::test_spawn_with_context_replaces_stale_persistence PASSED [ 67%]
+tests/test_worker_agent_transplant.py::TestSpawnContextFixes::test_spawn_with_context_produces_output_without_query_action PASSED [ 67%]
+tests/test_worker_agent_transplant.py::TestSpawnContextFixes::test_spawn_without_context_persistence_not_affected PASSED [ 67%]
+tests/test_worker_definition.py::TestTemplates::test_all_templates_load_from_disk PASSED [ 67%]
+tests/test_worker_definition.py::TestTemplates::test_default_validates PASSED [ 67%]
+tests/test_worker_definition.py::TestValidInstantiation::test_minimal PASSED [ 67%]
+tests/test_worker_definition.py::TestValidInstantiation::test_all_optional_fields_default_to_none PASSED [ 67%]
+tests/test_worker_definition.py::TestValidInstantiation::test_critical_threshold_default PASSED [ 68%]
+tests/test_worker_definition.py::TestValidInstantiation::test_critical_threshold_override PASSED [ 68%]
+tests/test_worker_definition.py::TestValidInstantiation::test_all_optional_fields_set PASSED [ 68%]
+tests/test_worker_definition.py::TestJsonSchema::test_schema_includes_critical_threshold_tokens PASSED [ 68%]
+tests/test_worker_definition.py::TestJsonSchema::test_schema_has_required_fields PASSED [ 68%]
+tests/test_worker_definition.py::TestJsonSchema::test_schema_file_matches FAILED [ 68%]
+tests/test_worker_definition.py::TestSerialisation::test_json_round_trip PASSED [ 68%]
+tests/test_worker_loop_spike.py::TestWorkerContextAttributes::test_has_session_id PASSED [ 68%]
+tests/test_worker_loop_spike.py::TestWorkerContextAttributes::test_auto_session_id PASSED [ 69%]
+tests/test_worker_loop_spike.py::TestWorkerContextAttributes::test_user_history_default_empty_list PASSED [ 69%]
+tests/test_worker_loop_spike.py::TestWorkerContextAttributes::test_user_history_custom PASSED [ 69%]
+tests/test_worker_loop_spike.py::TestWorkerContextAttributes::test_total_input_tokens_default_zero PASSED [ 69%]
+tests/test_worker_loop_spike.py::TestWorkerContextAttributes::test_total_input_tokens_settable PASSED [ 69%]
+tests/test_worker_loop_spike.py::TestWorkerContextAttributes::test_total_output_tokens_default_zero PASSED [ 69%]
+tests/test_worker_loop_spike.py::TestWorkerContextAttributes::test_total_output_tokens_settable PASSED [ 69%]
+tests/test_worker_loop_spike.py::TestWorkerContextAttributes::test_conversation_version_property PASSED [ 70%]
+tests/test_worker_loop_spike.py::TestWorkerContextAttributes::test_conversation_hash_present PASSED [ 70%]
+tests/test_worker_loop_spike.py::TestWorkerContextAttributes::test_summary_default_none PASSED [ 70%]
+tests/test_worker_loop_spike.py::TestWorkerContextAttributes::test_summary_settable PASSED [ 70%]
+tests/test_worker_loop_spike.py::TestWorkerContextAttributes::test_updated_at_datetime PASSED [ 70%]
+tests/test_worker_loop_spike.py::TestWorkerContextAttributes::test_updated_at_settable PASSED [ 70%]
+tests/test_worker_loop_spike.py::TestWorkerContextAttributes::test_get_next_seq_increments PASSED [ 70%]
+tests/test_worker_loop_spike.py::TestWorkerContextAttributes::test_on_conversation_changed_is_callable PASSED [ 70%]
+tests/test_worker_loop_spike.py::TestWorkerContextAttributes::test_repr PASSED [ 71%]
+tests/test_worker_loop_spike.py::TestAgentWithWorkerContext::test_agent_accepts_worker_context PASSED [ 71%]
+tests/test_worker_loop_spike.py::TestAgentWithWorkerContext::test_agent_session_property PASSED [ 71%]
+tests/test_worker_loop_spike.py::TestAgentWithWorkerContext::test_agent_conversation_uses_worker_history PASSED [ 71%]
+tests/test_worker_loop_spike.py::TestAgentWithWorkerContext::test_token_counts_delegate_to_worker PASSED [ 71%]
+tests/test_worker_loop_spike.py::TestAgentWithWorkerContext::test_process_query_with_tool_call PASSED [ 71%]
+tests/test_worker_loop_spike.py::TestAgentWithWorkerContext::test_conversation_data_on_events PASSED [ 71%]
+tests/test_worker_loop_spike.py::TestAgentWithWorkerContext::test_summary_and_updated_at_updated PASSED [ 71%]
+tests/test_worker_loop_spike.py::TestWorkerContextStandalone::test_supports_get_next_seq PASSED [ 72%]
+tests/test_worker_loop_spike.py::TestWorkerContextStandalone::test_on_conversation_changed_increments_version PASSED [ 72%]
+tests/test_worker_loop_spike.py::TestWorkerContextStandalone::test_conversation_hash_changes_on_content PASSED [ 72%]
+tests/test_worker_loop_spike.py::TestWorkerContextStandalone::test_user_history_is_mutable PASSED [ 72%]
+tests/test_worker_loop_spike.py::TestWorkerContextStandalone::test_idempotent_conversation_hash_for_empty PASSED [ 72%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_query_permissions PASSED [ 72%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_query_permissions_no_ws_id PASSED [ 72%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_query_container_status FAILED [ 73%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_query_container_status_no_ws_path PASSED [ 73%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_query_workspace_info PASSED [ 73%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_query_my_config PASSED [ 73%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_query_my_config_no_agent_config PASSED [ 73%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_network_diagnostics_no_container PASSED [ 73%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_unknown_query PASSED [ 73%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_required_categories_empty PASSED [ 73%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_my_config_is_valid_json PASSED [ 74%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_my_config_includes_restriction_reason PASSED [ 74%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_workers_query_returns_definitions PASSED [ 74%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_worker_detail_query PASSED [ 74%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_worker_detail_query_not_found PASSED [ 74%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_running_workers_query PASSED [ 74%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_capabilities_query PASSED [ 74%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_dockerfile_query PASSED [ 75%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_dockerfile_query_not_available PASSED [ 75%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_mcp_servers_query PASSED [ 75%]
+tests/tools/test_workspace_tools.py::TestCheckSystem::test_unknown_query_returns_valid_queries PASSED [ 75%]
+tests/tools/test_workspace_tools.py::TestWorker::test_worker_thread_init FAILED [ 75%]
+tests/tools/test_workspace_tools.py::TestWorker::test_worker_thread_save_and_load_context FAILED [ 75%]
+tests/tools/test_workspace_tools.py::TestWorker::test_resume_worker_loads_current_system_prompt FAILED [ 75%]
+tests/tools/test_workspace_tools.py::TestWorker::test_worker_thread_send_query_timeout PASSED [ 75%]
+tests/tools/test_workspace_tools.py::TestWorker::test_action_list_empty FAILED [ 76%]
+tests/tools/test_workspace_tools.py::TestWorker::test_action_list_with_workers PASSED [ 76%]
+tests/tools/test_workspace_tools.py::TestWorker::test_spawn_preserves_context_file PASSED [ 76%]
+tests/tools/test_workspace_tools.py::TestWorker::test_spawn_without_context_creates_fresh PASSED [ 76%]
+tests/tools/test_workspace_tools.py::TestWorker::test_action_spawn_found FAILED [ 76%]
+tests/tools/test_workspace_tools.py::TestWorker::test_action_spawn_not_found PASSED [ 76%]
+tests/tools/test_workspace_tools.py::TestWorker::test_action_check_not_spawned PASSED [ 76%]
+tests/tools/test_workspace_tools.py::TestWorker::test_action_check_not_found PASSED [ 77%]
+tests/tools/test_workspace_tools.py::TestWorker::test_action_query_not_spawned PASSED [ 77%]
+tests/tools/test_workspace_tools.py::TestWorker::test_action_missing_worker_name PASSED [ 77%]
+tests/tools/test_workspace_tools.py::TestWorker::test_unknown_action PASSED [ 77%]
+tests/tools/test_workspace_tools.py::TestWorker::test_missing_workers_file FAILED [ 77%]
+tests/tools/test_workspace_tools.py::TestWorker::test_required_categories PASSED [ 77%]
+tests/tools/test_workspace_tools.py::TestWorker::test_permission_gate_allows PASSED [ 77%]
+tests/tools/test_workspace_tools.py::TestWorker::test_permission_gate_denies PASSED [ 77%]
+tests/tools/test_workspace_tools.py::TestWorker::test_no_required_categories_skips_gate PASSED [ 78%]
+tests/tools/test_workspace_tools.py::TestWorker::test_gate_unavailable PASSED [ 78%]
+tests/tools/test_workspace_tools.py::TestWorker::test_spawn_strips_by_footprint FAILED [ 78%]
+tests/tools/test_workspace_tools.py::TestWorker::test_spawn_strips_blocklisted_tools FAILED [ 78%]
+tests/tools/test_workspace_tools.py::TestWorker::test_per_call_gate_denies_write_for_readonly_worker FAILED [ 78%]
+tests/tools/test_workspace_tools.py::TestEditDockerfile::test_append_instructions PASSED [ 78%]
+tests/tools/test_workspace_tools.py::TestEditDockerfile::test_creates_from_template PASSED [ 78%]
+tests/tools/test_workspace_tools.py::TestEditDockerfile::test_empty_instructions PASSED [ 78%]
+tests/tools/test_workspace_tools.py::TestEditDockerfile::test_no_workspace PASSED [ 79%]
+tests/tools/test_workspace_tools.py::TestEditDockerfile::test_timestamp_in_output PASSED [ 79%]
+tests/tools/test_workspace_tools.py::TestEditDockerfile::test_required_categories PASSED [ 79%]
+tests/trust/test_gate_contract.py::TestEffectivePermissionsEdgeValues::test_filesystem_full PASSED [ 79%]
+tests/trust/test_gate_contract.py::TestEffectivePermissionsEdgeValues::test_filesystem_full_workspace_denies_write_no_downgrade PASSED [ 79%]
+tests/trust/test_gate_contract.py::TestEffectivePermissionsEdgeValues::test_filesystem_ask PASSED [ 79%]
+tests/trust/test_gate_contract.py::TestEffectivePermissionsEdgeValues::test_filesystem_ask_with_workspace_deny PASSED [ 79%]
+tests/trust/test_gate_contract.py::TestContainerConfigEdgeValues::test_workspace_mode_edge[full-True-rw] PASSED [ 80%]
+tests/trust/test_gate_contract.py::TestContainerConfigEdgeValues::test_workspace_mode_edge[full-False-rw] PASSED [ 80%]
+tests/trust/test_gate_contract.py::TestContainerConfigEdgeValues::test_workspace_mode_edge[ask-True-ro] PASSED [ 80%]
+tests/trust/test_gate_contract.py::TestContainerConfigEdgeValues::test_workspace_mode_edge[ask-False-ro] PASSED [ 80%]
+tests/trust/test_gate_contract.py::TestGetExpectedContainerConfig::test_write_all_allowed PASSED [ 80%]
+tests/trust/test_gate_contract.py::TestGetExpectedContainerConfig::test_write_downgraded_by_workspace PASSED [ 80%]
+tests/trust/test_gate_contract.py::TestGetExpectedContainerConfig::test_banned_network PASSED [ 80%]
+tests/trust/test_gate_contract.py::TestGetExpectedContainerConfig::test_full_filesystem PASSED [ 80%]
+tests/trust/test_gate_contract.py::TestGetExpectedContainerConfig::test_ask_filesystem PASSED [ 81%]
+tests/trust/test_gate_contract.py::TestGetExpectedContainerConfig::test_ask_network PASSED [ 81%]
+tests/trust/test_gate_contract.py::TestGetExpectedContainerConfig::test_full_filesystem_not_downgraded_by_workspace PASSED [ 81%]
+tests/trust/test_gate_contract.py::TestGetExpectedContainerConfig::test_workspace_denies_network PASSED [ 81%]
+tests/trust/test_gate_contract.py::TestGetExpectedContainerConfig::test_workspace_denies_container PASSED [ 81%]
+tests/trust/test_gate_contract.py::TestGetExpectedContainerConfig::test_default_workspace_caps PASSED [ 81%]
+tests/trust/test_gate_contract.py::TestGetExpectedContainerConfig::test_matches_expected_config_helper PASSED [ 81%]
+tests/trust/test_gate_contract.py::TestGetExpectedContainerConfig::test_invalid_network_value_returns_safe_defaults PASSED [ 82%]
+tests/trust/test_gate_contract.py::TestGetExpectedContainerConfig::test_invalid_filesystem_value_returns_safe_defaults PASSED [ 82%]
+tests/trust/test_gate_contract.py::TestGetExpectedContainerConfig::test_empty_session_permissions_returns_safe_defaults PASSED [ 82%]
+tests/trust/test_gate_contract.py::TestCheckRequiredCategoriesPermissionFootprint::test_worker_read_narrows_write PASSED [ 82%]
+tests/trust/test_gate_contract.py::TestCheckRequiredCategoriesPermissionFootprint::test_worker_banned_hard_denies PASSED [ 82%]
+tests/trust/test_gate_contract.py::TestCheckRequiredCategoriesPermissionFootprint::test_worker_same_level_passthrough PASSED [ 82%]
+tests/trust/test_gate_contract.py::TestCheckRequiredCategoriesPermissionFootprint::test_worker_multi_category_restriction PASSED [ 82%]
+tests/trust/test_gate_contract.py::TestCheckRequiredCategoriesPermissionFootprint::test_worker_missing_key_falls_back PASSED [ 82%]
+tests/trust/test_toggle_live.py::TestNoRecreation::test_no_recreation_when_permissions_unchanged PASSED [ 83%]
+tests/trust/test_toggle_live.py::TestNoRecreation::test_recreation_when_permissions_change PASSED [ 83%]
+tests/trust/test_toggle_live.py::TestNoRecreation::test_identity_after_reload PASSED [ 83%]
+tests/trust/test_toggle_live.py::TestAskPermissionRestrictive::test_ask_network_creates_none_mode PASSED [ 83%]
+tests/trust/test_toggle_live.py::TestAskPermissionRestrictive::test_ask_filesystem_creates_ro_mode PASSED [ 83%]
+tests/trust/test_toggle_live.py::TestAskPermissionRestrictive::test_ask_not_recreated_when_already_restrictive PASSED [ 83%]
+tests/trust/test_toggle_live.py::TestAskPermissionRestrictive::test_ask_to_write_recreates_container PASSED [ 83%]
+tests/trust/test_toggle_live.py::TestAskPermissionRestrictive::test_write_to_ask_recreates_container PASSED [ 84%]
+tests/web_ui/backend/test_websocket_integration.py::TestWebSocketLifecycle::test_new_session_emits_six_events PASSED [ 84%]
+tests/web_ui/backend/test_websocket_integration.py::TestWebSocketLifecycle::test_continue_session_without_key_emits_error PASSED [ 84%]
+tests/web_ui/backend/test_websocket_integration.py::TestWebSocketLifecycle::test_new_session_resolves_workspace_id FAILED [ 84%]
+tests/web_ui/backend/test_websocket_integration.py::TestWebSocketLifecycle::test_apply_config_with_api_key FAILED [ 84%]
+tests/web_ui/backend/test_ws_mock_provider.py::TestWebSocketWithMockProvider::test_new_session_emits_six_events PASSED [ 84%]
+tests/web_ui/backend/test_ws_mock_provider.py::TestWebSocketWithMockProvider::test_continue_session_calls_mock_provider FAILED [ 84%]
+tests/web_ui/backend/test_ws_mock_provider.py::TestWebSocketWithMockProvider::test_apply_config_deep_merge_permissions FAILED [ 84%]
+tests/web_ui/backend/test_ws_mock_provider.py::TestWebSocketWithMockProvider::test_model_override_priority FAILED [ 85%]
+tests/web_ui/backend/test_ws_mock_provider.py::TestWebSocketWithMockProvider::test_api_key_stripped_from_config_dump FAILED [ 85%]
+tests/web_ui/backend/test_ws_mock_provider.py::TestWebSocketWithMockProvider::test_save_and_load_session_roundtrip FAILED [ 85%]
+tests/web_ui/test_templates_endpoint.py::TestGetTemplates::test_returns_200_with_fallback_templates PASSED [ 85%]
+tests/web_ui/test_templates_endpoint.py::TestGetTemplates::test_each_item_parses_as_worker_definition PASSED [ 85%]
+tests/web_ui/test_templates_endpoint.py::TestGetTemplates::test_returns_valid_jsons_only_skips_invalid PASSED [ 85%]
+tests/web_ui/test_templates_endpoint.py::TestGetTemplates::test_empty_user_dir_falls_back_to_repo PASSED [ 85%]
+tests/web_ui/test_templates_endpoint.py::TestGetTemplates::test_default_template_name_present PASSED [ 85%]
+tests/web_ui/test_templates_endpoint.py::TestGetTemplates::test_logs_warning_for_invalid_files PASSED [ 86%]
+tests/web_ui/test_worker_crud.py::TestCreateWorker::test_create_worker FAILED [ 86%]
+tests/web_ui/test_worker_crud.py::TestCreateWorker::test_create_duplicate FAILED [ 86%]
+tests/web_ui/test_worker_crud.py::TestCreateWorker::test_create_invalid_schema PASSED [ 86%]
+tests/web_ui/test_worker_crud.py::TestCreateWorker::test_create_invalid_json PASSED [ 86%]
+tests/web_ui/test_worker_crud.py::TestUpdateWorker::test_update_worker FAILED [ 86%]
+tests/web_ui/test_worker_crud.py::TestUpdateWorker::test_update_nonexistent PASSED [ 86%]
+tests/web_ui/test_worker_crud.py::TestUpdateWorker::test_update_invalid_schema PASSED [ 87%]
+tests/web_ui/test_worker_crud.py::TestDeleteWorker::test_delete_worker FAILED [ 87%]
+tests/web_ui/test_worker_crud.py::TestDeleteWorker::test_delete_nonexistent PASSED [ 87%]
+tests/web_ui/test_worker_crud.py::TestDeleteWorker::test_delete_from_empty_file PASSED [ 87%]
+tests/web_ui/test_worker_crud.py::TestDockerfile::test_put_dockerfile PASSED [ 87%]
+tests/web_ui/test_worker_crud.py::TestDockerfile::test_put_dockerfile_overwrites PASSED [ 87%]
+tests/web_ui/test_worker_crud.py::TestGetWorkerByName::test_get_worker_by_name PASSED [ 87%]
+tests/web_ui/test_worker_crud.py::TestGetWorkerByName::test_get_worker_by_name_missing PASSED [ 87%]
+tests/web_ui/test_worker_crud.py::TestGetWorkerByName::test_get_worker_by_name_from_empty PASSED [ 88%]
+tests/web_ui/test_worker_crud.py::TestListWorkers::test_list_workers_after_crud FAILED [ 88%]
+tests/web_ui/test_worker_crud.py::TestListWorkers::test_list_workers_empty FAILED [ 88%]
+tests/workspace/test_api.py::TestGetDockerfile::test_returns_dockerfile PASSED [ 88%]
+tests/workspace/test_api.py::TestGetDockerfile::test_404_for_unknown_workspace PASSED [ 88%]
+tests/workspace/test_api.py::TestGetDomainAllowlist::test_returns_empty_list_initially PASSED [ 88%]
+tests/workspace/test_api.py::TestGetDomainAllowlist::test_returns_after_put PASSED [ 88%]
+tests/workspace/test_api.py::TestPutDomainAllowlist::test_rejects_non_list_body PASSED [ 89%]
+tests/workspace/test_api.py::TestPutDomainAllowlist::test_atomic_write_no_tmp_leftover PASSED [ 89%]
+tests/workspace/test_api.py::TestGetWorkers::test_returns_empty_list_initially FAILED [ 89%]
+tests/workspace/test_api.py::TestGetMcpServers::test_returns_empty_list_initially PASSED [ 89%]
+tests/workspace/test_api.py::TestEffectivePermissions::test_returns_effective_permissions_default PASSED [ 89%]
+tests/workspace/test_api.py::TestEffectivePermissions::test_with_session_id PASSED [ 89%]
+tests/workspace/test_bootstrap.py::TestEnsureWorkspaceDirs::test_creates_base_directory PASSED [ 89%]
+tests/workspace/test_bootstrap.py::TestEnsureWorkspaceDirs::test_no_stray_subdirectories_created PASSED [ 89%]
+tests/workspace/test_bootstrap.py::TestEnsureWorkspaceDirs::test_creates_capabilities_file PASSED [ 90%]
+tests/workspace/test_bootstrap.py::TestEnsureWorkspaceDirs::test_creates_dockerfile PASSED [ 90%]
+tests/workspace/test_bootstrap.py::TestEnsureWorkspaceDirs::test_creates_domain_allowlist PASSED [ 90%]
+tests/workspace/test_bootstrap.py::TestEnsureWorkspaceDirs::test_creates_workers_json PASSED [ 90%]
+tests/workspace/test_bootstrap.py::TestEnsureWorkspaceDirs::test_creates_mcp_servers_json PASSED [ 90%]
+tests/workspace/test_bootstrap.py::TestEnsureWorkspaceDirs::test_idempotent_does_not_overwrite_existing PASSED [ 90%]
+tests/workspace/test_bootstrap.py::TestEnsureWorkspaceDirs::test_returns_list_of_created_paths PASSED [ 90%]
+tests/workspace/test_bootstrap.py::TestEnsureWorkspaceDirs::test_safeguard_warns_on_unexpected_item FAILED [ 91%]
+tests/workspace/test_bootstrap.py::TestEnsureWorkspaceDirs::test_safeguard_does_not_delete_unexpected_items FAILED [ 91%]
+tests/workspace/test_worker_permissions.py::TestRestrictiveMerge::test_session_ceiling_wins_string PASSED [ 91%]
+tests/workspace/test_worker_permissions.py::TestRestrictiveMerge::test_worker_can_be_stricter_string PASSED [ 91%]
+tests/workspace/test_worker_permissions.py::TestRestrictiveMerge::test_equal_values_string PASSED [ 91%]
+tests/workspace/test_worker_permissions.py::TestRestrictiveMerge::test_filesystem_hierarchy PASSED [ 91%]
+tests/workspace/test_worker_permissions.py::TestRestrictiveMerge::test_container_string_values PASSED [ 91%]
+tests/workspace/test_worker_permissions.py::TestRestrictiveMerge::test_session_false_ceiling_bool PASSED [ 91%]
+tests/workspace/test_worker_permissions.py::TestRestrictiveMerge::test_worker_false_overrides_session_true PASSED [ 92%]
+tests/workspace/test_worker_permissions.py::TestRestrictiveMerge::test_both_true PASSED [ 92%]
+tests/workspace/test_worker_permissions.py::TestRestrictiveMerge::test_both_false PASSED [ 92%]
+tests/workspace/test_worker_permissions.py::TestRestrictiveMerge::test_session_bool_worker_string PASSED [ 92%]
+tests/workspace/test_worker_permissions.py::TestRestrictiveMerge::test_session_string_worker_bool PASSED [ 92%]
+tests/workspace/test_worker_permissions.py::TestRestrictiveMerge::test_session_missing_key PASSED [ 92%]
+tests/workspace/test_worker_permissions.py::TestRestrictiveMerge::test_worker_missing_key PASSED [ 92%]
+tests/workspace/test_worker_permissions.py::TestRestrictiveMerge::test_both_empty PASSED [ 92%]
+tests/workspace/test_worker_permissions.py::TestRestrictiveMerge::test_unknown_key_passthrough PASSED [ 93%]
+tests/workspace/test_worker_permissions.py::TestWorkerPermissionsMergeIntegration::test_session_ceiling_enforced PASSED [ 93%]
+tests/workspace/test_worker_permissions.py::TestWorkerPermissionsMergeIntegration::test_worker_can_strengthen PASSED [ 93%]
+tests/workspace/test_worker_permissions.py::TestWorkerPermissionsMergeIntegration::test_backward_compat_worker_permissions_key PASSED [ 93%]
+tests/workspace/test_worker_permissions.py::TestWorkerPermissionsMergeIntegration::test_no_permission_footprint PASSED [ 93%]
+tests/workspace/test_worker_permissions.py::TestWorkerPermissionsMergeIntegration::test_worker_fills_gap PASSED [ 93%]
+tests/workspace/test_worker_permissions.py::TestWorkerPermissionsMergeIntegration::test_default_tool_set PASSED [ 93%]
+tests/workspace/test_worker_permissions.py::TestWorkerPermissionsMergeIntegration::test_default_system_prompt PASSED [ 94%]
+tests/workspace/test_worker_templates.py::TestLoadTemplateWorkers::test_uses_user_template_dir_first PASSED [ 94%]
+tests/workspace/test_worker_templates.py::TestLoadTemplateWorkers::test_invalid_template_is_skipped PASSED [ 94%]
+tests/workspace/test_worker_templates.py::TestLoadTemplateWorkers::test_invalid_json_is_skipped PASSED [ 94%]
+tests/workspace/test_worker_templates.py::TestLoadTemplateWorkers::test_falls_back_to_resources PASSED [ 94%]
+tests/workspace/test_worker_templates.py::TestLoadTemplateWorkers::test_empty_user_dir_uses_fallback PASSED [ 94%]
+tests/workspace/test_worker_templates.py::TestBuildDefaultWorkers::test_template_workers_present PASSED [ 94%]
+tests/workspace/test_worker_templates.py::TestBuildDefaultWorkers::test_default_worker_present PASSED [ 94%]
+tests/workspace/test_worker_templates.py::TestBuildDefaultWorkers::test_no_duplicate_names PASSED [ 95%]
+tests/workspace/test_worker_templates.py::TestBuildDefaultWorkers::test_each_worker_has_required_fields PASSED [ 95%]
+tests/workspace/test_worker_templates.py::TestEnsureWorkspaceDirsMerged::test_creates_workers_with_templates PASSED [ 95%]
+tests/workspace/test_worker_templates.py::TestEnsureWorkspaceDirsMerged::test_idempotent_does_not_overwrite_existing PASSED [ 95%]
+tests/workspace/test_worker_templates.py::TestEnsureWorkspaceDirsMerged::test_atomic_write_leaves_no_tmp_file PASSED [ 95%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistryEntry::test_to_dict_roundtrip PASSED [ 95%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistryEntry::test_from_dict_missing_keys_gets_defaults PASSED [ 95%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistryEntry::test_repr PASSED [ 96%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistry::test_empty_registry PASSED [ 96%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistry::test_register_and_list PASSED [ 96%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistry::test_register_duplicate_raises PASSED [ 96%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistry::test_get_workspace PASSED [ 96%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistry::test_get_workspace_missing PASSED [ 96%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistry::test_unregister_workspace PASSED [ 96%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistry::test_unregister_missing PASSED [ 96%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistry::test_update_workspace PASSED [ 97%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistry::test_update_workspace_root_path_normalises PASSED [ 97%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistry::test_update_metadata PASSED [ 97%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistry::test_update_metadata_type_error PASSED [ 97%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistry::test_update_missing PASSED [ 97%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistry::test_update_invalid_field PASSED [ 97%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistry::test_resolve_by_root PASSED [ 97%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistry::test_resolve_by_root_normalises PASSED [ 98%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistry::test_resolve_by_root_no_match PASSED [ 98%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistry::test_sort_order PASSED [ 98%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistry::test_register_by_root_new PASSED [ 98%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistry::test_register_by_root_existing PASSED [ 98%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistry::test_register_by_root_normalises_path PASSED [ 98%]
+tests/workspace/test_workspace_registry.py::TestGenerateHumanId::test_format PASSED [ 98%]
+tests/workspace/test_workspace_registry.py::TestGenerateHumanId::test_variation PASSED [ 98%]
+tests/workspace/test_workspace_registry.py::TestGenerateHumanId::test_length PASSED [ 99%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistryPersistence::test_persistence_across_instances PASSED [ 99%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistryPersistence::test_missing_file PASSED [ 99%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistryPersistence::test_corrupt_json_handling PASSED [ 99%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistryPersistence::test_atomic_write_preserves_original_on_crash PASSED [ 99%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistryPersistence::test_default_instance_is_cached PASSED [ 99%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistryPersistence::test_register_normalises_root_path PASSED [ 99%]
+tests/workspace/test_workspace_registry.py::TestWorkspaceRegistryPersistence::test_resolve_by_root_normalised_against_stored PASSED [100%]
+
+==================================== ERRORS ====================================
+__ ERROR at setup of TestTokenEstimation.test_worker_thread_token_properties ___
+file /home/jojo/PycharmProjects/ThoughtMachine-dev/tests/test_worker_agent_transplant.py, line 1387
+      def test_worker_thread_token_properties(self, worker_thread):
+E       fixture 'worker_thread' not found
+>       available fixtures: anyio_backend, anyio_backend_name, anyio_backend_options, cache, capfd, capfdbinary, caplog, capsys, capsysbinary, capteesys, doctest_namespace, free_tcp_port, free_tcp_port_factory, free_udp_port, free_udp_port_factory, monkeypatch, pytestconfig, record_property, record_testsuite_property, record_xml_attribute, recwarn, register_scripted_provider, subtests, tmp_path, tmp_path_factory, tmpdir, tmpdir_factory
+>       use 'pytest --fixtures [testpath]' for help on them.
+
+/home/jojo/PycharmProjects/ThoughtMachine-dev/tests/test_worker_agent_transplant.py:1387
+=================================== FAILURES ===================================
+_ TestTokenWarningDuplication.test_single_warning_across_oscillating_sequence __
+tests/presenter/test_token_warning_duplication.py:98: in test_single_warning_across_oscillating_sequence
+    assert len(all_events) == 1, (
+E   AssertionError: Expected exactly 1 token_warning event across the entire sequence, got 4
+E   assert 4 == 1
+E    +  where 4 = len([{'type': 'token_warning', 'timestamp': '2026-07-27T15:51:14.922565', 'event_id': 'evt_1785160274922_2127282322648031826', 'source': 'agent_state', ...}, {'type': 'token_warning', 'timestamp': '2026-07-27T15:51:14.922704', 'event_id': 'evt_1785160274922_2127609427357295186', 'source': 'agent_state', ...}, {'type': 'token_recovery', 'timestamp': '2026-07-27T15:51:14.922759', 'event_id': 'evt_1785160274922_2127736420950303314', 'source': 'agent_state', ...}, {'type': 'token_warning', 'timestamp': '2026-07-27T15:51:14.922822', 'event_id': 'evt_1785160274922_2127883205752611410', 'source': 'agent_state', ...}])
+_ TestTokenWarningDuplication.test_warning_fires_at_first_crossing_from_clean_state _
+tests/presenter/test_token_warning_duplication.py:136: in test_warning_fires_at_first_crossing_from_clean_state
+    assert len(events2) == 0, "_token_warning_has_fired should suppress this"
+E   AssertionError: _token_warning_has_fired should suppress this
+E   assert 1 == 0
+E    +  where 1 = len([{'type': 'token_warning', 'timestamp': '2026-07-27T15:51:14.948865', 'event_id': 'evt_1785160274948_2187933583059411538', 'source': 'agent_state', ...}])
+_ TestTokenWarningDuplication.test_rapid_re_entry_after_drop_does_not_fire_again _
+tests/presenter/test_token_warning_duplication.py:150: in test_rapid_re_entry_after_drop_does_not_fire_again
+    assert len(events) == 0, (
+E   AssertionError: Re-entering warning after drop should NOT fire a second warning because _token_warning_has_fired is True
+E   assert 1 == 0
+E    +  where 1 = len([{'type': 'token_warning', 'timestamp': '2026-07-27T15:51:14.952802', 'event_id': 'evt_1785160274952_2197013350081585746', 'source': 'agent_state', ...}])
+_ TestTokenWarningDuplication.test_warning_survives_critical_to_low_transition _
+tests/presenter/test_token_warning_duplication.py:189: in test_warning_survives_critical_to_low_transition
+    assert len(events2) == 0
+E   AssertionError: assert 1 == 0
+E    +  where 1 = len([{'type': 'token_recovery', 'timestamp': '2026-07-27T15:51:14.957221', 'event_id': 'evt_1785160274957_2207200875068744274', 'source': 'agent_state', ...}])
+_ TestNullEventBusIntegration.test_ask_with_null_event_bus_returns_denied_instantly _
+tests/security/test_null_event_bus.py:128: in test_ask_with_null_event_bus_returns_denied_instantly
+    assert elapsed < 1.0, (
+E   AssertionError: NullEventBus prompt path took 120.000s — should return instantly without blocking
+E   assert 120.00042151598609 < 1.0
+______ TestNullEventBusIntegration.test_ask_multi_category_with_null_bus _______
+tests/security/test_null_event_bus.py:182: in test_ask_multi_category_with_null_bus
+    assert elapsed < 1.0
+E   assert 120.00032857697806 < 1.0
+_ TestBridgePermissionsRoundtrip.test_apply_config_accepts_custom_permissions __
+tests/test_bridge_permissions_sync.py:64: in test_apply_config_accepts_custom_permissions
+    assert result == {"success": True}, f"apply_config failed: {result}"
+E   AssertionError: apply_config failed: {'success': False, 'error': 'No active session config'}
+E   assert {'success': F...ssion config'} == {'success': True}
+E     
+E     Differing items:
+E     {'success': False} != {'success': True}
+E     Left contains 1 more item:
+E     {'error': 'No active session config'}
+E     
+E     Full diff:...
+E     
+E     ...Full output truncated (7 lines hidden), use '-vv' to show
+----------------------------- Captured stderr call -----------------------------
+[15:55:15] WARNING  [server.bridge] apply_config called but no session config exists
+_____ TestBridgePermissionsRoundtrip.test_roundtrip_preserves_permissions ______
+tests/test_bridge_permissions_sync.py:93: in test_roundtrip_preserves_permissions
+    assert perms_disk.get("filesystem") == "banned", (
+E   AssertionError: Expected filesystem=banned on disk, got {}
+E   assert None == 'banned'
+E    +  where None = <built-in method get of dict object at 0x729215be5ec0>('filesystem')
+E    +    where <built-in method get of dict object at 0x729215be5ec0> = {}.get
+----------------------------- Captured stderr call -----------------------------
+[15:55:15] WARNING  [server.bridge] apply_config called but no session config exists
+[15:55:15] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+_________________ TestConfigSnapshot.test_capture_creates_file _________________
+tests/test_config_snapshot.py:66: in test_capture_creates_file
+    assert data["enabled_tools"] == [
+E   AssertionError: assert ['ApplyEdits'...reeTool', ...] == ['Bash', 'Fil...thonExecutor']
+E     
+E     At index 0 diff: 'ApplyEdits' != 'Bash'
+E     Left contains 18 more items, first extra item: 'DirectoryCreator'
+E     
+E     Full diff:
+E       [
+E     -     'Bash',...
+E     
+E     ...Full output truncated (24 lines hidden), use '-vv' to show
+_____________ TestConfigSnapshot.test_config_with_no_enabled_tools _____________
+tests/test_config_snapshot.py:214: in test_config_with_no_enabled_tools
+    assert data["enabled_tools"] == []
+E   AssertionError: assert ['ApplyEdits'...reeTool', ...] == []
+E     
+E     Left contains 22 more items, first extra item: 'ApplyEdits'
+E     
+E     Full diff:
+E     - []
+E     + [
+E     +     'ApplyEdits',...
+E     
+E     ...Full output truncated (22 lines hidden), use '-vv' to show
+________________________ test_full_first_run_lifecycle _________________________
+tests/test_first_run.py:233: in test_full_first_run_lifecycle
+    assert last_config.get("api_key_configured") is True, (
+E   AssertionError: Expected api_key_configured=True, got api_key_configured=False. Full config: {'worker_mode': False, 'base_url': 'https://api.deepseek.com', 'model': 'deepseek-chat', 'provider_config': {}, 'temperature': 0.7, 'max_turns': 100, 'mode': 'agent', 'system_prompt': 'You are ThoughtMachine, an AI agent designed to help with software projects.\n\n**Architecture (understand this first):**\n\nYou run on the user\'s host machine. All your file operations, git commands, and\nnetwork calls execute on the host itself. Docker (if available) is a *tool you\ncall from the host* to run code in an isolated sandbox — the container is not\nyour runtime environment. The user\'s application runs on their computer with\nnormal internet access, separate from any Docker sandbox you might use.\n\nYou operate inside a **workspace** — a bounded directory tree. You can (depending\non permissions) read, write, and execute everything inside it, but tools will\nnever allow you to go outside the workspace. The only window out of the workspace\nis into the **vault** (`~/.thoughtmachine`), a read‑only/inspectable area that\nholds configuration, knowledge bases, and session data. You can inspect the vault\nwith `CheckSystem` but you cannot write to it.\n\nIf something confuses "where I run" vs "where the user\'s app runs" vs "where\nDocker runs," stop and clarify before proceeding.\n\n**Workspace Awareness:**\n\nUse `CheckSystem` at the start of a session to inspect your effective permissions,\ncontainer status, and workspace configuration.\n\n**Core Rules & Tools:**\n\n1. **Tools**: Use provided tools. Prefer `ApplyEdits` for code changes (supports regex,\n   multiline edits, batch editing across multiple files via file_pattern, and preview\n   mode). Second choice `CodeModifier` for structural Python changes, fallback\n   `FileEditor` for simple line operations.\n\n2. **Context**: Project root is determined by `DirectoryTreeTool`. All paths are relative.\n\n3. **Efficiency**: Batch file operations are preferred when the tool supports them.\n\n4. **Responding to the user**: Always use the `Respond` tool when you are ready to\n   communicate with the user.\n   - `content` must contain your complete message.\n   - `response_type` `"answer"` = final result (session continues, no immediate reply\n     required).\n   - `response_type` `"question"` = you need user input before continuing.\n   - If the task produced a detailed report, fill in `report_body` and `report_title`\n     to write it as a downloadable file. The user always sees `content` in chat; the\n     report file is a bonus.\n\n5. **Helper Files**: `temp/` is the playground directory for short‑lived helper files.\n\n6. **File Search**: Use `FileSearchTool` for search across files with regex, multiline\n   patterns, context lines, and line numbers.\n\n7. **Semantic Code Search**: Use `SearchCodebaseTool` to understand code meaning or\n   find implementations using natural language queries.\n\n8. **Refactoring**: Use `RefactorTool` for cross‑file structural changes; supports\n   preview mode and atomic updates.\n\n9. **Token and Turn Monitoring**: The system monitors token usage and turn count.\n   Warnings are normal — they signal that it\'s time to consider summarizing. When\n   context reaches critical, tools (except `Respond` and `SummarizeTool`) are\n   automatically restricted. Call `SummarizeTool` to prune older conversation turns\n   and continue unbothered. Both you and any workers run on the same mechanism;\n   summarizing is the natural cycle of work.\n\n10. **Git**: Git is available. **You are responsible for committing** — workers can\n    only read Git history. Commit logical chunks with meaningful messages. If you\n    notice the project lacks version control, suggest initialising it.\n\n11. **Availability of new features**: If you write code/tools for this agent, changes\n    only take effect after restarting the agent.\n\n12. **Knowledge Base**: A project notebook is available in `.thoughtmachine/knowledge/`\n    (workspace scope) or `~/.thoughtmachine/knowledge/` (global scope). Use\n    `KnowledgeBaseTool` to search or update — store architecture notes, development\n    guides, bug logs, task tracking, and lessons learned. Before starting a fresh\n    session, check relevant KB entries.\n\n13. **Avoid Loops**: Do not repeat the same tool call with the same parameters more\n    than twice consecutively. If a tool returns an error, analyse what changed and\n    adjust — don\'t retry blindly. If you call the same tool >3 times without progress,\n    reassess and try a different strategy.\n\n14. **New User Onboarding**: When interacting with someone new to ThoughtMachine, offer\n    a guided, friendly experience. Explain concepts in plain language. Check the\n    global KB\'s `system/onboarding_guide.md` for a ready‑to‑use introduction.\n\n15. **Capability Transparency**: Be proactively honest about what you can and cannot\n    do. If a tool fails because a dependency is missing, explain in plain language\n    what that means, what the user is missing, and how to fix it.\n\n16. **Proactive Guidance**: Think critically about the project. Flag technical debt,\n    missing tests, error handling, or architectural smells. Frame suggestions\n    constructively.\n\n17. **Map the Territory**: At natural breakpoints, offer to explain the current\n    landscape — state of the project, available capabilities, tradeoffs. Don\'t\n    assume the user knows what\'s possible.\n\n18. **Workers (optional)**: The `Worker` tool gives you access to sub‑agents. A\n    `default` worker is always available; additional workers may be defined in the\n    workspace. Workers are fully capable but you are not required to use them. For\n    most tasks, work directly with your own tools. If a task is large, multi‑file,\n    or benefits from isolation, you may spawn the worker — but it\'s a choice, not\n    a rule.\n\n    If you do use a worker, prefer to give it a clear `query`, a `briefing` with\n    essential context, and a short `timeout_seconds` (~60s) to start. You can\n    follow up with `action="query"` on the same worker to continue the conversation\n    without losing context.\n\n19. **Handoff & KB Learning**: Before calling `SummarizeTool`, take a moment to\n    record useful knowledge. In particular, if you\'ve been working with a worker,\n    write a short KB entry (e.g., in `worker_notes.md`) describing what worked, what\n    didn\'t, and any tips for future sessions. This lets the system improve\n    dynamically as we learn how to best use workers.', 'token_monitor_warning_threshold': 65000, 'token_monitor_critical_threshold': 80000, 'turn_monitor_enabled': True, 'enable_logging': True, 'log_dir': './logs', 'log_level': 'INFO', 'enable_file_logging': True, 'jsonl_format': True, 'log_categories': ['SESSION', 'LLM', 'TOOLS'], 'max_file_size_mb': 10, 'max_backup_files': 5, 'rag_enabled': False, 'rag_embedding_model': 'BAAI/bge-small-en-v1.5', 'rag_chunk_size': 1500, 'rag_chunk_overlap': 200, 'rag_batch_size': 16, 'rag_truncate_dim': 256, 'kb_enabled': True, 'tool_output_token_limit': 10000, 'detail': 'normal', 'timeout_seconds': 300, 'time_monitor_enabled': False, 'time_warning_threshold': 240, 'session_permissions': {'container': False, 'network': 'banned', 'filesystem': 'read', 'system': 'read', 'git': 'read', 'execution': 'banned'}, 'provider': 'local', 'tools': [{'name': 'FileEditor', 'enabled': True}, {'name': 'ReadFile', 'enabled': True}, {'name': 'FilePreviewTool', 'enabled': True}, {'name': 'DirectoryTreeTool', 'enabled': True}, {'name': 'GlobTool', 'enabled': True}, {'name': 'FileSearchTool', 'enabled': True}, {'name': 'ApplyEdits', 'enabled': True}, {'name': 'CodeModifier', 'enabled': True}, {'name': 'DateTimeTool', 'enabled': True}, {'name': 'DirectoryCreator', 'enabled': True}, {'name': 'DockerCodeRunner', 'enabled': True}, {'name': 'FieldViewer', 'enabled': True}, {'name': 'FileMover', 'enabled': True}, {'name': 'FileSummaryTool', 'enabled': True}, {'name': 'GitInfoTool', 'enabled': True}, {'name': 'KnowledgeBaseTool', 'enabled': True}, {'name': 'MCPValidator', 'enabled': True}, {'name': 'PaginateTool', 'enabled': True}, {'name': 'Respond', 'enabled': True}, {'name': 'SummarizeTool', 'enabled': True}, {'name': 'CheckSystem', 'enabled': True}, {'name': 'WorkingDocument', 'enabled': True}], 'workspace_path': None, 'api_key_configured': False}
+E   assert False is True
+E    +  where False = <built-in method get of dict object at 0x729214d50e00>('api_key_configured')
+E    +    where <built-in method get of dict object at 0x729214d50e00> = {'worker_mode': False, 'base_url': 'https://api.deepseek.com', 'model': 'deepseek-chat', 'provider_config': {}, ...}.get
+----------------------------- Captured stderr call -----------------------------
+[15:55:18] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:55:18] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:55:18] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:55:18] WARNING  [server.bridge] apply_config: controller thread is dead — restarting controller
+[15:55:18] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:55:18] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+____________________ TestHealthEndpoint.test_empty_response ____________________
+tests/test_health_endpoint.py:72: in test_empty_response
+    assert data["active_sessions"] == []
+E   AssertionError: assert [{'session_id...167104', ...}] == []
+E     
+E     Left contains 4 more items, first extra item: {'session_id': 'dcfcda4e-0d41-470b-8f10-1785f4403ef0', 'workspace': '/home/jojo/.thoughtmachine/workspaces/quiet-zebra-85', 'created_at': '2026-07-23 23:41:08.053011', 'last_activity': '2026-07-27 15:05:59.823471', ...}
+E     
+E     Full diff:
+E     - []
+E     + [
+E     +     {...
+E     
+E     ...Full output truncated (28 lines hidden), use '-vv' to show
+----------------------------- Captured stderr call -----------------------------
+[15:55:18] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:55:18] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:55:18] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:55:18] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+_ TestConfigFileRoundTrip.test_missing_session_permissions_backfilled_from_defaults _
+tests/test_permissions_roundtrip.py:289: in test_missing_session_permissions_backfilled_from_defaults
+    assert sp.container is False
+E   AssertionError: assert True is False
+E    +  where True = SessionPermissions(container=True, network='write', filesystem='write', system='read', git='read', execution='banned').container
+_____ TestRestrictionReason.test_restriction_reason_set_on_token_critical ______
+tests/test_state_timeout.py:106: in test_restriction_reason_set_on_token_critical
+    events = state.update_token_state()
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   TypeError: AgentState.update_token_state() missing 1 required positional argument: 'total_tokens'
+______ TestRestrictionReason.test_restriction_reason_set_on_turn_critical ______
+tests/test_state_timeout.py:118: in test_restriction_reason_set_on_turn_critical
+    assert state.restriction_reason == 'turn', (
+E   AssertionError: Expected 'turn', got None
+E   assert None == 'turn'
+E    +  where None = AgentState(config=<MagicMock id='125971741681728'>, logger=<MagicMock id='125971741685664'>, security_config=None, token_state=<TokenState.LOW: 'low'>, turn_state=<TurnState.LOW: 'low'>, time_state=<TimeState.LOW: 'low'>, execution_state=<ExecutionState.READY: 'ready'>, session_state=<SessionState.NEW: 'new'>, current_conversation_tokens=0, current_turn=19, restrictions_pending=False, restrictions_active=False, last_token_warning_state=<TokenState.LOW: 'low'>, _token_warning_has_fired=False, last_turn_warning_state=<TurnState.LOW: 'low'>, last_time_warning_state=<TimeState.LOW: 'low'>, last_token_warning=None, last_token_warning_count=0, last_turn_warning=None, last_turn_warning_count=0, last_time_warning=None, last_time_warning_count=0, timeout_seconds=300, time_warning_threshold=240, time_start=None, restriction_reason=None, _pending_events=[]).restriction_reason
+_ TestRestrictionReason.test_restriction_reason_cleared_when_time_returns_to_low _
+tests/test_state_timeout.py:138: in test_restriction_reason_cleared_when_time_returns_to_low
+    assert state.restrictions_active is False
+E   AssertionError: assert True is False
+E    +  where True = AgentState(config=<MagicMock id='125971741710416'>, logger=<MagicMock id='125971741714352'>, security_config=None, token_state=<TokenState.LOW: 'low'>, turn_state=<TurnState.LOW: 'low'>, time_state=<TimeState.LOW: 'low'>, execution_state=<ExecutionState.READY: 'ready'>, session_state=<SessionState.NEW: 'new'>, current_conversation_tokens=0, current_turn=0, restrictions_pending=False, restrictions_active=True, last_token_warning_state=<TokenState.LOW: 'low'>, _token_warning_has_fired=False, last_turn_warning_state=<TurnState.LOW: 'low'>, last_time_warning_state=<TimeState.LOW: 'low'>, last_token_warning=None, last_token_warning_count=0, last_turn_warning=None, last_turn_warning_count=0, last_time_warning='**Time critical**: Agent has exceeded the timeout (300s). Tool restrictions are now active. Only the Respond tool is available. Please finish your work and respond immediately.', last_time_warning_count=999, timeout_seconds=1, time_warning_threshold=0, time_start=None, restriction_reason=None, _pending_events=[]).restrictions_active
+_ TestRestrictionReason.test_restriction_reason_cleared_when_token_returns_to_low _
+tests/test_state_timeout.py:146: in test_restriction_reason_cleared_when_token_returns_to_low
+    state.update_token_state()
+E   TypeError: AgentState.update_token_state() missing 1 required positional argument: 'total_tokens'
+_ TestRestrictionReason.test_restriction_reason_cleared_when_turn_returns_to_low _
+tests/test_state_timeout.py:162: in test_restriction_reason_cleared_when_turn_returns_to_low
+    assert state.restriction_reason == 'turn'
+E   AssertionError: assert None == 'turn'
+E    +  where None = AgentState(config=<MagicMock id='125971735097856'>, logger=<MagicMock id='125971735092480'>, security_config=None, token_state=<TokenState.LOW: 'low'>, turn_state=<TurnState.WARNING: 'warning'>, time_state=<TimeState.LOW: 'low'>, execution_state=<ExecutionState.READY: 'ready'>, session_state=<SessionState.NEW: 'new'>, current_conversation_tokens=0, current_turn=95, restrictions_pending=False, restrictions_active=False, last_token_warning_state=<TokenState.LOW: 'low'>, _token_warning_has_fired=False, last_turn_warning_state=<TurnState.WARNING: 'warning'>, last_time_warning_state=<TimeState.LOW: 'low'>, last_token_warning=None, last_token_warning_count=0, last_turn_warning='**Turn limit warning**: You are running out of turns (95/100). Please finish your work and prepare a final response.', last_turn_warning_count=95, last_time_warning=None, last_time_warning_count=0, timeout_seconds=300, time_warning_threshold=240, time_start=None, restriction_reason=None, _pending_events=[]).restriction_reason
+_ TestTimeoutWarningMessage.test_timeout_warning_message_contains_restriction_hint _
+tests/test_state_timeout.py:185: in test_timeout_warning_message_contains_restriction_hint
+    state = AgentState(logger=MagicMock())
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   TypeError: AgentState.__init__() missing 1 required positional argument: 'config'
+_ TestTimeoutWarningMessage.test_timeout_critical_message_contains_only_respond_hint _
+tests/test_state_timeout.py:203: in test_timeout_critical_message_contains_only_respond_hint
+    state = AgentState(logger=MagicMock())
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   TypeError: AgentState.__init__() missing 1 required positional argument: 'config'
+____ TestAgentConfigSystemPromptValidator.test_custom_file_takes_precedence ____
+tests/test_system_prompt.py:185: in test_custom_file_takes_precedence
+    assert cfg.system_prompt == "Custom file prompt"
+E   AssertionError: assert 'You are Thou... use workers.' == 'Custom file prompt'
+E     
+E     - Custom file prompt
+E     + You are ThoughtMachine, an AI agent designed to help with software projects.
+E     + 
+E     + **Architecture (understand this first):**
+E     + 
+E     + You run on the user's host machine. All your file operations, git commands, and...
+E     
+E     ...Full output truncated (110 lines hidden), use '-vv' to show
+_ TestAgentConfigSystemPromptValidator.test_explicit_value_when_no_custom_file _
+tests/test_system_prompt.py:193: in test_explicit_value_when_no_custom_file
+    assert cfg.system_prompt == "My explicit prompt"
+E   AssertionError: assert 'You are Thou... use workers.' == 'My explicit prompt'
+E     
+E     - My explicit prompt
+E     + You are ThoughtMachine, an AI agent designed to help with software projects.
+E     + 
+E     + **Architecture (understand this first):**
+E     + 
+E     + You run on the user's host machine. All your file operations, git commands, and...
+E     
+E     ...Full output truncated (110 lines hidden), use '-vv' to show
+______ TestTimeoutEnforcesRestrictions.test_timeout_enforces_restrictions ______
+tests/test_worker_agent_transplant.py:384: in test_timeout_enforces_restrictions
+    assert agent.state.restriction_reason == 'timeout', (
+E   AssertionError: Expected restriction_reason='timeout', got turn
+E   assert 'turn' == 'timeout'
+E     
+E     - timeout
+E     + turn
+----------------------------- Captured stderr call -----------------------------
+[15:55:20] WARNING  [core.agent] Time critical: soft restriction applied after 0.0s
+[15:55:20] WARNING  [core.token] Token estimate drift detected | {'estimated': 1689, 'reported': 10, 'drift_pct': 16790.0}
+[15:55:20] WARNING  [core.token] Token estimate drift detected | {'estimated': 25, 'reported': 10, 'drift_pct': 150.0}
+[15:55:20] WARNING  [core.token] Token estimate drift detected | {'estimated': 25, 'reported': 10, 'drift_pct': 150.0}
+[15:55:20] WARNING  [core.token] Token estimate drift detected | {'estimated': 25, 'reported': 10, 'drift_pct': 150.0}
+[15:55:20] WARNING  [core.token] Token estimate drift detected | {'estimated': 97, 'reported': 10, 'drift_pct': 870.0}
+[15:55:20] WARNING  [core.agent] Max turns (5) reached - loop exhausted
+_____ TestReasoningPassthrough.test_reasoning_passthrough_with_tool_calls ______
+tests/test_worker_agent_transplant.py:1116: in test_reasoning_passthrough_with_tool_calls
+    events = list(agent.process_query("test reasoning with tool calls"))
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+agent/core/agent.py:1198: in process_query
+    executed_tools, final_detected, respond_result, summary_text, summary_keep_recent_turns = self.tool_executor.execute_tool_calls(tool_calls, add_to_conversation_func=self._add_to_conversation, agent_id=0, session_id=self.session_id, turn_transaction=turn_transaction)
+                                                                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+agent/core/tool_executor.py:124: in execute_tool_calls
+    tool_name = tool_call['function']['name']
+                ^^^^^^^^^^^^^^^^^^^^^
+E   KeyError: 'function'
+----------------------------- Captured stderr call -----------------------------
+[15:57:21] WARNING  [core.token] Token estimate drift detected | {'estimated': 1618, 'reported': 10, 'drift_pct': 16080.0}
+_______ TestWorkerConfigForwarding.test_worker_overrides_take_precedence _______
+tests/test_worker_agent_transplant.py:1194: in test_worker_overrides_take_precedence
+    assert agent_cfg.system_prompt == "Worker override prompt."
+E   AssertionError: assert 'You are Thou... use workers.' == 'Worker override prompt.'
+E     
+E     - Worker override prompt.
+E     + You are ThoughtMachine, an AI agent designed to help with software projects.
+E     + 
+E     + **Architecture (understand this first):**
+E     + 
+E     + You run on the user's host machine. All your file operations, git commands, and...
+E     
+E     ...Full output truncated (110 lines hidden), use '-vv' to show
+___________________ TestJsonSchema.test_schema_file_matches ____________________
+tests/test_worker_definition.py:140: in test_schema_file_matches
+    assert on_disk == in_memory, (
+E   AssertionError: Schema file is out of date — regenerate it.
+E   assert {'description...inition', ...} == {'description...inition', ...}
+E     
+E     Omitting 4 identical items, use -vv to show
+E     Differing items:
+E     {'properties': {'name': {'description': 'Unique name for this worker definition.', 'title': 'Name', 'type': 'string'},... of tool names this worker is allowed to call.', 'items': {'type': 'string'}, 'title': 'Tools', 'type': 'array'}, ...}} != {'properties': {'name': {'description': 'Unique name for this worker definition.', 'title': 'Name', 'type': 'string'},... of tool names this worker is allowed to call.', 'items': {'type': 'string'}, 'title': 'Tools', 'type': 'array'}, ...}}
+E     
+E     Full diff:
+E       {...
+E     
+E     ...Full output truncated (118 lines hidden), use '-vv' to show
+_________________ TestCheckSystem.test_query_container_status __________________
+tests/tools/test_workspace_tools.py:91: in test_query_container_status
+    assert result["status"] == "running"
+E   AssertionError: assert 'unavailable' == 'running'
+E     
+E     - running
+E     + unavailable
+------------------------------ Captured log call -------------------------------
+WARNING  root:check_system.py:128 CheckSystem falling back to deprecated AgentConfig.workspace_path
+______________________ TestWorker.test_worker_thread_init ______________________
+tests/tools/test_workspace_tools.py:445: in test_worker_thread_init
+    assert thread.conversation == []
+           ^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'WorkerThread' object has no attribute 'conversation'
+_____________ TestWorker.test_worker_thread_save_and_load_context ______________
+tests/tools/test_workspace_tools.py:468: in test_worker_thread_save_and_load_context
+    assert context_file.exists()
+E   AssertionError: assert False
+E    +  where False = exists()
+E    +    where exists = PosixPath('/tmp/pytest-of-jojo/pytest-9/test_worker_thread_save_and_lo0/workers/persist_test/context.json').exists
+__________ TestWorker.test_resume_worker_loads_current_system_prompt ___________
+tests/tools/test_workspace_tools.py:508: in test_resume_worker_loads_current_system_prompt
+    assert len(thread.conversation) == 3
+               ^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'WorkerThread' object has no attribute 'conversation'
+______________________ TestWorker.test_action_list_empty _______________________
+tests/tools/test_workspace_tools.py:558: in test_action_list_empty
+    assert result["count"] == 0
+E   assert 1 == 0
+------------------------------ Captured log call -------------------------------
+WARNING  root:worker.py:1786 Worker tool resolved workspace via deprecated AgentConfig.workspace_path. Consider ensuring session_id is present.
+______________________ TestWorker.test_action_spawn_found ______________________
+/usr/lib/python3.12/unittest/mock.py:1387: in patched
+    with self.decoration_helper(patched,
+/usr/lib/python3.12/contextlib.py:137: in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+/usr/lib/python3.12/unittest/mock.py:1369: in decoration_helper
+    arg = exit_stack.enter_context(patching)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/contextlib.py:526: in enter_context
+    result = _enter(cm)
+             ^^^^^^^^^^
+/usr/lib/python3.12/unittest/mock.py:1458: in __enter__
+    original, local = self.get_original()
+                      ^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/unittest/mock.py:1431: in get_original
+    raise AttributeError(
+E   AttributeError: <class 'tools.workspace.worker.Worker'> does not have the attribute '_build_llm_client'
+_____________________ TestWorker.test_missing_workers_file _____________________
+tests/tools/test_workspace_tools.py:785: in test_missing_workers_file
+    assert result["count"] == 0
+E   assert 1 == 0
+------------------------------ Captured log call -------------------------------
+WARNING  root:worker.py:1786 Worker tool resolved workspace via deprecated AgentConfig.workspace_path. Consider ensuring session_id is present.
+__________________ TestWorker.test_spawn_strips_by_footprint ___________________
+/usr/lib/python3.12/unittest/mock.py:1387: in patched
+    with self.decoration_helper(patched,
+/usr/lib/python3.12/contextlib.py:137: in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+/usr/lib/python3.12/unittest/mock.py:1369: in decoration_helper
+    arg = exit_stack.enter_context(patching)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/contextlib.py:526: in enter_context
+    result = _enter(cm)
+             ^^^^^^^^^^
+/usr/lib/python3.12/unittest/mock.py:1458: in __enter__
+    original, local = self.get_original()
+                      ^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/unittest/mock.py:1431: in get_original
+    raise AttributeError(
+E   AttributeError: <class 'tools.workspace.worker.Worker'> does not have the attribute '_build_llm_client'
+________________ TestWorker.test_spawn_strips_blocklisted_tools ________________
+/usr/lib/python3.12/unittest/mock.py:1387: in patched
+    with self.decoration_helper(patched,
+/usr/lib/python3.12/contextlib.py:137: in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+/usr/lib/python3.12/unittest/mock.py:1369: in decoration_helper
+    arg = exit_stack.enter_context(patching)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/contextlib.py:526: in enter_context
+    result = _enter(cm)
+             ^^^^^^^^^^
+/usr/lib/python3.12/unittest/mock.py:1458: in __enter__
+    original, local = self.get_original()
+                      ^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/unittest/mock.py:1431: in get_original
+    raise AttributeError(
+E   AttributeError: <class 'tools.workspace.worker.Worker'> does not have the attribute '_build_llm_client'
+________ TestWorker.test_per_call_gate_denies_write_for_readonly_worker ________
+tests/tools/test_workspace_tools.py:970: in test_per_call_gate_denies_write_for_readonly_worker
+    error = thread._check_tool_permissions(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'WorkerThread' object has no attribute '_check_tool_permissions'
+________ TestWebSocketLifecycle.test_new_session_resolves_workspace_id _________
+tests/web_ui/backend/test_websocket_integration.py:253: in test_new_session_resolves_workspace_id
+    assert sl["workspace_id"] == ws_id, (
+E   AssertionError: Expected workspace_id='2e2f8ae018fa435', got 'brave-gecko-83'
+E   assert 'brave-gecko-83' == '2e2f8ae018fa435'
+E     
+E     - 2e2f8ae018fa435
+E     + brave-gecko-83
+----------------------------- Captured stderr call -----------------------------
+[15:57:23] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:23] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+____________ TestWebSocketLifecycle.test_apply_config_with_api_key _____________
+tests/web_ui/backend/test_websocket_integration.py:288: in test_apply_config_with_api_key
+    assert last_config.get("api_key_configured") is True, (
+E   AssertionError: Expected api_key_configured=True, got api_key_configured=False. Full config: {'worker_mode': False, 'base_url': 'https://api.deepseek.com', 'model': 'gpt-4', 'provider_config': {}, 'temperature': 0.7, 'max_turns': 100, 'mode': 'agent', 'system_prompt': 'You are ThoughtMachine, an AI agent designed to help with software projects.\n\n**Architecture (understand this first):**\n\nYou run on the user\'s host machine. All your file operations, git commands, and\nnetwork calls execute on the host itself. Docker (if available) is a *tool you\ncall from the host* to run code in an isolated sandbox — the container is not\nyour runtime environment. The user\'s application runs on their computer with\nnormal internet access, separate from any Docker sandbox you might use.\n\nYou operate inside a **workspace** — a bounded directory tree. You can (depending\non permissions) read, write, and execute everything inside it, but tools will\nnever allow you to go outside the workspace. The only window out of the workspace\nis into the **vault** (`~/.thoughtmachine`), a read‑only/inspectable area that\nholds configuration, knowledge bases, and session data. You can inspect the vault\nwith `CheckSystem` but you cannot write to it.\n\nIf something confuses "where I run" vs "where the user\'s app runs" vs "where\nDocker runs," stop and clarify before proceeding.\n\n**Workspace Awareness:**\n\nUse `CheckSystem` at the start of a session to inspect your effective permissions,\ncontainer status, and workspace configuration.\n\n**Core Rules & Tools:**\n\n1. **Tools**: Use provided tools. Prefer `ApplyEdits` for code changes (supports regex,\n   multiline edits, batch editing across multiple files via file_pattern, and preview\n   mode). Second choice `CodeModifier` for structural Python changes, fallback\n   `FileEditor` for simple line operations.\n\n2. **Context**: Project root is determined by `DirectoryTreeTool`. All paths are relative.\n\n3. **Efficiency**: Batch file operations are preferred when the tool supports them.\n\n4. **Responding to the user**: Always use the `Respond` tool when you are ready to\n   communicate with the user.\n   - `content` must contain your complete message.\n   - `response_type` `"answer"` = final result (session continues, no immediate reply\n     required).\n   - `response_type` `"question"` = you need user input before continuing.\n   - If the task produced a detailed report, fill in `report_body` and `report_title`\n     to write it as a downloadable file. The user always sees `content` in chat; the\n     report file is a bonus.\n\n5. **Helper Files**: `temp/` is the playground directory for short‑lived helper files.\n\n6. **File Search**: Use `FileSearchTool` for search across files with regex, multiline\n   patterns, context lines, and line numbers.\n\n7. **Semantic Code Search**: Use `SearchCodebaseTool` to understand code meaning or\n   find implementations using natural language queries.\n\n8. **Refactoring**: Use `RefactorTool` for cross‑file structural changes; supports\n   preview mode and atomic updates.\n\n9. **Token and Turn Monitoring**: The system monitors token usage and turn count.\n   Warnings are normal — they signal that it\'s time to consider summarizing. When\n   context reaches critical, tools (except `Respond` and `SummarizeTool`) are\n   automatically restricted. Call `SummarizeTool` to prune older conversation turns\n   and continue unbothered. Both you and any workers run on the same mechanism;\n   summarizing is the natural cycle of work.\n\n10. **Git**: Git is available. **You are responsible for committing** — workers can\n    only read Git history. Commit logical chunks with meaningful messages. If you\n    notice the project lacks version control, suggest initialising it.\n\n11. **Availability of new features**: If you write code/tools for this agent, changes\n    only take effect after restarting the agent.\n\n12. **Knowledge Base**: A project notebook is available in `.thoughtmachine/knowledge/`\n    (workspace scope) or `~/.thoughtmachine/knowledge/` (global scope). Use\n    `KnowledgeBaseTool` to search or update — store architecture notes, development\n    guides, bug logs, task tracking, and lessons learned. Before starting a fresh\n    session, check relevant KB entries.\n\n13. **Avoid Loops**: Do not repeat the same tool call with the same parameters more\n    than twice consecutively. If a tool returns an error, analyse what changed and\n    adjust — don\'t retry blindly. If you call the same tool >3 times without progress,\n    reassess and try a different strategy.\n\n14. **New User Onboarding**: When interacting with someone new to ThoughtMachine, offer\n    a guided, friendly experience. Explain concepts in plain language. Check the\n    global KB\'s `system/onboarding_guide.md` for a ready‑to‑use introduction.\n\n15. **Capability Transparency**: Be proactively honest about what you can and cannot\n    do. If a tool fails because a dependency is missing, explain in plain language\n    what that means, what the user is missing, and how to fix it.\n\n16. **Proactive Guidance**: Think critically about the project. Flag technical debt,\n    missing tests, error handling, or architectural smells. Frame suggestions\n    constructively.\n\n17. **Map the Territory**: At natural breakpoints, offer to explain the current\n    landscape — state of the project, available capabilities, tradeoffs. Don\'t\n    assume the user knows what\'s possible.\n\n18. **Workers (optional)**: The `Worker` tool gives you access to sub‑agents. A\n    `default` worker is always available; additional workers may be defined in the\n    workspace. Workers are fully capable but you are not required to use them. For\n    most tasks, work directly with your own tools. If a task is large, multi‑file,\n    or benefits from isolation, you may spawn the worker — but it\'s a choice, not\n    a rule.\n\n    If you do use a worker, prefer to give it a clear `query`, a `briefing` with\n    essential context, and a short `timeout_seconds` (~60s) to start. You can\n    follow up with `action="query"` on the same worker to continue the conversation\n    without losing context.\n\n19. **Handoff & KB Learning**: Before calling `SummarizeTool`, take a moment to\n    record useful knowledge. In particular, if you\'ve been working with a worker,\n    write a short KB entry (e.g., in `worker_notes.md`) describing what worked, what\n    didn\'t, and any tips for future sessions. This lets the system improve\n    dynamically as we learn how to best use workers.', 'token_monitor_warning_threshold': 65000, 'token_monitor_critical_threshold': 80000, 'turn_monitor_enabled': True, 'enable_logging': True, 'log_dir': './logs', 'log_level': 'INFO', 'enable_file_logging': True, 'jsonl_format': True, 'log_categories': ['SESSION', 'LLM', 'TOOLS'], 'max_file_size_mb': 10, 'max_backup_files': 5, 'rag_enabled': False, 'rag_embedding_model': 'BAAI/bge-small-en-v1.5', 'rag_chunk_size': 1500, 'rag_chunk_overlap': 200, 'rag_batch_size': 16, 'rag_truncate_dim': 256, 'kb_enabled': True, 'tool_output_token_limit': 10000, 'detail': 'normal', 'timeout_seconds': 300, 'time_monitor_enabled': False, 'time_warning_threshold': 240, 'session_permissions': {'container': False, 'network': 'banned', 'filesystem': 'read', 'system': 'read', 'git': 'read', 'execution': 'banned'}, 'provider': 'local', 'tools': [{'name': 'FileEditor', 'enabled': True}, {'name': 'ReadFile', 'enabled': True}, {'name': 'FilePreviewTool', 'enabled': True}, {'name': 'DirectoryTreeTool', 'enabled': True}, {'name': 'GlobTool', 'enabled': True}, {'name': 'FileSearchTool', 'enabled': True}, {'name': 'ApplyEdits', 'enabled': True}, {'name': 'CodeModifier', 'enabled': True}, {'name': 'DateTimeTool', 'enabled': True}, {'name': 'DirectoryCreator', 'enabled': True}, {'name': 'DockerCodeRunner', 'enabled': True}, {'name': 'FieldViewer', 'enabled': True}, {'name': 'FileMover', 'enabled': True}, {'name': 'FileSummaryTool', 'enabled': True}, {'name': 'GitInfoTool', 'enabled': True}, {'name': 'KnowledgeBaseTool', 'enabled': True}, {'name': 'MCPValidator', 'enabled': True}, {'name': 'PaginateTool', 'enabled': True}, {'name': 'Respond', 'enabled': True}, {'name': 'SummarizeTool', 'enabled': True}, {'name': 'CheckSystem', 'enabled': True}, {'name': 'WorkingDocument', 'enabled': True}], 'workspace_path': None, 'api_key_configured': False}
+E   assert False is True
+E    +  where False = <built-in method get of dict object at 0x729215c82040>('api_key_configured')
+E    +    where <built-in method get of dict object at 0x729215c82040> = {'worker_mode': False, 'base_url': 'https://api.deepseek.com', 'model': 'gpt-4', 'provider_config': {}, ...}.get
+----------------------------- Captured stderr call -----------------------------
+[15:57:23] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:23] WARNING  [server.bridge] apply_config: controller thread is dead — restarting controller
+[15:57:23] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:23] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+___ TestWebSocketWithMockProvider.test_continue_session_calls_mock_provider ____
+tests/web_ui/backend/test_ws_mock_provider.py:301: in test_continue_session_calls_mock_provider
+    assert len(mock_instances) > 0, "No MockProvider was ever created"
+E   AssertionError: No MockProvider was ever created
+E   assert 0 > 0
+E    +  where 0 = len([])
+----------------------------- Captured stderr call -----------------------------
+[15:57:24] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:24] WARNING  [server.bridge] apply_config: controller thread is dead — restarting controller
+[15:57:24] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:24] WARNING  [core.controller] start() is deprecated. Use set_session() + process_query() instead.
+[15:57:24] ERROR    [core.controller] _run: Agent creation FAILED: Provider 'openai_compatible' not found. Available: ['scripted', 'echotool', 'mock']
+Traceback (most recent call last):
+  File "/home/jojo/PycharmProjects/ThoughtMachine-dev/agent/controller/__init__.py", line 583, in _run
+    agent = Agent(run_config, session=self._session if hasattr(self, '_session') else None)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jojo/PycharmProjects/ThoughtMachine-dev/agent/core/agent.py", line 105, in __init__
+    self.llm_client = LLMClient(config, session, self.logger)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jojo/PycharmProjects/ThoughtMachine-dev/agent/core/llm_client.py", line 36, in __init__
+    self.provider = ProviderFactory.create_provider(provider_type=config.provider_type, api_key=config.api_key, base_url=config.base_url, model=config.model, temperature=config.temperature)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jojo/PycharmProjects/ThoughtMachine-dev/llm_providers/factory.py", line 83, in create_provider
+    raise ProviderNotFoundError(
+llm_providers.exceptions.ProviderNotFoundError: Provider 'openai_compatible' not found. Available: ['scripted', 'echotool', 'mock']
+____ TestWebSocketWithMockProvider.test_apply_config_deep_merge_permissions ____
+tests/web_ui/backend/test_ws_mock_provider.py:349: in test_apply_config_deep_merge_permissions
+    assert perms.get("network") is False, (
+E   AssertionError: Expected network=False (preserved by deep_merge), got banned
+E   assert 'banned' is False
+E    +  where 'banned' = <built-in method get of dict object at 0x72921433b000>('network')
+E    +    where <built-in method get of dict object at 0x72921433b000> = {'container': False, 'network': 'banned', 'filesystem': 'write', 'system': 'read', ...}.get
+----------------------------- Captured stderr call -----------------------------
+[15:57:25] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:25] WARNING  [server.bridge] apply_config: controller thread is dead — restarting controller
+[15:57:25] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:25] WARNING  [server.bridge] apply_config: controller thread is dead — restarting controller
+[15:57:25] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:25] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+__________ TestWebSocketWithMockProvider.test_model_override_priority __________
+tests/web_ui/backend/test_ws_mock_provider.py:380: in test_model_override_priority
+    assert last_config.get("model") == "gpt-4-turbo", (
+E   AssertionError: Expected model=gpt-4-turbo (model_override wins), got model='gpt-3.5-turbo'
+E   assert 'gpt-3.5-turbo' == 'gpt-4-turbo'
+E     
+E     - gpt-4-turbo
+E     ?     ^
+E     + gpt-3.5-turbo
+E     ?     ^^^
+----------------------------- Captured stderr call -----------------------------
+[15:57:26] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:26] WARNING  [server.bridge] apply_config: controller thread is dead — restarting controller
+[15:57:26] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:26] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+_____ TestWebSocketWithMockProvider.test_api_key_stripped_from_config_dump _____
+tests/web_ui/backend/test_ws_mock_provider.py:413: in test_api_key_stripped_from_config_dump
+    assert last_config.get("api_key_configured") is True
+E   AssertionError: assert False is True
+E    +  where False = <built-in method get of dict object at 0x7292147bf540>('api_key_configured')
+E    +    where <built-in method get of dict object at 0x7292147bf540> = {'worker_mode': False, 'base_url': 'https://api.deepseek.com', 'model': 'mock-model', 'provider_config': {}, ...}.get
+----------------------------- Captured stderr call -----------------------------
+[15:57:26] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:26] WARNING  [server.bridge] apply_config: controller thread is dead — restarting controller
+[15:57:26] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:26] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+______ TestWebSocketWithMockProvider.test_save_and_load_session_roundtrip ______
+tests/web_ui/backend/test_ws_mock_provider.py:462: in test_save_and_load_session_roundtrip
+    assert loaded_config.get("model") == "mock-model"
+E   AssertionError: assert None == 'mock-model'
+E    +  where None = <built-in method get of dict object at 0x729214211f80>('model')
+E    +    where <built-in method get of dict object at 0x729214211f80> = {}.get
+----------------------------- Captured stderr call -----------------------------
+[15:57:27] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:27] ERROR    [server.ws] FATAL WebSocket error: 1 validation error for AgentConfig
+session_permissions.network
+  Input should be 'banned', 'ask' or 'write' [type=literal_error, input_value='all', input_type=str]
+    For further information visit https://errors.pydantic.dev/2.13/v/literal_error
+Traceback (most recent call last):
+  File "/home/jojo/PycharmProjects/ThoughtMachine-dev/web_ui/backend/server.py", line 905, in websocket_endpoint
+    result = bridge.apply_config(backend_config)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jojo/PycharmProjects/ThoughtMachine-dev/web_ui/backend/bridge.py", line 1287, in apply_config
+    agent_config = session_config.to_agent_config()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jojo/PycharmProjects/ThoughtMachine-dev/agent/config/session_config.py", line 191, in to_agent_config
+    return AgentConfig(**kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jojo/PycharmProjects/ThoughtMachine-dev/.venv/lib/python3.12/site-packages/pydantic/main.py", line 263, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+pydantic_core._pydantic_core.ValidationError: 1 validation error for AgentConfig
+session_permissions.network
+  Input should be 'banned', 'ask' or 'write' [type=literal_error, input_value='all', input_type=str]
+    For further information visit https://errors.pydantic.dev/2.13/v/literal_error
+[15:57:32] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:37] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:37] WARNING  [docker.verify_integrity] Container 0862d7644e88 config mismatch — removing | {'container_name': 'agent-exec-0acf09775137', 'actual_network': 'bridge', 'desired_network': 'none',... [truncated]
+[15:57:42] ERROR    [server.ws] FATAL WebSocket error: 1 validation error for AgentConfig
+session_permissions.network
+  Input should be 'banned', 'ask' or 'write' [type=literal_error, input_value='all', input_type=str]
+    For further information visit https://errors.pydantic.dev/2.13/v/literal_error
+Traceback (most recent call last):
+  File "/home/jojo/PycharmProjects/ThoughtMachine-dev/web_ui/backend/server.py", line 1344, in websocket_endpoint
+    fe_config = _frontend_config_from_bridge(bridge)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jojo/PycharmProjects/ThoughtMachine-dev/web_ui/backend/server.py", line 2208, in _frontend_config_from_bridge
+    agent_cfg = AgentConfig(**cfg)
+                ^^^^^^^^^^^^^^^^^^
+  File "/home/jojo/PycharmProjects/ThoughtMachine-dev/.venv/lib/python3.12/site-packages/pydantic/main.py", line 263, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+pydantic_core._pydantic_core.ValidationError: 1 validation error for AgentConfig
+session_permissions.network
+  Input should be 'banned', 'ask' or 'write' [type=literal_error, input_value='all', input_type=str]
+    For further information visit https://errors.pydantic.dev/2.13/v/literal_error
+[15:57:42] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+_____________________ TestCreateWorker.test_create_worker ______________________
+tests/web_ui/test_worker_crud.py:109: in test_create_worker
+    assert len(disk_data) == 1
+E   assert 2 == 1
+E    +  where 2 = len([{'name': 'default', 'description': 'Default general-purpose worker with no restrictions — can perform any task the main agent delegates.', 'system_prompt': 'You are a worker sub-agent of ThoughtMachine. You communicate with an engineer agent above you via the Respond tool. Your job is to execute the given sub-task and return an honest, structured response.\n\n**Role awareness:**\n- The main agent will give you a task in the initial system message (look for the "Initial context" JSON). It contains a "query" (your task), likely a "briefing" (critical state the main agent wants you to know), and optionally "purpose", "style", and "meta".\n- You are a specialist executor — focus on your specific assignment. The main agent handles planning, user interaction, and orchestration.\n\n**Tools and capabilities:**\nYou have a broad set of tools for file editing, search, code execution, and system inspection. Use them efficiently:\n- Prefer `ApplyEdits` for code changes (supports regex, multiline, batch editing, preview).\n- Use `CodeModifier` for structural Python changes, `FileEditor` for simple line operations.\n- For search: `FileSearchTool` (regex, patterns), `SearchCodebaseTool` (seman...see the main agent\'s conversation history.\n\n**Token monitoring and summarisation:**\n- The system monitors your token usage. Warnings are normal — they indicate that context is filling up and it\'s a good time to consider summarizing.\n- When context reaches critical, tools (except `Respond` and `SummarizeTool`) are automatically restricted. Call `SummarizeTool` to prune older conversation turns and restore full tool access. This is the natural cycle of work; it is not an error or a problem.\n- If you receive a token warning, finish your current thought and call `SummarizeTool` to compact your context, then continue. If a timeout warning appears (separate mechanism), finish and call `Respond` immediately.\n\n**Be concise and focused:**\n- Answer the sub-task directly. Prefer code, data, and concrete results over lengthy explanations.\n- Think thoroughly, use all available tools, then respond with your result.\n- Do not ask the user for clarification — the main agent already understood the request.', 'tools': [], ...}, {'name': 'test-worker', 'description': 'A worker created during testing.', 'system_prompt': 'You are a test worker.\n', 'tools': ['FileEditor', 'GlobTool'], ...}])
+____________________ TestCreateWorker.test_create_duplicate ____________________
+tests/web_ui/test_worker_crud.py:130: in test_create_duplicate
+    assert len(disk_data) == 1
+E   assert 2 == 1
+E    +  where 2 = len([{'name': 'default', 'description': 'Default general-purpose worker with no restrictions — can perform any task the main agent delegates.', 'system_prompt': 'You are a worker sub-agent of ThoughtMachine. You communicate with an engineer agent above you via the Respond tool. Your job is to execute the given sub-task and return an honest, structured response.\n\n**Role awareness:**\n- The main agent will give you a task in the initial system message (look for the "Initial context" JSON). It contains a "query" (your task), likely a "briefing" (critical state the main agent wants you to know), and optionally "purpose", "style", and "meta".\n- You are a specialist executor — focus on your specific assignment. The main agent handles planning, user interaction, and orchestration.\n\n**Tools and capabilities:**\nYou have a broad set of tools for file editing, search, code execution, and system inspection. Use them efficiently:\n- Prefer `ApplyEdits` for code changes (supports regex, multiline, batch editing, preview).\n- Use `CodeModifier` for structural Python changes, `FileEditor` for simple line operations.\n- For search: `FileSearchTool` (regex, patterns), `SearchCodebaseTool` (seman...see the main agent\'s conversation history.\n\n**Token monitoring and summarisation:**\n- The system monitors your token usage. Warnings are normal — they indicate that context is filling up and it\'s a good time to consider summarizing.\n- When context reaches critical, tools (except `Respond` and `SummarizeTool`) are automatically restricted. Call `SummarizeTool` to prune older conversation turns and restore full tool access. This is the natural cycle of work; it is not an error or a problem.\n- If you receive a token warning, finish your current thought and call `SummarizeTool` to compact your context, then continue. If a timeout warning appears (separate mechanism), finish and call `Respond` immediately.\n\n**Be concise and focused:**\n- Answer the sub-task directly. Prefer code, data, and concrete results over lengthy explanations.\n- Think thoroughly, use all available tools, then respond with your result.\n- Do not ask the user for clarification — the main agent already understood the request.', 'tools': [], ...}, {'name': 'test-worker', 'description': 'A worker created during testing.', 'system_prompt': 'You are a test worker.\n', 'tools': ['FileEditor', 'GlobTool'], ...}])
+_____________________ TestUpdateWorker.test_update_worker ______________________
+tests/web_ui/test_worker_crud.py:186: in test_update_worker
+    assert len(disk_data) == 1
+E   assert 2 == 1
+E    +  where 2 = len([{'name': 'default', 'description': 'Default general-purpose worker with no restrictions — can perform any task the main agent delegates.', 'system_prompt': 'You are a worker sub-agent of ThoughtMachine. You communicate with an engineer agent above you via the Respond tool. Your job is to execute the given sub-task and return an honest, structured response.\n\n**Role awareness:**\n- The main agent will give you a task in the initial system message (look for the "Initial context" JSON). It contains a "query" (your task), likely a "briefing" (critical state the main agent wants you to know), and optionally "purpose", "style", and "meta".\n- You are a specialist executor — focus on your specific assignment. The main agent handles planning, user interaction, and orchestration.\n\n**Tools and capabilities:**\nYou have a broad set of tools for file editing, search, code execution, and system inspection. Use them efficiently:\n- Prefer `ApplyEdits` for code changes (supports regex, multiline, batch editing, preview).\n- Use `CodeModifier` for structural Python changes, `FileEditor` for simple line operations.\n- For search: `FileSearchTool` (regex, patterns), `SearchCodebaseTool` (seman...r see the main agent\'s conversation history.\n\n**Token monitoring and summarisation:**\n- The system monitors your token usage. Warnings are normal — they indicate that context is filling up and it\'s a good time to consider summarizing.\n- When context reaches critical, tools (except `Respond` and `SummarizeTool`) are automatically restricted. Call `SummarizeTool` to prune older conversation turns and restore full tool access. This is the natural cycle of work; it is not an error or a problem.\n- If you receive a token warning, finish your current thought and call `SummarizeTool` to compact your context, then continue. If a timeout warning appears (separate mechanism), finish and call `Respond` immediately.\n\n**Be concise and focused:**\n- Answer the sub-task directly. Prefer code, data, and concrete results over lengthy explanations.\n- Think thoroughly, use all available tools, then respond with your result.\n- Do not ask the user for clarification — the main agent already understood the request.', 'tools': [], ...}, {'name': 'test-worker', 'description': 'A worker created during testing.', 'system_prompt': 'Updated system prompt.', 'tools': ['FileEditor', 'GlobTool'], ...}])
+_____________________ TestDeleteWorker.test_delete_worker ______________________
+tests/web_ui/test_worker_crud.py:240: in test_delete_worker
+    assert len(disk_data) == 0, "workers.json should be empty after delete"
+E   AssertionError: workers.json should be empty after delete
+E   assert 1 == 0
+E    +  where 1 = len([{'name': 'default', 'description': 'Default general-purpose worker with no restrictions — can perform any task the main agent delegates.', 'system_prompt': 'You are a worker sub-agent of ThoughtMachine. You communicate with an engineer agent above you via the Respond tool. Your job is to execute the given sub-task and return an honest, structured response.\n\n**Role awareness:**\n- The main agent will give you a task in the initial system message (look for the "Initial context" JSON). It contains a "query" (your task), likely a "briefing" (critical state the main agent wants you to know), and optionally "purpose", "style", and "meta".\n- You are a specialist executor — focus on your specific assignment. The main agent handles planning, user interaction, and orchestration.\n\n**Tools and capabilities:**\nYou have a broad set of tools for file editing, search, code execution, and system inspection. Use them efficiently:\n- Prefer `ApplyEdits` for code changes (supports regex, multiline, batch editing, preview).\n- Use `CodeModifier` for structural Python changes, `FileEditor` for simple line operations.\n- For search: `FileSearchTool` (regex, patterns), `SearchCodebaseTool` (seman...de execution happens inside Docker containers. You have no direct host filesystem access beyond the workspace.\n- You cannot commit to Git, write to the vault, or see the main agent\'s conversation history.\n\n**Token monitoring and summarisation:**\n- The system monitors your token usage. Warnings are normal — they indicate that context is filling up and it\'s a good time to consider summarizing.\n- When context reaches critical, tools (except `Respond` and `SummarizeTool`) are automatically restricted. Call `SummarizeTool` to prune older conversation turns and restore full tool access. This is the natural cycle of work; it is not an error or a problem.\n- If you receive a token warning, finish your current thought and call `SummarizeTool` to compact your context, then continue. If a timeout warning appears (separate mechanism), finish and call `Respond` immediately.\n\n**Be concise and focused:**\n- Answer the sub-task directly. Prefer code, data, and concrete results over lengthy explanations.\n- Think thoroughly, use all available tools, then respond with your result.\n- Do not ask the user for clarification — the main agent already understood the request.', 'tools': [], ...}])
+_________________ TestListWorkers.test_list_workers_after_crud _________________
+tests/web_ui/test_worker_crud.py:383: in test_list_workers_after_crud
+    assert len(resp.json()) == 2
+E   assert 3 == 2
+E    +  where 3 = len([{'name': 'default', 'description': 'Default general-purpose worker with no restrictions — can perform any task the main agent delegates.', 'system_prompt': 'You are a worker sub-agent of ThoughtMachine. You communicate with an engineer agent above you via the Respond tool. Your job is to execute the given sub-task and return an honest, structured response.\n\n**Role awareness:**\n- The main agent will give you a task in the initial system message (look for the "Initial context" JSON). It contains a "query" (your task), likely a "briefing" (critical state the main agent wants you to know), and optionally "purpose", "style", and "meta".\n- You are a specialist executor — focus on your specific assignment. The main agent handles planning, user interaction, and orchestration.\n\n**Tools and capabilities:**\nYou have a broad set of tools for file editing, search, code execution, and system inspection. Use them efficiently:\n- Prefer `ApplyEdits` for code changes (supports regex, multiline, batch editing, preview).\n- Use `CodeModifier` for structural Python changes, `FileEditor` for simple line operations.\n- For search: `FileSearchTool` (regex, patterns), `SearchCodebaseTool` (seman...dicate that context is filling up and it\'s a good time to consider summarizing.\n- When context reaches critical, tools (except `Respond` and `SummarizeTool`) are automatically restricted. Call `SummarizeTool` to prune older conversation turns and restore full tool access. This is the natural cycle of work; it is not an error or a problem.\n- If you receive a token warning, finish your current thought and call `SummarizeTool` to compact your context, then continue. If a timeout warning appears (separate mechanism), finish and call `Respond` immediately.\n\n**Be concise and focused:**\n- Answer the sub-task directly. Prefer code, data, and concrete results over lengthy explanations.\n- Think thoroughly, use all available tools, then respond with your result.\n- Do not ask the user for clarification — the main agent already understood the request.', 'tools': [], ...}, {'name': 'worker-a', 'description': 'A worker created during testing.', 'system_prompt': 'You are a test worker.\n', 'tools': ['FileEditor', 'GlobTool'], ...}, {'name': 'worker-b', 'description': 'A worker created during testing.', 'system_prompt': 'You are a test worker.\n', 'tools': ['FileEditor', 'GlobTool'], ...}])
+E    +    where [{'name': 'default', 'description': 'Default general-purpose worker with no restrictions — can perform any task the main agent delegates.', 'system_prompt': 'You are a worker sub-agent of ThoughtMachine. You communicate with an engineer agent above you via the Respond tool. Your job is to execute the given sub-task and return an honest, structured response.\n\n**Role awareness:**\n- The main agent will give you a task in the initial system message (look for the "Initial context" JSON). It contains a "query" (your task), likely a "briefing" (critical state the main agent wants you to know), and optionally "purpose", "style", and "meta".\n- You are a specialist executor — focus on your specific assignment. The main agent handles planning, user interaction, and orchestration.\n\n**Tools and capabilities:**\nYou have a broad set of tools for file editing, search, code execution, and system inspection. Use them efficiently:\n- Prefer `ApplyEdits` for code changes (supports regex, multiline, batch editing, preview).\n- Use `CodeModifier` for structural Python changes, `FileEditor` for simple line operations.\n- For search: `FileSearchTool` (regex, patterns), `SearchCodebaseTool` (seman...dicate that context is filling up and it\'s a good time to consider summarizing.\n- When context reaches critical, tools (except `Respond` and `SummarizeTool`) are automatically restricted. Call `SummarizeTool` to prune older conversation turns and restore full tool access. This is the natural cycle of work; it is not an error or a problem.\n- If you receive a token warning, finish your current thought and call `SummarizeTool` to compact your context, then continue. If a timeout warning appears (separate mechanism), finish and call `Respond` immediately.\n\n**Be concise and focused:**\n- Answer the sub-task directly. Prefer code, data, and concrete results over lengthy explanations.\n- Think thoroughly, use all available tools, then respond with your result.\n- Do not ask the user for clarification — the main agent already understood the request.', 'tools': [], ...}, {'name': 'worker-a', 'description': 'A worker created during testing.', 'system_prompt': 'You are a test worker.\n', 'tools': ['FileEditor', 'GlobTool'], ...}, {'name': 'worker-b', 'description': 'A worker created during testing.', 'system_prompt': 'You are a test worker.\n', 'tools': ['FileEditor', 'GlobTool'], ...}] = json()
+E    +      where json = <Response [200 OK]>.json
+___________________ TestListWorkers.test_list_workers_empty ____________________
+tests/web_ui/test_worker_crud.py:404: in test_list_workers_empty
+    assert resp.json() == []
+E   AssertionError: assert [{'name': 'de...ls': [], ...}] == []
+E     
+E     Left contains one more item: {'name': 'default', 'description': 'Default general-purpose worker with no restrictions — can perform any task the mai...r result.\n- Do not ask the user for clarification — the main agent already understood the request.', 'tools': [], ...}
+E     
+E     Full diff:
+E     - []
+E     + [
+E     +     {...
+E     
+E     ...Full output truncated (123 lines hidden), use '-vv' to show
+_______________ TestGetWorkers.test_returns_empty_list_initially _______________
+tests/workspace/test_api.py:114: in test_returns_empty_list_initially
+    assert resp.json() == []
+E   AssertionError: assert [{'name': 'de...ls': [], ...}] == []
+E     
+E     Left contains one more item: {'name': 'default', 'description': 'Default general-purpose worker with no restrictions — can perform any task the mai...r result.\n- Do not ask the user for clarification — the main agent already understood the request.', 'tools': [], ...}
+E     
+E     Full diff:
+E     - []
+E     + [
+E     +     {...
+E     
+E     ...Full output truncated (123 lines hidden), use '-vv' to show
+_______ TestEnsureWorkspaceDirs.test_safeguard_warns_on_unexpected_item ________
+tests/workspace/test_bootstrap.py:157: in test_safeguard_warns_on_unexpected_item
+    assert any("sessions" in record.message for record in caplog.records)
+E   assert False
+E    +  where False = any(<generator object TestEnsureWorkspaceDirs.test_safeguard_warns_on_unexpected_item.<locals>.<genexpr> at 0x72920e45f6b0>)
+------------------------------ Captured log call -------------------------------
+WARNING  root:workspace_capabilities.py:446 Unexpected item in workspace config dir (/tmp/tmpy5yyd4v_/.thoughtmachine/workspaces/test-ws): container_state.json
+___ TestEnsureWorkspaceDirs.test_safeguard_does_not_delete_unexpected_items ____
+tests/workspace/test_bootstrap.py:178: in test_safeguard_does_not_delete_unexpected_items
+    assert any("sessions" in record.message for record in caplog.records)
+E   assert False
+E    +  where False = any(<generator object TestEnsureWorkspaceDirs.test_safeguard_does_not_delete_unexpected_items.<locals>.<genexpr> at 0x72920e404450>)
+=============================== warnings summary ===============================
+.venv/lib/python3.12/site-packages/_pytest/config/__init__.py:1464
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/.venv/lib/python3.12/site-packages/_pytest/config/__init__.py:1464: PytestConfigWarning: Unknown config option: asyncio_mode
+  
+    self._warn_or_fail_if_strict(f"Unknown config option: {key}\n")
+
+agent/events.py:87
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/agent/events.py:87: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    class EventMetadata(BaseModel):
+
+.venv/lib/python3.12/site-packages/pydantic/_internal/_generate_schema.py:325
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/.venv/lib/python3.12/site-packages/pydantic/_internal/_generate_schema.py:325: PydanticDeprecatedSince20: `json_encoders` is deprecated. See https://docs.pydantic.dev/2.13/concepts/serialization/#custom-serializers for alternatives. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    warnings.warn(
+
+agent/events.py:141
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/agent/events.py:141: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    @validator('data')
+
+agent/events.py:153
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/agent/events.py:153: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    @validator('data')
+
+agent/events.py:163
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/agent/events.py:163: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    @validator('data')
+
+agent/events.py:188
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/agent/events.py:188: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    @validator('data')
+
+agent/events.py:213
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/agent/events.py:213: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    @validator('data')
+
+agent/events.py:225
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/agent/events.py:225: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    @validator('data')
+
+agent/events.py:237
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/agent/events.py:237: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    @validator('data')
+
+agent/events.py:249
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/agent/events.py:249: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    @validator('data')
+
+agent/events.py:257
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/agent/events.py:257: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    @validator('data')
+
+agent/events.py:269
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/agent/events.py:269: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    @validator('data')
+
+agent/events.py:281
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/agent/events.py:281: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    @validator('data')
+
+agent/events.py:291
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/agent/events.py:291: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    @validator('data')
+
+agent/events.py:303
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/agent/events.py:303: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    @validator('data')
+
+agent/events.py:313
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/agent/events.py:313: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    @validator('data')
+
+agent/events.py:324
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/agent/events.py:324: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    @validator('data')
+
+agent/events.py:335
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/agent/events.py:335: PydanticDeprecatedSince20: Pydantic V1 style `@validator` validators are deprecated. You should migrate to Pydantic V2 style `@field_validator` validators, see the migration guide for more details. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    @validator('data')
+
+tests/test_first_run.py:28
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/tests/test_first_run.py:28: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient
+
+tests/test_first_run.py::test_full_first_run_lifecycle
+  /home/jojo/PycharmProjects/ThoughtMachine-dev/.venv/lib/python3.12/site-packages/websockets/legacy/__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
+    warnings.warn(  # deprecated in 14.0 - 2024-11-09
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+============================= slowest 10 durations =============================
+120.03s call     tests/test_worker_agent_transplant.py::TestGateDenialInstant::test_gate_denial_instant
+120.00s call     tests/security/test_null_event_bus.py::TestNullEventBusIntegration::test_ask_with_null_event_bus_returns_denied_instantly
+120.00s call     tests/security/test_null_event_bus.py::TestNullEventBusIntegration::test_ask_multi_category_with_null_bus
+16.02s call     tests/web_ui/backend/test_ws_mock_provider.py::TestWebSocketWithMockProvider::test_save_and_load_session_roundtrip
+2.00s call     tests/test_event_logger.py::TestEventLogger::test_async_queue_drain
+1.00s call     tests/test_permissions_roundtrip.py::TestCancelPendingPrompts::test_thread_exits_with_denial_on_cancel
+0.59s call     tests/web_ui/backend/test_ws_mock_provider.py::TestWebSocketWithMockProvider::test_continue_session_calls_mock_provider
+0.51s call     tests/web_ui/backend/test_ws_mock_provider.py::TestWebSocketWithMockProvider::test_apply_config_deep_merge_permissions
+0.51s call     tests/web_ui/backend/test_ws_mock_provider.py::TestWebSocketWithMockProvider::test_new_session_emits_six_events
+0.51s call     tests/web_ui/backend/test_websocket_integration.py::TestWebSocketLifecycle::test_new_session_emits_six_events
+=========================== short test summary info ============================
+FAILED tests/presenter/test_token_warning_duplication.py::TestTokenWarningDuplication::test_single_warning_across_oscillating_sequence
+FAILED tests/presenter/test_token_warning_duplication.py::TestTokenWarningDuplication::test_warning_fires_at_first_crossing_from_clean_state
+FAILED tests/presenter/test_token_warning_duplication.py::TestTokenWarningDuplication::test_rapid_re_entry_after_drop_does_not_fire_again
+FAILED tests/presenter/test_token_warning_duplication.py::TestTokenWarningDuplication::test_warning_survives_critical_to_low_transition
+FAILED tests/security/test_null_event_bus.py::TestNullEventBusIntegration::test_ask_with_null_event_bus_returns_denied_instantly
+FAILED tests/security/test_null_event_bus.py::TestNullEventBusIntegration::test_ask_multi_category_with_null_bus
+FAILED tests/test_bridge_permissions_sync.py::TestBridgePermissionsRoundtrip::test_apply_config_accepts_custom_permissions
+FAILED tests/test_bridge_permissions_sync.py::TestBridgePermissionsRoundtrip::test_roundtrip_preserves_permissions
+FAILED tests/test_config_snapshot.py::TestConfigSnapshot::test_capture_creates_file
+FAILED tests/test_config_snapshot.py::TestConfigSnapshot::test_config_with_no_enabled_tools
+FAILED tests/test_first_run.py::test_full_first_run_lifecycle - AssertionErro...
+FAILED tests/test_health_endpoint.py::TestHealthEndpoint::test_empty_response
+FAILED tests/test_permissions_roundtrip.py::TestConfigFileRoundTrip::test_missing_session_permissions_backfilled_from_defaults
+FAILED tests/test_state_timeout.py::TestRestrictionReason::test_restriction_reason_set_on_token_critical
+FAILED tests/test_state_timeout.py::TestRestrictionReason::test_restriction_reason_set_on_turn_critical
+FAILED tests/test_state_timeout.py::TestRestrictionReason::test_restriction_reason_cleared_when_time_returns_to_low
+FAILED tests/test_state_timeout.py::TestRestrictionReason::test_restriction_reason_cleared_when_token_returns_to_low
+FAILED tests/test_state_timeout.py::TestRestrictionReason::test_restriction_reason_cleared_when_turn_returns_to_low
+FAILED tests/test_state_timeout.py::TestTimeoutWarningMessage::test_timeout_warning_message_contains_restriction_hint
+FAILED tests/test_state_timeout.py::TestTimeoutWarningMessage::test_timeout_critical_message_contains_only_respond_hint
+FAILED tests/test_system_prompt.py::TestAgentConfigSystemPromptValidator::test_custom_file_takes_precedence
+FAILED tests/test_system_prompt.py::TestAgentConfigSystemPromptValidator::test_explicit_value_when_no_custom_file
+FAILED tests/test_worker_agent_transplant.py::TestTimeoutEnforcesRestrictions::test_timeout_enforces_restrictions
+FAILED tests/test_worker_agent_transplant.py::TestReasoningPassthrough::test_reasoning_passthrough_with_tool_calls
+FAILED tests/test_worker_agent_transplant.py::TestWorkerConfigForwarding::test_worker_overrides_take_precedence
+FAILED tests/test_worker_definition.py::TestJsonSchema::test_schema_file_matches
+FAILED tests/tools/test_workspace_tools.py::TestCheckSystem::test_query_container_status
+FAILED tests/tools/test_workspace_tools.py::TestWorker::test_worker_thread_init
+FAILED tests/tools/test_workspace_tools.py::TestWorker::test_worker_thread_save_and_load_context
+FAILED tests/tools/test_workspace_tools.py::TestWorker::test_resume_worker_loads_current_system_prompt
+FAILED tests/tools/test_workspace_tools.py::TestWorker::test_action_list_empty
+FAILED tests/tools/test_workspace_tools.py::TestWorker::test_action_spawn_found
+FAILED tests/tools/test_workspace_tools.py::TestWorker::test_missing_workers_file
+FAILED tests/tools/test_workspace_tools.py::TestWorker::test_spawn_strips_by_footprint
+FAILED tests/tools/test_workspace_tools.py::TestWorker::test_spawn_strips_blocklisted_tools
+FAILED tests/tools/test_workspace_tools.py::TestWorker::test_per_call_gate_denies_write_for_readonly_worker
+FAILED tests/web_ui/backend/test_websocket_integration.py::TestWebSocketLifecycle::test_new_session_resolves_workspace_id
+FAILED tests/web_ui/backend/test_websocket_integration.py::TestWebSocketLifecycle::test_apply_config_with_api_key
+FAILED tests/web_ui/backend/test_ws_mock_provider.py::TestWebSocketWithMockProvider::test_continue_session_calls_mock_provider
+FAILED tests/web_ui/backend/test_ws_mock_provider.py::TestWebSocketWithMockProvider::test_apply_config_deep_merge_permissions
+FAILED tests/web_ui/backend/test_ws_mock_provider.py::TestWebSocketWithMockProvider::test_model_override_priority
+FAILED tests/web_ui/backend/test_ws_mock_provider.py::TestWebSocketWithMockProvider::test_api_key_stripped_from_config_dump
+FAILED tests/web_ui/backend/test_ws_mock_provider.py::TestWebSocketWithMockProvider::test_save_and_load_session_roundtrip
+FAILED tests/web_ui/test_worker_crud.py::TestCreateWorker::test_create_worker
+FAILED tests/web_ui/test_worker_crud.py::TestCreateWorker::test_create_duplicate
+FAILED tests/web_ui/test_worker_crud.py::TestUpdateWorker::test_update_worker
+FAILED tests/web_ui/test_worker_crud.py::TestDeleteWorker::test_delete_worker
+FAILED tests/web_ui/test_worker_crud.py::TestListWorkers::test_list_workers_after_crud
+FAILED tests/web_ui/test_worker_crud.py::TestListWorkers::test_list_workers_empty
+FAILED tests/workspace/test_api.py::TestGetWorkers::test_returns_empty_list_initially
+FAILED tests/workspace/test_bootstrap.py::TestEnsureWorkspaceDirs::test_safeguard_warns_on_unexpected_item
+FAILED tests/workspace/test_bootstrap.py::TestEnsureWorkspaceDirs::test_safeguard_does_not_delete_unexpected_items
+ERROR tests/test_worker_agent_transplant.py::TestTokenEstimation::test_worker_thread_token_properties
+======= 52 failed, 704 passed, 21 warnings, 1 error in 390.25s (0:06:30) =======
+[15:57:44] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:44] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:44] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:44] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:44] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:44] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:44] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:44] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:44] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:44] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+[15:57:44] WARNING  [core.history] Plain list assignment to user_history intercepted — auto-wrapped to ObservableList
+
