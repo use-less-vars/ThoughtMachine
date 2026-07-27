@@ -231,7 +231,7 @@ class TestGetWorkersPersistedContextFlag:
         _make_context(ws_dir / "workers", "alpha", {"msg": "persisted"})
 
         import asyncio
-        result = asyncio.run(get_workers("ws_test"))
+        result = asyncio.run(get_workers("ws_test", name=None))
 
         alpha_entry = next(e for e in result if e["name"] == "alpha")
         beta_entry = next(e for e in result if e["name"] == "beta")
@@ -248,7 +248,7 @@ class TestGetWorkersPersistedContextFlag:
             {"name": "gamma"},
         ])
         import asyncio
-        result = asyncio.run(get_workers("ws_test"))
+        result = asyncio.run(get_workers("ws_test", name=None))
         assert result[0]["has_persisted_context"] is False
 
     @patch("tools.workspace.worker._worker_registry", {})
@@ -261,7 +261,7 @@ class TestGetWorkersPersistedContextFlag:
         (ws_dir / "workers").mkdir(parents=True)
 
         import asyncio
-        result = asyncio.run(get_workers("ws_test"))
+        result = asyncio.run(get_workers("ws_test", name=None))
         assert result[0]["has_persisted_context"] is False
 
     @patch("tools.workspace.worker._worker_registry", {})
@@ -278,7 +278,7 @@ class TestGetWorkersPersistedContextFlag:
         _make_context(ws_dir / "workers", "two", {})
 
         import asyncio
-        result = asyncio.run(get_workers("ws_test"))
+        result = asyncio.run(get_workers("ws_test", name=None))
         flags = {e["name"]: e["has_persisted_context"] for e in result}
         assert flags == {"one": True, "two": True}
 
@@ -293,7 +293,7 @@ class TestGetWorkersPersistedContextFlag:
         _make_context(ws_dir / "workers", "orphan", {})  # not in config
 
         import asyncio
-        result = asyncio.run(get_workers("ws_test"))
+        result = asyncio.run(get_workers("ws_test", name=None))
         names = [e["name"] for e in result]
         assert "configured" in names
         assert "orphan" not in names

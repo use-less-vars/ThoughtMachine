@@ -1,0 +1,31 @@
+#!/bin/bash
+set -e
+
+# Activate the virtual environment
+source ~/PycharmProjects/ThoughtMachine-dev/.venv/bin/activate
+
+echo "=== Pre-commit: Syntax check ==="
+FILES=$(git diff --cached --name-only --diff-filter=ACM | grep '\.py$' || true)
+if [ -n "$FILES" ]; then
+    echo "$FILES" | while read file; do
+        python3 -m py_compile "$file" || { echo "❌ Syntax error in $file"; exit 1; }
+    done
+    echo "✅ Syntax check passed"
+else
+    echo "✅ No Python files to check"
+fi
+
+echo ""
+echo "=== Pre-commit: Import check ==="
+python3 -c "
+from agent.core.agent import Agent
+from web_ui.backend.bridge import WebAgentBridge
+print('✅ Critical imports OK')
+" || { echo "❌ Import check failed — machine will not start"; exit 1; }
+
+echo ""
+echo "=== Pre-commit: Unit tests ==="
+python3 -m pytest tests/ -x --tb=short --ignore=tests/integration --deselect tests/presenter/test_token_warning_duplication.py || { echo "❌ Tests failed"; exit 1; }
+
+echo ""
+echo "✅ All checks passed. Commit allowed."

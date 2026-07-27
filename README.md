@@ -39,13 +39,16 @@ real understanding of your project over time.
 
 ---
 
-### What's new in V2.0 (coming soon)
+### What's new in V2.0
 
-Workspaces will host their own sub-agents — workers that live in the workspace
-and work alongside you. Each worker gets a custom Docker container (the
-"workspace office machine"), correctly privileged per workspace, with
-session-level coarse security as hard limits. Default configs get you started
-fast.
+V2.0 introduces a multi-agent architecture with a dedicated Engineer mode.
+
+- **Agent & Engineer modes.** Agent mode gives you a general-purpose assistant with 22 tools. Engineer mode gives you a focused orchestrator that delegates all implementation to a powerful default worker sub-agent.
+- **Workers.** Each workspace hosts its own worker — a fully capable sub-agent that runs in an isolated thread with its own context window. The worker returns a structured envelope with status, confidence, metadata, and telemetry (elapsed time, tool call count, token usage).
+- **WorkingDocument.** A structured collaborative document tool for sharing task specs, progress, and results between the main agent and workers.
+- **Protocol fields.** Workers accept `purpose` and `style` hints; they respond with `status`, `confidence`, and `meta` (struggles, blockers, remaining work). The main agent is prompted to read these signals and adjust its delegation.
+- **Integration tests.** 26 hermetic tests verify session lifecycle, config serialization, preset enforcement, and vault bootstrap — all in under a second.
+- **Pre-commit safety net.** A pre-commit hook checks syntax, critical imports, and unit tests before every commit.
 
 ---
 
@@ -112,11 +115,12 @@ Prerequisites: **Python 3.11–3.13**, **Node.js 18+**, **Docker** (for sandboxe
 
 | Component | Description | Access |
 |-----------|-------------|--------|
-| **Web UI** | Full-featured browser interface (React + FastAPI + WebSocket) | `start_thoughtmachine.bat` / `.sh` → http://127.0.0.1:8000 |
-| **Qt GUI** | Native desktop interface (PyQt6) | `python run_gui.py` |
-| **CLI / API** | Programmatic access via FastAPI server | Server at port 8000 |
-| **Docker sandbox** | Secure code execution in isolated containers | Auto-configured |
-| **PyInstaller bundle** | Standalone `.exe` / binary (no Python needed) | See [PACKAGING.md](PACKAGING.md) |
+| Web UI | Full-featured browser interface (React + FastAPI + WebSocket) | `start_thoughtmachine.bat` / `.sh` → `http://127.0.0.1:8000` |
+| Qt GUI | Native desktop interface (PyQt6) | `python run_gui.py` |
+| CLI / API | Programmatic access via FastAPI server | Server at port 8000 |
+| Docker sandbox | Secure code execution in isolated containers | Auto-configured |
+| **V2.0 Engineer mode** | Multi-agent orchestrator with worker sub-agents, structured protocol, WorkingDocument | Create an Engineer session in the Web UI |
+| PyInstaller bundle | Standalone .exe / binary (no Python needed) | See `PACKAGING.md` |
 
 ---
 
