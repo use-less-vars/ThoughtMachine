@@ -2200,20 +2200,17 @@ def _frontend_config_from_bridge(bridge) -> Dict[str, Any]:
     cfg = bridge.get_config()
     if cfg is None:
         return _default_frontend_config()
-    # Strip None values so AgentConfig defaults apply — prevents Pydantic
-    # validation errors when session_config fields are unset (None).
-    cfg = {k: v for k, v in cfg.items() if v is not None}
-    # cfg is already a serialized dict — reconstruct AgentConfig for conversion
-    from agent.config import AgentConfig
-    agent_cfg = AgentConfig(**cfg)
     # Check if API key is configured before stripping it
     api_key = cfg.get('api_key', '') or ''
     if not api_key:
         import os
         api_key = os.getenv('OPENAI_API_KEY') or os.getenv('DEEPSEEK_API_KEY') or os.getenv('OPENAI_COMPATIBLE_API_KEY') or ''
     api_key_configured = bool(api_key)
-    raw = _config_to_dict(agent_cfg)
-    result = _backend_to_frontend_config(raw)
+    # Ensure mode is explicitly set — when mode is None, treat as custom
+    # so _backend_to_frontend_config doesn't fall back to agent tool preset.
+    if cfg.get('mode') is None:
+        cfg['mode'] = 'custom'
+    result = _backend_to_frontend_config(cfg)
     result['api_key_configured'] = api_key_configured
     if bridge._workspace_path:
         result['workspace_path'] = bridge._workspace_path
@@ -2267,6 +2264,7 @@ _FALLBACK_FRONTEND_CONFIG = {
         "execution": "banned",
     },
     "enabled_tools": get_tools_for_mode("agent"),
+    "tools": [],
 }
 
 
