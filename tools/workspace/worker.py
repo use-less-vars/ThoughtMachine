@@ -1164,7 +1164,7 @@ class WorkerThread(threading.Thread):
                 if self._initial_context:
                     user_history.append({
                         "role": "system",
-                        "content": f"Initial context: {json.dumps(self._initial_context, default=str)}",
+                        "content": f"Initial context: {json.dumps(self._initial_context, default=str, ensure_ascii=True)}",
                     })
                 # Reset cached token count for a fresh run
                 self._cached_context_tokens = None
@@ -1196,7 +1196,7 @@ class WorkerThread(threading.Thread):
                     # Add initial context as a system message for continuity
                     ctx_msg = {
                         "role": "system",
-                        "content": f"Initial context: {json.dumps(self._initial_context, default=str)}",
+                        "content": f"Initial context: {json.dumps(self._initial_context, default=str, ensure_ascii=True)}",
                     }
                     # Check if this initial_context was already injected (avoid duplicates
                     # on repeated spawn calls)

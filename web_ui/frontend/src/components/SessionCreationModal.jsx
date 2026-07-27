@@ -46,8 +46,11 @@ export default function SessionCreationModal({ show, onCreate, onOpen, onCancel,
       setError('')
       setAcknowledgedRisk(false)
       setShowModePicker(false)
+      function isAbsolutePath(p) {
+        return p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p)
+      }
       const stored = localStorage.getItem('thoughtmachine_last_workspace')
-      if (stored && stored.startsWith('/')) {
+      if (stored && isAbsolutePath(stored)) {
         setSelectedFolderPath(stored)
       } else {
         setSelectedFolderPath(null)

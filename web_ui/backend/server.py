@@ -2215,6 +2215,8 @@ def _frontend_config_from_bridge(bridge) -> Dict[str, Any]:
     raw = _config_to_dict(agent_cfg)
     result = _backend_to_frontend_config(raw)
     result['api_key_configured'] = api_key_configured
+    if bridge._workspace_path:
+        result['workspace_path'] = bridge._workspace_path
     return result
 
 
