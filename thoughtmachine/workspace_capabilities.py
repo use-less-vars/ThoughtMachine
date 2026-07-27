@@ -225,6 +225,16 @@ def resolve_workspace_id(workspace_path: str) -> Optional[str]:
         except (json.JSONDecodeError, OSError):
             continue
 
+    # Fallback: check WorkspaceRegistry
+    try:
+        from thoughtmachine.workspace_registry import WorkspaceRegistry
+        registry = WorkspaceRegistry.get_default()
+        entry = registry.resolve_by_root(workspace_path)
+        if entry is not None:
+            return entry.id
+    except Exception:
+        pass
+
     return None
 
 
