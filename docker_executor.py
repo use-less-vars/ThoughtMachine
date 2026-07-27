@@ -655,7 +655,7 @@ class DockerExecutor:
         return image
 
     def _build_image(self, verbose_build=False, nocache=False):
-        """Build Docker image from docker/executor.Dockerfile.
+        """Build Docker image from vault workspace Dockerfile (or docker/executor.Dockerfile as fallback).
 
         Args:
             verbose_build: If True, log build output summary on success.
@@ -676,8 +676,28 @@ class DockerExecutor:
         digest = hashlib.sha256(normalised.encode()).hexdigest()[:12]
         _container_name = f"agent-exec-{digest}"
 
-        dockerfile_dir = self.workspace_path
-        dockerfile_path = os.path.join(dockerfile_dir, "docker", "executor.Dockerfile")
+        # Resolve Dockerfile: vault workspace Dockerfile > codebase fallback
+        if self.workspace_id:
+            try:
+                from thoughtmachine.workspace_capabilities import _workspace_dir
+                vault_dockerfile = _workspace_dir(self.workspace_id) / "Dockerfile"
+                if vault_dockerfile.is_file():
+                    dockerfile_dir = str(vault_dockerfile.parent)
+                    dockerfile_rel = "Dockerfile"
+                    dockerfile_path = str(vault_dockerfile)
+                else:
+                    dockerfile_dir = self.workspace_path
+                    dockerfile_rel = os.path.join("docker", "executor.Dockerfile")
+                    dockerfile_path = os.path.join(dockerfile_dir, dockerfile_rel)
+            except Exception:
+                dockerfile_dir = self.workspace_path
+                dockerfile_rel = os.path.join("docker", "executor.Dockerfile")
+                dockerfile_path = os.path.join(dockerfile_dir, dockerfile_rel)
+        else:
+            dockerfile_dir = self.workspace_path
+            dockerfile_rel = os.path.join("docker", "executor.Dockerfile")
+            dockerfile_path = os.path.join(dockerfile_dir, dockerfile_rel)
+
         if not os.path.exists(dockerfile_path):
             _build_in_progress = False
             raise RuntimeError(f"Dockerfile not found at {dockerfile_path}")
@@ -694,7 +714,7 @@ class DockerExecutor:
             # the image ID from the final "aux" message ourselves.
             build_logs = self.client.api.build(
                 path=dockerfile_dir,
-                dockerfile="docker/executor.Dockerfile",
+                dockerfile=dockerfile_rel,
                 tag=self.image,
                 rm=True,
                 pull=True,
