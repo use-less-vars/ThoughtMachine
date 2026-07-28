@@ -13,9 +13,6 @@ CORE_TESTS=()
 
 if [ ${#CORE_TESTS[@]} -gt 0 ]; then
     python3 -m pytest "${CORE_TESTS[@]}" -x --tb=short -q
-else
-    echo "Core test files not found — running fast unit suite as fallback"
-    python3 -m pytest tests/ -x --tb=short -m "not slow" --ignore=tests/integration -q
 fi
 
 echo "=== Pre-commit checks passed ==="

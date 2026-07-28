@@ -736,11 +736,12 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         # Initialize _session_config so get_config() returns valid data before start
                         if bridge._session_config is None:
                             from agent.config.presets import get_tools_for_mode
+                            _mode = config_dict.get("mode", "agent") if isinstance(config_dict, dict) else "agent"
                             bridge._session_config = SessionConfig(
-                                mode="agent",
+                                mode=_mode,
                                 max_turns=100,
                                 session_permissions={},
-                                enabled_tools=list(get_tools_for_mode("agent")),
+                                enabled_tools=list(get_tools_for_mode(_mode)),
                             )
 
                         # 4. Resolve or auto-register workspace for the new path
@@ -881,11 +882,12 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         # `model_dump()` never produces None for required AgentConfig fields.
                         if bridge._session_config is None:
                             from agent.config.presets import get_tools_for_mode
+                            _mode = config.get("mode", "agent") if isinstance(config, dict) else "agent"
                             bridge._session_config = SessionConfig(
-                                mode="agent",
+                                mode=_mode,
                                 max_turns=100,
                                 session_permissions={},
-                                enabled_tools=list(get_tools_for_mode("agent")),
+                                enabled_tools=list(get_tools_for_mode(_mode)),
                             )
 
                         # Translate frontend format → backend AgentConfig format
@@ -1648,10 +1650,10 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         "type": "context_updated",
                         "context_length": 0,
                     })
-                    # Send default config so the frontend shows proper defaults
+                    # Send config from bridge so frontend gets workspace path etc.
                     await ws.send_json({
                         "type": "config_changed",
-                        "config": _default_frontend_config(),
+                        "config": _frontend_config_from_bridge(bridge),
                     })
                     await ws.send_json({"type": "status_message", "text": "Ready. Type a query to start."})
 
