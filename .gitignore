@@ -117,3 +117,4 @@ worker_live_test.txt
 
 # Node.js binary distribution (vendored)
 node-bin/
+config_snapshot.json

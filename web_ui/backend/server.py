@@ -842,16 +842,6 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         #    were updated in-place, no session_loaded is needed since the tab
                         #    is reused.
                         if result.get("success"):
-                            # Capture config snapshot for debugging
-                            try:
-                                from agent.logging.config_snapshot import ConfigSnapshot
-                                snapshotter = ConfigSnapshot(_project_path)
-                                cfg = bridge.get_config()
-                                if cfg is not None:
-                                    from agent.config import AgentConfig
-                                    snapshotter.capture(AgentConfig(**cfg), label="apply_config_switch")
-                            except Exception:
-                                pass
                             await ws.send_json({
                                 "type": "config_changed",
                                 "config": _frontend_config_from_bridge(bridge),
@@ -905,16 +895,6 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         result = bridge.apply_config(backend_config)
 
                         if result.get("success"):
-                            # Capture config snapshot for debugging
-                            try:
-                                from agent.logging.config_snapshot import ConfigSnapshot
-                                snapshotter = ConfigSnapshot(_project_path)
-                                cfg = bridge.get_config()
-                                if cfg is not None:
-                                    from agent.config import AgentConfig
-                                    snapshotter.capture(AgentConfig(**cfg), label="apply_config")
-                            except Exception:
-                                pass
                             await ws.send_json({
                                 "type": "config_changed",
                                 "config": _frontend_config_from_bridge(bridge),

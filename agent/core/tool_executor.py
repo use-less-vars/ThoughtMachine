@@ -141,11 +141,11 @@ class ToolExecutor:
             try:
                 if _os.path.isfile(_raw_log_path) and _os.path.getsize(_raw_log_path) >= _max_bytes:
                     # Truncate — start fresh, no leftover files
-                    with open(_raw_log_path, "w") as _f_trunc:
+                    with open(_raw_log_path, "w", encoding="utf-8") as _f_trunc:
                         _f_trunc.write(f"# TRUNCATED at {_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             except OSError:
                 pass  # best-effort
-            with open(_raw_log_path, "a") as _f:
+            with open(_raw_log_path, "a", encoding="utf-8") as _f:
                 _f.write(f"{_time.strftime('%Y-%m-%d %H:%M:%S')} | {tool_name} | {arguments_str}\n")
             # ────────────────────────────────
             try:
