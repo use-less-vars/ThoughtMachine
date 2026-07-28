@@ -1,3 +1,21 @@
 #!/bin/bash
-source ~/PycharmProjects/ThoughtMachine-dev/.venv/bin/activate
-python3 -m pytest tests/ -x --tb=short -m "not slow" --ignore=tests/integration --deselect tests/security/test_null_event_bus.py
+set -e
+VENV=~/PycharmProjects/ThoughtMachine-dev/.venv
+source "$VENV/bin/activate"
+
+echo "=== Pre-commit: integration tests ==="
+python3 -m pytest tests/integration/ -x --tb=short -q
+
+echo "=== Pre-commit: core unit tests ==="
+CORE_TESTS=()
+[ -f tests/tools/test_tool_gating.py ] && CORE_TESTS+=("tests/tools/test_tool_gating.py")
+[ -f tests/tools/test_respond.py ] && CORE_TESTS+=("tests/tools/test_respond.py")
+
+if [ ${#CORE_TESTS[@]} -gt 0 ]; then
+    python3 -m pytest "${CORE_TESTS[@]}" -x --tb=short -q
+else
+    echo "Core test files not found — running fast unit suite as fallback"
+    python3 -m pytest tests/ -x --tb=short -m "not slow" --ignore=tests/integration -q
+fi
+
+echo "=== Pre-commit checks passed ==="
