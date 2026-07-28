@@ -56,7 +56,7 @@ _ALL_TOOLS = [
 
 # ── Tool Lists ────────────────────────────────────────────────────────────
 
-# Agent mode — 22 tools focused on code editing, research, and user interaction
+# Agent mode — 21 tools focused on code editing, research, and user interaction
 AGENT_TOOLS = [
     "ApplyEdits",
     "CheckSystem",
@@ -79,7 +79,6 @@ AGENT_TOOLS = [
     "ReadFile",
     "Respond",
     "SummarizeTool",
-    "WorkingDocument",
 ]
 
 # Engineer mode — 7 tools focused on worker orchestration and agent introspection

@@ -98,8 +98,7 @@ class CheckSystem(ToolBase):
                       "'container_status' (Docker status), 'workspace_info' (workspace metadata), "
                       "'network_diagnostics' (connectivity checks), "
                       "'event_bus_status' (EventBus subscriber info), "
-                      "'event_log' (tail recent EventLogger entries), "
-                      "'config_snapshot' (last saved config snapshot).",
+                      "'event_log' (tail recent EventLogger entries).",
     )
 
     skip_output_truncation: ClassVar[bool] = True
@@ -152,7 +151,6 @@ class CheckSystem(ToolBase):
                 "mcp_servers": lambda: self._query_mcp_servers(ws_id),
                 "event_bus_status": lambda: self._query_event_bus_status(),
                 "event_log": lambda: self._query_event_log(),
-                "config_snapshot": lambda: self._query_config_snapshot(workspace_path),
             }
 
             handler = handler_map.get(self.query)
@@ -498,18 +496,6 @@ class CheckSystem(ToolBase):
             }
         except Exception as e:
             return {"error": f"Failed to get event bus status: {e}"}
-
-    def _query_config_snapshot(self, ws_path: Optional[str]) -> dict:
-        """Return the last saved config snapshot from disk."""
-        try:
-            from agent.logging.config_snapshot import ConfigSnapshot
-            snapshotter = ConfigSnapshot(ws_path or getattr(self, 'workspace_path', None))
-            data = snapshotter.load()
-            if data is None:
-                return {"available": False, "error": "No config snapshot found"}
-            return {"available": True, "snapshot": data}
-        except Exception as e:
-            return {"available": False, "error": str(e)}
 
     def _query_event_log(self) -> str:
         """Tail the EventLogger JSONL file and return a formatted string."""
