@@ -655,7 +655,11 @@ class DockerExecutor:
         return image
 
     def _build_image(self, verbose_build=False, nocache=False):
-        """Build Docker image from vault workspace Dockerfile (or docker/executor.Dockerfile as fallback).
+        """Build Docker image from committed requirements.txt and vault Dockerfile.
+
+        Creates a temporary build context with a generated Dockerfile and the
+        workspace's requirements.txt (retrieved from Git HEAD). This ensures
+        builds are reproducible and independent of local file system layout.
 
         Args:
             verbose_build: If True, log build output summary on success.
@@ -666,8 +670,12 @@ class DockerExecutor:
             The log_lines are also stored in the module-level ``_build_log_cache``.
 
         Raises:
-            RuntimeError: If build fails, with concatenated build logs in the message.
+            RuntimeError: If requirements.txt is not committed or build fails.
         """
+        import subprocess
+        import tempfile
+        import shutil
+
         global _build_in_progress
         _build_in_progress = True
 
@@ -676,45 +684,46 @@ class DockerExecutor:
         digest = hashlib.sha256(normalised.encode()).hexdigest()[:12]
         _container_name = f"agent-exec-{digest}"
 
-        # Resolve Dockerfile: vault workspace Dockerfile > codebase fallback
-        if self.workspace_id:
-            try:
-                from thoughtmachine.workspace_capabilities import _workspace_dir
-                vault_dockerfile = _workspace_dir(self.workspace_id) / "Dockerfile"
-                if vault_dockerfile.is_file():
-                    dockerfile_dir = str(vault_dockerfile.parent)
-                    dockerfile_rel = "Dockerfile"
-                    dockerfile_path = str(vault_dockerfile)
-                else:
-                    dockerfile_dir = self.workspace_path
-                    dockerfile_rel = os.path.join("docker", "executor.Dockerfile")
-                    dockerfile_path = os.path.join(dockerfile_dir, dockerfile_rel)
-            except Exception:
-                dockerfile_dir = self.workspace_path
-                dockerfile_rel = os.path.join("docker", "executor.Dockerfile")
-                dockerfile_path = os.path.join(dockerfile_dir, dockerfile_rel)
-        else:
-            dockerfile_dir = self.workspace_path
-            dockerfile_rel = os.path.join("docker", "executor.Dockerfile")
-            dockerfile_path = os.path.join(dockerfile_dir, dockerfile_rel)
-
-        if not os.path.exists(dockerfile_path):
-            _build_in_progress = False
-            raise RuntimeError(f"Dockerfile not found at {dockerfile_path}")
-
-        log('DEBUG', 'tools.docker_executor.build', f"Building Docker image {self.image} from {dockerfile_path}")
-
         log_lines: list[str] = []
         image_id: str | None = None
+
+        # Create temporary build context
+        tmpdir = tempfile.mkdtemp(prefix="docker_build_")
         try:
-            # Use the low-level API directly — the high-level images.build()
-            # consumes the response generator internally to find the image ID,
-            # which prevents live streaming.  The low-level api.build() returns
-            # an unconsumed generator; we decode each JSON chunk and extract
-            # the image ID from the final "aux" message ourselves.
+            # 1. Copy vault Dockerfile into build context
+            vault_dockerfile = os.path.expanduser(
+                f"~/.thoughtmachine/workspaces/{self.workspace_id}/Dockerfile"
+            )
+            if not os.path.exists(vault_dockerfile):
+                raise RuntimeError(
+                    f"Vault Dockerfile not found at {vault_dockerfile}. "
+                    "Please run the vault bootstrap to create it."
+                )
+            shutil.copy2(vault_dockerfile, os.path.join(tmpdir, "Dockerfile"))
+
+            # 2. Extract requirements.txt from Git HEAD
+            result = subprocess.run(
+                ["git", "show", "HEAD:requirements.txt"],
+                capture_output=True,
+                text=True,
+                cwd=self.workspace_path,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    "requirements.txt is not committed. Please commit it before rebuilding."
+                )
+
+            req_path = os.path.join(tmpdir, "requirements.txt")
+            with open(req_path, "w") as f:
+                f.write(result.stdout)
+
+            # 3. Build Docker image from temp context
+            log('DEBUG', 'tools.docker_executor.build',
+                f"Building Docker image {self.image} from temp context {tmpdir}")
+
             build_logs = self.client.api.build(
-                path=dockerfile_dir,
-                dockerfile=dockerfile_rel,
+                path=tmpdir,
+                dockerfile="Dockerfile",
                 tag=self.image,
                 rm=True,
                 pull=True,
@@ -735,13 +744,13 @@ class DockerExecutor:
                         sys.stdout.flush()
                 elif "aux" in chunk and "ID" in chunk["aux"]:
                     image_id = chunk["aux"]["ID"]
+
             if image_id is None:
                 raise RuntimeError("Docker build completed but no image ID was returned")
-            image = image_id
+
         except docker.errors.BuildError as e:
             build_log_str = "\n".join(str(line) for line in (e.build_log or []))
             log_lines.extend(str(line) for line in (e.build_log or []))
-            _build_in_progress = False
             with _build_log_cache_lock:
                 cache_value = "\n".join(log_lines)
                 _build_log_cache[self.workspace_path] = cache_value
@@ -750,26 +759,31 @@ class DockerExecutor:
                 f"Docker build failed: {e}\n"
                 f"Build logs:\n{build_log_str}"
             ) from e
+        except RuntimeError:
+            # Re-raise the committed-requirements error as-is
+            raise
         except Exception as e:
-            _build_in_progress = False
             log_lines.append(str(e))
             with _build_log_cache_lock:
                 cache_value = "\n".join(log_lines)
                 _build_log_cache[self.workspace_path] = cache_value
                 _build_log_cache[_container_name] = cache_value
             raise RuntimeError(f"Docker build failed: {e}") from e
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            _build_in_progress = False
 
         if verbose_build and log_lines:
-            log('INFO', 'tools.docker_executor.build', f"Build complete for {self.image}:\n" + "\n".join(log_lines))
+            log('INFO', 'tools.docker_executor.build',
+                f"Build complete for {self.image}:\n" + "\n".join(log_lines))
 
-        # ── Store build log in shared cache ────────────────────────────────────
+        # \u2500\u2500 Store build log in shared cache \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         with _build_log_cache_lock:
             cache_value = "\n".join(log_lines)
             _build_log_cache[self.workspace_path] = cache_value
             _build_log_cache[_container_name] = cache_value
 
-        _build_in_progress = False
-        return image, log_lines
+        return image_id, log_lines
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Container status helper (used by Flask endpoint)
