@@ -114,6 +114,8 @@ worker_live_test.txt
 
 # Workspace auto-generated files
 .thoughtmachine/workers.json
+.thoughtmachine/working_docs/
+.thoughtmachine/knowledge/project/test_protocols.md
 
 # Node.js binary distribution (vendored)
 node-bin/

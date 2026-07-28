@@ -1226,15 +1226,9 @@ class WebAgentBridge:
 
         session_config = self._session_config
 
-        # Tool changes (mode-locked: only works in custom mode)
-        if "enabled_tools" in config_dict:
-            session_config.update_tools(config_dict["enabled_tools"])
-
-        # Prompt changes (mode-locked: only works in custom mode)
-        if "system_prompt" in config_dict:
-            session_config.update_prompt(config_dict["system_prompt"])
-
         # Mode field — only mutable before session starts (new session initialization)
+        # IMPORTANT: mode MUST be updated BEFORE tools/prompt so that mode-locking
+        # (update_tools/update_prompt no-ops for non-custom modes) is respected.
         if "mode" in config_dict:
             new_mode = config_dict["mode"]
             valid_modes = {"agent", "engineer", "custom"}
@@ -1256,6 +1250,14 @@ class WebAgentBridge:
                 except Exception as e:
                     log("WARNING", "server.bridge",
                         f"apply_config: failed to apply mode '{new_mode}': {e}")
+
+        # Tool changes (mode-locked: only works in custom mode)
+        if "enabled_tools" in config_dict:
+            session_config.update_tools(config_dict["enabled_tools"])
+
+        # Prompt changes (mode-locked: only works in custom mode)
+        if "system_prompt" in config_dict:
+            session_config.update_prompt(config_dict["system_prompt"])
 
         # Mutable fields (always allowed regardless of mode)
         for field in ("provider_id", "model", "base_url", "temperature", "top_p", "max_tokens"):
