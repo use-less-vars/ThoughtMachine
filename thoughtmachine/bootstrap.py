@@ -95,10 +95,9 @@ def ensure_user_defaults(overwrite_existing: bool = False) -> list[str]:
     """Create/reset the ``~/.thoughtmachine/`` user directory with defaults.
 
     Steps:
-    1. Create ``~/.thoughtmachine/`` if it does not exist.
-    2. For each bundled default resource, copy it to the user directory
-       **only if** the destination is missing (or *overwrite_existing* is
-       ``True``).
+    1. Create the new vault compartment structure.
+    2. For each bundled default resource, deploy it to the appropriate location.
+    3. Copy factory defaults into system/factory_defaults.json.
 
     Args:
         overwrite_existing: If ``True``, overwrite user files even when they
@@ -108,18 +107,19 @@ def ensure_user_defaults(overwrite_existing: bool = False) -> list[str]:
         A list of absolute paths to files that were **created** or
         **overwritten**.
     """
-    USER_DIR.mkdir(parents=True, exist_ok=True)
+    # Step 1: Create the new vault structure (idempotent)
+    from thoughtmachine.vault import ensure_vault_structure, vault_root
+    created = ensure_vault_structure()
 
-    # ── Ensure required subdirectories exist ────────────────────────────
-    (USER_DIR / "sessions").mkdir(parents=True, exist_ok=True)
-    (USER_DIR / "state").mkdir(parents=True, exist_ok=True)
-    (USER_DIR / "knowledge").mkdir(parents=True, exist_ok=True)
-    (USER_DIR / "worker_templates").mkdir(parents=True, exist_ok=True)
+    # Step 2: Create legacy directories that still need to exist
+    #          (worker_templates at vault root for backward compatibility)
+    (vault_root() / "sessions").mkdir(parents=True, exist_ok=True)
+    (vault_root() / "state").mkdir(parents=True, exist_ok=True)
+    (vault_root() / "knowledge").mkdir(parents=True, exist_ok=True)
+    (vault_root() / "worker_templates").mkdir(parents=True, exist_ok=True)
 
+    # Step 3: Deploy individual files from manifest
     manifest = _load_manifest()
-    touched: list[str] = []
-
-    # ── Deploy individual files from manifest ────────────────────────────
     for entry in manifest.get("files", []):
         if entry.get("internal"):
             continue  # skip internal files (e.g., .version)
@@ -128,16 +128,23 @@ def ensure_user_defaults(overwrite_existing: bool = False) -> list[str]:
             continue
         src = _resolve_source(entry["source"])
         shutil.copy2(str(src), str(dst))
-        touched.append(str(dst))
+        created.append(str(dst))
 
-    # ── Deploy directories from manifest ─────────────────────────────────
+    # Step 4: Deploy factory defaults to system/factory_defaults.json
+    factory_src = _resources_dir() / "factory_defaults.json"
+    factory_dst = vault_root() / "system" / "factory_defaults.json"
+    if factory_src.exists() and (overwrite_existing or not factory_dst.exists()):
+        shutil.copy2(str(factory_src), str(factory_dst))
+        created.append(str(factory_dst))
+
+    # Step 5: Deploy directories from manifest
     for entry in manifest.get("directories", []):
         src_dir = _resolve_source(entry["source"])
         dst_dir = _resolve_dest(entry["dest"])
         condition = entry.get("condition", "")
 
         if condition == "dest_empty" and any(dst_dir.iterdir()):
-            continue  # only deploy if destination is empty
+            continue
 
         if not src_dir.is_dir():
             continue
@@ -146,13 +153,13 @@ def ensure_user_defaults(overwrite_existing: bool = False) -> list[str]:
         for src_file in src_dir.iterdir():
             if src_file.is_file():
                 shutil.copy2(str(src_file), str(dst_dir / src_file.name))
-                touched.append(str(dst_dir / src_file.name))
+                created.append(str(dst_dir / src_file.name))
 
-    # ── Ensure the global knowledge base (system/ + user/ + .version) ─────
+    # Step 6: Ensure the global knowledge base
     from agent.knowledge.global_kb import ensure_global_kb
-    touched.extend(ensure_global_kb())
+    created.extend(ensure_global_kb())
 
-    return touched
+    return created
 
 
 def load_user_config() -> dict:

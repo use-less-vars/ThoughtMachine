@@ -264,7 +264,28 @@ def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] =
     
     # Use requested_abs as the path to validate
     target_abs = requested_abs
-    
+
+    # ── BLOCK CREDENTIALS PATH ────────────────────────────────────────────
+    # Never allow file tools to access ~/.thoughtmachine/credentials/
+    user_home = os.path.expanduser("~")
+    vault_cred_path = os.path.join(user_home, ".thoughtmachine", "credentials")
+    try:
+        resolved_cred = os.path.realpath(vault_cred_path)
+        if requested_abs.startswith(resolved_cred) or requested_abs.startswith(vault_cred_path):
+            _log_security_event(
+                event_type=LogEventType.SECURITY_VIOLATION if LOGGING_AVAILABLE else None,
+                message=f"Blocked credentials access attempt: '{original_path}'",
+                level=LogLevel.WARNING if LOGGING_AVAILABLE else logging.WARNING,
+                data={
+                    "path": original_path,
+                    "resolved_path": requested_abs,
+                    "reason": "credentials_blocked"
+                }
+            )
+            raise PathOutsideWorkspaceError(f"Access to credentials path '{original_path}' is blocked")
+    except Exception:
+        pass  # If we can't resolve, fall through to normal checks
+
     # If no workspace restriction, return canonical path if possible
     if not workspace_path:
         try:

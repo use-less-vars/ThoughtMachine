@@ -8,6 +8,11 @@
       "description": "Default system prompt for agent mode"
     },
     {
+      "source": "factory_defaults.json",
+      "dest": "system/factory_defaults.json",
+      "description": "System factory defaults — immutable base configuration for the vault; deployed to the system/ subdirectory"
+    },
+    {
       "source": "default_config.json",
       "dest": "agent_config.json",
       "description": "Agent configuration overlay (diff from factory defaults — merged with resources/default_config.json at load time)"
