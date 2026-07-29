@@ -338,3 +338,257 @@ def atomic_replace(data: dict, dst: str, work_dir: str, retries: int = 3) -> Non
 
             # Back off before retrying
             time.sleep(0.2 * attempt)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ConfigManager class
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class ConfigManager:
+    """
+    Central config management facade.
+
+    Wraps all standalone config-translation functions as ``@staticmethod``
+    methods so callers (server.py, bridge.py) can use a single import
+    and instance.  Also adds higher-level convenience methods
+    (``get_frontend_config``, ``apply_config``, ``validate``) that
+    reduce boilerplate in WebSocket handlers.
+
+    Typical usage::
+
+        config_manager = ConfigManager()
+        backend = config_manager.translate_frontend_config(fe_config)
+        fe_config = config_manager.get_frontend_config(bridge)
+        errors = config_manager.validate(fe_config)
+    """
+
+    # ── Class-level references to module constants ──────────────────────
+    FALLBACK_FRONTEND_CONFIG: Dict[str, Any] = FALLBACK_FRONTEND_CONFIG
+
+    @staticmethod
+    def load_global_defaults() -> Dict[str, Any]:
+        """Load global defaults from ``~/.thoughtmachine/agent_config.json``."""
+        return load_global_defaults()
+
+    @staticmethod
+    def translate_frontend_config(fe_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate frontend config format to ``AgentConfig`` format."""
+        return translate_frontend_config(fe_config)
+
+    @staticmethod
+    def frontend_config_from_bridge(bridge) -> Dict[str, Any]:
+        """Convert bridge's ``SessionConfig`` back to frontend config format."""
+        return frontend_config_from_bridge(bridge)
+
+    @staticmethod
+    def backend_to_frontend_config(backend: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert backend ``AgentConfig`` format to frontend format."""
+        return backend_to_frontend_config(backend)
+
+    @staticmethod
+    def default_frontend_config() -> Dict[str, Any]:
+        """Return config in frontend format, merged with global defaults."""
+        return default_frontend_config()
+
+    @staticmethod
+    def config_to_dict(cfg) -> Dict[str, Any]:
+        """Convert an ``AgentConfig`` to a plain dict for JSON serialization."""
+        return config_to_dict(cfg)
+
+    @staticmethod
+    def atomic_replace(data: dict, dst: str, work_dir: str, retries: int = 3) -> None:
+        """Atomically write *data* as JSON to *dst*, with Windows-safe retries."""
+        return atomic_replace(data, dst, work_dir, retries)
+
+    # ── Higher-level convenience methods ─────────────────────────────
+
+    @staticmethod
+    def get_frontend_config(bridge) -> Dict[str, Any]:
+        """
+        Get the frontend-format config for a bridge.
+
+        Thin wrapper around ``frontend_config_from_bridge`` with a cleaner
+        name for callers that want a read-only snapshot of the current
+        bridge configuration.
+        """
+        return frontend_config_from_bridge(bridge)
+
+    @staticmethod
+    def session_config_to_frontend(
+        session_config,
+        workspace_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Convert a ``SessionConfig`` directly to frontend format (no bridge needed)."""
+        cfg_dict = config_to_dict(session_config)
+        result = backend_to_frontend_config(cfg_dict)
+        # Check if API key is configured
+        api_key = getattr(session_config, "api_key", "") or ""
+        if not api_key:
+            api_key = (
+                os.getenv("OPENAI_API_KEY")
+                or os.getenv("DEEPSEEK_API_KEY")
+                or os.getenv("OPENAI_COMPATIBLE_API_KEY")
+                or ""
+            )
+        result["api_key_configured"] = bool(api_key)
+        if workspace_path:
+            result["workspace_path"] = workspace_path
+        return result
+
+    @staticmethod
+    def apply_config(
+        config_dict: Dict[str, Any],
+        current_config,
+        is_running: bool = False,
+        has_session: bool = False,
+    ) -> tuple[Dict[str, Any], Optional[Any]]:
+        """
+        Validate + translate frontend config dict, enforce mode rules.
+
+        Moves the validation logic from ``bridge.apply_config()`` into here.
+        Does **not** do controller update, container sync, or persistence.
+
+        Args:
+            config_dict: Raw frontend config dict.
+            current_config: The current ``SessionConfig`` instance.
+            is_running: Whether the bridge is currently running.
+            has_session: Whether a session has been started.
+
+        Returns:
+            ``(frontend_format_dict, updated_SessionConfig_or_None)``
+        """
+        import copy
+        from agent.config.session_config import SessionConfig
+        from agent.config.provider_profile import ProviderManager
+
+        # Work on a copy to avoid mutating caller's object on failure
+        session_config = copy.deepcopy(current_config)
+
+        # Mode field — only mutable before session starts
+        if "mode" in config_dict:
+            new_mode = config_dict["mode"]
+            valid_modes = {"agent", "engineer", "custom"}
+            if new_mode not in valid_modes:
+                log("WARNING", "server.bridge",
+                    f"apply_config: invalid mode '{new_mode}'")
+            elif has_session or is_running:
+                log("WARNING", "server.bridge",
+                    f"apply_config: mode change to '{new_mode}' rejected — "
+                    f"mode is immutable after session start")
+            elif new_mode != session_config.mode:
+                log("INFO", "server.bridge",
+                    f"apply_config: changing mode from '{session_config.mode}' to '{new_mode}'")
+                old_cfg = session_config.model_dump(exclude={'api_key'}, exclude_none=True)
+                old_cfg['mode'] = new_mode
+                try:
+                    session_config = SessionConfig(**old_cfg)
+                except Exception as e:
+                    log("WARNING", "server.bridge",
+                        f"apply_config: failed to apply mode '{new_mode}': {e}")
+
+        # Tool changes (mode-locked: only works in custom mode)
+        if "enabled_tools" in config_dict:
+            session_config.update_tools(config_dict["enabled_tools"])
+
+        # Prompt changes (mode-locked: only works in custom mode)
+        if "system_prompt" in config_dict:
+            session_config.update_prompt(config_dict["system_prompt"])
+
+        # Mutable fields (always allowed regardless of mode)
+        for field in ("provider_id", "model", "base_url", "temperature", "top_p", "max_tokens"):
+            if field in config_dict:
+                setattr(session_config, field, config_dict[field])
+
+        # Session permissions (always mutable)
+        if "session_permissions" in config_dict:
+            sp = config_dict["session_permissions"]
+            if sp is not None and isinstance(sp, dict):
+                session_config.session_permissions = sp
+
+        # If provider_id changed, resolve provider credentials
+        if "provider_id" in config_dict and config_dict["provider_id"]:
+            try:
+                manager = ProviderManager()
+                resolved = manager.resolve_config(session_config.model_dump(exclude_none=True))
+                if "api_key" in resolved:
+                    session_config.api_key = resolved["api_key"]
+                if "base_url" in resolved:
+                    session_config.base_url = resolved["base_url"]
+            except Exception as e:
+                log("WARNING", "server.bridge",
+                    f"Provider resolution failed during apply_config: {e}")
+
+        # Convert updated session_config to frontend format for broadcasting
+        frontend_result = ConfigManager.session_config_to_frontend(session_config)
+
+        return frontend_result, session_config
+
+    @staticmethod
+    def validate(config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Validate a frontend-format config dict.
+
+        Checks for common configuration issues and returns a dict with:
+
+        - ``valid`` (bool): ``True`` if no blocking errors found.
+        - ``errors`` (list): blocking issues (e.g., missing provider).
+        - ``warnings`` (list): non-blocking suggestions.
+        - ``field_errors`` (dict): field-level error messages.
+        """
+        errors: list = []
+        warnings: list = []
+        field_errors: Dict[str, str] = {}
+
+        if not config:
+            errors.append("Config is empty")
+            return {"valid": False, "errors": errors, "warnings": [], "field_errors": {}}
+
+        # Check required fields
+        if not config.get("provider"):
+            field_errors["provider"] = "Provider is required"
+            errors.append("No provider selected")
+
+        if not config.get("model"):
+            field_errors["model"] = "Model is required"
+            errors.append("No model specified")
+
+        # Check for potentially unsafe API key exposure
+        api_key = config.get("api_key", "")
+        if api_key and len(api_key) > 0:
+            warnings.append("API key included in config; will be stripped before persistence")
+
+        # Check temperature range
+        temp = config.get("temperature", 1.0)
+        if temp is not None:
+            try:
+                t = float(temp)
+                if t < 0.0 or t > 2.0:
+                    warnings.append(f"Temperature {t} is outside recommended range [0.0, 2.0]")
+            except (ValueError, TypeError):
+                field_errors["temperature"] = "Temperature must be a number"
+                errors.append("Invalid temperature value")
+
+        # Check max_turns
+        max_turns = config.get("max_turns", 200)
+        if max_turns is not None:
+            try:
+                mt = int(max_turns)
+                if mt < 1:
+                    field_errors["max_turns"] = "Must be at least 1"
+                    errors.append("max_turns must be at least 1")
+            except (ValueError, TypeError):
+                field_errors["max_turns"] = "Must be an integer"
+                errors.append("Invalid max_turns value")
+
+        # Check workspace_path
+        workspace = config.get("workspace_path", "")
+        if workspace and not os.path.isdir(workspace):
+            warnings.append(f"Workspace path '{workspace}' does not exist on disk")
+
+        return {
+            "valid": len(errors) == 0,
+            "errors": errors,
+            "warnings": warnings,
+            "field_errors": field_errors,
+        }

@@ -104,6 +104,7 @@ except ImportError:
 from agent.config.session_config import SessionConfig
 
 from web_ui.backend.event_forwarder import EventForwarder, _active_tab_bridges
+from web_ui.backend.config_manager import ConfigManager
 
 # ── Workspace ID cache ──────────────────────────────────────────────────────
 # Cache mapping workspace path → workspace ID, built once and reused across
@@ -201,6 +202,7 @@ class WebAgentBridge:
 
         # Current config (for get_config / get_conversation)
         self._session_config: Optional[SessionConfig] = None
+        self._config_manager = ConfigManager()
         self._session_id: Optional[str] = None
         self._workspace_path: Optional[str] = None
 
@@ -1105,7 +1107,7 @@ class WebAgentBridge:
         """Return the current session config as a serializable dict (no api_key)."""
         if self._session_config is None:
             return None
-        return self._session_config.model_dump(exclude={'api_key'})
+        return self._config_manager.config_to_dict(self._session_config)
 
     # ── Controller restart / health check ───────────────────────────────────
 
@@ -1178,6 +1180,9 @@ class WebAgentBridge:
     def apply_config(self, config_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Apply partial config updates from the frontend.
 
+        Delegates validation and mode enforcement to ``ConfigManager.apply_config``,
+        then handles controller update, container re-sync, and persistence.
+
         SessionConfig enforces mode rules:
         - agent/engineer mode: tools and prompt are LOCKED (update_tools/update_prompt log warnings and no-op)
         - custom mode: tools and prompt can be freely changed
@@ -1187,69 +1192,20 @@ class WebAgentBridge:
             log("WARNING", "server.bridge", "apply_config called but no session config exists")
             return {"success": False, "error": "No active session config"}
 
-        session_config = self._session_config
+        # Step 1: Delegate validation and update to ConfigManager
+        frontend_result, new_config = self._config_manager.apply_config(
+            config_dict,
+            current_config=self._session_config,
+            is_running=self.is_running,
+            has_session=self._session is not None,
+        )
 
-        # Mode field — only mutable before session starts (new session initialization)
-        # IMPORTANT: mode MUST be updated BEFORE tools/prompt so that mode-locking
-        # (update_tools/update_prompt no-ops for non-custom modes) is respected.
-        if "mode" in config_dict:
-            new_mode = config_dict["mode"]
-            valid_modes = {"agent", "engineer", "custom"}
-            if new_mode not in valid_modes:
-                log("WARNING", "server.bridge",
-                    f"apply_config: invalid mode '{new_mode}' — must be one of {valid_modes}")
-            elif self._session is not None or self.is_running:
-                log("WARNING", "server.bridge",
-                    f"apply_config: mode change to '{new_mode}' rejected — "
-                    f"mode is immutable after session start")
-            elif new_mode != session_config.mode:
-                # Update mode and re-run mode presets via SessionConfig constructor
-                log("INFO", "server.bridge",
-                    f"apply_config: changing mode from '{session_config.mode}' to '{new_mode}'")
-                old_cfg = session_config.model_dump(exclude={'api_key'}, exclude_none=True)
-                old_cfg['mode'] = new_mode
-                try:
-                    session_config = SessionConfig(**old_cfg)
-                except Exception as e:
-                    log("WARNING", "server.bridge",
-                        f"apply_config: failed to apply mode '{new_mode}': {e}")
+        # Step 2: Update session config if ConfigManager returned a new one
+        if new_config is not None:
+            self._session_config = new_config
 
-        # Tool changes (mode-locked: only works in custom mode)
-        if "enabled_tools" in config_dict:
-            session_config.update_tools(config_dict["enabled_tools"])
-
-        # Prompt changes (mode-locked: only works in custom mode)
-        if "system_prompt" in config_dict:
-            session_config.update_prompt(config_dict["system_prompt"])
-
-        # Mutable fields (always allowed regardless of mode)
-        for field in ("provider_id", "model", "base_url", "temperature", "top_p", "max_tokens"):
-            if field in config_dict:
-                setattr(session_config, field, config_dict[field])
-
-        # Session permissions (always mutable — affects agent capabilities, not mode-locked)
-        if "session_permissions" in config_dict:
-            sp = config_dict["session_permissions"]
-            if sp is not None and isinstance(sp, dict):
-                session_config.session_permissions = sp
-
-        # If provider_id changed, resolve provider credentials
-        if "provider_id" in config_dict and config_dict["provider_id"]:
-            try:
-                manager = ProviderManager()
-                resolved = manager.resolve_config(session_config.model_dump(exclude_none=True))
-                if "api_key" in resolved:
-                    session_config.api_key = resolved["api_key"]
-                if "base_url" in resolved:
-                    session_config.base_url = resolved["base_url"]
-            except Exception as e:
-                log("WARNING", "server.bridge", f"Provider resolution failed during apply_config: {e}")
-
-        # Assign back (in case mode-validator updated tools/prompt)
-        self._session_config = session_config
-
-        # Convert to AgentConfig and apply to controller
-        agent_config = session_config.to_agent_config()
+        # Step 3: Convert to AgentConfig and apply to controller
+        agent_config = self._session_config.to_agent_config()
 
         if self._controller is not None:
             controller_alive = (
@@ -1260,20 +1216,20 @@ class WebAgentBridge:
             if not controller_alive:
                 log("WARNING", "server.bridge",
                     "apply_config: controller thread is dead — restarting controller")
-                self._restart_controller(session_config)
+                self._restart_controller(self._session_config)
             self._controller.request_config_update(agent_config)
 
-        # Re-sync container
+        # Step 4: Re-sync container
         self._maybe_re_sync_container(
             self._workspace_path or "",
-            getattr(agent_config, "session_permissions", None)
+            getattr(agent_config, "session_permissions", None),
         )
 
-        # Persist to disk
+        # Step 5: Persist to disk
         self.save_session()
 
         log("INFO", "server.bridge", "Config applied and persisted via apply_config")
-        return {"success": True}
+        return frontend_result
 
     # ── Session persistence ──────────────────────────────────────────────────
 

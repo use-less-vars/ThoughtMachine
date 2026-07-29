@@ -133,17 +133,11 @@ from web_ui.backend.health_routes import router as health_router
 from web_ui.backend.session_routes import router as session_router
 from web_ui.backend.prompt_routes import router as prompt_router
 
-# ── ConfigManager (extracted config utilities) ──────────────────────────────
-from web_ui.backend.config_manager import (
-    translate_frontend_config,
-    frontend_config_from_bridge,
-    backend_to_frontend_config,
-    default_frontend_config,
-    config_to_dict,
-    load_global_defaults,
-    FALLBACK_FRONTEND_CONFIG,
-    atomic_replace,
-)
+# ── ConfigManager (facade for all config operations) ────────────────────────
+from web_ui.backend.config_manager import ConfigManager
+
+# Singleton instance used throughout the WebSocket handlers.
+config_manager = ConfigManager()
 
 
 # Ensure project root is on sys.path
@@ -559,7 +553,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # Translate frontend config format → AgentConfig format.
                     # Global config from agent_config.json provides defaults;
                     # frontend fields become overrides.
-                    config_dict = translate_frontend_config(config_dict)
+                    config_dict = config_manager.translate_frontend_config(config_dict)
 
                     # Always create a fresh bridge + controller for start_session.
                     # Stop any existing bridge first to prevent resource leaks.
@@ -615,7 +609,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             # Pass the frontend config if available (for first query)
                             config_dict = msg.get("config", {})
                             if config_dict:
-                                config_dict = translate_frontend_config(config_dict)
+                                config_dict = config_manager.translate_frontend_config(config_dict)
                                 # 🛡️ Preserve mode from loaded session if frontend config doesn't specify it
                                 # Otherwise the frontend config (which may omit mode) would override
                                 # the correct mode loaded from session metadata with None → 'agent' default.
@@ -642,7 +636,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         try:
                             config_dict = msg.get("config", {})
                             if config_dict:
-                                config_dict = translate_frontend_config(config_dict)
+                                config_dict = config_manager.translate_frontend_config(config_dict)
                             bridge.continue_session(query, config_dict)
                             log('INFO', 'server.ws',
                                 f'continue_session: CASE 2 - bridge.continue_session() returned OK')
@@ -682,7 +676,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # frontend_config_from_bridge handles bridge=None and cfg=None gracefully
                     await ws.send_json({
                         "type": "config_changed",
-                        "config": frontend_config_from_bridge(bridge),
+                        "config": config_manager.get_frontend_config(bridge),
                     })
 
                 elif command == "get_conversation":
@@ -745,17 +739,6 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         bridge.set_event_callback(event_callback, key=id(ws))
                         bridge.register()
                         bridge.set_controller(controller)
-                        # Initialize _session_config so get_config() returns valid data before start
-                        if bridge._session_config is None:
-                            from agent.config.presets import get_tools_for_mode
-                            _mode = config.get("mode", "agent") if isinstance(config, dict) else "agent"
-                            bridge._session_config = SessionConfig(
-                                mode=_mode,
-                                max_turns=100,
-                                session_permissions={},
-                                enabled_tools=list(get_tools_for_mode(_mode)),
-                            )
-
                         # 4. Resolve or auto-register workspace for the new path
                         workspace_id = None
                         try:
@@ -846,18 +829,18 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             session_store.add_open_session(new_session.session_id)
 
                         # 6. Now apply the config to the NEW bridge
-                        backend_config = translate_frontend_config(config)
-                        result = bridge.apply_config(backend_config)
+                        result = bridge.apply_config(config)
 
                         # 7. Send config_changed + status message.
                         #    session_loaded was already sent above (step 5) if a new session was
                         #    created for a conversation-bearing session. For empty sessions that
                         #    were updated in-place, no session_loaded is needed since the tab
                         #    is reused.
-                        if result.get("success"):
+                        if not isinstance(result, dict) or result.get("success") is not False:
+                            # Success — result is the frontend-format config dict
                             await ws.send_json({
                                 "type": "config_changed",
-                                "config": frontend_config_from_bridge(bridge),
+                                "config": result,
                             })
                             log('INFO', 'server.config',
                                 f"Config applied after project switch to {_project_path}")
@@ -867,7 +850,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             # with stale state or wrong workspace_path.
                             await ws.send_json({
                                 "type": "config_changed",
-                                "config": frontend_config_from_bridge(bridge),
+                                "config": config_manager.get_frontend_config(bridge),
                             })
                             await ws.send_json({
                                 "type": "status_message",
@@ -889,10 +872,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             })
                             continue
 
-                        # Initialize _session_config if this is the first config apply
-                        # (bridge may have been created via new_session without a config)
-                        # Use explicit defaults matching AgentConfig expectations so that
-                        # `model_dump()` never produces None for required AgentConfig fields.
+                        # Ensure session config is initialised before applying
                         if bridge._session_config is None:
                             from agent.config.presets import get_tools_for_mode
                             _mode = config.get("mode", "agent") if isinstance(config, dict) else "agent"
@@ -903,16 +883,14 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 enabled_tools=list(get_tools_for_mode(_mode)),
                             )
 
-                        # Translate frontend format → backend AgentConfig format
-                        backend_config = translate_frontend_config(config)
-
                         # Apply via bridge (validates, merges, resolves provider, persists)
-                        result = bridge.apply_config(backend_config)
+                        result = bridge.apply_config(config)
 
-                        if result.get("success"):
+                        if not isinstance(result, dict) or result.get("success") is not False:
+                            # Success — result is the frontend-format config dict
                             await ws.send_json({
                                 "type": "config_changed",
-                                "config": frontend_config_from_bridge(bridge),
+                                "config": result,
                             })
                             log('INFO', 'server.config', "Config applied and persisted via apply_config")
                         else:
@@ -932,7 +910,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         config_dict = msg.get("config")
                         if config_dict:
                             # Frontend sent the draft — translate to backend format
-                            cfg_dict = translate_frontend_config(config_dict)
+                            cfg_dict = config_manager.translate_frontend_config(config_dict)
                         elif bridge is not None:
                             # Fallback: use bridge's currently applied config
                             cfg_dict = bridge.get_config() or {}
@@ -949,7 +927,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         config_path = config_dir / 'agent_config.json'
 
                         # Windows-safe atomic write with retry
-                        atomic_replace(
+                        config_manager.atomic_replace(
                             data=cfg_dict,
                             dst=str(config_path),
                             work_dir=str(config_dir),
@@ -1341,7 +1319,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             "context_length": loaded.context_length,
                         })
                     # Send config_changed so the frontend shows the session's actual config
-                    fe_config = frontend_config_from_bridge(bridge)
+                    fe_config = config_manager.get_frontend_config(bridge)
                     await ws.send_json({
                         "type": "config_changed",
                         "config": fe_config,
@@ -1639,7 +1617,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         f'new_session: bridge created, session_id={new_session.session_id}, '
                         f'bridge._loaded_session set')
 
-                    # Initialize _session_config so frontend_config_from_bridge returns
+                    # Initialize _session_config so config_manager.get_frontend_config returns
                     # meaningful bridge state (not hardcoded defaults). Use custom mode to
                     # avoid accidental tool preset locking.
                     if bridge._session_config is None:
@@ -1685,7 +1663,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # Send config from bridge so frontend gets workspace path etc.
                     await ws.send_json({
                         "type": "config_changed",
-                        "config": frontend_config_from_bridge(bridge),
+                        "config": config_manager.get_frontend_config(bridge),
                     })
                     await ws.send_json({"type": "status_message", "text": "Ready. Type a query to start."})
 
@@ -1795,7 +1773,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     })
                     await ws.send_json({
                         "type": "config_changed",
-                        "config": frontend_config_from_bridge(bridge),
+                        "config": config_manager.get_frontend_config(bridge),
                     })
                     await ws.send_json({
                         "type": "status_message",
