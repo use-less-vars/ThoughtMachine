@@ -43,7 +43,9 @@ VAULT_SUBDIRS: tuple[str, ...] = (
     "sessions",
     "state",
     "system",
+    "user",
     "worker_templates",
+    "workspaces",
 )
 
 

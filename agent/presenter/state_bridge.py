@@ -199,7 +199,7 @@ class StateBridge:
         self.current_config = AgentConfig(**config_dict)
         return self.current_config.model_dump(exclude={'api_key'}, exclude_none=True)
 
-    def create_agent_config(self, session_config: Optional['SessionConfig'] = None, mode: Optional[str] = None) -> AgentConfig:
+    def create_agent_config(self, session_config: Optional['SessionConfig'] = None, mode: Optional[str] = None, workspace_id: Optional[str] = None) -> AgentConfig:
         """
         Create AgentConfig from a SessionConfig object.
 
@@ -211,15 +211,36 @@ class StateBridge:
         Args:
             session_config: Optional SessionConfig object. When provided, used as source.
             mode: Optional session mode. Only used in legacy fallback path.
+            workspace_id: Optional workspace ID for vault defaults resolution.
 
         Returns:
             AgentConfig instance ready for use with controller
         """
-        if session_config is not None:
+
+        session_cfg = session_config  # local alias for cleaner code below
+
+        # Phase 4: Resolve vault defaults first (factory → user → workspace)
+        resolved_workspace_id = workspace_id or (
+            session_cfg.workspace_id if session_cfg else None
+        )
+        if resolved_workspace_id:
+            try:
+                from agent.config.config_manager import resolve_config_defaults
+                vault_defaults = resolve_config_defaults(resolved_workspace_id)
+                if vault_defaults and session_cfg is not None:
+                    # Merge vault defaults into session_cfg (only where None)
+                    for k, v in vault_defaults.items():
+                        if hasattr(session_cfg, k) and getattr(session_cfg, k) is None:
+                            setattr(session_cfg, k, v)
+            except Exception as exc:
+                log('WARNING', 'presenter.state_bridge',
+                    f'Failed to resolve vault defaults: {exc}')
+
+        if session_cfg is not None:
             # New path: derive AgentConfig from SessionConfig
-            agent_config = session_config.to_agent_config()
+            agent_config = session_cfg.to_agent_config()
             # Resolve provider profile if provider_id is present
-            if session_config.provider_id:
+            if session_cfg.provider_id:
                 from agent.config.provider_profile import ProviderManager
                 manager = ProviderManager()
                 config_dict = agent_config.model_dump(exclude_none=True)
