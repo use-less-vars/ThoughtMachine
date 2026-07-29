@@ -92,6 +92,13 @@ class SessionManager:
             base_url="",
         )
 
+        # Merge global defaults so saved provider/model appear in new sessions
+        from web_ui.backend.config_manager import load_global_defaults, translate_frontend_config
+        defaults_be = translate_frontend_config(load_global_defaults())
+        for key in ('provider_type', 'model', 'base_url', 'temperature'):
+            if key in defaults_be and defaults_be[key]:
+                setattr(session_config, key, defaults_be[key])
+
         # Persist session + config metadata
         new_session.metadata["session_config"] = session_config.model_dump(
             exclude={"api_key"}, exclude_none=True

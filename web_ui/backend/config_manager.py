@@ -187,17 +187,11 @@ def frontend_config_from_bridge(bridge) -> Dict[str, Any]:
 
     cfg = bridge.get_config()
     if cfg is None:
-        # Bridge exists but has no _session_config yet (before-first-query state).
-        result = backend_to_frontend_config({
-            "mode": "custom",
-            "temperature": 1.0,
-            "max_turns": 100,
-            "enabled_tools": [],
-            "provider_type": "openai_compatible",
-        })
-        if bridge._workspace_path:
-            result["workspace_path"] = bridge._workspace_path
-        result["api_key_configured"] = bool(
+        result = default_frontend_config()
+        # The bridge may still provide workspace_path even without a config
+        if bridge is not None and bridge._workspace_path:
+            result['workspace_path'] = bridge._workspace_path
+        result['api_key_configured'] = bool(
             os.getenv("OPENAI_API_KEY")
             or os.getenv("DEEPSEEK_API_KEY")
             or os.getenv("OPENAI_COMPATIBLE_API_KEY")
