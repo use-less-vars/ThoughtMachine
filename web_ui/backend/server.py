@@ -829,6 +829,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             session_store.add_open_session(new_session.session_id)
 
                         # 6. Now apply the config to the NEW bridge
+                        config = config_manager.translate_frontend_config(config)
                         result = bridge.apply_config(config)
 
                         # 7. Send config_changed + status message.
@@ -883,7 +884,8 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 enabled_tools=list(get_tools_for_mode(_mode)),
                             )
 
-                        # Apply via bridge (validates, merges, resolves provider, persists)
+                        # Translate frontend tools list → backend enabled_tools, then apply
+                        config = config_manager.translate_frontend_config(config)
                         result = bridge.apply_config(config)
 
                         if not isinstance(result, dict) or result.get("success") is not False:
