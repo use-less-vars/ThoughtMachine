@@ -89,8 +89,11 @@ from session.session_registry import SessionRegistry
 try:
     from tools.workspace.worker import (
         shutdown_workers, get_worker_event_bus, register_worker_event_bus,
-        unregister_worker_event_bus, _worker_registry, _registry_lock
+        unregister_worker_event_bus,
     )
+    from tools.workspace.worker_registry import WorkerRegistry as _WorkerRegistry
+    _worker_registry = _WorkerRegistry.get_instance()._worker_registry
+    _registry_lock = _WorkerRegistry.get_instance()._registry_lock
     WORKER_BUS_AVAILABLE = True
 except ImportError:
     shutdown_workers = None  # type: ignore
@@ -378,8 +381,8 @@ class WebAgentBridge:
         if not session_id:
             return
         try:
-            from tools.workspace.worker import get_worker_event_buses_for_session
-            buses = get_worker_event_buses_for_session(session_id)
+            from tools.workspace.worker_registry import WorkerRegistry as _WorkerRegistry
+            buses = _WorkerRegistry.get_instance().get_event_buses_for_session(session_id)
             for worker_name, bus in buses.items():
                 if worker_name in self._worker_bus_subs:
                     log('DEBUG', 'pipeline.bridge',

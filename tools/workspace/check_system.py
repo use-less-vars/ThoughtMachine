@@ -68,7 +68,10 @@ except ImportError:
 
 # Worker registry access (for running_workers query)
 try:
-    from tools.workspace.worker import _worker_registry, _registry_lock
+    from tools.workspace.worker_registry import WorkerRegistry as _WorkerRegistry
+    _registry_instance = _WorkerRegistry.get_instance()
+    _worker_registry = _registry_instance._worker_registry
+    _registry_lock = _registry_instance._registry_lock
     WORKER_REGISTRY_AVAILABLE = True
 except ImportError:
     _worker_registry = None

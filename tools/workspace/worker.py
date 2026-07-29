@@ -407,86 +407,41 @@ def _get_tool_registry() -> dict[str, type["ToolBase"]]:
     return _TOOL_REGISTRY
 
 # ---------------------------------------------------------------------------
+# Module-level worker registry (delegates to WorkerRegistry singleton)
+# ---------------------------------------------------------------------------
+
+from tools.workspace.worker_registry import WorkerRegistry as _WorkerRegistry
+
+_registry_instance = _WorkerRegistry.get_instance()
+_worker_registry = _registry_instance._worker_registry
+_registry_lock = _registry_instance._registry_lock
+_worker_event_bus_registry = _registry_instance._worker_event_bus_registry
+_bus_registry_lock = _registry_instance._bus_registry_lock
+
+# ---------------------------------------------------------------------------
 # Shutdown helper  (exposed for bridge integration)
 # ---------------------------------------------------------------------------
 
 def shutdown_workers(timeout: float = 5.0) -> None:
-    """
-    Gracefully stop all registered worker threads and persist their context.
-
-    Called from an ``atexit`` handler and from the bridge's ``close_session``
-    so that partial conversation state is not lost when the process exits or
-    a session is closed with active workers.
-    """
-    with _registry_lock:
-        keys = list(_worker_registry.keys())
-    for key in keys:
-        with _registry_lock:
-            thread = _worker_registry.get(key)
-        if thread is None or not thread.is_alive():
-            continue
-        worker_label = key[1] if isinstance(key, tuple) else str(key)
-        logger.info("Shutting down worker '%s' (status=%s)", worker_label, thread.status)
-        try:
-            thread.stop()
-            thread.join(timeout=timeout)
-        except Exception:
-            logger.exception("Error joining worker '%s' during shutdown", worker_label)
-        finally:
-            try:
-                thread._save_context()
-            except Exception:
-                logger.exception("Error saving context for worker '%s' during shutdown", worker_label)
-
-# Register atexit handler
-atexit.register(shutdown_workers)
+    """Delegate to WorkerRegistry singleton (backward compat)."""
+    _WorkerRegistry.get_instance().shutdown_workers(timeout=timeout)
 
 def register_worker_event_bus(session_id: str, worker_name: str, event_bus: Any) -> None:
-    """
-    Register a worker's per-worker EventBus so the bridge can discover it
-    and subscribe to detailed events (tool_call, tool_result, etc.).
-    """
-    key = (session_id or "", worker_name)
-    with _bus_registry_lock:
-        _worker_event_bus_registry[key] = event_bus
+    """Delegate to WorkerRegistry singleton (backward compat)."""
+    _WorkerRegistry.get_instance().register_event_bus(session_id, worker_name, event_bus)
 
 def unregister_worker_event_bus(session_id: str, worker_name: str) -> None:
-    """Unregister a worker's per-worker EventBus."""
-    key = (session_id or "", worker_name)
-    with _bus_registry_lock:
-        _worker_event_bus_registry.pop(key, None)
+    """Delegate to WorkerRegistry singleton (backward compat)."""
+    _WorkerRegistry.get_instance().unregister_event_bus(session_id, worker_name)
 
 def get_worker_event_bus(session_id: str, worker_name: str) -> Any:
-    """Get a worker's per-worker EventBus, or None if not registered."""
-    key = (session_id or "", worker_name)
-    with _bus_registry_lock:
-        return _worker_event_bus_registry.get(key)
+    """Delegate to WorkerRegistry singleton (backward compat)."""
+    return _WorkerRegistry.get_instance().get_event_bus(session_id, worker_name)
 
 
 def get_worker_event_buses_for_session(session_id: str) -> Dict[str, Any]:
-    """Return dict of {worker_name: EventBus} for all registered workers in a session.
-
-    Used by late-arriving bridges to discover already-running workers
-    whose WORKER_SPAWNED event was published before the bridge subscribed.
-    """
-    result: Dict[str, Any] = {}
-    with _bus_registry_lock:
-        for (sid, wname), bus in _worker_event_bus_registry.items():
-            if sid == (session_id or ""):
-                result[wname] = bus
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Module-level worker registry  (persists across tool calls)
-# ---------------------------------------------------------------------------
-
-_worker_registry: dict = {}
-_registry_lock = threading.Lock()
-
-# Per-worker EventBus registry (for bridge discovery of per-worker buses)
-_worker_event_bus_registry: Dict[Tuple[str, str], Any] = {}
-_bus_registry_lock = threading.Lock()
+    """Delegate to WorkerRegistry singleton (backward compat)."""
+    return _WorkerRegistry.get_instance().get_event_buses_for_session(session_id)
 
 # ---------------------------------------------------------------------------
 # Restrictive merge for permission ceiling enforcement
@@ -1999,12 +1954,7 @@ class Worker(ToolBase):
 
         Returns a list of ``(session_key, thread)`` tuples.
         """
-        results: list[tuple[str, Any]] = []
-        with _registry_lock:
-            for (sid, wname), thread in list(_worker_registry.items()):
-                if wname == worker_name:
-                    results.append((sid, thread))
-        return results
+        return _WorkerRegistry.get_instance().find_workers_by_name(worker_name)
 
     # -- action implementations --------------------------------------
 

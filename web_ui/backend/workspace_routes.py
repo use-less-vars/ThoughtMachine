@@ -32,7 +32,9 @@ from thoughtmachine.workspace_capabilities import (
     load_workspace_capabilities,
 )
 
-from tools.workspace.worker import _worker_registry, _registry_lock
+from tools.workspace.worker_registry import WorkerRegistry as _WorkerRegistry
+_worker_registry = _WorkerRegistry.get_instance()._worker_registry
+_registry_lock = _WorkerRegistry.get_instance()._registry_lock
 
 from agent.models.worker_definition import WorkerDefinition
 
