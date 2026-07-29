@@ -3,14 +3,14 @@ Tests for the web_ui backend config pipeline.
 
 Covers:
 - bridge.apply_config() stores and persists config correctly
-- _translate_frontend_config() correctly maps frontend ↔ backend fields
+- translate_frontend_config() correctly maps frontend ↔ backend fields
 """
 import json
 import pytest
 from pathlib import Path
 from agent.config.models import AgentConfig
 from web_ui.backend.bridge import WebAgentBridge
-from web_ui.backend.server import _translate_frontend_config, _backend_to_frontend_config
+from web_ui.backend.config_manager import translate_frontend_config, backend_to_frontend_config
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -109,20 +109,20 @@ class TestApplyConfig:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tests: _translate_frontend_config
+# Tests: translate_frontend_config
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestTranslateFrontendConfig:
-    """Tests for _translate_frontend_config()."""
+    """Tests for translate_frontend_config()."""
 
     def test_translate_frontend_config_passes_all_fields(self):
         """
-        _translate_frontend_config should:
+        translate_frontend_config should:
         - Map 'provider' → 'provider_type'
         - Pass through model, temperature unchanged
         - Convert tools [{name, enabled}] → enabled_tools list of enabled names
         """
-        result = _translate_frontend_config({
+        result = translate_frontend_config({
             "temperature": 1.0,
             "model": "gpt-4",
             "provider": "openai",
@@ -149,30 +149,30 @@ class TestTranslateFrontendConfig:
 
     def test_translate_frontend_config_anthropic_provider(self):
         """Verify 'anthropic' provider maps to provider_type='anthropic'."""
-        result = _translate_frontend_config({"provider": "anthropic"})
+        result = translate_frontend_config({"provider": "anthropic"})
         assert result.get("provider_type") == "anthropic"
 
     def test_translate_frontend_config_local_provider(self):
         """Verify 'local' provider maps to provider_type='openai_compatible'."""
-        result = _translate_frontend_config({"provider": "local"})
+        result = translate_frontend_config({"provider": "local"})
         assert result.get("provider_type") == "openai_compatible"
 
     def test_translate_frontend_config_no_tools_list(self):
         """When no tools field is provided, enabled_tools should not be set."""
-        result = _translate_frontend_config({"temperature": 0.5})
+        result = translate_frontend_config({"temperature": 0.5})
         assert "enabled_tools" not in result
 
     def test_translate_frontend_config_empty_tools_list(self):
         """When tools is an empty list, enabled_tools should be an empty list
         (all tools explicitly disabled)."""
-        result = _translate_frontend_config({"tools": []})
+        result = translate_frontend_config({"tools": []})
         assert result.get("enabled_tools") == [], \
             f"Expected enabled_tools=[], got {result.get('enabled_tools')}"
 
     def test_translate_frontend_config_all_disabled_tools(self):
         """When all tools are disabled, enabled_tools should be an empty list
         (all tools explicitly disabled)."""
-        result = _translate_frontend_config({
+        result = translate_frontend_config({
             "tools": [
                 {"name": "bash", "enabled": False},
                 {"name": "file_read", "enabled": False},
@@ -183,7 +183,7 @@ class TestTranslateFrontendConfig:
 
     def test_translate_frontend_config_strips_private_keys(self):
         """Keys starting with '_' should be stripped from the result."""
-        result = _translate_frontend_config({
+        result = translate_frontend_config({
             "temperature": 0.7,
             "_internal_id": "abc123",
             "_debug": True,
@@ -194,22 +194,22 @@ class TestTranslateFrontendConfig:
 
     def test_translate_frontend_config_no_provider(self):
         """When no provider is given, provider_type should not be set."""
-        result = _translate_frontend_config({"temperature": 0.5})
+        result = translate_frontend_config({"temperature": 0.5})
         assert "provider_type" not in result
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tests: _backend_to_frontend_config  (round-trip completeness)
+# Tests: backend_to_frontend_config  (round-trip completeness)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestBackendToFrontendConfig:
-    """Tests for _backend_to_frontend_config()."""
+    """Tests for backend_to_frontend_config()."""
 
     def test_backend_to_frontend_emits_all_tools(self):
         """
-        _backend_to_frontend_config should emit ALL known tools from
+        backend_to_frontend_config should emit ALL known tools from
         SIMPLIFIED_TOOL_CLASSES, each with enabled: true/false.
         """
-        result = _backend_to_frontend_config({
+        result = backend_to_frontend_config({
             "enabled_tools": ["FileEditor", "ReadFile"],
         })
         tools = result.get("tools", [])
@@ -235,7 +235,7 @@ class TestBackendToFrontendConfig:
         When enabled_tools key is absent, tools should remain as-is
         (or absent), not be populated.
         """
-        result = _backend_to_frontend_config({"temperature": 0.5})
+        result = backend_to_frontend_config({"temperature": 0.5})
         # tools should not be populated from nowhere
         assert "tools" not in result or result["tools"] is None
 
@@ -244,7 +244,7 @@ class TestBackendToFrontendConfig:
         When enabled_tools is an empty list, all tools should be
         present with enabled=False.
         """
-        result = _backend_to_frontend_config({"enabled_tools": []})
+        result = backend_to_frontend_config({"enabled_tools": []})
         tools = result.get("tools", [])
         assert len(tools) > 0, "Should still emit all tools"
         assert all(t["enabled"] is False for t in tools), (

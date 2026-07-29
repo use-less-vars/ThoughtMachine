@@ -44,7 +44,7 @@ import threading
 import queue
 import traceback
 import uuid
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import datetime
 
@@ -105,6 +105,7 @@ from agent.config.session_config import SessionConfig
 
 from web_ui.backend.event_forwarder import EventForwarder, _active_tab_bridges
 from web_ui.backend.config_manager import ConfigManager
+from web_ui.backend.session_manager import SessionManager
 
 # ── Workspace ID cache ──────────────────────────────────────────────────────
 # Cache mapping workspace path → workspace ID, built once and reused across
@@ -212,6 +213,7 @@ class WebAgentBridge:
 
         # Session persistence — use shared store if provided, otherwise create one
         self._session_store = session_store if session_store is not None else FileSystemSessionStore()
+        self._session_manager = SessionManager(self._session_store, self._config_manager)
         self._session: Optional[Session] = None
         self._loaded_session: Optional[Session] = None
         self._workspace_id: Optional[str] = None
@@ -1095,13 +1097,9 @@ class WebAgentBridge:
     def get_conversation(self) -> Optional[List[Dict[str, Any]]]:
         """
         Return the current conversation for frontend display.
-
-        Normalizes roles (``tool" → ``tool_result") for the frontend
-        without modifying the underlying session data.
+        Delegates to SessionManager for normalization.
         """
-        if self._session is not None:
-            return self._normalize_for_frontend(self._session.user_history)
-        return None
+        return self._session_manager.get_conversation(self._session)
 
     def get_config(self) -> Optional[Dict[str, Any]]:
         """Return the current session config as a serializable dict (no api_key)."""
@@ -1244,12 +1242,7 @@ class WebAgentBridge:
     def save_session(self, name: Optional[str] = None) -> Optional[Session]:
         """
         Save current conversation as a session to the store.
-
-        Args:
-            name: Optional display name for the session.
-
-        Returns:
-            The saved Session object, or None on failure.
+        Delegates persistence to SessionManager, then reloads worker contexts.
         """
         try:
             # Use the active session if available (standalone or controller path)
@@ -1281,7 +1274,9 @@ class WebAgentBridge:
             elif self._loaded_session and self._loaded_session.metadata.get('name'):
                 session.metadata['name'] = self._loaded_session.metadata['name']
             session.ensure_name()
-            self._session_store.save_session(session, workspace_id=session.workspace_id)
+
+            # Delegate save to SessionManager
+            self._session_manager.save_session(session, session_config=None, name=None)
             self._loaded_session = session
 
             # ── Load persisted worker contexts for this workspace ──────────
@@ -1408,13 +1403,35 @@ class WebAgentBridge:
 
         return normalized
 
+    def create_session(self, mode: str = "custom") -> Tuple[str, Dict[str, Any]]:
+        """
+        Create a new empty session and return (session_id, frontend_config).
+
+        Delegates to ``SessionManager.create_session``, then updates bridge
+        in-memory state (``_session``, ``_loaded_session``, ``_session_config``)
+        WITHOUT broadcasting events — the caller (e.g. server.py) is responsible
+        for sending session_loaded / state_changed to the frontend.
+        """
+        session_id, frontend_config = self._session_manager.create_session(
+            mode=mode, workspace_path=self._workspace_path
+        )
+        # Load session into in-memory state (no broadcast)
+        session = self._session_manager.load_session(session_id, workspace_id=self._workspace_id)
+        if session is not None:
+            self._session = session
+            self._loaded_session = session
+            self._history_version = session.conversation_version
+            self._workspace_id = session.workspace_id
+            sc = self._session_manager.extract_session_config(session)
+            if sc is not None:
+                self._session_config = sc
+        return session_id, frontend_config
+
     def load_session(self, session_id: str, limit: Optional[int] = 50, offset: int = 0) -> bool:
         """Load a session from the store, replacing current conversation.
 
-        Also extracts ``session.metadata['session_config']`` (new format) or
-        ``session.metadata['agent_config']`` (legacy fallback) and merges it
-        into ``self._session_config`` so that ``get_config()`` returns the saved
-        configuration immediately and ``start()`` uses it as the base config.
+        Delegates persistence and role repair to ``SessionManager.load_session``
+        and config extraction to ``SessionManager.extract_session_config``.
 
         After calling this, the server handler should send ``config_changed``
         (in frontend format) so the frontend controls update.
@@ -1428,19 +1445,18 @@ class WebAgentBridge:
         and ``has_more`` to let the frontend fetch older pages.
         """
         try:
+            # Load from the bridge's current store (caller may have replaced _session_store)
             session = self._session_store.load_session(session_id, workspace_id=self._workspace_id)
             if session is None:
                 log('WARNING', 'server.bridge', f"Session not found: {session_id}")
                 return False
+            # Apply role repair, config migration, registry registration
+            self._session_manager.repair_session(session)
             self._session = session
             self._history_version = session.conversation_version
             self._workspace_id = session.workspace_id
 
             # ── Backfill workspace_path from the workspace registry ─────
-            # If the session has a workspace_id but the config doesn't have
-            # a workspace_path yet, look it up from the registry so that
-            # downstream code (e.g. server.py fallback blocks) can use it
-            # immediately without needing a separate resolution step.
             if self._workspace_id and not self._workspace_path:
                 try:
                     registry = WorkspaceRegistry.get_default()
@@ -1458,77 +1474,21 @@ class WebAgentBridge:
                     log('WARNING', 'server.bridge',
                         f"Could not backfill workspace_path from registry: {exc}")
 
-            # ── Repair: restore corrupted roles ─────────────────────────────
-            # Sessions previously saved via a buggy bridge version may have
-            # "tool_result" as a role (introduced by in-place frontend normalization).
-            # The canonical API format is "tool" – fix it here so the session
-            # stays valid for API calls.
-            repaired = False
-            for msg in session.user_history:
-                if msg.get("role") == "tool_result":
-                    msg["role"] = "tool"
-                    repaired = True
-            if repaired:
-                log('WARNING', 'server.bridge',
-                    f"Repaired {session_id}: corrected 'tool_result' roles back to 'tool'")
-                self._session_store.save_session(session, workspace_id=session.workspace_id)
-
             self._loaded_session = session
 
             # ── Load persisted worker contexts for this workspace ──────────
             self._persisted_workers.clear()
             self._load_worker_contexts()
 
-            # ── Extract session config from session metadata into self._session_config ──
-            session_config_raw = session.metadata.get('session_config') or session.metadata.get('agent_config')
-            if session_config_raw and isinstance(session_config_raw, dict):
-                try:
-                    # If mode is missing, default to 'agent' (legacy migration)
-                    if 'mode' not in session_config_raw:
-                        session_config_raw['mode'] = 'agent'
-                        log('INFO', 'server.bridge',
-                            f'Migrated legacy session {session_id}: defaulted mode to "agent"')
-
-                    # Construct SessionConfig — validator applies mode presets
-                    sc = SessionConfig(**session_config_raw)
-
-                    # 🛡️ Defensive: if mode is still None after construction, default to 'agent'
-                    # This catches edge cases where session_config_raw has an unrecognized
-                    # mode value or the SessionConfig model changed.
-                    if not sc.mode:
-                        sc.mode = 'agent'
-                        log('WARNING', 'server.bridge',
-                            f'load_session: mode was None after SessionConfig construction — defaulted to "agent"')
-
-                    # Re-inject API key from provider resolution (never persisted)
-                    try:
-                        manager = ProviderManager()
-                        resolved = manager.resolve_config({'provider_id': sc.provider_id})
-                        if resolved.get('api_key'):
-                            sc.api_key = resolved['api_key']
-                        else:
-                            # Fallback: find ANY available provider with an API key
-                            for profile in manager.list_profiles():
-                                if profile.api_key:
-                                    sc.api_key = profile.api_key
-                                    sc.provider_id = profile.id
-                                    break
-                    except Exception as exc:
-                        log('WARNING', 'server.bridge',
-                            f'Could not resolve API key for provider {sc.provider_id}: {exc}')
-
-                    self._session_config = sc
-                    log('INFO', 'server.bridge',
-                        f'Loaded session_config from metadata: mode={sc.mode}, '
-                        f'provider={sc.provider_id}, model={sc.model}')
-
-                    # Migrate saved config to new format (exclude api_key)
-                    session.metadata['session_config'] = sc.model_dump(exclude={'api_key'})
-                    if 'agent_config' in session.metadata:
-                        del session.metadata['agent_config']
-                    self._session_store.save_session(session, workspace_id=session.workspace_id)
-                except Exception as exc:
-                    log('WARNING', 'server.bridge', f'load_session: config load failed: {exc}')
+            # ── Extract session config from session metadata via SessionManager ──
+            sc = self._session_manager.extract_session_config(session)
+            if sc is not None:
+                self._session_config = sc
+                # Migrate saved config to new format (exclude api_key)
+                self._session_manager.save_config_to_session(session, sc)
+                log('INFO', 'server.bridge',
+                    f'Loaded session_config from metadata: mode={sc.mode}, '
+                    f'provider={sc.provider_id}, model={sc.model}')
             else:
                 log('INFO', 'server.bridge', 'No session_config in session metadata — session will use defaults')
 
@@ -1606,104 +1566,36 @@ class WebAgentBridge:
             return False
 
     def load_more_messages(self, offset: int, limit: int = 50) -> Optional[Dict[str, Any]]:
-        """Return a page of older messages from the loaded session.
-
-        Args:
-            offset: Number of messages to skip from the end (e.g. offset=50 means
-                    skip the most recent 50, get the ones before that).
-            limit:  How many messages to return.
-
-        Returns:
-            A dict with ``messages``, ``total_count``, ``has_more``, or ``None``
-            if no session is loaded.
-        """
+        """Return a page of older messages — delegates to SessionManager."""
         session = self._session or self._loaded_session
-        if session is None:
-            return None
-
-        all_messages = session.user_history or []
-        total_count = len(all_messages)
-
-        # offset counts from the end: offset=0 means most recent
-        end_idx = total_count - offset
-        start_idx = max(0, end_idx - limit)
-
-        page = self._normalize_for_frontend(all_messages[start_idx:end_idx])
-        has_more = start_idx > 0
-
-        return {
-            "type": "more_messages",
-            "messages": page,
-            "offset": offset,
-            "total_count": total_count,
-            "has_more": has_more,
-        }
+        return self._session_manager.load_more_messages(session, offset, limit=limit)
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session from the store.
-
-        Cleans up all three locations:
-        1. Session file(s) on disk via session_store.delete_session()
-        2. In-memory SessionRegistry
-        3. open_sessions.json state file
-
-        Matches the pattern used by the WebSocket handler and REST API.
-        """
-        try:
-            result = self._session_store.delete_session(session_id)
-            if result:
-                log('INFO', 'server.bridge', f"Session deleted: {session_id}")
-                # Remove from in-memory session registry
-                registry = SessionRegistry.get_default()
-                registry.remove(session_id)
-                # Remove from open sessions state file
-                self._session_store.remove_open_session(session_id)
-            else:
-                log('WARNING', 'server.bridge', f"Session not found for deletion: {session_id}")
-            return result
-        except Exception as e:
-            log('ERROR', 'server.bridge', f"delete_session error: {e}")
-            return False
+        """Delete a session — delegates to SessionManager."""
+        return self._session_manager.delete_session(session_id)
 
     def rename_session(self, session_id: str, new_name: str) -> bool:
-        """Rename a session in the store."""
-        try:
-            session = self._session_store.load_session(session_id, workspace_id=self._workspace_id)
-            if session is None:
-                log('WARNING', 'server.bridge', f"Session not found for rename: {session_id}")
-                return False
-            session.metadata['name'] = new_name
-            self._session_store.save_session(session, workspace_id=session.workspace_id)
+        """Rename a session — delegates to SessionManager, then syncs in-memory state."""
+        result = self._session_manager.rename_session(session_id, new_name, workspace_id=self._workspace_id)
+        if result:
             # Update loaded session name if it's the one being renamed
             if self._loaded_session and self._loaded_session.session_id == session_id:
                 self._loaded_session.metadata['name'] = new_name
             # Also update active in-memory session to prevent save_session() from reverting
             if self._session and self._session.session_id == session_id:
                 self._session.metadata['name'] = new_name
-            log('INFO', 'server.bridge', f"Session renamed: {session_id} → {new_name}")
-            return True
-        except Exception as e:
-            log('ERROR', 'server.bridge', f"rename_session error: {e}")
-            return False
+        return result
 
     # ── Open sessions management ────────────────────────────────────────────
 
     def get_open_sessions(self) -> List[str]:
-        """
-        Return the list of open session IDs from open_sessions.json.
-        Delegates to FileSystemSessionStore.
-        """
-        try:
-            return self._session_store.get_open_sessions()
-        except Exception as e:
-            log('ERROR', 'server.bridge', f"get_open_sessions error: {e}")
-            return []
+        """Return the list of open session IDs — delegates to SessionManager."""
+        return self._session_manager.get_open_sessions()
 
     def save_open_session(self, session_id: Optional[str] = None) -> None:
         """
         Save the current session and add it to the open sessions list.
-        If session_id is provided, that ID is added; otherwise uses the
-        bridge's current session ID.
+        Delegates persistence to SessionManager.
         """
         sid = session_id or self._session_id or (
             self._loaded_session.session_id if self._loaded_session else None
@@ -1713,18 +1605,13 @@ class WebAgentBridge:
             return
         # Save the session first (so it exists on disk)
         self.save_session()
-        # Then add to open list
-        try:
-            self._session_store.add_open_session(sid)
-            log('INFO', 'server.bridge', f"Session {sid} added to open sessions")
-        except Exception as e:
-            log('ERROR', 'server.bridge', f"save_open_session error: {e}")
+        # Then add to open list via SessionManager
+        self._session_manager.save_open_session(sid)
 
     def remove_open_session(self, session_id: Optional[str] = None) -> None:
         """
         Remove a session from the open sessions list.
-        If session_id is provided, that ID is removed; otherwise uses the
-        bridge's current session ID.
+        Delegates to SessionManager.
         """
         sid = session_id or self._session_id or (
             self._loaded_session.session_id if self._loaded_session else None
@@ -1732,16 +1619,13 @@ class WebAgentBridge:
         if sid is None:
             log('WARNING', 'server.bridge', "remove_open_session: no session ID available")
             return
-        try:
-            self._session_store.remove_open_session(sid)
-            log('INFO', 'server.bridge', f"Session {sid} removed from open sessions")
-        except Exception as e:
-            log('ERROR', 'server.bridge', f"remove_open_session error: {e}")
+        self._session_manager.remove_open_session(sid)
 
     def close_session(self, session_id: Optional[str] = None) -> None:
         """
         Save session, remove from open sessions list, and stop the bridge.
         This is the complete "close tab" sequence.
+        Persistence cleanup is delegated to SessionManager.
 
         Args:
             session_id: Session to close. If None, uses the bridge's current
@@ -1761,7 +1645,7 @@ class WebAgentBridge:
         # NOW save — all final messages are captured
         if sid:
             self.save_session()
-            self.remove_open_session(sid)
+            self._session_manager.close_session(sid)
 
         # Gracefully stop any worker threads spawned during this session
         if shutdown_workers is not None:

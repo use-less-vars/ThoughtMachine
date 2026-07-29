@@ -104,7 +104,9 @@ def simulate_apply_config(
     result = bridge.apply_config(apply_dict)
 
     # 4. Build the event the handler would send
-    if result.get("success"):
+    # Bridge.apply_config() returns a frontend config dict on success,
+    # or {"success": False, "error": "..."} on failure.
+    if "error" not in result:
         config_changed_event = {
             "type": "config_changed",
             "config": _build_frontend_config(bridge),
@@ -167,7 +169,7 @@ class TestConfigRoundTrip:
 
         # --- Then: bridge state updated ---
         assert bridge._session_config.enabled_tools == ["Read", "Write"]
-        assert output["result"]["success"] is True
+        assert "error" not in output["result"]
 
         # --- Then: config_changed event has correct data ---
         event = output["config_changed_event"]
@@ -227,7 +229,7 @@ class TestConfigRoundTrip:
         output = simulate_apply_config(bridge, frontend_config)
 
         # --- Then: apply succeeds ---
-        assert output["result"]["success"] is True
+        assert "error" not in output["result"]
         assert output["config_changed_event"]["type"] == "config_changed"
         assert "Bash" in output["config_changed_event"]["config"].get("enabled_tools", [])
 

@@ -1582,13 +1582,12 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         except Exception:
                             pass
 
-                    # Create a new empty session
-                    from session.models import Session
-                    new_session = Session()
-                    new_session.metadata['source'] = 'web_ui'
-                    if workspace_id:
+                    # Create a new empty session via SessionManager
+                    session_id, _ = bridge.create_session(mode='custom')
+                    new_session = bridge._session
+                    if workspace_id and new_session:
                         new_session.workspace_id = workspace_id
-                    new_session.ensure_name()
+                        bridge._workspace_id = workspace_id
 
                     # ── Set workspace_path on bridge config from registry ──
                     if workspace_id and not bridge._workspace_path:
@@ -1600,10 +1599,10 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 log('INFO', 'server',
                                     f"new_session: set workspace_path from registry: {root_path}")
 
-                                # ── Also persist workspace_path in session metadata for reload ──
-                                if 'agent_config' not in new_session.metadata:
+                                # ── Persist workspace_path in session metadata for reload ──
+                                if new_session and 'agent_config' not in new_session.metadata:
                                     new_session.metadata['agent_config'] = {}
-                                if isinstance(new_session.metadata['agent_config'], dict):
+                                if new_session and isinstance(new_session.metadata['agent_config'], dict):
                                     new_session.metadata['agent_config']['workspace_path'] = root_path
                                     log('INFO', 'server',
                                         f"new_session: persisted workspace_path in session metadata: {root_path}")
@@ -1611,32 +1610,12 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             log('WARNING', 'server',
                                 f"new_session: could not resolve workspace root from registry: {exc}")
 
-                    # Store as the loaded session so continue_session picks it up
-                    bridge._loaded_session = new_session
                     log('INFO', 'server.ws',
-                        f'new_session: bridge created, session_id={new_session.session_id}, '
-                        f'bridge._loaded_session set')
-
-                    # Initialize _session_config so config_manager.get_frontend_config returns
-                    # meaningful bridge state (not hardcoded defaults). Use custom mode to
-                    # avoid accidental tool preset locking.
-                    if bridge._session_config is None:
-                        bridge._session_config = SessionConfig(
-                            mode='custom',
-                            max_turns=100,
-                            session_permissions={},
-                            enabled_tools=[],
-                            provider_id='',
-                            model='',
-                            base_url='',
-                        )
+                        f'new_session: bridge created, session_id={session_id}, '
+                        f'bridge._session set')
 
                     # Cache bridge by the new session ID so reconnects reuse it
-                    _session_bridges[new_session.session_id] = bridge
-                    # Persist to session store so the SessionTab can load it
-                    # via load_session on its own WS connection.
-                    session_store.save_session(new_session, workspace_id=workspace_id)
-                    session_store.add_open_session(new_session.session_id)
+                    _session_bridges[session_id] = bridge
 
                     await ws.send_json({
                         "type": "session_loaded",

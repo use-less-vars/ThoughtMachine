@@ -86,7 +86,7 @@ class TestFullSessionLifecycle:
         output = simulate_apply_config(bridge, frontend_config)
 
         assert bridge._session_config.enabled_tools == ["Read", "Write"]
-        assert output["result"]["success"] is True
+        assert "error" not in output["result"]
 
         event = output["config_changed_event"]
         assert event["type"] == "config_changed"
@@ -116,7 +116,7 @@ class TestFullSessionLifecycle:
             "enabled_tools": ["Read", "Write"],
         }
         output = simulate_apply_config(bridge, frontend_config)
-        assert output["result"]["success"] is True
+        assert "error" not in output["result"]
         assert output["config_changed_event"]["type"] == "config_changed"
         assert bridge._session_config.enabled_tools == ["Read", "Write"]
 
@@ -152,7 +152,7 @@ class TestFullSessionLifecycle:
             "enabled_tools": ["Read", "Write", "Bash"],
         }
         output2 = simulate_apply_config(bridge, reconfigure_config)
-        assert output2["result"]["success"] is True
+        assert "error" not in output2["result"]
         assert output2["config_changed_event"]["type"] == "config_changed"
         assert "Bash" in bridge._session_config.enabled_tools
         assert bridge._session_config.enabled_tools == ["Read", "Write", "Bash"]
