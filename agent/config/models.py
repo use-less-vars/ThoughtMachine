@@ -231,7 +231,7 @@ class AgentConfig(BaseModel):
         if not self.kb_enabled:
             tool_classes = [cls for cls in tool_classes if cls.__name__ != 'KnowledgeBaseTool']
         active_tools = enabled_tools if enabled_tools is not None else self.enabled_tools
-        if active_tools:
+        if active_tools is not None:
             tool_classes = [cls for cls in tool_classes if cls.__name__ in active_tools]
         return tool_classes
 

@@ -809,12 +809,16 @@ class WorkerThread(threading.Thread):
             DEFAULT_WORKER_SYSTEM_PROMPT,
         )
         worker_tools = self.definition.get("tools", [])
+        parent_enabled_tools = cfg.get("enabled_tools")
         if worker_tools:
             enabled_tools = [t for t in worker_tools if t not in _WORKER_BLOCKLIST]
         else:
             from tools import SIMPLIFIED_TOOL_CLASSES
             enabled_tools = [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES
                              if cls.__name__ not in _WORKER_BLOCKLIST]
+        # Intersect with parent's enabled_tools — worker cannot exceed parent
+        if parent_enabled_tools is not None:
+            enabled_tools = [t for t in enabled_tools if t in parent_enabled_tools]
         worker_cfg["enabled_tools"] = enabled_tools
         # Resolve max_turns: prefer definition, then parent config (treating
         # None as absent), then default 100.

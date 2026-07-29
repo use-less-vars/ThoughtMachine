@@ -103,7 +103,15 @@ class SessionConfig(BaseModel):
     @model_validator(mode='after')
     def enforce_mode_presets(self) -> 'SessionConfig':
         """Lock tools and prompt to the factory preset for non‑custom modes."""
-        if not self.mode or self.mode == 'custom':
+        if not self.mode:
+            return self
+        if self.mode == 'custom':
+            # Custom mode with no tools specified → populate default agent tools
+            if self.enabled_tools is None:
+                from agent.config.presets import get_tools_for_mode
+                preset_tools = get_tools_for_mode('agent')
+                if preset_tools:
+                    object.__setattr__(self, 'enabled_tools', list(preset_tools))
             return self
 
         # ── tools ─────────────────────────────────────
