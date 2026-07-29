@@ -850,11 +850,12 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             log('INFO', 'server.config',
                                 f"Config applied after project switch to {_project_path}")
                         else:
-                            # Config apply failed — still send a default config
-                            # so the frontend doesn't hang with stale state
+                            # Config apply failed — still send a config
+                            # from the bridge so the frontend doesn't hang
+                            # with stale state or wrong workspace_path.
                             await ws.send_json({
                                 "type": "config_changed",
-                                "config": _default_frontend_config(),
+                                "config": _frontend_config_from_bridge(bridge),
                             })
                             await ws.send_json({
                                 "type": "status_message",
@@ -1763,7 +1764,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     })
                     await ws.send_json({
                         "type": "config_changed",
-                        "config": _default_frontend_config(),
+                        "config": _frontend_config_from_bridge(bridge),
                     })
                     await ws.send_json({
                         "type": "status_message",
@@ -2181,7 +2182,13 @@ def _frontend_config_from_bridge(bridge) -> Dict[str, Any]:
     from web_ui.backend.bridge import WebAgentBridge
     cfg = bridge.get_config()
     if cfg is None:
-        return _default_frontend_config()
+        result = _default_frontend_config()
+        # Override workspace_path if bridge has one — prevents showing
+        # the installation directory (_project_root) for fresh bridges
+        # that haven't had _session_config set yet.
+        if bridge._workspace_path:
+            result['workspace_path'] = bridge._workspace_path
+        return result
     # Check if API key is configured before stripping it
     api_key = cfg.get('api_key', '') or ''
     if not api_key:
