@@ -1410,8 +1410,8 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         # access when no bridge is active.
                         # Broadcast the new name to ALL open bridges BEFORE responding,
                         # so no auto-save on another tab can race us and persist the old name.
-                        from web_ui.backend.bridge import _broadcast_rename
-                        _broadcast_rename(session_id, new_name)
+                        from web_ui.backend.event_forwarder import EventForwarder
+                        EventForwarder.broadcast_rename(session_id, new_name)
 
                         if bridge is not None and bridge.rename_session(session_id, new_name):
                             await ws.send_json({

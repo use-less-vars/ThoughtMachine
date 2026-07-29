@@ -86,9 +86,9 @@ async def update_logging_config(body: LoggingConfigBody) -> Dict[str, Any]:
 
         # Broadcast to all active WebSocket bridges
         try:
-            from web_ui.backend.bridge import WebAgentBridge
+            from web_ui.backend.event_forwarder import EventForwarder
 
-            WebAgentBridge.broadcast_logging_config(result["config"])
+            EventForwarder.broadcast_logging_config(result["config"])
         except Exception:
             pass  # No bridges active, that's fine
 

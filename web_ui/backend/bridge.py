@@ -103,6 +103,8 @@ except ImportError:
 
 from agent.config.session_config import SessionConfig
 
+from web_ui.backend.event_forwarder import EventForwarder, _active_tab_bridges
+
 # ── Workspace ID cache ──────────────────────────────────────────────────────
 # Cache mapping workspace path → workspace ID, built once and reused across
 # session load calls within the same bridge instance.
@@ -165,29 +167,6 @@ def _resolve_workspace_id(workspace_path: str) -> Optional[str]:
 #  Bridge class
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Global registry of active tab bridges — used to broadcast session renames
-# across all open tabs holding the same session.
-_active_tab_bridges: set = set()
-
-def _broadcast_rename(session_id: str, new_name: str) -> None:
-    """Update in-memory session name on every bridge that has this session loaded."""
-    for b in list(_active_tab_bridges):
-        try:
-            if b._loaded_session and b._loaded_session.session_id == session_id:
-                b._loaded_session.metadata['name'] = new_name
-            if b._session and b._session.session_id == session_id:
-                b._session.metadata['name'] = new_name
-        except Exception:
-            pass
-
-
-def _broadcast_logging_config(config: Dict[str, Any]) -> None:
-    """Emit a logging_config_changed event to every active tab bridge."""
-    for b in list(_active_tab_bridges):
-        try:
-            b._emit({"type": "logging_config_changed", "config": config})
-        except Exception:
-            pass
 
 
 class WebAgentBridge:
@@ -214,9 +193,8 @@ class WebAgentBridge:
         # Callbacks — called from the agent thread for every event.
         # Stored as a dict keyed by WebSocket id (or other unique key)
         # so multiple frontend connections can receive the same events.
-        self._event_callbacks: Dict[int, Callable] = {}
-        if event_callback is not None:
-            self._event_callbacks[id(event_callback)] = event_callback
+        # Event forwarder — owns callback registry, event mapping, and emission
+        self._forwarder = EventForwarder(self, event_callback)
 
         # Track last known controller busy state for state_changed is_running
         self._last_state_busy: Optional[bool] = None
@@ -225,9 +203,6 @@ class WebAgentBridge:
         self._session_config: Optional[SessionConfig] = None
         self._session_id: Optional[str] = None
         self._workspace_path: Optional[str] = None
-
-        # Track session conversation version for efficient history sync
-        self._history_version: int = 0
 
         # Controller integration (optional — used when Web UI wants to
         # reuse the existing AgentController instead of creating an Agent directly)
@@ -261,6 +236,8 @@ class WebAgentBridge:
 
         # Persisted worker contexts loaded from workspace on session load
         self._persisted_workers: Dict[str, Dict[str, Any]] = {}
+        # Track session conversation version for efficient history sync
+        self._history_version: int = 0
 
 
     # ── Security event subscription ───────────────────────────────────────────
@@ -280,7 +257,7 @@ class WebAgentBridge:
 
         def _security_prompt_handler(event: SecurityPromptEvent) -> None:
             """Forward a SecurityPromptEvent to the frontend."""
-            if not self._event_callbacks:
+            if not self._forwarder._callbacks:
                 log('DEBUG', 'server.bridge', 'No event callbacks — dropping security prompt')
                 return
             data = event.data or {}
@@ -304,7 +281,7 @@ class WebAgentBridge:
                     f"{', '.join(data.get('capabilities', []))}"
                 ),
             }
-            for cb in list(self._event_callbacks.values()):
+            for cb in list(self._forwarder._callbacks.values()):
                 try:
                     cb(event_dict)
                 except Exception as exc:
@@ -331,7 +308,7 @@ class WebAgentBridge:
 
         def _make_handler(event_cls):
             def _handler(event: event_cls) -> None:
-                if not self._event_callbacks:
+                if not self._forwarder._callbacks:
                     return
                 data = event.data or {}
                 log('DEBUG', 'pipeline.bridge',
@@ -352,7 +329,7 @@ class WebAgentBridge:
                     'data': data,
                 }
 
-                for cb in list(self._event_callbacks.values()):
+                for cb in list(self._forwarder._callbacks.values()):
                     try:
                         cb(event_dict)
                     except Exception as exc:
@@ -424,7 +401,7 @@ class WebAgentBridge:
         so they render as 'worker:system_notification'.  Skipping worker-sourced
         events eliminates the duplicate bubble problem.
         """
-        if not self._event_callbacks:
+        if not self._forwarder._callbacks:
             return
         source = event.metadata.source if event.metadata else ""
         if source == "worker":
@@ -446,7 +423,7 @@ class WebAgentBridge:
             },
         }
 
-        for cb in list(self._event_callbacks.values()):
+        for cb in list(self._forwarder._callbacks.values()):
             try:
                 cb(event_dict)
             except Exception as exc:
@@ -512,7 +489,7 @@ class WebAgentBridge:
             f"event_session_id={data.get('session_id', 'N/A')!r}, "
             f"bridge_session_id={self._session_id!r}, "
             f"resolved_session_id={session_id!r}, "
-            f"n_callbacks={len(self._event_callbacks)}, "
+            f"n_callbacks={len(self._forwarder._callbacks)}, "
             f"WORKER_BUS_AVAILABLE={WORKER_BUS_AVAILABLE}, "
             f"get_worker_event_bus={'SET' if get_worker_event_bus is not None else 'NONE'}")
         if data.get('session_id') and data['session_id'] != self._session_id:
@@ -550,7 +527,7 @@ class WebAgentBridge:
                         f"was called BEFORE the WORKER_SPAWNED event was published.")
 
         # Forward the event to frontend callbacks (if any)
-        if not self._event_callbacks:
+        if not self._forwarder._callbacks:
             log('DEBUG', 'pipeline.bridge',
                 f"_on_worker_spawned: no event_callbacks, skipping frontend forward "
                 f"(worker_bus subscription still happened if bus was found)")
@@ -561,7 +538,7 @@ class WebAgentBridge:
             'timestamp': event.metadata.timestamp.isoformat(),
             'data': data,
         }
-        for cb in list(self._event_callbacks.values()):
+        for cb in list(self._forwarder._callbacks.values()):
             try:
                 cb(event_dict)
             except Exception as exc:
@@ -594,7 +571,7 @@ class WebAgentBridge:
 
         def _make_bus_handler(original_type: str):
             def _handler(event: Any) -> None:
-                if not self._event_callbacks:
+                if not self._forwarder._callbacks:
                     # DIAG: Change from WARNING to DEBUG - transient condition during startup
                     log('DEBUG', 'pipeline.bridge',
                         f"Per-worker bus handler for {worker_name}/{original_type}: "
@@ -606,7 +583,7 @@ class WebAgentBridge:
                     f"[PIPELINE:HOPS] bridge._make_bus_handler entry [worker={worker_name}]: "
                     f"original_type={original_type!r}, "
                     f"data_keys={list(data.keys())}, "
-                    f"n_callbacks={len(self._event_callbacks)}")
+                    f"n_callbacks={len(self._forwarder._callbacks)}")
                 # Special handling for tokens_updated - flatten to top-level
                 # so the frontend's existing 'tokens_updated' handler picks it up.
                 if original_type == 'tokens_updated':
@@ -676,13 +653,13 @@ class WebAgentBridge:
                     f"forwarding type={event_dict.get('type')}, "
                     f"worker={event_dict.get('worker_name', 'N/A')}, "
                     f"data_keys={list(data.keys())}, "
-                    f"n_callbacks={len(self._event_callbacks)}, "
+                    f"n_callbacks={len(self._forwarder._callbacks)}, "
                     f"bridge_session_id={self._session_id}")
                 # [PIPELINE:HOPS] Dispatching event to WebSocket callbacks
                 log('DEBUG', 'pipeline.hops',
-                    f"[PIPELINE:HOPS] bridge dispatching to {len(self._event_callbacks)} callbacks: "
+                    f"[PIPELINE:HOPS] bridge dispatching to {len(self._forwarder._callbacks)} callbacks: "
                     f"type={event_dict.get('type')} worker={event_dict.get('worker_name', 'N/A')}")
-                for cb in list(self._event_callbacks.values()):
+                for cb in list(self._forwarder._callbacks.values()):
                     try:
                         cb(event_dict)
                     except Exception as exc:
@@ -767,7 +744,7 @@ class WebAgentBridge:
 
     def _forward_worker_event(self, event: Any) -> None:
         """Forward a worker lifecycle event to frontend (shared handler logic)."""
-        if not self._event_callbacks:
+        if not self._forwarder._callbacks:
             log('DEBUG', 'pipeline.bridge',
                 f"_forward_worker_event: no callbacks, dropping "
                 f"type={event.type.value if hasattr(event, 'type') else '?'}")
@@ -778,7 +755,7 @@ class WebAgentBridge:
             f"worker_name={data.get('worker_name', '?')}, "
             f"event_session_id={data.get('session_id', '?')}, "
             f"bridge_session_id={self._session_id}, "
-            f"n_callbacks={len(self._event_callbacks)}")
+            f"n_callbacks={len(self._forwarder._callbacks)}")
         # Only forward events for this bridge's session
         if data.get('session_id') and data['session_id'] != self._session_id:
             log('DEBUG', 'pipeline.bridge',
@@ -791,7 +768,7 @@ class WebAgentBridge:
             'timestamp': event.metadata.timestamp.isoformat(),
             'data': data,
         }
-        for cb in list(self._event_callbacks.values()):
+        for cb in list(self._forwarder._callbacks.values()):
             try:
                 cb(event_dict)
             except Exception as exc:
@@ -811,12 +788,12 @@ class WebAgentBridge:
     @staticmethod
     def broadcast_rename(session_id: str, new_name: str) -> None:
         """Update in-memory state on all bridges holding this session."""
-        _broadcast_rename(session_id, new_name)
+        EventForwarder.broadcast_rename(session_id, new_name)
 
     @staticmethod
     def broadcast_logging_config(config: Dict[str, Any]) -> None:
         """Broadcast a logging config change to all active tab bridges."""
-        _broadcast_logging_config(config)
+        EventForwarder.broadcast_logging_config(config)
 
 
     # ── Public API ──────────────────────────────────────────────────────────
@@ -860,26 +837,12 @@ class WebAgentBridge:
 
     def set_event_callback(self, callback: Callable[[Dict[str, Any]], None],
                           key: Optional[int] = None) -> None:
-        """
-        Register an event callback.
-
-        If *key* is provided, the callback is added (or updated) under that key,
-        allowing multiple callbacks to coexist.  If *key* is None (the legacy
-        behaviour), all existing callbacks are replaced with this single one.
-
-        The callback will be called from the agent thread for every event
-        generated by process_query().
-        """
-        if key is None:
-            # Legacy behaviour: replace all callbacks
-            self._event_callbacks.clear()
-            self._event_callbacks[id(callback)] = callback
-        else:
-            self._event_callbacks[key] = callback
+        """Register a WebSocket callback. Delegates to EventForwarder.register_websocket."""
+        self._forwarder.register_websocket(key, callback)
 
     def remove_event_callback(self, key: int) -> None:
-        """Remove a previously registered callback by its key."""
-        self._event_callbacks.pop(key, None)
+        """Remove a WebSocket callback. Delegates to EventForwarder.unregister_websocket."""
+        self._forwarder.unregister_websocket(key)
 
     def set_controller(self, controller: AgentController) -> None:
         """
@@ -1639,15 +1602,13 @@ class WebAgentBridge:
             else:
                 page = self._normalize_for_frontend(all_messages)
                 has_more = False
-            self._emit({
-                "type": "conversation_changed",
+            self._forwarder.broadcast(self._session_id, "conversation_changed", {
                 "messages": page,
                 "total_count": total_count,
                 "has_more": has_more,
             })
             # Emit session_loaded for metadata
-            self._emit({
-                "type": "session_loaded",
+            self._forwarder.broadcast(self._session_id, "session_loaded", {
                 "session_id": session_id,
                 "session_name": session.metadata.get('name', 'Untitled Session'),
                 "message_count": len(session.user_history),
@@ -1656,14 +1617,12 @@ class WebAgentBridge:
             })
             # Emit initial context_length so the frontend status bar shows
             # the correct value immediately (no need to wait for a live token_update).
-            self._emit({
-                "type": "context_updated",
+            self._forwarder.broadcast(self._session_id, "context_updated", {
                 "context_length": self._session.context_length,
             })
             # Also emit initial token counts so the frontend status bar shows
             # the correct values immediately (not stuck at 0/0).
-            self._emit({
-                "type": "tokens_updated",
+            self._forwarder.broadcast(self._session_id, "tokens_updated", {
                 "input": getattr(self._session, 'total_input_tokens', 0),
                 "output": getattr(self._session, 'total_output_tokens', 0),
             })
@@ -1862,11 +1821,8 @@ class WebAgentBridge:
         self._session = None
         self._loaded_session = None
         self._session_id = None
-        self._emit({
-            "type": "session_cleared",
-        })
-        self._emit({
-            "type": "state_changed",
+        self._forwarder.broadcast(None, "session_cleared", {})
+        self._forwarder.broadcast(None, "state_changed", {
             "state": "IDLE",
             "is_running": False,
         })
@@ -1940,24 +1896,10 @@ class WebAgentBridge:
         """Clear the loaded session reference for a fresh start."""
         self._session = None
         self._loaded_session = None
-        self._emit({
-            "type": "conversation_changed",
+        self._forwarder.broadcast(self._session_id, "conversation_changed", {
             "messages": []
         })
         log('INFO', 'server.bridge', "Session cleared for fresh start")
-
-    # ── Internal: event emission ────────────────────────────────────────────
-
-    def _emit(self, event: Dict[str, Any]) -> None:
-        """Thread‑safe event emission — broadcasts to all registered callbacks."""
-        log('DEBUG', 'server.bridge', f"Sending to frontend: {event}")
-
-        for cb in list(self._event_callbacks.values()):
-            if cb is not None:
-                try:
-                    cb(event)
-                except Exception:
-                    traceback.print_exc()
 
     def _on_controller_event(self, event: Dict[str, Any]) -> None:
         """
@@ -2028,8 +1970,7 @@ class WebAgentBridge:
             current_version = self._session.conversation_version
             if current_version != self._history_version:
                 self._history_version = current_version
-                self._emit({
-                    "type": "conversation_changed",
+                self._forwarder.broadcast(self._session_id, "conversation_changed", {
                     "messages": self._normalize_for_frontend(self._session.user_history),
                 })
 
@@ -2049,8 +1990,7 @@ class WebAgentBridge:
                 "ready": "IDLE",
                 "waiting": "WAITING_FOR_USER",
             }.get(new_state.lower(), new_state.upper())
-            self._emit({
-                "type": "state_changed",
+            self._forwarder.broadcast(self._session_id, "state_changed", {
                 "state": frontend_state,
                 "is_running": _is_busy,
             })
@@ -2062,8 +2002,7 @@ class WebAgentBridge:
                 f"[PIPELINE:HOPS] bridge processing token_update from main agent: "
                 f"tokens_in={tokens_in} tokens_out={tokens_out} "
                 f"context_length={raw_event.get('context_length', '?')}")
-            self._emit({
-                "type": "tokens_updated",
+            self._forwarder.broadcast(self._session_id, "tokens_updated", {
                 "input": tokens_in,
                 "output": tokens_out,
                 "agent_type": "main",
@@ -2075,8 +2014,7 @@ class WebAgentBridge:
                 log('DEBUG', 'pipeline.hops',
                     f"[PIPELINE:HOPS] bridge emitting context_updated for main agent: "
                     f"context_length={ctx}")
-                self._emit({
-                    "type": "context_updated",
+                self._forwarder.broadcast(self._session_id, "context_updated", {
                     "context_length": ctx,
                     "agent_type": "main",
                 })
@@ -2086,8 +2024,7 @@ class WebAgentBridge:
             # re-read to ensure frontend gets the full snapshot.
             if self._session is not None:
                 self._history_version = self._session.conversation_version
-                self._emit({
-                    "type": "conversation_changed",
+                self._forwarder.broadcast(self._session_id, "conversation_changed", {
                     "messages": self._normalize_for_frontend(self._session.user_history),
                 })
 
@@ -2095,8 +2032,7 @@ class WebAgentBridge:
             # Session has been updated by the agent; sync to frontend.
             if self._session is not None:
                 self._history_version = self._session.conversation_version
-                self._emit({
-                    "type": "conversation_changed",
+                self._forwarder.broadcast(self._session_id, "conversation_changed", {
                     "messages": self._normalize_for_frontend(self._session.user_history),
                 })
 
@@ -2104,8 +2040,7 @@ class WebAgentBridge:
             # Session has been updated by the agent; sync to frontend.
             if self._session is not None:
                 self._history_version = self._session.conversation_version
-                self._emit({
-                    "type": "conversation_changed",
+                self._forwarder.broadcast(self._session_id, "conversation_changed", {
                     "messages": self._normalize_for_frontend(self._session.user_history),
                 })
 
@@ -2113,20 +2048,17 @@ class WebAgentBridge:
             # Always sync conversation first — ensures frontend sees the agent's last message.
             if self._session is not None:
                 self._history_version = self._session.conversation_version
-                self._emit({
-                    "type": "conversation_changed",
+                self._forwarder.broadcast(self._session_id, "conversation_changed", {
                     "messages": self._normalize_for_frontend(self._session.user_history),
                 })
             # Then decide UI state based on response_type
             if raw_event.get('response_type') == 'question':
-                self._emit({
-                    "type": "state_changed",
+                self._forwarder.broadcast(self._session_id, "state_changed", {
                     "state": "WAITING_FOR_USER",
                     "is_running": _is_busy,
                 })
             else:
-                self._emit({
-                    "type": "state_changed",
+                self._forwarder.broadcast(self._session_id, "state_changed", {
                     "state": "IDLE",
                     "is_running": _is_busy,
                 })
@@ -2134,15 +2066,13 @@ class WebAgentBridge:
         elif event_type == "error":
             msg_text = raw_event.get('message', 'unknown')
             error_type = raw_event.get('error_type', 'PROVIDER_ERROR')
-            self._emit({
-                "type": "status_message",
+            self._forwarder.broadcast(self._session_id, "status_message", {
                 "text": f"⚠ Error: {msg_text}",
             })
             # Error may have added a system notification to session; sync it
             if self._session is not None:
                 self._history_version = self._session.conversation_version
-                self._emit({
-                    "type": "conversation_changed",
+                self._forwarder.broadcast(self._session_id, "conversation_changed", {
                     "messages": self._normalize_for_frontend(self._session.user_history),
                 })
 
@@ -2155,16 +2085,14 @@ class WebAgentBridge:
                 f'_is_busy={_is_busy} | '
                 f'controller_running={self._controller.is_running if self._controller else False}')
             if stop_reason:
-                self._emit({
-                    "type": "state_changed",
+                self._forwarder.broadcast(self._session_id, "state_changed", {
                     "state": "IDLE",
                     "is_running": _is_busy,
                 })
             return
 
         if raw_event.get("stop_reason"):
-            self._emit({
-                "type": "state_changed",
+            self._forwarder.broadcast(self._session_id, "state_changed", {
                 "state": "IDLE",
                 "is_running": _is_busy,
             })
@@ -2221,8 +2149,7 @@ class WebAgentBridge:
                             break
                 except Exception as exc:
                     traceback.print_exc()
-                    self._emit({
-                        "type": "error",
+                    self._forwarder.broadcast(self._session_id, "error", {
                         "error_type": "PROCESS_QUERY_ERROR",
                         "message": str(exc),
                         "traceback": traceback.format_exc(),
@@ -2235,20 +2162,18 @@ class WebAgentBridge:
                     })
         except Exception as exc:
             traceback.print_exc()
-            self._emit({
-                "type": "error",
+            self._forwarder.broadcast(self._session_id, "error", {
                 "error_type": "BRIDGE_LOOP_ERROR",
                 "message": str(exc),
                 "traceback": traceback.format_exc(),
             })
         finally:
             self._running = False
-            self._emit({
-                "type": "state_changed",
+            self._forwarder.broadcast(self._session_id, "state_changed", {
                 "state": "IDLE",
                 "is_running": False,
             })
-            self._emit({"type": "thread_finished"})
+            self._forwarder.broadcast(self._session_id, "thread_finished", {})
 
 
 # ══════════════════════════════════════════════════════════════════════════════

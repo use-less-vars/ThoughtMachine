@@ -21,7 +21,8 @@ import pytest
 # Add project root for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from web_ui.backend.bridge import WebAgentBridge, _active_tab_bridges
+from web_ui.backend.bridge import WebAgentBridge
+from web_ui.backend.event_forwarder import _active_tab_bridges
 from agent.events import (
     global_event_bus, EventType, BaseEvent,
     WorkerSpawnedEvent, WorkerStatusEvent, WorkerCompletedEvent, WorkerErrorEvent,
@@ -146,7 +147,7 @@ class TestMakeBusHandler:
 
         def _make_test_handler(original_type):
             def _handler(event):
-                if not bridge._event_callbacks:
+                if not bridge._forwarder._callbacks:
                     return
                 data = event.data or {}
                 if original_type == 'context_updated':
@@ -156,7 +157,7 @@ class TestMakeBusHandler:
                         'source': 'worker',
                         'worker_name': data.get('worker_name', worker_name),
                     }
-                    for cb in list(bridge._event_callbacks.values()):
+                    for cb in list(bridge._forwarder._callbacks.values()):
                         cb(event_dict)
             return _handler
 
@@ -190,7 +191,7 @@ class TestMakeBusHandler:
 
         def _make_test_handler(original_type):
             def _handler(event):
-                if not bridge._event_callbacks:
+                if not bridge._forwarder._callbacks:
                     return
                 data = event.data or {}
                 if original_type == 'context_updated':
@@ -200,7 +201,7 @@ class TestMakeBusHandler:
                         'source': 'worker',
                         'worker_name': data.get('worker_name', worker_name),
                     }
-                    for cb in list(bridge._event_callbacks.values()):
+                    for cb in list(bridge._forwarder._callbacks.values()):
                         cb(event_dict)
             return _handler
 
@@ -231,7 +232,7 @@ class TestMakeBusHandler:
 
         def _make_test_handler(original_type):
             def _handler(event):
-                if not bridge._event_callbacks:
+                if not bridge._forwarder._callbacks:
                     return
                 data = event.data or {}
                 if original_type == 'tokens_updated':
@@ -241,7 +242,7 @@ class TestMakeBusHandler:
                         'output': data.get('total_output', 0),
                         'source': 'worker',
                     }
-                    for cb in list(bridge._event_callbacks.values()):
+                    for cb in list(bridge._forwarder._callbacks.values()):
                         cb(event_dict)
             return _handler
 
@@ -274,7 +275,7 @@ class TestMakeBusHandler:
 
         def _make_test_handler(original_type):
             def _handler(event):
-                if not bridge._event_callbacks:
+                if not bridge._forwarder._callbacks:
                     return
                 data = event.data or {}
                 event_dict = {
@@ -283,7 +284,7 @@ class TestMakeBusHandler:
                     'timestamp': "2026-01-01T00:00:00",
                     'data': data,
                 }
-                for cb in list(bridge._event_callbacks.values()):
+                for cb in list(bridge._forwarder._callbacks.values()):
                     cb(event_dict)
             return _handler
 
@@ -377,7 +378,7 @@ class TestEventFlowIntegration:
 
         def _make_handler(original_type):
             def _handler(event):
-                if not bridge._event_callbacks:
+                if not bridge._forwarder._callbacks:
                     return
                 data = event.data or {}
                 event_dict = {
@@ -386,7 +387,7 @@ class TestEventFlowIntegration:
                     'source': 'worker',
                     'worker_name': data.get('worker_name', worker_name),
                 }
-                for cb in list(bridge._event_callbacks.values()):
+                for cb in list(bridge._forwarder._callbacks.values()):
                     cb(event_dict)
             return _handler
 
@@ -434,7 +435,7 @@ class TestEventFlowIntegration:
         worker_name = "worker-bee"
         def _make_handler(original_type):
             def _handler(event):
-                if not bridge._event_callbacks:
+                if not bridge._forwarder._callbacks:
                     return
                 data = event.data or {}
                 event_dict = {
@@ -443,7 +444,7 @@ class TestEventFlowIntegration:
                     'source': 'worker',
                     'worker_name': data.get('worker_name', worker_name),
                 }
-                for cb in list(bridge._event_callbacks.values()):
+                for cb in list(bridge._forwarder._callbacks.values()):
                     cb(event_dict)
             return _handler
 
