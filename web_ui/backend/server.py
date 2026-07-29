@@ -736,7 +736,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         # Initialize _session_config so get_config() returns valid data before start
                         if bridge._session_config is None:
                             from agent.config.presets import get_tools_for_mode
-                            _mode = config_dict.get("mode", "agent") if isinstance(config_dict, dict) else "agent"
+                            _mode = config.get("mode", "agent") if isinstance(config, dict) else "agent"
                             bridge._session_config = SessionConfig(
                                 mode=_mode,
                                 max_turns=100,
@@ -1224,6 +1224,9 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             log('WARNING', 'server.ws', f'Cached bridge state sending failed: {exc} — creating fresh bridge')
                             existing = None
 
+                    # Track whether bridge.load_session() was called (it emits session_loaded internally)
+                    _bridge_loaded_session = False
+
                     if existing is None or existing._controller is None:
                         # Create fresh controller and bridge
                         from agent.controller import AgentController
@@ -1237,6 +1240,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         page_limit = msg.get("limit", 50)
                         page_offset = msg.get("offset", 0)
                         bridge.load_session(session_id, limit=page_limit, offset=page_offset)
+                        _bridge_loaded_session = True  # bridge already emitted session_loaded
 
                     # ── Fallback: resolve workspace_id from project path ──
                     # Old sessions may have been saved without a workspace_id.
@@ -1300,12 +1304,13 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             log('WARNING', 'server',
                                 f"load_session: could not resolve workspace root from registry: {exc}")
 
-                    await ws.send_json({
-                        "type": "session_loaded",
-                        "session_id": session_id,
-                        "workspace_id": bridge.workspace_id,
-                        "workspace_path": bridge._workspace_path or '',
-                    })
+                    if not _bridge_loaded_session:
+                        await ws.send_json({
+                            "type": "session_loaded",
+                            "session_id": session_id,
+                            "workspace_id": bridge.workspace_id,
+                            "workspace_path": bridge._workspace_path or '',
+                        })
                     await ws.send_json({
                         "type": "state_changed",
                         "state": "IDLE",
@@ -1621,6 +1626,20 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     log('INFO', 'server.ws',
                         f'new_session: bridge created, session_id={new_session.session_id}, '
                         f'bridge._loaded_session set')
+
+                    # Initialize _session_config so _frontend_config_from_bridge returns
+                    # meaningful bridge state (not hardcoded defaults). Use custom mode to
+                    # avoid accidental tool preset locking.
+                    if bridge._session_config is None:
+                        bridge._session_config = SessionConfig(
+                            mode='custom',
+                            max_turns=100,
+                            session_permissions={},
+                            enabled_tools=[],
+                            provider_id='',
+                            model='',
+                            base_url='',
+                        )
 
                     # Cache bridge by the new session ID so reconnects reuse it
                     _session_bridges[new_session.session_id] = bridge
@@ -2182,12 +2201,21 @@ def _frontend_config_from_bridge(bridge) -> Dict[str, Any]:
     from web_ui.backend.bridge import WebAgentBridge
     cfg = bridge.get_config()
     if cfg is None:
-        result = _default_frontend_config()
-        # Override workspace_path if bridge has one — prevents showing
-        # the installation directory (_project_root) for fresh bridges
-        # that haven't had _session_config set yet.
+        # Bridge exists but has no _session_config yet (before-first-query state).
+        # Return a minimal config reflecting bridge state rather than hardcoded
+        # defaults, so the frontend doesn't silently switch to agent mode.
+        result = _backend_to_frontend_config({
+            "mode": "custom",
+            "temperature": 1.0,
+            "max_turns": 100,
+            "enabled_tools": [],
+            "provider_type": "openai_compatible",
+        })
         if bridge._workspace_path:
             result['workspace_path'] = bridge._workspace_path
+        result['api_key_configured'] = bool(
+            os.getenv('OPENAI_API_KEY') or os.getenv('DEEPSEEK_API_KEY') or os.getenv('OPENAI_COMPATIBLE_API_KEY') or ''
+        )
         return result
     # Check if API key is configured before stripping it
     api_key = cfg.get('api_key', '') or ''
