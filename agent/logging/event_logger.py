@@ -50,14 +50,10 @@ class EventLogger:
         # Track all (bus, event_type) subscriptions so we can unsubscribe later
         self._subscriptions: list[tuple[EventBus, Optional[EventType]]] = []
 
-        # Determine log directory and file path
-        if workspace_path:
-            self.log_dir = workspace_path
-            self._file_path = os.path.join(workspace_path, "event_log.jsonl")
-        else:
-            # XDG-ish default: ~/.thoughtmachine/event_log.jsonl
-            self.log_dir = os.path.expanduser("~/.thoughtmachine")
-            self._file_path = os.path.join(self.log_dir, "event_log.jsonl")
+        # Determine log directory and file path — always use vault path
+        vault_log_dir = os.path.join(os.path.expanduser("~"), ".thoughtmachine", "logs")
+        self.log_dir = vault_log_dir
+        self._file_path = os.path.join(vault_log_dir, "event_log.jsonl")
 
         os.makedirs(self.log_dir, exist_ok=True)
         self._file = None

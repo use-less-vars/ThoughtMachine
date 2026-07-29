@@ -5818,3 +5818,37 @@ Refactoring `web_ui/backend/bridge.py` to use `SessionConfig` instead of `AgentC
 ## 2026-07-27 — 2025-07-22: Docker pipeline trace completed. Key finding: `d...
 
 2025-07-22: Docker pipeline trace completed. Key finding: `docker/requirements-docker.txt` contains ML bloat (sentence-transformers, chromadb, langchain, langchain-community) pulling ~3GB of unnecessary GPU packages (torch, nvidia-cudnn, nvidia-cublas, etc.) into the executor container. The earlier Dockerfile fix (COPY + pip install requirements-docker.txt) fixed the missing fast-json-repair bug but introduced massive bloat because requirements-docker.txt was never cleaned up. Full audit at `docs/infrastructure/docker-pipeline-trace.md`.
+
+## 2026-07-29 — ## WebAgentBridge Decomposition Research
+
+### Source Files S...
+
+## WebAgentBridge Decomposition Research
+
+### Source Files Status
+- **bridge.py**: 2,260 lines, ~55+ methods — full `__init__` (L199-263), all method signatures, `start()` (L916-980), event callback system (L861-892), worker lifecycle (L688-800), registry/broadcast (L801-820), public properties (L824-858), all read
+- **server.py**: 2,545 lines, 29 functions — 26 WebSocket command handlers, all read: `start_session`, `continue_session`, `apply_config` (L687-910), `new_session` (L1530-1678), `delete_session` (L1369-1454), `translate_frontend_config` (L2144-2185), `_frontend_config_from_bridge` (L2197-2234), `_backend_to_frontend_config` (L2312-2349), `_default_frontend_config` (L2352-2357), `_load_global_defaults` (L2288-2309), `_FALLBACK_FRONTEND_CONFIG` (L2238-2285)
+- **session_config.py**: 200 lines — `SessionConfig` class (pydantic BaseModel), `to_agent_config()` method, `from_mode()` factory method, workspace_path stored on bridge not session
+
+### Key Observations
+1. bridge.py is the largest/most complex file (2260 lines) — handles: lifecycle (start/stop/pause/resume), event forwarding, worker subscriptions, session management, config merging
+2. server.py is the WebSocket dispatcher (2545 lines) — command routing + config translation functions
+3. Config translation has two formats: frontend format (provider/tools as list of dicts) ↔ backend AgentConfig format (provider_type/enabled_tools)
+4. Worker handling is split: subscriptions/lifecycle in bridge.py, event forwarding in bridge.py, no worker-specific server.py handlers
+5. session_config.py is small (200 lines) — clean pydantic model
+
+## 2026-07-29 — Phase 1 — Vault Restructuring (COMPLETE):
+  - Created resour...
+
+Phase 1 — Vault Restructuring (COMPLETE):
+  - Created resources/factory_defaults.json — immutable base config
+  - Created thoughtmachine/vault.py — vault module with ensure_vault_structure(), ensure_vault_defaults(), load_factory_defaults(), vault_root()
+  - Updated resources/MANIFEST.json — added factory_defaults.json entry (source → system/factory_defaults.json)
+  - Modified thoughtmachine/security.py — added credentials path blocking in validate_path()
+  - Modified thoughtmachine/bootstrap.py — ensure_user_defaults() now imports from thoughtmachine.vault
+
+All 5 tasks completed. Next: Phase 2 (KB integration) or Phase 3 (migration).
+
+## 2026-07-29 — **Phase 4 Facts (2025-02-20):** Vault has 6 subdirs: credent...
+
+**Phase 4 Facts (2025-02-20):** Vault has 6 subdirs: credentials, knowledge, sessions, state, system, worker_templates. `factory_defaults.json` (vault) has 5 fields under `config` key: max_turns=50, temperature=0.7, provider_id="", model="", system_prompt="". `default_config.json` (AgentConfig) has 40+ flat fields. `loader.load_factory_config()` uses default_config.json, NOT factory_defaults.json. Working doc at `.thoughtmachine/working_docs/phase4_facts.json`.

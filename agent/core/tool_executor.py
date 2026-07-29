@@ -130,10 +130,9 @@ class ToolExecutor:
                 executed_tools.append({'name': tool_name, 'arguments': {}, 'result': tool_result})
                 continue
             arguments_str = tool_call['function']['arguments']
-            # ── RAW TOOL CALL DIAGNOSTIC ──
+            # ── RAW TOOL CALL DIAGNOSTIC (vault path) ──
             import os as _os, time as _time
-            _raw_log_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..", "logs")
-            _raw_log_dir = _os.path.normpath(_raw_log_dir)
+            _raw_log_dir = _os.path.join(_os.path.expanduser("~"), ".thoughtmachine", "logs")
             _os.makedirs(_raw_log_dir, exist_ok=True)
             _raw_log_path = _os.path.join(_raw_log_dir, "tool_calls_raw_debug.log")
             # Size-limited: max 2MB, single file, no debris

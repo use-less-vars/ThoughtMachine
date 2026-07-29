@@ -195,8 +195,8 @@ def _check_api_key(report: HealthReport) -> None:
 def _check_directories(report: HealthReport) -> None:
     """Verify required directories exist or can be created."""
     dirs_to_check = {
-        'Log directory': './logs',
-        'Config backups': '.config_backups',
+        'Log directory': '~/.thoughtmachine/logs',
+        'Config backups': '~/.thoughtmachine/config_backups',
         'Knowledge base': '.thoughtmachine/knowledge',
     }
 
@@ -210,7 +210,8 @@ def _check_directories(report: HealthReport) -> None:
 
     for label, path in dirs_to_check.items():
         try:
-            os.makedirs(path, exist_ok=True)
+            expanded_path = os.path.expanduser(path)
+            os.makedirs(expanded_path, exist_ok=True)
             report.add(
                 f'Directory accessible: {label}',
                 True, path,

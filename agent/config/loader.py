@@ -197,15 +197,13 @@ def _migrate_legacy_system_prompt() -> None:
             f"Failed to migrate legacy system prompt {LEGACY_SYSTEM_PROMPT_PATH}: {exc}")
 
 # ── Backup safety ───────────────────────────────────────────────────────────
-BACKUP_DIR_NAME = '.config_backups'
+VAULT_BACKUP_DIR = os.path.join(os.path.expanduser("~"), ".thoughtmachine", "config_backups")
 
 
 def _ensure_backup_dir() -> str:
-    """Return path to config backup directory, creating it if needed."""
-    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    backup_dir = os.path.join(project_root, BACKUP_DIR_NAME)
-    os.makedirs(backup_dir, exist_ok=True)
-    return backup_dir
+    """Return path to config backup directory (vault), creating it if needed."""
+    os.makedirs(VAULT_BACKUP_DIR, exist_ok=True)
+    return VAULT_BACKUP_DIR
 
 
 def _backup_config(config_path: str) -> Optional[str]:

@@ -86,7 +86,7 @@ class _AgentLogger:
     Thread-safe for use in the agent's background thread.
     """
 
-    def __init__(self, config: 'AgentConfig', log_dir: str='./logs', log_level: Union[str, LogLevel]=LogLevel.INFO, file_log_level: Union[str, LogLevel]=LogLevel.DEBUG, enable_file_logging: bool=True, jsonl_format: bool=True, max_file_size_mb: int=10, session_id: Optional[str]=None):
+    def __init__(self, config: 'AgentConfig', log_dir: str=None, log_level: Union[str, LogLevel]=LogLevel.INFO, file_log_level: Union[str, LogLevel]=LogLevel.DEBUG, enable_file_logging: bool=True, jsonl_format: bool=True, max_file_size_mb: int=10, session_id: Optional[str]=None):
         """
         Initialize the logger.
 
@@ -107,6 +107,8 @@ class _AgentLogger:
             env_list = [cat.strip().upper() for cat in env_categories.split(',') if cat.strip()]
             if env_list:
                 self.enabled_categories = [LogCategory(cat) for cat in env_list]
+        if log_dir is None:
+            log_dir = os.path.join(os.path.expanduser("~"), ".thoughtmachine", "logs")
         self.log_dir = os.path.abspath(log_dir)
         if log_level == LogLevel.INFO and hasattr(config, 'log_level'):
             log_level = config.log_level
