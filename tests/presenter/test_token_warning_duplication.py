@@ -1,21 +1,23 @@
 """
-Test: token_warning duplication suppression in AgentState.
+Test: token_warning event emission in AgentState.
 
-Verifies that update_token_state() emits exactly ONE token_warning event
-across a realistic sequence of token counts that cross thresholds multiple
-times, ensuring the _token_warning_has_fired flag works correctly.
+Verifies that update_token_state() emits events correctly:
+- token_warning on LOW→WARNING (unless already fired)
+- token_warning on WARNING→CRITICAL (independent of WARNING flag)
+- token_recovery on CRITICAL/WARNING→LOW (resets warning flag)
+- After recovery, a fresh LOW→WARNING can fire again
 
 Sequence: 50k → 68k → 72k → 85k → 64k → 68k
 Thresholds: warning=65k, critical=80k
 
 Expected:
   50k → LOW              (no event, below warning)
-  68k → WARNING          (1st event: LOW→WARNING fires)
+  68k → WARNING          (event 1: LOW→WARNING fires)
   72k → WARNING          (no event: no state change)
-  85k → CRITICAL         (no event: _token_warning_has_fired is True)
-  64k → LOW              (no event: state_order decreases)
-  68k → WARNING          (no event: _token_warning_has_fired is True)
-Total: exactly 1 warning event.
+  85k → CRITICAL         (event 2: WARNING→CRITICAL fires independently)
+  64k → LOW              (event 3: CRITICAL→LOW fires token_recovery)
+  68k → WARNING          (event 4: LOW→WARNING fires again after recovery reset)
+Total: exactly 4 events.
 """
 
 import pytest
@@ -64,16 +66,23 @@ def agent_state(agent_config):
 
 
 class TestTokenWarningDuplication:
-    """AgentState must emit exactly one token_warning across multiple threshold crossings."""
+    """AgentState must emit token_warning and token_recovery events correctly."""
 
     def test_single_warning_across_oscillating_sequence(self, agent_state):
         """
         Given a sequence of token counts that oscillate above and below thresholds,
-        exactly one token_warning event is emitted — the first time the state
-        transitions upward into warning or critical territory.
+        the state machine emits events correctly: one warning when entering warning
+        territory, one critical when entering critical territory, one recovery when
+        dropping back to LOW, and another warning when re-entering after recovery.
 
         Sequence: 50k (LOW) → 68k (WARNING) → 72k (WARNING) → 85k (CRITICAL)
                   → 64k (LOW) → 68k (WARNING)
+
+        Expected events:
+          1. token_warning   at 68k (LOW→WARNING)
+          2. token_warning   at 85k (WARNING→CRITICAL)
+          3. token_recovery  at 64k (CRITICAL→LOW)
+          4. token_warning   at 68k (LOW→WARNING, after recovery)
         """
         sequence = [50_000, 68_000, 72_000, 85_000, 64_000, 68_000]
 
@@ -94,25 +103,46 @@ class TestTokenWarningDuplication:
                     f"at index {idx} (tokens={tokens})"
                 )
 
-        # ── Assert exactly 1 event total ──
-        assert len(all_events) == 1, (
-            f"Expected exactly 1 token_warning event across the entire sequence, "
+        # ── Assert exactly 4 events total ──
+        assert len(all_events) == 4, (
+            f"Expected exactly 4 events across the entire sequence, "
             f"got {len(all_events)}"
         )
 
-        # ── Assert the single event fired at the correct index ──
-        warning_tokens = all_events[0]["token_count"]
-        assert warning_tokens == 68_000, (
-            f"The single warning should fire at 68k (first LOW→WARNING), "
-            f"but token_count is {warning_tokens}"
-        )
+        # ── Event 1: token_warning at 68k (LOW→WARNING) ──
+        evt1 = all_events[0]
+        assert evt1["type"] == "token_warning"
+        assert evt1["old_state"] == "low"
+        assert evt1["new_state"] == "warning"
+        assert evt1["token_count"] == 68_000
+        assert "warning_message" in evt1
+        assert evt1["state"] == "warning"
 
-        # ── Assert specific event fields are present ──
-        evt = all_events[0]
-        assert evt["old_state"] == "low"
-        assert evt["new_state"] == "warning"
-        assert "warning_message" in evt
-        assert evt["state"] == "warning"
+        # ── Event 2: token_warning at 85k (WARNING→CRITICAL) ──
+        evt2 = all_events[1]
+        assert evt2["type"] == "token_warning"
+        assert evt2["old_state"] == "warning"
+        assert evt2["new_state"] == "critical"
+        assert evt2["token_count"] == 85_000
+        assert "warning_message" in evt2
+        assert evt2["state"] == "critical"
+
+        # ── Event 3: token_recovery at 64k (CRITICAL→LOW) ──
+        evt3 = all_events[2]
+        assert evt3["type"] == "token_recovery"
+        assert evt3["old_state"] == "critical"
+        assert evt3["new_state"] == "low"
+        assert evt3["token_count"] == 64_000
+        assert "recovery_message" in evt3
+
+        # ── Event 4: token_warning at 68k (LOW→WARNING, after recovery reset) ──
+        evt4 = all_events[3]
+        assert evt4["type"] == "token_warning"
+        assert evt4["old_state"] == "low"
+        assert evt4["new_state"] == "warning"
+        assert evt4["token_count"] == 68_000
+        assert "warning_message" in evt4
+        assert evt4["state"] == "warning"
 
     def test_no_warning_when_below_threshold(self, agent_state):
         """Token counts entirely below the warning threshold produce no events."""
@@ -124,33 +154,57 @@ class TestTokenWarningDuplication:
             )
 
     def test_warning_fires_at_first_crossing_from_clean_state(self, agent_state):
-        """A clean state fires exactly once when crossing from LOW→WARNING."""
+        """A clean state fires token_warning on both LOW→WARNING and WARNING→CRITICAL."""
         events = agent_state.update_token_state(68_000)
         assert len(events) == 1
         assert events[0]["type"] == "token_warning"
         assert events[0]["new_state"] == "warning"
         assert events[0]["token_count"] == 68_000
 
-        # Second crossing (regardless of direction) should NOT fire
+        # WARNING→CRITICAL fires independently (CRITICAL always fires
+        # regardless of previous WARNING, as long as last_token_warning_state
+        # is not already CRITICAL)
         events2 = agent_state.update_token_state(90_000)  # WARNING→CRITICAL
-        assert len(events2) == 0, "_token_warning_has_fired should suppress this"
+        assert len(events2) == 1, (
+            "CRITICAL fires independently of WARNING when "
+            "last_token_warning_state != CRITICAL"
+        )
+        assert events2[0]["type"] == "token_warning"
+        assert events2[0]["new_state"] == "critical"
+        assert events2[0]["token_count"] == 90_000
 
     def test_rapid_re_entry_after_drop_does_not_fire_again(self, agent_state):
-        """After firing, dropping below warning and re-entering is suppressed."""
+        """
+        After firing, dropping below warning fires a recovery event and resets
+        the flag, so re-entering can fire again.
+        """
         # First crossing
-        agent_state.update_token_state(70_000)  # fires
+        agent_state.update_token_state(70_000)  # fires token_warning
         assert agent_state._token_warning_has_fired is True
 
-        # Drop below warning
-        agent_state.update_token_state(50_000)  # no event
-        assert agent_state.token_state == TokenState.LOW
-
-        # Re-enter warning — should NOT fire again
-        events = agent_state.update_token_state(70_000)
-        assert len(events) == 0, (
-            "Re-entering warning after drop should NOT fire a second warning "
-            "because _token_warning_has_fired is True"
+        # Drop below warning — fires token_recovery and resets the flag
+        events_drop = agent_state.update_token_state(50_000)
+        assert len(events_drop) == 1, (
+            "Dropping from WARNING→LOW with _token_warning_has_fired=True "
+            "should fire a token_recovery event"
         )
+        assert events_drop[0]["type"] == "token_recovery"
+        assert events_drop[0]["old_state"] == "warning"
+        assert events_drop[0]["new_state"] == "low"
+        assert events_drop[0]["token_count"] == 50_000
+        assert agent_state.token_state == TokenState.LOW
+        assert agent_state._token_warning_has_fired is False, (
+            "Recovery should reset _token_warning_has_fired to False"
+        )
+
+        # Re-enter warning — fires again because flag was reset by recovery
+        events = agent_state.update_token_state(70_000)
+        assert len(events) == 1, (
+            "Re-entering warning after recovery should fire again "
+            "because _token_warning_has_fired was reset"
+        )
+        assert events[0]["type"] == "token_warning"
+        assert events[0]["new_state"] == "warning"
 
     def test_internal_warning_flag_not_reset_by_reset_method(self, agent_state):
         """
@@ -171,8 +225,9 @@ class TestTokenWarningDuplication:
 
     def test_warning_survives_critical_to_low_transition(self, agent_state):
         """
-        If the first crossing is directly to CRITICAL (bypassing WARNING),
-        the flag is still set and subsequent crossings are suppressed.
+        Crossing directly to CRITICAL fires a token_warning. Dropping to LOW
+        fires a token_recovery (resetting the flag), so a fresh LOW→WARNING
+        can fire again.
         """
         import warnings as _w
 
@@ -184,14 +239,26 @@ class TestTokenWarningDuplication:
             assert events[0]["new_state"] == "critical"
             assert agent_state._token_warning_has_fired is True
 
-            # Drop to LOW
+            # Drop to LOW — fires token_recovery
             events2 = agent_state.update_token_state(50_000)
-            assert len(events2) == 0
-            assert agent_state.token_state == TokenState.LOW
-
-            # Re-enter WARNING → suppressed
-            events3 = agent_state.update_token_state(70_000)
-            assert len(events3) == 0, (
-                "Even after CRITICAL→LOW→WARNING, "
-                "_token_warning_has_fired prevents a second warning"
+            assert len(events2) == 1, (
+                "Dropping from CRITICAL→LOW with _token_warning_has_fired=True "
+                "should fire a token_recovery event"
             )
+            assert events2[0]["type"] == "token_recovery"
+            assert events2[0]["old_state"] == "critical"
+            assert events2[0]["new_state"] == "low"
+            assert events2[0]["token_count"] == 50_000
+            assert agent_state.token_state == TokenState.LOW
+            assert agent_state._token_warning_has_fired is False, (
+                "Recovery should reset _token_warning_has_fired to False"
+            )
+
+            # Re-enter WARNING → fires again because flag was reset
+            events3 = agent_state.update_token_state(70_000)
+            assert len(events3) == 1, (
+                "After CRITICAL→LOW recovery, re-entering WARNING should fire "
+                "again because _token_warning_has_fired was reset"
+            )
+            assert events3[0]["type"] == "token_warning"
+            assert events3[0]["new_state"] == "warning"
