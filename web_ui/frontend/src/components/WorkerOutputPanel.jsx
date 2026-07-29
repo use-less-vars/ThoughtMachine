@@ -495,6 +495,14 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
       // This scroll event was triggered by programmatic scroll;
       // reset the guard and bail out.
       programmaticScrollRef.current = false;
+      // Update isAtBottomRef so it reflects the user's actual scroll position
+      // even when this scroll event was triggered programmatically.
+      const el = scrollRef.current;
+      if (el) {
+        const threshold = 50;
+        isAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
+        if (isAtBottomRef.current) setHasNewEvents(false);
+      }
       return;
     }
     const el = scrollRef.current;

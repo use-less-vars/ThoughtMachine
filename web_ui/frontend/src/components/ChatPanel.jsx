@@ -36,6 +36,12 @@ function ChatPanel({ messages, loadMore, hasMore, scrollToBottomKey = 0 }) {
       // This scroll event was triggered by our own programmatic scroll;
       // reset the guard for the next user-initiated scroll.
       programmaticScrollRef.current = false
+      // Update isAtBottomRef so it reflects the user's actual scroll position
+      // even when this scroll event was triggered programmatically.
+      const el = chatRef.current
+      if (el) {
+        isAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 20
+      }
       return
     }
     const el = chatRef.current
