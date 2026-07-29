@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "allowlist": [
+    "capabilities",
+    "container_status",
+    "dockerfile",
+    "effective_permissions",
+    "event_bus_status",
+    "event_log",
+    "mcp_servers",
+    "my_config",
+    "network_diagnostics",
+    "running_workers",
+    "workers",
+    "workspace_info"
+  ],
+  "sha256": "697c326308135db2b508b16261e849bb79dd75b1d529748a5f8d88e799afa2d8"
+}

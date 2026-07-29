@@ -78,6 +78,14 @@ except ImportError:
     _registry_lock = None
     WORKER_REGISTRY_AVAILABLE = False
 
+# Vault allowlist support (CheckSystem query allowlist)
+try:
+    from thoughtmachine.vault import get_checksystem_allowlist
+    VAULT_AVAILABLE = True
+except ImportError:
+    get_checksystem_allowlist = None
+    VAULT_AVAILABLE = False
+
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +114,47 @@ class CheckSystem(ToolBase):
 
     skip_output_truncation: ClassVar[bool] = True
 
+    allowlist: Optional[list] = Field(default=None, description="Loaded allowlist from vault (list of allowed query names)")
+
+    workspace_id: Optional[str] = Field(
+        default=None,
+        description="Explicit workspace ID override. If set, used directly instead of resolving from session.",
+    )
+
+    # ------------------------------------------------------------------
+    def _check_path_allowed(self, query_name: str) -> bool:
+        """Check if a CheckSystem query name is allowed by the vault allowlist.
+
+        Returns True if allowed or if vault is unavailable (degraded mode).
+        Logs a warning if the query is denied.
+        """
+        if self.allowlist is None:
+            return True  # degraded mode: vault not available, assume allowed
+        if query_name in self.allowlist:
+            return True
+        logger.warning("CheckSystem: query '%s' not in allowlist", query_name)
+        return False
+
+    # ------------------------------------------------------------------
+    def _load_allowlist_from_vault(self) -> Optional[list]:
+        """Load and verify the allowlist from vault.
+
+        Returns the allowlist list, or None if vault is unavailable.
+        Uses get_checksystem_allowlist() which handles integrity verification internally.
+        """
+        if get_checksystem_allowlist is None:
+            return None
+        try:
+            entries = get_checksystem_allowlist()
+            logger.info(
+                "CheckSystem: loaded allowlist with %d allowed queries",
+                len(entries),
+            )
+            return entries
+        except Exception as exc:
+            logger.exception("CheckSystem: failed to load allowlist: %s", exc)
+            return None
+
     # ------------------------------------------------------------------
     def execute(self) -> str:
         try:
@@ -130,14 +179,32 @@ class CheckSystem(ToolBase):
                     logging.warning(
                         "CheckSystem falling back to deprecated AgentConfig.workspace_path")
 
-            # Resolve workspace ID from the resolved workspace_path
-            ws_id = None
-            if workspace_path and resolve_workspace_id:
+            # Resolve workspace ID — explicit field takes priority
+            ws_id = self.workspace_id
+            if not ws_id and workspace_path and resolve_workspace_id:
                 ws_id = resolve_workspace_id(workspace_path)
 
+            # Load vault allowlist
+            self.allowlist = self._load_allowlist_from_vault()
+
+            # Path allowlist enforcement for file-access queries
+            query = self.query
+            if self.allowlist is not None:
+                file_access_queries = {
+                    'my_config', 'dockerfile', 'network_diagnostics',
+                    'event_log', 'capabilities',
+                }
+                if query in file_access_queries:
+                    allowed = self._check_path_allowed(query)
+                    if not allowed:
+                        return json.dumps({
+                            'error': f'Query "{query}" not allowed by system configuration',
+                            'status': 'denied',
+                        }, indent=2)
+
             # Dynamic handlers: worker/<name> needs special handling
-            if self.query.startswith("worker/"):
-                worker_name = self.query[len("worker/"):]
+            if query.startswith("worker/"):
+                worker_name = query[len("worker/"):]
                 result = self._query_worker_detail(ws_id, worker_name)
                 return json.dumps(result, indent=2, default=str)
 
@@ -156,10 +223,10 @@ class CheckSystem(ToolBase):
                 "event_log": lambda: self._query_event_log(),
             }
 
-            handler = handler_map.get(self.query)
+            handler = handler_map.get(query)
             if handler is None:
                 return json.dumps({
-                    "error": f"Unknown query: {self.query}",
+                    "error": f"Unknown query: {query}",
                     "valid_queries": list(handler_map.keys()),
                 })
 
@@ -170,7 +237,7 @@ class CheckSystem(ToolBase):
         except Exception as exc:
             logger.exception("CheckSystem failed")
             return json.dumps(
-                {"error": str(exc), "query": self.query}, indent=2
+                {"error": str(exc), "query": getattr(self, 'query', 'unknown')}, indent=2
             )
 
     # -- query implementations -------------------------------------------

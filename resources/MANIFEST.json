@@ -13,6 +13,11 @@
       "description": "System factory defaults — immutable base configuration for the vault; deployed to the system/ subdirectory"
     },
     {
+      "source": "checksystem_allowlist.json",
+      "dest": "system/checksystem_allowlist.json",
+      "description": "Factory default CheckSystem allowlist — initial allowlist for the CheckSystem tool"
+    },
+    {
       "source": "default_config.json",
       "dest": "agent_config.json",
       "description": "Agent configuration overlay (diff from factory defaults — merged with resources/default_config.json at load time)"
