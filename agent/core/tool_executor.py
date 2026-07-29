@@ -303,6 +303,23 @@ class ToolExecutor:
             if 'session_id' in valid_field_names:
                 tool_args['session_id'] = session_id
 
+            # Credential injection: resolve {{credential:...}} placeholders in tool args
+            if tool_args:
+                try:
+                    from agent.credentials import CredentialInjector
+                    # Get workspace_id from the session context already available
+                    ws_id = None
+                    if 'session_permissions' in tool_args and isinstance(tool_args['session_permissions'], dict):
+                        ws_id = tool_args['session_permissions'].get('workspace_id')
+                    if not ws_id and 'workspace_id' in tool_args:
+                        ws_id = tool_args['workspace_id']
+                    if ws_id:
+                        injector = CredentialInjector(ws_id)
+                        tool_args = injector.inject(tool_args)
+                except Exception as exc:
+                    log('ERROR', 'core.credentials', "Credential injection failed for tool '%s': %s", tool_name, exc)
+                    return {'result': f"Credential injection failed: {exc}", 'tool_type': 'normal'}
+
             try:
                 tool_instance = tool_class(**tool_args)
             except ValidationError:
