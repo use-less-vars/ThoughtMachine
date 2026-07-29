@@ -1190,8 +1190,10 @@ class WebAgentBridge:
         - Other fields (provider_id, model, temperature, etc.) are always mutable.
         """
         if self._session_config is None:
-            log("WARNING", "server.bridge", "apply_config called but no session config exists")
-            return {"success": False, "error": "No active session config"}
+            log("INFO", "server.bridge",
+                "apply_config: initializing default session config")
+            from agent.config.session_config import SessionConfig
+            self._session_config = SessionConfig()
 
         # Step 1: Delegate validation and update to ConfigManager
         frontend_result, new_config = self._config_manager.apply_config(
