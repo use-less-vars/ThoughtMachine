@@ -19,7 +19,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
       container: false,
       system: 'read',
       git: 'read',
-      worker: 'banned',
+      execution: 'banned',
       ...(permissions ?? {}),
     };
 
@@ -595,10 +595,10 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>Worker Access</strong></label>
             <select
-              value={draft.session_permissions?.worker ?? 'banned'}
+              value={draft.session_permissions?.execution ?? 'banned'}
               onChange={(e) => setDraft({
                 ...draft,
-                session_permissions: { ...draft.session_permissions, worker: e.target.value }
+                session_permissions: { ...draft.session_permissions, execution: e.target.value }
               })}
               style={inputStyle}
             >
