@@ -19,7 +19,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
       container: false,
       system: 'read',
       git: 'read',
-      execution: 'banned',
+      worker: 'banned',
       ...(permissions ?? {}),
     };
 
@@ -546,7 +546,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               </span>
             </div>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
-              Allow container execution of code.
+              Allow container operations.
             </small>
           </div>
 
@@ -593,12 +593,12 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           </div>
 
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Execution</strong></label>
+            <label style={labelStyle}><strong>Worker Access</strong></label>
             <select
-              value={draft.session_permissions?.execution ?? 'banned'}
+              value={draft.session_permissions?.worker ?? 'banned'}
               onChange={(e) => setDraft({
                 ...draft,
-                session_permissions: { ...draft.session_permissions, execution: e.target.value }
+                session_permissions: { ...draft.session_permissions, worker: e.target.value }
               })}
               style={inputStyle}
             >

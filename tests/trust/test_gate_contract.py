@@ -420,16 +420,16 @@ class TestCheckRequiredCategoriesPermissionFootprint:
 
     def test_worker_missing_key_falls_back(self):
         """
-        Worker only defines ``{"execution": "read"}``.
+        Worker only defines ``{"container": "read"}``.
         Other keys (filesystem, network) fall back to the effective
         session+workspace value unchanged.
         """
         eff = {
             "filesystem": "write",
             "network": True,
-            "execution": "write",
+            "container": "write",
         }
-        wp = {"execution": "read"}
+        wp = {"container": "read"}
 
         # filesystem:write still passes (not in worker)
         ok, _ = check_required_categories(
@@ -443,9 +443,9 @@ class TestCheckRequiredCategoriesPermissionFootprint:
         )
         assert ok2 is True
 
-        # execution:write now denied (worker narrowed to read)
+        # container:write now denied (worker narrowed to read)
         ok3, msg3 = check_required_categories(
-            ["execution:write"], eff, "Tool", {}, "", None, permission_footprint=wp
+            ["container:write"], eff, "Tool", {}, "", None, permission_footprint=wp
         )
         assert ok3 is False, msg3
         assert "denied" in msg3.lower()

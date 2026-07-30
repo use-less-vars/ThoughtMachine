@@ -115,7 +115,7 @@ def get_effective_permissions(
 
     Returns a flat dict with keys matching the six permission categories::
 
-        {"filesystem": ..., "network": ..., "container": ..., "git": ..., "system": ..., "execution": ...}
+        {"filesystem": ..., "network": ..., "container": ..., "git": ..., "system": ..., "execution": ..., "worker": ...}
 
     Each value is either a boolean (``True`` / ``False``) for hard allow/deny,
     a string level (``"write"``, ``"read"``, ``"none"``, ``"banned"``, ``"ask"``),
@@ -147,6 +147,7 @@ def get_effective_permissions(
         "git": git,
         "system": system,
         "execution": session.execution,
+        "worker": session.execution,
     }
 
 

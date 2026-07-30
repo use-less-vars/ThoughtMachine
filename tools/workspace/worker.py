@@ -1636,7 +1636,7 @@ class Worker(ToolBase):
     """
 
     tool: str = "Worker"
-    required_categories: ClassVar[List[str]] = ["execution:read"]
+    required_categories: ClassVar[List[str]] = ["container:read"]
 
     action: str = Field(
         description="Action: list, spawn, check, query, stop. "

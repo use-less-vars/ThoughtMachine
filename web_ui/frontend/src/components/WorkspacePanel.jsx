@@ -160,7 +160,7 @@ function EffectivePermissionsSection({ workspaceId, sessionId }) {
   if (!perms) return <div style={{ color: '#f38ba8', fontSize: '0.85rem' }}>Failed to load effective permissions.</div>;
 
   const ep = perms.effective_permissions || {};
-  const categories = ['filesystem', 'network', 'git', 'system', 'execution', 'container'];
+  const categories = ['filesystem', 'network', 'git', 'system', 'worker', 'container'];
 
   return (
     <div>

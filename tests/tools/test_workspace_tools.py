@@ -566,7 +566,7 @@ class TestWorker:
         mock_file = MagicMock()
         mock_file.exists.return_value = True
         mock_file.read_text.return_value = json.dumps([
-            {"name": "default", "status": "ready", "permission_subset": ["execution:read"], "last_heartbeat": None},
+            {"name": "default", "status": "ready", "permission_subset": ["container:read"], "last_heartbeat": None},
         ])
         mock_dir.__truediv__.return_value = mock_file
         mock_ws_dir.return_value = mock_dir
@@ -785,8 +785,8 @@ class TestWorker:
         assert result["count"] == 0
 
     def test_required_categories(self):
-        """Worker declares execution:read."""
-        assert "execution:read" in Worker.required_categories
+        """Worker declares container:read."""
+        assert "container:read" in Worker.required_categories
 
     # ═══════════════════════════════════════════════════════════════════
     #  Permission gate
@@ -799,8 +799,8 @@ class TestWorker:
         mock_gate.return_value = (True, "")
         tool = Worker(action="list", workspace_path="/tmp/test_ws")
         result = tool._check_worker_permissions(
-            {"required_categories": ["execution:read"], "permission_footprint": {}},
-            {"execution": "read"},
+            {"required_categories": ["container:read"], "permission_footprint": {}},
+            {"container": "read"},
         )
         assert result is None
 
