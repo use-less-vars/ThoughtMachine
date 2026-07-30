@@ -23,6 +23,7 @@ between integrity checks and container creation/recreation.
 
 from agent.logging import log
 import docker
+from docker import types
 import hashlib
 import io
 import os
@@ -340,6 +341,34 @@ class DockerExecutor:
             self.session_permissions,
         )
 
+    def _ensure_volume(self) -> str | None:
+        """Ensure a named Docker volume exists for this workspace.
+
+        Volume name: ``tm-workspace-<workspace_id>``
+
+        If ``workspace_id`` is unavailable (None/empty), returns None
+        to signal that the caller should fall back to a bind mount.
+
+        The volume is created once and persists across container stops,
+        recreations, and image rebuilds. Never delete it here.
+
+        Returns:
+            Volume name string, or None if no workspace_id is set.
+        """
+        if not self.workspace_id:
+            return None
+
+        volume_name = f"tm-workspace-{self.workspace_id}"
+        try:
+            self.client.volumes.get(volume_name)
+            audit_event("VOLUME_ENSURE",
+                       f"volume={volume_name} action=reuse")
+        except docker.errors.NotFound:
+            self.client.volumes.create(volume_name)
+            audit_event("VOLUME_ENSURE",
+                       f"volume={volume_name} action=create")
+        return volume_name
+
     def _ensure_container(self):
         # Ensure the Docker image exists
         self._ensure_image()
@@ -520,10 +549,27 @@ class DockerExecutor:
 
         audit_event("CONTAINER_CREATE",
                    f"image={self.image} network={network_mode} name={container_name}")
+        # Determine mount: named volume (preferred) vs bind mount (fallback)
+        volume_name = self._ensure_volume()
+        if volume_name:
+            mounts = [
+                docker.types.Mount(
+                    target="/workspace",
+                    source=volume_name,
+                    type="volume",
+                    read_only=(workspace_mode == "ro"),
+                ),
+            ]
+            volumes = None
+        else:
+            mounts = None
+            volumes = {self.workspace_path: {"bind": "/workspace", "mode": workspace_mode}}
+
         self.container = self.client.containers.run(
             image=self.image,
             name=container_name,
-            volumes={self.workspace_path: {"bind": "/workspace", "mode": workspace_mode}},
+            volumes=volumes,
+            mounts=mounts,
             tmpfs=tmpfs,
             network=network_mode,
             cap_drop=["ALL"],
