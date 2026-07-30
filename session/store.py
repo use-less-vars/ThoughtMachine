@@ -374,7 +374,18 @@ class FileSystemSessionStore(SessionStore):
             # Remove external_file_path from metadata if present (legacy concept)
             if 'metadata' in data and 'external_file_path' in data['metadata']:
                 del data['metadata']['external_file_path']
-            return Session.from_persistable_dict(data)
+            session = Session.from_persistable_dict(data)
+            # Backward compat: populate workspace_id from metadata.workspace_path for legacy sessions
+            if session.workspace_id is None and session.metadata.get('workspace_path'):
+                from thoughtmachine.workspace_capabilities import resolve_workspace_id
+                try:
+                    resolved_id = resolve_workspace_id(session.metadata['workspace_path'])
+                    if resolved_id:
+                        session.workspace_id = resolved_id
+                        self.save_session(session, workspace_id=resolved_id)
+                except Exception:
+                    pass  # leave as None, handled gracefully later
+            return session
         except Exception as e:
             # Log error? For now return None
             logger.error(f"[SessionStore] Error loading session {session_id}: {e}")

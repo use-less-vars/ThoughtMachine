@@ -168,6 +168,14 @@ class Session:
                 new_list = ObservableList(list(value), callback=self._on_conversation_changed)
                 object.__setattr__(self, name, new_list)
                 return
+        # Guard workspace_id from being changed once set (immutable after initial assignment).
+        if name == 'workspace_id':
+            try:
+                current = object.__getattribute__(self, 'workspace_id')
+            except AttributeError:
+                current = None
+            if current is not None and value != current:
+                raise AttributeError("workspace_id is immutable once set")
         # Default behavior for all other attributes.
         super().__setattr__(name, value)
 

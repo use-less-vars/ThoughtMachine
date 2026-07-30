@@ -108,11 +108,17 @@ class SessionLifecycle:
                 self._cached_preset_name = None
             if self.state_bridge.current_session is None:
                 ws_path = self.state_bridge.current_config.workspace_path
+                workspace_id = None
                 metadata = {}
                 if ws_path:
+                    from thoughtmachine.workspace_capabilities import resolve_workspace_id
+                    try:
+                        workspace_id = resolve_workspace_id(ws_path)
+                    except Exception:
+                        workspace_id = None
                     metadata['workspace_path'] = ws_path
                 metadata['agent_config'] = agent_config.model_dump(exclude={'api_key'}, exclude_none=True)
-                new_session = Session(session_id=str(uuid.uuid4()), user_history=[], metadata=metadata)
+                new_session = Session(session_id=str(uuid.uuid4()), user_history=[], metadata=metadata, workspace_id=workspace_id)
                 new_session.ensure_name()
                 self.state_bridge.bind_session(new_session)
                 self._register_session_callbacks(new_session)
@@ -140,13 +146,19 @@ class SessionLifecycle:
         session_mode = self.state_bridge.current_session.mode if self.state_bridge.current_session else None
         agent_config = self.state_bridge.create_agent_config(mode=session_mode)
         ws_path = self.state_bridge.current_config.workspace_path
+        workspace_id = None
         metadata = {}
         if name:
             metadata['name'] = name
         if ws_path:
+            from thoughtmachine.workspace_capabilities import resolve_workspace_id
+            try:
+                workspace_id = resolve_workspace_id(ws_path)
+            except Exception:
+                workspace_id = None
             metadata['workspace_path'] = ws_path
         metadata['agent_config'] = agent_config.model_dump(exclude={'api_key'}, exclude_none=True)
-        session = Session(session_id=str(uuid.uuid4()), user_history=[], metadata=metadata)
+        session = Session(session_id=str(uuid.uuid4()), user_history=[], metadata=metadata, workspace_id=workspace_id)
         session.ensure_name()
         self.state_bridge.bind_session(session)
         self._register_session_callbacks(session)
