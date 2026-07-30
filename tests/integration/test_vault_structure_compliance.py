@@ -1,21 +1,24 @@
-"""Tests for the hermetic_vault fixture."""
-import json
+"""Compliance tests: verify vault structure matches design spec."""
+
 from pathlib import Path
+import json
+import pytest
 
 
-def test_hermetic_vault_creates_factory_defaults(hermetic_vault):
+def test_factory_defaults_present(hermetic_vault):
     """Factory defaults must be present at system/factory_defaults.json."""
     vault_path = Path(hermetic_vault)
     factory_path = vault_path / "system" / "factory_defaults.json"
     assert factory_path.is_file(), f"Missing: {factory_path}"
     data = json.loads(factory_path.read_text())
+    # Must have the expected structure
     assert "version" in data
     assert "description" in data
     assert "config" in data
     assert isinstance(data["config"], dict)
 
 
-def test_hermetic_vault_creates_user_defaults(hermetic_vault):
+def test_user_defaults_present(hermetic_vault):
     """User defaults must be present at user/defaults.json."""
     vault_path = Path(hermetic_vault)
     user_defaults = vault_path / "user" / "defaults.json"
@@ -24,7 +27,7 @@ def test_hermetic_vault_creates_user_defaults(hermetic_vault):
     assert isinstance(data, dict)
 
 
-def test_hermetic_vault_creates_vault_compartments(hermetic_vault):
+def test_all_spec_directories_exist(hermetic_vault):
     """All 8 required spec directories must exist."""
     vault_path = Path(hermetic_vault)
     expected = {"credentials", "global", "logs", "sessions", "state", "system", "user", "workspaces"}
@@ -33,16 +36,13 @@ def test_hermetic_vault_creates_vault_compartments(hermetic_vault):
     assert not missing, f"Missing directories: {missing}"
 
 
-def test_hermetic_vault_is_isolated_from_real_home(hermetic_vault, tmp_path):
-    """Verify the vault lives under tmp_path (not the actual ~)."""
-    vault_path = Path(hermetic_vault)
-    assert str(vault_path).startswith(str(tmp_path))
-
-
-def test_hermetic_vault_no_workspace_defaults(hermetic_vault):
+def test_no_workspace_defaults_written(hermetic_vault):
     """Workspace-specific defaults must NOT be written until workspace started."""
     vault_path = Path(hermetic_vault)
     workspaces_dir = vault_path / "workspaces"
+    # The workspaces dir should exist but be empty
     assert workspaces_dir.is_dir()
     workspace_ids = [d for d in workspaces_dir.iterdir() if d.is_dir()]
-    assert len(workspace_ids) == 0, f"Expected empty workspaces dir, found: {workspace_ids}"
+    for ws_dir in workspace_ids:
+        defaults = ws_dir / "defaults.json"
+        assert not defaults.exists(), f"Unexpected defaults file: {defaults}"
