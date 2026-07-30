@@ -288,6 +288,221 @@ class TestGetExpectedContainerConfig:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  _compute_container_config_from_permissions — standalone function
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestComputeContainerConfigFromPermissions:
+    """Tests for the standalone ``_compute_container_config_from_permissions``
+    function in ``docker_executor.py``.
+
+    Three code paths:
+      1. workspace_id + session_permissions → security gate
+      2. no workspace_id + session_permissions → fallback to raw perms
+      3. no workspace_id + no session_permissions → safe defaults ("none", "ro")
+
+    Uses ``monkeypatch`` (built-in pytest) rather than ``pytest-mock`` because
+    ``pytest-mock`` is not installed in the CI/test environment.
+    """
+
+    # ── Path 1: workspace_id + session_permissions → security gate ────
+
+    def test_gate_write_all_allowed(self, monkeypatch):
+        """workspace + write perms → bridge + rw."""
+        import security.security_gate as sg
+        monkeypatch.setattr(sg, "get_workspace_capabilities", lambda wid: _make_workspace())
+        monkeypatch.setattr(
+            sg, "get_effective_permissions",
+            lambda s, w: {"network": "write", "filesystem": "write", "container": True},
+        )
+        from docker_executor import _compute_container_config_from_permissions
+        net, mode = _compute_container_config_from_permissions(
+            "/ws/test", "ws-123", {"network": "write", "filesystem": "write"},
+        )
+        assert net == "bridge"
+        assert mode == "rw"
+
+    def test_gate_write_workspace_denies_network(self, monkeypatch):
+        """workspace denies network → none."""
+        import security.security_gate as sg
+        monkeypatch.setattr(
+            sg, "get_workspace_capabilities",
+            lambda wid: _make_workspace(allow_network=False),
+        )
+        monkeypatch.setattr(
+            sg, "get_effective_permissions",
+            lambda s, w: {"network": False, "filesystem": "write", "container": True},
+        )
+        from docker_executor import _compute_container_config_from_permissions
+        net, mode = _compute_container_config_from_permissions(
+            "/ws/test", "ws-123", {"network": "write", "filesystem": "write"},
+        )
+        assert net == "none"
+        assert mode == "rw"
+
+    def test_gate_workspace_denies_fs_write(self, monkeypatch):
+        """workspace denies filesystem write → bridge + ro."""
+        import security.security_gate as sg
+        monkeypatch.setattr(
+            sg, "get_workspace_capabilities",
+            lambda wid: _make_workspace(filesystem_write=False),
+        )
+        monkeypatch.setattr(
+            sg, "get_effective_permissions",
+            lambda s, w: {"network": "write", "filesystem": "read", "container": False},
+        )
+        from docker_executor import _compute_container_config_from_permissions
+        net, mode = _compute_container_config_from_permissions(
+            "/ws/test", "ws-123", {"network": "write", "filesystem": "write"},
+        )
+        assert net == "bridge"
+        assert mode == "ro"
+
+    def test_gate_ask_filesystem(self, monkeypatch):
+        """ask filesystem → ro."""
+        import security.security_gate as sg
+        monkeypatch.setattr(sg, "get_workspace_capabilities", lambda wid: _make_workspace())
+        monkeypatch.setattr(
+            sg, "get_effective_permissions",
+            lambda s, w: {"network": "write", "filesystem": "ask", "container": True},
+        )
+        from docker_executor import _compute_container_config_from_permissions
+        net, mode = _compute_container_config_from_permissions(
+            "/ws/test", "ws-123", {"network": "write", "filesystem": "ask"},
+        )
+        assert net == "bridge"
+        assert mode == "ro"
+
+    def test_gate_full_filesystem(self, monkeypatch):
+        """full filesystem → rw."""
+        import security.security_gate as sg
+        monkeypatch.setattr(sg, "get_workspace_capabilities", lambda wid: _make_workspace())
+        monkeypatch.setattr(
+            sg, "get_effective_permissions",
+            lambda s, w: {"network": "write", "filesystem": "full", "container": True},
+        )
+        from docker_executor import _compute_container_config_from_permissions
+        net, mode = _compute_container_config_from_permissions(
+            "/ws/test", "ws-123", {"network": "write", "filesystem": "full"},
+        )
+        assert net == "bridge"
+        assert mode == "rw"
+
+    def test_gate_banned_network(self, monkeypatch):
+        """banned network → none."""
+        import security.security_gate as sg
+        monkeypatch.setattr(sg, "get_workspace_capabilities", lambda wid: _make_workspace())
+        monkeypatch.setattr(
+            sg, "get_effective_permissions",
+            lambda s, w: {"network": "banned", "filesystem": "write", "container": True},
+        )
+        from docker_executor import _compute_container_config_from_permissions
+        net, mode = _compute_container_config_from_permissions(
+            "/ws/test", "ws-123", {"network": "banned", "filesystem": "write"},
+        )
+        assert net == "none"
+        assert mode == "rw"
+
+    def test_gate_gate_lookup_exception(self, monkeypatch):
+        """If the security gate raises, safe defaults are returned."""
+        import security.security_gate as sg
+        def _raise(*a):
+            raise RuntimeError("gate down")
+        monkeypatch.setattr(sg, "get_workspace_capabilities", _raise)
+        from docker_executor import _compute_container_config_from_permissions
+        net, mode = _compute_container_config_from_permissions(
+            "/ws/test", "ws-123", {"network": "write", "filesystem": "write"},
+        )
+        assert net == "none"
+        assert mode == "ro"
+
+    # ── Path 2: no workspace_id + session_permissions → fallback ───
+
+    def test_fallback_write_network_and_fs(self, monkeypatch):
+        """No workspace_id, write perms → bridge + rw."""
+        from docker_executor import _compute_container_config_from_permissions
+        net, mode = _compute_container_config_from_permissions(
+            "/ws/test", None, {"network": "write", "filesystem": "write"},
+        )
+        assert net == "bridge"
+        assert mode == "rw"
+
+    def test_fallback_banned_network(self, monkeypatch):
+        """No workspace_id, banned network → none."""
+        from docker_executor import _compute_container_config_from_permissions
+        net, mode = _compute_container_config_from_permissions(
+            "/ws/test", None, {"network": "banned", "filesystem": "write"},
+        )
+        assert net == "none"
+        assert mode == "rw"
+
+    def test_fallback_ask_network(self, monkeypatch):
+        """No workspace_id, ask network → none."""
+        from docker_executor import _compute_container_config_from_permissions
+        net, mode = _compute_container_config_from_permissions(
+            "/ws/test", None, {"network": "ask", "filesystem": "write"},
+        )
+        assert net == "none"
+        assert mode == "rw"
+
+    def test_fallback_read_filesystem(self, monkeypatch):
+        """No workspace_id, read filesystem → ro."""
+        from docker_executor import _compute_container_config_from_permissions
+        net, mode = _compute_container_config_from_permissions(
+            "/ws/test", None, {"network": "write", "filesystem": "read"},
+        )
+        assert net == "bridge"
+        assert mode == "ro"
+
+    def test_fallback_ask_filesystem_ro(self, monkeypatch):
+        """No workspace_id, ask filesystem → ro."""
+        from docker_executor import _compute_container_config_from_permissions
+        net, mode = _compute_container_config_from_permissions(
+            "/ws/test", None, {"network": "write", "filesystem": "ask"},
+        )
+        assert net == "bridge"
+        assert mode == "ro"
+
+    def test_fallback_full_filesystem(self, monkeypatch):
+        """No workspace_id, full filesystem → rw."""
+        from docker_executor import _compute_container_config_from_permissions
+        net, mode = _compute_container_config_from_permissions(
+            "/ws/test", None, {"network": "write", "filesystem": "full"},
+        )
+        assert net == "bridge"
+        assert mode == "rw"
+
+    def test_fallback_defaults_when_missing_keys(self, monkeypatch):
+        """No workspace_id, empty perms dict → defaults (none + ro)."""
+        from docker_executor import _compute_container_config_from_permissions
+        net, mode = _compute_container_config_from_permissions(
+            "/ws/test", None, {},
+        )
+        assert net == "none"
+        assert mode == "ro"
+
+    # ── Path 3: no workspace_id + no session_permissions → safe defaults ──
+
+    def test_safe_defaults_no_permissions(self, monkeypatch):
+        """Both None → none + ro."""
+        from docker_executor import _compute_container_config_from_permissions
+        net, mode = _compute_container_config_from_permissions(
+            "/ws/test", None, None,
+        )
+        assert net == "none"
+        assert mode == "ro"
+
+    def test_safe_defaults_no_workspace_id_no_permissions(self, monkeypatch):
+        """workspace_id None + permissions None → none + ro."""
+        from docker_executor import _compute_container_config_from_permissions
+        net, mode = _compute_container_config_from_permissions(
+            "/ws/test", None, None,
+        )
+        assert net == "none"
+        assert mode == "ro"
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  Permission-footprint overlay on check_required_categories
 # ══════════════════════════════════════════════════════════════════════════
 

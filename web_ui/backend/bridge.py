@@ -33,6 +33,31 @@ that the React frontend expects (see frontend/src/App.jsx):
     user_query / turn / tool_call
       / tool_result / final        → conversation_changed
     (synthetic bridge events)      → status_message
+
+
+Call chain for container integrity re-sync
+─────────────────────────────────────────────
+
+The bridge calls ``_maybe_re_sync_container`` at two points to ensure the
+running Docker container (if any) matches the current session permissions:
+
+1. **apply_config** (line ~1253) — When the user updates session permissions
+   (or any config) via the frontend.  The new permissions are applied to
+   the running agent, then ``_maybe_re_sync_container`` checks whether the
+   existing container still complies.
+
+2. **load_session** (line ~1603) — When a saved session is loaded, because
+   its stored permissions may differ from those the container was created
+   with in a previous agent run.  This catches stale containers whose
+   network/volume settings no longer match the loaded session's permissions.
+
+The full resolution chain:
+
+    _maybe_re_sync_container
+      → verify_container_integrity (docker_executor.py)
+           → _compute_container_config_from_permissions
+                → get_workspace_capabilities + get_effective_permissions
+                     (security/security_gate.py)
 """
 
 from __future__ import annotations
@@ -1599,6 +1624,16 @@ class WebAgentBridge:
             # (late-arriving bridge guard: workers may have been spawned
             # between bridge.__init__ and load_session).
             self._discover_existing_workers(session_id)
+
+            # Verify container integrity after loading a session whose
+            # permissions may have changed since the last active session.
+            # If an existing container no longer matches the new permissions,
+            # it is stopped and removed (recreated on next use).
+            self._maybe_re_sync_container(
+                self._workspace_path or "",
+                getattr(self._session_config, "session_permissions", None)
+                if self._session_config else None,
+            )
 
             return True
         except Exception as e:
