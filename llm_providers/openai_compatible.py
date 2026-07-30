@@ -283,7 +283,7 @@ class OpenAICompatibleProvider(LLMProvider):
             _log_payload = {
                 'model': completion_kwargs.get('model'),
                 'base_url': str(self.client.base_url) if hasattr(self.client, 'base_url') else 'N/A',
-                'api_key_prefix': (self.config.api_key[:8] + '...') if self.config.api_key else 'NONE',
+                'api_key_present': bool(self.config.api_key),
                 'temperature': completion_kwargs.get('temperature'),
                 'max_tokens': completion_kwargs.get('max_tokens'),
                 'tool_choice': completion_kwargs.get('tool_choice'),

@@ -95,9 +95,9 @@ class CredentialInjector:
         # 4. Check it exists and is a regular file
         path_obj = Path(resolved)
         if not path_obj.exists():
-            raise CredentialError(f"Credential '{key}' not found at '{resolved}'")
+            raise CredentialError(f"Credential '{key}' not found")
         if not path_obj.is_file():
-            raise CredentialError(f"Credential path '{resolved}' is not a regular file")
+            raise CredentialError(f"Credential file for '{key}' is not a regular file")
 
         # 5. Read the file, strip final trailing newline
         try:

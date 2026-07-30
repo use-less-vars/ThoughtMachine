@@ -410,6 +410,9 @@ class Agent:
         using the session's workspace_id.
         """
         if not config.api_key or not isinstance(config.api_key, str) or "{{credential:" not in config.api_key:
+            if config.api_key and isinstance(config.api_key, str):
+                from agent.logging import log
+                log('INFO', 'credential', 'Using direct API key for provider (no credential placeholder)')
             return  # No placeholder, nothing to do
         
         if not self._session or not self._session.workspace_id:
@@ -424,7 +427,7 @@ class Agent:
         match = _re.search(r"\{\{credential:([^}]+)\}\}", config.api_key)
         if not match:
             from agent.credentials import CredentialError
-            raise CredentialError(f"Invalid credential placeholder: {config.api_key}")
+            raise CredentialError("Invalid credential placeholder syntax in api_key config")
         
         key_name = match.group(1).strip()
         injector = CredentialInjector(self._session.workspace_id)
@@ -432,6 +435,8 @@ class Agent:
         try:
             resolved = injector.resolve(key_name)
         except Exception as e:
+            from agent.logging import log
+            log('WARNING', 'credential', f"Failed to resolve credential '{key_name}': {e}")
             from agent.credentials import CredentialError
             raise CredentialError(f"Failed to resolve credential '{key_name}': {e}") from e
         

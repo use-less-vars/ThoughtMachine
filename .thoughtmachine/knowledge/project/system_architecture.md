@@ -5852,3 +5852,94 @@ All 5 tasks completed. Next: Phase 2 (KB integration) or Phase 3 (migration).
 ## 2026-07-29 — **Phase 4 Facts (2025-02-20):** Vault has 6 subdirs: credent...
 
 **Phase 4 Facts (2025-02-20):** Vault has 6 subdirs: credentials, knowledge, sessions, state, system, worker_templates. `factory_defaults.json` (vault) has 5 fields under `config` key: max_turns=50, temperature=0.7, provider_id="", model="", system_prompt="". `default_config.json` (AgentConfig) has 40+ flat fields. `loader.load_factory_config()` uses default_config.json, NOT factory_defaults.json. Working doc at `.thoughtmachine/working_docs/phase4_facts.json`.
+
+## 2026-07-30 — ## End-to-End Provider Client Instantiation Analysis (Comple...
+
+## End-to-End Provider Client Instantiation Analysis (Complete)
+
+Completed a deep trace of the entire LLM provider client creation path — from config loading through factory dispatch to actual HTTP client construction. Below is the full chain documented for reference.
+
+### Entry Point: Agent.initialize()
+File: `agent/core/agent.py`
+- `Agent.initialize()` is async, called by session lifecycle.
+- It calls `self._initialize_llm()` which delegates to `LLMClient.initialize()`.
+
+### Config Load Chain
+`agent/config/`:
+1. `loader.py` → `ConfigLoader.load()` merges default_config.json, factory_defaults.json, user config, env vars, CLI args
+2. `models.py` → Uses `AppConfig`, `LLMConfig`, `ProviderConfig` (Pydantic models with field validation)
+3. `service.py` → `ConfigService` acts as a facade, caching parsed config
+
+### Credential Injection
+`agent/credentials/injector.py`:
+- `ConfigInjector.inject_credentials()` runs after base config load
+- Scans `ProviderConfig` for fields matching `{PROVIDER}_api_key` pattern
+- If `api_key` field is empty, reads from `THOUGHTMACHINE_{PROVIDER}_API_KEY` environment variable
+- Replaces `${ENV_VAR}` patterns in config values
+- All providers go through the same credential injection logic
+
+### LLM Client Initialization
+`agent/core/llm_client.py`:
+- `LLMClient.initialize()` receives the fully resolved `AppConfig`
+- Creates an `LLMConfig` from `app_config.llm` (or uses defaults)
+- Calls `LLMClient._create_provider_client()`
+
+### Factory Pattern
+`llm_providers/factory.py`:
+- `create_provider()` is the factory function
+- Takes `provider_name` (str) and `config` (ProviderConfig)
+- Normalizes provider name via `ProviderType` enum (maps "anthropic", "openai", etc.)
+- Dispatch dict: `{"openai": OpenAIProvider, "anthropic": AnthropicProvider, ...}`
+- Instantiates the matching provider class with the config
+
+### Provider Base Class
+`llm_providers/base.py`:
+- `BaseProvider.__init__()` stores config, validates presence of api_key
+- Calls `self._create_client()` — abstract method subclasses must implement
+
+### OpenAI-Compatible Providers
+`llm_providers/openai_compatible.py`:
+- `OpenAICompatibleProvider.__init__()`:
+  1. Calls `super().__init__(config)` → validates api_key
+  2. Sets `self.base_url` from `config.base_url` or defaults
+  3. Calls `self._create_client()`:
+     - Creates `openai.AsyncOpenAI(api_key=..., base_url=...)`
+     - Stores in `self._client`
+  4. Sets `self.model` from `config.model`
+  5. Returns the `AsyncOpenAI` client object
+
+### Anthropic Provider
+`llm_providers/anthropic_provider.py`:
+- `AnthropicProvider.__init__()`:
+  1. Calls `super().__init__(config)` → validates api_key
+  2. Sets `self.base_url` from `config.base_url`
+  3. Calls `self._create_client()`:
+     - Creates `anthropic.AsyncAnthropic(api_key=..., base_url=...)`
+     - Stores in `self._client`
+  4. Sets `self.model` from `config.model`
+  5. Returns the `AsyncAnthropic` client object
+
+### Return Path
+- The provider instance (with ready-to-use HTTP client) propagates back through:
+  `LLMClient._create_provider_client()` → `LLMClient.initialize()` → `Agent._initialize_llm()` → `Agent.initialize()`
+- `LLMClient` stores the provider as `self._provider` for subsequent `chat_completion()` calls
+
+### Security Layer
+`thoughtmachine/security.py`:
+- Not directly involved in provider creation but wraps config loading
+- `SecureConfigLoader` can encrypt/decrypt sensitive config values (api keys at rest)
+- Keys are decrypted before being passed to the provider config
+
+### Vault (Bootstrap)
+`thoughtmachine/vault.py`, `thoughtmachine/bootstrap.py`:
+- `Vault` initializes the workspace structure
+- `bootstrap.py` orchestrates initial setup (directory creation, default config copying)
+- Not directly in the hot path of provider creation after initial setup
+
+### Key Design Observations
+1. **Two factory patterns**: The config system uses `ConfigService` as a facade; the provider system uses `create_provider()` function dispatch
+2. **Credential injection is decoupled**: Happens at config level, not provider level — providers always see fully-resolved credentials
+3. **Client creation is the provider's responsibility**: Each provider subclass implements `_create_client()` differently
+4. **No lazy initialization**: Providers create their HTTP clients eagerly in `__init__()` — failures surface immediately
+5. **Config defaults cascade**: `factory_defaults.json` → `default_config.json` → user config → env vars → CLI args (later overrides earlier)
+
