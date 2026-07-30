@@ -1,4 +1,5 @@
 # tools/file_editor.py
+import json
 from typing import ClassVar, List, Optional, Union, Dict, Literal
 import os
 from pathlib import Path
@@ -120,6 +121,22 @@ class FileEditor(ToolBase):
         return self
 
     def execute(self) -> str:
+        # Atomic permission re-check for write operations
+        operation = self.operation
+        if operation in ("write", "append", "insert", "delete", "replace"):
+            from security.security_gate import check_atomic_operation
+            effective = self.effective_permissions or {}
+            if not check_atomic_operation(
+                "filesystem:write",
+                effective,
+                "FileEditor",
+                f"{operation} on {getattr(self, 'filename', 'unknown')}"
+            ):
+                return json.dumps({
+                    "error": f"Atomic permission check failed: filesystem:write required for {operation}",
+                    "tool": "FileEditor"
+                })
+
         # Determine target files
         if self.filenames is not None:
             target_files = self.filenames

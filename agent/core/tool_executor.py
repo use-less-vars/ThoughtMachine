@@ -282,6 +282,12 @@ class ToolExecutor:
             else:
                 tool_args['session_permissions'] = DEFAULT_SESSION_PERMISSIONS
 
+            # Inject effective permissions for in-tool atomic re-checks
+            if GATE_AVAILABLE and session_perms_obj is not None:
+                tool_args['effective_permissions'] = effective
+            else:
+                tool_args['effective_permissions'] = {}
+
             # Inject agent config for introspection tools
             if hasattr(self, 'config') and self.config is not None:
                 tool_args['agent_config'] = {

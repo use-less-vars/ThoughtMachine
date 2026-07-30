@@ -1,4 +1,5 @@
 # tools/git_info_tool.py
+import json
 from typing import ClassVar, Literal, Optional, List, Union
 from pydantic import Field
 import logging
@@ -129,6 +130,20 @@ class GitInfoTool(ToolBase):
     )
     
     def execute(self) -> str:
+        # Atomic permission re-check for network operations
+        operation = self.operation
+        network_ops = {"remote", "clone", "push", "pull", "fetch", "merge", "rebase"}
+        if operation in network_ops:
+            from security.security_gate import check_atomic_operation
+            effective = self.effective_permissions or {}
+            if not check_atomic_operation(
+                "network:outbound",
+                effective,
+                "GitInfoTool",
+                f"{operation} on remote"
+            ):
+                return json.dumps({"error": f"Atomic permission check failed: network:outbound required for {operation}"})
+
         try:
             # Determine working directory
             if self.working_dir:

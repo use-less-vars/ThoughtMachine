@@ -38,6 +38,13 @@ class ToolBase(BaseModel):
         description='Session permissions dict injected by ToolExecutor.',
     )
 
+    # Effective merged permissions injected by ToolExecutor for in-tool atomic re-checks.
+    # Computed as session_permissions × workspace_capabilities.
+    effective_permissions: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description='Effective merged permissions (session × workspace) for atomic checks.',
+    )
+
     # Agent config dict injected by ToolExecutor before execute().
     # Contains runtime-observable settings such as temperature, max_turns,
     # provider, model, tool_output_token_limit, and workspace_path.

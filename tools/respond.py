@@ -56,6 +56,20 @@ class Respond(ToolBase):
 
     def execute(self) -> str:
         """Execute the Respond tool."""
+        if self.report_body:
+            from security.security_gate import check_atomic_operation
+            effective = self.effective_permissions or {}
+            if not check_atomic_operation(
+                "filesystem:write",
+                effective,
+                "Respond",
+                f"report_body for '{getattr(self, 'report_title', '')}'"
+            ):
+                self.report_body = None
+                logging.getLogger(__name__).warning(
+                    "Respond: report_body write denied by atomic permission check"
+                )
+
         if self.report_body and self.report_title:
             try:
                 from datetime import datetime

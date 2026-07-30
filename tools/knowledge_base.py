@@ -6,6 +6,7 @@ for architecture notes, development guides, roadmaps, bug tracking, lessons
 learned, and task management.
 """
 
+import json
 import logging
 import threading
 from datetime import datetime
@@ -269,6 +270,19 @@ class KnowledgeBaseTool(ToolBase):
             init_result = self._initialize_kb(kb_root)
             if init_result:
                 self._log_debug(f"Knowledge base initialized: {init_result}")
+
+        # Atomic permission re-check for write modes
+        mode = self.mode
+        if mode in ("append", "update", "create_domain"):
+            from security.security_gate import check_atomic_operation
+            effective = self.effective_permissions or {}
+            if not check_atomic_operation(
+                "filesystem:write",
+                effective,
+                "KnowledgeBaseTool",
+                f"{mode} in {getattr(self, 'domain', 'unknown')}"
+            ):
+                return json.dumps({"error": f"Atomic permission check failed: filesystem:write required for {mode}"})
 
         # Dispatch to mode handler
         try:

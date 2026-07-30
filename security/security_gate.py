@@ -18,6 +18,7 @@ This module is always active — there is no fallback path.
 
 from __future__ import annotations
 
+import logging
 import queue
 import uuid
 from pathlib import Path
@@ -29,6 +30,8 @@ from thoughtmachine.workspace_capabilities import (
 )
 from thoughtmachine.security import SessionPermissions, _pending_security_requests, _pending_requests_lock, resolve_security_prompt
 from agent.events import SecurityPromptEvent, EventType, NullEventBus
+
+logger = logging.getLogger(__name__)
 
 # ── Pending-prompt registry ──────────────────────────────────────────────
 
@@ -277,6 +280,44 @@ def _value_satisfies(required: str, allowed: object) -> bool | str:
         return allowed_str == required_lower
 
     return allowed_level >= required_level
+
+
+def check_atomic_operation(
+    operation_required: str,
+    effective_permissions: dict,
+    tool_name: str,
+    description: str = "",
+) -> bool:
+    """
+    Synchronous in-tool re-check of an operation.
+    Returns True if allowed, False if denied.
+    If the permission level is 'ask', treats it as DENIED (escalation not pre-approved).
+    """
+    parts = operation_required.split(":", 1)
+    if len(parts) != 2:
+        logger.warning(
+            "check_atomic_operation: malformed required '%s' for %s",
+            operation_required, tool_name
+        )
+        return False
+
+    category, required_value = parts
+    allowed = effective_permissions.get(category)
+    if allowed is None:
+        logger.warning(
+            "check_atomic_operation: unknown category '%s' for %s",
+            category, tool_name
+        )
+        return False
+
+    result = _value_satisfies(required_value, allowed)
+    if result == "ASK":
+        logger.warning(
+            "check_atomic_operation: '%s' for %s would require user prompt (ASK) — denying by policy",
+            operation_required, tool_name
+        )
+        return False
+    return bool(result)
 
 
 # ══════════════════════════════════════════════════════════════════════════
