@@ -76,6 +76,7 @@ class SessionManager:
         from session.models import Session
 
         new_session = Session()
+        new_session.mode = mode
         new_session.metadata["source"] = "web_ui"
         new_session.ensure_name()
 

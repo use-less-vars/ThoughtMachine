@@ -1604,7 +1604,9 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             pass
 
                     # Create a new empty session via SessionManager
-                    session_id, _ = bridge.create_session(mode='custom')
+                    # Use mode from the frontend payload if provided, fall back to 'custom'
+                    mode = msg.get('mode', 'custom')
+                    session_id, _ = bridge.create_session(mode=mode)
                     new_session = bridge._session
                     if workspace_id and new_session:
                         new_session.workspace_id = workspace_id

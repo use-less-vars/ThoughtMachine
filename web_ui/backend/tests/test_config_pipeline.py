@@ -43,15 +43,19 @@ class TestApplyConfig:
         result = bridge.apply_config({
             "temperature": 1.5,
             "model": "test-model",
-            "max_tokens": 8192,
+            "max_turns": 100,
         })
 
         # ── Assert: bridge config updated ──────────────────────────────
-        assert result == {"success": True}, f"apply_config failed: {result}"
+        assert result is not None, "apply_config returned None"
+        assert "config" in result, f"apply_config result missing 'config': {result}"
+        assert "settings" in result
+        assert "permissions" in result
+        assert "merged_config" in result
         assert bridge._session_config is not None, "bridge._session_config should not be None after apply_config"
         assert bridge._session_config.temperature == 1.5
         assert bridge._session_config.model == "test-model"
-        assert bridge._session_config.max_tokens == 8192
+        assert bridge._session_config.max_turns == 100
 
         # ── Assert: session file written to disk ───────────────────────
         session_files = _find_session_files(temp_session_dir)
@@ -67,45 +71,43 @@ class TestApplyConfig:
             f"Expected temperature=1.5 in session file, got {session_config.get('temperature')}"
         assert session_config.get("model") == "test-model", \
             f"Expected model='test-model' in session file, got {session_config.get('model')}"
-        assert session_config.get("max_tokens") == 8192, \
-            f"Expected max_tokens=8192 in session file, got {session_config.get('max_tokens')}"
+        assert session_config.get("max_turns") == 100, \
+            f"Expected max_turns=100 in session file, got {session_config.get('max_turns')}"
 
     def test_apply_config_merges_with_existing_config(self, session_store, temp_session_dir):
         """
         apply_config should merge with the existing config rather than
         replacing it entirely.
         """
-        bridge = WebAgentBridge()
-        bridge._session_store = session_store
-
+        bridge = WebAgentBridge(session_store=session_store)
+    
         # Set initial config
-        bridge.apply_config({
+        result1 = bridge.apply_config({
             "temperature": 0.5,
             "model": "initial-model",
-            "max_tokens": 8192,
+            "max_turns": 100,
         })
+        assert result1 is not None, "first apply_config returned None"
 
         # Apply a partial update — only temperature changes
-        bridge.apply_config({
+        result2 = bridge.apply_config({
             "temperature": 1.0,
         })
+        assert result2 is not None, "second apply_config returned None"
 
-        # model and max_tokens should be preserved from the initial call
+        # model and max_turns should be preserved from the initial call
         assert bridge._session_config.temperature == 1.0
         assert bridge._session_config.model == "initial-model"
-        assert bridge._session_config.max_tokens == 8192
+        assert bridge._session_config.max_turns == 100
 
     def test_apply_config_invalid_values_return_error(self, session_store):
-        """apply_config should return {'success': False} for invalid input."""
-        bridge = WebAgentBridge()
-        bridge._session_store = session_store
-
-        result = bridge.apply_config({
-            "temperature": "not-a-number",  # invalid type
-        })
-
-        assert result.get("success") is False
-        assert "error" in result
+        """apply_config should raise ValueError for invalid types."""
+        bridge = WebAgentBridge(session_store=session_store)
+    
+        with pytest.raises((ValueError, TypeError)):
+            bridge.apply_config({
+                "temperature": "not-a-number",  # invalid type
+            })
 
 
 # ══════════════════════════════════════════════════════════════════════════════

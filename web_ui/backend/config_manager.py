@@ -542,7 +542,7 @@ class ConfigManager:
             session_config.update_prompt(config_dict["system_prompt"])
 
         # Mutable fields (always allowed regardless of mode)
-        for field in ("provider_id", "model", "base_url", "temperature", "top_p", "max_tokens"):
+        for field in ("provider_id", "model", "base_url", "temperature", "top_p", "max_turns"):
             if field in config_dict:
                 setattr(session_config, field, config_dict[field])
 
