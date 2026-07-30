@@ -81,18 +81,19 @@ class TestFullSessionLifecycle:
 
         frontend_config = {
             "mode": "custom",
-            "enabled_tools": ["Read", "Write"],
+            "enabled_tools": ["FileEditor", "ReadFile"],
         }
         output = simulate_apply_config(bridge, frontend_config)
 
-        assert bridge._session_config.enabled_tools == ["Read", "Write"]
+        assert bridge._session_config.enabled_tools == ["FileEditor", "ReadFile"]
         assert "error" not in output["result"]
 
         event = output["config_changed_event"]
         assert event["type"] == "config_changed"
         assert event["config"]["mode"] == "custom"
-        assert "Read" in event["config"].get("enabled_tools", [])
-        assert "Write" in event["config"].get("enabled_tools", [])
+        tool_names = [t["name"] for t in event["config"].get("tools", [])]
+        assert "FileEditor" in tool_names
+        assert "ReadFile" in tool_names
 
         session_loaded_events = [
             e for e in collector.events if e.get("type") == "session_loaded"
@@ -113,12 +114,12 @@ class TestFullSessionLifecycle:
         # ── Step 2: Apply config ──
         frontend_config = {
             "mode": "custom",
-            "enabled_tools": ["Read", "Write"],
+            "enabled_tools": ["FileEditor", "ReadFile"],
         }
         output = simulate_apply_config(bridge, frontend_config)
         assert "error" not in output["result"]
         assert output["config_changed_event"]["type"] == "config_changed"
-        assert bridge._session_config.enabled_tools == ["Read", "Write"]
+        assert bridge._session_config.enabled_tools == ["FileEditor", "ReadFile"]
 
         # ── Step 3: First query with PuppetLLM (tool call then respond) ──
         puppet = PuppetLLM(scenario=[
@@ -149,13 +150,13 @@ class TestFullSessionLifecycle:
         # ── Step 4: Reconfigure (add more tools) ──
         reconfigure_config = {
             "mode": "custom",
-            "enabled_tools": ["Read", "Write", "Bash"],
+            "enabled_tools": ["FileEditor", "ReadFile", "DockerCodeRunner"],
         }
         output2 = simulate_apply_config(bridge, reconfigure_config)
         assert "error" not in output2["result"]
         assert output2["config_changed_event"]["type"] == "config_changed"
-        assert "Bash" in bridge._session_config.enabled_tools
-        assert bridge._session_config.enabled_tools == ["Read", "Write", "Bash"]
+        assert "DockerCodeRunner" in bridge._session_config.enabled_tools
+        assert bridge._session_config.enabled_tools == ["FileEditor", "ReadFile", "DockerCodeRunner"]
 
         # ── Step 5: Second query (assistant-only, no tool calls) ──
         puppet2 = PuppetLLM(scenario=[
