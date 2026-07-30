@@ -133,8 +133,8 @@ class TestCheckSystemAllowlist:
         result = tool.execute()
         assert isinstance(result, str)
         parsed = json.loads(result)
-        # The query doesn't match any handler, so it should return "Unknown query"
-        assert "Unknown query" in str(parsed.get("error", ""))
+        # The query is not in the allowlist, so it should be denied
+        assert parsed.get("status") == "denied"
 
     def test_allowlist_tampering_detected(self, tmp_path: Path) -> None:
         """A tampered checksystem_allowlist.json causes integrity failure.

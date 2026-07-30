@@ -187,20 +187,19 @@ class CheckSystem(ToolBase):
             # Load vault allowlist
             self.allowlist = self._load_allowlist_from_vault()
 
-            # Path allowlist enforcement for file-access queries
+            # Allowlist enforcement for ALL queries (not just a subset)
             query = self.query
             if self.allowlist is not None:
-                file_access_queries = {
-                    'my_config', 'dockerfile', 'network_diagnostics',
-                    'event_log', 'capabilities',
-                }
-                if query in file_access_queries:
-                    allowed = self._check_path_allowed(query)
-                    if not allowed:
-                        return json.dumps({
-                            'error': f'Query "{query}" not allowed by system configuration',
-                            'status': 'denied',
-                        }, indent=2)
+                # Handle worker/<name> prefix: check base "workers" against allowlist
+                check_query = query
+                if query.startswith("worker/"):
+                    check_query = "workers"
+                allowed = self._check_path_allowed(check_query)
+                if not allowed:
+                    return json.dumps({
+                        'error': f'Query "{query}" not allowed by system configuration',
+                        'status': 'denied',
+                    }, indent=2)
 
             # Dynamic handlers: worker/<name> needs special handling
             if query.startswith("worker/"):
