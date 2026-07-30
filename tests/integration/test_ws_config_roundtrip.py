@@ -88,7 +88,7 @@ def simulate_apply_config(
     # 2. Build AgentConfig from frontend format (like _translate_frontend_config)
     backend_config = AgentConfig(
         mode=frontend_config.get("mode"),
-        enabled_tools=frontend_config.get("enabled_tools"),
+        enabled_tools=frontend_config.get("enabled_tools") or [],
         temperature=frontend_config.get("temperature", 0.7),
         api_key=frontend_config.get("api_key", "test-key"),
         enable_logging=False,
@@ -104,17 +104,17 @@ def simulate_apply_config(
     result = bridge.apply_config(apply_dict)
 
     # 4. Build the event the handler would send
-    # Bridge.apply_config() returns a frontend config dict on success,
-    # or {"success": False, "error": "..."} on failure.
-    if "error" not in result:
+    # Bridge.apply_config() now returns {"config": ..., "settings": ...,
+    # "permissions": ..., "merged_config": ...}.
+    if isinstance(result, dict) and "config" in result:
         config_changed_event = {
             "type": "config_changed",
-            "config": _build_frontend_config(bridge),
+            **result,
         }
     else:
         config_changed_event = {
             "type": "status_message",
-            "text": f"Failed to apply config: {result.get('error', 'unknown error')}",
+            "text": f"Failed to apply config: {result.get('error', 'unknown error')}" if isinstance(result, dict) else f"Failed to apply config: {result}",
         }
 
     return {
@@ -163,20 +163,27 @@ class TestConfigRoundTrip:
         # --- When: apply config with tool changes ---
         frontend_config = {
             "mode": "custom",
-            "enabled_tools": ["Read", "Write"],
+            "enabled_tools": ["FileEditor", "ReadFile"],
         }
         output = simulate_apply_config(bridge, frontend_config)
 
         # --- Then: bridge state updated ---
-        assert bridge._session_config.enabled_tools == ["Read", "Write"]
+        assert bridge._session_config.enabled_tools == ["FileEditor", "ReadFile"]
         assert "error" not in output["result"]
 
         # --- Then: config_changed event has correct data ---
         event = output["config_changed_event"]
         assert event["type"] == "config_changed"
         assert event["config"]["mode"] == "custom"
-        assert "Read" in event["config"].get("enabled_tools", [])
-        assert "Write" in event["config"].get("enabled_tools", [])
+        # tools is a list of {"name": ..., "enabled": bool}
+        tool_names = [t["name"] for t in event["config"].get("tools", [])]
+        assert "FileEditor" in tool_names
+        assert "ReadFile" in tool_names
+        # Verify new fields are present
+        assert "settings" in event
+        assert "permissions" in event
+        assert "merged_config" in event
+        assert event["merged_config"] == event["config"]
 
         # --- Then: no session_loaded from bridge event callback ---
         session_loaded_events = [
@@ -223,7 +230,7 @@ class TestConfigRoundTrip:
         # --- When: apply config (no query sent first) ---
         frontend_config = {
             "mode": "custom",
-            "enabled_tools": ["Read", "Write", "Bash"],
+            "enabled_tools": ["FileEditor", "ReadFile", "DockerCodeRunner"],
             "temperature": 0.5,
         }
         output = simulate_apply_config(bridge, frontend_config)
@@ -231,7 +238,13 @@ class TestConfigRoundTrip:
         # --- Then: apply succeeds ---
         assert "error" not in output["result"]
         assert output["config_changed_event"]["type"] == "config_changed"
-        assert "Bash" in output["config_changed_event"]["config"].get("enabled_tools", [])
+        # tools is a list of {"name": ..., "enabled": bool}
+        tool_names = [t["name"] for t in output["config_changed_event"]["config"].get("tools", [])]
+        assert "DockerCodeRunner" in tool_names
+        # Verify new fields
+        assert "settings" in output["config_changed_event"]
+        assert "permissions" in output["config_changed_event"]
+        assert "merged_config" in output["config_changed_event"]
 
         # --- When: inject PuppetLLM and process a query ---
         puppet = PuppetLLM(scenario=[

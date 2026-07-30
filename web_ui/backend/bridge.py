@@ -1259,7 +1259,17 @@ class WebAgentBridge:
         self.save_session()
 
         log("INFO", "server.bridge", "Config applied and persisted via apply_config")
-        return frontend_result
+
+        # Step 6: Build enhanced result with settings, permissions, and merged_config
+        settings = self._config_manager.extract_settings(frontend_result)
+        permissions = self._config_manager.resolve_effective_permissions(self._session_config)
+
+        return {
+            "config": frontend_result,
+            "settings": settings,
+            "permissions": permissions,
+            "merged_config": frontend_result,
+        }
 
     # ── Session persistence ──────────────────────────────────────────────────
 

@@ -674,9 +674,15 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
 
                 elif command == "get_config":
                     # frontend_config_from_bridge handles bridge=None and cfg=None gracefully
+                    fe_config = config_manager.get_frontend_config(bridge)
+                    settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
+                    permissions = config_manager.resolve_effective_permissions(bridge._session_config) if bridge._session_config else {}
                     await ws.send_json({
                         "type": "config_changed",
-                        "config": config_manager.get_frontend_config(bridge),
+                        "config": fe_config,
+                        "settings": settings,
+                        "permissions": permissions,
+                        "merged_config": fe_config,
                     })
 
                 elif command == "get_conversation":
@@ -837,11 +843,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         #    created for a conversation-bearing session. For empty sessions that
                         #    were updated in-place, no session_loaded is needed since the tab
                         #    is reused.
-                        if not isinstance(result, dict) or result.get("success") is not False:
-                            # Success — result is the frontend-format config dict
+                        if isinstance(result, dict) and "config" in result:
+                            # Success — result includes config, settings, permissions, merged_config
                             await ws.send_json({
                                 "type": "config_changed",
-                                "config": result,
+                                **result,
                             })
                             log('INFO', 'server.config',
                                 f"Config applied after project switch to {_project_path}")
@@ -849,13 +855,20 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             # Config apply failed — still send a config
                             # from the bridge so the frontend doesn't hang
                             # with stale state or wrong workspace_path.
+                            fe_config = config_manager.get_frontend_config(bridge)
+                            settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
+                            permissions = config_manager.resolve_effective_permissions(bridge._session_config) if bridge._session_config else {}
                             await ws.send_json({
                                 "type": "config_changed",
-                                "config": config_manager.get_frontend_config(bridge),
+                                "config": fe_config,
+                                "settings": settings,
+                                "permissions": permissions,
+                                "merged_config": fe_config,
                             })
+                            err_msg = result.get('error', 'unknown error') if isinstance(result, dict) else 'unknown error'
                             await ws.send_json({
                                 "type": "status_message",
-                                "text": f"⚠ Config apply had issues: {result.get('error', 'unknown error')}",
+                                "text": f"⚠ Config apply had issues: {err_msg}",
                             })
 
                         await ws.send_json({
@@ -888,17 +901,18 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         config = config_manager.translate_frontend_config(config)
                         result = bridge.apply_config(config)
 
-                        if not isinstance(result, dict) or result.get("success") is not False:
-                            # Success — result is the frontend-format config dict
+                        if isinstance(result, dict) and "config" in result:
+                            # Success — result includes config, settings, permissions, merged_config
                             await ws.send_json({
                                 "type": "config_changed",
-                                "config": result,
+                                **result,
                             })
                             log('INFO', 'server.config', "Config applied and persisted via apply_config")
                         else:
+                            err_msg = result.get('error', 'unknown error') if isinstance(result, dict) else 'unknown error'
                             await ws.send_json({
                                 "type": "status_message",
-                                "text": f"⚠ Failed to apply config: {result.get('error', 'unknown error')}",
+                                "text": f"⚠ Failed to apply config: {err_msg}",
                             })
 
                 elif command == "set_default_config":
@@ -1322,9 +1336,14 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         })
                     # Send config_changed so the frontend shows the session's actual config
                     fe_config = config_manager.get_frontend_config(bridge)
+                    settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
+                    permissions = config_manager.resolve_effective_permissions(bridge._session_config) if bridge._session_config else {}
                     await ws.send_json({
                         "type": "config_changed",
                         "config": fe_config,
+                        "settings": settings,
+                        "permissions": permissions,
+                        "merged_config": fe_config,
                     })
                     await ws.send_json({"type": "status_message", "text": f"Session {session_id} loaded. Click Run to continue."})
                     # Register/update in global session registry
@@ -1642,9 +1661,15 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         "context_length": 0,
                     })
                     # Send config from bridge so frontend gets workspace path etc.
+                    fe_config = config_manager.get_frontend_config(bridge)
+                    settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
+                    permissions = config_manager.resolve_effective_permissions(bridge._session_config) if bridge._session_config else {}
                     await ws.send_json({
                         "type": "config_changed",
-                        "config": config_manager.get_frontend_config(bridge),
+                        "config": fe_config,
+                        "settings": settings,
+                        "permissions": permissions,
+                        "merged_config": fe_config,
                     })
                     await ws.send_json({"type": "status_message", "text": "Ready. Type a query to start."})
 
@@ -1752,9 +1777,15 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         "type": "context_updated",
                         "context_length": 0,
                     })
+                    fe_config = config_manager.get_frontend_config(bridge)
+                    settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
+                    permissions = config_manager.resolve_effective_permissions(bridge._session_config) if bridge._session_config else {}
                     await ws.send_json({
                         "type": "config_changed",
-                        "config": config_manager.get_frontend_config(bridge),
+                        "config": fe_config,
+                        "settings": settings,
+                        "permissions": permissions,
+                        "merged_config": fe_config,
                     })
                     await ws.send_json({
                         "type": "status_message",

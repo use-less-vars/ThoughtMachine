@@ -262,3 +262,145 @@ class TestBridgeSessionCapture:
         assert bridge._session.session_id == session.session_id, (
             "Session ID should match the controller's session"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 5: Config changed message includes settings, permissions, merged_config
+# ---------------------------------------------------------------------------
+
+class TestConfigChangedMessageStructure:
+    """Verify config_changed broadcasts include the new structured fields."""
+
+    def test_apply_config_includes_settings_permissions_merged(self, hermetic_vault):
+        """bridge.apply_config() returns config, settings, permissions, merged_config."""
+        from tests.integration.test_ws_config_roundtrip import simulate_apply_config
+
+        bridge = WebAgentBridge()
+        bridge._session_config = SessionConfig(
+            mode="custom",
+            max_turns=100,
+            session_permissions={},
+            enabled_tools=[],
+            provider_id="openai",
+            model="gpt-4o-mini",
+            base_url="https://api.openai.com/v1",
+        )
+
+        frontend_config = {
+            "mode": "custom",
+            "temperature": 0.3,
+            "session_permissions": {
+                "filesystem": "write",
+                "network": "banned",
+            },
+        }
+
+        output = simulate_apply_config(bridge, frontend_config)
+        result = output["result"]
+
+        # --- Result has the expected structure ---
+        assert isinstance(result, dict)
+        assert "config" in result, "Result must contain 'config'"
+        assert "settings" in result, "Result must contain 'settings'"
+        assert "permissions" in result, "Result must contain 'permissions'"
+        assert "merged_config" in result, "Result must contain 'merged_config'"
+
+        # --- config is the full frontend-format config dict ---
+        assert isinstance(result["config"], dict)
+        assert result["config"]["mode"] == "custom"
+        assert result["config"].get("provider") is not None  # provider was set from SessionConfig
+
+        # --- settings is a subset of operational knobs ---
+        assert isinstance(result["settings"], dict)
+        assert result["settings"]["mode"] == "custom"
+        assert "temperature" in result["settings"]
+        assert "provider" in result["settings"]
+        assert "model" in result["settings"]
+        # settings should NOT include tools or permissions
+        assert "tools" not in result["settings"]
+        assert "session_permissions" not in result["settings"]
+
+        # --- permissions is the resolved permissions dict ---
+        assert isinstance(result["permissions"], dict)
+        assert "filesystem" in result["permissions"]
+        assert result["permissions"]["filesystem"] == "write"
+        assert "network" in result["permissions"]
+        assert result["permissions"]["network"] == "banned"
+        # Default fields should be present
+        assert result["permissions"].get("container") is not None
+        assert result["permissions"].get("execution") is not None
+
+        # --- merged_config equals config (full frontend format) ---
+        assert result["merged_config"] == result["config"]
+
+    def test_apply_config_without_permissions_uses_defaults(self, hermetic_vault):
+        """When no session_permissions in config, defaults are applied."""
+        from tests.integration.test_ws_config_roundtrip import simulate_apply_config
+
+        bridge = WebAgentBridge()
+        bridge._session_config = SessionConfig(
+            mode="agent",
+            max_turns=50,
+            session_permissions={},
+            enabled_tools=[],
+            provider_id="anthropic",
+            model="claude-3",
+            base_url="https://api.anthropic.com/v1",
+        )
+
+        frontend_config = {
+            "mode": "agent",
+            "temperature": 0.7,
+        }
+
+        output = simulate_apply_config(bridge, frontend_config)
+        result = output["result"]
+
+        # Permissions should be populated with defaults
+        perms = result["permissions"]
+        assert perms.get("filesystem") is not None
+        assert perms.get("network") is not None
+        assert perms.get("container") is not None
+        assert perms.get("system") is not None
+        assert perms.get("git") is not None
+        assert perms.get("execution") is not None
+
+    def test_apply_config_changed_event_has_settings_permissions(self, hermetic_vault):
+        """Config changed event sent to frontend has all new fields."""
+        from tests.integration.test_ws_config_roundtrip import simulate_apply_config
+
+        bridge = WebAgentBridge()
+        bridge._session_config = SessionConfig(
+            mode="custom",
+            max_turns=100,
+            session_permissions={"filesystem": "write"},
+            enabled_tools=[],
+            provider_id="openai",
+            model="gpt-4",
+            base_url="https://api.openai.com/v1",
+        )
+
+        frontend_config = {
+            "mode": "custom",
+            "temperature": 0.5,
+            "session_permissions": {"filesystem": "full"},
+        }
+
+        output = simulate_apply_config(bridge, frontend_config)
+        event = output["config_changed_event"]
+
+        assert event["type"] == "config_changed"
+        assert "config" in event
+        assert "settings" in event
+        assert "permissions" in event
+        assert "merged_config" in event
+
+        # Settings should reflect the applied config
+        assert event["settings"]["mode"] == "custom"
+        assert event["settings"]["temperature"] == 0.5
+
+        # Permissions should reflect the applied permission overrides
+        assert event["permissions"]["filesystem"] == "full"
+
+        # merged_config should equal config
+        assert event["merged_config"] == event["config"]

@@ -431,6 +431,58 @@ class ConfigManager:
         return result
 
     @staticmethod
+    def resolve_effective_permissions(
+        session_config,
+    ) -> Dict[str, Any]:
+        """
+        Resolve effective session permissions from a ``SessionConfig``.
+
+        Returns a normalized permissions dict with defaults applied for any
+        missing categories.  This merges the raw ``session_permissions``
+        dict from the config with the system defaults so the frontend always
+        sees a complete permissions profile.
+        """
+        from thoughtmachine.security import SessionPermissions
+
+        raw_perms = getattr(session_config, "session_permissions", None) or {}
+        try:
+            perms_obj = SessionPermissions(**raw_perms)
+            return perms_obj.model_dump()
+        except Exception:
+            return {
+                "container": False,
+                "network": "banned",
+                "filesystem": "read",
+                "system": "read",
+                "git": "read",
+                "execution": "banned",
+            }
+
+    @staticmethod
+    def extract_settings(frontend_config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Extract core operational settings from a frontend-format config dict.
+
+        Returns a subset containing only the operational knobs that control
+        agent behaviour (provider, model, temperature, mode, etc.), excluding
+        tools, permissions, and workspace metadata.
+        """
+        keys = (
+            "mode",
+            "provider",
+            "provider_id",
+            "model",
+            "base_url",
+            "temperature",
+            "top_p",
+            "max_tokens",
+            "max_turns",
+            "system_prompt",
+            "api_key_configured",
+        )
+        return {k: frontend_config.get(k) for k in keys if k in frontend_config}
+
+    @staticmethod
     def apply_config(
         config_dict: Dict[str, Any],
         current_config,
