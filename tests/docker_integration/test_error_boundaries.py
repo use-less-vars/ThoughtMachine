@@ -3,7 +3,7 @@ Tests for error boundary handling in the Docker integration layer.
 
 Covers:
 
-  * ``_compute_desired_config`` failure modes (gate lookup failures, bad inputs)
+  * ``_compute_container_config_from_permissions`` failure modes (gate lookup failures, bad inputs, fallback paths)
   * ``_resolve_workspace_id`` failures
   * Audit log I/O errors (``/tmp/container_audit.log``)
   * Exceptional container states (stopped vs running, missing attrs keys)
@@ -24,7 +24,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from docker_executor import (
-    _compute_desired_config,
+    _compute_container_config_from_permissions,
     _resolve_workspace_id,
     verify_container_integrity,
 )
@@ -57,28 +57,28 @@ class TestResolveWorkspaceId:
 
 
 # ===================================================================
-# _compute_desired_config edge cases
+# _compute_container_config_from_permissions edge cases
 # ===================================================================
 
-class TestComputeDesiredConfig:
+class TestComputeContainerConfigFromPermissions:
     """Standalone config computation with various permission/capability combos."""
 
     def test_no_workspace_id_and_no_permissions(self):
         """Both workspace_id and permissions are None/absent → most restrictive."""
-        net, mode = _compute_desired_config("/tmp/ws", workspace_id=None, session_permissions=None)
+        net, mode = _compute_container_config_from_permissions("/tmp/ws", workspace_id=None, session_permissions=None)
         assert net == "none"
         assert mode == "ro"
 
     def test_workspace_id_but_no_permissions(self):
         """Workspace ID present but permissions None → restrictive."""
-        net, mode = _compute_desired_config("/tmp/ws", workspace_id="ws-1", session_permissions=None)
+        net, mode = _compute_container_config_from_permissions("/tmp/ws", workspace_id="ws-1", session_permissions=None)
         # Falls through to defaults since session_permissions is None
         assert net == "none"
         assert mode == "ro"
 
     def test_no_workspace_id_with_permissions_fallback(self):
         """No workspace ID but permissions dict present → fallback logic."""
-        net, mode = _compute_desired_config(
+        net, mode = _compute_container_config_from_permissions(
             "/tmp/ws", workspace_id=None, session_permissions={"network": "write", "filesystem": "write"}
         )
         # Fallback: network="write" → "bridge", filesystem="write" → "rw"
@@ -87,7 +87,7 @@ class TestComputeDesiredConfig:
 
     def test_no_workspace_id_with_banned_permissions(self):
         """Fallback with banned network."""
-        net, mode = _compute_desired_config(
+        net, mode = _compute_container_config_from_permissions(
             "/tmp/ws", workspace_id=None, session_permissions={"network": "banned", "filesystem": "read"}
         )
         assert net == "none"
@@ -97,7 +97,7 @@ class TestComputeDesiredConfig:
         """When ``get_workspace_capabilities`` raises, the function logs a
         warning and returns safe defaults."""
         with patch("security.security_gate.get_workspace_capabilities", side_effect=RuntimeError("gate down")):
-            net, mode = _compute_desired_config(
+            net, mode = _compute_container_config_from_permissions(
                 "/tmp/ws", workspace_id="ws-1",
                 session_permissions={"network": "write", "filesystem": "write"}
             )
@@ -111,7 +111,7 @@ class TestComputeDesiredConfig:
         from thoughtmachine.workspace_capabilities import WorkspaceCapabilities
         limited = WorkspaceCapabilities(allow_network=False, filesystem_write=False)
         with patch("security.security_gate.get_workspace_capabilities", return_value=limited):
-            net, mode = _compute_desired_config(
+            net, mode = _compute_container_config_from_permissions(
                 "/tmp/ws", workspace_id="ws-1",
                 session_permissions={"network": "write", "filesystem": "write"}
             )

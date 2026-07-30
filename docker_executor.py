@@ -1,3 +1,26 @@
+"""
+docker_executor.py — Docker container lifecycle and integrity verification.
+
+Call chain for container integrity checks
+══════════════════════════════════════════
+
+When a session is loaded or configuration is changed, the container is
+checked to ensure it still matches the current session permissions:
+
+    WebAgentBridge.load_session() / WebAgentBridge.apply_config()
+        → _maybe_re_sync_container()
+            → verify_container_integrity()
+                → _compute_container_config_from_permissions()
+                    → get_workspace_capabilities() + get_effective_permissions()
+                        (security/security_gate.py)
+
+The unified function ``_compute_container_config_from_permissions`` is the
+single source of truth for computing desired (network_mode, workspace_mode)
+from session permissions. It is called by both ``verify_container_integrity``
+and ``DockerExecutor._compute_container_config``, ensuring consistency
+between integrity checks and container creation/recreation.
+"""
+
 from agent.logging import log
 import docker
 import hashlib
