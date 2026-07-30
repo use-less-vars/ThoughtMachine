@@ -47,6 +47,21 @@ _pending_security_requests: Dict[str, queue.Queue] = {}
 _pending_requests_lock = threading.Lock()
 _prompt_cancelled = threading.Event()
 
+# Vault directories that are forbidden for file tools to access
+VAULT_BLOCKED_SUBDIRS = [
+    "credentials",
+    "system",
+    "global",
+    "user",
+    "state",
+    "sessions",
+    "workspaces",
+    "logs",
+    "worker_templates",
+]
+
+VAULT_ROOT = os.path.join(os.path.expanduser("~"), ".thoughtmachine")
+
 # Security exceptions
 class SecurityError(Exception):
     """Base security exception."""
@@ -250,41 +265,69 @@ def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] =
         ValueError: For invalid inputs.
     """
     original_path = path
-    
+
+    # ── REJECT NULL BYTES ─────────────────────────────────────────────────
+    # Null bytes in paths can cause silent truncation on some OSes, bypassing
+    # path validation. Always reject them early.
+    if '\x00' in path:
+        _log_security_event(
+            event_type=LogEventType.SECURITY_VIOLATION if LOGGING_AVAILABLE else None,
+            message=f"Rejected path containing null byte: '{original_path}'",
+            level=LogLevel.WARNING if LOGGING_AVAILABLE else logging.WARNING,
+            data={
+                "path": original_path,
+                "reason": "null_byte_in_path"
+            }
+        )
+        raise ValueError(f"Path contains null byte: '{original_path}'")
+
     # If workspace_path is provided, treat relative paths as relative to workspace_path
     if workspace_path and not os.path.isabs(path):
         # Join with workspace_path
         path = os.path.join(workspace_path, path)
-    
+
     # First, get absolute path of the requested location (without following symlinks)
     try:
         requested_abs = os.path.abspath(path)
     except Exception as e:
-        raise ValueError(f"Invalid path '{original_path}': {e}")
-    
+        raise ValueError(f"Invalid path '{original_path}': {e}")    
     # Use requested_abs as the path to validate
     target_abs = requested_abs
 
-    # ── BLOCK CREDENTIALS PATH ────────────────────────────────────────────
-    # Never allow file tools to access ~/.thoughtmachine/credentials/
-    user_home = os.path.expanduser("~")
-    vault_cred_path = os.path.join(user_home, ".thoughtmachine", "credentials")
+    # ── BLOCK VAULT COMPARTMENTS ──────────────────────────────────────────
+    # Never allow file tools to access ~/.thoughtmachine/ or its subdirectories
     try:
-        resolved_cred = os.path.realpath(vault_cred_path)
-        if requested_abs.startswith(resolved_cred) or requested_abs.startswith(vault_cred_path):
-            _log_security_event(
-                event_type=LogEventType.SECURITY_VIOLATION if LOGGING_AVAILABLE else None,
-                message=f"Blocked credentials access attempt: '{original_path}'",
-                level=LogLevel.WARNING if LOGGING_AVAILABLE else logging.WARNING,
-                data={
-                    "path": original_path,
-                    "resolved_path": requested_abs,
-                    "reason": "credentials_blocked"
-                }
-            )
-            raise PathOutsideWorkspaceError(f"Access to credentials path '{original_path}' is blocked")
+        vault_root_resolved = os.path.realpath(VAULT_ROOT)
     except Exception:
-        pass  # If we can't resolve, fall through to normal checks
+        vault_root_resolved = VAULT_ROOT  # Fallback if realpath fails
+
+    # If the path itself is directly under ~/.thoughtmachine/, block it
+    if requested_abs.startswith(vault_root_resolved) or requested_abs.startswith(VAULT_ROOT):
+        # Check each blocked subdirectory
+        blocked_reason = None
+        for subdir in VAULT_BLOCKED_SUBDIRS:
+            subdir_path = os.path.join(VAULT_ROOT, subdir)
+            try:
+                resolved_subdir = os.path.realpath(subdir_path)
+            except Exception:
+                resolved_subdir = subdir_path
+            if requested_abs.startswith(resolved_subdir) or requested_abs.startswith(subdir_path):
+                blocked_reason = subdir
+                break
+        if blocked_reason is None:
+            # Path is in ~/.thoughtmachine/ but not in a known blocked subdir — still block
+            blocked_reason = "vault_root"
+        _log_security_event(
+            event_type=LogEventType.SECURITY_VIOLATION if LOGGING_AVAILABLE else None,
+            message=f"Blocked vault access attempt: '{original_path}' (compartment: {blocked_reason})",
+            level=LogLevel.WARNING if LOGGING_AVAILABLE else logging.WARNING,
+            data={
+                "path": original_path,
+                "resolved_path": requested_abs,
+                "reason": f"vault_blocked:{blocked_reason}"
+            }
+        )
+        raise PathOutsideWorkspaceError(f"Access to vault compartment '{blocked_reason}' is blocked: '{original_path}'")
 
     # If no workspace restriction, return canonical path if possible
     if not workspace_path:
@@ -333,15 +376,41 @@ def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] =
         raise PathOutsideWorkspaceError(f"Path {original_path} is outside workspace {workspace_abs}")
     
     # Try to get canonical path (following symlinks) for return value
-    # If symlink points outside workspace or is broken, that's OK - we already validated
-    # the symlink itself is within workspace
     canonical_abs = target_abs
     try:
         canonical_abs = os.path.realpath(target_abs)
     except Exception:
         # Broken symlink or other issue - keep the absolute path
         pass
-    
+
+    # ── RE-CHECK VAULT AFTER SYMLINK RESOLUTION ──────────────────────────
+    # A symlink inside the workspace may point to a vault file. Even though
+    # the symlink itself passed the vault check, the resolved target must not
+    # be in the vault.
+    try:
+        vault_root_resolved = os.path.realpath(VAULT_ROOT)
+    except Exception:
+        vault_root_resolved = VAULT_ROOT
+    if canonical_abs != target_abs:
+        # Symlink was resolved — check if target is in vault
+        try:
+            canonical_resolved = os.path.realpath(canonical_abs)
+        except Exception:
+            canonical_resolved = canonical_abs
+        if canonical_resolved.startswith(vault_root_resolved) or canonical_resolved.startswith(VAULT_ROOT):
+            _log_security_event(
+                event_type=LogEventType.SECURITY_VIOLATION if LOGGING_AVAILABLE else None,
+                message=f"Blocked vault access via symlink: '{original_path}' resolves to '{canonical_resolved}'",
+                level=LogLevel.WARNING if LOGGING_AVAILABLE else logging.WARNING,
+                data={
+                    "path": original_path,
+                    "resolved_path": canonical_resolved,
+                    "symlink_target": canonical_abs,
+                    "reason": "vault_blocked_via_symlink"
+                }
+            )
+            raise PathOutsideWorkspaceError(f"Access to vault via symlink is blocked: '{original_path}' -> '{canonical_resolved}'")
+
     # Log successful access
     try:
         file_size = os.path.getsize(canonical_abs) if os.path.exists(canonical_abs) and os.path.isfile(canonical_abs) else None
