@@ -47,6 +47,7 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import datetime
+from pathlib import Path
 
 from agent import Agent
 from agent.config import AgentConfig
@@ -940,6 +941,17 @@ class WebAgentBridge:
             except Exception:
                 pass
 
+        # ── Log workspace defaults status (diagnostic for fresh-vault debugging) ──
+        if self._workspace_id and self._workspace_path:
+            ws_defaults_path = os.path.join(
+                str(Path.home() / ".thoughtmachine" / "workspaces" / self._workspace_id),
+                "defaults.json"
+            )
+            if not os.path.exists(ws_defaults_path):
+                log('INFO', 'server.bridge',
+                    f'No workspace defaults for {self._workspace_id} at {ws_defaults_path}, '
+                    f'using factory+user defaults only')
+
         # If a controller already exists, delegate to it
         if self._controller is not None:
             session_arg = self._loaded_session
@@ -947,6 +959,21 @@ class WebAgentBridge:
             self._session = session_arg
             self._controller.start(query, agent_config, session=session_arg)
             self._loaded_session = None  # consumed
+
+            # Immediately try to capture session from controller's agent
+            if self._session is None and self._controller is not None:
+                try:
+                    controller_agent = getattr(self._controller, 'agent', None)
+                    if controller_agent is not None:
+                        agent_session = getattr(controller_agent, 'session', None)
+                        if agent_session is not None:
+                            self._session = agent_session
+                            self._history_version = getattr(agent_session, 'conversation_version', 0)
+                            log('INFO', 'server.bridge',
+                                f'Session {agent_session.session_id} captured from controller agent in start()')
+                except Exception as exc:
+                    log('WARNING', 'server.bridge',
+                        f'Could not capture session from controller agent in start(): {exc}')
             return
 
         if self.is_running:
@@ -1788,10 +1815,15 @@ class WebAgentBridge:
                     if agent_session is not None:
                         self._session = agent_session
                         self._history_version = getattr(agent_session, 'conversation_version', 0)
-                        log('DEBUG', 'server.bridge',
+                        log('INFO', 'server.bridge',
                             f'Session {agent_session.session_id} propagated to bridge from controller agent')
-            except Exception:
-                pass  # Safe to retry on next event
+                else:
+                    log('WARNING', 'server.bridge',
+                        '_on_controller_event: controller.agent is None, '
+                        'session capture deferred to next event')
+            except Exception as exc:
+                log('WARNING', 'server.bridge',
+                    f'_on_controller_event: session capture failed: {exc}')
 
         self._map_and_emit(event)
 
@@ -1818,6 +1850,10 @@ class WebAgentBridge:
                 self._forwarder.broadcast(self._session_id, "conversation_changed", {
                     "messages": self._normalize_for_frontend(self._session.user_history),
                 })
+        else:
+            log('DEBUG', 'server.bridge',
+                f'_map_and_emit: session is None (event_type={event_type!r}), '
+                f'skipping conversation_changed sync')
 
         # ── 2. Handle event-type-specific logic ───────────────────────────
         _is_busy = self._controller.is_busy if self._controller else False
@@ -1928,12 +1964,23 @@ class WebAgentBridge:
                 f'_map_and_emit: session_stop received | '
                 f'stop_reason={stop_reason!r} | '
                 f'_is_busy={_is_busy} | '
+                f'_session={self._session is not None} | '
                 f'controller_running={self._controller.is_running if self._controller else False}')
             if stop_reason:
                 self._forwarder.broadcast(self._session_id, "state_changed", {
                     "state": "IDLE",
                     "is_running": _is_busy,
                 })
+            # Emit final conversation snapshot so the frontend gets the last
+            # messages even if session_stop is the only event emitted.
+            if self._session is not None:
+                self._history_version = self._session.conversation_version
+                self._forwarder.broadcast(self._session_id, "conversation_changed", {
+                    "messages": self._normalize_for_frontend(self._session.user_history),
+                })
+                log('DEBUG', 'server.bridge',
+                    f'session_stop: emitted final conversation_changed '
+                    f'(version={self._history_version}, messages={len(self._session.user_history)})')
             return
 
         if raw_event.get("stop_reason"):
