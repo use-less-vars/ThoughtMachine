@@ -371,14 +371,18 @@ class WorkerSessionLifecycle:
 
 logger = logging.getLogger(__name__)
 
-# Tools excluded from workers for safety reasons
-# Workers could spawn other workers (recursion), manage containers, or
-# modify workspace infrastructure — all operations reserved for the
-# main agent / human user.
+# Hard blocklist: tools that workers must NEVER use, regardless of permissions.
+# Workers can spawn other workers (recursion), manage containers, modify
+# workspace infrastructure, inspect system state, or access the persistent
+# knowledge base — all operations reserved for the main agent / human user.
+# This is defense-in-depth: the blocklist is enforced at two separate points
+# (enabled_tools filtering and tool class resolution).
 _WORKER_BLOCKLIST: frozenset[str] = frozenset({
     "Worker",           # recursion: worker spawning workers
     "EditDockerfile",    # container configuration
     "MCPValidator",      # MCP server management
+    "CheckSystem",       # system/network/worker/infrastructure discovery
+    "KnowledgeBaseTool", # persistent cross-session knowledge store
 })
 
 # Default system prompt for worker sub-agents.
