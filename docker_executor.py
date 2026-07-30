@@ -19,6 +19,28 @@ single source of truth for computing desired (network_mode, workspace_mode)
 from session permissions. It is called by both ``verify_container_integrity``
 and ``DockerExecutor._compute_container_config``, ensuring consistency
 between integrity checks and container creation/recreation.
+
+Volume lifecycle (Pillar 3.1 — Container Persistence)
+══════════════════════════════════════════════════════
+
+Named Docker volumes provide persistent workspaces that survive container
+stop/remove/recreate cycles. The volume lifecycle is managed by:
+
+    _ensure_volume(workspace_id) — Creates or verifies a named volume
+        Volume name: tm-workspace-<workspace_id>
+        Called automatically by _ensure_container() when workspace_id is set.
+        Falls back to bind mounts when workspace_id is None.
+
+    _ensure_container() — Creates containers with:
+        - Named volume mounts (type="volume") when workspace_id is set
+        - Bind mounts (type="bind") when workspace_id is None
+        The volume is mounted at /workspace inside the container.
+
+Volume cleanup is the responsibility of the caller (typically
+DockerCodeRunner or session lifecycle management). Volumes are NOT
+automatically removed when containers stop.
+
+For integration tests, see tests/docker/test_persistence.py.
 """
 
 from agent.logging import log
