@@ -124,7 +124,18 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
 
   // ── Derived: selected provider object ──────────────────────────────
   // Backend sends 'provider' in config_changed; fall back if 'provider_id' not set.
-  const activeProviderId = draft.provider_id || draft.provider || '';
+  // Try matching by UUID id first, then by legacy provider_type string.
+  const activeProviderId = (() => {
+    if (draft.provider_id) {
+      const match = providers.find(p => p.id === draft.provider_id);
+      if (match) return draft.provider_id;
+    }
+    if (draft.provider) {
+      const match = providers.find(p => p.provider_type === draft.provider);
+      if (match) return match.id;
+    }
+    return '';
+  })();
   const selectedProvider = providers.find((p) => p.id === activeProviderId);
   const availableModels = useMemo(() => {
     if (!selectedProvider) return []
@@ -447,11 +458,16 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
             </small>
           </div>
           <div style={{ borderTop: '1px solid #45475a', paddingTop: '0.75rem' }}>
-            <label style={labelStyle}><strong>Tools ({allTools.length} total)</strong></label>
-            {allTools.length > 0 ? (
-              allTools.map((toolName) => {
-                const toolConfig = draft.tools?.find(t => t.name === toolName);
-                const enabled = toolConfig ? toolConfig.enabled : false;
+            {(() => {
+              /* Locked modes show allTools (mode presets); custom shows availableTools */
+              const displayTools = isModeLocked ? allTools : availableTools;
+              return (
+                <>
+                  <label style={labelStyle}><strong>Tools ({displayTools.length} total)</strong></label>
+                  {displayTools.length > 0 ? (
+                    displayTools.map((toolName) => {
+                      const toolConfig = draft.tools?.find(t => t.name === toolName);
+                      const enabled = toolConfig ? toolConfig.enabled : false;
                 return (
                   <div key={toolName} style={{ marginBottom: '0.35rem' }}>
                     <label style={{ cursor: isModeLocked ? 'default' : 'pointer', display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem', opacity: isModeLocked ? 0.6 : 1 }}>
@@ -480,6 +496,9 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
                 Loading tool list...
               </div>
             )}
+                </>
+              );
+            })()}
           </div>
         </div>
       )}

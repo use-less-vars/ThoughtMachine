@@ -70,12 +70,15 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
   const [defaultConfigSaveMessage, setDefaultConfigSaveMessage] = useState('')
   const [securityPrompt, setSecurityPrompt] = useState(null) // null | { request_id, tool_name, capabilities, ... }
   const [containerRebuildResult, setContainerRebuildResult] = useState(null) // null | { status, buildLog }
+  const [sessionReady, setSessionReady] = useState(false) // true after session_loaded confirms session is ready
   const [isDeferred, setIsDeferred] = useState(false) // true = load skipped; waiting for activation
   const [totalMessages, setTotalMessages] = useState(0) // total messages in the session
   const [hasMore, setHasMore] = useState(false) // true if older messages are available
   const [scrollToBottomKey, setScrollToBottomKey] = useState(0) // incremented to force scroll to bottom (R3)
   const loadSentRef = useRef(false) // true once load_session has been sent (by any path)
   const dataReceivedRef = useRef(false) // true once we've received a response to our load
+  const modeRef = useRef(mode)
+  modeRef.current = mode
   const isActiveRef = useRef(isActive)
   isActiveRef.current = isActive
   const prevIsActiveRef = useRef(isActive)
@@ -262,7 +265,10 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
           }
         }
       } else {
-        ws.send(JSON.stringify({ command: 'new_session' }))
+        ws.send(JSON.stringify({
+          command: 'new_session',
+          mode: modeRef.current || 'custom',
+        }))
       }
 
       // Fetch providers and tools list only if not already cached
@@ -490,6 +496,7 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
             // Fresh tab (no sessionId yet) → update currentSessionId
             setCurrentSessionId(msg.session_id)
             setDisplayName(msg.session_name || displayName)
+            setSessionReady(true)
             // Notify parent that this tab now has a real sessionId
             if (!sessionId) {
               onNewSession?.(msg.session_id, msg.session_name)
@@ -534,11 +541,13 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
 
       case 'session_closed':
         closedRef.current = true
+        setSessionReady(false)
         onClose?.()
         break
 
       case 'session_deleted':
         // Session was deleted from the store — close the tab
+        setSessionReady(false)
         onClose?.()
         break
 
@@ -794,6 +803,7 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
             config={state.config}
             mode={mode}
             sessionId={currentSessionId}
+            sessionReady={sessionReady}
           />
         </div>
         {/* Session list is rendered by App, not per-tab */}

@@ -20,7 +20,7 @@
 
 import React, { useState, useRef } from 'react'
 
-function QueryBar({ sendCommand, status, isRunning, config, mode, sessionId }) {
+function QueryBar({ sendCommand, status, isRunning, config, mode, sessionId, sessionReady }) {
   const [query, setQuery] = useState('')
   const textareaRef = useRef(null)
 
@@ -29,6 +29,7 @@ function QueryBar({ sendCommand, status, isRunning, config, mode, sessionId }) {
   const isPaused = status === 'PAUSED'
   const isPausing = status === 'PAUSING'
   const isWaiting = status === 'WAITING_FOR_USER'
+  const isConnecting = !sessionReady && !sessionId // fresh tab waiting for session_loaded
 
   const handleRun = () => {
     if (!query.trim()) return
@@ -111,9 +112,9 @@ function QueryBar({ sendCommand, status, isRunning, config, mode, sessionId }) {
           <button
             className="btn btn-run"
             onClick={handleToggle}
-            disabled={!query.trim() && isIdle}
+            disabled={(isConnecting) || (!query.trim() && isIdle)}
           >
-            ▶ Run
+            {isConnecting ? 'Connecting…' : '▶ Run'}
           </button>
         )}
       </div>

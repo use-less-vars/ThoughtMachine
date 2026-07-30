@@ -28,14 +28,16 @@ export default function SessionCreationModal({ show, onCreate, onOpen, onCancel,
   // Fetch home directory for vault warning — must resolve before folder browser renders
   useEffect(() => {
     if (!show) return
-    fetch(`${API_BASE}/api/user-home`)
+    const ac = new AbortController()
+    fetch(`${API_BASE}/api/user-home`, { signal: ac.signal })
       .then(r => r.json())
       .then(data => {
-        setHomeDir(data.home || null)
+        if (!ac.signal.aborted) setHomeDir(data.home || null)
       })
       .catch(() => {
-        setHomeDir(null)
+        if (!ac.signal.aborted) setHomeDir(null)
       })
+    return () => ac.abort()
   }, [show])
 
   // Reset when modal opens
@@ -46,8 +48,9 @@ export default function SessionCreationModal({ show, onCreate, onOpen, onCancel,
       setError('')
       setAcknowledgedRisk(false)
       setShowModePicker(false)
-      function isAbsolutePath(p) {
-        return p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p)
+      function isAbsolutePath(path) {
+        if (typeof path !== 'string') return false;
+        return path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path);
       }
       const stored = localStorage.getItem('thoughtmachine_last_workspace')
       if (stored && isAbsolutePath(stored)) {
