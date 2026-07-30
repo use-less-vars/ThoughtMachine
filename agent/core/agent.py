@@ -102,6 +102,7 @@ class Agent:
         self._display_turn = user_msg_count
         self._conversation_start_time = time.time()
         self.token_counter = TokenCounter(config)
+        self._resolve_credential_placeholder(config)
         self.llm_client = LLMClient(config, session, self.logger)
         self.conversation_manager = ConversationManager(session, None, self.logger)
         self.debug_context = DebugContext(self.logger)
@@ -402,6 +403,40 @@ class Agent:
                 return True
         return False
 
+    def _resolve_credential_placeholder(self, config: 'AgentConfig') -> None:
+        """Resolve {{credential:key}} placeholders in config.api_key in-place.
+        
+        If the api_key contains a placeholder, resolve it from the vault
+        using the session's workspace_id.
+        """
+        if not config.api_key or not isinstance(config.api_key, str) or "{{credential:" not in config.api_key:
+            return  # No placeholder, nothing to do
+        
+        if not self._session or not self._session.workspace_id:
+            from agent.credentials import CredentialError
+            raise CredentialError(
+                "Cannot resolve credential placeholder: no workspace associated with session"
+            )
+        
+        from agent.credentials import CredentialInjector
+        import re as _re
+        
+        match = _re.search(r"\{\{credential:([^}]+)\}\}", config.api_key)
+        if not match:
+            from agent.credentials import CredentialError
+            raise CredentialError(f"Invalid credential placeholder: {config.api_key}")
+        
+        key_name = match.group(1).strip()
+        injector = CredentialInjector(self._session.workspace_id)
+        
+        try:
+            resolved = injector.resolve(key_name)
+        except Exception as e:
+            from agent.credentials import CredentialError
+            raise CredentialError(f"Failed to resolve credential '{key_name}': {e}") from e
+        
+        config.api_key = resolved
+
     def restart(self, new_config: AgentConfig) -> bool:
         """
         Restart the agent with a new configuration while preserving conversation history.
@@ -451,6 +486,7 @@ class Agent:
             self.token_counter = TokenCounter(new_config)
 
             # Re-initialise LLM client and provider from new_config
+            self._resolve_credential_placeholder(new_config)
             self.llm_client = LLMClient(new_config, self._session, old_logger)
             self.provider = self.llm_client.provider
 
@@ -493,6 +529,7 @@ class Agent:
             # Restore old LLM client so agent isn't left in a broken state
             if old_config is not None and old_logger is not None:
                 try:
+                    self._resolve_credential_placeholder(old_config)
                     self.llm_client = LLMClient(old_config, self._session, old_logger)
                     self.provider = self.llm_client.provider
                 except Exception as restore_error:
