@@ -95,9 +95,12 @@ def ensure_user_defaults(overwrite_existing: bool = False) -> list[str]:
     """Create/reset the ``~/.thoughtmachine/`` user directory with defaults.
 
     Steps:
-    1. Create the new vault compartment structure.
-    2. For each bundled default resource, deploy it to the appropriate location.
-    3. Copy factory defaults into system/factory_defaults.json.
+    1. Create the vault compartment structure via ``ensure_vault_structure()``.
+    2. Deploy all spec files via ``ensure_vault_defaults()`` (factory defaults,
+       provider config, system prompts, registry stubs, etc).
+    3. Deploy individual resource files from the manifest.
+    4. Deploy directories from the manifest (e.g., worker_templates).
+    5. Ensure the global knowledge base.
 
     Args:
         overwrite_existing: If ``True``, overwrite user files even when they
@@ -107,16 +110,12 @@ def ensure_user_defaults(overwrite_existing: bool = False) -> list[str]:
         A list of absolute paths to files that were **created** or
         **overwritten**.
     """
-    # Step 1: Create the new vault structure (idempotent)
-    from thoughtmachine.vault import ensure_vault_structure, vault_root
+    # Step 1: Create the vault structure (idempotent)
+    from thoughtmachine.vault import ensure_vault_structure, ensure_vault_defaults, vault_root
     created = ensure_vault_structure()
 
-    # Step 2: Create legacy directories that still need to exist
-    #          (worker_templates at vault root for backward compatibility)
-    (vault_root() / "sessions").mkdir(parents=True, exist_ok=True)
-    (vault_root() / "state").mkdir(parents=True, exist_ok=True)
-    (vault_root() / "knowledge").mkdir(parents=True, exist_ok=True)
-    (vault_root() / "worker_templates").mkdir(parents=True, exist_ok=True)
+    # Step 2: Deploy all spec files via vault defaults
+    created.extend(ensure_vault_defaults(_resources_dir(), overwrite_existing))
 
     # Step 3: Deploy individual files from manifest
     manifest = _load_manifest()
@@ -130,32 +129,27 @@ def ensure_user_defaults(overwrite_existing: bool = False) -> list[str]:
         shutil.copy2(str(src), str(dst))
         created.append(str(dst))
 
-    # Step 4: Deploy factory defaults to system/factory_defaults.json
-    factory_src = _resources_dir() / "factory_defaults.json"
-    factory_dst = vault_root() / "system" / "factory_defaults.json"
-    if factory_src.exists() and (overwrite_existing or not factory_dst.exists()):
-        shutil.copy2(str(factory_src), str(factory_dst))
-        created.append(str(factory_dst))
-
-    # Step 5: Deploy directories from manifest
+    # Step 4: Deploy directories from manifest
     for entry in manifest.get("directories", []):
         src_dir = _resolve_source(entry["source"])
         dst_dir = _resolve_dest(entry["dest"])
         condition = entry.get("condition", "")
 
-        if condition == "dest_empty" and any(dst_dir.iterdir()):
-            continue
-
         if not src_dir.is_dir():
             continue
 
+        # Create destination if needed, then check condition
         dst_dir.mkdir(parents=True, exist_ok=True)
+
+        if condition == "dest_empty" and any(dst_dir.iterdir()):
+            continue
+
         for src_file in src_dir.iterdir():
             if src_file.is_file():
                 shutil.copy2(str(src_file), str(dst_dir / src_file.name))
                 created.append(str(dst_dir / src_file.name))
 
-    # Step 6: Ensure the global knowledge base
+    # Step 5: Ensure the global knowledge base
     from agent.knowledge.global_kb import ensure_global_kb
     created.extend(ensure_global_kb())
 
@@ -163,12 +157,12 @@ def ensure_user_defaults(overwrite_existing: bool = False) -> list[str]:
 
 
 def load_user_config() -> dict:
-    """Load the user's ``agent_config.json``, falling back to defaults.
+    """Load the user's config from ``user/defaults.json``, falling back to bundled defaults.
 
     Returns:
         A ``dict`` with all keys that the project-level defaults provide.
     """
-    config_path = USER_DIR / "agent_config.json"
+    config_path = USER_DIR / "user" / "defaults.json"
     if config_path.exists():
         try:
             return json.loads(config_path.read_text(encoding="utf-8"))

@@ -4,20 +4,29 @@ from pathlib import Path
 
 def test_hermetic_vault_creates_config(hermetic_vault):
     vault_path = Path(hermetic_vault)
-    # From MANIFEST.json: default_config.json -> agent_config.json
+    # From MANIFEST.json: default_config.json -> agent_config.json (manifest)
+    # Also system/factory_defaults.json -> created by vault defaults
     config_file = vault_path / "agent_config.json"
     assert config_file.exists(), f"Expected {config_file} to exist"
+    factory_defaults = vault_path / "system" / "factory_defaults.json"
+    assert factory_defaults.exists(), f"Expected {factory_defaults} to exist"
 
 
-def test_hermetic_vault_creates_knowledge_dirs(hermetic_vault):
+def test_hermetic_vault_creates_global_kb_dirs(hermetic_vault):
     vault_path = Path(hermetic_vault)
-    assert (vault_path / "knowledge" / "system").is_dir()
-    assert (vault_path / "knowledge" / "user").is_dir()
+    assert (vault_path / "global" / "system").is_dir()
+    assert (vault_path / "global" / "user").is_dir()
 
 
-def test_hermetic_vault_creates_sessions_dir(hermetic_vault):
+def test_hermetic_vault_creates_vault_compartments(hermetic_vault):
     vault_path = Path(hermetic_vault)
-    assert (vault_path / "sessions").is_dir()
+    assert (vault_path / "system").is_dir()
+    assert (vault_path / "user").is_dir()
+    assert (vault_path / "credentials").is_dir()
+    assert (vault_path / "workspaces").is_dir()
+    assert (vault_path / "global").is_dir()
+    assert (vault_path / "state").is_dir()
+    assert (vault_path / "logs").is_dir()
 
 
 def test_hermetic_vault_is_isolated_from_real_home(hermetic_vault, tmp_path):

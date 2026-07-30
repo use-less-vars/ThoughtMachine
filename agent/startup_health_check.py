@@ -197,7 +197,7 @@ def _check_directories(report: HealthReport) -> None:
     dirs_to_check = {
         'Log directory': '~/.thoughtmachine/logs',
         'Config backups': '~/.thoughtmachine/config_backups',
-        'Knowledge base': '.thoughtmachine/knowledge',
+        'Knowledge base': '.thoughtmachine/global',
     }
 
     # Also check workspace_path from config if available

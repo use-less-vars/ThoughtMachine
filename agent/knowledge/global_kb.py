@@ -2,11 +2,11 @@
 global_kb.py — Global Knowledge Base management.
 
 Handles synchronisation of the global (user-wide) knowledge base at
-``~/.thoughtmachine/knowledge/`` with the packaged resource files shipped
+``~/.thoughtmachine/global/`` with the packaged resource files shipped
 with ThoughtMachine.
 
 File structure:
-    ~/.thoughtmachine/knowledge/
+    ~/.thoughtmachine/global/
         .version              — currently deployed version string
         system/               — read-only system files synced from package data
             (all .md files from resources/global_kb/)
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-GLOBAL_KB_DIR = Path.home() / ".thoughtmachine" / "knowledge"
+GLOBAL_KB_DIR = Path.home() / ".thoughtmachine" / "global"
 SYSTEM_DIR = GLOBAL_KB_DIR / "system"
 USER_DIR = GLOBAL_KB_DIR / "user"
 
@@ -81,7 +81,7 @@ def ensure_global_kb(version_file: Optional[Path] = None) -> list[str]:
     """Ensure the global knowledge base is populated and up-to-date.
 
     Reads the version from ``resources/global_kb/.version``, compares it with
-    the stored version in ``~/.thoughtmachine/knowledge/.version``, and copies
+    the stored version in ``~/.thoughtmachine/global/.version``, and copies
     system resource files (all .md files from ``resources/global_kb/``) if the
     version has changed or the system directory is missing.
 

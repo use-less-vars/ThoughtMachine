@@ -93,14 +93,14 @@ FALLBACK_FRONTEND_CONFIG: Dict[str, Any] = {
 # ═══════════════════════════════════════════════════════════════════════════
 
 def load_global_defaults() -> Dict[str, Any]:
-    """Load global defaults from ``~/.thoughtmachine/agent_config.json``.
+    """Load global defaults from ``~/.thoughtmachine/user/defaults.json``.
 
     Auto-creates the file with sensible defaults on first run.
     """
     config_dir = Path.home() / ".thoughtmachine"
-    config_path = config_dir / "agent_config.json"
+    config_path = config_dir / "user" / "defaults.json"
 
-    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
 
     if config_path.exists():
         try:
@@ -362,7 +362,7 @@ class ConfigManager:
 
     @staticmethod
     def load_global_defaults() -> Dict[str, Any]:
-        """Load global defaults from ``~/.thoughtmachine/agent_config.json``."""
+        """Load global defaults from ``~/.thoughtmachine/user/defaults.json``."""
         return load_global_defaults()
 
     @staticmethod

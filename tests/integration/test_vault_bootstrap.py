@@ -56,10 +56,13 @@ class TestVaultBootstrap:
         bootstrap.ensure_user_defaults(overwrite_existing=False)
 
         assert vault.is_dir(), f"Vault root not created at {vault}"
-        assert (vault / "sessions").is_dir()
+        assert (vault / "system").is_dir()
+        assert (vault / "user").is_dir()
+        assert (vault / "credentials").is_dir()
+        assert (vault / "workspaces").is_dir()
+        assert (vault / "global").is_dir()
         assert (vault / "state").is_dir()
-        assert (vault / "knowledge").is_dir()
-        assert (vault / "worker_templates").is_dir()
+        assert (vault / "logs").is_dir()
 
     def test_resource_files_deployed(self, bootstrap, fake_home: Path) -> None:
         """All non-internal manifest files are copied to the vault."""
@@ -137,7 +140,7 @@ class TestVaultBootstrap:
         vault = fake_home / ".thoughtmachine"
         vault.mkdir(parents=True, exist_ok=True)
         # Do NOT call ensure_user_defaults — no config file should exist
-        assert not (vault / "agent_config.json").exists()
+        assert not (vault / "user" / "defaults.json").exists()
 
         cfg = bootstrap.load_user_config()
         assert isinstance(cfg, dict)

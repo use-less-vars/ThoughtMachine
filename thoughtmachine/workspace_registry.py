@@ -1,7 +1,7 @@
 """
 workspace_registry.py — Persistent workspace registry.
 
-Manages a JSON file at ``~/.thoughtmachine/workspace_registry.json`` that
+Manages a JSON file at ``~/.thoughtmachine/state/workspace_registry.json`` that
 tracks all known workspaces.  This replaces ad-hoc directory scanning with
 an explicit registry.
 
@@ -63,7 +63,7 @@ def _user_dir() -> Path:
 
 def _registry_path() -> Path:
     """Return the path to the workspace registry JSON file."""
-    return _user_dir() / "workspace_registry.json"
+    return _user_dir() / "state" / "workspace_registry.json"
 
 
 def _normalize_path(p: str) -> str:
@@ -165,7 +165,7 @@ class WorkspaceRegistry:
     def __init__(self, path: Optional[Path] = None) -> None:
         """Create or open a registry at *path*.
 
-        If *path* is ``None``, the default ``~/.thoughtmachine/workspace_registry.json``
+        If *path* is ``None``, the default ``~/.thoughtmachine/state/workspace_registry.json``
         is used.
         """
         self._path = path or _registry_path()

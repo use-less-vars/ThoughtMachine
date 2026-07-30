@@ -38,14 +38,13 @@ def vault_root() -> Path:
 
 # Sub-directories that form the vault compartment hierarchy.
 VAULT_SUBDIRS: tuple[str, ...] = (
-    "credentials",
-    "knowledge",
-    "sessions",
-    "state",
     "system",
     "user",
-    "worker_templates",
+    "credentials",
     "workspaces",
+    "global",
+    "state",
+    "logs",
 )
 
 
@@ -53,7 +52,8 @@ def ensure_vault_structure() -> list[str]:
     """Create the vault compartment structure under ``~/.thoughtmachine/``.
 
     Each subdirectory is created only if it does not already exist
-    (idempotent).  Directories that already exist are left untouched.
+    (idempotent).  Newly created directories get permissions ``0o700``
+    (owner-only access).
 
     Returns:
         A list of absolute paths to directories that were **created**
@@ -66,6 +66,7 @@ def ensure_vault_structure() -> list[str]:
         target = root / subdir
         if not target.exists():
             target.mkdir(parents=True, exist_ok=True)
+            target.chmod(0o700)
             created.append(str(target))
 
     return created
@@ -77,14 +78,50 @@ _FACTORY_DEFAULTS_RELPATH = "system/factory_defaults.json"
 _CHECKSYSTEM_ALLOWLIST_RELPATH = "system/checksystem_allowlist.json"
 
 
+def _copy_resource(
+    src: Path,
+    dst: Path,
+    overwrite_existing: bool,
+    created: list[str],
+) -> None:
+    """Copy *src* to *dst* if conditions are met and set 0o644 permissions."""
+    if src.exists() and (overwrite_existing or not dst.exists()):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(src), str(dst))
+        dst.chmod(0o644)
+        created.append(str(dst))
+
+
+def _write_file(
+    content: str,
+    dst: Path,
+    overwrite_existing: bool,
+    created: list[str],
+) -> None:
+    """Write *content* to *dst* if conditions are met and set 0o644 permissions."""
+    if overwrite_existing or not dst.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(content, encoding="utf-8")
+        dst.chmod(0o644)
+        created.append(str(dst))
+
+
 def ensure_vault_defaults(
     resources_dir: Path,
     overwrite_existing: bool = False,
 ) -> list[str]:
     """Deploy factory-default resource files into the vault.
 
-    Currently this copies ``resources/factory_defaults.json`` into
-    ``~/.thoughtmachine/system/factory_defaults.json``.
+    Copies / creates the following files:
+
+    * ``system/factory_defaults.json``          — from ``resources/factory_defaults.json``
+    * ``system/checksystem_allowlist.json``     — from ``resources/checksystem_allowlist.json``
+    * ``system/providers.json``                 — from ``resources/default_providers.json``
+    * ``system/default_system_prompt.txt``      — from ``resources/default_system_prompt.txt``
+    * ``system/engineer_system_prompt.txt``     — from ``resources/engineer_system_prompt.txt``
+    * ``system/.vault_version``                 — from ``get_version()``
+    * ``state/session_registry.json``           — written as ``[]``
+    * ``state/workspace_registry.json``         — written as ``[]``
 
     Args:
         resources_dir: Absolute path to the project-level ``resources/``
@@ -95,25 +132,60 @@ def ensure_vault_defaults(
     Returns:
         A list of absolute paths to files that were written.
     """
+    from thoughtmachine.bootstrap import get_version
+
     created: list[str] = []
     root = vault_root()
 
-    # Ensure the system subdirectory exists
-    (root / "system").mkdir(parents=True, exist_ok=True)
+    # 1–2. Copy factory_defaults.json and checksystem_allowlist.json
+    _copy_resource(
+        resources_dir / "factory_defaults.json",
+        root / _FACTORY_DEFAULTS_RELPATH,
+        overwrite_existing, created,
+    )
+    _copy_resource(
+        resources_dir / "checksystem_allowlist.json",
+        root / _CHECKSYSTEM_ALLOWLIST_RELPATH,
+        overwrite_existing, created,
+    )
 
-    # Copy factory_defaults.json
-    src = resources_dir / "factory_defaults.json"
-    dst = root / _FACTORY_DEFAULTS_RELPATH
-    if src.exists() and (overwrite_existing or not dst.exists()):
-        shutil.copy2(str(src), str(dst))
-        created.append(str(dst))
+    # 3. Copy providers.json (from default_providers.json)
+    _copy_resource(
+        resources_dir / "default_providers.json",
+        root / "system" / "providers.json",
+        overwrite_existing, created,
+    )
 
-    # Copy checksystem_allowlist.json
-    src = resources_dir / "checksystem_allowlist.json"
-    dst = root / _CHECKSYSTEM_ALLOWLIST_RELPATH
-    if src.exists() and (overwrite_existing or not dst.exists()):
-        shutil.copy2(str(src), str(dst))
-        created.append(str(dst))
+    # 4–5. Copy system prompt files
+    _copy_resource(
+        resources_dir / "default_system_prompt.txt",
+        root / "system" / "default_system_prompt.txt",
+        overwrite_existing, created,
+    )
+    _copy_resource(
+        resources_dir / "engineer_system_prompt.txt",
+        root / "system" / "engineer_system_prompt.txt",
+        overwrite_existing, created,
+    )
+
+    # 6. Write .vault_version marker
+    _write_file(
+        get_version(),
+        root / "system" / ".vault_version",
+        overwrite_existing, created,
+    )
+
+    # 7–8. Write empty state registry files
+    _write_file(
+        "[]\n",
+        root / "state" / "session_registry.json",
+        overwrite_existing, created,
+    )
+    _write_file(
+        "[]\n",
+        root / "state" / "workspace_registry.json",
+        overwrite_existing, created,
+    )
 
     return created
 

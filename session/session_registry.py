@@ -1,7 +1,7 @@
 """
 session_registry.py — Global session registry.
 
-Maintains a JSON file at ~/.thoughtmachine/session_registry.json that tracks
+Maintains a JSON file at ~/.thoughtmachine/state/session_registry.json that tracks
 every session across all workspaces. Used for fast listing, cross-workspace
 lookup, and rebuilding the session list on startup.
 """
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 def _registry_path() -> Path:
-    return Path.home() / ".thoughtmachine" / "session_registry.json"
+    return Path.home() / ".thoughtmachine" / "state" / "session_registry.json"
 
 
 class SessionRegistry:
