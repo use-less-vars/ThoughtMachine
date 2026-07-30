@@ -118,7 +118,7 @@ def get_effective_permissions(
         {"filesystem": ..., "network": ..., "container": ..., "git": ..., "system": ..., "execution": ..., "worker": ...}
 
     Each value is either a boolean (``True`` / ``False``) for hard allow/deny,
-    a string level (``"write"``, ``"read"``, ``"none"``, ``"banned"``, ``"ask"``),
+    a string level (``"write"``, ``"read"``, ``"none"``, ``"banned"``, ``"ask"``, ``"outbound"``),
     or ``False`` if the workspace forbids the operation.
     """
     # ── Filesystem ──────────────────────────────────────────────────────

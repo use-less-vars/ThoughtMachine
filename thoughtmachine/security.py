@@ -88,7 +88,7 @@ class SessionPermissions(BaseModel):
     ``tool_executor._check_permissions()``:
 
     - **container**:  Boolean — may the tool spawn containers?
-    - **network**:    ``'banned' | 'ask' | 'write'`` (legacy booleans are accepted)
+    - **network**:    ``'banned' | 'ask' | 'write' | 'outbound'`` (legacy booleans are accepted)
     - **filesystem**: ``'banned' | 'read' | 'write' | 'full' | 'ask'``
     - **system**:   ``'banned' | 'read' | 'write' | 'full' | 'ask'``
     - **git**:        ``'banned' | 'read' | 'write' | 'full' | 'ask'``
@@ -99,7 +99,7 @@ class SessionPermissions(BaseModel):
         default=False,
         description='May the tool spawn containers?',
     )
-    network: Literal['banned', 'ask', 'write'] = Field(
+    network: Literal['banned', 'ask', 'write', 'outbound'] = Field(
         default='banned',
         description='Network access level for the session.',
     )
@@ -148,7 +148,7 @@ VALID_PERMISSION_LEVELS = ("banned", "ask", "read", "write")
 # "full" is intentionally excluded — it is not a valid mode for
 # the Docker security gate and should not be settable from the UI.
 PERMISSION_SCHEMA: Dict[str, tuple] = {
-    "network":   ("banned", "ask", "write"),
+    "network":   ("banned", "ask", "write", "outbound"),
     "filesystem": VALID_PERMISSION_LEVELS,   # banned, ask, read, write (no "full")
     "container":  (True, False),
     "execution":  ("banned", "ask", "read", "write"),
