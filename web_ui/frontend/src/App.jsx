@@ -526,8 +526,21 @@ export default function App() {
   const handleOpenNewTab = useCallback((sessionId, sessionName) => {
     // Called by SessionTab when a workspace switch creates a NEW session
     // while the existing tab keeps the old session. Opens a fresh tab.
-    console.log('[App] handleOpenNewTab: opening new tab for', sessionId)
+    console.log('[App] handleOpenNewTab: opening new tab for', sessionId, sessionName)
     loadTab(sessionId)
+    // Record the session name immediately (same pattern as
+    // handleNewSessionCreated) so the new tab shows a human-readable label
+    // instead of "Unnamed" before the sessions list refreshes.
+    if (sessionName) {
+      const store = useStore.getState()
+      const existing = store.sessions.find((s) => s.session_id === sessionId)
+      if (!existing) {
+        store.setSessions([
+          ...store.sessions,
+          { session_id: sessionId, name: sessionName },
+        ])
+      }
+    }
     // Refresh sessions list so the new session appears in the sidebar
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ command: 'list_sessions' }))
