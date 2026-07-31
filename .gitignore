@@ -120,3 +120,7 @@ worker_live_test.txt
 # Node.js binary distribution (vendored)
 node-bin/
 config_snapshot.json
+
+# Local working docs — not part of the repo
+docs/
+
