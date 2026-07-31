@@ -84,6 +84,8 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
   const prevIsActiveRef = useRef(isActive)
   const providersRef = useRef(providers)
   providersRef.current = providers
+  const configRef = useRef(state.config)
+  configRef.current = state.config
   const availableToolsRef = useRef(availableTools)
   availableToolsRef.current = availableTools
   const availableToolsModeRef = useRef(null)
@@ -421,7 +423,21 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
           ...m,
           is_system_notification: m.is_system_notification || false,
         }));
-        const notes = mergedMessages.filter(m => m.is_system_notification);
+        // TODO: Backend dedup tracked for cleanup sprint — the backend re-emits
+        // "[SYSTEM NOTIFICATION] Configuration updated: provider_id=..." on every
+        // query when a pending config is re-applied, even when the provider is
+        // unchanged from what this tab already displays.  Suppress the
+        // user-visible bubble here; proper dedup belongs on the backend.
+        const activeProvider = configRef.current?.provider || configRef.current?.provider_id
+        const visibleMessages = mergedMessages.filter((m) => {
+          if (!m.is_system_notification) return true
+          const text = m.content || ''
+          if (!text.startsWith('[SYSTEM NOTIFICATION] Configuration updated')) return true
+          if (!activeProvider) return true
+          const provMatch = text.match(/(?:provider_id|provider)=([^\s,]+)/)
+          return !(provMatch && provMatch[1] === String(activeProvider))
+        })
+        const notes = visibleMessages.filter(m => m.is_system_notification);
         if (notes.length > 0) console.log('🔔 SYSTEM NOTIFICATIONS:', notes);
         // Detect context compaction messages — force scroll to bottom (R3)
         if (notes.some(m => {
@@ -433,7 +449,7 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
         })) {
           setScrollToBottomKey(k => k + 1)
         }
-        update({ history: mergedMessages })
+        update({ history: visibleMessages })
         // Pagination metadata from the server
         if (msg.total_count !== undefined) {
           setTotalMessages(msg.total_count)
@@ -455,6 +471,14 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
         break
 
       case 'config_changed':
+        // Defensive guard: apply_config must NEVER trigger tab creation or
+        // session switching.  If a config_changed event ever carries a
+        // session_id for a DIFFERENT session, ignore it here — tab management
+        // is driven exclusively by new_session / session_loaded.
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] config_changed for different session, ignoring:', msg.session_id)
+          break
+        }
         // Replace config entirely with what the backend sends.
         // The backend is now the single source of truth; it always sends
         // a complete frontend-format config (including tools, provider, etc.).
