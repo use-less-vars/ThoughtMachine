@@ -2,6 +2,77 @@ import React, { useState, useEffect, useCallback } from 'react'
 
 const API_BASE = ''
 
+// ── Cross-platform path helpers ──────────────────────────────────────────────
+// Handles POSIX (/home/foo), Windows (C:\Users\foo) and UNC (\\server\share)
+// paths so "Up", breadcrumbs and folder navigation work identically on
+// Windows and macOS/Linux.  (Windows polish sprint: the old code split on '/'
+// only, which made C:\Users\foo's parent collapse to '/'.)
+const isWindowsPath = (p) => /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('\\\\')
+
+function getParentPath(path) {
+  if (!path) return null
+  const p = String(path)
+  // Roots have no parent
+  if (p === '/') return null
+  if (/^[A-Za-z]:[\\/]?$/.test(p)) return null                        // C:\  or  C:
+  if (/^\\\\[^\\/]+[\\/][^\\/]+[\\/]?$/.test(p)) return null    // \\server\share
+  const isWin = isWindowsPath(p)
+  const norm = p.replace(/\\/g, '/').replace(/\/+$/, '')
+  const idx = norm.lastIndexOf('/')
+  if (idx < 0) return null
+  let parent = norm.slice(0, idx)
+  if (isWin) {
+    parent = parent.replace(/\//g, '\\')
+    if (/^[A-Za-z]:$/.test(parent)) parent += '\\'   // C:  →  C:\
+  } else {
+    parent = parent === '' ? '/' : parent
+  }
+  return parent
+}
+
+function joinPath(base, name) {
+  if (!base) return name
+  const b = String(base).replace(/[\\/]+$/, '')
+  return b + (isWindowsPath(b) ? '\\' : '/') + name
+}
+
+function buildBreadcrumbs(path) {
+  if (!path) return []
+  const p = String(path)
+  const isWin = isWindowsPath(p)
+  const norm = p.replace(/\\/g, '/').replace(/\/+$/, '')
+  const crumbs = []
+  if (isWin) {
+    const driveMatch = norm.match(/^([A-Za-z]:)(.*)$/)
+    if (driveMatch) {
+      // Windows drive: C:\ → C:\Users → C:\Users\foo
+      let acc = driveMatch[1] + '\\'
+      crumbs.push({ name: driveMatch[1], path: acc, sep: '' })
+      for (const part of driveMatch[2].split('/').filter(Boolean)) {
+        acc += part + '\\'
+        crumbs.push({ name: part, path: acc, sep: '\\' })
+      }
+    } else if (norm.startsWith('//')) {
+      // UNC share: \\server\share → first crumb is the server root
+      const parts = norm.split('/').filter(Boolean)
+      let acc = '\\\\'
+      for (let i = 0; i < parts.length; i++) {
+        acc += parts[i] + '\\'
+        crumbs.push({ name: i === 0 ? '\\\\' + parts[i] : parts[i], path: acc, sep: i === 0 ? '' : '\\' })
+      }
+    }
+  } else {
+    // POSIX: / → /home → /home/foo
+    crumbs.push({ name: '/', path: '/', sep: '' })
+    let acc = ''
+    for (const part of norm.split('/').filter(Boolean)) {
+      acc += '/' + part
+      crumbs.push({ name: part, path: acc, sep: '/' })
+    }
+  }
+  return crumbs
+}
+
 export default function FolderBrowser({ onSelect, startPath, onNavigate }) {
   const [currentPath, setCurrentPath] = useState(null)
   const [homePath, setHomePath] = useState(null)
@@ -70,21 +141,39 @@ export default function FolderBrowser({ onSelect, startPath, onNavigate }) {
   }, [])
 
   const navigateUp = useCallback(() => {
-    if (!currentPath || currentPath === '/') return
-    const parent = currentPath.replace(/\/+$/, '').split('/').slice(0, -1).join('/') || '/'
+    if (!currentPath) return
+    const parent = getParentPath(currentPath)
+    if (!parent) return   // already at a root (/, C:\ or \\server\share)
     navigateTo(parent)
   }, [currentPath, navigateTo])
 
-  // Build breadcrumb segments from current path
-  const breadcrumbs = []
-  if (currentPath) {
-    const parts = currentPath.replace(/\/+$/, '').split('/').filter(Boolean)
-    let accumulated = ''
-    for (const part of parts) {
-      accumulated += '/' + part
-      breadcrumbs.push({ name: part, path: accumulated })
+  // Create a new folder inside the currently viewed directory (New Folder button)
+  const handleCreateFolder = useCallback(async () => {
+    if (!currentPath) return
+    const name = window.prompt('New folder name:', '')
+    if (!name) return
+    const trimmed = name.trim()
+    if (!trimmed) return
+    try {
+      const res = await fetch(`${API_BASE}/api/browse/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parent_path: currentPath, name: trimmed }),
+      })
+      const data = await res.json()
+      if (data.success) {
+        setError('')
+        navigateTo(currentPath)  // refresh listing to reveal the new folder
+      } else {
+        setError(data.error || 'Failed to create folder')
+      }
+    } catch {
+      setError('Network error while creating folder')
     }
-  }
+  }, [currentPath, navigateTo])
+
+  // Build breadcrumb segments from current path (cross-platform)
+  const breadcrumbs = buildBreadcrumbs(currentPath)
 
   // Always show "Select This Folder" when a folder is being viewed
   const showSelectButton = !!currentPath
@@ -212,16 +301,9 @@ export default function FolderBrowser({ onSelect, startPath, onNavigate }) {
     <div style={containerStyle}>
       {/* Breadcrumb navigation */}
       <div style={breadcrumbStyle}>
-        <button
-          style={breadcrumbBtnStyle}
-          onClick={() => navigateTo('/')}
-          title="Root directory"
-        >
-          /
-        </button>
         {breadcrumbs.map((seg, i) => (
           <React.Fragment key={seg.path}>
-            <span style={separatorStyle}>/</span>
+            {i > 0 && <span style={separatorStyle}>{seg.sep || '/'}</span>}
             <button
               style={breadcrumbBtnStyle}
               onClick={() => navigateTo(seg.path)}
@@ -231,6 +313,16 @@ export default function FolderBrowser({ onSelect, startPath, onNavigate }) {
             </button>
           </React.Fragment>
         ))}
+        <span style={{ flex: 1 }} />
+        {currentPath && (
+          <button
+            style={breadcrumbBtnStyle}
+            onClick={handleCreateFolder}
+            title={`Create a new folder in ${currentPath}`}
+          >
+            ＋ New Folder
+          </button>
+        )}
       </div>
 
       {/* Error message */}
@@ -249,7 +341,7 @@ export default function FolderBrowser({ onSelect, startPath, onNavigate }) {
       {!loading && !error && (
         <>
           {/* Separate "Up" button above the list */}
-          {currentPath && currentPath !== '/' && (
+          {currentPath && getParentPath(currentPath) && (
             <button
               style={upBtnOuterStyle}
               onClick={navigateUp}
@@ -283,7 +375,7 @@ export default function FolderBrowser({ onSelect, startPath, onNavigate }) {
                 >
                   <span
                     style={entryNameStyle}
-                    onClick={() => navigateTo(currentPath.replace(/\/+$/, '') + '/' + entry.name)}
+                    onClick={() => navigateTo(joinPath(currentPath, entry.name))}
                   >
                     📁 {entry.name}
                   </span>
