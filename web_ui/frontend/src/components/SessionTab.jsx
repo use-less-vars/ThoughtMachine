@@ -11,11 +11,12 @@
  *   onSessionSaved — called with (sessionId) so App can track new sessions
  *   onNewSession   — called with (sessionId) when a new session is created
  *
- * State (local — not in Zustand):
- *   status, history, tokensIn/Out, contextLength, isRunning, config
+ * State (session-scoped — in Zustand store, sub-step 2.2):
+ *   status, history, tokensIn/Out, contextLength, isRunning, config,
+ *   providers, availableTools — keyed by sessionId, read via selectors
  *
- * Child components receive session state as props instead of reading
- * from the global store.
+ * Child components receive session state as props sourced from store
+ * selectors; prop-drilling removal is sub-step 2.4.
  */
 
 import React, { useEffect, useRef, useState, useCallback } from 'react'
@@ -36,22 +37,13 @@ const WS_URL = `ws://${window.location.hostname}:${WS_PORT}/ws`
 // ────────────────────────────────────────────────────────────────────────────
 // Initial per-tab state
 // ────────────────────────────────────────────────────────────────────────────
-const INITIAL_STATE = {
-  status: 'IDLE',
-  history: [],
-  tokensIn: 0,
-  tokensOut: 0,
-  contextLength: 0,
-  isRunning: false,
-  config: null,
-  workspaceId: null,
-}
+// Session-scoped initial values now live in the Zustand store
+// (see DEFAULT_SESSION_CONFIG / DEFAULT_SESSION_STATE in useStore.js).
 
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
 function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onSessionRenamed, selectedWorker, onSelectWorker, onWorkerEvent, onLoggingConfigChanged, sessionName = '' }) {
-  const [state, setState] = useState(INITIAL_STATE)
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
   const [displayName, setDisplayName] = useState(sessionName || '')
   const [isRenaming, setIsRenaming] = useState(false)
@@ -59,8 +51,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const deleteConfirmRef = useRef(null)
   const currentSessionIdRef = useRef(currentSessionId)
-  const [providers, setProviders] = useState([])
-  const [availableTools, setAvailableTools] = useState([])
+  const [workspaceId, setWorkspaceId] = useState(null) // session metadata; no store slice yet (kept local)
   const wsRef = useRef(null)
   const closedRef = useRef(false)  // prevent double-close
   const tabConnectingRef = useRef(false)  // prevent StrictMode duplicate
@@ -82,13 +73,27 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const mode = useStore((s) => (sessionId ? (s.sessionModes[sessionId] || null) : null))
   const modeRef = useRef(mode)
   modeRef.current = mode
+  // ── Store subscriptions (sub-step 2.2): session-scoped state lives in Zustand ──
+  const storeKey = currentSessionId || sessionId
+  const sessionConfig = useStore((s) => s.sessionConfigs[storeKey])
+  const sessionMessages = useStore((s) => s.sessionMessages[storeKey])
+  const sessionState = useStore((s) => s.sessionStates[storeKey])
+  const config = sessionConfig?.config ?? null
+  const providers = sessionConfig?.providers ?? []
+  const availableTools = sessionConfig?.tools ?? []
+  const history = sessionMessages ?? []
+  const status = sessionState?.state ?? 'IDLE'
+  const isRunning = sessionState?.isRunning ?? false
+  const contextLength = sessionState?.contextLength ?? 0
+  const tokensIn = sessionState?.tokensIn ?? 0
+  const tokensOut = sessionState?.tokensOut ?? 0
   const isActiveRef = useRef(isActive)
   isActiveRef.current = isActive
   const prevIsActiveRef = useRef(isActive)
   const providersRef = useRef(providers)
   providersRef.current = providers
-  const configRef = useRef(state.config)
-  configRef.current = state.config
+  const configRef = useRef(config)
+  configRef.current = config
   const availableToolsRef = useRef(availableTools)
   availableToolsRef.current = availableTools
   const availableToolsModeRef = useRef(null)
@@ -150,7 +155,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
       setIsDeferred(false)
       loadSentRef.current = true
     }
-  }, [isDeferred, state.history])
+  }, [isDeferred, history])
 
   // ── Derived helpers ─────────────────────────────────────────────────────
   // ── Keep currentSessionIdRef in sync (avoids stale closure in handleEvent) ──
@@ -158,29 +163,15 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     currentSessionIdRef.current = currentSessionId
   }, [currentSessionId])
 
-  const update = useCallback((patch) => {
-    setState((prev) => ({
-      ...prev,
-      ...(typeof patch === 'function' ? patch(prev) : patch),
-    }))
-  }, [])
-
   // ── Report running state to the store (for tab color) ────────────────
   // Written directly to Zustand (keyed by sessionId); previously went via
   // the onRunningChange prop keyed by tabId.
   useEffect(() => {
     const sid = currentSessionIdRef.current || sessionId
     if (sid) {
-      useStore.getState().setTabRunningState(sid, state.status)
+      useStore.getState().setTabRunningState(sid, status)
     }
-  }, [state.status, sessionId])
-
-  // ── Debug: log whenever history changes ─────────────────────────────
-  useEffect(() => {
-    console.log('[SessionTab] history updated, length:', state.history.length,
-      'first role:', state.history[0]?.role,
-      'last role:', state.history[state.history.length - 1]?.role)
-  }, [state.history])
+  }, [status, sessionId])
 
   // ── sendCommand — sends over this tab's WebSocket with auto-queue ───
   // If the WS is not OPEN, the command is queued and resent once the
@@ -390,10 +381,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           console.warn('[SessionTab] state_changed for different session, ignoring:', msg.session_id)
           break
         }
-        update({
-          status: msg.state,
-          isRunning: msg.is_running !== false,
-        })
+        useStore.getState().receiveStateChanged(msg.session_id || currentSessionIdRef.current, msg.state)
         break
 
       case 'tokens_updated':
@@ -402,10 +390,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           break
         }
         console.log('[TOKEN_PIPELINE] SessionTab: tokens_updated arrived', { type: msg.type, input: msg.input, output: msg.output, source: msg.source })
-        update({
-          tokensIn: msg.input ?? 0,
-          tokensOut: msg.output ?? 0,
-        })
+        useStore.getState().receiveTokensUpdated(msg.session_id || currentSessionIdRef.current, msg)
         // Forward to worker panel if this is a worker-sourced token update
         // IMPORTANT: Use currentSessionIdRef to avoid stale closure (connectSessionWs has [] deps)
         if (msg.source === 'worker') {
@@ -417,7 +402,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
 
       case 'context_updated':
         console.log('[TOKEN_PIPELINE] SessionTab: context_updated arrived', { context_length: msg.context_length, source: msg.source, worker_name: msg.worker_name })
-        update({ contextLength: msg.context_length ?? 0 })
+        useStore.getState().updateContextLength(msg.session_id || currentSessionIdRef.current, msg.context_length ?? 0)
         // Forward to worker panel if this is a worker-sourced context update
         // IMPORTANT: Use currentSessionIdRef to avoid stale closure (connectSessionWs has [] deps)
         if (msg.source === 'worker') {
@@ -469,7 +454,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         })) {
           setScrollToBottomKey(k => k + 1)
         }
-        update({ history: visibleMessages })
+        useStore.getState().receiveConversationChanged(msg.session_id || currentSessionIdRef.current, visibleMessages)
         // Pagination metadata from the server
         if (msg.total_count !== undefined) {
           setTotalMessages(msg.total_count)
@@ -484,9 +469,11 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           ...m,
           is_system_notification: m.is_system_notification || false,
         }))
-        update((prev) => ({
-          history: [...olderMessages, ...prev.history],
-        }))
+        {
+          const key = msg.session_id || currentSessionIdRef.current
+          const prevHistory = useStore.getState().sessionMessages[key] || []
+          useStore.getState().receiveConversationChanged(key, [...olderMessages, ...prevHistory])
+        }
         setHasMore(msg.has_more === true)
         break
 
@@ -502,7 +489,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         // Replace config entirely with what the backend sends.
         // The backend is now the single source of truth; it always sends
         // a complete frontend-format config (including tools, provider, etc.).
-        update({ config: msg.config })
+        useStore.getState().receiveConfigChanged(msg.session_id || currentSessionIdRef.current, msg)
         // Re-fetch available tools if the mode changed (e.g. session loaded
         // from disk where mode wasn't known at initial WS connection time).
         if (msg.config?.mode && msg.config.mode !== (availableToolsModeRef.current || 'custom')) {
@@ -516,18 +503,21 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         break
 
       case 'status_message':
-        update((prev) => ({
-          history: [
-            ...prev.history,
+        {
+          const key = msg.session_id || currentSessionIdRef.current
+          const prevHistory = useStore.getState().sessionMessages[key] || []
+          useStore.getState().receiveConversationChanged(key, [
+            ...prevHistory,
             { role: 'system', content: msg.text ?? '', is_system_notification: true },
-          ],
-        }))
+          ])
+        }
         break
 
       case 'session_loaded':
         dataReceivedRef.current = true;
         if (msg.workspace_id) {
-          update({ workspaceId: msg.workspace_id })
+          // Session metadata — no dedicated store slice yet (kept local).
+          setWorkspaceId(msg.workspace_id)
         }
         if (msg.session_id) {
           if (sessionId && sessionId !== msg.session_id) {
@@ -535,9 +525,14 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
             // that created a new session. Notify parent to open a new tab for it,
             // while keeping this tab pointing to the original session.
             console.log('[SessionTab] session_loaded for DIFFERENT session, opening new tab:', msg.session_id)
+            // Register the new session in the store before handing it to a new tab
+            useStore.getState().registerSession(msg.session_id)
+            useStore.getState().receiveSessionLoaded(msg.session_id, msg)
             onOpenNewTab?.(msg.session_id, msg.session_name)
           } else {
             // Fresh tab (no sessionId yet) → update currentSessionId
+            useStore.getState().registerSession(msg.session_id)
+            useStore.getState().receiveSessionLoaded(msg.session_id, msg)
             setCurrentSessionId(msg.session_id)
             setDisplayName(msg.session_name || displayName)
             setSessionReady(true)
@@ -554,7 +549,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           console.warn('[SessionTab] providers_list for different session, ignoring:', msg.session_id)
           break
         }
-        setProviders(msg.providers || [])
+        useStore.getState().receiveProvidersList(msg.session_id || currentSessionIdRef.current, msg.providers || [])
         break
 
       case 'provider_saved':
@@ -570,7 +565,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           console.warn('[SessionTab] tools_list for different session, ignoring:', msg.session_id)
           break
         }
-        setAvailableTools(msg.tools || [])
+        useStore.getState().receiveToolsList(msg.session_id || currentSessionIdRef.current, msg.tools || [])
         break
 
       case 'default_config_saved':
@@ -646,9 +641,9 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         // (belt-and-suspenders — the bridge should flatten to 'tokens_updated',
         //  but if it doesn't, this ensures the counter still updates).
         if (msg.type === 'worker:tokens_updated') {
-          update({
-            tokensIn: msg.data?.total_input ?? 0,
-            tokensOut: msg.data?.total_output ?? 0,
+          useStore.getState().receiveTokensUpdated(msg.session_id || currentSessionIdRef.current, {
+            input: msg.data?.total_input ?? 0,
+            output: msg.data?.total_output ?? 0,
           })
         }
         // Use refs to avoid stale closure (connectSessionWs has [] deps)
@@ -701,9 +696,9 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
 
   // ── Load more (pagination) ────────────────────────────────────────────────
   const loadMore = useCallback(() => {
-    const offset = state.history.length
+    const offset = history.length
     sendCommand('load_more_messages', { offset, limit: 20 })
-  }, [state.history.length, sendCommand])
+  }, [history.length, sendCommand])
 
   // ── Auto-focus delete confirm button ────────────────────────────────────────
   useEffect(() => {
@@ -811,21 +806,21 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         ) : null}
       </div>
       <StatusBar
-        status={state.status}
-        tokensIn={state.tokensIn}
-        tokensOut={state.tokensOut}
-        contextLength={state.contextLength}
+        status={status}
+        tokensIn={tokensIn}
+        tokensOut={tokensOut}
+        contextLength={contextLength}
       />
       <div className="app-main">
         <ConfigPanel
           mode={mode}
-          config={state.config}
+          config={config}
           sendCommand={sendCommand}
           providers={providers}
           availableTools={availableTools}
           panelWidth={configPanelWidth}
           wsConnected={wsConnected}
-          workspaceId={state.workspaceId}
+          workspaceId={workspaceId}
           sessionId={currentSessionId}
           defaultConfigSaveStatus={defaultConfigSaveStatus}
           onClearDefaultSaveStatus={() => {
@@ -850,12 +845,12 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
               onDismiss={() => setSecurityPrompt(null)}
             />
           )}
-          <ChatPanel messages={state.history} loadMore={loadMore} hasMore={hasMore} scrollToBottomKey={scrollToBottomKey} />
+          <ChatPanel messages={history} loadMore={loadMore} hasMore={hasMore} scrollToBottomKey={scrollToBottomKey} />
           <QueryBar
             sendCommand={sendCommand}
-            status={state.status}
-            isRunning={state.isRunning}
-            config={state.config}
+            status={status}
+            isRunning={isRunning}
+            config={config}
             mode={mode}
             sessionId={currentSessionId}
             sessionReady={sessionReady}
