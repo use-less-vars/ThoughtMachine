@@ -461,7 +461,8 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
                 <>
                   <label style={labelStyle}><strong>Tools ({displayTools.length} total)</strong></label>
                   {displayTools.length > 0 ? (
-                    displayTools.map((toolName) => {
+                    displayTools.map((tool) => {
+                      const toolName = typeof tool === 'string' ? tool : tool?.name;
                       const toolConfig = draft.tools?.find(t => t.name === toolName);
                       const enabled = toolConfig ? toolConfig.enabled : false;
                 return (
