@@ -19,6 +19,7 @@ const WORKER_STOPPED_TEXT = '⏹ Worker stopped'
 const WORKER_PAUSED_TEXT = '⏸ Worker paused'
 const WORKER_RESUMED_TEXT = '▶ Worker resumed'
 const UNKNOWN_EVENT_TEXT = 'Unknown event: '
+const SYSTEM_NOTIFICATION_EMOJI = '\u26a0\ufe0f'
 
 /**
  * Build a unique ID for deduplication.
@@ -35,16 +36,30 @@ function eventId(evt) {
 }
 
 /**
+ * Build display content for a system notification:
+ *   "⚠️ <message> (<detail>)"
+ * The emoji is always present; message and detail are optional.
+ */
+function notificationContent(message, detail) {
+  const parts = [SYSTEM_NOTIFICATION_EMOJI]
+  const msg = (message || '').trim()
+  if (msg) parts.push(msg)
+  if (detail) parts.push(detail)
+  return parts.join(' ')
+}
+
+/**
  * Adapt a token-warning system_notification into a msg object.
  */
 function tokenWarningMsg(evt) {
   const resp = evt.response || {}
-  // Use the original core message verbatim — the panel is a live view into the kernel
-  const content = resp.message || resp.warning_message || ''
+  const detail = typeof resp.token_count === 'number'
+    ? `(Tokens: ${resp.token_count})`
+    : undefined
   return {
     _id: eventId(evt),
     role: 'user',
-    content: content.trim(),
+    content: notificationContent(resp.message || resp.warning_message, detail),
     is_system_notification: true,
   }
 }
@@ -54,12 +69,13 @@ function tokenWarningMsg(evt) {
  */
 function turnWarningMsg(evt) {
   const resp = evt.response || {}
-  // Use original core message verbatim
-  const content = resp.message || ''
+  const detail = typeof resp.turn_count === 'number'
+    ? `(Turns: ${resp.turn_count})`
+    : undefined
   return {
     _id: eventId(evt),
     role: 'user',
-    content: content.trim(),
+    content: notificationContent(resp.message, detail),
     is_system_notification: true,
   }
 }
@@ -69,12 +85,13 @@ function turnWarningMsg(evt) {
  */
 function timeWarningMsg(evt) {
   const resp = evt.response || {}
-  // Use original core message verbatim
-  const content = resp.message || ''
+  const detail = typeof resp.elapsed_seconds === 'number'
+    ? `(Elapsed: ${resp.elapsed_seconds}s)`
+    : undefined
   return {
     _id: eventId(evt),
     role: 'user',
-    content: content.trim(),
+    content: notificationContent(resp.message, detail),
     is_system_notification: true,
   }
 }
@@ -175,11 +192,16 @@ export default function adaptWorkerEvent(evt) {
       if (type === 'turn_warning') return turnWarningMsg(evt)
       if (type === 'time_warning') return timeWarningMsg(evt)
       if (type === 'context_summarized') {
-        // Use original core message verbatim
+        const detail = typeof resp.context_length === 'number'
+          ? `(Tokens: ${resp.context_length})`
+          : undefined
         return {
           _id: eventId(evt),
           role: 'user',
-          content: (resp.message || 'Context has been summarized. You now have a fresh context window and full access to tools.').trim(),
+          content: notificationContent(
+            resp.message || 'Context has been summarized. You now have a fresh context window and full access to tools.',
+            detail
+          ),
           is_system_notification: true,
         }
       }
@@ -187,7 +209,7 @@ export default function adaptWorkerEvent(evt) {
       return {
         _id: eventId(evt),
         role: 'user',
-        content: (resp.message || 'System notification').trim(),
+        content: notificationContent(resp.message || 'System notification'),
         is_system_notification: true,
       }
     }
