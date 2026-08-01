@@ -19,7 +19,6 @@ const WORKER_STOPPED_TEXT = '⏹ Worker stopped'
 const WORKER_PAUSED_TEXT = '⏸ Worker paused'
 const WORKER_RESUMED_TEXT = '▶ Worker resumed'
 const UNKNOWN_EVENT_TEXT = 'Unknown event: '
-const SYSTEM_NOTIFICATION_EMOJI = '\u26a0\ufe0f'
 
 /**
  * Build a unique ID for deduplication.
@@ -37,11 +36,11 @@ function eventId(evt) {
 
 /**
  * Build display content for a system notification:
- *   "⚠️ <message> (<detail>)"
- * The emoji is always present; message and detail are optional.
+ *   "<message> (<detail>)"
+ * Message and detail are optional.
  */
 function notificationContent(message, detail) {
-  const parts = [SYSTEM_NOTIFICATION_EMOJI]
+  const parts = []
   const msg = (message || '').trim()
   if (msg) parts.push(msg)
   if (detail) parts.push(detail)
