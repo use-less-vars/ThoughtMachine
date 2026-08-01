@@ -16,6 +16,15 @@
 
 import { create } from 'zustand'
 
+export const PERMISSION_DEFAULTS = {
+  filesystem: 'read',
+  network: 'banned',
+  container: false,
+  system: 'read',
+  git: 'read',
+  execution: 'banned',
+}
+
 const initialState = {
   sessions: [],            // list of { session_id, name, created_at, updated_at, preview }
   sessionModes: {},        // { [sessionId]: 'agent' | 'engineer' | 'custom' }

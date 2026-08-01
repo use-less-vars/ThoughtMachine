@@ -3,6 +3,7 @@ import ManageProvidersModal from './ManageProvidersModal';
 import ContainerPanelContent from './ContainerPanel';
 import WorkspacePanel from './WorkspacePanel';
 import PromptLibrary from './PromptLibrary';
+import { PERMISSION_DEFAULTS } from '../store/useStore';
 
 const BACKEND_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
 const API_BASE = `http://${window.location.hostname}:${BACKEND_PORT}`;
@@ -509,7 +510,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>Filesystem</strong></label>
             <select
-              value={draft.session_permissions?.filesystem ?? 'read'}
+              value={draft.session_permissions?.filesystem ?? PERMISSION_DEFAULTS.filesystem}
               onChange={(e) => setDraft({
                 ...draft,
                 session_permissions: { ...draft.session_permissions, filesystem: e.target.value }
@@ -530,7 +531,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>Network</strong></label>
             <select
-              value={draft.session_permissions?.network ?? 'banned'}
+              value={draft.session_permissions?.network ?? PERMISSION_DEFAULTS.network}
               onChange={(e) => setDraft({
                 ...draft,
                 session_permissions: { ...draft.session_permissions, network: e.target.value }
@@ -552,7 +553,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               <label className="toggle-switch">
                 <input
                   type="checkbox"
-                  checked={draft.session_permissions?.container ?? false}
+                  checked={draft.session_permissions?.container ?? PERMISSION_DEFAULTS.container}
                   onChange={(e) => setDraft({
                     ...draft,
                     session_permissions: { ...draft.session_permissions, container: e.target.checked }
@@ -572,7 +573,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>Git</strong></label>
             <select
-              value={draft.session_permissions?.git ?? 'read'}
+              value={draft.session_permissions?.git ?? PERMISSION_DEFAULTS.git}
               onChange={(e) => setDraft({
                 ...draft,
                 session_permissions: { ...draft.session_permissions, git: e.target.value }
@@ -593,7 +594,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>System</strong></label>
             <select
-              value={draft.session_permissions?.system ?? 'read'}
+              value={draft.session_permissions?.system ?? PERMISSION_DEFAULTS.system}
               onChange={(e) => setDraft({
                 ...draft,
                 session_permissions: { ...draft.session_permissions, system: e.target.value }
@@ -614,7 +615,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>Worker Access</strong></label>
             <select
-              value={draft.session_permissions?.execution ?? 'banned'}
+              value={draft.session_permissions?.execution ?? PERMISSION_DEFAULTS.execution}
               onChange={(e) => setDraft({
                 ...draft,
                 session_permissions: { ...draft.session_permissions, execution: e.target.value }
