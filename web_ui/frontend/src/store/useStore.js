@@ -12,6 +12,12 @@
  *   - workerEvents: per-session worker event log
  *     ({ [sessionId]: [{ type, timestamp, ... }] }), written via
  *     SessionTab's onWorkerEvent and capped at 500 events/session.
+ *   - sessionConfigs: per-session config snapshot
+ *     ({ [sessionId]: { config, permissions, providers, tools, isLoaded } })
+ *   - sessionMessages: per-session conversation
+ *     ({ [sessionId]: [messages] })
+ *   - sessionStates: per-session runtime state
+ *     ({ [sessionId]: { isRunning, state, contextLength, tokensIn, tokensOut } })
  *
  * Each SessionTab manages its own local state (status, history, tokens,
  * config, etc.) via useState, since those are per-tab concerns.
@@ -33,11 +39,24 @@ export const PERMISSION_DEFAULTS = {
 // assistant_message emitted for the same step.
 const CANONICAL_WORKER_EVENT_TYPES = new Set(['final_response', 'worker_message', 'assistant_message'])
 
+// Default per-session entries created by registerSession / receive* actions.
+const DEFAULT_SESSION_CONFIG = { config: null, permissions: null, providers: [], tools: [], isLoaded: false }
+const DEFAULT_SESSION_STATE = { isRunning: false, state: null, contextLength: 0, tokensIn: 0, tokensOut: 0 }
+
+// Normalize a tools list to plain names: string entries stay as-is,
+// object entries (e.g. { name, enabled }) become their name.
+function normalizeTools(tools) {
+  return (tools || []).map((t) => (typeof t === 'string' ? t : t?.name ?? ''))
+}
+
 const initialState = {
   sessions: [],            // list of { session_id, name, created_at, updated_at, preview }
   sessionModes: {},        // { [sessionId]: 'agent' | 'engineer' | 'custom' }
   tabRunningStates: {},    // { [sessionId]: status string ('RUNNING' | 'PAUSED' | ...) }
   workerEvents: {},        // { [sessionId]: [{ type, timestamp, ... }] }
+  sessionConfigs: {},      // { [sessionId]: { config, permissions, providers, tools, isLoaded } }
+  sessionMessages: {},     // { [sessionId]: [messages] }
+  sessionStates: {},       // { [sessionId]: { isRunning, state, contextLength, tokensIn, tokensOut } }
 }
 
 const useStore = create((set) => ({
@@ -71,6 +90,118 @@ const useStore = create((set) => ({
 
   clearWorkerEvents: (sessionId) =>
     set((state) => ({ workerEvents: { ...state.workerEvents, [sessionId]: [] } })),
+
+  registerSession: (sessionId) =>
+    set((state) => {
+      // Create per-session entries if missing; never overwrite existing data.
+      const config = state.sessionConfigs[sessionId] || DEFAULT_SESSION_CONFIG
+      const messages = state.sessionMessages[sessionId] || []
+      const runtimeState = state.sessionStates[sessionId] || DEFAULT_SESSION_STATE
+      const events = state.workerEvents[sessionId] || []
+      return {
+        sessionConfigs: { ...state.sessionConfigs, [sessionId]: config },
+        sessionMessages: { ...state.sessionMessages, [sessionId]: messages },
+        sessionStates: { ...state.sessionStates, [sessionId]: runtimeState },
+        workerEvents: { ...state.workerEvents, [sessionId]: events },
+      }
+    }),
+
+  removeSession: (sessionId) =>
+    set((state) => {
+      // Destructure-rest: drop the session's entries from all per-session slices.
+      const { [sessionId]: _removedConfig, ...sessionConfigs } = state.sessionConfigs
+      const { [sessionId]: _removedMessages, ...sessionMessages } = state.sessionMessages
+      const { [sessionId]: _removedStates, ...sessionStates } = state.sessionStates
+      const { [sessionId]: _removedEvents, ...workerEvents } = state.workerEvents
+      return { sessionConfigs, sessionMessages, sessionStates, workerEvents }
+    }),
+
+  receiveSessionLoaded: (sessionId, payload) =>
+    set((state) => ({
+      // session_loaded carries metadata (session_id/name/workspace); config /
+      // permissions / providers / tools arrive via their own events, so default
+      // any missing fields here.
+      sessionConfigs: {
+        ...state.sessionConfigs,
+        [sessionId]: {
+          config: payload?.config ?? null,
+          permissions: payload?.permissions ?? null,
+          providers: payload?.providers || [],
+          tools: normalizeTools(payload?.tools),
+          isLoaded: true,
+        },
+      },
+    })),
+
+  receiveConfigChanged: (sessionId, payload) =>
+    set((state) => ({
+      // REPLACE the whole entry (same shape as receiveSessionLoaded) — do not
+      // merge with the previous config snapshot.
+      sessionConfigs: {
+        ...state.sessionConfigs,
+        [sessionId]: {
+          config: payload?.config ?? null,
+          permissions: payload?.permissions ?? null,
+          providers: payload?.providers || [],
+          tools: normalizeTools(payload?.tools),
+          isLoaded: true,
+        },
+      },
+    })),
+
+  receiveProvidersList: (sessionId, providers) =>
+    set((state) => ({
+      sessionConfigs: {
+        ...state.sessionConfigs,
+        [sessionId]: { ...(state.sessionConfigs[sessionId] || DEFAULT_SESSION_CONFIG), providers },
+      },
+    })),
+
+  receiveToolsList: (sessionId, tools) =>
+    set((state) => ({
+      sessionConfigs: {
+        ...state.sessionConfigs,
+        [sessionId]: { ...(state.sessionConfigs[sessionId] || DEFAULT_SESSION_CONFIG), tools: normalizeTools(tools) },
+      },
+    })),
+
+  receiveConversationChanged: (sessionId, messages) =>
+    set((state) => ({ sessionMessages: { ...state.sessionMessages, [sessionId]: messages || [] } })),
+
+  receiveStateChanged: (sessionId, state) =>
+    set((state) => ({
+      sessionStates: {
+        ...state.sessionStates,
+        [sessionId]: {
+          ...(state.sessionStates[sessionId] || DEFAULT_SESSION_STATE),
+          isRunning: state === 'RUNNING',
+          state,
+        },
+      },
+    })),
+
+  updateContextLength: (sessionId, length) =>
+    set((state) => ({
+      sessionStates: {
+        ...state.sessionStates,
+        [sessionId]: { ...(state.sessionStates[sessionId] || DEFAULT_SESSION_STATE), contextLength: length },
+      },
+    })),
+
+  receiveTokensUpdated: (sessionId, payload) =>
+    set((state) => ({
+      // tokens_updated payload carries { input, output } — FLAGGED EXTENSION:
+      // tokensIn/tokensOut live in sessionStates so token info can be read from
+      // the store instead of SessionTab local state.
+      sessionStates: {
+        ...state.sessionStates,
+        [sessionId]: {
+          ...(state.sessionStates[sessionId] || DEFAULT_SESSION_STATE),
+          tokensIn: payload?.input ?? 0,
+          tokensOut: payload?.output ?? 0,
+        },
+      },
+    })),
 
   removeSessionState: (sessionId) =>
     set((state) => {
