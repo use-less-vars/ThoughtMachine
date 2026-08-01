@@ -168,14 +168,14 @@ const useStore = create((set) => ({
   receiveConversationChanged: (sessionId, messages) =>
     set((state) => ({ sessionMessages: { ...state.sessionMessages, [sessionId]: messages || [] } })),
 
-  receiveStateChanged: (sessionId, state) =>
+  receiveStateChanged: (sessionId, newState) =>
     set((state) => ({
       sessionStates: {
         ...state.sessionStates,
         [sessionId]: {
           ...(state.sessionStates[sessionId] || DEFAULT_SESSION_STATE),
-          isRunning: state === 'RUNNING',
-          state,
+          isRunning: newState === 'RUNNING',
+          state: newState,
         },
       },
     })),
