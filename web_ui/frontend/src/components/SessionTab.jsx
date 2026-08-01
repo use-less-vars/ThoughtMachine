@@ -378,6 +378,10 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
     }
     switch (msg.type) {
       case 'state_changed':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] state_changed for different session, ignoring:', msg.session_id)
+          break
+        }
         update({
           status: msg.state,
           isRunning: msg.is_running !== false,
@@ -385,6 +389,10 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
         break
 
       case 'tokens_updated':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] tokens_updated for different session, ignoring:', msg.session_id)
+          break
+        }
         console.log('[TOKEN_PIPELINE] SessionTab: tokens_updated arrived', { type: msg.type, input: msg.input, output: msg.output, source: msg.source })
         update({
           tokensIn: msg.input ?? 0,
@@ -412,6 +420,10 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
         break
 
       case 'conversation_changed':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] conversation_changed for different session, ignoring:', msg.session_id)
+          break
+        }
         console.log('conversation_changed RAW:', msg)
         // Mark that we've received a response (even if empty) so deferred
         // tabs can exit their placeholder state.
@@ -530,6 +542,10 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
         break
 
       case 'providers_list':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] providers_list for different session, ignoring:', msg.session_id)
+          break
+        }
         setProviders(msg.providers || [])
         break
 
@@ -542,6 +558,10 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
         break
 
       case 'tools_list':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] tools_list for different session, ignoring:', msg.session_id)
+          break
+        }
         setAvailableTools(msg.tools || [])
         break
 
@@ -576,6 +596,10 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
         break
 
       case 'security_prompt':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] security_prompt for different session, ignoring:', msg.session_id)
+          break
+        }
         // Show the security approval dialog (tool permission request)
         console.log('[SessionTab] security_prompt:', msg)
         setSecurityPrompt({
@@ -607,6 +631,10 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
       case 'worker:context_summarized':
       case 'worker:context_cleared':
       case 'worker:token_recovery':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] worker event for different session, ignoring:', msg.session_id)
+          break
+        }
         // For worker:tokens_updated, also update the token counter display
         // (belt-and-suspenders — the bridge should flatten to 'tokens_updated',
         //  but if it doesn't, this ensures the counter still updates).
