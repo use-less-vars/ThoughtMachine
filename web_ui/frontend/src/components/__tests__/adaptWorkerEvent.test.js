@@ -2,7 +2,6 @@ import { describe, it, expect } from 'vitest';
 import adaptWorkerEvent from '../chat/adaptWorkerEvent';
 
 // ── Constants from the source (must match adaptWorkerEvent.js) ────────────
-const SYSTEM_NOTIFICATION_EMOJI = '⚠️';
 const WORKER_STARTED_TEXT = '⬤ Worker started';
 const WORKER_COMPLETED_TEXT = '■ Worker completed';
 const WORKER_STOPPED_TEXT = '⏹ Worker stopped';
@@ -452,7 +451,7 @@ describe('system_notification', () => {
       });
       const result = adaptWorkerEvent(evt);
       expect(result.role).toBe('user');
-      expect(result.content).toBe(`${SYSTEM_NOTIFICATION_EMOJI} Approaching limit (Tokens: 120000)`);
+      expect(result.content).toBe(`Approaching limit (Tokens: 120000)`);
       expect(result.is_system_notification).toBe(true);
     });
 
@@ -462,7 +461,7 @@ describe('system_notification', () => {
         response: { type: 'token_warning', message: 'Warning' },
       });
       const result = adaptWorkerEvent(evt);
-      expect(result.content).toBe(`${SYSTEM_NOTIFICATION_EMOJI} Warning`);
+      expect(result.content).toBe(`Warning`);
     });
 
     it('handles null token_count', () => {
@@ -471,7 +470,7 @@ describe('system_notification', () => {
         response: { type: 'token_warning', message: 'Warning', token_count: null },
       });
       const result = adaptWorkerEvent(evt);
-      expect(result.content).toBe(`${SYSTEM_NOTIFICATION_EMOJI} Warning`);
+      expect(result.content).toBe(`Warning`);
     });
 
     it('handles empty message', () => {
@@ -480,7 +479,7 @@ describe('system_notification', () => {
         response: { type: 'token_warning', message: '' },
       });
       const result = adaptWorkerEvent(evt);
-      expect(result.content).toBe(`${SYSTEM_NOTIFICATION_EMOJI}`);
+      expect(result.content).toBe('');
     });
   });
 
@@ -493,7 +492,7 @@ describe('system_notification', () => {
       });
       const result = adaptWorkerEvent(evt);
       expect(result.role).toBe('user');
-      expect(result.content).toBe(`${SYSTEM_NOTIFICATION_EMOJI} Turn limit near (Turns: 18)`);
+      expect(result.content).toBe(`Turn limit near (Turns: 18)`);
       expect(result.is_system_notification).toBe(true);
     });
 
@@ -503,7 +502,7 @@ describe('system_notification', () => {
         response: { type: 'turn_warning', message: 'Warning' },
       });
       const result = adaptWorkerEvent(evt);
-      expect(result.content).toBe(`${SYSTEM_NOTIFICATION_EMOJI} Warning`);
+      expect(result.content).toBe(`Warning`);
     });
   });
 
@@ -516,7 +515,7 @@ describe('system_notification', () => {
       });
       const result = adaptWorkerEvent(evt);
       expect(result.role).toBe('user');
-      expect(result.content).toBe(`${SYSTEM_NOTIFICATION_EMOJI} Time running out (Elapsed: 55s)`);
+      expect(result.content).toBe(`Time running out (Elapsed: 55s)`);
       expect(result.is_system_notification).toBe(true);
     });
 
@@ -526,7 +525,7 @@ describe('system_notification', () => {
         response: { type: 'time_warning', message: 'Warning' },
       });
       const result = adaptWorkerEvent(evt);
-      expect(result.content).toBe(`${SYSTEM_NOTIFICATION_EMOJI} Warning`);
+      expect(result.content).toBe(`Warning`);
     });
   });
 
@@ -539,7 +538,7 @@ describe('system_notification', () => {
       });
       const result = adaptWorkerEvent(evt);
       expect(result.role).toBe('user');
-      expect(result.content).toBe(`${SYSTEM_NOTIFICATION_EMOJI} Context compressed (Tokens: 5000)`);
+      expect(result.content).toBe(`Context compressed (Tokens: 5000)`);
       expect(result.is_system_notification).toBe(true);
     });
 
@@ -549,7 +548,7 @@ describe('system_notification', () => {
         response: { type: 'context_summarized', message: 'Done', context_length: null },
       });
       const result = adaptWorkerEvent(evt);
-      expect(result.content).toBe(`${SYSTEM_NOTIFICATION_EMOJI} Done`);
+      expect(result.content).toBe(`Done`);
     });
 
     it('handles missing context_length', () => {
@@ -558,7 +557,7 @@ describe('system_notification', () => {
         response: { type: 'context_summarized', message: 'Done' },
       });
       const result = adaptWorkerEvent(evt);
-      expect(result.content).toBe(`${SYSTEM_NOTIFICATION_EMOJI} Done`);
+      expect(result.content).toBe(`Done`);
     });
   });
 
@@ -571,7 +570,7 @@ describe('system_notification', () => {
       });
       const result = adaptWorkerEvent(evt);
       expect(result.role).toBe('user');
-      expect(result.content).toBe(`${SYSTEM_NOTIFICATION_EMOJI} Something happened`);
+      expect(result.content).toBe(`Something happened`);
       expect(result.is_system_notification).toBe(true);
     });
 
@@ -581,14 +580,14 @@ describe('system_notification', () => {
         response: { type: 'custom_alert' },
       });
       const result = adaptWorkerEvent(evt);
-      expect(result.content).toBe(`${SYSTEM_NOTIFICATION_EMOJI} System notification`);
+      expect(result.content).toBe(`System notification`);
     });
 
     it('handles missing response object', () => {
       const evt = makeEvent({ event: 'system_notification' });
       delete evt.response;
       const result = adaptWorkerEvent(evt);
-      expect(result.content).toBe(`${SYSTEM_NOTIFICATION_EMOJI} System notification`);
+      expect(result.content).toBe(`System notification`);
     });
   });
 });
