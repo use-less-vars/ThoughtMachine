@@ -236,3 +236,238 @@ describe('workerEvents (Phase 1 contract — intentionally failing until Phase 1
     expect(useStore.getState().workerEvents.s2).toHaveLength(1);
   });
 });
+
+// ==========================================================================
+// registerSession — per-session slice initialization (no overwrite)
+// ==========================================================================
+describe('registerSession', () => {
+  it('creates empty per-session entries in all four slices', () => {
+    useStore.getState().registerSession('s1');
+    const st = useStore.getState();
+    expect(st.sessionConfigs.s1).toEqual({ config: null, permissions: null, providers: [], tools: [], isLoaded: false });
+    expect(st.sessionMessages.s1).toEqual([]);
+    expect(st.sessionStates.s1).toEqual({ isRunning: false, state: null, contextLength: 0, tokensIn: 0, tokensOut: 0 });
+    expect(st.workerEvents.s1).toEqual([]);
+  });
+
+  it('does NOT overwrite an existing session entry', () => {
+    useStore.getState().receiveSessionLoaded('s1', { config: { mode: 'custom' } });
+    useStore.getState().addWorkerEvent('s1', { type: 'worker_message', timestamp: 'T1' });
+    useStore.getState().registerSession('s1');
+    const st = useStore.getState();
+    expect(st.sessionConfigs.s1).toEqual({
+      config: { mode: 'custom' },
+      permissions: null,
+      providers: [],
+      tools: [],
+      isLoaded: true,
+    });
+    expect(st.workerEvents.s1).toHaveLength(1);
+  });
+});
+
+// ==========================================================================
+// removeSession — drops a session from all four slices, keeps others
+// ==========================================================================
+describe('removeSession', () => {
+  it('removes a session from all four slices and leaves other sessions intact', () => {
+    useStore.getState().registerSession('s1');
+    useStore.getState().registerSession('s2');
+    useStore.getState().receiveSessionLoaded('s1', {});
+    useStore.getState().receiveConversationChanged('s1', [{ role: 'user', content: 'hi' }]);
+    useStore.getState().receiveStateChanged('s1', 'RUNNING');
+    useStore.getState().addWorkerEvent('s1', { type: 'worker_message', timestamp: 'T1' });
+    useStore.getState().receiveSessionLoaded('s2', {});
+    useStore.getState().removeSession('s1');
+    const st = useStore.getState();
+    expect(st.sessionConfigs.s1).toBeUndefined();
+    expect(st.sessionMessages.s1).toBeUndefined();
+    expect(st.sessionStates.s1).toBeUndefined();
+    expect(st.workerEvents.s1).toBeUndefined();
+    expect(st.sessionConfigs.s2).toBeDefined();
+    expect(st.sessionMessages.s2).toEqual([]);
+  });
+});
+
+// ==========================================================================
+// receiveSessionLoaded — snapshot from the session_loaded event
+// ==========================================================================
+describe('receiveSessionLoaded', () => {
+  it('stores config/permissions/providers/tools and marks isLoaded', () => {
+    useStore.getState().receiveSessionLoaded('s1', {
+      type: 'session_loaded',
+      session_id: 's1',
+      config: { mode: 'custom' },
+      permissions: { network: 'banned' },
+      providers: [{ id: 'p1' }],
+      tools: [{ name: 'read_file' }, 'glob'],
+    });
+    expect(useStore.getState().sessionConfigs.s1).toEqual({
+      config: { mode: 'custom' },
+      permissions: { network: 'banned' },
+      providers: [{ id: 'p1' }],
+      tools: ['read_file', 'glob'],
+      isLoaded: true,
+    });
+  });
+
+  it('normalizes object tools to names and tolerates missing fields', () => {
+    useStore.getState().receiveSessionLoaded('s1', { type: 'session_loaded' });
+    expect(useStore.getState().sessionConfigs.s1).toEqual({
+      config: null,
+      permissions: null,
+      providers: [],
+      tools: [],
+      isLoaded: true,
+    });
+  });
+});
+
+// ==========================================================================
+// receiveConfigChanged — REPLACES, does not merge
+// ==========================================================================
+describe('receiveConfigChanged', () => {
+  it('replaces the whole entry (no merge with previous providers/tools)', () => {
+    useStore.getState().receiveSessionLoaded('s1', { providers: [{ id: 'p1' }], tools: ['read_file'] });
+    useStore.getState().receiveConfigChanged('s1', { config: { mode: 'agent' } });
+    expect(useStore.getState().sessionConfigs.s1).toEqual({
+      config: { mode: 'agent' },
+      permissions: null,
+      providers: [],
+      tools: [],
+      isLoaded: true,
+    });
+  });
+});
+
+// ==========================================================================
+// receiveProvidersList — providers array without clobbering the entry
+// ==========================================================================
+describe('receiveProvidersList', () => {
+  it('stores the providers array without clobbering config', () => {
+    useStore.getState().receiveSessionLoaded('s1', { config: { mode: 'custom' } });
+    useStore.getState().receiveProvidersList('s1', [{ id: 'p1' }, { id: 'p2' }]);
+    const entry = useStore.getState().sessionConfigs.s1;
+    expect(entry.providers).toEqual([{ id: 'p1' }, { id: 'p2' }]);
+    expect(entry.config).toEqual({ mode: 'custom' });
+  });
+
+  it('creates the entry when missing', () => {
+    useStore.getState().receiveProvidersList('s1', [{ id: 'p1' }]);
+    expect(useStore.getState().sessionConfigs.s1.providers).toEqual([{ id: 'p1' }]);
+  });
+});
+
+// ==========================================================================
+// receiveToolsList — normalization of string/object entries
+// ==========================================================================
+describe('receiveToolsList', () => {
+  it('normalizes mixed string/object tools and preserves the rest of the entry', () => {
+    useStore.getState().receiveSessionLoaded('s1', { config: { mode: 'custom' }, providers: [{ id: 'p1' }] });
+    useStore.getState().receiveToolsList('s1', [{ name: 'read_file', enabled: true }, 'glob']);
+    const entry = useStore.getState().sessionConfigs.s1;
+    expect(entry.tools).toEqual(['read_file', 'glob']);
+    expect(entry.config).toEqual({ mode: 'custom' });
+    expect(entry.providers).toEqual([{ id: 'p1' }]);
+  });
+});
+
+// ==========================================================================
+// receiveConversationChanged — replaces the messages array
+// ==========================================================================
+describe('receiveConversationChanged', () => {
+  it('replaces the messages array', () => {
+    useStore.getState().receiveConversationChanged('s1', [{ role: 'user', content: 'a' }]);
+    useStore.getState().receiveConversationChanged('s1', [
+      { role: 'user', content: 'b' },
+      { role: 'assistant', content: 'c' },
+    ]);
+    expect(useStore.getState().sessionMessages.s1).toEqual([
+      { role: 'user', content: 'b' },
+      { role: 'assistant', content: 'c' },
+    ]);
+  });
+});
+
+// ==========================================================================
+// receiveStateChanged — derives isRunning, merges into session state
+// ==========================================================================
+describe('receiveStateChanged', () => {
+  it('derives isRunning from the state string', () => {
+    useStore.getState().receiveStateChanged('s1', 'RUNNING');
+    expect(useStore.getState().sessionStates.s1.isRunning).toBe(true);
+    useStore.getState().receiveStateChanged('s1', 'PAUSED');
+    expect(useStore.getState().sessionStates.s1.isRunning).toBe(false);
+    useStore.getState().receiveStateChanged('s1', 'WAITING_FOR_USER');
+    expect(useStore.getState().sessionStates.s1.isRunning).toBe(false);
+  });
+
+  it('preserves contextLength/tokens on subsequent state changes', () => {
+    useStore.getState().updateContextLength('s1', 120);
+    useStore.getState().receiveTokensUpdated('s1', { input: 100, output: 50 });
+    useStore.getState().receiveStateChanged('s1', 'RUNNING');
+    expect(useStore.getState().sessionStates.s1).toEqual({
+      isRunning: true,
+      state: 'RUNNING',
+      contextLength: 120,
+      tokensIn: 100,
+      tokensOut: 50,
+    });
+  });
+});
+
+// ==========================================================================
+// updateContextLength — merges contextLength into session state
+// ==========================================================================
+describe('updateContextLength', () => {
+  it('merges contextLength into the session state', () => {
+    useStore.getState().receiveStateChanged('s1', 'RUNNING');
+    useStore.getState().updateContextLength('s1', 500);
+    const st = useStore.getState().sessionStates.s1;
+    expect(st.contextLength).toBe(500);
+    expect(st.isRunning).toBe(true);
+  });
+
+  it('creates the entry when missing', () => {
+    useStore.getState().updateContextLength('s2', 300);
+    expect(useStore.getState().sessionStates.s2.contextLength).toBe(300);
+  });
+});
+
+// ==========================================================================
+// receiveTokensUpdated — flagged extension (tokens live in sessionStates)
+// ==========================================================================
+describe('receiveTokensUpdated', () => {
+  it('stores input/output tokens and preserves other session state', () => {
+    useStore.getState().receiveStateChanged('s1', 'RUNNING');
+    useStore.getState().receiveTokensUpdated('s1', { type: 'tokens_updated', input: 100, output: 50 });
+    const st = useStore.getState().sessionStates.s1;
+    expect(st.tokensIn).toBe(100);
+    expect(st.tokensOut).toBe(50);
+    expect(st.isRunning).toBe(true);
+  });
+});
+
+// ==========================================================================
+// New-slice cross-session isolation
+// ==========================================================================
+describe('new slice cross-session isolation', () => {
+  it('keeps s2 data untouched when s1 is registered/removed', () => {
+    useStore.getState().receiveSessionLoaded('s1', { config: { mode: 'custom' } });
+    useStore.getState().receiveSessionLoaded('s2', { config: { mode: 'engineer' } });
+    useStore.getState().receiveConversationChanged('s1', [{ role: 'user', content: 'x' }]);
+    useStore.getState().receiveStateChanged('s1', 'RUNNING');
+    useStore.getState().removeSession('s1');
+    const st = useStore.getState();
+    expect(st.sessionConfigs.s2).toEqual({
+      config: { mode: 'engineer' },
+      permissions: null,
+      providers: [],
+      tools: [],
+      isLoaded: true,
+    });
+    expect(st.sessionMessages.s2).toBeUndefined();
+    expect(st.sessionStates.s2).toBeUndefined();
+  });
+});
+
