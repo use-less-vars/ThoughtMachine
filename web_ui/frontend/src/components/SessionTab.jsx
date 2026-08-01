@@ -50,7 +50,7 @@ const INITIAL_STATE = {
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
-function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onSessionRenamed, selectedWorker, onSelectWorker, activeSessionId, onClearWorker, onWorkerEvent, onLoggingConfigChanged, sessionName = '' }) {
+function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onSessionRenamed, selectedWorker, onSelectWorker, onWorkerEvent, onLoggingConfigChanged, sessionName = '' }) {
   const [state, setState] = useState(INITIAL_STATE)
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
   const [displayName, setDisplayName] = useState(sessionName || '')
@@ -68,7 +68,6 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const connectSessionWsRef = useRef(null)  // ref to avoid circular deps in sendCommand
   const [wsConnected, setWsConnected] = useState(false)
   const [defaultConfigSaveStatus, setDefaultConfigSaveStatus] = useState(null) // null | 'ok' | 'error'
-  const [defaultConfigSaveMessage, setDefaultConfigSaveMessage] = useState('')
   const [securityPrompt, setSecurityPrompt] = useState(null) // null | { request_id, tool_name, capabilities, ... }
   const [containerRebuildResult, setContainerRebuildResult] = useState(null) // null | { status, buildLog }
   const [sessionReady, setSessionReady] = useState(false) // true after session_loaded confirms session is ready
@@ -576,7 +575,6 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
 
       case 'default_config_saved':
         setDefaultConfigSaveStatus(msg.status)
-        setDefaultConfigSaveMessage(msg.message || '')
         break
 
       case 'session_saved':
@@ -830,18 +828,14 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           workspaceId={state.workspaceId}
           sessionId={currentSessionId}
           defaultConfigSaveStatus={defaultConfigSaveStatus}
-          defaultConfigSaveMessage={defaultConfigSaveMessage}
           onClearDefaultSaveStatus={() => {
             setDefaultConfigSaveStatus(null)
-            setDefaultConfigSaveMessage('')
           }}
           containerRebuildResult={containerRebuildResult}
           onClearRebuildResult={() => setContainerRebuildResult(null)}
           selectedWorker={selectedWorker}
           onSelectWorker={onSelectWorker}
           isActive={isActive}
-          activeSessionId={activeSessionId}
-          onClearWorker={onClearWorker}
         />
         <div
           className="resize-handle"
@@ -879,7 +873,6 @@ export default React.memo(SessionTab, (prevProps, nextProps) => {
   // Ignore changes to callback props (onClose, onRegister, etc.)
   // which create new references on every parent render
   return (
-    prevProps.mode === nextProps.mode &&
     prevProps.sessionId === nextProps.sessionId &&
     prevProps.hubReady === nextProps.hubReady &&
     prevProps.staggerMs === nextProps.staggerMs &&

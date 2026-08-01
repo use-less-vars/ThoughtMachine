@@ -8,19 +8,14 @@ import { PERMISSION_DEFAULTS } from '../store/useStore';
 const BACKEND_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
 const API_BASE = `http://${window.location.hostname}:${BACKEND_PORT}`;
 
-function ConfigPanel({ mode = null, config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, defaultConfigSaveMessage, onClearDefaultSaveStatus, workspaceId, sessionId, containerRebuildResult, onClearRebuildResult, selectedWorker, onSelectWorker, isActive, activeSessionId, onClearWorker }) {
+function ConfigPanel({ mode = null, config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, onClearDefaultSaveStatus, workspaceId, sessionId, containerRebuildResult, onClearRebuildResult, selectedWorker, onSelectWorker, isActive }) {
   const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error'
   const [showManageProviders, setShowManageProviders] = useState(false);
   const [providerVersion, setProviderVersion] = useState(0);  // incremented when a provider is saved
   const [allTools, setAllTools] = useState([]);
   const normalizeSessionPermissions = (permissions) => {
     const normalized = {
-      filesystem: 'read',
-      network: 'banned',
-      container: false,
-      system: 'read',
-      git: 'read',
-      execution: 'banned',
+      ...PERMISSION_DEFAULTS,
       ...(permissions ?? {}),
     };
 
