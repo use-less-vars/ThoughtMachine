@@ -77,6 +77,16 @@ class MockWebSocket {
   }
 }
 
+// ─── Mock ResizeObserver (jsdom lacks it; ChatPanel constructs one on mount) ───
+class MockResizeObserver {
+  constructor(callback) {
+    this.callback = callback;
+  }
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Test helpers
 // ────────────────────────────────────────────────────────────────────────────
@@ -143,6 +153,7 @@ function renderTab(props = {}) {
 beforeEach(() => {
   MockWebSocket.instances = [];
   vi.stubGlobal('WebSocket', MockWebSocket);
+  vi.stubGlobal('ResizeObserver', MockResizeObserver);
   vi.stubGlobal('fetch', vi.fn(async () => ({
     ok: true,
     json: async () => ({ tools: [] }),
