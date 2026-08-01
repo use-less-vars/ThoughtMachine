@@ -211,8 +211,12 @@ describe('SessionTab — WebSocket lifecycle', () => {
     vi.useFakeTimers();
     try {
       renderTab();
-      // Connect happens synchronously in the effect (staggerMs=0); open it.
+      // The mount effect always defers the first connection via
+      // setTimeout(connectSessionWs, staggerMs) — even with staggerMs=0 —
+      // so flush the timer before grabbing the instance (fake timers).
+      act(() => vi.advanceTimersByTime(0));
       const ws = lastWs();
+      expect(ws).toBeTruthy();
       act(() => ws.open());
       const before = MockWebSocket.instances.length;
       act(() => ws.close(1006));
