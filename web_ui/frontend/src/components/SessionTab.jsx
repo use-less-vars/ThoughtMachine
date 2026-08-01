@@ -19,6 +19,7 @@
  */
 
 import React, { useEffect, useRef, useState, useCallback } from 'react'
+import useStore from '../store/useStore'
 import ChatPanel from './ChatPanel'
 import QueryBar from './QueryBar'
 import StatusBar from './StatusBar'
@@ -49,7 +50,7 @@ const INITIAL_STATE = {
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
-function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onRunningChange, onSessionRenamed, selectedWorker, onSelectWorker, activeSessionId, onClearWorker, onWorkerEvent, onLoggingConfigChanged, sessionName = '' }) {
+function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onSessionRenamed, selectedWorker, onSelectWorker, activeSessionId, onClearWorker, onWorkerEvent, onLoggingConfigChanged, sessionName = '' }) {
   const [state, setState] = useState(INITIAL_STATE)
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
   const [displayName, setDisplayName] = useState(sessionName || '')
@@ -77,6 +78,9 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
   const [scrollToBottomKey, setScrollToBottomKey] = useState(0) // incremented to force scroll to bottom (R3)
   const loadSentRef = useRef(false) // true once load_session has been sent (by any path)
   const dataReceivedRef = useRef(false) // true once we've received a response to our load
+  // Read mode from the store (sessionModes is keyed by sessionId; the prop
+  // was removed — SessionTab reads it directly like other consumers).
+  const mode = useStore((s) => (sessionId ? (s.sessionModes[sessionId] || null) : null))
   const modeRef = useRef(mode)
   modeRef.current = mode
   const isActiveRef = useRef(isActive)
@@ -162,10 +166,15 @@ function SessionTab({ mode = null, sessionId, tabId, hubReady, staggerMs = 0, lo
     }))
   }, [])
 
-  // ── Notify parent when running state changes (for tab color) ────────
+  // ── Report running state to the store (for tab color) ────────────────
+  // Written directly to Zustand (keyed by sessionId); previously went via
+  // the onRunningChange prop keyed by tabId.
   useEffect(() => {
-    onRunningChange?.(tabId, state.status)
-  }, [state.status, tabId, onRunningChange])
+    const sid = currentSessionIdRef.current || sessionId
+    if (sid) {
+      useStore.getState().setTabRunningState(sid, state.status)
+    }
+  }, [state.status, sessionId])
 
   // ── Debug: log whenever history changes ─────────────────────────────
   useEffect(() => {

@@ -46,7 +46,6 @@ export default function App() {
   const [tabs, setTabs] = useState([])           // { tabId, sessionId }
   const [activeTabId, setActiveTabId] = useState(null)
   const [showSessions, setShowSessions] = useState(false)
-  const [tabRunningStates, setTabRunningStates] = useState({})
   const wsRef = useRef(null)
   const [hubWs, setHubWs] = useState(null)
   const hubHasConnectedOnceRef = useRef(false)   // persist past StrictMode double-mount
@@ -65,7 +64,6 @@ export default function App() {
     }
   })
 
-  const [sessionModes, setSessionModes] = useState({})
   const [showCreationModal, setShowCreationModal] = useState(false)
   const [showLoggingPanel, setShowLoggingPanel] = useState(false)
   const [loggingConfig, setLoggingConfig] = useState(null)
@@ -371,6 +369,8 @@ export default function App() {
     const closingTab = tabsRef.current.find((t) => t.tabId === tabId)
     if (closingTab?.sessionId) {
       loadedSessionIdsRef.current.delete(closingTab.sessionId)
+      // Drop store slices for this session (mode + running state) on tab close
+      useStore.getState().removeSessionState(closingTab.sessionId)
     }
     setTabs((prev) => {
       const idx = prev.findIndex((t) => t.tabId === tabId)
@@ -405,7 +405,7 @@ export default function App() {
 
       localStorage.setItem('lastSessionMode', mode)
 
-      setSessionModes(prev => ({ ...prev, [data.session_id]: mode }))
+      useStore.getState().setSessionMode(data.session_id, mode)
       setShowCreationModal(false)
       loadTab(data.session_id)
 
@@ -428,10 +428,6 @@ export default function App() {
     setShowCreationModal(false)
     loadTab(sessionId)
   }, [loadTab])
-
-  const handleRunningChange = useCallback((tabId, status) => {
-    setTabRunningStates((prev) => ({ ...prev, [tabId]: status }))
-  }, [])
 
   const handleSelectWorker = useCallback((workerName, workspaceId) => {
     if (!activeSessionId) {
@@ -528,6 +524,9 @@ export default function App() {
     // while the existing tab keeps the old session. Opens a fresh tab.
     console.log('[App] handleOpenNewTab: opening new tab for', sessionId, sessionName)
     loadTab(sessionId)
+    // Initialize store slices for the new session (keyed by sessionId)
+    useStore.getState().setSessionMode(sessionId, localStorage.getItem('lastSessionMode') || 'engineer')
+    useStore.getState().setTabRunningState(sessionId, false)
     // Record the session name immediately (same pattern as
     // handleNewSessionCreated) so the new tab shows a human-readable label
     // instead of "Unnamed" before the sessions list refreshes.
@@ -630,6 +629,7 @@ export default function App() {
 
   // ── Derive tab names from sessions list ─────────────────────────────────
   const sessions = useStore((s) => s.sessions)
+  const tabRunningStates = useStore((s) => s.tabRunningStates)
   const sessionMap = {}
   for (const s of sessions) {
     sessionMap[s.session_id] = s.name || 'Untitled'
@@ -639,6 +639,17 @@ export default function App() {
     id: t.tabId,
     name: t.sessionId ? (sessionMap[t.sessionId] || t.sessionId.slice(0, 8)) : 'New Session',
   }))
+
+  // TabBar indexes running states by tab.id (= tabId); the store is keyed by
+  // sessionId, so derive a tabId-keyed map for TabBar (TabBar is not modified
+  // in this phase).
+  const runningStatesByTabId = useMemo(() => {
+    const map = {}
+    for (const t of tabs) {
+      if (t.sessionId) map[t.tabId] = tabRunningStates[t.sessionId]
+    }
+    return map
+  }, [tabs, tabRunningStates])
 
   const activeSessionName = activeSessionId ? (sessionMap[activeSessionId] || 'Untitled') : 'New Session'
 
@@ -711,7 +722,7 @@ export default function App() {
         onSelectTab={handleSelectTab}
         onCloseTab={initiateCloseTab}
         onNewTab={handleNewTab}
-        runningStates={tabRunningStates}
+        runningStates={runningStatesByTabId}
         onLoggingClick={() => setShowLoggingPanel(prev => !prev)}
       />
 
@@ -748,7 +759,6 @@ export default function App() {
                 style={{ display: tab.tabId === activeTabId ? '' : 'none' }}
               >
                 <SessionTab
-                  mode={tab.sessionId ? (sessionModes[tab.sessionId] || null) : null}
                   sessionId={tab.sessionId}
                   sessionName={tab.sessionId ? (sessionMap[tab.sessionId] || '') : ''}
                   tabId={tab.tabId}
@@ -761,7 +771,6 @@ export default function App() {
                   onOpenNewTab={handleOpenNewTab}
                   onSessionSaved={handleSessionSaved}
                   onRegister={(actions) => handleRegisterTab(tab.tabId, actions)}
-                  onRunningChange={handleRunningChange}
                   onSessionRenamed={handleSessionRenamed}
                   selectedWorker={selectedWorker}
                   onSelectWorker={handleSelectWorker}
