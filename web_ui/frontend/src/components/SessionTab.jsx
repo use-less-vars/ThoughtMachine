@@ -401,6 +401,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         break
 
       case 'context_updated':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] context_updated for different session, ignoring:', msg.session_id)
+          break
+        }
         console.log('[TOKEN_PIPELINE] SessionTab: context_updated arrived', { context_length: msg.context_length, source: msg.source, worker_name: msg.worker_name })
         useStore.getState().updateContextLength(msg.session_id || currentSessionIdRef.current, msg.context_length ?? 0)
         // Forward to worker panel if this is a worker-sourced context update
@@ -463,6 +467,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         break
 
       case 'more_messages':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] more_messages for different session, ignoring:', msg.session_id)
+          break
+        }
         // Prepend older messages to the current history
         console.log('[SessionTab] more_messages:', msg.messages?.length, 'messages, offset:', msg.offset, 'has_more:', msg.has_more)
         const olderMessages = (msg.messages ?? []).map((m) => ({
@@ -499,10 +507,18 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         break
 
       case 'rebuild_result':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] rebuild_result for different session, ignoring:', msg.session_id)
+          break
+        }
         setContainerRebuildResult({ status: msg.status, buildLog: msg.build_log })
         break
 
       case 'status_message':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] status_message for different session, ignoring:', msg.session_id)
+          break
+        }
         {
           const key = msg.session_id || currentSessionIdRef.current
           const prevHistory = useStore.getState().sessionMessages[key] || []
@@ -553,10 +569,20 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         break
 
       case 'provider_saved':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] provider_saved for different session, ignoring:', msg.session_id)
+          break
+        }
         console.log('[SessionTab] Provider saved:', msg.provider?.id)
+        // Refresh providers from the backend (it will push a fresh providers_list)
+        sendCommand('get_providers')
         break
 
       case 'provider_deleted':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] provider_deleted for different session, ignoring:', msg.session_id)
+          break
+        }
         console.log('[SessionTab] Provider deleted:', msg.provider_id)
         break
 
@@ -569,14 +595,26 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         break
 
       case 'default_config_saved':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] default_config_saved for different session, ignoring:', msg.session_id)
+          break
+        }
         setDefaultConfigSaveStatus(msg.status)
         break
 
       case 'session_saved':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] session_saved for different session, ignoring:', msg.session_id)
+          break
+        }
         onSessionSaved?.()
         break
 
       case 'session_renamed':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] session_renamed for different session, ignoring:', msg.session_id)
+          break
+        }
         // The session was renamed; update our currentSessionId if needed
         if (msg.session_id) {
           setCurrentSessionId(msg.session_id)
@@ -586,12 +624,20 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         break
 
       case 'session_closed':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] session_closed for different session, ignoring:', msg.session_id)
+          break
+        }
         closedRef.current = true
         setSessionReady(false)
         onClose?.()
         break
 
       case 'session_deleted':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] session_deleted for different session, ignoring:', msg.session_id)
+          break
+        }
         // Session was deleted from the store — close the tab
         setSessionReady(false)
         onClose?.()
@@ -653,6 +699,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         break
 
       case 'logging_config_changed':
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] logging_config_changed for different session, ignoring:', msg.session_id)
+          break
+        }
         if (onLoggingConfigChangedRef.current) {
           onLoggingConfigChangedRef.current(msg.config)
         }
