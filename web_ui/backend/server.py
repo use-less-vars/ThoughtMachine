@@ -1442,8 +1442,12 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         EventForwarder.broadcast_rename(session_id, new_name)
 
                         if bridge is not None and bridge.rename_session(session_id, new_name):
-                            await ws.send_json({
-                                "type": "session_renamed",
+                            # Broadcast session_renamed to ALL tabs of this session via the
+                            # shared bridge's forwarder (each tab's WS is registered as a
+                            # callback keyed by ws id — see the load_session reuse path).
+                            # The requesting socket is one of them, so this doubles as its
+                            # success ack — no separate reply is needed.
+                            bridge._forwarder.broadcast(session_id, "session_renamed", {
                                 "session_id": session_id,
                                 "new_name": new_name,
                             })
@@ -1457,11 +1461,20 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 continue
                             session.metadata['name'] = new_name
                             session_store.save_session(session, workspace_id=session.workspace_id)
-                            await ws.send_json({
-                                "type": "session_renamed",
-                                "session_id": session_id,
-                                "new_name": new_name,
-                            })
+                            # Broadcast to all tabs via the shared session bridge when one
+                            # exists; otherwise fall back to acking only the requesting socket.
+                            rename_bridge = bridge if bridge is not None else _session_bridges.get(session_id)
+                            if rename_bridge is not None:
+                                rename_bridge._forwarder.broadcast(session_id, "session_renamed", {
+                                    "session_id": session_id,
+                                    "new_name": new_name,
+                                })
+                            else:
+                                await ws.send_json({
+                                    "type": "session_renamed",
+                                    "session_id": session_id,
+                                    "new_name": new_name,
+                                })
                             log("INFO", "server.config", f"Renamed session {session_id} → {new_name}")
                         # Update name in global session registry
                         registry = SessionRegistry.get_default()
