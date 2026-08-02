@@ -17,10 +17,12 @@ from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
 
 from session.store import FileSystemSessionStore
-from session.models import Session
 from session.session_registry import SessionRegistry
 from thoughtmachine.workspace_registry import WorkspaceRegistry
 from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
+
+from web_ui.backend.config_manager import ConfigManager
+from web_ui.backend.session_manager import SessionManager
 
 # ── Router ──────────────────────────────────────────────────────────────────
 
@@ -90,12 +92,25 @@ async def create_session(body: CreateSessionBody) -> Dict[str, Any]:
     """
     try:
         store = _get_store()
-        session = Session()
-        session.metadata['source'] = 'rest_api'
+        session_manager = SessionManager(store, ConfigManager())
+        mode = body.mode or "custom"
+        session_id, _frontend_config = session_manager.create_session(
+            mode=mode,
+            workspace_path=body.workspace_path,
+        )
+
+        # Reload the persisted session so we can layer workspace/name metadata
+        # on top of the SessionManager-built session (create_session does not
+        # handle workspace_id itself).
+        session = store.load_session(session_id, workspace_id=None)
+        if session is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session not found after creation: {session_id}",
+            )
+
         if body.name:
             session.metadata['name'] = body.name
-        if body.mode:
-            session.mode = body.mode
         if body.workspace_path:
             # Register the path via WorkspaceRegistry, which returns
             # the existing entry (if already registered) or creates a new one.
@@ -119,8 +134,9 @@ async def create_session(body: CreateSessionBody) -> Dict[str, Any]:
                 pass
         session.ensure_name()
 
+        # Re-save so workspace_id + name + agent_config land on disk.
+        # save_session moves the file to the workspace-scoped location.
         store.save_session(session, workspace_id=session.workspace_id)
-        store.add_open_session(session.session_id)
 
         # Register in global session registry
         registry = SessionRegistry.get_default()
