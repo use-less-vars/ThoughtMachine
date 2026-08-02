@@ -86,6 +86,23 @@ Server → Client (JSON):
 
 from __future__ import annotations
 
+# ---- Stdio guard -------------------------------------------------------
+# If this process is launched with file descriptors 1/2 closed (e.g. by a
+# headless launcher or service wrapper), CPython sets sys.stdout / sys.stderr
+# to None.  Any print(), warnings emission, or stdlib-logging lastResort
+# fallback then crashes with "'NoneType' object has no attribute 'write'"
+# (this is the DockerCodeRunner crash).  Redirect them to devnull so the
+# whole process is stdio-safe in any launch environment.  This MUST run
+# before any import that could emit warnings (e.g. fastapi, websockets,
+# docker SDK) or the crash would strike during module import.
+import sys as _sys
+import os as _os
+if _sys.stdout is None:
+    _sys.stdout = open(_os.devnull, 'w')
+if _sys.stderr is None:
+    _sys.stderr = open(_os.devnull, 'w')
+del _sys, _os
+
 import argparse
 import json
 import os
@@ -1745,17 +1762,31 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             log('WARNING', 'server',
                                 f"set_project: auto-register error: {exc}")
 
-                    # 5. Create a new empty session for the new workspace
-                    from session.models import Session
-                    new_session = Session()
-                    new_session.metadata['source'] = 'web_ui'
-                    if workspace_id:
+                    # 5. Create a new empty session for the new workspace via SessionManager
+                    # The bridge already owns a SessionManager built from the same
+                    # session_store (mirrors the REST /api/session/create pattern).
+                    session_id, _ = bridge._session_manager.create_session(
+                        mode="custom", workspace_path=_project_path
+                    )
+
+                    # Reload the persisted session so we can layer workspace metadata
+                    # on top (create_session does not handle workspace_id itself).
+                    new_session = session_store.load_session(session_id, workspace_id=None)
+                    if workspace_id and new_session:
                         new_session.workspace_id = workspace_id
-                    new_session.ensure_name()
+
+                    # Wire the reloaded session into the bridge (mirrors bridge.create_session)
+                    # and re-save so the workspace_id lands on disk in the
+                    # workspace-scoped location.
+                    bridge._session = new_session
                     bridge._loaded_session = new_session
-                    _session_bridges[new_session.session_id] = bridge
+                    bridge._history_version = new_session.conversation_version
+                    sc = bridge._session_manager.extract_session_config(new_session)
+                    if sc is not None:
+                        bridge._session_config = sc
                     session_store.save_session(new_session, workspace_id=workspace_id)
                     session_store.add_open_session(new_session.session_id)
+                    _session_bridges[new_session.session_id] = bridge
 
                     # 6. Send session_loaded and state messages
                     await ws.send_json({
