@@ -1336,8 +1336,9 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         })
                     await ws.send_json({
                         "type": "state_changed",
-                        "state": "IDLE",
-                        "is_running": False,
+                        "session_id": session_id,
+                        "state": "RUNNING" if bridge.agent_is_running else "IDLE",
+                        "is_running": bridge.agent_is_running,
                     })
                     # Send tokens_updated so the frontend shows saved token counts
                     loaded = bridge._session or bridge._loaded_session
@@ -1679,8 +1680,9 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     })
                     await ws.send_json({
                         "type": "state_changed",
-                        "state": "IDLE",
-                        "is_running": False,
+                        "session_id": new_session.session_id,
+                        "state": "RUNNING" if bridge.agent_is_running else "IDLE",
+                        "is_running": bridge.agent_is_running,
                     })
                     # Reset token display for a fresh session
                     await ws.send_json({
@@ -1811,8 +1813,9 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     })
                     await ws.send_json({
                         "type": "state_changed",
-                        "state": "IDLE",
-                        "is_running": False,
+                        "session_id": new_session.session_id,
+                        "state": "RUNNING" if bridge.agent_is_running else "IDLE",
+                        "is_running": bridge.agent_is_running,
                     })
                     await ws.send_json({
                         "type": "tokens_updated",
