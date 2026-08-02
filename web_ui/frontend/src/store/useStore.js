@@ -1,8 +1,10 @@
 /*
  * useStore.js — Zustand store
  *
- * After the multi-tab refactoring, the store holds data that is shared
- * across all tabs:
+ * The store is the single source of truth for all per-session state. Each
+ * session's { name, status, history, tokens, config, permissions, error }
+ * lives in the slices below, so every consumer (SessionTab, TabBar, header,
+ * sidebar) reads the same data and stays consistent:
  *   - sessions: the sessions list
  *   - sessionModes: per-session mode ('agent' | 'engineer' | 'custom'),
  *     written by App handlers and read by SessionTab
@@ -22,8 +24,11 @@
  *     ({ [sessionId]: '...' }), written by SessionTab on 'error' / abnormal
  *     'session_stop' events and cleared on dismiss or session close.
  *
- * Each SessionTab manages its own local state (status, history, tokens,
- * config, etc.) via useState, since those are per-tab concerns.
+ * SessionTab does not keep status/history/tokens/config in local useState —
+ * it subscribes via useStore selectors, and the WS event handlers in this
+ * file (receiveSessionLoaded, receiveConfigChanged, receiveConversationChanged,
+ * receiveStateChanged, receiveTokensUpdated, updateSessionName, the
+ * sessionErrors slice, ...) mutate the store as events arrive.
  */
 
 import { create } from 'zustand'
