@@ -18,6 +18,9 @@
  *     ({ [sessionId]: [messages] })
  *   - sessionStates: per-session runtime state
  *     ({ [sessionId]: { isRunning, state, contextLength, tokensIn, tokensOut } })
+ *   - sessionErrors: per-session last error message string
+ *     ({ [sessionId]: '...' }), written by SessionTab on 'error' / abnormal
+ *     'session_stop' events and cleared on dismiss or session close.
  *
  * Each SessionTab manages its own local state (status, history, tokens,
  * config, etc.) via useState, since those are per-tab concerns.
@@ -57,6 +60,7 @@ const initialState = {
   sessionConfigs: {},      // { [sessionId]: { config, permissions, providers, tools, isLoaded } }
   sessionMessages: {},     // { [sessionId]: [messages] }
   sessionStates: {},       // { [sessionId]: { isRunning, state, contextLength, tokensIn, tokensOut } }
+  sessionErrors: {},        // { [sessionId]: last error message string }
 }
 
 const useStore = create((set) => ({
@@ -125,7 +129,8 @@ const useStore = create((set) => ({
       const { [sessionId]: _removedMessages, ...sessionMessages } = state.sessionMessages
       const { [sessionId]: _removedStates, ...sessionStates } = state.sessionStates
       const { [sessionId]: _removedEvents, ...workerEvents } = state.workerEvents
-      return { sessionConfigs, sessionMessages, sessionStates, workerEvents }
+      const { [sessionId]: _removedErrors, ...sessionErrors } = state.sessionErrors
+      return { sessionConfigs, sessionMessages, sessionStates, workerEvents, sessionErrors }
     }),
 
   receiveSessionLoaded: (sessionId, payload) =>
@@ -191,6 +196,18 @@ const useStore = create((set) => ({
         },
       },
     })),
+
+  // Store the last error message for a session ("dead events → visible errors").
+  // Written by SessionTab on 'error' events and abnormal 'session_stop' events;
+  // read via s.sessionErrors[storeKey] to render the dismissible banner.
+  setSessionError: (sessionId, message) =>
+    set((state) => ({ sessionErrors: { ...state.sessionErrors, [sessionId]: message } })),
+
+  clearSessionError: (sessionId) =>
+    set((state) => {
+      const { [sessionId]: _removedError, ...sessionErrors } = state.sessionErrors
+      return { sessionErrors }
+    }),
 
   updateContextLength: (sessionId, length) =>
     set((state) => ({

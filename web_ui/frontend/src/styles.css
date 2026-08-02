@@ -94,6 +94,43 @@ body {
   color: var(--border);
 }
 
+/* ── Session error banner (dismissible; from 'error' / abnormal 'session_stop' events) ── */
+.session-error-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 1rem;
+  background: rgba(243, 139, 168, 0.12);
+  color: var(--danger);
+  border-bottom: 1px solid rgba(243, 139, 168, 0.3);
+  font-size: 0.82rem;
+  font-family: var(--font-sans);
+}
+
+.session-error-banner-text {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-error-banner-dismiss {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--danger);
+  font-size: 0.9rem;
+  line-height: 1;
+  padding: 0.15rem 0.3rem;
+  border-radius: 4px;
+  transition: background 0.15s;
+  flex-shrink: 0;
+}
+
+.session-error-banner-dismiss:hover {
+  background: rgba(243, 139, 168, 0.25);
+}
+
 /* ──────────────────────────────────────────────────────────────────────────
    ConfigPanel (sidebar)
    ────────────────────────────────────────────────────────────────────────── */

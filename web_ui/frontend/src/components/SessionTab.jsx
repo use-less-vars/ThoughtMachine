@@ -82,6 +82,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const sessionConfig = useStore((s) => s.sessionConfigs[storeKey])
   const sessionMessages = useStore((s) => s.sessionMessages[storeKey])
   const sessionState = useStore((s) => s.sessionStates[storeKey])
+  const sessionError = useStore((s) => (storeKey ? (s.sessionErrors[storeKey] || '') : ''))
   const config = sessionConfig?.config ?? null
   const providers = sessionConfig?.providers ?? []
   const availableTools = sessionConfig?.tools ?? []
@@ -721,6 +722,34 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         }
         break
 
+      case 'error':
+        // bridge.py broadcasts {"type":"error","error_type":...,"message":...,"traceback":...}
+        // via EventForwarder, which does NOT inject session_id into the payload.
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] error for different session, ignoring:', msg.session_id)
+          break
+        }
+        useStore.getState().setSessionError(msg.session_id || currentSessionIdRef.current, msg.error || msg.message || 'Unknown error')
+        break
+
+      case 'session_stop':
+        // Defensive: the bridge normally folds session_stop into state_changed
+        // + conversation_changed and never forwards the raw type, but handle it
+        // here so the tab can never stay stuck in RUNNING. Only surface a
+        // banner when the stop was abnormal (not 'completed'/'ok').
+        useStore.getState().receiveStateChanged(msg.session_id || currentSessionIdRef.current, 'IDLE')
+        if (msg.stop_reason && msg.stop_reason !== 'completed' && msg.stop_reason !== 'ok') {
+          useStore.getState().setSessionError(msg.session_id || currentSessionIdRef.current, `Session stopped: ${msg.stop_reason}`)
+        }
+        break
+
+      case 'session_cleared':
+        // bridge.py broadcasts session_cleared ({} — no session_id) on
+        // close_session; the conversation is gone, so drop it and any error.
+        useStore.getState().receiveConversationChanged(msg.session_id || currentSessionIdRef.current, [])
+        useStore.getState().clearSessionError(msg.session_id || currentSessionIdRef.current)
+        break
+
       default:
         console.warn('[SessionTab] Unknown event type:', msg.type)
     }
@@ -868,6 +897,16 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           )
         ) : null}
       </div>
+      {sessionError ? (
+        <div className="session-error-banner" role="alert">
+          <span className="session-error-banner-text">⚠ {sessionError}</span>
+          <button
+            className="session-error-banner-dismiss"
+            onClick={() => useStore.getState().clearSessionError(storeKey)}
+            title="Dismiss"
+          >✕</button>
+        </div>
+      ) : null}
       <StatusBar
         status={status}
         tokensIn={tokensIn}
