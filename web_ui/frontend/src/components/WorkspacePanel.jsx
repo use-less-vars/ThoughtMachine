@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React from 'react';
+import useStore, { PERMISSION_DEFAULTS } from '../store/useStore';
 import WorkerManagementPanel from './WorkerManagementPanel';
 import DockerfileEditor from './DockerfileEditor';
 import DomainAllowlistEditor from './DomainAllowlistEditor';
@@ -138,28 +139,17 @@ function WorkerDot({ status }) {
 
 
 // ── Section: Effective Permissions ───────────────────────────────────────
-function EffectivePermissionsSection({ workspaceId, sessionId }) {
-  const [perms, setPerms] = useState(null);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    if (!workspaceId) return;
-    setLoading(true);
-    const params = new URLSearchParams();
-    if (sessionId) params.set('session_id', sessionId);
-    fetch(`/api/workspace/${workspaceId}/effective_permissions?${params}`)
-      .then(async (res) => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        setPerms(await res.json());
-      })
-      .catch(() => setPerms(null))
-      .finally(() => setLoading(false));
-  }, [workspaceId, sessionId]);
-
-  if (loading) return <div style={{ color: '#6c7086', fontSize: '0.85rem' }}>Loading effective permissions…</div>;
-  if (!perms) return <div style={{ color: '#f38ba8', fontSize: '0.85rem' }}>Failed to load effective permissions.</div>;
-
-  const ep = perms.effective_permissions || {};
+function EffectivePermissionsSection({ sessionId }) {
+  // Permissions now come straight from the store: the WS 'config_changed' /
+  // 'session_loaded' events carry the exact payload the old REST endpoint
+  // (/api/workspace/<id>/effective_permissions) wrapped as
+  // { effective_permissions: ... } — server.py get_config calls
+  // config_manager.resolve_effective_permissions(bridge._session_config) and
+  // the store saves it verbatim in sessionConfigs[sessionId].permissions.
+  // Reading from the store keeps the pills live after apply_config and drops
+  // the one-shot fetch plus the loading/failed states.
+  const permissions = useStore((s) => (sessionId ? (s.sessionConfigs[sessionId]?.permissions ?? null) : null));
+  const ep = permissions || PERMISSION_DEFAULTS;
   const categories = ['filesystem', 'network', 'git', 'system', 'worker', 'container'];
 
   return (
@@ -213,7 +203,7 @@ export default function WorkspacePanel({ workspaceId, sessionId, onSelectWorker,
         <small style={{ color: '#6c7086', fontSize: '0.75rem', display: 'block', marginBottom: '0.3rem' }}>
           Merged session + workspace capabilities.
         </small>
-        <EffectivePermissionsSection workspaceId={workspaceId} sessionId={sessionId} />
+        <EffectivePermissionsSection sessionId={sessionId} />
       </div>
     </div>
   );
