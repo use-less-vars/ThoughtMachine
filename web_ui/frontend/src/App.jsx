@@ -460,10 +460,6 @@ export default function App() {
       console.warn('[TOKEN_PIPELINE] App.handleWorkerEvent: DROPPED — sessionId is falsy')
       return
     }
-    if (event.session_id && event.session_id !== sessionId) {
-      console.warn('[TOKEN_PIPELINE] App.handleWorkerEvent: DROPPED — event for different session', { type: event.type, eventSessionId: event.session_id, sessionId })
-      return
-    }
     setWorkerEvents(prev => {
       const events = prev[sessionId] || []
       // Use canonical dedup key: normalize worker_message/assistant_message/final_response
