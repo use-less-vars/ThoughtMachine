@@ -43,9 +43,8 @@ const WS_URL = `ws://${window.location.hostname}:${WS_PORT}/ws`
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
-function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onSessionRenamed, selectedWorker, onSelectWorker, onWorkerEvent, onLoggingConfigChanged, sessionName = '' }) {
+function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onSessionRenamed, selectedWorker, onSelectWorker, onWorkerEvent, onLoggingConfigChanged }) {
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
-  const [displayName, setDisplayName] = useState(sessionName || '')
   const [isRenaming, setIsRenaming] = useState(false)
   const renameInputRef = useRef(null)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
@@ -75,6 +74,11 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   modeRef.current = mode
   // ── Store subscriptions (sub-step 2.2): session-scoped state lives in Zustand ──
   const storeKey = currentSessionId || sessionId
+  // Single source of truth for the display name: store.sessions (refreshed by
+  // sessions_list, upserted immediately via updateSessionName on load/rename).
+  const sessionName = useStore((s) =>
+    storeKey ? (s.sessions.find((x) => x.session_id === storeKey)?.name || '') : ''
+  )
   const sessionConfig = useStore((s) => s.sessionConfigs[storeKey])
   const sessionMessages = useStore((s) => s.sessionMessages[storeKey])
   const sessionState = useStore((s) => s.sessionStates[storeKey])
@@ -230,6 +234,35 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     const ws = new WebSocket(WS_URL)
     wsRef.current = ws
 
+    // Listener-ordering fix: register message/close/error listeners BEFORE
+    // onopen so no event can be missed if the connection opens before the
+    // onopen handler is installed (reconnects, StrictMode remounts, or any
+    // WS implementation that fires `open` synchronously). onopen is the only
+    // handler that sends commands, so it is attached last.
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data)
+        handleEvent(msg)
+      } catch (err) {
+        console.error('[SessionTab] Failed to parse message:', event.data, err)
+      }
+    }
+
+    ws.onclose = (e) => {
+      tabConnectingRef.current = false
+      setWsConnected(false)
+      // 1001 = normal close (component unmounting), don't reconnect
+      if (e.code !== 1001 && !closedRef.current) {
+        const delay = 1000 + Math.random() * 3000  // 1–4s jitter
+        console.log(`[SessionTab ${sessionIdRef.current || '?'}] disconnected, reconnecting in ${Math.round(delay)}ms...`)
+        reconnectTimeoutRef.current = setTimeout(connectSessionWs, delay)
+      }
+    }
+
+    ws.onerror = () => {
+      // onclose fires right after onerror, so we let onclose handle reconnection
+    }
+
     ws.onopen = () => {
       console.log(`[SessionTab ${sessionId || 'new'}] WS onopen, isActive=${isActiveRef.current}, loadOnConnect=${loadOnConnectRef.current}, sessionId=${sessionIdRef.current}`)
       tabConnectingRef.current = false
@@ -250,10 +283,13 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
       const sid = sessionIdRef.current
       if (sid) {
         if (loadOnConnectRef.current) {
-          ws.send(JSON.stringify({
-            command: 'load_session',
-            session_id: sid
-          }))
+          // Defer load_session by one tick so the parent's synchronous setup (handlers, etc.) completes first
+          setTimeout(() => {
+            ws.send(JSON.stringify({
+              command: 'load_session',
+              session_id: sid
+            }))
+          }, 0)
           console.log(`[SessionTab ${sid}] Sent load_session (active tab)`)
         } else {
           // Check if load_session was already queued by App trigger (user clicked tab before WS connected)
@@ -288,29 +324,6 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
       }
     }
 
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data)
-        handleEvent(msg)
-      } catch (err) {
-        console.error('[SessionTab] Failed to parse message:', event.data, err)
-      }
-    }
-
-    ws.onclose = (e) => {
-      tabConnectingRef.current = false
-      setWsConnected(false)
-      // 1001 = normal close (component unmounting), don't reconnect
-      if (e.code !== 1001 && !closedRef.current) {
-        const delay = 1000 + Math.random() * 3000  // 1–4s jitter
-        console.log(`[SessionTab ${sessionIdRef.current || '?'}] disconnected, reconnecting in ${Math.round(delay)}ms...`)
-        reconnectTimeoutRef.current = setTimeout(connectSessionWs, delay)
-      }
-    }
-
-    ws.onerror = () => {
-      // onclose fires right after onerror, so we let onclose handle reconnection
-    }
   }, [])  // all external values via refs — no cascade on sessionId/onRegister change
   connectSessionWsRef.current = connectSessionWs
 
@@ -550,7 +563,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
             useStore.getState().registerSession(msg.session_id)
             useStore.getState().receiveSessionLoaded(msg.session_id, msg)
             setCurrentSessionId(msg.session_id)
-            setDisplayName(msg.session_name || displayName)
+            if (msg.session_name) useStore.getState().updateSessionName(msg.session_id, msg.session_name)
             setSessionReady(true)
             // Notify parent that this tab now has a real sessionId
             if (!sessionId) {
@@ -619,7 +632,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         if (msg.session_id) {
           setCurrentSessionId(msg.session_id)
         }
-        setDisplayName(msg.new_name || displayName)
+        if (msg.new_name) useStore.getState().updateSessionName(msg.session_id, msg.new_name)
         onSessionRenamed?.(msg.session_id, msg.new_name)
         break
 
@@ -779,13 +792,13 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
             <input
               ref={renameInputRef}
               className="session-header-input"
-              defaultValue={displayName}
+              defaultValue={sessionName}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') {
                   const newName = e.target.value.trim()
-                  if (newName && newName !== displayName) {
+                  if (newName && newName !== sessionName) {
                     sendCommand('rename_session', { session_id: currentSessionId, new_name: newName })
-                    setDisplayName(newName)
+                    useStore.getState().updateSessionName(currentSessionId, newName)
                     onSessionRenamed?.(currentSessionId, newName)
                   }
                   setIsRenaming(false)
@@ -795,9 +808,9 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
               }}
               onBlur={(e) => {
                 const newName = e.target.value.trim()
-                if (newName && newName !== displayName) {
+                if (newName && newName !== sessionName) {
                   sendCommand('rename_session', { session_id: currentSessionId, new_name: newName })
-                  setDisplayName(newName)
+                  useStore.getState().updateSessionName(currentSessionId, newName)
                   onSessionRenamed?.(currentSessionId, newName)
                 }
                 setIsRenaming(false)
@@ -806,7 +819,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
             />
           ) : (
             <>
-              <span className="session-header-name">{displayName || 'Untitled'}</span>
+              <span className="session-header-name">{sessionName || 'Untitled'}</span>
               <button
                 className="session-header-rename-btn"
                 onClick={() => {

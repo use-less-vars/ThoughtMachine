@@ -505,17 +505,10 @@ export default function App() {
     setTabs((prev) =>
       prev.map((t) => (t.sessionId === null ? { ...t, sessionId } : t))
     )
-    // If we got a session name, immediately add/update it in the sessions store
-    // so the tab label shows a human-readable name instead of a UUID truncation.
+    // Record the session name immediately in the shared store authority
+    // (upsert) so the tab label shows a human-readable name right away.
     if (sessionName) {
-      const store = useStore.getState()
-      const existing = store.sessions.find((s) => s.session_id === sessionId)
-      if (!existing) {
-        store.setSessions([
-          ...store.sessions,
-          { session_id: sessionId, name: sessionName },
-        ])
-      }
+      useStore.getState().updateSessionName(sessionId, sessionName)
     }
   }, [])
 
@@ -527,18 +520,10 @@ export default function App() {
     // Initialize store slices for the new session (keyed by sessionId)
     useStore.getState().setSessionMode(sessionId, localStorage.getItem('lastSessionMode') || 'engineer')
     useStore.getState().setTabRunningState(sessionId, false)
-    // Record the session name immediately (same pattern as
-    // handleNewSessionCreated) so the new tab shows a human-readable label
-    // instead of "Unnamed" before the sessions list refreshes.
+    // Record the session name immediately in the shared store authority
+    // (upsert) so the new tab shows a human-readable label right away.
     if (sessionName) {
-      const store = useStore.getState()
-      const existing = store.sessions.find((s) => s.session_id === sessionId)
-      if (!existing) {
-        store.setSessions([
-          ...store.sessions,
-          { session_id: sessionId, name: sessionName },
-        ])
-      }
+      useStore.getState().updateSessionName(sessionId, sessionName)
     }
     // Refresh sessions list so the new session appears in the sidebar
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -760,7 +745,6 @@ export default function App() {
               >
                 <SessionTab
                   sessionId={tab.sessionId}
-                  sessionName={tab.sessionId ? (sessionMap[tab.sessionId] || '') : ''}
                   tabId={tab.tabId}
                   hubReady={hubReady}
                   isActive={tab.tabId === activeTabId}

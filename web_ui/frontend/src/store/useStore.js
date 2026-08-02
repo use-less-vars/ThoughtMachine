@@ -64,6 +64,18 @@ const useStore = create((set) => ({
 
   setSessions: (sessions) => set({ sessions }),
 
+  // Upsert a session's display name into the sessions list (the single source
+  // of truth for names). Called on session_loaded / session_renamed / optimistic
+  // rename so the header, TabBar and sidebar stay consistent immediately.
+  updateSessionName: (sessionId, name) =>
+    set((state) => {
+      const exists = state.sessions.some((s) => s.session_id === sessionId)
+      if (exists) {
+        return { sessions: state.sessions.map((s) => (s.session_id === sessionId ? { ...s, name } : s)) }
+      }
+      return { sessions: [...state.sessions, { session_id: sessionId, name }] }
+    }),
+
   setSessionMode: (sessionId, mode) =>
     set((state) => ({ sessionModes: { ...state.sessionModes, [sessionId]: mode } })),
 
