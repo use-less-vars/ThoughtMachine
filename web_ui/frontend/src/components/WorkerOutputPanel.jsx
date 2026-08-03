@@ -19,6 +19,23 @@ function statusDotColor(status) {
   return STATUS_DOT[status]?.bg || '#6c7086';
 }
 
+// Event types that mean the worker is no longer actively producing output.
+// Used ONLY by the recency-based activity indicator (Fix 2c heuristic) —
+// these are the panel-normalized names (raw 'worker:xxx' minus prefix).
+// Includes defensive aliases (worker_stopped / worker_finished / bare
+// lifecycle names) in case they appear via other paths.
+const TERMINAL_WORKER_EVENTS = new Set([
+  'worker_completed',
+  'worker_error',
+  'worker_paused',
+  'worker_stopped',
+  'worker_finished',
+  'completed',
+  'error',
+  'stopped',
+  'paused',
+]);
+
 function relativeTime(isoString) {
   if (!isoString) return '';
   const now = Date.now();
@@ -665,6 +682,30 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
     return () => clearInterval(interval);
   }, [runtimeStatus]);
 
+  // ── Recency-based activity indicator (Fix 2c) ──────────────────────────
+  // Derived locally from this panel's own event list (already filtered to
+  // the selected worker). Heuristic: the worker counts as "active" only if
+  // its last event is a non-terminal event and arrived within the last 15s.
+  // After a browser refresh the event list is empty, so nothing is shown.
+  // This deliberately does NOT touch runtimeStatus/workerInfo or the main
+  // agent sessionStates.isRunning — it is an independent, local signal.
+  const [, setNowTick] = useState(0);
+  useEffect(() => {
+    if (events.length === 0) return;
+    const interval = setInterval(() => setNowTick((t) => t + 1), 5000);
+    return () => clearInterval(interval);
+  }, [events.length]);
+
+  const lastEvent = events[events.length - 1] || null;
+  const lastEventType = lastEvent?.event || '';
+  const lastEventAgeMs = lastEvent
+    ? Date.now() - new Date(lastEvent.timestamp).getTime()
+    : Infinity;
+  const workerActive =
+    !!lastEvent &&
+    !TERMINAL_WORKER_EVENTS.has(lastEventType) &&
+    lastEventAgeMs < 15000; // staleness guard — clearly a heuristic
+
   // ── Render helpers ────────────────────────────────────────────────────
   // renderEvent removed in Phase B Step 3 — replaced by adaptWorkerEvent + MessageBubble below
 
@@ -714,10 +755,33 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
       >
         {/* ── Status bar (slim, matching main StatusBar) ────────────── */}
         <div className="worker-output-header">
-          <span
-            className={'worker-status-dot' + (runtimeStatus === 'busy' ? ' worker-status-dot-busy' : '')}
-            style={{ background: statusDotColor(runtimeStatus) }}
-          />
+          {/* Fix 2c: hide the default grey 'Idle' dot when there are no events
+              (e.g. right after a browser refresh — nothing is running). */}
+          {events.length > 0 && (
+            <span
+              className={'worker-status-dot' + (runtimeStatus === 'busy' ? ' worker-status-dot-busy' : '')}
+              style={{ background: statusDotColor(runtimeStatus) }}
+            />
+          )}
+          {/* Fix 2c: recency-based activity badge (heuristic, local derivation).
+              Active when the last event is non-terminal and < 15s old;
+              neutral otherwise. Hidden entirely in the empty state. */}
+          {events.length > 0 && (
+            <span
+              className="worker-recency-badge"
+              title={workerActive
+                ? 'Worker activity detected in the last 15s'
+                : 'No recent worker activity'}
+              style={{
+                fontSize: '11px',
+                marginLeft: '6px',
+                color: workerActive ? '#a6e3a1' : '#6c7086',
+                userSelect: 'none',
+              }}
+            >
+              {workerActive ? '● active' : '○ inactive'}
+            </span>
+          )}
           <span className="worker-output-header-label">
             Worker: {workerName}
           </span>
@@ -750,7 +814,9 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
         >
           {events.length === 0 && (
             <div className="worker-output-empty">
-              {workerError || 'No events yet.'}
+              {/* Fix 2c: calm empty state with the required copy. A real
+                  worker error (e.g. failed spawn) still overrides it. */}
+              {workerError || 'Worker output appears here when the agent spawns a worker. History is not preserved across refreshes.'}
             </div>
           )}
 
