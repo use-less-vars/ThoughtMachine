@@ -116,25 +116,24 @@ function renderTab(props = {}) {
   const onSessionRenamed = vi.fn();
   const onWorkerEvent = vi.fn();
   const onLoggingConfigChanged = vi.fn();
-  render(
-    <SessionTab
-      sessionId={null}
-      tabId="tab-1"
-      hubReady
-      staggerMs={0}
-      loadOnConnect
-      isActive
-      onClose={onClose}
-      onNewSession={onNewSession}
-      onOpenNewTab={onOpenNewTab}
-      onSessionSaved={onSessionSaved}
-      onRegister={onRegister}
-      onSessionRenamed={onSessionRenamed}
-      onWorkerEvent={onWorkerEvent}
-      onLoggingConfigChanged={onLoggingConfigChanged}
-      {...props}
-    />
-  );
+  const mergedProps = {
+    sessionId: null,
+    tabId: 'tab-1',
+    hubReady: true,
+    staggerMs: 0,
+    loadOnConnect: true,
+    isActive: true,
+    onClose,
+    onNewSession,
+    onOpenNewTab,
+    onSessionSaved,
+    onRegister,
+    onSessionRenamed,
+    onWorkerEvent,
+    onLoggingConfigChanged,
+    ...props,
+  };
+  const utils = render(<SessionTab {...mergedProps} />);
   return {
     onClose,
     onNewSession,
@@ -144,6 +143,8 @@ function renderTab(props = {}) {
     onSessionRenamed,
     onWorkerEvent,
     onLoggingConfigChanged,
+    rerender: (nextProps) =>
+      utils.rerender(<SessionTab {...{ ...mergedProps, ...nextProps }} />),
   };
 }
 
@@ -231,6 +232,36 @@ describe('SessionTab — WebSocket lifecycle', () => {
       expect(loads).toHaveLength(1);
       expect(loads[0].session_id).toBe('sess-1');
     });
+  });
+
+  it('keeps the deferred placeholder on activation and clears it when the load response arrives', async () => {
+    const { rerender } = renderTab({ sessionId: 'sess-1', loadOnConnect: false, isActive: false });
+    const ws = await connectWs();
+    // Fix 4b: inactive tabs still send load_session on connect.
+    await waitFor(() => {
+      const loads = sentCommands(ws).filter((c) => c.command === 'load_session');
+      expect(loads).toHaveLength(1);
+      expect(loads[0].session_id).toBe('sess-1');
+    });
+    expect(screen.getByText('Click tab to load conversation')).toBeInTheDocument();
+    // Activating the tab with the socket still OPEN neither reconnects nor
+    // resends load_session nor clears the placeholder (the deferred-clear
+    // effect is driven by the server response, not by isActive alone).
+    rerender({ isActive: true });
+    expect(screen.getByText('Click tab to load conversation')).toBeInTheDocument();
+    expect(sentCommands(ws).filter((c) => c.command === 'load_session')).toHaveLength(1);
+    // The placeholder clears only once the backend responds with the session.
+    act(() =>
+      ws.receive({
+        type: 'session_loaded',
+        session_id: 'sess-1',
+        session_name: 'My Session',
+        // Fix 4a: backend embeds config in session_loaded so the UI renders immediately
+        config: { mode: 'custom', workspace_path: '/tmp/x' },
+      })
+    );
+    expect(await screen.findByText('My Session')).toBeInTheDocument();
+    expect(screen.queryByText('Click tab to load conversation')).not.toBeInTheDocument();
   });
 
   it('reconnects after an unexpected close (code != 1001)', async () => {
