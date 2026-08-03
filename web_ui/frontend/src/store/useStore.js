@@ -127,15 +127,28 @@ const useStore = create((set) => ({
       }
     }),
 
+  // Full purge — must touch all 8 slices defined in initialState.
   removeSession: (sessionId) =>
     set((state) => {
-      // Destructure-rest: drop the session's entries from all per-session slices.
+      // Destructure-rest: drop the session's entries from ALL per-session slices
+      // (including the sessions list, sessionModes and tabRunningStates).
       const { [sessionId]: _removedConfig, ...sessionConfigs } = state.sessionConfigs
       const { [sessionId]: _removedMessages, ...sessionMessages } = state.sessionMessages
       const { [sessionId]: _removedStates, ...sessionStates } = state.sessionStates
       const { [sessionId]: _removedEvents, ...workerEvents } = state.workerEvents
       const { [sessionId]: _removedErrors, ...sessionErrors } = state.sessionErrors
-      return { sessionConfigs, sessionMessages, sessionStates, workerEvents, sessionErrors }
+      const { [sessionId]: _removedMode, ...sessionModes } = state.sessionModes
+      const { [sessionId]: _removedRunning, ...tabRunningStates } = state.tabRunningStates
+      return {
+        sessionConfigs,
+        sessionMessages,
+        sessionStates,
+        workerEvents,
+        sessionErrors,
+        sessionModes,
+        tabRunningStates,
+        sessions: state.sessions.filter((s) => s.session_id !== sessionId),
+      }
     }),
 
   receiveSessionLoaded: (sessionId, payload) =>

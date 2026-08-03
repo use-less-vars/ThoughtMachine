@@ -420,6 +420,13 @@ describe('SessionTab — event handling', () => {
       const load = sentCommands(ws).find((c) => c.command === 'load_session');
       expect(load).toBeTruthy();
     });
+    // Seed store slices for the dead session so the Fix 4c purge is observable.
+    act(() => {
+      useStore.getState().setSessions([{ session_id: 'sess-1', name: 'Dead Session' }]);
+      useStore.getState().setSessionMode('sess-1', 'agent');
+      useStore.getState().setTabRunningState('sess-1', 'RUNNING');
+      useStore.getState().registerSession('sess-1');
+    });
     act(() =>
       ws.receive({
         type: 'session_loaded',
@@ -433,6 +440,12 @@ describe('SessionTab — event handling', () => {
     // Recovery banner with the stale-session message + Start New Session action.
     expect(await screen.findByText(/no longer available/i)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Start New Session' })).toBeInTheDocument();
+    // Fix 4c: the dead session's store slices are purged so nothing can leak
+    // into the replacement session.
+    expect(useStore.getState().sessionModes['sess-1']).toBeUndefined();
+    expect(useStore.getState().tabRunningStates['sess-1']).toBeUndefined();
+    expect(useStore.getState().sessionConfigs['sess-1']).toBeUndefined();
+    expect(useStore.getState().sessions.some((s) => s.session_id === 'sess-1')).toBe(false);
     // The tab was NOT silently rebound to the replacement session.
     expect(screen.queryByText('Replacement Session')).not.toBeInTheDocument();
     // sendCommand is gated: further commands are blocked (nothing sent on the WS).

@@ -233,9 +233,18 @@ export default function App() {
         // session_saved is never sent to the hub WS (only to tab WSes).
         // Tab WS triggers refresh via onSessionSaved callback → hubSend('list_sessions').
         break
-      case 'session_deleted':
+      case 'session_deleted': {
+        // Fix 4c: purge the deleted session from ALL store slices, close any
+        // tab still showing it, then re-sync the sidebar session list.
+        const deletedId = msg.session_id
+        if (deletedId) {
+          useStore.getState().removeSession(deletedId)
+          const affectedTabs = tabsRef.current.filter((t) => t.sessionId === deletedId)
+          affectedTabs.forEach((t) => removeTab(t.tabId))
+        }
         wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
         break
+      }
       case 'session_renamed':
         wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
         break
@@ -369,8 +378,10 @@ export default function App() {
     const closingTab = tabsRef.current.find((t) => t.tabId === tabId)
     if (closingTab?.sessionId) {
       loadedSessionIdsRef.current.delete(closingTab.sessionId)
-      // Drop store slices for this session (mode + running state) on tab close
-      useStore.getState().removeSessionState(closingTab.sessionId)
+      // Fix 4c: drop ALL store slices for this session on tab close, then
+      // re-sync the sidebar session list.
+      useStore.getState().removeSession(closingTab.sessionId)
+      hubSend('list_sessions')
     }
     setTabs((prev) => {
       const idx = prev.findIndex((t) => t.tabId === tabId)
@@ -383,7 +394,7 @@ export default function App() {
       return next
     })
     delete tabActionsRef.current[tabId]
-  }, [activeTabId])
+  }, [activeTabId, hubSend])
 
   const handleNewTab = useCallback(() => {
     setShowCreationModal(true)

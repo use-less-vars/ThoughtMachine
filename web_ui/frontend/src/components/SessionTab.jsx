@@ -632,6 +632,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           // session id (normal new-session creation).
           if (expectedSessionId && expectedSessionId !== msg.session_id) {
             console.warn('[SessionTab] STALE SESSION: expected', expectedSessionId, 'got', msg.session_id, '— backend may have restarted')
+            // Fix 4c: purge the dead session's store slices (config, messages,
+            // state, mode, running state, sessions list, ...) so none of its
+            // data can leak into the replacement session.
+            useStore.getState().removeSession(expectedSessionId)
             staleSessionRef.current = true
             setStaleSession(true)
             setSessionReady(false)

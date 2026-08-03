@@ -267,16 +267,23 @@ describe('registerSession', () => {
 });
 
 // ==========================================================================
-// removeSession — drops a session from all four slices, keeps others
+// removeSession — drops a session from all eight slices, keeps others
 // ==========================================================================
 describe('removeSession', () => {
-  it('removes a session from all four slices and leaves other sessions intact', () => {
+  it('removes a session from all eight slices and leaves other sessions intact', () => {
     useStore.getState().registerSession('s1');
     useStore.getState().registerSession('s2');
     useStore.getState().receiveSessionLoaded('s1', {});
     useStore.getState().receiveConversationChanged('s1', [{ role: 'user', content: 'hi' }]);
     useStore.getState().receiveStateChanged('s1', 'RUNNING');
     useStore.getState().addWorkerEvent('s1', { type: 'worker_message', timestamp: 'T1' });
+    useStore.getState().setSessionError('s1', 'boom');
+    useStore.getState().setSessionMode('s1', 'agent');
+    useStore.getState().setTabRunningState('s1', 'RUNNING');
+    useStore.getState().setSessions([
+      { session_id: 's1', name: 'One' },
+      { session_id: 's2', name: 'Two' },
+    ]);
     useStore.getState().receiveSessionLoaded('s2', {});
     useStore.getState().removeSession('s1');
     const st = useStore.getState();
@@ -284,6 +291,10 @@ describe('removeSession', () => {
     expect(st.sessionMessages.s1).toBeUndefined();
     expect(st.sessionStates.s1).toBeUndefined();
     expect(st.workerEvents.s1).toBeUndefined();
+    expect(st.sessionErrors.s1).toBeUndefined();
+    expect(st.sessionModes.s1).toBeUndefined();
+    expect(st.tabRunningStates.s1).toBeUndefined();
+    expect(st.sessions.map((s) => s.session_id)).toEqual(['s2']);
     expect(st.sessionConfigs.s2).toBeDefined();
     expect(st.sessionMessages.s2).toEqual([]);
   });
