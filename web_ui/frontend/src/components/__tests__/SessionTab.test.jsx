@@ -354,6 +354,44 @@ describe('SessionTab — event handling', () => {
       expect(mocks.onNewSession).toHaveBeenCalledWith('sess-new', 'My Session');
     });
   });
+
+  // Fix 3b: after a backend restart, load_session on a dead id makes the
+  // backend create a REPLACEMENT session and reply session_loaded with a
+  // DIFFERENT session_id. The tab must NOT silently rebind — it shows a
+  // recovery banner and blocks further commands until 'Start New Session'.
+  it('session_loaded with a DIFFERENT session id shows the stale-session recovery banner', async () => {
+    const mocks = renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    // load_session for sess-1 is deferred by one tick on open — wait for it so
+    // the tab is in the "loaded session" state before the stale reply arrives.
+    await waitFor(() => {
+      const load = sentCommands(ws).find((c) => c.command === 'load_session');
+      expect(load).toBeTruthy();
+    });
+    act(() =>
+      ws.receive({
+        type: 'session_loaded',
+        session_id: 'replacement-sess',
+        session_name: 'Replacement Session',
+        workspace_id: 'ws-2',
+      })
+    );
+    // Recovery banner with the stale-session message + Start New Session action.
+    expect(await screen.findByText(/no longer available/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Start New Session' })).toBeInTheDocument();
+    // The tab was NOT silently rebound to the replacement session.
+    expect(screen.queryByText('Replacement Session')).not.toBeInTheDocument();
+    // sendCommand is gated: further commands are blocked (nothing sent on the WS).
+    const registered = mocks.onRegister.mock.calls[0][0];
+    act(() => registered.sendCommand('start_session', { query: 'ignored' }));
+    expect(sentCommands(ws).some((c) => c.command === 'start_session')).toBe(false);
+    // 'Start New Session' adopts the stashed replacement through onNewSession.
+    fireEvent.click(screen.getByRole('button', { name: 'Start New Session' }));
+    await waitFor(() => {
+      expect(mocks.onNewSession).toHaveBeenCalledWith('replacement-sess', 'Replacement Session');
+    });
+    expect(screen.queryByText(/no longer available/i)).not.toBeInTheDocument();
+  });
 });
 
 // ────────────────────────────────────────────────────────────────────────────

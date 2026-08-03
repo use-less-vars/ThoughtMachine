@@ -80,6 +80,14 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const [securityPrompt, setSecurityPrompt] = useState(null) // null | { request_id, tool_name, capabilities, ... }
   const [containerRebuildResult, setContainerRebuildResult] = useState(null) // null | { status, buildLog }
   const [sessionReady, setSessionReady] = useState(false) // true after session_loaded confirms session is ready
+  // Fix 3b: stale-session recovery (backend restart). staleSessionRef gates
+  // sendCommand (must be a ref — sendCommand is a []-deps callback); the state
+  // drives banner rendering. pendingAdoptRef stashes the replacement session
+  // the backend created for the dead id so 'Start New Session' can adopt it
+  // through the same acceptance path a fresh tab uses.
+  const [staleSession, setStaleSession] = useState(false)
+  const staleSessionRef = useRef(false)
+  const pendingAdoptRef = useRef(null)
   const [isDeferred, setIsDeferred] = useState(false) // true = load skipped; waiting for activation
   const [totalMessages, setTotalMessages] = useState(0) // total messages in the session
   const [hasMore, setHasMore] = useState(false) // true if older messages are available
@@ -202,6 +210,13 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   // connection is re-established.
   const sendCommandRef = useRef(null)
   const sendCommand = useCallback((command, payload = {}) => {
+    // Fix 3b: stale session — block ALL further commands (load_more, rename,
+    // delete, security responses, config apply, query sends, ...) until the
+    // user starts a new session.
+    if (staleSessionRef.current) {
+      console.warn('[SessionTab] Stale session — command blocked:', command)
+      return
+    }
     const ws = wsRef.current
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       console.warn('[SessionTab] WebSocket not connected. Command queued for retry.')
@@ -296,6 +311,13 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
       console.log(`[SessionTab ${sessionId || 'new'}] WS onopen, isActive=${isActiveRef.current}, loadOnConnect=${loadOnConnectRef.current}, sessionId=${sessionIdRef.current}`)
       tabConnectingRef.current = false
       setWsConnected(true)
+
+      // Fix 3b: stale session — don't re-load the dead session or re-drain
+      // queued commands on reconnect (raw ws.send below bypasses sendCommand).
+      if (staleSessionRef.current) {
+        console.warn('[SessionTab] Stale session — skipping load_session / queued drain on reconnect')
+        return
+      }
 
       // Drain any commands that were queued while disconnected
       const pending = pendingCommandsRef.current
@@ -578,26 +600,39 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           setWorkspaceId(msg.workspace_id)
         }
         if (msg.session_id) {
-          if (sessionId && sessionId !== msg.session_id) {
-            // Tab already has a different session → this is a workspace switch
-            // that created a new session. Notify parent to open a new tab for it,
-            // while keeping this tab pointing to the original session.
-            console.log('[SessionTab] session_loaded for DIFFERENT session, opening new tab:', msg.session_id)
-            // Register the new session in the store before handing it to a new tab
-            useStore.getState().registerSession(msg.session_id)
-            useStore.getState().receiveSessionLoaded(msg.session_id, msg)
-            onOpenNewTab?.(msg.session_id, msg.session_name)
-          } else {
-            // Fresh tab (no sessionId yet) → update currentSessionId
-            useStore.getState().registerSession(msg.session_id)
-            useStore.getState().receiveSessionLoaded(msg.session_id, msg)
-            setCurrentSessionId(msg.session_id)
-            if (msg.session_name) useStore.getState().updateSessionName(msg.session_id, msg.session_name)
-            setSessionReady(true)
-            // Notify parent that this tab now has a real sessionId
-            if (!sessionId) {
-              onNewSession?.(msg.session_id, msg.session_name)
-            }
+          const expectedSessionId = currentSessionIdRef.current
+          // Fix 3b: stale-session detection. After a backend restart, old
+          // session ids are invalid: load_session on a dead id makes the
+          // backend create a REPLACEMENT session and reply session_loaded with
+          // a DIFFERENT session_id. That must never silently rebind this tab to
+          // another session's data — show a recovery banner instead.
+          // A fresh tab (currentSessionIdRef null/undefined) accepts any
+          // session id (normal new-session creation).
+          if (expectedSessionId && expectedSessionId !== msg.session_id) {
+            console.warn('[SessionTab] STALE SESSION: expected', expectedSessionId, 'got', msg.session_id, '— backend may have restarted')
+            staleSessionRef.current = true
+            setStaleSession(true)
+            setSessionReady(false)
+            // Stash the replacement so 'Start New Session' can adopt it via the
+            // same path a fresh tab uses (register + receiveSessionLoaded +
+            // setCurrentSessionId + onNewSession).
+            pendingAdoptRef.current = msg
+            useStore.getState().setSessionError(
+              expectedSessionId,
+              'This session is no longer available (backend may have restarted).'
+            )
+            break
+          }
+          // Normal path: fresh tab or confirmed same session.
+          pendingAdoptRef.current = null
+          useStore.getState().registerSession(msg.session_id)
+          useStore.getState().receiveSessionLoaded(msg.session_id, msg)
+          setCurrentSessionId(msg.session_id)
+          if (msg.session_name) useStore.getState().updateSessionName(msg.session_id, msg.session_name)
+          setSessionReady(true)
+          // Notify parent that this tab now has a real sessionId
+          if (!sessionId) {
+            onNewSession?.(msg.session_id, msg.session_name)
           }
         }
         break
@@ -820,6 +855,30 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     sendCommand('load_more_messages', { offset, limit: 20 })
   }, [history.length, sendCommand])
 
+  // ── Start New Session (stale-session recovery) ─────────────────────────────
+  // Fix 3b: adopt the replacement session the backend created for the dead id
+  // (stashed by the stale branch of session_loaded) using the exact acceptance
+  // sequence a fresh tab uses, then notify App via the onNewSession prop (same
+  // mechanism as normal new-session creation).
+  const startNewSession = useCallback(() => {
+    staleSessionRef.current = false
+    setStaleSession(false)
+    const pending = pendingAdoptRef.current
+    pendingAdoptRef.current = null
+    if (!pending?.session_id) {
+      console.warn('[SessionTab] startNewSession: no stashed replacement session')
+      return
+    }
+    if (pending.workspace_id) setWorkspaceId(pending.workspace_id)
+    useStore.getState().registerSession(pending.session_id)
+    useStore.getState().receiveSessionLoaded(pending.session_id, pending)
+    setCurrentSessionId(pending.session_id)
+    if (pending.session_name) useStore.getState().updateSessionName(pending.session_id, pending.session_name)
+    setSessionReady(true)
+    useStore.getState().clearSessionError(storeKey)
+    onNewSession?.(pending.session_id, pending.session_name)
+  }, [storeKey, onNewSession])
+
   // ── Auto-focus delete confirm button ────────────────────────────────────────
   useEffect(() => {
     if (showDeleteConfirm && deleteConfirmRef.current) {
@@ -928,11 +987,18 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
       {sessionError ? (
         <div className="session-error-banner" role="alert">
           <span className="session-error-banner-text">⚠ {sessionError}</span>
-          <button
-            className="session-error-banner-dismiss"
-            onClick={() => useStore.getState().clearSessionError(storeKey)}
-            title="Dismiss"
-          >✕</button>
+          {staleSession ? (
+            <button
+              className="session-error-banner-action"
+              onClick={startNewSession}
+            >Start New Session</button>
+          ) : (
+            <button
+              className="session-error-banner-dismiss"
+              onClick={() => useStore.getState().clearSessionError(storeKey)}
+              title="Dismiss"
+            >✕</button>
+          )}
         </div>
       ) : null}
       <StatusBar
