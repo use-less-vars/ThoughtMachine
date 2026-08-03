@@ -347,6 +347,8 @@ describe('SessionTab — event handling', () => {
         type: 'session_loaded',
         session_id: 'sess-new',
         session_name: 'My Session',
+        // Fix 4a: backend now embeds config in session_loaded so the chat UI renders immediately
+        config: { mode: 'custom', workspace_path: '/tmp/x' },
       })
     );
     expect(await screen.findByText('My Session')).toBeInTheDocument();
@@ -374,6 +376,8 @@ describe('SessionTab — event handling', () => {
         session_id: 'replacement-sess',
         session_name: 'Replacement Session',
         workspace_id: 'ws-2',
+        // Fix 4a: config field is inert for the stale-branch path
+        config: { mode: 'custom', workspace_path: '/tmp/x' },
       })
     );
     // Recovery banner with the stale-session message + Start New Session action.

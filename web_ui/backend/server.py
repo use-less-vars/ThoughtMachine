@@ -67,7 +67,7 @@ Server → Client (JSON):
     status_message      { "type": "status_message",      "text": "..." }
     sessions_list       { "type": "sessions_list",       "sessions": [...] }
     session_saved       { "type": "session_saved",       "session": {...} }
-    session_loaded      { "type": "session_loaded",      "session_id": "...", "session_name": "...", "message_count": int, "workspace_id": "...", "workspace_path": "..." }
+    session_loaded      { "type": "session_loaded",      "session_id": "...", "session_name": "...", "message_count": int, "workspace_id": "...", "workspace_path": "...", "config": {...} }
     session_deleted     { "type": "session_deleted",     "session_id": "..." }
     session_renamed     { "type": "session_renamed",     "session_id": "...", "new_name": "..." }
     open_sessions_list  { "type": "open_sessions_list",  "session_ids": ["..."] }
@@ -829,6 +829,10 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 "message_count": 0,
                                 "workspace_id": workspace_id or '',
                                 "workspace_path": _project_path,
+                                # Fix 4a: embed the config the user just submitted so the
+                                # chat UI renders from the first event; the config_changed
+                                # sent below (step 7) carries the canonical merged config.
+                                "config": msg.get("config"),
                             })
                         elif existing_session is not None:
                             # No conversation (empty/fresh tab) — update workspace_id in-place
@@ -1327,13 +1331,24 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             log('WARNING', 'server',
                                 f"load_session: could not resolve workspace root from registry: {exc}")
 
+                    # Fix 4a: compute the frontend config once so session_loaded carries it
+                    # (chat UI renders from the first event) and config_changed below
+                    # reuses the exact same value.
+                    try:
+                        fe_config = config_manager.get_frontend_config(bridge)
+                    except Exception:
+                        fe_config = None
+
                     if not _bridge_loaded_session:
+                        _loaded_meta = bridge._session or bridge._loaded_session
                         await ws.send_json({
                             "type": "session_loaded",
                             "session_id": session_id,
+                            "session_name": _loaded_meta.metadata.get('name', '') if _loaded_meta else '',
                             "workspace_id": bridge.workspace_id,
                             "workspace_path": bridge._workspace_path or '',
                             "is_running": bridge.agent_is_running if hasattr(bridge, 'agent_is_running') else False,
+                            "config": fe_config,
                         })
                     # Send tokens_updated so the frontend shows saved token counts
                     loaded = bridge._session or bridge._loaded_session
@@ -1348,7 +1363,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             "context_length": loaded.context_length,
                         })
                     # Send config_changed so the frontend shows the session's actual config
-                    fe_config = config_manager.get_frontend_config(bridge)
+                    # (fe_config computed above — Fix 4a)
                     settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
                     permissions = config_manager.resolve_effective_permissions(bridge._session_config) if bridge._session_config else {}
                     await ws.send_json({
@@ -1632,7 +1647,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # Create a new empty session via SessionManager
                     # Use mode from the frontend payload if provided, fall back to 'custom'
                     mode = msg.get('mode', 'custom')
-                    session_id, _ = bridge.create_session(mode=mode)
+                    session_id, frontend_config = bridge.create_session(mode=mode)
                     new_session = bridge._session
                     if workspace_id and new_session:
                         new_session.workspace_id = workspace_id
@@ -1673,6 +1688,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         "workspace_id": bridge._workspace_id,
                         "workspace_path": bridge._workspace_path or '',
                         "is_running": bridge.agent_is_running if hasattr(bridge, 'agent_is_running') else False,
+                        "config": frontend_config if isinstance(frontend_config, dict) else None,
                     })
                     # Reset token display for a fresh session
                     await ws.send_json({
@@ -1794,6 +1810,12 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     _session_bridges[new_session.session_id] = bridge
 
                     # 6. Send session_loaded and state messages
+                    # Fix 4a: embed config (bridge._session_config is already set above, so
+                    # get_frontend_config is canonical) so the chat UI renders immediately.
+                    try:
+                        fe_config = config_manager.get_frontend_config(bridge)
+                    except Exception:
+                        fe_config = None
                     await ws.send_json({
                         "type": "session_loaded",
                         "session_id": new_session.session_id,
@@ -1801,6 +1823,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         "workspace_id": bridge._workspace_id,
                         "workspace_path": _project_path,
                         "is_running": bridge.agent_is_running if hasattr(bridge, 'agent_is_running') else False,
+                        "config": fe_config,
                     })
                     await ws.send_json({
                         "type": "tokens_updated",

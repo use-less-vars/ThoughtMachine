@@ -1591,6 +1591,12 @@ class WebAgentBridge:
                 "has_more": has_more,
             })
             # Emit session_loaded for metadata
+            # Fix 4a: embed the frontend config so the chat UI renders from the
+            # first event (uses the existing ConfigManager instance — no new import).
+            try:
+                _fe_config = self._config_manager.frontend_config_from_bridge(self)
+            except Exception:
+                _fe_config = None
             self._forwarder.broadcast(self._session_id, "session_loaded", {
                 "session_id": session_id,
                 "session_name": session.metadata.get('name', 'Untitled Session'),
@@ -1601,6 +1607,7 @@ class WebAgentBridge:
                 # load path — the server no longer sends a separate state_changed
                 # after session_loaded (Fix 2a).
                 "is_running": self.agent_is_running if hasattr(self, 'agent_is_running') else False,
+                "config": _fe_config,
             })
             # Emit initial context_length so the frontend status bar shows
             # the correct value immediately (no need to wait for a live token_update).
