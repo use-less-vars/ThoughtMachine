@@ -1318,6 +1318,7 @@ class WebAgentBridge:
             current_config=self._session_config,
             is_running=self.is_running,
             has_session=self._session is not None,
+            workspace_path=self._workspace_path,
         )
 
         # Step 2: Update session config if ConfigManager returned a new one

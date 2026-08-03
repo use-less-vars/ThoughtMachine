@@ -488,6 +488,7 @@ class ConfigManager:
         current_config,
         is_running: bool = False,
         has_session: bool = False,
+        workspace_path: Optional[str] = None,
     ) -> tuple[Dict[str, Any], Optional[Any]]:
         """
         Validate + translate frontend config dict, enforce mode rules.
@@ -566,7 +567,9 @@ class ConfigManager:
                     f"Provider resolution failed during apply_config: {e}")
 
         # Convert updated session_config to frontend format for broadcasting
-        frontend_result = ConfigManager.session_config_to_frontend(session_config)
+        frontend_result = ConfigManager.session_config_to_frontend(
+            session_config, workspace_path=workspace_path
+        )
 
         return frontend_result, session_config
 
