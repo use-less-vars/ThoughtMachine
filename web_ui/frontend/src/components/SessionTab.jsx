@@ -658,6 +658,18 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           pendingAdoptRef.current = null
           useStore.getState().registerSession(msg.session_id)
           useStore.getState().receiveSessionLoaded(msg.session_id, msg)
+          // F2: the onopen-time get_providers reply may have landed before
+          // session_loaded (routed under a null/stale key because the backend
+          // reply had no session_id yet). If the freshly loaded session has no
+          // providers cached, re-request so the reply carries the real
+          // session_id and the provider dropdown populates.
+          {
+            const loadedConfig = useStore.getState().sessionConfigs[msg.session_id]
+            const loadedProviders = loadedConfig?.providers
+            if (!loadedProviders || loadedProviders.length === 0) {
+              sendCommand('get_providers')
+            }
+          }
           setCurrentSessionId(msg.session_id)
           if (msg.session_name) useStore.getState().updateSessionName(msg.session_id, msg.session_name)
           setSessionReady(true)

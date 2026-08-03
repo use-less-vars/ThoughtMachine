@@ -1056,6 +1056,16 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
 
                 elif command == "get_providers":
                     # Return list of provider profiles (safe fields only)
+                    # F2: attach the current session id so the reply routes to the
+                    # right tab/store key (provider dropdown). Non-null source:
+                    # bridge._session_id, falling back to the loaded session
+                    # (load_session / create_session set _loaded_session but not
+                    # _session_id). Mirrors the canonical pattern used at Round C.
+                    provider_session_id = None
+                    if bridge is not None:
+                        provider_session_id = bridge._session_id or (
+                            bridge._loaded_session.session_id if bridge._loaded_session else None
+                        )
                     from agent.config.provider_profile import ProviderManager
                     try:
                         manager = ProviderManager()
@@ -1074,6 +1084,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             })
                         await ws.send_json({
                             "type": "providers_list",
+                            "session_id": provider_session_id,
                             "providers": safe_profiles,
                         })
                         log('INFO', 'server.config', f"Returned {len(safe_profiles)} provider profiles")
@@ -1081,6 +1092,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         log('ERROR', 'server.config', f"get_providers failed: {exc}")
                         await ws.send_json({
                             "type": "providers_list",
+                            "session_id": provider_session_id,
                             "providers": [],
                         })
 
