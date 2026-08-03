@@ -388,3 +388,74 @@ describe('new slice cross-session isolation', () => {
   });
 });
 
+
+// ==========================================================================
+// session lifecycle — register → load(running) → state → conversation →
+// tokens → idle → remove (full purge across all 7 slices)
+// ==========================================================================
+describe('session lifecycle', () => {
+  it('walks a full lifecycle and purges all slices on removeSession', () => {
+    // 1. register — empty per-session entries
+    useStore.getState().registerSession('s1');
+
+    // 2. session_loaded with is_running: true — authoritative snapshot
+    useStore.getState().receiveSessionLoaded('s1', { config: { mode: 'custom' }, is_running: true });
+    let st = useStore.getState();
+    expect(st.sessionConfigs.s1.isLoaded).toBe(true);
+    expect(st.sessionConfigs.s1.config).toEqual({ mode: 'custom' });
+    expect(st.sessionStates.s1.state).toBe('RUNNING');
+    expect(st.sessionStates.s1.isRunning).toBe(true);
+
+    // 3. state_changed RUNNING
+    useStore.getState().receiveStateChanged('s1', 'RUNNING');
+    expect(useStore.getState().sessionStates.s1.state).toBe('RUNNING');
+    expect(useStore.getState().sessionStates.s1.isRunning).toBe(true);
+
+    // 4. conversation_changed
+    useStore.getState().receiveConversationChanged('s1', [{ role: 'user', content: 'hi' }]);
+    expect(useStore.getState().sessionMessages.s1).toEqual([{ role: 'user', content: 'hi' }]);
+
+    // 5. tokens_updated — tokens live in sessionStates
+    useStore.getState().receiveTokensUpdated('s1', { input: 100, output: 50 });
+    st = useStore.getState();
+    expect(st.sessionStates.s1.tokensIn).toBe(100);
+    expect(st.sessionStates.s1.tokensOut).toBe(50);
+    expect(st.sessionStates.s1.state).toBe('RUNNING');
+
+    // 6. state_changed IDLE — session finished
+    useStore.getState().receiveStateChanged('s1', 'IDLE');
+    st = useStore.getState();
+    expect(st.sessionStates.s1.state).toBe('IDLE');
+    expect(st.sessionStates.s1.isRunning).toBe(false);
+
+    // 7. removeSession — full purge
+    useStore.getState().removeSession('s1');
+    st = useStore.getState();
+    expect(st.sessionConfigs.s1).toBeUndefined();
+    expect(st.sessionMessages.s1).toBeUndefined();
+    expect(st.sessionStates.s1).toBeUndefined();
+    expect(st.sessionErrors.s1).toBeUndefined();
+    expect(st.sessionModes.s1).toBeUndefined();
+    expect(st.tabRunningStates.s1).toBeUndefined();
+    expect(st.sessions.some((s) => s.session_id === 's1')).toBe(false);
+
+    // Deep-equal against the store's real empty initial slices (getState()
+    // includes action fns, so only the 7 data slices are compared).
+    const {
+      sessions, sessionModes, tabRunningStates,
+      sessionConfigs, sessionMessages, sessionStates, sessionErrors,
+    } = useStore.getState();
+    expect({
+      sessions, sessionModes, tabRunningStates,
+      sessionConfigs, sessionMessages, sessionStates, sessionErrors,
+    }).toEqual({
+      sessions: [],
+      sessionModes: {},
+      tabRunningStates: {},
+      sessionConfigs: {},
+      sessionMessages: {},
+      sessionStates: {},
+      sessionErrors: {},
+    });
+  });
+});
