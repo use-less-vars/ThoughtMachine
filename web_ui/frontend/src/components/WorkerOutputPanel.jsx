@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef, useLayoutEffect } from 'react';
+import React, { memo, useState, useEffect, useCallback, useRef, useLayoutEffect } from 'react';
 import { MessageBubble } from './chat/MessageBubble';
 import adaptWorkerEvent, { isWorkerEventRenderable } from './chat/adaptWorkerEvent';
 import useStore from '../store/useStore';
@@ -852,4 +852,24 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
   );
 }
 
-export default WorkerOutputPanel;
+// ── Memoization ──────────────────────────────────────────────────────────
+// App re-renders frequently (store updates, tab switches); the panel only
+// needs to re-render when one of its real props actually changed. incomingEvents
+// is compared by reference, then length, then element identity — the `|| []`
+// fallback at the call site means two DIFFERENT empty arrays must count as
+// equal, or the memo would never help while the panel has no events.
+function workerOutputPropsEqual(prevProps, nextProps) {
+  if (prevProps.workspaceId !== nextProps.workspaceId) return false;
+  if (prevProps.workerName !== nextProps.workerName) return false;
+  if (prevProps.sessionId !== nextProps.sessionId) return false;
+  if (prevProps.onClose !== nextProps.onClose) return false;
+  const prevEvents = prevProps.incomingEvents || [];
+  const nextEvents = nextProps.incomingEvents || [];
+  if (prevEvents === nextEvents) return true;
+  if (prevEvents.length !== nextEvents.length) return false;
+  for (let i = 0; i < prevEvents.length; i++) {
+    if (prevEvents[i] !== nextEvents[i]) return false;
+  }
+  return true;
+}
+export default memo(WorkerOutputPanel, workerOutputPropsEqual);
