@@ -730,11 +730,12 @@ async def pause_worker(ws_id: str, name: str):
     registry.  Returns immediately — the worker will transition to ``paused``
     asynchronously.
 
-    Also immediately writes ``status.json`` with ``runtime_status: "paused"``
-    so the web UI's next poll sees the paused state right away.
+    Also immediately writes ``status.json`` with ``runtime_status: "pausing"``
+    so the web UI's next poll shows the pending pause right away.  The worker
+    transitions to ``"paused"`` only once its current turn actually completes.
 
     Returns:
-        200 with ``{"status": "paused", "name": name}`` on success.
+        200 with ``{"status": "pausing", "name": name}`` on success.
         404 if the worker directory does not exist.
     """
     ensure_workspace_dirs(ws_id)
@@ -771,9 +772,10 @@ async def pause_worker(ws_id: str, name: str):
     # Write the pause command file — the worker thread polls for this
     _atomic_write_json({"action": "pause"}, worker_dir / "command.json")
 
-    # Immediately write status.json as "paused" so the UI sees it right away
+    # Immediately write status.json as "pausing" (the pause is in flight).
+    # The worker flips to "paused" only when its current turn completes.
     _atomic_write_json({
-        "runtime_status": "paused",
+        "runtime_status": "pausing",
         "current_task": None,
         "last_heartbeat": datetime.now(timezone.utc).isoformat(),
         "error": None,
@@ -790,7 +792,7 @@ async def pause_worker(ws_id: str, name: str):
                 except Exception:
                     pass  # File-based pause will still work
 
-    return {"status": "paused", "name": name}
+    return {"status": "pausing", "name": name}
 
 
 # ── POST /api/workspace/{ws_id}/workers/{name}/resume ──────────────────────

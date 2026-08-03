@@ -755,9 +755,9 @@ class WorkerThread(threading.Thread):
         """
         Check for a ``command.json`` file in the worker's directory.
 
-        If found and the action is ``"stop"``, delete the file and signal
-        the stop event.  This enables cross-process stop (e.g. from the
-        Web UI via the REST API).
+        If found, the action is ``"stop"``/``"pause"``/``"resume"``: delete
+        the file and signal the corresponding event.  This enables
+        cross-process control (e.g. from the Web UI via the REST API).
         """
         cmd_path = self._worker_dir / "command.json"
         if not cmd_path.is_file():
@@ -773,6 +773,16 @@ class WorkerThread(threading.Thread):
                 cmd_path.unlink(missing_ok=True)
                 self._pause_event.set()
                 self._input_queue.put(None)
+            elif action == "resume":
+                # Resume while a pause is pending (or a leftover from an
+                # earlier REST resume): cancel the pause so the worker keeps
+                # running.  Mirrors WorkerThread.resume() semantics; without
+                # this the command.json would linger forever (no-op on every
+                # poll).  Events are thread-safe, so this is safe even if the
+                # blocked pause loop is waiting on _resume_event.
+                cmd_path.unlink(missing_ok=True)
+                self._pause_event.clear()
+                self._resume_event.set()
         except (json.JSONDecodeError, OSError):
             # Corrupted file — delete and ignore
             try:
@@ -1656,7 +1666,9 @@ class Worker(ToolBase):
     """
 
     tool: str = "Worker"
-    required_categories: ClassVar[List[str]] = ["container:read"]
+    # Workers are not gated by session permissions: spawning/running a worker
+    # is decoupled from the 'execution' session permission (2026-08-03).
+    required_categories: ClassVar[List[str]] = []
 
     action: str = Field(
         description="Action: list, spawn, check, query, stop. "
@@ -1898,39 +1910,6 @@ class Worker(ToolBase):
             return None
         return _workspace_dir(ws_id)
 
-    def _check_worker_permissions(
-        self,
-        definition: dict,
-        session_permissions: Optional[Dict[str, Any]],
-    ) -> Optional[str]:
-        """
-        Check whether the current session has sufficient permissions to
-        spawn this worker.  Returns an error message string if denied,
-        or ``None`` if allowed.
-        """
-        if not GATE_AVAILABLE or not check_required_categories:
-            return None  # no gate = allow
-
-        required = definition.get("required_categories", [])
-        if not required:
-            return None
-
-        worker_perms = definition.get("permission_footprint") or definition.get("worker_permissions", {})
-
-        ok, error_msg = check_required_categories(
-            required=required,
-            effective=session_permissions or {},
-            tool_name="Worker",
-            tool_args={"action": self.action, "worker_name": self.worker_name},
-            description=f"Spawn worker '{self.worker_name}'",
-            permission_footprint=worker_perms,
-            is_worker_context=True,
-        )
-
-        if not ok:
-            return error_msg
-        return None
-
     def _build_agent_config(self) -> dict:
         """
         Build an agent config dict from the tool's injected agent_config.
@@ -2107,16 +2086,6 @@ class Worker(ToolBase):
             if elapsed is not None:
                 parsed["elapsed_seconds"] = round(elapsed, 1)
             return parsed
-
-        # Permission gate check
-        gate_error = self._check_worker_permissions(
-            definition, self.session_permissions
-        )
-        if gate_error is not None:
-            return {
-                "error": f"Permission denied: {gate_error}",
-                "worker_name": self.worker_name,
-            }
 
         # Build agent config for this worker
         agent_config = self._build_agent_config()

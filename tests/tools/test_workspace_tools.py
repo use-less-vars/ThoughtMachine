@@ -566,7 +566,7 @@ class TestWorker:
         mock_file = MagicMock()
         mock_file.exists.return_value = True
         mock_file.read_text.return_value = json.dumps([
-            {"name": "default", "status": "ready", "permission_subset": ["container:read"], "last_heartbeat": None},
+            {"name": "default", "status": "ready", "permission_subset": [], "last_heartbeat": None},
         ])
         mock_dir.__truediv__.return_value = mock_file
         mock_ws_dir.return_value = mock_dir
@@ -785,56 +785,10 @@ class TestWorker:
         assert result["count"] == 0
 
     def test_required_categories(self):
-        """Worker declares container:read."""
-        assert "container:read" in Worker.required_categories
+        """Worker declares no required categories — spawning workers is not
+        gated by session permissions (decoupled from 'execution')."""
+        assert Worker.required_categories == []
 
-    # ═══════════════════════════════════════════════════════════════════
-    #  Permission gate
-    # ═══════════════════════════════════════════════════════════════════
-
-    @patch("tools.workspace.worker.GATE_AVAILABLE", True)
-    @patch("tools.workspace.worker.check_required_categories")
-    def test_permission_gate_allows(self, mock_gate):
-        """check_required_categories returning (True, "") means allowed."""
-        mock_gate.return_value = (True, "")
-        tool = Worker(action="list", workspace_path="/tmp/test_ws")
-        result = tool._check_worker_permissions(
-            {"required_categories": ["container:read"], "permission_footprint": {}},
-            {"container": "read"},
-        )
-        assert result is None
-
-    @patch("tools.workspace.worker.GATE_AVAILABLE", True)
-    @patch("tools.workspace.worker.check_required_categories")
-    def test_permission_gate_denies(self, mock_gate):
-        """check_required_categories returning (False, msg) means denied."""
-        mock_gate.return_value = (False, "Insufficient permissions")
-        tool = Worker(action="list", workspace_path="/tmp/test_ws")
-        result = tool._check_worker_permissions(
-            {"required_categories": ["execution:write"], "permission_footprint": {}},
-            {"execution": "read"},
-        )
-        assert result == "Insufficient permissions"
-
-    @patch("tools.workspace.worker.GATE_AVAILABLE", True)
-    def test_no_required_categories_skips_gate(self):
-        """If definition has no required_categories, gate is skipped."""
-        tool = Worker(action="list", workspace_path="/tmp/test_ws")
-        result = tool._check_worker_permissions(
-            {"permission_footprint": {}},
-            {},
-        )
-        assert result is None
-
-    @patch("tools.workspace.worker.GATE_AVAILABLE", False)
-    def test_gate_unavailable(self):
-        """If security gate is not importable, all workers allowed."""
-        tool = Worker(action="list", workspace_path="/tmp/test_ws")
-        result = tool._check_worker_permissions(
-            {"required_categories": ["execution:write"], "permission_footprint": {}},
-            {},
-        )
-        assert result is None
 
     # ═══════════════════════════════════════════════════════════════════
     #  Spawn-time tool stripping (4b — footprint + 4a blocklist)

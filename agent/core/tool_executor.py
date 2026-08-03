@@ -56,7 +56,6 @@ DEFAULT_SESSION_PERMISSIONS = {
     "system": "read",
     "git": "read",
     "execution": "banned",
-    "worker": "banned",
 }
 
 class ToolExecutor:
