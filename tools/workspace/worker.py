@@ -203,6 +203,16 @@ class WorkerBusAdapter:
             content = event.get("content", "") or event.get("data", {}).get("content", "")
             reasoning = event.get("reasoning_content", "") or event.get("data", {}).get("reasoning_content", "")
             response_type = event.get("response_type", event.get("data", {}).get("response_type", "answer"))
+            # FIX C: skip publishing empty placeholder messages. They produce invisible
+            # bubbles in the worker panel AND consume the frontend dedup key (canonical
+            # type|timestamp), causing the real full-content message (same logical event,
+            # same timestamp) to be deduplicated away. Verified: no streaming /
+            # update-in-place flow depends on empty-content worker_message publishes.
+            if not content and not reasoning:
+                log('DEBUG', 'pipeline.worker_bus',
+                    f"forward_agent_event: SKIPPED agent_responded (empty content/reasoning) "
+                    f"[worker={self.worker_name}]")
+                return
             self._publish("worker_message", {
                 "content": str(content)[:1000],
                 "reasoning_content": str(reasoning)[:2000] if reasoning else None,
@@ -271,6 +281,12 @@ class WorkerBusAdapter:
                 f"[TOKEN_PIPELINE] WorkerBusAdapter.forward_agent_event: assistant_message "
                 f"[worker={self.worker_name}] content_len={len(str(content))} "
                 f"reasoning={bool(reasoning)}")
+            # FIX C: skip empty placeholder messages (see agent_responded guard above).
+            if not content and not reasoning:
+                log('DEBUG', 'pipeline.worker_bus',
+                    f"forward_agent_event: SKIPPED turn (empty content/reasoning) "
+                    f"[worker={self.worker_name}]")
+                return
             self._publish("assistant_message", {
                 "content": str(content)[:1000],
                 "reasoning_content": str(reasoning)[:2000] if reasoning else None,

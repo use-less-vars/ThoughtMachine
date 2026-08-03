@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import adaptWorkerEvent from '../chat/adaptWorkerEvent';
+import adaptWorkerEvent, { isWorkerEventRenderable } from '../chat/adaptWorkerEvent';
 
 // ── Constants from the source (must match adaptWorkerEvent.js) ────────────
 const WORKER_STARTED_TEXT = '⬤ Worker started';
@@ -883,3 +883,67 @@ describe('_id generation', () => {
     expect(result._id).toBe('sess_xyz_2026-07-09T12:00:00.000Z_tool_call');
   });
 });
+
+// ==========================================================================
+// isWorkerEventRenderable (Fix A / Fix B helper — added with panel fixes)
+// ==========================================================================
+describe('isWorkerEventRenderable', () => {
+  it('is false for null/undefined/empty input', () => {
+    expect(isWorkerEventRenderable(null)).toBe(false);
+    expect(isWorkerEventRenderable(undefined)).toBe(false);
+    expect(isWorkerEventRenderable({})).toBe(false);
+  });
+
+  it('is false for header-only internal events (context_updated / tokens_updated)', () => {
+    expect(isWorkerEventRenderable(makeEvent({ event: 'context_updated', response: {} }))).toBe(false);
+    expect(isWorkerEventRenderable(makeEvent({ event: 'tokens_updated', response: {} }))).toBe(false);
+  });
+
+  it('is true for lifecycle events (system notifications)', () => {
+    expect(isWorkerEventRenderable(makeEvent({ event: 'started' }))).toBe(true);
+    expect(isWorkerEventRenderable(makeEvent({ event: 'worker_completed', response: { worker_name: 'w1' } }))).toBe(true);
+  });
+
+  it('is false for internal assistant messages with empty content and no reasoning', () => {
+    const evt = makeEvent({
+      event: 'worker_message',
+      response: { content: '', reasoning_content: undefined, response_type: 'answer' },
+    });
+    expect(isWorkerEventRenderable(evt)).toBe(false);
+  });
+
+  it('is true for internal assistant messages with content', () => {
+    const evt = makeEvent({ event: 'worker_message', response: { content: 'Hello' } });
+    expect(isWorkerEventRenderable(evt)).toBe(true);
+  });
+
+  it('is true for internal assistant messages with only reasoning_content', () => {
+    const evt = makeEvent({ event: 'assistant_message', response: { reasoning_content: 'thinking...' } });
+    expect(isWorkerEventRenderable(evt)).toBe(true);
+  });
+
+  it('is false for raw WS header-only events', () => {
+    expect(isWorkerEventRenderable({ type: 'worker:context_updated', data: {}, timestamp: 't' })).toBe(false);
+    expect(isWorkerEventRenderable({ type: 'worker:tokens_updated', data: {}, timestamp: 't' })).toBe(false);
+  });
+
+  it('is false for raw WS empty worker_message (placeholder)', () => {
+    expect(isWorkerEventRenderable({ type: 'worker:worker_message', data: { content: '' }, timestamp: 't' })).toBe(false);
+    expect(isWorkerEventRenderable({ type: 'worker:assistant_message', data: {}, timestamp: 't' })).toBe(false);
+  });
+
+  it('is true for raw WS worker_message with content or reasoning', () => {
+    expect(isWorkerEventRenderable({ type: 'worker:worker_message', data: { content: 'Hi' }, timestamp: 't' })).toBe(true);
+    expect(isWorkerEventRenderable({ type: 'worker:assistant_message', data: { reasoning_content: 'r' }, timestamp: 't' })).toBe(true);
+  });
+
+  it('is true for raw WS lifecycle/warning events', () => {
+    expect(isWorkerEventRenderable({ type: 'worker:worker_completed', data: { worker_name: 'w1' }, timestamp: 't' })).toBe(true);
+    expect(isWorkerEventRenderable({ type: 'worker:token_warning', data: { token_count: 1 }, timestamp: 't' })).toBe(true);
+  });
+
+  it('is true for raw WS user_message with a query', () => {
+    expect(isWorkerEventRenderable({ type: 'worker:user_message', data: { query: 'Do it' }, timestamp: 't' })).toBe(true);
+  });
+});
+

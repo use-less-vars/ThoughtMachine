@@ -366,6 +366,48 @@ export default function adaptWorkerEvent(evt) {
   }
 }
 
+/**
+ * Determine whether a worker event will render a visible bubble.
+ *
+ * Handles BOTH shapes used across the frontend:
+ *   (1) raw WS shape   : { type: 'worker:worker_message', data: {...}, timestamp }
+ *   (2) internal panel : { event: 'worker_message', request, response, timestamp }
+ *
+ * An event is renderable when adaptWorkerEvent() produces a msg with content,
+ * reasoning_content, or is_system_notification — mirroring the EMPTY EVENT
+ * FILTER in WorkerOutputPanel. Header-only events (context_updated /
+ * tokens_updated) and suppressed queries ('query') are NOT renderable.
+ *
+ * @param {object} evt
+ * @returns {boolean} true if the event renders a visible bubble
+ */
+export function isWorkerEventRenderable(evt) {
+  if (!evt) return false
+
+  // ── Raw WebSocket shape: { type: 'worker:xxx', data: {...} } ──
+  if (evt.type) {
+    const rawType = evt.type.replace('worker:', '') || ''
+    const data = evt.data || {}
+    // Header-only / suppressed events never render a bubble
+    if (rawType === 'context_updated') return false
+    if (rawType === 'tokens_updated') return false
+    if (rawType === 'query') return false
+    // Assistant-message variants are visible only with actual content
+    if (rawType === 'worker_message' || rawType === 'assistant_message' || rawType === 'final_response') {
+      return !!(data.content || data.reasoning_content)
+    }
+    if (rawType === 'user_message') {
+      return !!(data.content || data.query || (evt.request && evt.request.query))
+    }
+    // Lifecycle, warnings, errors, tool events — always render
+    return true
+  }
+
+  // ── Internal panel shape: { event: 'xxx', request, response } ──
+  const msg = adaptWorkerEvent(evt)
+  return !!(msg && (msg.content || msg.reasoning_content || msg.is_system_notification))
+}
+
 
 /* ===================================================================
  * Example mappings (for reference / testing):

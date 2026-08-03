@@ -1125,6 +1125,14 @@ body {
   animation: worker-glow-pulse 1.5s ease-in-out infinite;
 }
 
+/* Label next to the status dot in the WorkerOutputPanel header (F5) */
+.worker-status-label {
+  font-size: 11px;
+  color: #6c7086;
+  margin-left: 6px;
+  user-select: none;
+}
+
 /* Glow/pulse animation for busy dot in WorkerManagementPanel lists */
 @keyframes worker-dot-pulse {
   0%, 100% {

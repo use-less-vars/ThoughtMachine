@@ -1,40 +1,12 @@
 import React, { useState, useEffect, useCallback, useRef, useLayoutEffect } from 'react';
 import { MessageBubble } from './chat/MessageBubble';
-import adaptWorkerEvent from './chat/adaptWorkerEvent';
+import adaptWorkerEvent, { isWorkerEventRenderable } from './chat/adaptWorkerEvent';
+import useStore from '../store/useStore';
 
 const PANEL_MIN = 250;
 const PANEL_MAX = 600;
 const PANEL_DEFAULT = 350;
 
-const STATUS_DOT = {
-  ready: { bg: '#585b70', label: 'Idle' },        /* grey — spawned but not doing anything */
-  busy: { bg: '#a6e3a1', label: 'Running' },      /* green with pulse — actively processing */
-  completed: { bg: '#6c7086', label: 'Completed' }, /* muted grey — done */
-  error: { bg: '#f38ba8', label: 'Error' },       /* red — failed */
-  stopped: { bg: '#313244', label: 'Stopped' },   /* dark/off — not spawned */
-  paused: { bg: '#f0ad4e', label: 'Paused' },      /* amber — paused by user */
-};
-
-function statusDotColor(status) {
-  return STATUS_DOT[status]?.bg || '#6c7086';
-}
-
-// Event types that mean the worker is no longer actively producing output.
-// Used ONLY by the recency-based activity indicator (Fix 2c heuristic) —
-// these are the panel-normalized names (raw 'worker:xxx' minus prefix).
-// Includes defensive aliases (worker_stopped / worker_finished / bare
-// lifecycle names) in case they appear via other paths.
-const TERMINAL_WORKER_EVENTS = new Set([
-  'worker_completed',
-  'worker_error',
-  'worker_paused',
-  'worker_stopped',
-  'worker_finished',
-  'completed',
-  'error',
-  'stopped',
-  'paused',
-]);
 
 function relativeTime(isoString) {
   if (!isoString) return '';
@@ -155,6 +127,11 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
   workerInfoRef.current = workerInfo;
 
   const runtimeStatus = workerInfo?.runtime_status || 'ready';
+
+  // F5: the status dot follows the owning session's running state — the same
+  // signal as the session tab's Running/Idle indicator. It survives refreshes
+  // because it comes from the store, not from the (possibly empty) event list.
+  const isRunning = useStore((s) => (sessionId ? (s.sessionStates[sessionId]?.isRunning ?? false) : false));
 
   // Worker info is updated via WebSocket incomingEvents (no polling)
 
@@ -315,12 +292,6 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
       return !seenEventKeysRef.current.has(key)
     })
 
-    // ── Register dedup keys using the SAME rawType as the filter ──
-    for (const e of firstTimers) {
-      const rawType = e.type?.replace('worker:', '') || ''
-      seenEventKeysRef.current.add(makeDedupKey(rawType, e.timestamp))
-    }
-
     // ── Transform filtered events to display format ──
     const newOnes = firstTimers.map(e => {
         const eventType = e.type?.replace('worker:', '') || 'unknown'
@@ -479,8 +450,17 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
         }
       })
 
-    // Dedup keys were registered above using rawType (matching the filter check).
-    // No separate registration loop needed here.
+    // ── Register dedup keys ONLY for events that render a visible bubble ──
+    // Fix B: empty placeholder messages (no content/reasoning) must NOT consume
+    // the dedup key — the same logical event typically arrives again with full
+    // content (same canonical key + timestamp) and that later arrival must still
+    // pass the dedup filter and render.
+    for (let i = 0; i < firstTimers.length; i++) {
+      if (isWorkerEventRenderable(newOnes[i])) {
+        const rawType = firstTimers[i].type?.replace('worker:', '') || ''
+        seenEventKeysRef.current.add(makeDedupKey(rawType, firstTimers[i].timestamp))
+      }
+    }
 
     // ═══ Bailout if nothing new ═══
     if (newOnes.length === 0) {
@@ -682,29 +662,6 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
     return () => clearInterval(interval);
   }, [runtimeStatus]);
 
-  // ── Recency-based activity indicator (Fix 2c) ──────────────────────────
-  // Derived locally from this panel's own event list (already filtered to
-  // the selected worker). Heuristic: the worker counts as "active" only if
-  // its last event is a non-terminal event and arrived within the last 15s.
-  // After a browser refresh the event list is empty, so nothing is shown.
-  // This deliberately does NOT touch runtimeStatus/workerInfo or the main
-  // agent sessionStates.isRunning — it is an independent, local signal.
-  const [, setNowTick] = useState(0);
-  useEffect(() => {
-    if (events.length === 0) return;
-    const interval = setInterval(() => setNowTick((t) => t + 1), 5000);
-    return () => clearInterval(interval);
-  }, [events.length]);
-
-  const lastEvent = events[events.length - 1] || null;
-  const lastEventType = lastEvent?.event || '';
-  const lastEventAgeMs = lastEvent
-    ? Date.now() - new Date(lastEvent.timestamp).getTime()
-    : Infinity;
-  const workerActive =
-    !!lastEvent &&
-    !TERMINAL_WORKER_EVENTS.has(lastEventType) &&
-    lastEventAgeMs < 15000; // staleness guard — clearly a heuristic
 
   // ── Render helpers ────────────────────────────────────────────────────
   // renderEvent removed in Phase B Step 3 — replaced by adaptWorkerEvent + MessageBubble below
@@ -755,33 +712,18 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
       >
         {/* ── Status bar (slim, matching main StatusBar) ────────────── */}
         <div className="worker-output-header">
-          {/* Fix 2c: hide the default grey 'Idle' dot when there are no events
-              (e.g. right after a browser refresh — nothing is running). */}
-          {events.length > 0 && (
-            <span
-              className={'worker-status-dot' + (runtimeStatus === 'busy' ? ' worker-status-dot-busy' : '')}
-              style={{ background: statusDotColor(runtimeStatus) }}
-            />
-          )}
-          {/* Fix 2c: recency-based activity badge (heuristic, local derivation).
-              Active when the last event is non-terminal and < 15s old;
-              neutral otherwise. Hidden entirely in the empty state. */}
-          {events.length > 0 && (
-            <span
-              className="worker-recency-badge"
-              title={workerActive
-                ? 'Worker activity detected in the last 15s'
-                : 'No recent worker activity'}
-              style={{
-                fontSize: '11px',
-                marginLeft: '6px',
-                color: workerActive ? '#a6e3a1' : '#6c7086',
-                userSelect: 'none',
-              }}
-            >
-              {workerActive ? '● active' : '○ inactive'}
-            </span>
-          )}
+          {/* Status dot — always visible. Reflects the owning session's running
+              state (green + pulse when running, grey idle), matching the session
+              tab's Running/Idle indicator (F5). No longer event-heuristic based,
+              so it also renders correctly right after a browser refresh. */}
+          <span
+            className={'worker-status-dot' + (isRunning ? ' worker-status-dot-busy' : '')}
+            style={{ background: isRunning ? '#4caf50' : '#9e9e9e' }}
+            title={isRunning ? 'Worker session is running' : 'Worker session is idle'}
+          />
+          <span className="worker-status-label">
+            {isRunning ? 'Running' : 'Idle'}
+          </span>
           <span className="worker-output-header-label">
             Worker: {workerName}
           </span>

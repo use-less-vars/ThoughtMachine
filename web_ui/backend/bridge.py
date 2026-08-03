@@ -227,6 +227,13 @@ class WebAgentBridge:
         # Event forwarder — owns callback registry, event mapping, and emission
         self._forwarder = EventForwarder(self, event_callback)
 
+        # Reconnect buffer — worker events published while no WebSocket callback
+        # is registered (e.g. F5 reload gap) are kept here and replayed to the
+        # next connection via _flush_worker_event_buffer() in set_event_callback().
+        self._worker_event_buffer: List[Dict[str, Any]] = []
+        self._worker_event_buffer_max = 100
+        self._worker_event_buffer_lock = threading.Lock()
+
         # Track last known controller busy state for state_changed is_running
         self._last_state_busy: Optional[bool] = None
 
@@ -341,8 +348,6 @@ class WebAgentBridge:
 
         def _make_handler(event_cls):
             def _handler(event: event_cls) -> None:
-                if not self._forwarder._callbacks:
-                    return
                 data = event.data or {}
                 log('DEBUG', 'pipeline.bridge',
                     f"[TOKEN_PIPELINE] bridge global bus handler: type={event.type.value!r}, "
@@ -361,7 +366,14 @@ class WebAgentBridge:
                     'timestamp': event.metadata.timestamp.isoformat(),
                     'data': data,
                 }
-
+                # Buffer before the drop gate so lifecycle events (worker_status,
+                # worker_message) published during the F5 reconnect gap are replayed.
+                self._buffer_worker_event(event_dict)
+                if not self._forwarder._callbacks:
+                    log('DEBUG', 'pipeline.bridge',
+                        f"Global bus handler: no event_callbacks registered, "
+                        f"buffered worker:{event.type.value} (replay on next connect)")
+                    return
                 for cb in list(self._forwarder._callbacks.values()):
                     try:
                         cb(event_dict)
@@ -559,18 +571,21 @@ class WebAgentBridge:
                         f"(session_id={session_id!r}). Check that register_worker_event_bus() "
                         f"was called BEFORE the WORKER_SPAWNED event was published.")
 
-        # Forward the event to frontend callbacks (if any)
-        if not self._forwarder._callbacks:
-            log('DEBUG', 'pipeline.bridge',
-                f"_on_worker_spawned: no event_callbacks, skipping frontend forward "
-                f"(worker_bus subscription still happened if bus was found)")
-            return
+        # Build the event dict and buffer it BEFORE the no-callback drop gate so
+        # a worker spawned during the F5 reconnect gap is replayed on next connect.
         event_dict = {
             'type': f'worker:{event.type.value}',
             'worker_name': worker_name,
             'timestamp': event.metadata.timestamp.isoformat(),
             'data': data,
         }
+        self._buffer_worker_event(event_dict)
+        # Forward the event to frontend callbacks (if any)
+        if not self._forwarder._callbacks:
+            log('DEBUG', 'pipeline.bridge',
+                f"_on_worker_spawned: no event_callbacks, buffered worker_spawned "
+                f"(worker_bus subscription still happened if bus was found)")
+            return
         for cb in list(self._forwarder._callbacks.values()):
             try:
                 cb(event_dict)
@@ -604,12 +619,6 @@ class WebAgentBridge:
 
         def _make_bus_handler(original_type: str):
             def _handler(event: Any) -> None:
-                if not self._forwarder._callbacks:
-                    # DIAG: Change from WARNING to DEBUG - transient condition during startup
-                    log('DEBUG', 'pipeline.bridge',
-                        f"Per-worker bus handler for {worker_name}/{original_type}: "
-                        f"NO event_callbacks registered, dropping event")
-                    return
                 data = event.data or {}
                 # [PIPELINE:HOPS] Per-worker bus handler entry
                 log('DEBUG', 'pipeline.hops',
@@ -681,6 +690,18 @@ class WebAgentBridge:
                         ),
                         'data': data,
                     }
+                # Buffer the event BEFORE the drop gate so events published while
+                # no WebSocket callback is registered (F5 reconnect gap) are
+                # replayed to the next connection instead of being lost.
+                # Heartbeat events (tokens_updated / context_updated) are NOT
+                # buffered — they are transient token/context snapshots.
+                if event_dict.get('type') not in ('worker:tokens_updated', 'worker:context_updated'):
+                    self._buffer_worker_event(event_dict)
+                if not self._forwarder._callbacks:
+                    log('DEBUG', 'pipeline.bridge',
+                        f"Per-worker bus handler for {worker_name}/{original_type}: "
+                        f"NO event_callbacks registered, buffered event (replay on next connect)")
+                    return
                 log('DEBUG', 'pipeline.bridge',
                     f"[TOKEN_PIPELINE] bridge per-worker bus handler [{worker_name}/{original_type}]: "
                     f"forwarding type={event_dict.get('type')}, "
@@ -777,11 +798,6 @@ class WebAgentBridge:
 
     def _forward_worker_event(self, event: Any) -> None:
         """Forward a worker lifecycle event to frontend (shared handler logic)."""
-        if not self._forwarder._callbacks:
-            log('DEBUG', 'pipeline.bridge',
-                f"_forward_worker_event: no callbacks, dropping "
-                f"type={event.type.value if hasattr(event, 'type') else '?'}")
-            return
         data = event.data or {}
         log('DEBUG', 'pipeline.bridge',
             f"[TOKEN_PIPELINE] bridge._forward_worker_event: type={event.type.value if hasattr(event, 'type') else '?'}, "
@@ -801,6 +817,14 @@ class WebAgentBridge:
             'timestamp': event.metadata.timestamp.isoformat(),
             'data': data,
         }
+        # Buffer before the drop gate so worker_completed / worker_error events
+        # published during the F5 reconnect gap are replayed on next connect.
+        self._buffer_worker_event(event_dict)
+        if not self._forwarder._callbacks:
+            log('DEBUG', 'pipeline.bridge',
+                f"_forward_worker_event: no callbacks, buffered "
+                f"type={event.type.value if hasattr(event, 'type') else '?'}")
+            return
         for cb in list(self._forwarder._callbacks.values()):
             try:
                 cb(event_dict)
@@ -870,12 +894,53 @@ class WebAgentBridge:
 
     def set_event_callback(self, callback: Callable[[Dict[str, Any]], None],
                           key: Optional[int] = None) -> None:
-        """Register a WebSocket callback. Delegates to EventForwarder.register_websocket."""
+        """Register a WebSocket callback. Delegates to EventForwarder.register_websocket.
+
+        After registration, any worker events buffered while no callback was
+        registered (F5 reload / reconnect gap) are replayed to this callback.
+        """
         self._forwarder.register_websocket(key, callback)
+        self._flush_worker_event_buffer(key)
 
     def remove_event_callback(self, key: int) -> None:
         """Remove a WebSocket callback. Delegates to EventForwarder.unregister_websocket."""
         self._forwarder.unregister_websocket(key)
+
+    def _buffer_worker_event(self, event_dict: Dict[str, Any]) -> None:
+        """Append a worker event to the reconnect ring buffer (max 100).
+
+        Called from per-worker event handlers *before* the no-callback drop gate
+        so events published while no WebSocket callback is registered (e.g. F5
+        reconnect gap) are replayed to the next connection instead of being lost.
+        """
+        with self._worker_event_buffer_lock:
+            self._worker_event_buffer.append(event_dict)
+            if len(self._worker_event_buffer) > self._worker_event_buffer_max:
+                self._worker_event_buffer.pop(0)
+
+    def _flush_worker_event_buffer(self, key: Optional[int] = None) -> None:
+        """Replay buffered worker events to the just-registered callback.
+
+        Only the callback identified by *key* receives the replay — already
+        connected callbacks received these events live.  The buffer is cleared
+        so each connection replays exactly the events it missed.
+        """
+        with self._worker_event_buffer_lock:
+            if not self._worker_event_buffer:
+                return
+            buffered, self._worker_event_buffer = self._worker_event_buffer[:], []
+        if key is None:
+            cbs = list(self._forwarder._callbacks.values())
+        else:
+            cb = self._forwarder._callbacks.get(key)
+            cbs = [cb] if cb is not None else []
+        for event_dict in buffered:
+            for cb in cbs:
+                try:
+                    cb(event_dict)
+                except Exception as exc:
+                    log('ERROR', 'server.bridge',
+                        f'Failed to replay buffered worker event: {exc}')
 
     def set_controller(self, controller: AgentController) -> None:
         """

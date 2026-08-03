@@ -33,6 +33,7 @@ import SessionTab from './components/SessionTab'
 import SessionList from './components/SessionList'
 import TabBar from './components/TabBar'
 import WorkerOutputPanel from './components/WorkerOutputPanel'
+import { isWorkerEventRenderable } from './components/chat/adaptWorkerEvent'
 import LoggingPanel from './components/LoggingPanel'
 import SessionCreationModal from './components/SessionCreationModal'
 import './styles.css'
@@ -483,7 +484,14 @@ export default function App() {
         rawType === 'assistant_message'
       ) ? 'final_response' : rawType
       const key = canonicalType + '|' + (event.timestamp || '')
-      if (events.some(e => {
+      const incomingVisible = isWorkerEventRenderable(event)
+      // Fix B: only renderable stored events can block a duplicate — an earlier
+      // empty placeholder must not consume the dedup key, otherwise the full-content
+      // message for the same logical event is wrongly dropped. Non-renderable
+      // incoming events are always stored (the panel needs them for the live ctx:
+      // counter and token updates), never blocked.
+      if (incomingVisible && events.some(e => {
+        if (!isWorkerEventRenderable(e)) return false
         const eRawType = e.type?.replace('worker:', '') || ''
         const eCanonicalType = (
           eRawType === 'worker_message' ||
