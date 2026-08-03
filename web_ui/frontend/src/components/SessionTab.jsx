@@ -40,17 +40,22 @@ const WS_URL = `ws://${window.location.hostname}:${WS_PORT}/ws`
 // ChatPanel re-renders (and re-runs its scroll effects) on every update.
 const EMPTY_MESSAGES = []
 // Chat messages carry no id/message_id in this app (verified: only session /
-// workspace metadata has ids), so compare role + content of the last message.
-// Length + last-message equality matches the store's append-dominant update
-// pattern (streaming mutates the LAST message; earlier messages are immutable).
+// workspace metadata has ids), so compare role + content of the FIRST and
+// LAST messages. Length + first/last-message equality matches the store's
+// update pattern (streaming mutates the LAST message; earlier messages are
+// immutable, so the first message pins the conversation start).
 function messagesEqual(a, b) {
   if (a === b) return true
   if (!a || !b) return false
   if (a.length !== b.length) return false
   if (a.length === 0) return true
+  const fa = a[0]
+  const fb = b[0]
   const la = a[a.length - 1]
   const lb = b[b.length - 1]
-  return !!(la && lb) && la.role === lb.role && la.content === lb.content
+  return !!(fa && fb && la && lb) &&
+    fa.role === fb.role && fa.content === fb.content &&
+    la.role === lb.role && la.content === lb.content
 }
 
 // ────────────────────────────────────────────────────────────────────────────
