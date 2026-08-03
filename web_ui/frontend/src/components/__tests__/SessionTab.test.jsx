@@ -204,13 +204,33 @@ describe('SessionTab — WebSocket lifecycle', () => {
     });
   });
 
-  it('inactive tab with existing session shows deferred placeholder instead of loading', async () => {
+  it('does not send load_session twice on first connect', async () => {
+    renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    // Duplicate onopen on the same socket (StrictMode / backend race) must
+    // not double-send: loadSentRef dedupes per connection (Fix 4b).
+    act(() => ws.open());
+    act(() => ws.open());
+    await waitFor(() => {
+      const loads = sentCommands(ws).filter((c) => c.command === 'load_session');
+      expect(loads).toHaveLength(1);
+      expect(loads[0].session_id).toBe('sess-1');
+    });
+  });
+
+  it('inactive tab with existing session still sends load_session but shows deferred placeholder', async () => {
     renderTab({ sessionId: 'sess-1', loadOnConnect: false });
     await connectWs();
+    // Fix 4b: inactive tabs still send load_session on connect (session state
+    // may have changed while disconnected), but keep the placeholder until
+    // the data arrives (or the tab is activated).
     expect(screen.getByText('Click tab to load conversation')).toBeInTheDocument();
     const ws = lastWs();
-    const commands = sentCommands(ws).map((c) => c.command);
-    expect(commands).not.toContain('load_session');
+    await waitFor(() => {
+      const loads = sentCommands(ws).filter((c) => c.command === 'load_session');
+      expect(loads).toHaveLength(1);
+      expect(loads[0].session_id).toBe('sess-1');
+    });
   });
 
   it('reconnects after an unexpected close (code != 1001)', async () => {
@@ -228,6 +248,36 @@ describe('SessionTab — WebSocket lifecycle', () => {
       act(() => ws.close(1006));
       act(() => vi.advanceTimersByTime(5000));
       expect(MockWebSocket.instances.length).toBeGreaterThan(before);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('resends load_session after an unexpected close (forced reload on reconnect)', async () => {
+    vi.useFakeTimers();
+    try {
+      renderTab({ sessionId: 'sess-1' });
+      // Flush the mount-effect stagger timer (see reconnect test above).
+      act(() => vi.advanceTimersByTime(0));
+      const ws1 = lastWs();
+      act(() => ws1.open());
+      // Flush the one-tick load_session deferral inside onopen.
+      act(() => vi.advanceTimersByTime(0));
+      expect(sentCommands(ws1).filter((c) => c.command === 'load_session')).toHaveLength(1);
+
+      const before = MockWebSocket.instances.length;
+      act(() => ws1.close(1006));
+      act(() => vi.advanceTimersByTime(5000));
+      expect(MockWebSocket.instances.length).toBeGreaterThan(before);
+
+      // Fix 4b: onclose resets loadSentRef, so the reconnected socket must
+      // send load_session again (forced reload on reconnect).
+      const ws2 = lastWs();
+      act(() => ws2.open());
+      act(() => vi.advanceTimersByTime(0));
+      const loads2 = sentCommands(ws2).filter((c) => c.command === 'load_session');
+      expect(loads2).toHaveLength(1);
+      expect(loads2[0].session_id).toBe('sess-1');
     } finally {
       vi.useRealTimers();
     }

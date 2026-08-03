@@ -295,6 +295,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     ws.onclose = (e) => {
       tabConnectingRef.current = false
       setWsConnected(false)
+      // Fix 4b: reset one-shot guards so a reconnect can send load_session
+      // again (the connection is fresh; the per-connection dedup restarts).
+      loadSentRef.current = false
+      dataReceivedRef.current = false
       // 1001 = normal close (component unmounting), don't reconnect
       if (e.code !== 1001 && !closedRef.current) {
         const delay = 1000 + Math.random() * 3000  // 1–4s jitter
@@ -324,39 +328,57 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
       pendingCommandsRef.current = []
       for (const cmd of pending) {
         console.log(`[SessionTab] Sending queued command: ${cmd.command}`)
-        ws.send(JSON.stringify({ command: cmd.command, ...cmd.payload }))
+        try {
+          wsRef.current?.send(JSON.stringify({ command: cmd.command, ...cmd.payload }))
+        } catch (err) {
+          console.warn(`[SessionTab] queued command send failed (socket closed): ${cmd.command}`, err.message)
+        }
       }
 
       // Register sendCommand with parent (use ref to avoid stale closure)
       onRegisterRef.current?.({ sendCommand: sendCommandRef.current, getSessionId: () => currentSessionId })
 
       // If we have a sessionId, load it immediately (active tab) or defer (inactive tab)
+      // Fix 4b: the tab owns the single, deduped load path. On EVERY connect
+      // (initial or reconnect) we send load_session for an existing session —
+      // active tabs reload immediately, and inactive tabs still send it so
+      // their session state refreshes after a disconnect. The ONLY skip is a
+      // stale session (Fix 3b, above) or a closing/unmounting tab.
       const sid = sessionIdRef.current
       if (sid) {
-        if (loadOnConnectRef.current) {
-          // Defer load_session by one tick so the parent's synchronous setup (handlers, etc.) completes first
-          setTimeout(() => {
-            ws.send(JSON.stringify({
+        // Defer load_session by one tick so the parent's synchronous setup (handlers, etc.) completes first
+        setTimeout(() => {
+          if (loadSentRef.current) return  // Fix 4b: one load_session per connection
+          loadSentRef.current = true
+          try {
+            wsRef.current?.send(JSON.stringify({
               command: 'load_session',
               session_id: sid
             }))
-          }, 0)
+          } catch (err) {
+            console.warn('[SessionTab] load_session send failed (socket closed):', err.message)
+          }
+        }, 0)
+        if (loadOnConnectRef.current) {
           console.log(`[SessionTab ${sid}] Sent load_session (active tab)`)
         } else {
-          // Check if load_session was already queued by App trigger (user clicked tab before WS connected)
-          const hasQueuedLoad = pending.some(cmd => cmd.command === 'load_session')
-          if (!hasQueuedLoad) {
-            setIsDeferred(true)
-            console.log(`[SessionTab ${sid}] Deferred load (inactive tab)`)
-          } else {
-            console.log(`[SessionTab ${sid}] Load already queued, skipping deferred placeholder`)
-          }
+          // Fix 4b: inactive tabs still send load_session (state may have
+          // changed while disconnected); keep the placeholder until the
+          // response (or activation) clears it.
+          setIsDeferred(true)
+          console.log(`[SessionTab ${sid}] Sent load_session (deferred tab)`)
         }
       } else {
-        ws.send(JSON.stringify({
-          command: 'new_session',
-          mode: modeRef.current || 'custom',
-        }))
+        if (loadSentRef.current) return  // Fix 4b: one new_session per connection
+        loadSentRef.current = true
+        try {
+          wsRef.current?.send(JSON.stringify({
+            command: 'new_session',
+            mode: modeRef.current || 'custom',
+          }))
+        } catch (err) {
+          console.warn('[SessionTab] new_session send failed (socket closed):', err.message)
+        }
       }
 
       // Fetch providers and tools list only if not already cached

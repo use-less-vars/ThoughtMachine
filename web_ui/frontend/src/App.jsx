@@ -539,42 +539,20 @@ export default function App() {
       'actionsExist=', !!tabActionsRef.current[tabId])
     setActiveTabId(tabId)
     // If this tab was deferred (didn't load on WS connect), trigger its load now
-    if (!tabLoadTriggeredRef.current[tabId]) {
-      tabLoadTriggeredRef.current[tabId] = true
-      const tab = tabsRef.current.find((t) => t.tabId === tabId)
-      if (tab?.sessionId) {
-        const actions = tabActionsRef.current[tabId]
-        if (actions?.sendCommand) {
-          actions.sendCommand('load_session', { session_id: tab.sessionId })
-          deferredLoadSentRef.current[tabId] = true
-          console.log(`[App] Triggered deferred load for tab ${tabId}, session ${tab.sessionId}`)
-        } else {
-          console.log(`[DEBUG App.handleSelectTab] actions MISSING for tab ${tabId} — deferred won't fire yet`)
-        }
-      } else {
-        console.log(`[DEBUG App.handleSelectTab] tab ${tabId} has no sessionId — skipping deferred load`)
-      }
-    } else {
-      console.log(`[DEBUG App.handleSelectTab] tab ${tabId} already triggered — no deferred action`)
-    }
+    // Fix 4b: load_session is owned by the tab's onopen (single deduped path);
+    // the tab reloads itself on every connect, so no deferred trigger here.
+    // Keep the trigger flag so the "already triggered" diagnostics stay valid.
+    tabLoadTriggeredRef.current[tabId] = true
   }, [])
 
   // ── Tab action registry (for save from SessionList) ───────────────────
   const handleRegisterTab = useCallback((tabId, actions) => {
     console.log(`[DEBUG App.handleRegisterTab] tabId=${tabId}, triggered=${!!tabLoadTriggeredRef.current[tabId]}, sent=${!!deferredLoadSentRef.current[tabId]}, sessionId=`, tabsRef.current.find(t => t.tabId === tabId)?.sessionId)
     tabActionsRef.current[tabId] = actions
-    // If this tab was selected before its actions were registered, trigger deferred load now
-    if (tabLoadTriggeredRef.current[tabId] && !deferredLoadSentRef.current[tabId]) {
-      const tab = tabsRef.current.find((t) => t.tabId === tabId)
-      if (tab?.sessionId) {
-        console.log(`[DEBUG App.handleRegisterTab] FIRE! sending load_session for tab ${tabId}`)
-        actions.sendCommand('load_session', { session_id: tab.sessionId })
-        deferredLoadSentRef.current[tabId] = true
-        console.log(`[App] Triggered deferred load for tab ${tabId} (via delayed registration)`)
-      } else {
-        console.log(`[DEBUG App.handleRegisterTab] tab ${tabId} has no sessionId — cannot send load_session`)
-      }
-    }
+    // load_session is sent by the tab's own onopen (deduped); do not send here.
+    // (Fix 4b) This previously re-sent load_session for tabs selected before
+    // their WS registered — racing the tab's onopen send and producing
+    // duplicate load_session commands. The tab owns the single load path.
   }, [])
 
   // ── Reliable rename via per-tab WS (Task 2) ──────────────────────────
