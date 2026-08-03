@@ -677,7 +677,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                 elif command == "pause_session":
                     if bridge is not None:
                         bridge.pause()
-                        await ws.send_json({"type": "status_message", "text": "⏸ Paused."})
+                        await ws.send_json({"type": "status_message", "text": "⏸ Pausing…"})
 
                 elif command == "resume_session":
                     if bridge is not None:

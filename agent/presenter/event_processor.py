@@ -158,7 +158,7 @@ class EventProcessor:
         """
         log('DEBUG', 'presenter.event_processor', f'_process_paused_event: stop_reason={event.get("stop_reason","unknown")}')
         if self.gui_integration:
-            self.gui_integration.emit_status_message('Paused')
+            self.gui_integration.emit_status_message('⏸ Paused')
 
     def _process_stop_reason_event(self, event: Dict[str, Any]) -> None:
         """Process stop_reason event (max_turns_reached, rate_limit)."""
