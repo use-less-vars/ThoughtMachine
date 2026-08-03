@@ -6,12 +6,6 @@
  *   - initial state slices
  *   - setSessions / setSessionMode / setTabRunningState / removeSessionState / reset
  *   - foreign-session isolation (per-session keyed maps)
- *
- * RED (intentionally failing until Phase 1 — do NOT delete):
- *   - workerEvents slice contract (per-session event log, dedup, 500 cap,
- *     clearWorkerEvents, removal on removeSessionState).  The backend already
- *     emits worker:* events and SessionTab forwards them via onWorkerEvent;
- *     Phase 1 adds this slice to the store.  These tests drive that work.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
@@ -177,82 +171,19 @@ describe('reset', () => {
 });
 
 // ==========================================================================
-// workerEvents (Phase 1 contract — intentionally failing until Phase 1)
-// ==========================================================================
-// The backend already emits worker:* events, and SessionTab forwards them to
-// the parent via onWorkerEvent.  Phase 1 will add a per-session workerEvents
-// slice to this store with canonical-type dedup and a 500-event cap.  These
-// tests document that contract and FAIL (RED) until Phase 1 lands — they are
-// the acceptance tests for that work, do not delete them.
-describe('workerEvents (Phase 1 contract — intentionally failing until Phase 1)', () => {
-  it('defines workerEvents in the initial state', () => {
-    expect(useStore.getState().workerEvents).toBeDefined();
-  });
-
-  it('defines addWorkerEvent as a function', () => {
-    expect(typeof useStore.getState().addWorkerEvent).toBe('function');
-  });
-
-  it('defines clearWorkerEvents as a function', () => {
-    expect(typeof useStore.getState().clearWorkerEvents).toBe('function');
-  });
-
-  it('appends events per session (isolation)', () => {
-    useStore.getState().addWorkerEvent('s1', { type: 'worker_message', timestamp: 'T1' });
-    useStore.getState().addWorkerEvent('s1', { type: 'worker_message', timestamp: 'T2' });
-    useStore.getState().addWorkerEvent('s2', { type: 'worker_message', timestamp: 'T3' });
-    expect(useStore.getState().workerEvents.s1).toHaveLength(2);
-    expect(useStore.getState().workerEvents.s2).toHaveLength(1);
-  });
-
-  it('dedups canonical event types sharing a timestamp', () => {
-    // worker_message / final_response / assistant_message all canonicalize to 'final_response'
-    useStore.getState().addWorkerEvent('s1', { type: 'final_response', timestamp: 'T' });
-    useStore.getState().addWorkerEvent('s1', { type: 'worker_message', timestamp: 'T' });
-    useStore.getState().addWorkerEvent('s1', { type: 'assistant_message', timestamp: 'T' });
-    expect(useStore.getState().workerEvents.s1).toHaveLength(1);
-  });
-
-  it('caps each session at 500 events (oldest dropped)', () => {
-    for (let i = 0; i < 501; i++) {
-      useStore.getState().addWorkerEvent('s1', { type: 'worker_message', timestamp: `T${i}` });
-    }
-    expect(useStore.getState().workerEvents.s1).toHaveLength(500);
-    expect(useStore.getState().workerEvents.s1[0].timestamp).not.toBe('T0');
-    expect(useStore.getState().workerEvents.s1[499].timestamp).toBe('T500');
-  });
-
-  it('clearWorkerEvents empties a session events', () => {
-    useStore.getState().addWorkerEvent('s1', { type: 'worker_message', timestamp: 'T1' });
-    useStore.getState().clearWorkerEvents('s1');
-    expect(useStore.getState().workerEvents.s1).toEqual([]);
-  });
-
-  it('removeSessionState also drops workerEvents for that session only', () => {
-    useStore.getState().addWorkerEvent('s1', { type: 'worker_message', timestamp: 'T1' });
-    useStore.getState().addWorkerEvent('s2', { type: 'worker_message', timestamp: 'T2' });
-    useStore.getState().removeSessionState('s1');
-    expect(useStore.getState().workerEvents.s1).toBeUndefined();
-    expect(useStore.getState().workerEvents.s2).toHaveLength(1);
-  });
-});
-
-// ==========================================================================
 // registerSession — per-session slice initialization (no overwrite)
 // ==========================================================================
 describe('registerSession', () => {
-  it('creates empty per-session entries in all four slices', () => {
+  it('creates empty per-session entries in all three slices', () => {
     useStore.getState().registerSession('s1');
     const st = useStore.getState();
     expect(st.sessionConfigs.s1).toEqual({ config: null, permissions: null, providers: [], tools: [], isLoaded: false });
     expect(st.sessionMessages.s1).toEqual([]);
     expect(st.sessionStates.s1).toEqual({ isRunning: false, state: null, contextLength: 0, tokensIn: 0, tokensOut: 0 });
-    expect(st.workerEvents.s1).toEqual([]);
   });
 
   it('does NOT overwrite an existing session entry', () => {
     useStore.getState().receiveSessionLoaded('s1', { config: { mode: 'custom' } });
-    useStore.getState().addWorkerEvent('s1', { type: 'worker_message', timestamp: 'T1' });
     useStore.getState().registerSession('s1');
     const st = useStore.getState();
     expect(st.sessionConfigs.s1).toEqual({
@@ -262,21 +193,19 @@ describe('registerSession', () => {
       tools: [],
       isLoaded: true,
     });
-    expect(st.workerEvents.s1).toHaveLength(1);
   });
 });
 
 // ==========================================================================
-// removeSession — drops a session from all eight slices, keeps others
+// removeSession — drops a session from all seven slices, keeps others
 // ==========================================================================
 describe('removeSession', () => {
-  it('removes a session from all eight slices and leaves other sessions intact', () => {
+  it('removes a session from all seven slices and leaves other sessions intact', () => {
     useStore.getState().registerSession('s1');
     useStore.getState().registerSession('s2');
     useStore.getState().receiveSessionLoaded('s1', {});
     useStore.getState().receiveConversationChanged('s1', [{ role: 'user', content: 'hi' }]);
     useStore.getState().receiveStateChanged('s1', 'RUNNING');
-    useStore.getState().addWorkerEvent('s1', { type: 'worker_message', timestamp: 'T1' });
     useStore.getState().setSessionError('s1', 'boom');
     useStore.getState().setSessionMode('s1', 'agent');
     useStore.getState().setTabRunningState('s1', 'RUNNING');
@@ -290,7 +219,6 @@ describe('removeSession', () => {
     expect(st.sessionConfigs.s1).toBeUndefined();
     expect(st.sessionMessages.s1).toBeUndefined();
     expect(st.sessionStates.s1).toBeUndefined();
-    expect(st.workerEvents.s1).toBeUndefined();
     expect(st.sessionErrors.s1).toBeUndefined();
     expect(st.sessionModes.s1).toBeUndefined();
     expect(st.tabRunningStates.s1).toBeUndefined();

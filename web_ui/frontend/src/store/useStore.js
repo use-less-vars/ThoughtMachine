@@ -11,9 +11,6 @@
  *   - tabRunningStates: per-session running status string
  *     ('RUNNING' | 'PAUSED' | 'WAITING_FOR_USER' | ...), written by
  *     SessionTab and consumed (via a tabId-keyed map) by TabBar.
- *   - workerEvents: per-session worker event log
- *     ({ [sessionId]: [{ type, timestamp, ... }] }), written via
- *     SessionTab's onWorkerEvent and capped at 500 events/session.
  *   - sessionConfigs: per-session config snapshot
  *     ({ [sessionId]: { config, permissions, providers, tools, isLoaded } })
  *   - sessionMessages: per-session conversation
@@ -42,11 +39,6 @@ export const PERMISSION_DEFAULTS = {
   execution: 'banned',
 }
 
-// Canonical worker event types: these dedup against each other when they share
-// a timestamp, so a final_response supersedes the worker_message /
-// assistant_message emitted for the same step.
-const CANONICAL_WORKER_EVENT_TYPES = new Set(['final_response', 'worker_message', 'assistant_message'])
-
 // Default per-session entries created by registerSession / receive* actions.
 const DEFAULT_SESSION_CONFIG = { config: null, permissions: null, providers: [], tools: [], isLoaded: false }
 const DEFAULT_SESSION_STATE = { isRunning: false, state: null, contextLength: 0, tokensIn: 0, tokensOut: 0 }
@@ -61,7 +53,6 @@ const initialState = {
   sessions: [],            // list of { session_id, name, created_at, updated_at, preview }
   sessionModes: {},        // { [sessionId]: 'agent' | 'engineer' | 'custom' }
   tabRunningStates: {},    // { [sessionId]: status string ('RUNNING' | 'PAUSED' | ...) }
-  workerEvents: {},        // { [sessionId]: [{ type, timestamp, ... }] }
   sessionConfigs: {},      // { [sessionId]: { config, permissions, providers, tools, isLoaded } }
   sessionMessages: {},     // { [sessionId]: [messages] }
   sessionStates: {},       // { [sessionId]: { isRunning, state, contextLength, tokensIn, tokensOut } }
@@ -91,43 +82,20 @@ const useStore = create((set) => ({
   setTabRunningState: (sessionId, status) =>
     set((state) => ({ tabRunningStates: { ...state.tabRunningStates, [sessionId]: status } })),
 
-  addWorkerEvent: (sessionId, evt) =>
-    set((state) => {
-      const existing = state.workerEvents[sessionId] || []
-      let events
-      if (CANONICAL_WORKER_EVENT_TYPES.has(evt.type) && existing.some((e) => e.timestamp === evt.timestamp)) {
-        // Dedup: a canonical event supersedes an earlier event with the same
-        // timestamp (e.g. final_response replaces the worker_message for a step).
-        events = existing.map((e) => (e.timestamp === evt.timestamp ? evt : e))
-      } else {
-        events = [...existing, evt]
-      }
-      // Cap each session at 500 events, dropping the oldest.
-      if (events.length > 500) {
-        events = events.slice(events.length - 500)
-      }
-      return { workerEvents: { ...state.workerEvents, [sessionId]: events } }
-    }),
-
-  clearWorkerEvents: (sessionId) =>
-    set((state) => ({ workerEvents: { ...state.workerEvents, [sessionId]: [] } })),
-
   registerSession: (sessionId) =>
     set((state) => {
       // Create per-session entries if missing; never overwrite existing data.
       const config = state.sessionConfigs[sessionId] || DEFAULT_SESSION_CONFIG
       const messages = state.sessionMessages[sessionId] || []
       const runtimeState = state.sessionStates[sessionId] || DEFAULT_SESSION_STATE
-      const events = state.workerEvents[sessionId] || []
       return {
         sessionConfigs: { ...state.sessionConfigs, [sessionId]: config },
         sessionMessages: { ...state.sessionMessages, [sessionId]: messages },
         sessionStates: { ...state.sessionStates, [sessionId]: runtimeState },
-        workerEvents: { ...state.workerEvents, [sessionId]: events },
       }
     }),
 
-  // Full purge — must touch all 8 slices defined in initialState.
+  // Full purge — must touch all 7 slices defined in initialState.
   removeSession: (sessionId) =>
     set((state) => {
       // Destructure-rest: drop the session's entries from ALL per-session slices
@@ -135,7 +103,6 @@ const useStore = create((set) => ({
       const { [sessionId]: _removedConfig, ...sessionConfigs } = state.sessionConfigs
       const { [sessionId]: _removedMessages, ...sessionMessages } = state.sessionMessages
       const { [sessionId]: _removedStates, ...sessionStates } = state.sessionStates
-      const { [sessionId]: _removedEvents, ...workerEvents } = state.workerEvents
       const { [sessionId]: _removedErrors, ...sessionErrors } = state.sessionErrors
       const { [sessionId]: _removedMode, ...sessionModes } = state.sessionModes
       const { [sessionId]: _removedRunning, ...tabRunningStates } = state.tabRunningStates
@@ -143,7 +110,6 @@ const useStore = create((set) => ({
         sessionConfigs,
         sessionMessages,
         sessionStates,
-        workerEvents,
         sessionErrors,
         sessionModes,
         tabRunningStates,
@@ -266,8 +232,7 @@ const useStore = create((set) => ({
       // Destructure-rest: drop the per-session slices for a sessionId that is going away.
       const { [sessionId]: _removedMode, ...sessionModes } = state.sessionModes
       const { [sessionId]: _removedRunning, ...tabRunningStates } = state.tabRunningStates
-      const { [sessionId]: _removedEvents, ...workerEvents } = state.workerEvents
-      return { sessionModes, tabRunningStates, workerEvents }
+      return { sessionModes, tabRunningStates }
     }),
 
   reset: () => set({ ...initialState }),
