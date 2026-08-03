@@ -23,12 +23,20 @@
 import React, { useEffect, useLayoutEffect, useRef, useCallback } from 'react'
 import { MessageBubble } from './chat/MessageBubble'
 
+// Fix 3a: "at bottom" window (~50px). Wider than the old 20px so a user
+// reading near the bottom edge isn't considered "scrolled up" by every small
+// append, while still auto-scrolling for the common reading-at-bottom case.
+const AT_BOTTOM_THRESHOLD = 50
+
 /* ── Main panel ── */
 function ChatPanel({ messages, loadMore, hasMore, scrollToBottomKey = 0 }) {
   const chatRef = useRef(null)
   const isAtBottomRef = useRef(true)
   const programmaticScrollRef = useRef(false)
   const prevCountRef = useRef(0)
+  // Fix 3a: last known scrollTop — used to preserve the user's reading
+  // position when the messages list is replaced while scrolled up.
+  const prevScrollTopRef = useRef(0)
 
   // ── Scroll handler — suppress updates during programmatic scroll ──
   const handleScroll = useCallback(() => {
@@ -40,14 +48,16 @@ function ChatPanel({ messages, loadMore, hasMore, scrollToBottomKey = 0 }) {
       // even when this scroll event was triggered programmatically.
       const el = chatRef.current
       if (el) {
-        isAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 20
+        isAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_THRESHOLD
+        prevScrollTopRef.current = el.scrollTop
       }
       return
     }
     const el = chatRef.current
     if (!el) return
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 20
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_THRESHOLD
     isAtBottomRef.current = atBottom
+    prevScrollTopRef.current = el.scrollTop
   }, [])
 
   // ── Centralized programmatic scroll helper ──
@@ -71,17 +81,23 @@ function ChatPanel({ messages, loadMore, hasMore, scrollToBottomKey = 0 }) {
     const prevCount = prevCountRef.current
     prevCountRef.current = currentCount
 
-    // Only auto-scroll when content was APPENDED (count increased),
-    // user is at bottom, and container exists.
-    if (
-      !isAtBottomRef.current ||
-      !chatRef.current ||
-      currentCount <= prevCount ||
-      currentCount === 0
-    ) {
+    // No container — nothing to do.
+    if (!chatRef.current || currentCount === 0) return
+
+    // Fix 3a: content changed while the user is scrolled UP — preserve their
+    // exact reading position. Browsers keep scrollTop when content is appended
+    // below the fold, but conversation_changed REPLACES the whole list, so we
+    // defensively restore the last known scrollTop from prevScrollTopRef.
+    // This replaces the previous hard early-return and prevents scroll fights
+    // between this effect and the ResizeObserver.
+    if (!isAtBottomRef.current || currentCount <= prevCount) {
+      chatRef.current.scrollTop = prevScrollTopRef.current
       return
     }
 
+    // Content was APPENDED and user is at bottom — scroll to the new bottom.
+    // Runs synchronously after DOM mutations (useLayoutEffect) but double-rAF
+    // ensures async rendering (syntax highlighting, markdown) has settled.
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         scrollToBottomFn()
@@ -110,12 +126,17 @@ function ChatPanel({ messages, loadMore, hasMore, scrollToBottomKey = 0 }) {
   }, [])
 
   // ── Force scroll to bottom when scrollToBottomKey changes ──
-  // Used for context compaction/summary recovery (R3).
+  // Fix 3a: the key is bumped on (a) context compaction/summary recovery
+  // (R3, pre-existing wiring in SessionTab.handleEvent) and (b) user query
+  // send (start_session / continue_session, wired in SessionTab.sendCommand).
+  // Both are explicit user/system actions where force-scrolling is desired
+  // EVEN IF the user is scrolled up — hence the removed isAtBottomRef guard
+  // (previously it made this key a no-op whenever the user had scrolled up,
+  // defeating the compaction intent).
   useEffect(() => {
     const el = chatRef.current
     if (!el) return
     if (scrollToBottomKey === 0) return  // initial value, no action
-    if (!isAtBottomRef.current) return  // don't yank user from reading position
 
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {

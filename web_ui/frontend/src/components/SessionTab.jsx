@@ -34,6 +34,25 @@ const CONFIG_PANEL_DEFAULT_WIDTH = 280
 const WS_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
 const WS_URL = `ws://${window.location.hostname}:${WS_PORT}/ws`
 
+// ── Fix 3a: stable empty array + memoized equality for sessionMessages ──
+// SessionTab re-renders on ANY store slice change (status, tokens, etc.);
+// without a stable messages reference, React.memo(ChatPanel) is defeated and
+// ChatPanel re-renders (and re-runs its scroll effects) on every update.
+const EMPTY_MESSAGES = []
+// Chat messages carry no id/message_id in this app (verified: only session /
+// workspace metadata has ids), so compare role + content of the last message.
+// Length + last-message equality matches the store's append-dominant update
+// pattern (streaming mutates the LAST message; earlier messages are immutable).
+function messagesEqual(a, b) {
+  if (a === b) return true
+  if (!a || !b) return false
+  if (a.length !== b.length) return false
+  if (a.length === 0) return true
+  const la = a[a.length - 1]
+  const lb = b[b.length - 1]
+  return !!(la && lb) && la.role === lb.role && la.content === lb.content
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Initial per-tab state
 // ────────────────────────────────────────────────────────────────────────────
@@ -80,13 +99,13 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     storeKey ? (s.sessions.find((x) => x.session_id === storeKey)?.name || '') : ''
   )
   const sessionConfig = useStore((s) => s.sessionConfigs[storeKey])
-  const sessionMessages = useStore((s) => s.sessionMessages[storeKey])
+  const sessionMessages = useStore((s) => s.sessionMessages[storeKey], messagesEqual)
   const sessionState = useStore((s) => s.sessionStates[storeKey])
   const sessionError = useStore((s) => (storeKey ? (s.sessionErrors[storeKey] || '') : ''))
   const config = sessionConfig?.config ?? null
   const providers = sessionConfig?.providers ?? []
   const availableTools = sessionConfig?.tools ?? []
-  const history = sessionMessages ?? []
+  const history = sessionMessages ?? EMPTY_MESSAGES
   const status = sessionState?.state ?? 'IDLE'
   const isRunning = sessionState?.isRunning ?? false
   const contextLength = sessionState?.contextLength ?? 0
@@ -197,6 +216,15 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     }
     console.log(`[SessionTab] Sending command: ${command}`, JSON.stringify({ command, ...payload }))
     ws.send(JSON.stringify({ command, ...payload }))
+    // Fix 3a: force ChatPanel scroll to bottom when the user sends a query.
+    // Scoped to the two query-send commands ONLY — sendCommand is generic and
+    // also serves get_providers / get_available_tools / load_more_messages /
+    // rename_session / delete_session, which must NOT yank the viewport.
+    // setScrollToBottomKey is a stable useState setter, so this stays valid
+    // inside the []-deps callback.
+    if (command === 'start_session' || command === 'continue_session') {
+      setScrollToBottomKey(k => k + 1)
+    }
   }, [])
   sendCommandRef.current = sendCommand
 
