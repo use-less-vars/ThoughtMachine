@@ -609,7 +609,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           </div>
 
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Worker Access</strong></label>
+            <label style={labelStyle}><strong>Execution</strong></label>
             <select
               value={draft.session_permissions?.execution ?? PERMISSION_DEFAULTS.execution}
               onChange={(e) => setDraft({

@@ -79,6 +79,8 @@ const STATUS_DOT_COLORS = {
   busy: '#a6e3a1',     /* green with pulse — actively processing */
   completed: '#6c7086', /* muted grey — finished */
   error: '#f38ba8',    /* red — something went wrong */
+  pausing: '#f9e2af',  /* amber — pause in flight (not yet paused) */
+  paused: '#f9e2af',   /* amber — paused; matches session StatusBar */
   stopped: '#313244',  /* dark/off — not spawned */
 };
 
@@ -627,7 +629,7 @@ export default function WorkerManagementPanel({
         throw new Error(body?.detail?.error || `HTTP ${res.status}`);
       }
       setWorkers((prev) =>
-        prev.map((w) => (w.name === name ? { ...w, runtime_status: 'paused' } : w))
+        prev.map((w) => (w.name === name ? { ...w, runtime_status: 'pausing' } : w))
       );
       setStopErrors((prev) => { const n = { ...prev }; delete n[name]; return n; });
     } catch (err) {
@@ -948,10 +950,16 @@ export default function WorkerManagementPanel({
                               ? '#f38ba8'
                               : w.runtime_status === 'busy'
                                 ? '#89b4fa'
-                                : '#a6adc8',
+                                : w.runtime_status === 'pausing' || w.runtime_status === 'paused'
+                                  ? '#f9e2af'
+                                  : '#a6adc8',
                         }}
                       >
-                        {w.runtime_status}
+                        {w.runtime_status === 'pausing'
+                          ? 'Pausing…'
+                          : w.runtime_status === 'paused'
+                            ? 'Paused'
+                            : w.runtime_status}
                       </span>
                       {/* Pause / Resume toggle */}
                       {w.runtime_status === 'paused' ? (
@@ -975,6 +983,26 @@ export default function WorkerManagementPanel({
                           title={`Resume ${w.name}`}
                         >
                           ▶ Resume
+                        </button>
+                      ) : w.runtime_status === 'pausing' ? (
+                        <button
+                          disabled
+                          style={{
+                            background: '#f9e2af',
+                            color: '#1e1e2e',
+                            border: 'none',
+                            borderRadius: '3px',
+                            padding: '0.1rem 0.4rem',
+                            cursor: 'default',
+                            opacity: 0.6,
+                            fontWeight: 600,
+                            fontSize: '0.65rem',
+                            lineHeight: '1.4',
+                            marginRight: '4px',
+                          }}
+                          title={`Pausing ${w.name}…`}
+                        >
+                          ⏸ Pausing…
                         </button>
                       ) : (
                         canPause(w.runtime_status) && (

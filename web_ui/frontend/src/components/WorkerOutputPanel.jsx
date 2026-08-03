@@ -613,8 +613,9 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
         const body = await res.json().catch(() => ({}));
         throw new Error(body?.detail?.error || `HTTP ${res.status}`);
       }
-      // Optimistic update
-      setWorkerInfo((prev) => prev ? { ...prev, runtime_status: 'paused' } : prev);
+      // Optimistic update — pause is in flight; flips to 'paused' when the
+      // worker_paused WS event arrives (once the current turn completes).
+      setWorkerInfo((prev) => prev ? { ...prev, runtime_status: 'pausing' } : prev);
     } catch (err) {
       setStopError(err.message);
       setTimeout(() => setStopError(''), 3000);

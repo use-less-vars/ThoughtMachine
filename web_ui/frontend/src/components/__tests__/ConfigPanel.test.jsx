@@ -136,7 +136,7 @@ describe('Permissions tab', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Permissions' }));
     const selects = container.querySelectorAll('select');
     expect(selects).toHaveLength(5);
-    // Order must be: Filesystem, Network, Git, System, Worker Access
+    // Order must be: Filesystem, Network, Git, System, Execution
     expect(selects[0].value).toBe(PERMISSION_DEFAULTS.filesystem); // 'read'
     expect(selects[1].value).toBe(PERMISSION_DEFAULTS.network);   // 'banned'
     expect(selects[2].value).toBe(PERMISSION_DEFAULTS.git);       // 'read'

@@ -150,7 +150,7 @@ function EffectivePermissionsSection({ sessionId }) {
   // the one-shot fetch plus the loading/failed states.
   const permissions = useStore((s) => (sessionId ? (s.sessionConfigs[sessionId]?.permissions ?? null) : null));
   const ep = permissions || PERMISSION_DEFAULTS;
-  const categories = ['filesystem', 'network', 'git', 'system', 'worker', 'container'];
+  const categories = ['filesystem', 'network', 'git', 'system', 'container'];
 
   return (
     <div>
