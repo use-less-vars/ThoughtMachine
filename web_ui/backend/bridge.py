@@ -1597,6 +1597,10 @@ class WebAgentBridge:
                 "message_count": len(session.user_history),
                 "workspace_id": self.workspace_id,
                 "workspace_path": self._workspace_path or '',
+                # is_running is the authoritative runtime flag for the reconnect/
+                # load path — the server no longer sends a separate state_changed
+                # after session_loaded (Fix 2a).
+                "is_running": self.agent_is_running if hasattr(self, 'agent_is_running') else False,
             })
             # Emit initial context_length so the frontend status bar shows
             # the correct value immediately (no need to wait for a live token_update).

@@ -1333,13 +1333,8 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             "session_id": session_id,
                             "workspace_id": bridge.workspace_id,
                             "workspace_path": bridge._workspace_path or '',
+                            "is_running": bridge.agent_is_running if hasattr(bridge, 'agent_is_running') else False,
                         })
-                    await ws.send_json({
-                        "type": "state_changed",
-                        "session_id": session_id,
-                        "state": "RUNNING" if bridge.agent_is_running else "IDLE",
-                        "is_running": bridge.agent_is_running,
-                    })
                     # Send tokens_updated so the frontend shows saved token counts
                     loaded = bridge._session or bridge._loaded_session
                     if loaded:
@@ -1677,12 +1672,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         "session_name": new_session.metadata.get('name', ''),
                         "workspace_id": bridge._workspace_id,
                         "workspace_path": bridge._workspace_path or '',
-                    })
-                    await ws.send_json({
-                        "type": "state_changed",
-                        "session_id": new_session.session_id,
-                        "state": "RUNNING" if bridge.agent_is_running else "IDLE",
-                        "is_running": bridge.agent_is_running,
+                        "is_running": bridge.agent_is_running if hasattr(bridge, 'agent_is_running') else False,
                     })
                     # Reset token display for a fresh session
                     await ws.send_json({
@@ -1810,12 +1800,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         "session_name": new_session.metadata.get('name', ''),
                         "workspace_id": bridge._workspace_id,
                         "workspace_path": _project_path,
-                    })
-                    await ws.send_json({
-                        "type": "state_changed",
-                        "session_id": new_session.session_id,
-                        "state": "RUNNING" if bridge.agent_is_running else "IDLE",
-                        "is_running": bridge.agent_is_running,
+                        "is_running": bridge.agent_is_running if hasattr(bridge, 'agent_is_running') else False,
                     })
                     await ws.send_json({
                         "type": "tokens_updated",

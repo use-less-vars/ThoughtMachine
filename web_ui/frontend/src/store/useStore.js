@@ -140,9 +140,10 @@ const useStore = create((set) => ({
 
   receiveSessionLoaded: (sessionId, payload) =>
     set((state) => ({
-      // session_loaded carries metadata (session_id/name/workspace); config /
-      // permissions / providers / tools arrive via their own events, so default
-      // any missing fields here.
+      // session_loaded is the authoritative snapshot: it carries metadata
+      // (session_id/name/workspace) plus is_running so the session's runtime
+      // state is set atomically on (re)load. Config / permissions / providers /
+      // tools arrive via their own events, so default any missing fields here.
       sessionConfigs: {
         ...state.sessionConfigs,
         [sessionId]: {
@@ -151,6 +152,16 @@ const useStore = create((set) => ({
           providers: payload?.providers || [],
           tools: normalizeTools(payload?.tools),
           isLoaded: true,
+        },
+      },
+      // is_running from the payload is authoritative; a missing is_running
+      // (older payloads) defaults to IDLE/False so nothing breaks.
+      sessionStates: {
+        ...state.sessionStates,
+        [sessionId]: {
+          ...(state.sessionStates[sessionId] || DEFAULT_SESSION_STATE),
+          state: payload?.is_running ? 'RUNNING' : 'IDLE',
+          isRunning: !!payload?.is_running,
         },
       },
     })),
