@@ -193,9 +193,15 @@ describe('SessionTab — WebSocket lifecycle', () => {
   it('existing session sends load_session with its session_id', async () => {
     renderTab({ sessionId: 'sess-1' });
     const ws = await connectWs();
-    const load = sentCommands(ws).find((c) => c.command === 'load_session');
-    expect(load).toBeTruthy();
-    expect(load.session_id).toBe('sess-1');
+    // load_session is deliberately deferred by one tick on open (SessionTab.jsx:
+    // "Defer load_session by one tick so the parent's synchronous setup
+    // (handlers, etc.) completes first"), so it arrives in a later macrotask
+    // than the synchronous new_session/get_providers sends — poll for it.
+    await waitFor(() => {
+      const load = sentCommands(ws).find((c) => c.command === 'load_session');
+      expect(load).toBeTruthy();
+      expect(load.session_id).toBe('sess-1');
+    });
   });
 
   it('inactive tab with existing session shows deferred placeholder instead of loading', async () => {
