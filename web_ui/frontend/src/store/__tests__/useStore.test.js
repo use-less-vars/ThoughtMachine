@@ -467,7 +467,7 @@ describe('new slice cross-session isolation', () => {
       isLoaded: true,
     });
     expect(st.sessionMessages.s2).toBeUndefined();
-    expect(st.sessionStates.s2).toBeUndefined();
+    expect(st.sessionStates.s2).toEqual({ isRunning: false, state: 'IDLE', contextLength: 0, tokensIn: 0, tokensOut: 0 });
   });
 });
 
