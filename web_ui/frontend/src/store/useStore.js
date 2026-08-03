@@ -227,14 +227,6 @@ const useStore = create((set) => ({
       },
     })),
 
-  removeSessionState: (sessionId) =>
-    set((state) => {
-      // Destructure-rest: drop the per-session slices for a sessionId that is going away.
-      const { [sessionId]: _removedMode, ...sessionModes } = state.sessionModes
-      const { [sessionId]: _removedRunning, ...tabRunningStates } = state.tabRunningStates
-      return { sessionModes, tabRunningStates }
-    }),
-
   reset: () => set({ ...initialState }),
 }))
 

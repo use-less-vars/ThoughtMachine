@@ -4,7 +4,7 @@
  * GREEN (passes today):
  *   - PERMISSION_DEFAULTS: the 6 documented defaults the Permissions tab relies on
  *   - initial state slices
- *   - setSessions / setSessionMode / setTabRunningState / removeSessionState / reset
+ *   - setSessions / setSessionMode / setTabRunningState / reset
  *   - foreign-session isolation (per-session keyed maps)
  */
 
@@ -130,28 +130,6 @@ describe('setTabRunningState', () => {
     useStore.getState().setTabRunningState('s1', 'RUNNING');
     useStore.getState().setTabRunningState('s2', 'PAUSED');
     expect(useStore.getState().tabRunningStates).toEqual({ s1: 'RUNNING', s2: 'PAUSED' });
-  });
-});
-
-// ==========================================================================
-// removeSessionState — drops both slices for one session, keeps others
-// ==========================================================================
-describe('removeSessionState', () => {
-  it('drops sessionModes and tabRunningStates for the removed session only', () => {
-    useStore.getState().setSessionMode('s1', 'agent');
-    useStore.getState().setSessionMode('s2', 'custom');
-    useStore.getState().setTabRunningState('s1', 'RUNNING');
-    useStore.getState().setTabRunningState('s2', 'IDLE');
-    useStore.getState().removeSessionState('s1');
-    expect(useStore.getState().sessionModes).toEqual({ s2: 'custom' });
-    expect(useStore.getState().tabRunningStates).toEqual({ s2: 'IDLE' });
-  });
-
-  it('keeps the sessions list untouched', () => {
-    useStore.getState().setSessions([{ session_id: 's1' }]);
-    useStore.getState().setSessionMode('s1', 'agent');
-    useStore.getState().removeSessionState('s1');
-    expect(useStore.getState().sessions).toEqual([{ session_id: 's1' }]);
   });
 });
 
