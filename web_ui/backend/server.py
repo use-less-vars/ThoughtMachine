@@ -799,61 +799,113 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         #      so it opens a fresh tab. The old session+tab stays untouched.
                         #
                         #    - **Existing session with NO conversation** (empty/fresh tab):
-                        #      update the existing session's workspace_id in-place so the same
-                        #      tab is reused — no new tab created.
+                        #      reuse the same tab; the session's workspace_id is immutable once
+                        #      set, so the workspace switch is applied via the workspace-scoped
+                        #      save below — no new tab created.
                         #
                         #    - **No existing session**: create a fresh one.
-                        from session.models import Session
-                        if existing_session is not None and _session_has_conversation(existing_session):
-                            # Session has real conversation — create new session for new workspace
-                            # (opens a new tab on the frontend via session_loaded)
-                            new_session = Session()
-                            new_session.metadata['source'] = 'web_ui'
-                            if workspace_id:
-                                new_session.workspace_id = workspace_id
-                            new_session.ensure_name()
-                            bridge._loaded_session = new_session
-                            _session_bridges[new_session.session_id] = bridge
-                            session_store.save_session(new_session, workspace_id=workspace_id)
-                            session_store.add_open_session(new_session.session_id)
-                            log('INFO', 'server',
-                                f"apply_config: created new session {new_session.session_id} "
-                                f"for workspace {workspace_id} (existing session {existing_session.session_id} "
-                                f"had conversation, preserved intact)")
+                        #
+                        #    All session creation goes through the bridge's SessionManager
+                        #    (mirrors the REST /api/session/create path and set_project) so the
+                        #    new session gets the full persisted config.
+                        try:
+                            if existing_session is not None and _session_has_conversation(existing_session):
+                                # Session has real conversation — create new session for new workspace
+                                # (opens a new tab on the frontend via session_loaded)
+                                session_id, _ = bridge._session_manager.create_session(
+                                    mode="custom", workspace_path=_project_path
+                                )
+                                # Reload the persisted session so we can layer workspace
+                                # metadata on top (create_session does not handle workspace_id).
+                                new_session = session_store.load_session(session_id, workspace_id=None)
+                                if workspace_id and new_session:
+                                    new_session.workspace_id = workspace_id
+                                # Wire the reloaded session into the bridge (mirrors
+                                # bridge.create_session) and re-save so the workspace_id
+                                # lands on disk in the workspace-scoped location.
+                                bridge._session = new_session
+                                bridge._loaded_session = new_session
+                                bridge._history_version = new_session.conversation_version
+                                sc = bridge._session_manager.extract_session_config(new_session)
+                                if sc is not None:
+                                    bridge._session_config = sc
+                                session_store.save_session(new_session, workspace_id=workspace_id)
+                                session_store.add_open_session(new_session.session_id)
+                                _session_bridges[new_session.session_id] = bridge
+                                log('INFO', 'server',
+                                    f"apply_config: created new session {new_session.session_id} "
+                                    f"for workspace {workspace_id} (existing session {existing_session.session_id} "
+                                    f"had conversation, preserved intact)")
 
-                            # Send session_loaded to frontend so it opens a new tab
-                            await ws.send_json({
-                                "type": "session_loaded",
-                                "session_id": new_session.session_id,
-                                "session_name": new_session.metadata.get('name', ''),
-                                "message_count": 0,
-                                "workspace_id": workspace_id or '',
-                                "workspace_path": _project_path,
-                                # Fix 4a: embed the config the user just submitted so the
-                                # chat UI renders from the first event; the config_changed
-                                # sent below (step 7) carries the canonical merged config.
-                                "config": msg.get("config"),
-                            })
-                        elif existing_session is not None:
-                            # No conversation (empty/fresh tab) — update workspace_id in-place
-                            existing_session.workspace_id = workspace_id or ''
-                            bridge._loaded_session = existing_session
-                            _session_bridges[existing_session.session_id] = bridge
-                            session_store.save_session(existing_session, workspace_id=workspace_id)
-                            log('INFO', 'server',
-                                f"apply_config: updated existing session {existing_session.session_id} "
-                                f"to workspace {workspace_id} (no conversation — kept same tab)")
-                        else:
-                            # No prior session — create one (rare: first config on a new conn)
-                            new_session = Session()
-                            new_session.metadata['source'] = 'web_ui'
-                            if workspace_id:
-                                new_session.workspace_id = workspace_id
-                            new_session.ensure_name()
-                            bridge._loaded_session = new_session
-                            _session_bridges[new_session.session_id] = bridge
-                            session_store.save_session(new_session, workspace_id=workspace_id)
-                            session_store.add_open_session(new_session.session_id)
+                                # Send session_loaded to frontend so it opens a new tab
+                                await ws.send_json({
+                                    "type": "session_loaded",
+                                    "session_id": new_session.session_id,
+                                    "session_name": new_session.metadata.get('name', ''),
+                                    "message_count": 0,
+                                    "workspace_id": workspace_id or '',
+                                    "workspace_path": _project_path,
+                                    # Fix 4a: embed the config the user just submitted so the
+                                    # chat UI renders from the first event; the config_changed
+                                    # sent below (step 7) carries the canonical merged config.
+                                    "config": msg.get("config"),
+                                })
+                            elif existing_session is not None:
+                                # No conversation (empty/fresh tab) — reuse the same tab. The
+                                # session's workspace_id is immutable once persisted, so the
+                                # workspace switch is applied via the workspace-scoped save below.
+                                bridge._loaded_session = existing_session
+                                _session_bridges[existing_session.session_id] = bridge
+                                session_store.save_session(existing_session, workspace_id=workspace_id)
+                                log('INFO', 'server',
+                                    f"apply_config: updated existing session {existing_session.session_id} "
+                                    f"to workspace {workspace_id} (no conversation — kept same tab)")
+                            else:
+                                # No prior session — create one (rare: first config on a new conn)
+                                session_id, _ = bridge._session_manager.create_session(
+                                    mode="custom", workspace_path=_project_path
+                                )
+                                new_session = session_store.load_session(session_id, workspace_id=None)
+                                if workspace_id and new_session:
+                                    new_session.workspace_id = workspace_id
+                                bridge._session = new_session
+                                bridge._loaded_session = new_session
+                                bridge._history_version = new_session.conversation_version
+                                sc = bridge._session_manager.extract_session_config(new_session)
+                                if sc is not None:
+                                    bridge._session_config = sc
+                                session_store.save_session(new_session, workspace_id=workspace_id)
+                                session_store.add_open_session(new_session.session_id)
+                                _session_bridges[new_session.session_id] = bridge
+                                log('INFO', 'server',
+                                    f"apply_config: created new session {new_session.session_id} "
+                                    f"for workspace {workspace_id} (no prior session)")
+
+                                # Mirror site 1: send session_loaded so the frontend opens the
+                                # freshly created session (same payload as the conversation branch).
+                                await ws.send_json({
+                                    "type": "session_loaded",
+                                    "session_id": new_session.session_id,
+                                    "session_name": new_session.metadata.get('name', ''),
+                                    "message_count": 0,
+                                    "workspace_id": workspace_id or '',
+                                    "workspace_path": _project_path,
+                                    "config": msg.get("config"),
+                                })
+                        except Exception as exc:
+                            # The old bridge is already stopped at this point; surface the
+                            # error and stop handling this connection (the Round C try/except
+                            # below is deliberately NOT entered).
+                            log('ERROR', 'server.ws',
+                                f"apply_config: session strategy failed: {exc}")
+                            try:
+                                await ws.send_json({
+                                    "type": "status_message",
+                                    "text": f"⚠ apply_config: session strategy failed: {exc}",
+                                })
+                            except Exception:
+                                pass
+                            return
 
                         try:
                             # 6. Now apply the config to the NEW bridge
