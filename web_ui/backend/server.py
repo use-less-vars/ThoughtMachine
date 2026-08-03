@@ -1347,7 +1347,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             "session_name": _loaded_meta.metadata.get('name', '') if _loaded_meta else '',
                             "workspace_id": bridge.workspace_id,
                             "workspace_path": bridge._workspace_path or '',
-                            "is_running": bridge.agent_is_running if hasattr(bridge, 'agent_is_running') else False,
+                            "is_running": bridge._controller.is_busy if bridge._controller else False,
                             "config": fe_config,
                         })
                     # Send tokens_updated so the frontend shows saved token counts
@@ -1687,7 +1687,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         "session_name": new_session.metadata.get('name', ''),
                         "workspace_id": bridge._workspace_id,
                         "workspace_path": bridge._workspace_path or '',
-                        "is_running": bridge.agent_is_running if hasattr(bridge, 'agent_is_running') else False,
+                        "is_running": bridge._controller.is_busy if bridge._controller else False,
                         "config": frontend_config if isinstance(frontend_config, dict) else None,
                     })
                     # Reset token display for a fresh session
@@ -1822,7 +1822,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         "session_name": new_session.metadata.get('name', ''),
                         "workspace_id": bridge._workspace_id,
                         "workspace_path": _project_path,
-                        "is_running": bridge.agent_is_running if hasattr(bridge, 'agent_is_running') else False,
+                        "is_running": bridge._controller.is_busy if bridge._controller else False,
                         "config": fe_config,
                     })
                     await ws.send_json({
