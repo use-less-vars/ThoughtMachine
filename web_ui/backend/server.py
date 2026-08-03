@@ -726,11 +726,10 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # Detect workspace_path change — the frontend no longer sends
                     # a separate set_project command; apply_config handles the full
                     # project switch internally to avoid race conditions.
-                    new_workspace_path = config.get("workspace_path", "") or ""
-                    workspace_changed = (
-                        bool(new_workspace_path)
-                        and new_workspace_path != _project_path
-                    )
+                    raw_workspace_path = config.get("workspace_path", "") or ""
+                    new_workspace_path = os.path.normpath(raw_workspace_path) if raw_workspace_path else ""
+                    current_path = os.path.normpath(_project_path or "")
+                    workspace_changed = bool(new_workspace_path) and new_workspace_path != current_path
 
                     if workspace_changed:
                         # ── Full project switch ────────────────────────────────────────────
