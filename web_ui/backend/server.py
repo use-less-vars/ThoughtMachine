@@ -855,47 +855,65 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             session_store.save_session(new_session, workspace_id=workspace_id)
                             session_store.add_open_session(new_session.session_id)
 
-                        # 6. Now apply the config to the NEW bridge
-                        config = config_manager.translate_frontend_config(config)
-                        result = bridge.apply_config(config)
+                        try:
+                            # 6. Now apply the config to the NEW bridge
+                            config = config_manager.translate_frontend_config(config)
+                            result = bridge.apply_config(config)
 
-                        # 7. Send config_changed + status message.
-                        #    session_loaded was already sent above (step 5) if a new session was
-                        #    created for a conversation-bearing session. For empty sessions that
-                        #    were updated in-place, no session_loaded is needed since the tab
-                        #    is reused.
-                        if isinstance(result, dict) and "config" in result:
-                            # Success — result includes config, settings, permissions, merged_config
-                            await ws.send_json({
-                                "type": "config_changed",
-                                **result,
-                            })
-                            log('INFO', 'server.config',
-                                f"Config applied after project switch to {_project_path}")
-                        else:
-                            # Config apply failed — still send a config
-                            # from the bridge so the frontend doesn't hang
-                            # with stale state or wrong workspace_path.
-                            fe_config = config_manager.get_frontend_config(bridge)
-                            settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
-                            permissions = config_manager.resolve_effective_permissions(bridge._session_config) if bridge._session_config else {}
-                            await ws.send_json({
-                                "type": "config_changed",
-                                "config": fe_config,
-                                "settings": settings,
-                                "permissions": permissions,
-                                "merged_config": fe_config,
-                            })
-                            err_msg = result.get('error', 'unknown error') if isinstance(result, dict) else 'unknown error'
+                            # 7. Send config_changed + status message.
+                            #    session_loaded was already sent above (step 5) if a new session was
+                            #    created for a conversation-bearing session. For empty sessions that
+                            #    were updated in-place, no session_loaded is needed since the tab
+                            #    is reused.
+                            if isinstance(result, dict) and "config" in result:
+                                # Success — result includes config, settings, permissions, merged_config
+                                await ws.send_json({
+                                    "type": "config_changed",
+                                    **result,
+                                })
+                                log('INFO', 'server.config',
+                                    f"Config applied after project switch to {_project_path}")
+                            else:
+                                # Config apply failed — still send a config
+                                # from the bridge so the frontend doesn't hang
+                                # with stale state or wrong workspace_path.
+                                fe_config = config_manager.get_frontend_config(bridge)
+                                settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
+                                permissions = config_manager.resolve_effective_permissions(bridge._session_config) if bridge._session_config else {}
+                                await ws.send_json({
+                                    "type": "config_changed",
+                                    "config": fe_config,
+                                    "settings": settings,
+                                    "permissions": permissions,
+                                    "merged_config": fe_config,
+                                })
+                                err_msg = result.get('error', 'unknown error') if isinstance(result, dict) else 'unknown error'
+                                await ws.send_json({
+                                    "type": "status_message",
+                                    "text": f"⚠ Config apply had issues: {err_msg}",
+                                })
+
                             await ws.send_json({
                                 "type": "status_message",
-                                "text": f"⚠ Config apply had issues: {err_msg}",
+                                "text": f"✅ Switched to project: {_project_path}",
                             })
-
-                        await ws.send_json({
-                            "type": "status_message",
-                            "text": f"✅ Switched to project: {_project_path}",
-                        })
+                        except Exception as exc:
+                            # Do NOT let a failed apply kill the WS handler — the old
+                            # bridge is already stopped at this point, so surface the
+                            # error to the frontend and let the loop continue.
+                            log('ERROR', 'server.ws',
+                                f"apply_config failed in load_session: {exc}")
+                            session_id = bridge._session_id or (
+                                bridge._loaded_session.session_id if bridge._loaded_session else None
+                            )
+                            try:
+                                await ws.send_json({
+                                    "type": "error",
+                                    "session_id": session_id,
+                                    "message": "Failed to apply config",
+                                })
+                            except Exception:
+                                pass
 
 
                     else:
