@@ -5943,3 +5943,42 @@ File: `agent/core/agent.py`
 4. **No lazy initialization**: Providers create their HTTP clients eagerly in `__init__()` — failures surface immediately
 5. **Config defaults cascade**: `factory_defaults.json` → `default_config.json` → user config → env vars → CLI args (later overrides earlier)
 
+
+## 2026-08-01 — ## Agent Core Inner Mechanics — Verified Deep-Dive (2026-08-...
+
+## Agent Core Inner Mechanics — Verified Deep-Dive (2026-08-01)
+
+Verified against current code (agent/core/agent.py is 1563 lines, not 1519 as older notes said; tool_executor.py 404 lines; state.py 406 lines).
+
+**Main loop (`process_query`, agent.py:823-1384)** — a Python generator that YIELDS event dicts to the caller (controller → EventBus → bridge → WebSocket). Turn loop: `for turn in range(config.max_turns)`. Per turn:
+1. stop_check → PAUSING + stopped event
+2. time monitoring (`update_time_state`) → time_warning injected IMMEDIATELY into conversation (LLM sees it)
+3. turn monitoring (`update_turn_state`) → turn_warning injected IMMEDIATELY
+4. token check (`update_token_state`) → token_warning injected IMMEDIATELY
+5. build LLM context via context_builder.build() → `_cleanup_orphaned_tool_messages`
+6. rate-limit delay if active, then `llm_client.chat_completion()`
+7. **LLM-reported prompt_tokens OVERWRITE the running token estimate** (ground truth; drift >5% logged as warning)
+8. assistant message → TurnTransaction → `commit_assistant_only()` BEFORE yielding any event (crash-safety)
+9. if tool_calls: tool_executor.execute_tool_calls() → `turn_transaction.commit()` → yield tool_call + tool_result events → flush BUFFERED token warnings (from _update_tokens_after_tool) → if final_detected (Respond) yield agent_responded + return; if summary_text (SummarizeTool) → `_apply_summary_pruning` → yield context_summarized → CONTINUE loop (agent keeps working)
+10. if no tool_calls: commit turn, yield agent_responded (answer), return
+11. loop exhaustion → stop_reason: max_turns_reached
+
+**Warning injection timing (important asymmetry)**: pre-LLM time/turn/token warnings are added to conversation IMMEDIATELY (LLM can react). Token warnings generated during tool execution (`_update_tokens_after_tool`, agent.py:718-750) are BUFFERED in `_pending_warnings`/`_pending_warning_events` and flushed AFTER turn_transaction.commit() so they land chronologically after tool results.
+
+**TurnTransaction (turn_transaction.py, 196 lines)**: buffers assistant msg + tool calls + tool results; `commit_assistant_only()` commits assistant before events; `commit()` writes everything; `rollback()` on failure. Crash-safety: data committed to user_history BEFORE any event yields.
+
+**ToolExecutor.execute_tool_calls (tool_executor.py:87-202)**: per tool_call: (1) `state.is_tool_allowed()` gate → rejection message if denied; (2) raw args logged to ~/.thoughtmachine/logs/tool_calls_raw_debug.log (2MB capped, truncated); (3) `json.loads` → `fast_json_repair.loads` fallback; (4) tool_class lookup in filtered tool_classes; (5) `_execute_single_tool` (permission categories check via security_gate, `required_categories`, workspace capabilities); (6) tool result added via turn_transaction, tokens estimated + `update_token_func`. Respond tool → final_detected=True + respond_result (response_type/status/confidence/meta); SummarizeTool → summary_text + keep_recent_turns.
+
+**State machine (state.py, 406 lines)**: AgentState dataclass with 5 enums: TokenState (NORMAL/WARNING/CRITICAL), TurnState, ExecutionState (READY/RUNNING/PAUSING/...), TimeState, SessionState. `update_token_state` (83-170), `update_time_state` (172-250), `update_turn_state` (252-330), `get_allowed_tools` (384-399) — restrictions_active gates tool set (SummarizeTool/Final only when CRITICAL next turn).
+
+**Config lifecycle**: mailbox pattern — `request_config_update()` queues to `_pending_config`, applied at start of next process_query. `_can_hot_swap` (temperature/top_p/enabled_tools → hot-swap, no restart) vs full `restart()` (preserves conversation + token counts; restores old LLM client on failure). `_configs_are_identical` skips no-op updates; `_notify_config_change` posts [SYSTEM NOTIFICATION].
+
+**Summarization (`_apply_summary_pruning`, agent.py:1385-1462)**: inserts system-role summary message at turn boundary (`_find_summary_insertion_index` via shared `group_messages_into_turns_with_indices`), appends unwarning AFTER SummarizeTool result, sets session.summary, updates token estimate, re-evaluates token state (clears restrictions), resets emergency_mode. Max summary length 20000 chars.
+
+**Emergency recovery**: token_limit_exceeded LLMError → `context_builder.emergency_mode = True` + retry (max 2 retries) → rebuilds context slimmer; exhausted → error event + stop.
+
+**Rate limiting**: RateLimitExceeded → exponential backoff delay (10s base × 1.2^n, cap 60s), adds rate_limit_warning event, sleep, then stop_reason: rate_limit.
+
+**Pause**: `request_pause()` sets `_pause_requested`; checked at 3 checkpoints: [1] turn_start, [2] after_llm (DEFERRED if tool_calls pending — grace turn commits assistant without tool_calls), [3] after_turn. Transition → PAUSING + paused event.
+
+**Event stream**: process_query yields dicts; `_add_conversation_data_to_event` stamps created_at/timestamp/seq/conversation_version/hash/tokens/turns. Event types actually yielded: user_query, stopped, token_update, time_warning, turn_warning, token_warning, turn, tool_call, tool_result, agent_responded, context_summarized, max_turns_reached/stop_reason, paused, error, rate_limit_warning. Many EventType enum entries (AGENT_START, WORKER_*, etc.) are emitted by controller/presenter, not by process_query.
