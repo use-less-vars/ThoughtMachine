@@ -27,6 +27,32 @@ def _load_file_or_fallback(path: str, fallback: str = '') -> str:
     return fallback
 
 
+def normalize_system_prompt(value: Any) -> str:
+    """Coerce a raw ``system_prompt`` value from the client to a plain string.
+
+    Some clients send a file-object dict instead of text::
+
+        {"name": "test_1.txt", "content": "...", "size_bytes": 11,
+         "modified_at": "2026-01-01T00:00:00"}
+
+    Without normalization that dict would be stored as-is and later
+    ``str()``/``json.dumps``-serialized into the LLM system message
+    (system-prompt injection).  Rules:
+
+    * ``str`` -> unchanged
+    * ``dict`` with a ``'content'`` key -> ``str(value['content'])``
+    * anything else (``None``, ``''``, numbers, dicts without ``'content'``,
+      lists) -> ``''`` (falsy == "use factory default" downstream)
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        content = value.get('content')
+        if content is not None:
+            return str(content)
+    return ''
+
+
 class SessionConfig(BaseModel):
     """Session-level configuration model.
 
@@ -150,15 +176,23 @@ class SessionConfig(BaseModel):
             return  # mode-locked — cannot override
         self.enabled_tools = list(new_tools)
 
-    def update_prompt(self, new_prompt: Optional[str]) -> None:
+    def update_prompt(self, new_prompt: Any) -> None:
         """Update the system prompt.
 
         In ``'custom'`` mode this replaces the prompt.
         In any other mode this is a **no-op** — the mode preset is enforced.
+
+        ``new_prompt`` is normalized via :func:`normalize_system_prompt` before
+        assignment, so a client-sent file-object dict
+        (``{"name", "content", ...}``) can never be stored raw and later
+        ``str()``/``json.dumps``-serialized into the LLM system message.
+        ``SessionConfig.system_prompt`` is therefore always ``str`` after this
+        method returns (``''`` == factory default, matching ``None`` semantics
+        downstream).
         """
         if self.mode and self.mode != 'custom':
             return  # mode-locked — cannot override
-        self.system_prompt = new_prompt
+        self.system_prompt = normalize_system_prompt(new_prompt)
 
     # ── Conversions ─────────────────────────────────────────────────────
 

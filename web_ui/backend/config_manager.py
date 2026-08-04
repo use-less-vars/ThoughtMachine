@@ -512,7 +512,7 @@ class ConfigManager:
             ``(frontend_format_dict, updated_SessionConfig_or_None)``
         """
         import copy
-        from agent.config.session_config import SessionConfig
+        from agent.config.session_config import SessionConfig, normalize_system_prompt
         from agent.config.provider_profile import ProviderManager
 
         # Work on a copy to avoid mutating caller's object on failure
@@ -545,8 +545,14 @@ class ConfigManager:
             session_config.update_tools(config_dict["enabled_tools"])
 
         # Prompt changes (mode-locked: only works in custom mode)
+        # Defense-in-depth: normalize the raw client value BEFORE update_prompt
+        # (SessionConfig.update_prompt also normalizes) so a file-object dict
+        # {"name", "content", ...} can never be stored raw and later
+        # str()/json.dumps-ed into the LLM system message.
         if "system_prompt" in config_dict:
-            session_config.update_prompt(config_dict["system_prompt"])
+            session_config.update_prompt(
+                normalize_system_prompt(config_dict["system_prompt"])
+            )
 
         # Mutable fields (always allowed regardless of mode)
         for field in ("provider_id", "model", "base_url", "temperature", "top_p", "max_turns"):

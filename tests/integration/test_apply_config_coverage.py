@@ -1064,3 +1064,71 @@ def test_case11_busy_config_queued_then_deferred_apply_fails(contract_server):
             finally:
                 controller.agent = orig_agent
                 controller.thread = orig_thread
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Case 12 — system_prompt sent as a file-object dict → normalized to its
+# 'content' string (never stored/leaked as a JSON object into the LLM prompt)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_case12_system_prompt_file_object_dict_normalized(contract_server):
+    """apply_config whose config.system_prompt is a file-object dict
+    {"name", "content", "size_bytes", "modified_at"} (the injection shape) →
+    SessionConfig.system_prompt becomes the plain 'content' string; neither the
+    raw dict nor a json.dumps'd object string ever reaches the LLM-facing
+    config. Regression guard for the system-prompt injection bug
+    (SessionConfig.update_prompt + ConfigManager.apply_config normalization)."""
+    app, _ = contract_server
+    label = "case12"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)  # mode='custom' by default
+            sid = loaded["session_id"]
+            assert sid
+
+            bridge = _server_mod()._session_bridges.get(sid)
+            assert bridge is not None
+            # custom mode → update_prompt applies (not mode-locked).
+            assert bridge._session_config.mode == "custom"
+
+            evt, events = _apply_config(ws, {
+                "system_prompt": {
+                    "name": "test_1.txt",
+                    "content": "SECRET_PROMPT_123",
+                    "size_bytes": 11,
+                    "modified_at": "2026-01-01T00:00:00",
+                }
+            }, label)
+            assert "session_loaded" not in [e.get("type") for e in events], (
+                f"system_prompt apply must not replace the session; got: "
+                f"{[e.get('type') for e in events]}"
+            )
+            # Normal branch: config_changed ONLY — no status_message.
+            _assert_quiet(ws, label)
+
+            # PRIMARY: the effective SessionConfig prompt is the plain string.
+            effective = bridge._session_config.system_prompt
+            assert effective == "SECRET_PROMPT_123", (
+                f"expected normalized content string, got {effective!r}"
+            )
+            assert "SECRET_PROMPT_123" in str(effective)
+            assert '{"name"' not in str(effective), (
+                f"system_prompt must not be a JSON-object string: {effective!r}"
+            )
+
+            # The broadcast config_changed payload carries the plain string too.
+            assert evt["config"]["system_prompt"] == "SECRET_PROMPT_123", (
+                f"config_changed system_prompt must be the plain string, got "
+                f"{evt['config'].get('system_prompt')!r}"
+            )
+
+            # Round-trips cleanly through model_dump (persistence path).
+            dumped = bridge._session_config.model_dump(exclude_none=True)
+            assert dumped["system_prompt"] == "SECRET_PROMPT_123", dumped
+
+            # The LLM-facing handoff receives a plain string — never the dict
+            # or a json-serialized object (AgentConfig only keeps non-empty
+            # strings; the dict would previously be dropped or leaked raw).
+            agent_cfg = bridge._session_config.to_agent_config()
+            assert isinstance(agent_cfg.system_prompt, str), agent_cfg.system_prompt
+            assert '{"name"' not in (agent_cfg.system_prompt or "")
