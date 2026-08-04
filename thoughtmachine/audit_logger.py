@@ -75,7 +75,7 @@ def audit_event(
         handler.terminator = ""  # we include \n in the line ourselves
         handler.stream.write(line)
         handler.flush()
-    except OSError:
+    except Exception:
         pass  # best-effort: don't crash the agent if the audit log is unwritable
 
 

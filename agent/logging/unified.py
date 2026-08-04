@@ -371,7 +371,10 @@ def set_log_level(level: Union[str, LogLevel]) -> str:
         try:
             CURRENT_LOG_LEVEL = LogLevel(level.upper())
         except ValueError:
-            print(f"[LOGGING] Invalid log level: {level}. Keeping {CURRENT_LOG_LEVEL.value}.", file=sys.stderr)
+            try:
+                print(f"[LOGGING] Invalid log level: {level}. Keeping {CURRENT_LOG_LEVEL.value}.", file=sys.stderr)
+            except Exception:
+                pass  # No console available
     else:
         CURRENT_LOG_LEVEL = level
     return previous
@@ -541,7 +544,13 @@ def log(
                 data_str = _truncate_string(data_str, console_limit)
             console_msg += f" | {data_str}"
         
-        print(console_msg, file=sys.stderr)
+        try:
+            print(console_msg, file=sys.stderr)
+        except Exception:
+            # Never let console logging crash tool execution.
+            # sys.stderr/stdout may be None or closed in daemonized/
+            # service runtimes (e.g., headless agent processes).
+            pass
 
     # Forward to AgentLogger (if available)
     logger = _get_logger()
@@ -576,7 +585,10 @@ def log(
                 turn=logger.current_turn if hasattr(logger, 'current_turn') else 0
             )
         except Exception as e:
-            print(f"[LOGGING ERROR] Failed to forward to AgentLogger: {e}", file=sys.stderr)
+            try:
+                print(f"[LOGGING ERROR] Failed to forward to AgentLogger: {e}", file=sys.stderr)
+            except Exception:
+                pass  # No console available; never propagate logging errors
 
 
 # Convenience functions

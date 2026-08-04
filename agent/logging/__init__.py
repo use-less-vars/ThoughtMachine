@@ -6,6 +6,20 @@ import json
 import logging as python_logging
 import os
 import threading
+
+
+def _safe_err_print(message: str) -> None:
+    """Print *message* to stderr without crashing when stderr is None.
+
+    In headless daemon launches CPython may set ``sys.stderr`` to ``None``;
+    ``print(x, file=None)`` then raises
+    ``AttributeError: 'NoneType' object has no attribute 'write'``.
+    """
+    try:
+        import sys
+        print(message, file=sys.stderr)
+    except Exception:
+        pass
 from datetime import datetime
 from enum import Enum
 try:
@@ -165,12 +179,19 @@ class _AgentLogger:
     def _initialize_logging(self):
         """Initialize logging handlers."""
         self.py_logger.handlers.clear()
+        # Add a NullHandler so stdlib logging NEVER falls back to
+        # logging.lastResort (which writes to sys.stderr and crashes with
+        # AttributeError when sys.stderr is None in headless daemon
+        # launches).  With at least one handler present on the logger,
+        # debug/warning/error calls on py_logger are silently dropped
+        # instead of touching stderr.
+        self.py_logger.addHandler(python_logging.NullHandler())
         if self.enable_file_logging:
             try:
                 self._file_handle = open(self.log_file_path, 'a', encoding='utf-8')
                 self._current_file_size = os.path.getsize(self.log_file_path) if os.path.exists(self.log_file_path) else 0
             except Exception as e:
-                print(f"[LOGGING ERROR] Failed to open log file {self.log_file_path}: {e}", file=__import__('sys').stderr)
+                _safe_err_print(f"[LOGGING ERROR] Failed to open log file {self.log_file_path}: {e}")
                 self.enable_file_logging = False
 
     def _should_log(self, level: LogLevel) -> bool:
@@ -199,7 +220,7 @@ class _AgentLogger:
         # Use a timeout to prevent indefinite blocking if lock is contended
         acquired = self._lock.acquire(timeout=5.0)
         if not acquired:
-            print(f"[LOGGING WARNING] _write_jsonl: could not acquire lock within 5s, skipping", file=__import__('sys').stderr)
+            _safe_err_print(f"[LOGGING WARNING] _write_jsonl: could not acquire lock within 5s, skipping")
             return
         try:
             if not self.enable_file_logging or not self._file_handle or self._file_handle.closed:
@@ -224,7 +245,7 @@ class _AgentLogger:
                         self._current_file_size = 0
                         _prune_logs_by_size(self.log_dir)
                     except Exception as rotate_e:
-                        print(f"[LOGGING ERROR] Failed to archive log file: {rotate_e}", file=__import__('sys').stderr)
+                        _safe_err_print(f"[LOGGING ERROR] Failed to archive log file: {rotate_e}")
                         self._file_handle = None
                         try:
                             self._file_handle = open(self.log_file_path, 'a', encoding='utf-8')
@@ -232,7 +253,7 @@ class _AgentLogger:
                             self._file_handle = None
                             self.enable_file_logging = False
             except Exception as e:
-                print(f"[LOGGING ERROR] Failed to write log entry: {e}", file=__import__('sys').stderr)
+                _safe_err_print(f"[LOGGING ERROR] Failed to write log entry: {e}")
                 # Attempt fallback write to agent_fallback.jsonl
                 try:
                     fallback_dir = os.path.dirname(self.log_file_path) if hasattr(self, 'log_file_path') and self.log_file_path else self.log_dir
@@ -709,6 +730,6 @@ def create_logger(config: 'AgentConfig') -> Optional[_AgentLogger]:
         )
         return logger
     except Exception as e:
-        print(f"[LOGGING ERROR] Failed to create logger: {e}", file=__import__('sys').stderr)
+        _safe_err_print(f"[LOGGING ERROR] Failed to create logger: {e}")
 from .unified import log, set_log_level, set_log_tags, show_log_config
 __all__ = ['log', 'set_log_level', 'set_log_tags', 'show_log_config', 'LogLevel', 'LogCategory', 'LogEventType', 'create_logger', 'AgentLogger']

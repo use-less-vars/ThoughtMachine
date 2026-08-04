@@ -68,7 +68,6 @@ _audit("MODULE_LOAD", f"file={__file__} pid={os.getpid()}")
 _build_log_cache: dict[str, str] = {}
 _build_log_cache_lock = threading.Lock()
 _build_in_progress: bool = False
-log("DEBUG", "tools.docker_executor", "Module loaded", {"__file__": __file__})
 
 def _compute_image_tag(workspace_path: str) -> str:
     """Derive a deterministic Docker image tag from the workspace path.
@@ -804,8 +803,11 @@ class DockerExecutor:
                         # loop sees each line as it arrives
                         with _build_log_cache_lock:
                             _build_log_cache[normalised] = '\n'.join(log_lines)
-                        sys.stdout.write(line + '\n')
-                        sys.stdout.flush()
+                        try:
+                            sys.stdout.write(line + '\n')
+                            sys.stdout.flush()
+                        except Exception:
+                            pass  # stdout may be None/closed in headless runtimes
                 elif "aux" in chunk and "ID" in chunk["aux"]:
                     image_id = chunk["aux"]["ID"]
 

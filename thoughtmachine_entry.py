@@ -9,6 +9,18 @@ This wrapper:
 import sys
 import os
 
+# ---- Stdio guard -------------------------------------------------------
+# If this process is launched with file descriptors 1/2 closed (e.g. by a
+# headless launcher or service wrapper), CPython sets sys.stdout / sys.stderr
+# to None.  Any print(), warnings emission, or stdlib-logging lastResort
+# fallback then crashes with "'NoneType' object has no attribute 'write'"
+# (this is the DockerCodeRunner crash).  Redirect them to devnull so the
+# whole process is stdio-safe in any launch environment.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, 'w')
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, 'w')
+
 
 def main() -> None:
     """Launch ThoughtMachine web UI server with frontend serving enabled."""

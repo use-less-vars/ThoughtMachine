@@ -19,6 +19,20 @@ except ImportError:
 import sys
 
 
+def _safe_stderr_print(message: str) -> None:
+    """Print *message* to stderr without crashing when stderr is None.
+
+    In headless daemon launches CPython may set ``sys.stderr`` to ``None``;
+    ``print(x, file=None)`` then raises
+    ``AttributeError: 'NoneType' object has no attribute 'write'``.
+    This helper makes debug logging best-effort in any environment.
+    """
+    try:
+        print(message, file=sys.stderr)
+    except Exception:
+        pass
+
+
 class ToolBase(BaseModel):
     model_config = ConfigDict(extra="forbid")
     """
@@ -123,7 +137,7 @@ class ToolBase(BaseModel):
                 msg = f"DEBUG: {message}"
                 if trunc_limit > 0 and len(msg) > trunc_limit:
                     msg = msg[:trunc_limit] + "..."
-                print(msg, file=sys.stderr)
+                _safe_stderr_print(msg)
 
     def _log_tool_warning(self, message: str, data: Optional[Dict[str, Any]] = None, tool_call_id: Optional[str] = None):
         """Log tool warning using structured logging or fallback."""
@@ -141,7 +155,7 @@ class ToolBase(BaseModel):
             import os
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                 import sys
-                print(f"WARNING: {message}", file=sys.stderr)
+                _safe_stderr_print(f"WARNING: {message}")
     
     def _log_tool_error(self, message: str, data: Optional[Dict[str, Any]] = None, tool_call_id: Optional[str] = None):
         """Log tool error using structured logging or fallback."""
@@ -159,7 +173,7 @@ class ToolBase(BaseModel):
             import os
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                 import sys
-                print(f"ERROR: {message}", file=sys.stderr)
+                _safe_stderr_print(f"ERROR: {message}")
     
     def _log_tool_internal(self, message: str, data: Optional[Dict[str, Any]] = None, tool_call_id: Optional[str] = None):
         """Log tool internal event using structured logging or fallback."""
@@ -177,7 +191,7 @@ class ToolBase(BaseModel):
             import os
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                 import sys
-                print(f"INTERNAL: {message}", file=sys.stderr)
+                _safe_stderr_print(f"INTERNAL: {message}")
     
     def _log_tool_performance(self, message: str, metrics: Dict[str, Any], tool_call_id: Optional[str] = None):
         """Log tool performance metrics using structured logging or fallback."""
@@ -195,7 +209,7 @@ class ToolBase(BaseModel):
             import os
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                 import sys
-                print(f"PERFORMANCE: {message} - {metrics}", file=sys.stderr)
+                _safe_stderr_print(f"PERFORMANCE: {message} - {metrics}")
     
     def _log_tool_event(self, event_type: Any, level: Any, message: str, data: Optional[Dict[str, Any]] = None, tool_call_id: Optional[str] = None):
         """Generic tool event logging using structured logging or fallback."""
@@ -222,7 +236,7 @@ class ToolBase(BaseModel):
             import os
             if os.environ.get('THOUGHTMACHINE_DEBUG') == '1':
                 import sys
-                print(f"TOOL [{level}]: {message}", file=sys.stderr)
+                _safe_stderr_print(f"TOOL [{level}]: {message}")
     
     def _resolve_registry_workspace(self) -> Optional[str]:
         """
