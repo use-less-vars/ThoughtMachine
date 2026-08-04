@@ -38,8 +38,8 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
     tools: cfg?.tools ?? [],
     session_permissions: normalizeSessionPermissions(cfg?.session_permissions),
 
-    token_monitor_warning_threshold: cfg?.token_monitor_warning_threshold ?? 35000,
-    token_monitor_critical_threshold: cfg?.token_monitor_critical_threshold ?? 50000,
+    token_monitor_warning_threshold: cfg?.token_monitor_warning_threshold ?? 65000,
+    token_monitor_critical_threshold: cfg?.token_monitor_critical_threshold ?? 80000,
     workspace_path: cfg?.workspace_path ?? '',
     tool_output_token_limit: cfg?.tool_output_token_limit ?? 10000,
   });
@@ -323,7 +323,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>Max Turns</strong></label>
             <input
-              type="number" min="1" max="100"
+              type="number" min="1" max="150"
               value={draft.max_turns}
               onChange={(e) => setDraft({ ...draft, max_turns: parseInt(e.target.value, 10) || 1 })}
               style={inputStyle}

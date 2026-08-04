@@ -95,6 +95,16 @@ class SessionConfig(BaseModel):
         ge=1,
         description='Maximum conversation turns for this session.',
     )
+    token_monitor_warning_threshold: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description='Token count threshold for warning state (None = AgentConfig default 65000).',
+    )
+    token_monitor_critical_threshold: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description='Token count threshold for critical state (None = AgentConfig default 80000).',
+    )
     provider_id: Optional[str] = Field(
         default=None,
         description='Provider identifier for the LLM (e.g. "v4_flash").',
@@ -211,7 +221,7 @@ class SessionConfig(BaseModel):
 
         kwargs: Dict[str, Any] = {
             'enabled_tools': list(self.enabled_tools),
-            'max_turns': self.max_turns or 0,
+            'max_turns': self.max_turns or 100,
             'system_prompt': self.system_prompt or '',
             'provider_id': self.provider_id or '',
             'api_key': self.api_key or '',
@@ -219,6 +229,8 @@ class SessionConfig(BaseModel):
             'model': self.model or '',
             'model_override': self.model_override or '',
             'temperature': self.temperature,
+            'token_monitor_warning_threshold': self.token_monitor_warning_threshold or 65000,
+            'token_monitor_critical_threshold': self.token_monitor_critical_threshold or 80000,
         }
 
         if self.mode:

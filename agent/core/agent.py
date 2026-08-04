@@ -913,6 +913,10 @@ class Agent:
             last_output_tokens = 0
             # Initialize time monitoring at start of agent execution
             self.state.time_start = time.time()
+            # max_turns is a per-query limit: read fresh at loop entry so a
+            # mailbox config update (Agent.request_config_update / hot-swap)
+            # is honored on the next query. Mid-loop changes do not extend
+            # the already-computed range.
             for turn in range(self.config.max_turns):
                 turn_start_time = time.time()
                 log('DEBUG', 'core.agent', f'process_query: starting turn {turn}/{self.config.max_turns}, conversation length={len(self.conversation)}')

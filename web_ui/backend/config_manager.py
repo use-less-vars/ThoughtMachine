@@ -51,8 +51,8 @@ FALLBACK_FRONTEND_CONFIG: Dict[str, Any] = {
     "stop_check": None,
     "system_prompt": None,
     "api_key_configured": False,
-    "token_monitor_warning_threshold": 60000,
-    "token_monitor_critical_threshold": 75000,
+    "token_monitor_warning_threshold": 65000,
+    "token_monitor_critical_threshold": 80000,
     "turn_monitor_enabled": True,
     "enable_logging": True,
     "log_dir": "./logs",
@@ -555,7 +555,8 @@ class ConfigManager:
             )
 
         # Mutable fields (always allowed regardless of mode)
-        for field in ("provider_id", "model", "base_url", "temperature", "top_p", "max_turns"):
+        for field in ("provider_id", "model", "base_url", "temperature", "top_p", "max_turns",
+                      "token_monitor_warning_threshold", "token_monitor_critical_threshold"):
             if field in config_dict:
                 setattr(session_config, field, config_dict[field])
 
@@ -641,6 +642,18 @@ class ConfigManager:
             except (ValueError, TypeError):
                 field_errors["max_turns"] = "Must be an integer"
                 errors.append("Invalid max_turns value")
+
+        # Check token monitor thresholds — warning must stay below critical
+        warn_thr = config.get("token_monitor_warning_threshold")
+        crit_thr = config.get("token_monitor_critical_threshold")
+        if warn_thr is not None and crit_thr is not None:
+            try:
+                if int(warn_thr) >= int(crit_thr):
+                    field_errors["token_monitor_warning_threshold"] = (
+                        "Warning threshold must be below critical threshold")
+                    warnings.append("Warning threshold should be below critical threshold")
+            except (ValueError, TypeError):
+                pass
 
         # Check workspace_path
         workspace = config.get("workspace_path", "")
