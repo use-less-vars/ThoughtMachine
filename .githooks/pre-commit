@@ -1,40 +1,45 @@
 #!/bin/bash
-# Pre-commit hook — ThoughtMachine
+# Pre-commit hook — ThoughtMachine fast gate (total budget < 10 s)
 #
 # Runs, in order:
-#   1. Integration tests:  pytest tests/integration/ -x --tb=short
-#   2. Core unit tests:    tests/tools/test_tool_gating.py, tests/tools/test_respond.py
-#   3. Frontend tests:     npm test --prefix web_ui/frontend  (vitest run; skipped with a
-#                          warning when web_ui/frontend/node_modules is not installed)
+#   1. Import gate    — `python -c "import web_ui.backend.server"`          (~1 s)
+#   2. Health check   — start the real server on 127.0.0.1:<random high port>,
+#                       poll GET /health with stdlib urllib (NOT curl), verify
+#                       {"status":"ok"} AND revision == `git rev-parse HEAD`,
+#                       then stop the server reliably (setsid process-group
+#                       TERM, kill -9 fallback, server output captured to log).
+#   3. Live smoke     — starlette TestClient against web_ui.backend.server.app:
+#                       ws /ws -> new_session -> assert session_loaded arrives.
+#                       Hermetic (temp HOME, API keys stripped, modules purged),
+#                       NO LLM call, NO network beyond 127.0.0.1.  Session
+#                       creation only — no chat message is ever sent.
+#   4. Contract test  — pytest tests/integration/test_session_creation_contract.py
+#                       ONLY when steps 1-3 finished in < 3 s combined
+#                       (otherwise skipped with the reason, to respect the
+#                       10 s total budget).  Skipped with a warning when the
+#                       file is absent (it is untracked in this repo).
 #
-# Robustness properties:
-#   * Every test command is wrapped in `timeout` (default 600s, override with
-#     PRE_COMMIT_TIMEOUT) so a hung test can never block a commit indefinitely.
-#   * Exit codes are aggregated explicitly: one failing suite does not abort the
-#     others, and the hook exits non-zero if any suite failed.
-#   * No network calls, no interactive prompts, no background processes — safe to
-#     run headless / from a server context.
-#   * The venv path is derived from the hook location, so the hook works from any
-#     checkout path (no hard-coded user directory).
+# Robustness:
+#   * Every subprocess is wrapped in `timeout` — no step can hang a commit.
+#   * The health-check server runs under setsid + timeout, is killed via
+#     process-group TERM with a -9 fallback, and is reaped by the EXIT trap.
+#   * No `set -u` on purpose: the hook may run in environments with unset
+#     variables; every expansion here is defensive (${VAR:-}).
+#   * No Docker, no real LLM calls, no api keys, no network beyond 127.0.0.1.
+#   * Self-contained: all Python is inline heredocs.
 
-set -u
 set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$REPO_ROOT"
+cd "$REPO_ROOT" || exit 1
 
-TIMEOUT_SECONDS="${PRE_COMMIT_TIMEOUT:-600}"
-
-if command -v timeout >/dev/null 2>&1; then
-    run_limited() { timeout --kill-after=30s "$TIMEOUT_SECONDS" "$@"; }
-else
-    echo "warning: 'timeout' not found — test suites run without a time limit" >&2
-    run_limited() { "$@"; }
-fi
-
-# Prefer the project virtualenv; fall back to system python3.
-if [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+# ── Python resolution ─────────────────────────────────────────────────────────
+# Honour an explicit $PYTHON if set and executable; otherwise prefer the repo
+# venv (derived from hook location, so any checkout path works), else python3.
+if [ -n "${PYTHON:-}" ] && [ -x "$PYTHON" ]; then
+    :
+elif [ -x "$REPO_ROOT/.venv/bin/python" ]; then
     PYTHON="$REPO_ROOT/.venv/bin/python"
 elif [ -x "$REPO_ROOT/.venv/bin/python3" ]; then
     PYTHON="$REPO_ROOT/.venv/bin/python3"
@@ -45,51 +50,222 @@ else
     exit 1
 fi
 
-failures=0
-
-echo "=== Pre-commit: integration tests ==="
-if run_limited "$PYTHON" -m pytest tests/integration/ -x --tb=short -q; then
-    echo "integration tests: PASS"
+# ── timeout helper ────────────────────────────────────────────────────────────
+TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="timeout"
 else
-    rc=$?
-    echo "integration tests: FAIL (exit $rc)" >&2
-    failures=$((failures + 1))
+    echo "warning: 'timeout' not found — steps run without a hard limit" >&2
 fi
-
-echo "=== Pre-commit: core unit tests ==="
-CORE_TESTS=()
-[ -f tests/tools/test_tool_gating.py ] && CORE_TESTS+=("tests/tools/test_tool_gating.py")
-[ -f tests/tools/test_respond.py ] && CORE_TESTS+=("tests/tools/test_respond.py")
-if [ "${#CORE_TESTS[@]}" -gt 0 ]; then
-    if run_limited "$PYTHON" -m pytest "${CORE_TESTS[@]}" -x --tb=short -q; then
-        echo "core unit tests: PASS"
+run_limited() {
+    local secs="$1"
+    shift
+    if [ -n "$TIMEOUT_BIN" ]; then
+        timeout --kill-after=10s "$secs" "$@"
     else
-        rc=$?
-        echo "core unit tests: FAIL (exit $rc)" >&2
-        failures=$((failures + 1))
+        "$@"
     fi
+}
+
+# ── Timing (GNU date ns; python fallback for non-GNU date) ───────────────────
+now_ns() {
+    local ns
+    ns="$(date +%s%N 2>/dev/null || true)"
+    case "$ns" in
+        *[!0-9]*|"") "$PYTHON" -c 'import time; print(time.time_ns())' ;;
+        *) printf '%s\n' "$ns" ;;
+    esac
+}
+elapsed_ms() {
+    printf '%d' $(( ( $2 - $1 ) / 1000000 ))
+}
+
+# ── Temp dir + reliable server cleanup ───────────────────────────────────────
+TMPDIR_HOOK="$(mktemp -d "${TMPDIR:-/tmp}/tm_precommit.XXXXXX")" || exit 1
+SERVER_PID=""
+
+stop_server() {
+    if [ -n "$SERVER_PID" ]; then
+        # Negative PID = whole process group (setsid made the server its own
+        # group leader).  TERM first, grace period, then -9.
+        kill -- "-$SERVER_PID" 2>/dev/null || kill "$SERVER_PID" 2>/dev/null || true
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            kill -0 "$SERVER_PID" 2>/dev/null || break
+            sleep 0.3
+        done
+        kill -9 -- "-$SERVER_PID" 2>/dev/null || kill -9 "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+        SERVER_PID=""
+    fi
+}
+cleanup() {
+    stop_server
+    rm -rf "$TMPDIR_HOOK"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+STEP_FAILURES=0
+OVERALL_START="$(now_ns)"
+
+# ── Step 1: import gate ───────────────────────────────────────────────────────
+echo "[pre-commit] 1/4 import gate"
+S1_START="$(now_ns)"
+if run_limited 30 "$PYTHON" -c "import web_ui.backend.server"; then
+    echo "  PASS ($(elapsed_ms "$S1_START" "$(now_ns)") ms)"
 else
-    echo "core unit tests: nothing to run (no test files found)"
+    echo "  FAIL ($(elapsed_ms "$S1_START" "$(now_ns)") ms) — web_ui.backend.server did not import (traceback above)" >&2
+    STEP_FAILURES=$((STEP_FAILURES + 1))
 fi
 
-echo "=== Pre-commit: frontend tests ==="
-if [ -d web_ui/frontend/node_modules ]; then
-    if run_limited npm test --prefix web_ui/frontend; then
-        echo "frontend tests: PASS"
+# ── Step 2: live health check ─────────────────────────────────────────────────
+echo "[pre-commit] 2/4 live health check (127.0.0.1, random high port)"
+S2_START="$(now_ns)"
+
+PORT=""
+for _ in 1 2 3 4 5; do
+    CAND=$(( ( RANDOM % 20000 ) + 20000 ))
+    if "$PYTHON" -c 'import socket, sys
+s = socket.socket()
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()' "$CAND" 2>/dev/null; then
+        PORT="$CAND"
+        break
+    fi
+done
+
+if [ -z "$PORT" ]; then
+    echo "  FAIL — could not find a free 127.0.0.1 port" >&2
+    STEP_FAILURES=$((STEP_FAILURES + 1))
+else
+    SERVER_LOG="$TMPDIR_HOOK/server.log"
+    if command -v setsid >/dev/null 2>&1; then
+        setsid timeout 30 "$PYTHON" -m web_ui.backend.server --host 127.0.0.1 --port "$PORT" >"$SERVER_LOG" 2>&1 &
     else
-        rc=$?
-        echo "frontend tests: FAIL (exit $rc)" >&2
-        failures=$((failures + 1))
+        timeout 30 "$PYTHON" -m web_ui.backend.server --host 127.0.0.1 --port "$PORT" >"$SERVER_LOG" 2>&1 &
     fi
-else
-    echo "warning: web_ui/frontend/node_modules not installed — skipping frontend tests" >&2
-    echo "  install with: npm install --prefix web_ui/frontend" >&2
+    SERVER_PID=$!
+
+    # No commits yet -> `git rev-parse HEAD` fails and the server reports
+    # "unknown"; match that fallback so the comparison works either way.
+    EXPECTED_REV="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+
+    if run_limited 15 "$PYTHON" - "$PORT" "$EXPECTED_REV" <<'PY'
+import json
+import sys
+import time
+import urllib.request
+
+port = sys.argv[1]
+expected_rev = sys.argv[2]
+deadline = time.time() + 12.0
+last_err = ""
+while time.time() < deadline:
+    try:
+        with urllib.request.urlopen(
+            "http://127.0.0.1:%s/health" % port, timeout=2
+        ) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            if body.get("status") == "ok" and body.get("revision") == expected_rev:
+                sys.exit(0)
+            last_err = "unexpected payload %r (expected revision %r)" % (body, expected_rev)
+    except Exception as exc:  # server not up yet / connection refused etc.
+        last_err = str(exc)
+    time.sleep(0.25)
+sys.stderr.write("health poll timed out: %s\n" % last_err)
+sys.exit(1)
+PY
+    then
+        echo "  PASS ($(elapsed_ms "$S2_START" "$(now_ns)") ms) — /health ok, revision $EXPECTED_REV"
+    else
+        echo "  FAIL ($(elapsed_ms "$S2_START" "$(now_ns)") ms) — health check failed; server log tail:" >&2
+        tail -n 25 "$SERVER_LOG" >&2 || true
+        STEP_FAILURES=$((STEP_FAILURES + 1))
+    fi
+    stop_server
 fi
 
-if [ "$failures" -eq 0 ]; then
-    echo "=== Pre-commit checks passed ==="
+# ── Step 3: live smoke test (TestClient, hermetic) ───────────────────────────
+echo "[pre-commit] 3/4 live smoke test (WS new_session -> session_loaded)"
+S3_START="$(now_ns)"
+if run_limited 30 "$PYTHON" - <<'PY'
+import os
+import pathlib
+import shutil
+import sys as sys_mod
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+# Hermetic: temp HOME + patched Path.home() + purged module singletons,
+# exactly like tests/integration/test_session_creation_contract.py.
+tmp_home = tempfile.mkdtemp(prefix="tm_precommit_smoke_")
+os.environ["HOME"] = tmp_home
+for key in ("OPENAI_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_COMPATIBLE_API_KEY"):
+    os.environ.pop(key, None)
+
+patcher = patch.object(pathlib.Path, "home", return_value=Path(tmp_home))
+patcher.start()
+try:
+    for mod_name in list(sys_mod.modules.keys()):
+        if mod_name.startswith(
+            ("web_ui.backend", "agent.config.provider_profile", "thoughtmachine.bootstrap")
+        ):
+            del sys_mod.modules[mod_name]
+
+    from web_ui.backend.server import app
+    from starlette.testclient import TestClient
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"command": "new_session", "mode": "custom"})
+            first = ws.receive_json()
+            assert first["type"] == "session_loaded", (
+                "expected session_loaded first, got %r" % (first.get("type"),)
+            )
+            assert first.get("session_id"), "session_loaded missing session_id"
+    print("  smoke: new_session -> session_loaded OK (session_id=%s)" % first["session_id"])
+finally:
+    patcher.stop()
+    shutil.rmtree(tmp_home, ignore_errors=True)
+PY
+then
+    echo "  PASS ($(elapsed_ms "$S3_START" "$(now_ns)") ms)"
+else
+    echo "  FAIL ($(elapsed_ms "$S3_START" "$(now_ns)") ms) — WS smoke test failed (see traceback above)" >&2
+    STEP_FAILURES=$((STEP_FAILURES + 1))
+fi
+
+# ── Step 4: conditional contract test ────────────────────────────────────────
+S3_END="$(now_ns)"
+STEPS123_MS="$(elapsed_ms "$OVERALL_START" "$S3_END")"
+CONTRACT_TEST="tests/integration/test_session_creation_contract.py"
+
+echo "[pre-commit] 4/4 conditional contract test"
+S4_START="$(now_ns)"
+if [ ! -f "$CONTRACT_TEST" ]; then
+    echo "  SKIP — $CONTRACT_TEST not in this checkout (untracked file, not yet committed)"
+elif [ "$STEPS123_MS" -ge 3000 ]; then
+    echo "  SKIP — steps 1-3 took ${STEPS123_MS} ms (>= 3000 ms); pytest would exceed the 10 s budget"
+else
+    if run_limited 6 "$PYTHON" -m pytest "$CONTRACT_TEST" -x --tb=short -q; then
+        echo "  PASS ($(elapsed_ms "$S4_START" "$(now_ns)") ms)"
+    else
+        echo "  FAIL ($(elapsed_ms "$S4_START" "$(now_ns)") ms) — $CONTRACT_TEST failed" >&2
+        STEP_FAILURES=$((STEP_FAILURES + 1))
+    fi
+fi
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+TOTAL_MS="$(elapsed_ms "$OVERALL_START" "$(now_ns)")"
+if [ "$STEP_FAILURES" -eq 0 ]; then
+    echo "[pre-commit] all steps PASSED (steps 1-3: ${STEPS123_MS} ms, total: ${TOTAL_MS} ms)"
     exit 0
 fi
-
-echo "=== Pre-commit checks FAILED ($failures suite(s)) ===" >&2
+echo "[pre-commit] FAILED — ${STEP_FAILURES} step(s) failed (total: ${TOTAL_MS} ms)" >&2
 exit 1
