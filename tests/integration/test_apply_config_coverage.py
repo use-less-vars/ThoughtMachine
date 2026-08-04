@@ -1132,3 +1132,275 @@ def test_case12_system_prompt_file_object_dict_normalized(contract_server):
             agent_cfg = bridge._session_config.to_agent_config()
             assert isinstance(agent_cfg.system_prompt, str), agent_cfg.system_prompt
             assert '{"name"' not in (agent_cfg.system_prompt or "")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Config-change guarantee while busy — ACKed fast (config_queued), applied on
+# idle on the SAME session (no lost updates, no premature config_changed)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_config_change_guarantee_while_busy(contract_server):
+    """A NON-workspace config change sent while the controller is RUNNING is
+    GUARANTEED to be applied: the server ACKs it with config_queued within
+    200ms (applying NOTHING yet), and once the controller goes idle the SAME
+    bridge/session applies it and broadcasts config_changed with the updated
+    permissions.  No session_loaded, no lost update, no premature apply."""
+    app, _ = contract_server
+    label = "case-guard"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)
+            sid = loaded["session_id"]
+            assert sid
+
+            bridge = _server_mod()._session_bridges.get(sid)
+            assert bridge is not None
+            controller = bridge._controller
+            assert controller is not None
+
+            # Simulate a busy controller WITHOUT starting a real agent thread
+            # (same stub as case10/11): RUNNING execution state + no-op config
+            # update + the (alive) main thread so apply_config_queued's
+            # controller_alive check doesn't trigger _restart_controller.
+            from agent.core.state import ExecutionState
+
+            class _FakeAgentState:
+                execution_state = ExecutionState.RUNNING
+
+            class _FakeAgent:
+                state = _FakeAgentState()
+                session = None  # keep _on_controller_event session-capture quiet
+
+                def request_config_update(self, agent_config):  # noqa: D401
+                    return None
+
+            orig_agent = controller.agent
+            orig_thread = controller.thread
+            try:
+                controller.agent = _FakeAgent()
+                controller.thread = threading.main_thread()
+                assert controller.is_busy, "stub must make the controller busy"
+
+                # ── Busy: the change is ACKed fast, applied NOTHING yet ────
+                ws.send_json({"command": "apply_config",
+                              "config": {"session_permissions": _NEW_PERMISSIONS}})
+                evt_q, events_q = _receive_until(
+                    ws, "config_queued", f"{label} → busy apply", timeout=0.2
+                )
+                assert evt_q.get("status") == "queued"
+                assert "config_changed" not in [e.get("type") for e in events_q], (
+                    f"guarantee: busy apply must NOT emit config_changed early; "
+                    f"got: {[e.get('type') for e in events_q]}"
+                )
+                assert "session_loaded" not in [e.get("type") for e in events_q], (
+                    f"guarantee: busy apply must NOT replace the session; got: "
+                    f"{[e.get('type') for e in events_q]}"
+                )
+                # Nothing else may arrive while the controller is still busy.
+                _assert_quiet(ws, f"{label} → still busy")
+
+                # ── Idle: the queued change is applied, not dropped ────────
+                controller.agent.state.execution_state = ExecutionState.READY
+                bridge._on_controller_event({"type": "thread_finished"})
+                evt_d, events_d = _receive_until(
+                    ws, "config_changed", f"{label} → deferred apply"
+                )
+                # The updated permissions arrive in the deferred broadcast.
+                assert evt_d["permissions"]["filesystem"] == "write"
+                assert evt_d["permissions"]["git"] == "write"
+                assert evt_d["permissions"]["network"] == "outbound"
+                assert evt_d["config"]["session_permissions"]["filesystem"] == "write"
+                assert "session_loaded" not in [e.get("type") for e in events_d], (
+                    f"guarantee: deferred apply must not replace the session; got: "
+                    f"{[e.get('type') for e in events_d]}"
+                )
+                # config_changed carries no session_id key, so the "same
+                # session" guarantee is pinned via object identity: the SAME
+                # bridge still owns the SAME session_id.
+                bridge_after = _server_mod()._session_bridges.get(sid)
+                assert bridge_after is bridge, (
+                    "deferred apply must not rebuild the bridge/session"
+                )
+                session = bridge_after._loaded_session or bridge_after._session
+                assert session is not None and session.session_id == sid
+                _assert_quiet(ws, label)
+
+                # The applied change is visible to a later get_config too.
+                probe = _get_config(ws, label)
+                assert probe["config"]["session_permissions"]["filesystem"] == "write"
+            finally:
+                controller.agent = orig_agent
+                controller.thread = orig_thread
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Case 13 — model change while busy → deferred config_changed carries the new
+# model on the SAME session (Config Change Queue: busy → idle transition)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_case13_model_change_while_busy(contract_server):
+    """apply_config {model: 'gpt-4o-turbo'} while the controller is RUNNING →
+    config_queued ACK only (no premature config_changed); once the controller
+    goes idle the deferred config_changed carries the new model on the SAME
+    bridge/session (no lost update)."""
+    app, _ = contract_server
+    label = "case13"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)
+            sid = loaded["session_id"]
+            assert sid
+
+            bridge = _server_mod()._session_bridges.get(sid)
+            assert bridge is not None
+            controller = bridge._controller
+            assert controller is not None
+
+            # Same busy stub as case10/11 (see the guarantee test above).
+            from agent.core.state import ExecutionState
+
+            class _FakeAgentState:
+                execution_state = ExecutionState.RUNNING
+
+            class _FakeAgent:
+                state = _FakeAgentState()
+                session = None  # keep _on_controller_event session-capture quiet
+
+                def request_config_update(self, agent_config):  # noqa: D401
+                    return None
+
+            orig_agent = controller.agent
+            orig_thread = controller.thread
+            try:
+                controller.agent = _FakeAgent()
+                controller.thread = threading.main_thread()
+                assert controller.is_busy, "stub must make the controller busy"
+
+                # ── Busy: model change must be QUEUED, not applied ─────────
+                ws.send_json({"command": "apply_config",
+                              "config": {"model": "gpt-4o-turbo"}})
+                evt_q, events_q = _receive_until(
+                    ws, "config_queued", f"{label} → busy apply"
+                )
+                assert evt_q.get("status") == "queued"
+                assert "config_changed" not in [e.get("type") for e in events_q], (
+                    f"busy apply must NOT emit config_changed early; got: "
+                    f"{[e.get('type') for e in events_q]}"
+                )
+                assert "session_loaded" not in [e.get("type") for e in events_q]
+                _assert_quiet(ws, f"{label} → still busy")
+
+                # ── Idle: deferred config_changed carries the new model ────
+                controller.agent.state.execution_state = ExecutionState.READY
+                bridge._on_controller_event({"type": "thread_finished"})
+                evt_d, events_d = _receive_until(
+                    ws, "config_changed", f"{label} → deferred apply"
+                )
+                assert evt_d["config"]["model"] == "gpt-4o-turbo", (
+                    f"deferred config_changed must carry the new model, got "
+                    f"{evt_d['config'].get('model')!r}"
+                )
+                assert "session_loaded" not in [e.get("type") for e in events_d], (
+                    f"deferred apply must not replace the session; got: "
+                    f"{[e.get('type') for e in events_d]}"
+                )
+                bridge_after = _server_mod()._session_bridges.get(sid)
+                assert bridge_after is bridge, (
+                    "deferred apply must not rebuild the bridge/session"
+                )
+                session = bridge_after._loaded_session or bridge_after._session
+                assert session is not None and session.session_id == sid
+                _assert_quiet(ws, label)
+
+                probe = _get_config(ws, label)
+                assert probe["config"]["model"] == "gpt-4o-turbo"
+            finally:
+                controller.agent = orig_agent
+                controller.thread = orig_thread
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Case 14 — temperature change while busy → deferred config_changed carries the
+# new temperature on the SAME session (Config Change Queue: busy → idle)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_case14_temperature_change_while_busy(contract_server):
+    """apply_config {temperature: 0.7} while the controller is RUNNING →
+    config_queued ACK only (no premature config_changed); once the controller
+    goes idle the deferred config_changed carries the new temperature on the
+    SAME bridge/session (no lost update)."""
+    app, _ = contract_server
+    label = "case14"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)
+            sid = loaded["session_id"]
+            assert sid
+
+            bridge = _server_mod()._session_bridges.get(sid)
+            assert bridge is not None
+            controller = bridge._controller
+            assert controller is not None
+
+            # Same busy stub as case10/11 (see the guarantee test above).
+            from agent.core.state import ExecutionState
+
+            class _FakeAgentState:
+                execution_state = ExecutionState.RUNNING
+
+            class _FakeAgent:
+                state = _FakeAgentState()
+                session = None  # keep _on_controller_event session-capture quiet
+
+                def request_config_update(self, agent_config):  # noqa: D401
+                    return None
+
+            orig_agent = controller.agent
+            orig_thread = controller.thread
+            try:
+                controller.agent = _FakeAgent()
+                controller.thread = threading.main_thread()
+                assert controller.is_busy, "stub must make the controller busy"
+
+                # ── Busy: temperature change must be QUEUED, not applied ───
+                ws.send_json({"command": "apply_config",
+                              "config": {"temperature": 0.7}})
+                evt_q, events_q = _receive_until(
+                    ws, "config_queued", f"{label} → busy apply"
+                )
+                assert evt_q.get("status") == "queued"
+                assert "config_changed" not in [e.get("type") for e in events_q], (
+                    f"busy apply must NOT emit config_changed early; got: "
+                    f"{[e.get('type') for e in events_q]}"
+                )
+                assert "session_loaded" not in [e.get("type") for e in events_q]
+                _assert_quiet(ws, f"{label} → still busy")
+
+                # ── Idle: deferred config_changed carries the new temperature ──
+                controller.agent.state.execution_state = ExecutionState.READY
+                bridge._on_controller_event({"type": "thread_finished"})
+                evt_d, events_d = _receive_until(
+                    ws, "config_changed", f"{label} → deferred apply"
+                )
+                assert evt_d["config"]["temperature"] == 0.7, (
+                    f"deferred config_changed must carry the new temperature, "
+                    f"got {evt_d['config'].get('temperature')!r}"
+                )
+                assert "session_loaded" not in [e.get("type") for e in events_d], (
+                    f"deferred apply must not replace the session; got: "
+                    f"{[e.get('type') for e in events_d]}"
+                )
+                bridge_after = _server_mod()._session_bridges.get(sid)
+                assert bridge_after is bridge, (
+                    "deferred apply must not rebuild the bridge/session"
+                )
+                session = bridge_after._loaded_session or bridge_after._session
+                assert session is not None and session.session_id == sid
+                _assert_quiet(ws, label)
+
+                probe = _get_config(ws, label)
+                assert probe["config"]["temperature"] == 0.7
+            finally:
+                controller.agent = orig_agent
+                controller.thread = orig_thread
+

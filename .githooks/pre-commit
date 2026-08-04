@@ -1,18 +1,95 @@
 #!/bin/bash
-set -e
-VENV=~/PycharmProjects/ThoughtMachine-dev/.venv
-source "$VENV/bin/activate"
+# Pre-commit hook — ThoughtMachine
+#
+# Runs, in order:
+#   1. Integration tests:  pytest tests/integration/ -x --tb=short
+#   2. Core unit tests:    tests/tools/test_tool_gating.py, tests/tools/test_respond.py
+#   3. Frontend tests:     npm test --prefix web_ui/frontend  (vitest run; skipped with a
+#                          warning when web_ui/frontend/node_modules is not installed)
+#
+# Robustness properties:
+#   * Every test command is wrapped in `timeout` (default 600s, override with
+#     PRE_COMMIT_TIMEOUT) so a hung test can never block a commit indefinitely.
+#   * Exit codes are aggregated explicitly: one failing suite does not abort the
+#     others, and the hook exits non-zero if any suite failed.
+#   * No network calls, no interactive prompts, no background processes — safe to
+#     run headless / from a server context.
+#   * The venv path is derived from the hook location, so the hook works from any
+#     checkout path (no hard-coded user directory).
+
+set -u
+set -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
+TIMEOUT_SECONDS="${PRE_COMMIT_TIMEOUT:-600}"
+
+if command -v timeout >/dev/null 2>&1; then
+    run_limited() { timeout --kill-after=30s "$TIMEOUT_SECONDS" "$@"; }
+else
+    echo "warning: 'timeout' not found — test suites run without a time limit" >&2
+    run_limited() { "$@"; }
+fi
+
+# Prefer the project virtualenv; fall back to system python3.
+if [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+    PYTHON="$REPO_ROOT/.venv/bin/python"
+elif [ -x "$REPO_ROOT/.venv/bin/python3" ]; then
+    PYTHON="$REPO_ROOT/.venv/bin/python3"
+elif command -v python3 >/dev/null 2>&1; then
+    PYTHON="$(command -v python3)"
+else
+    echo "error: no Python interpreter found (expected $REPO_ROOT/.venv)" >&2
+    exit 1
+fi
+
+failures=0
 
 echo "=== Pre-commit: integration tests ==="
-python3 -m pytest tests/integration/ -x --tb=short -q
+if run_limited "$PYTHON" -m pytest tests/integration/ -x --tb=short -q; then
+    echo "integration tests: PASS"
+else
+    rc=$?
+    echo "integration tests: FAIL (exit $rc)" >&2
+    failures=$((failures + 1))
+fi
 
 echo "=== Pre-commit: core unit tests ==="
 CORE_TESTS=()
 [ -f tests/tools/test_tool_gating.py ] && CORE_TESTS+=("tests/tools/test_tool_gating.py")
 [ -f tests/tools/test_respond.py ] && CORE_TESTS+=("tests/tools/test_respond.py")
-
-if [ ${#CORE_TESTS[@]} -gt 0 ]; then
-    python3 -m pytest "${CORE_TESTS[@]}" -x --tb=short -q
+if [ "${#CORE_TESTS[@]}" -gt 0 ]; then
+    if run_limited "$PYTHON" -m pytest "${CORE_TESTS[@]}" -x --tb=short -q; then
+        echo "core unit tests: PASS"
+    else
+        rc=$?
+        echo "core unit tests: FAIL (exit $rc)" >&2
+        failures=$((failures + 1))
+    fi
+else
+    echo "core unit tests: nothing to run (no test files found)"
 fi
 
-echo "=== Pre-commit checks passed ==="
+echo "=== Pre-commit: frontend tests ==="
+if [ -d web_ui/frontend/node_modules ]; then
+    if run_limited npm test --prefix web_ui/frontend; then
+        echo "frontend tests: PASS"
+    else
+        rc=$?
+        echo "frontend tests: FAIL (exit $rc)" >&2
+        failures=$((failures + 1))
+    fi
+else
+    echo "warning: web_ui/frontend/node_modules not installed — skipping frontend tests" >&2
+    echo "  install with: npm install --prefix web_ui/frontend" >&2
+fi
+
+if [ "$failures" -eq 0 ]; then
+    echo "=== Pre-commit checks passed ==="
+    exit 0
+fi
+
+echo "=== Pre-commit checks FAILED ($failures suite(s)) ===" >&2
+exit 1

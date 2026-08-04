@@ -162,6 +162,32 @@ _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+# ── Server revision (git HEAD at import time) ─────────────────────────────────────────────────────────
+# Used by the /health endpoint and the startup log for deployment
+# verification.  Falls back to "unknown" when git is unavailable (e.g. a
+# packaged build) or the checkout has no commits yet.
+
+def _get_server_revision() -> str:
+    """Return the git revision this server was built from, or 'unknown'."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=_project_root,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        if result.returncode == 0:
+            rev = result.stdout.strip()
+            if rev:
+                return rev
+    except Exception:
+        pass
+    return "unknown"
+
+
+_SERVER_REVISION = _get_server_revision()
+
 # ── Monkey-patch websockets library race condition ──────────────────
 # websockets.legacy.protocol has a race condition: when send_json() is
 # called concurrently from multiple coroutines, two _drain_helper calls
@@ -245,6 +271,7 @@ def _migrate_old_workspaces() -> int:
 async def lifespan(app: FastAPI):
     """Lifespan handler — registers signal handlers for graceful shutdown."""
     log('INFO', 'server', 'ThoughtMachine Web UI server starting ...')
+    log('INFO', 'server', f'Starting ThoughtMachine server — revision {_SERVER_REVISION}')
     # Start EventLogger to persist all events to disk
     try:
         from agent.logging.event_logger import EventLogger
@@ -2273,7 +2300,11 @@ async def user_home():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "thoughtmachine-web-ui"}
+    return {
+        "status": "ok",
+        "service": "thoughtmachine-web-ui",
+        "revision": _SERVER_REVISION,
+    }
 
 @app.get("/api/container/integrity")
 def container_integrity(workspace: str = "", permissions: str = ""):
@@ -2502,7 +2533,7 @@ def main():
         _setup_frontend_serving()
 
     log('INFO', 'server',
-        f'Starting ThoughtMachine Web UI on {args.host}:{args.port}')
+        f'Starting ThoughtMachine Web UI on {args.host}:{args.port} — revision {_SERVER_REVISION}')
     # Pass the app OBJECT directly — using the string form would
     # double-import this module, creating a second copy where _SERVE_FRONTEND
     # is still False and the StaticFiles mount is missing.
