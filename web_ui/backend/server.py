@@ -732,6 +732,8 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     workspace_changed = bool(new_workspace_path) and new_workspace_path != current_path
 
                     if workspace_changed:
+                        log('INFO', 'server.config',
+                            "apply_config: workspace_changed=True — switching project workspace")
                         # ── Full project switch ────────────────────────────────────────────
                         # The user changed the workspace folder. Save and stop the current
                         # bridge, resolve the new workspace, then update the EXISTING
@@ -987,10 +989,24 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 enabled_tools=list(get_tools_for_mode(_mode)),
                             )
 
-                        # Translate frontend tools list → backend enabled_tools, then apply
+                        # Translate frontend tools list → backend enabled_tools, then apply.
+                        # If the controller is busy (agent mid-turn) the config is QUEUED
+                        # on the bridge and applied automatically once the controller
+                        # becomes idle — the frontend is ACKed with config_queued and
+                        # receives the config_changed later (deferred broadcast).
                         config = config_manager.translate_frontend_config(config)
-                        result = bridge.apply_config(config)
+                        outcome = bridge.apply_config_queued(config)
 
+                        if isinstance(outcome, dict) and outcome.get("status") == "queued":
+                            await ws.send_json({
+                                "type": "config_queued",
+                                "status": "queued",
+                            })
+                            log('INFO', 'server.config',
+                                "Controller busy — config queued (config_queued sent)")
+                            continue
+
+                        result = outcome
                         if isinstance(result, dict) and "config" in result:
                             # Success — result includes config, settings, permissions, merged_config
                             await ws.send_json({

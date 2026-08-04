@@ -250,7 +250,13 @@ def backend_to_frontend_config(backend: Dict[str, Any]) -> Dict[str, Any]:
             mode_tool_names = None
 
         cfg["tools"] = [
-            {"name": cls.__name__, "enabled": cls.__name__ in enabled_set}
+            {
+                "name": cls.__name__,
+                "enabled": cls.__name__ in enabled_set,
+                # Keep tool descriptions so the frontend can show them without
+                # a separate /api/tools round-trip (session_loaded tools fix).
+                "description": (cls.__doc__ or "").strip(),
+            }
             for cls in SIMPLIFIED_TOOL_CLASSES
             if mode_tool_names is None or cls.__name__ in mode_tool_names
         ]

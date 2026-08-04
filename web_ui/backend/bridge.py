@@ -274,6 +274,12 @@ class WebAgentBridge:
         # to avoid re-saving on abrupt disconnect (data loss guard).
         self._cleanly_closed = False
 
+        # Config queued while the controller was busy (deferred apply).
+        # Populated by apply_config_queued(); consumed in _on_controller_event
+        # as soon as the controller becomes idle (last write wins).  Cleared
+        # in stop() so a torn-down bridge never leaks a pending config.
+        self._pending_config = None
+
         # Persisted worker contexts loaded from workspace on session load
         self._persisted_workers: Dict[str, Dict[str, Any]] = {}
         # Track session conversation version for efficient history sync
@@ -1203,6 +1209,9 @@ class WebAgentBridge:
 
     def stop(self) -> None:
         """Request the agent to stop (finishes current operation then exits)."""
+        # Drop any queued config — the bridge is being torn down and the
+        # caller (close_session / server close path) owns the lifecycle now.
+        self._pending_config = None
         self.unregister()
         self._unsubscribe_security_events()
         self._unsubscribe_worker_events()
@@ -1361,6 +1370,25 @@ class WebAgentBridge:
             "permissions": permissions,
             "merged_config": frontend_result,
         }
+
+    def apply_config_queued(self, config_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply config now if the controller is idle, otherwise queue it.
+
+        When the controller is busy (agent mid-turn, ``is_busy`` == RUNNING/
+        PAUSING) the config is stored in ``self._pending_config`` and applied
+        automatically by ``_on_controller_event`` as soon as the controller
+        becomes idle again — the deferred ``config_changed`` is broadcast from
+        there (last write wins: a newer queued config replaces an older one).
+
+        Returns ``{"status": "queued"}`` when queued; otherwise returns the
+        usual ``apply_config`` result dict (``{"config": ..., ...}``).
+        """
+        if self._controller is not None and self._controller.is_busy:
+            self._pending_config = config_dict
+            log('INFO', 'server.bridge',
+                "Controller busy — config queued for deferred apply")
+            return {"status": "queued"}
+        return self.apply_config(config_dict)
 
     # ── Session persistence ──────────────────────────────────────────────────
 
@@ -1675,6 +1703,10 @@ class WebAgentBridge:
                 # session_loaded (Fix 2a).
                 "is_running": self._controller.is_busy if self._controller else False,
                 "config": _fe_config,
+                # Full tool list (name/enabled/description) so the store's
+                # receiveSessionLoaded can populate the tools panel without a
+                # separate /api/tools round-trip (session_loaded tools fix).
+                "tools": (_fe_config or {}).get("tools", []),
             })
             # Emit initial context_length so the frontend status bar shows
             # the correct value immediately (no need to wait for a live token_update).
@@ -1947,6 +1979,43 @@ class WebAgentBridge:
             except Exception as exc:
                 log('WARNING', 'server.bridge',
                     f'_on_controller_event: session capture failed: {exc}')
+
+        # ── Deferred config apply ─────────────────────────────────────────────
+        # If a config was queued while the controller was busy, apply it now
+        # that the controller is idle.  This runs on the controller's agent
+        # thread (the callback is invoked from there) — safe because the agent
+        # is READY, so no query is in flight.  The deferred config_changed is
+        # broadcast through the normal forwarder (same payload shape as the
+        # immediate server.py path).
+        if (
+            self._pending_config is not None
+            and self._controller is not None
+            and not self._controller.is_busy
+        ):
+            pending = self._pending_config
+            self._pending_config = None
+            try:
+                result = self.apply_config(pending)
+                if isinstance(result, dict) and "config" in result:
+                    self._forwarder.broadcast(self._session_id, "config_changed", result)
+                    log('INFO', 'server.bridge',
+                        "Deferred (queued) config applied — controller idle")
+                else:
+                    err_msg = (
+                        result.get('error', 'unknown error')
+                        if isinstance(result, dict) else 'unknown error'
+                    )
+                    self._forwarder.broadcast(
+                        self._session_id, "status_message",
+                        {"text": f"⚠ Failed to apply queued config: {err_msg}"},
+                    )
+            except Exception as exc:
+                log('ERROR', 'server.bridge',
+                    f"Deferred config apply failed: {exc}")
+                self._forwarder.broadcast(
+                    self._session_id, "status_message",
+                    {"text": f"⚠ Queued config apply failed: {exc}"},
+                )
 
         self._map_and_emit(event)
 
