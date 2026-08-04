@@ -726,9 +726,26 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # Detect workspace_path change — the frontend no longer sends
                     # a separate set_project command; apply_config handles the full
                     # project switch internally to avoid race conditions.
+                    #
+                    # FIX6: baseline the comparison on the SESSION's own workspace,
+                    # not _project_path. The frontend echoes the session's
+                    # workspace_path in every apply_config payload (ConfigPanel
+                    # getSafeDraft), while _project_path defaults to the server
+                    # root because the tab frontend never sends ?project= — so
+                    # comparing against _project_path would treat EVERY apply on a
+                    # non-default-workspace session as a workspace switch and
+                    # spawn a new session id. Only a genuine difference from the
+                    # session's own workspace should trigger the switch.
                     raw_workspace_path = config.get("workspace_path", "") or ""
                     new_workspace_path = os.path.normpath(raw_workspace_path) if raw_workspace_path else ""
-                    current_path = os.path.normpath(_project_path or "")
+                    session_ws = None
+                    if bridge is not None:
+                        _session_obj = bridge.session  # property: _session or _loaded_session (bridge.py L864-867)
+                        if _session_obj is not None:
+                            session_ws = (_session_obj.metadata or {}).get('agent_config', {}).get('workspace_path') or None
+                        if session_ws is None:
+                            session_ws = bridge._workspace_path or None
+                    current_path = os.path.normpath(session_ws or _project_path or "")
                     workspace_changed = bool(new_workspace_path) and new_workspace_path != current_path
 
                     if workspace_changed:
@@ -747,11 +764,27 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             if existing_session is None:
                                 existing_session = bridge._loaded_session
 
-                        # 1. Save current session and stop the bridge
-                        if bridge is not None and bridge.session is not None:
-                            bridge.save_session()
-                        if bridge is not None:
-                            bridge.stop()
+                        # 1. Save current session and stop the bridge.
+                        #    A failing save/stop must not abort the whole workspace
+                        #    switch — log and proceed with a fresh bridge.
+                        try:
+                            if bridge is not None and bridge.session is not None:
+                                bridge.save_session()
+                            if bridge is not None:
+                                bridge.stop()
+                        except Exception as exc:
+                            log('ERROR', 'server.ws',
+                                f"apply_config: save/stop of previous bridge failed: {exc}")
+                        finally:
+                            # Drop the old bridge from the cache so the new bridge
+                            # created below is the only owner of this session —
+                            # otherwise a later load_session could resurrect a
+                            # stopped bridge.
+                            if bridge is not None:
+                                for _sid, _br in list(_session_bridges.items()):
+                                    if _br is bridge:
+                                        del _session_bridges[_sid]
+                                        break
 
                         # 2. Update the per-connection project path
                         _project_path = new_workspace_path
@@ -902,8 +935,10 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 })
                         except Exception as exc:
                             # The old bridge is already stopped at this point; surface the
-                            # error and stop handling this connection (the Round C try/except
-                            # below is deliberately NOT entered).
+                            # error and continue the command loop (the Round C try/except
+                            # below is deliberately NOT entered — the session strategy
+                            # failure left the bridge in an unknown state, but the
+                            # connection stays alive for subsequent commands).
                             log('ERROR', 'server.ws',
                                 f"apply_config: session strategy failed: {exc}")
                             try:
@@ -913,7 +948,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                 })
                             except Exception:
                                 pass
-                            return
+                            continue
 
                         try:
                             # 6. Now apply the config to the NEW bridge
@@ -1025,6 +1060,10 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             err_msg = result.get('error', 'unknown error') if isinstance(result, dict) else 'unknown error'
                             await ws.send_json({
                                 "type": "status_message",
+                                "text": f"⚠ Failed to apply config: {err_msg}",
+                            })
+                            await ws.send_json({
+                                "type": "config_apply_failed",
                                 "text": f"⚠ Failed to apply config: {err_msg}",
                             })
 
@@ -1328,6 +1367,12 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         log('INFO', 'server.ws', f'Reusing cached bridge for session {session_id}')
                         bridge = existing
                         bridge.set_event_callback(event_callback, key=id(ws))
+                        # NOTE: do NOT set _bridge_loaded_session here — the cached
+                        # bridge's session_loaded broadcast predates this tab's
+                        # callback (registered only just now), so the fallback below
+                        # must send the session_loaded payload to THIS websocket
+                        # directly (and report load_error if the cached bridge holds
+                        # no session).
                         # Send current state from live bridge data (not from disk)
                         try:
                             page_limit = msg.get("limit", 50)
@@ -1355,7 +1400,15 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             log('WARNING', 'server.ws', f'Cached bridge state sending failed: {exc} — creating fresh bridge')
                             existing = None
 
-                    # Track whether bridge.load_session() was called (it emits session_loaded internally)
+                    # _bridge_loaded_session means "this tab's callback already received
+                    # the session_loaded broadcast for this load".
+                    #   - Fresh path: bridge.load_session() broadcasts session_loaded to
+                    #     ALL registered callbacks (including this tab's) and returns
+                    #     True on success — the fallback below is then skipped.
+                    #   - Cached path: the reuse branch above did NOT call
+                    #     bridge.load_session(); the live-state broadcast from a previous
+                    #     connection predates this tab's callback, so it stays False and
+                    #     the fallback below sends session_loaded to THIS websocket.
                     _bridge_loaded_session = False
 
                     if existing is None or existing._controller is None:
@@ -1370,8 +1423,12 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         # Pagination: limit how many messages are sent initially
                         page_limit = msg.get("limit", 50)
                         page_offset = msg.get("offset", 0)
-                        bridge.load_session(session_id, limit=page_limit, offset=page_offset)
-                        _bridge_loaded_session = True  # bridge already emitted session_loaded
+                        # load_session returns False (no broadcast) when the id is dead —
+                        # fall through to the fallback, which reports load_error instead
+                        # of pretending the session loaded.
+                        _bridge_loaded_session = bool(
+                            bridge.load_session(session_id, limit=page_limit, offset=page_offset)
+                        )
 
                     # ── Fallback: resolve workspace_id from project path ──
                     # Old sessions may have been saved without a workspace_id.
@@ -1445,15 +1502,30 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
 
                     if not _bridge_loaded_session:
                         _loaded_meta = bridge._session or bridge._loaded_session
-                        await ws.send_json({
-                            "type": "session_loaded",
-                            "session_id": session_id,
-                            "session_name": _loaded_meta.metadata.get('name', '') if _loaded_meta else '',
-                            "workspace_id": bridge.workspace_id,
-                            "workspace_path": bridge._workspace_path or '',
-                            "is_running": bridge._controller.is_busy if bridge._controller else False,
-                            "config": fe_config,
-                        })
+                        if _loaded_meta is None:
+                            # Load failure (dead session id, e.g. backend restart):
+                            # report it explicitly so the frontend can show a recovery
+                            # banner instead of rendering a phantom loaded session.
+                            await ws.send_json({
+                                "type": "session_loaded",
+                                "session_id": session_id,
+                                "session_name": '',
+                                "load_error": True,
+                                "workspace_id": bridge.workspace_id,
+                                "workspace_path": bridge._workspace_path or '',
+                                "is_running": False,
+                                "config": fe_config,
+                            })
+                        else:
+                            await ws.send_json({
+                                "type": "session_loaded",
+                                "session_id": session_id,
+                                "session_name": _loaded_meta.metadata.get('name', ''),
+                                "workspace_id": bridge.workspace_id,
+                                "workspace_path": bridge._workspace_path or '',
+                                "is_running": bridge._controller.is_busy if bridge._controller else False,
+                                "config": fe_config,
+                            })
                     # Send tokens_updated so the frontend shows saved token counts
                     loaded = bridge._session or bridge._loaded_session
                     if loaded:
@@ -1466,21 +1538,19 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             "type": "context_updated",
                             "context_length": loaded.context_length,
                         })
-                    # Send config_changed so the frontend shows the session's actual config
-                    # (fe_config computed above — Fix 4a)
-                    settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
-                    permissions = config_manager.resolve_effective_permissions(bridge._session_config) if bridge._session_config else {}
-                    await ws.send_json({
-                        "type": "config_changed",
-                        "config": fe_config,
-                        "settings": settings,
-                        "permissions": permissions,
-                        "merged_config": fe_config,
-                    })
-                    await ws.send_json({"type": "status_message", "text": f"Session {session_id} loaded. Click Run to continue."})
-                    # Register/update in global session registry
-                    loaded = bridge._session or bridge._loaded_session
-                    if loaded:
+                        # Send config_changed so the frontend shows the session's actual config
+                        # (fe_config computed above — Fix 4a)
+                        settings = config_manager.extract_settings(fe_config) if isinstance(fe_config, dict) else {}
+                        permissions = config_manager.resolve_effective_permissions(bridge._session_config) if bridge._session_config else {}
+                        await ws.send_json({
+                            "type": "config_changed",
+                            "config": fe_config,
+                            "settings": settings,
+                            "permissions": permissions,
+                            "merged_config": fe_config,
+                        })
+                        await ws.send_json({"type": "status_message", "text": f"Session {session_id} loaded. Click Run to continue."})
+                        # Register/update in global session registry
                         registry = SessionRegistry.get_default()
                         registry.register(
                             session_id=loaded.session_id,
@@ -1489,6 +1559,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             mode=loaded.mode,
                         )
                         registry.set_open(loaded.session_id, is_open=True)
+                    else:
+                        await ws.send_json({
+                            "type": "status_message",
+                            "text": f"⚠ Session {session_id} could not be loaded.",
+                        })
 
                 elif command == "load_more_messages":
                     offset = msg.get("offset", 50)

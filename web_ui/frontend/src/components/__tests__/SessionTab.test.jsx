@@ -423,6 +423,33 @@ describe('SessionTab — event handling', () => {
     expect(screen.queryByText('Loading config...')).not.toBeInTheDocument();
   });
 
+  it('config_queued marks the session as queued for ConfigPanel (FIX7)', async () => {
+    renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    act(() => ws.receive({ type: 'config_queued', status: 'queued', session_id: 'sess-1' }));
+    await waitFor(() => {
+      expect(useStore.getState().sessionConfigs['sess-1'].configQueued).toBe(true);
+    });
+  });
+
+  it('config_apply_failed stores the error and clears the queued state (FIX7)', async () => {
+    renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    act(() => ws.receive({ type: 'config_queued', status: 'queued', session_id: 'sess-1' }));
+    act(() =>
+      ws.receive({
+        type: 'config_apply_failed',
+        session_id: 'sess-1',
+        text: '⚠ Failed to apply queued config: boom',
+      })
+    );
+    await waitFor(() => {
+      const entry = useStore.getState().sessionConfigs['sess-1'];
+      expect(entry.configQueued).toBe(false);
+      expect(entry.applyFailed).toBe('⚠ Failed to apply queued config: boom');
+    });
+  });
+
   it('session_loaded on a fresh tab registers the new session and shows its name', async () => {
     const mocks = renderTab();
     const ws = await connectWs();
@@ -544,6 +571,84 @@ describe('SessionTab — event handling', () => {
     });
     // This is a rebind, not a new-tab creation — onNewSession must NOT fire.
     expect(mocks.onNewSession).not.toHaveBeenCalled();
+  });
+
+  // Fix 4d: a dead session id (backend restart) now makes the backend reply
+  // session_loaded with load_error: true and the SAME session_id the tab asked
+  // for. The tab must show the recovery banner and must NOT register the
+  // phantom session in the store (no config, no sessions-list entry, no
+  // onSessionAdopted / onNewSession notifications).
+  it('session_loaded with load_error renders the load-failed state and does not register the session', async () => {
+    const mocks = renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    // load_session for sess-1 is deferred by one tick on open — wait for it so
+    // the tab is in the "loaded session" state before the load_error reply.
+    await waitFor(() => {
+      const load = sentCommands(ws).find((c) => c.command === 'load_session');
+      expect(load).toBeTruthy();
+    });
+    act(() =>
+      ws.receive({
+        type: 'session_loaded',
+        session_id: 'sess-1',
+        load_error: true,
+        workspace_id: 'ws-1',
+      })
+    );
+    // Recovery banner: load-failed message + Start New Session action.
+    expect(await screen.findByText(/could not be loaded/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Start New Session' })).toBeInTheDocument();
+    // The phantom session is NOT registered in the store (no config snapshot,
+    // no sessions-list entry).
+    expect(useStore.getState().sessionConfigs['sess-1']).toBeUndefined();
+    expect(useStore.getState().sessions.some((s) => s.session_id === 'sess-1')).toBe(false);
+    // No adoption, no rebind, no new-session notification.
+    expect(mocks.onSessionAdopted).not.toHaveBeenCalled();
+    expect(mocks.onNewSession).not.toHaveBeenCalled();
+  });
+
+  // Fix 4d: 'Start New Session' after load_error has no stashed replacement —
+  // it asks the backend for a brand new session and accepts the reply through
+  // the normal path (expectingNewSessionRef bypasses stale detection for the
+  // dead id, and wasExpectingNew routes onNewSession to App).
+  it('Start New Session after load_error sends new_session and accepts the reply', async () => {
+    const mocks = renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    await waitFor(() => {
+      const load = sentCommands(ws).find((c) => c.command === 'load_session');
+      expect(load).toBeTruthy();
+    });
+    act(() =>
+      ws.receive({
+        type: 'session_loaded',
+        session_id: 'sess-1',
+        load_error: true,
+      })
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Start New Session' }));
+    // The tab asks the backend for a brand new session (custom mode), exactly
+    // like a fresh tab does on open.
+    await waitFor(() => {
+      const ns = sentCommands(ws).find((c) => c.command === 'new_session');
+      expect(ns).toBeTruthy();
+      expect(ns.mode).toBe('custom');
+    });
+    act(() =>
+      ws.receive({
+        type: 'session_loaded',
+        session_id: 'sess-new',
+        session_name: 'Fresh Session',
+        config: { mode: 'custom', workspace_path: '/tmp/x' },
+      })
+    );
+    // The new session is adopted and rendered; the recovery banner is gone.
+    expect(await screen.findByText('Fresh Session')).toBeInTheDocument();
+    expect(screen.queryByText(/could not be loaded/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/no longer available/i)).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(mocks.onNewSession).toHaveBeenCalledWith('sess-new', 'Fresh Session');
+    });
+    expect(useStore.getState().sessionConfigs['sess-new'].isLoaded).toBe(true);
   });
 });
 

@@ -974,3 +974,93 @@ def test_case10_busy_config_queued_then_deferred_apply(contract_server):
                 controller.agent = orig_agent
                 controller.thread = orig_thread
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# Case 11 — busy apply queued, deferred apply FAILS on idle
+# (Config Change Queue: queued path — busy → idle transition, failure branch)
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_case11_busy_config_queued_then_deferred_apply_fails(contract_server):
+    """apply_config while the controller is BUSY → config_queued ACK only (no
+    premature config_apply_failed); once the controller goes idle the deferred
+    apply RUNS and FAILS → status_message '⚠ Queued config apply failed: ...'
+    AND config_apply_failed are broadcast; NO config_changed is emitted."""
+    app, _ = contract_server
+    label = "case11"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            loaded, _ = _new_session(ws, label)
+            sid = loaded["session_id"]
+            assert sid
+
+            bridge = _server_mod()._session_bridges.get(sid)
+            assert bridge is not None
+            controller = bridge._controller
+            assert controller is not None
+
+            # Simulate a busy controller WITHOUT starting a real agent thread
+            # (same stub as case10): RUNNING execution state + no-op config
+            # update + the (alive) main thread so apply_config's
+            # controller_alive check doesn't trigger _restart_controller.
+            from agent.core.state import ExecutionState
+
+            class _FakeAgentState:
+                execution_state = ExecutionState.RUNNING
+
+            class _FakeAgent:
+                state = _FakeAgentState()
+                session = None  # keep _on_controller_event session-capture quiet
+
+                def request_config_update(self, agent_config):  # noqa: D401
+                    return None
+
+            orig_agent = controller.agent
+            orig_thread = controller.thread
+            try:
+                controller.agent = _FakeAgent()
+                controller.thread = threading.main_thread()
+                assert controller.is_busy, "stub must make the controller busy"
+
+                # ── Busy: config must be QUEUED, not applied ────────────────
+                ws.send_json({"command": "apply_config",
+                              "config": {"session_permissions": _NEW_PERMISSIONS}})
+                evt_q, events_q = _receive_until(
+                    ws, "config_queued", f"{label} → busy apply"
+                )
+                assert evt_q.get("status") == "queued"
+                assert "config_apply_failed" not in [e.get("type") for e in events_q], (
+                    f"busy apply must NOT emit config_apply_failed early; got: "
+                    f"{[e.get('type') for e in events_q]}"
+                )
+                assert "config_changed" not in [e.get("type") for e in events_q], (
+                    f"busy apply must NOT emit config_changed early; got: "
+                    f"{[e.get('type') for e in events_q]}"
+                )
+                # Nothing else may arrive while the controller is still busy.
+                _assert_quiet(ws, f"{label} → still busy")
+
+                # ── Idle: deferred apply runs and FAILS ─────────────────────
+                controller.agent.state.execution_state = ExecutionState.READY
+                with patch.object(bridge, "apply_config",
+                                  side_effect=RuntimeError("boom-deferred-apply")):
+                    bridge._on_controller_event({"type": "thread_finished"})
+                    # _receive_until fail-fasts on '⚠'/'failed' status_message
+                    # texts, so drain the two broadcasts manually: the bridge
+                    # sends status_message FIRST, then config_apply_failed
+                    # (bridge.py:2016-2026).
+                    evt_s = _receive_next(ws, f"{label} → deferred apply status")
+                    assert evt_s.get("type") == "status_message", f"unexpected: {evt_s}"
+                    assert "Queued config apply failed" in evt_s.get("text", ""), (
+                        f"deferred failure must surface as a status_message; got: {evt_s}"
+                    )
+                    assert "boom-deferred-apply" in evt_s.get("text", ""), evt_s
+                    evt_f = _receive_next(ws, f"{label} → deferred apply failed")
+                    assert evt_f.get("type") == "config_apply_failed", f"unexpected: {evt_f}"
+                    assert "boom-deferred-apply" in evt_f.get("text", ""), (
+                        f"config_apply_failed must carry the deferred error; got: {evt_f}"
+                    )
+                # A failed deferred apply must NOT emit config_changed.
+                _assert_quiet(ws, label)
+            finally:
+                controller.agent = orig_agent
+                controller.thread = orig_thread

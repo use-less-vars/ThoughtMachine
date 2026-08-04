@@ -519,17 +519,30 @@ export default function App() {
     hubSend('list_sessions')
   }, [hubSend])
 
-  const handleNewSessionCreated = useCallback((sessionId, sessionName) => {
-    // Update the tab that created this session with its new sessionId
+  const handleNewSessionCreated = useCallback((tabId, sessionId, sessionName) => {
+    // Update the tab that created this session with its new sessionId.
+    // Rebinds BY tabId so this covers both fresh tabs (entry has sessionId
+    // null) and load-error recovery (entry still points at a dead session
+    // id). The tab keeps its identity; only the session id it points at
+    // changes.
+    const oldId = tabsRef.current.find((t) => t.tabId === tabId)?.sessionId
     setTabs((prev) =>
-      prev.map((t) => (t.sessionId === null ? { ...t, sessionId } : t))
+      prev.map((t) => (t.tabId === tabId ? { ...t, sessionId } : t))
     )
+    // Keep the dedup set in sync so a later open_sessions replay activates
+    // this tab instead of duplicating it.
+    loadedSessionIdsRef.current.add(sessionId)
+    if (oldId && localStorage.getItem('activeSessionId') === oldId) {
+      localStorage.setItem('activeSessionId', sessionId)
+    }
     // Record the session name immediately in the shared store authority
     // (upsert) so the tab label shows a human-readable name right away.
     if (sessionName) {
       useStore.getState().updateSessionName(sessionId, sessionName)
     }
-  }, [])
+    // Refresh the sidebar so the new session appears in the list.
+    hubSend('list_sessions')
+  }, [hubSend])
 
   // ── Handle tab session adoption (intentional replacement) ────────────────
   // Called by SessionTab when a session_loaded flagged `replacement: true`
@@ -768,7 +781,7 @@ export default function App() {
                   staggerMs={(index + 1) * 200}   // +1 so first tab doesn't connect at 0ms (page still loading)
                   loadOnConnect={tab.sessionId === startupActiveSessionId || tab.tabId === activeTabId}
                   onClose={() => removeTab(tab.tabId)}
-                  onNewSession={handleNewSessionCreated}
+                  onNewSession={(sid, name) => handleNewSessionCreated(tab.tabId, sid, name)}
                   onSessionAdopted={(newId) => handleSessionAdopted(tab.tabId, newId)}
                   onOpenNewTab={handleOpenNewTab}
                   onSessionSaved={handleSessionSaved}

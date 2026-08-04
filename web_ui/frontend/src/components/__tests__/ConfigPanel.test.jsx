@@ -22,7 +22,7 @@
 
 import React from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 import ConfigPanel from '../ConfigPanel';
 import { PERMISSION_DEFAULTS } from '../../store/useStore';
@@ -213,6 +213,48 @@ describe('Apply button', () => {
       expect.objectContaining({ config: expect.any(Object) })
     );
     expect(screen.getByRole('button', { name: 'Applying…' })).toBeInTheDocument();
+  });
+
+  it('shows the queued label and disarms the 6s timeout while the apply is queued', () => {
+    vi.useFakeTimers();
+    try {
+      const utils = renderPanel();
+      fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+      expect(utils.sendCommand).toHaveBeenCalledWith('apply_config', expect.anything());
+      // Backend ACKs config_queued → queued label, timeout effect disarmed.
+      utils.rerender(
+        <ConfigPanel
+          config={baseConfig}
+          sendCommand={utils.sendCommand}
+          providers={[]}
+          availableTools={[]}
+          wsConnected
+          defaultConfigSaveStatus={null}
+          onClearDefaultSaveStatus={utils.onClearDefaultSaveStatus}
+          configQueued
+        />
+      );
+      expect(
+        screen.getByRole('button', { name: 'Queued — applying when idle…' })
+      ).toBeInTheDocument();
+      // 7s pass — NO false 'Apply timed out' error while queued.
+      act(() => {
+        vi.advanceTimersByTime(7000);
+      });
+      expect(screen.queryByText(/Apply timed out/)).not.toBeInTheDocument();
+      expect(
+        screen.getByRole('button', { name: 'Queued — applying when idle…' })
+      ).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('surfaces a server-reported apply failure immediately', () => {
+    renderPanel({ applyFailed: '⚠ Failed to apply config: boom' });
+    expect(screen.getByText(/Failed to apply config: boom/)).toBeInTheDocument();
+    // Applying state is cleared → the button is enabled again.
+    expect(screen.getByRole('button', { name: 'Apply' })).toBeEnabled();
   });
 });
 

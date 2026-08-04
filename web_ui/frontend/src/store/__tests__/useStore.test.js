@@ -241,19 +241,73 @@ describe('receiveSessionLoaded', () => {
 });
 
 // ==========================================================================
-// receiveConfigChanged — REPLACES, does not merge
+// receiveConfigChanged — authoritative config, PRESERVES omitted providers/tools
+// (FIX7: the queued/deferred config_changed payload carries only
+//  config/settings/permissions/merged_config, so a full replace would wipe
+//  the Tools tab to 0 / 'Loading tool list...')
 // ==========================================================================
 describe('receiveConfigChanged', () => {
-  it('replaces the whole entry (no merge with previous providers/tools)', () => {
+  it('preserves previous providers/tools when the payload omits them', () => {
     useStore.getState().receiveSessionLoaded('s1', { providers: [{ id: 'p1' }], tools: ['read_file'] });
     useStore.getState().receiveConfigChanged('s1', { config: { mode: 'agent' } });
     expect(useStore.getState().sessionConfigs.s1).toEqual({
       config: { mode: 'agent' },
       permissions: null,
-      providers: [],
-      tools: [],
+      providers: [{ id: 'p1' }],
+      tools: ['read_file'],
       isLoaded: true,
     });
+  });
+
+  it('replaces providers/tools when the payload DOES carry them', () => {
+    useStore.getState().receiveSessionLoaded('s1', { providers: [{ id: 'p1' }], tools: ['read_file'] });
+    useStore.getState().receiveConfigChanged('s1', {
+      config: { mode: 'agent' },
+      providers: [{ id: 'p2' }],
+      tools: [{ name: 'glob', enabled: true }],
+    });
+    expect(useStore.getState().sessionConfigs.s1).toEqual({
+      config: { mode: 'agent' },
+      permissions: null,
+      providers: [{ id: 'p2' }],
+      tools: ['glob'],
+      isLoaded: true,
+    });
+  });
+});
+
+// ==========================================================================
+// receiveConfigQueued / receiveConfigApplyFailed — FIX7 queued-apply state
+// ==========================================================================
+describe('receiveConfigQueued', () => {
+  it('marks the entry as configQueued without clobbering anything', () => {
+    useStore.getState().receiveSessionLoaded('s1', { providers: [{ id: 'p1' }], tools: ['read_file'] });
+    useStore.getState().receiveConfigQueued('s1');
+    const entry = useStore.getState().sessionConfigs.s1;
+    expect(entry.configQueued).toBe(true);
+    expect(entry.providers).toEqual([{ id: 'p1' }]);
+    expect(entry.tools).toEqual(['read_file']);
+    expect(entry.config).toBeNull();
+  });
+
+  it('creates the entry when missing', () => {
+    useStore.getState().receiveConfigQueued('s1');
+    expect(useStore.getState().sessionConfigs.s1.configQueued).toBe(true);
+  });
+});
+
+describe('receiveConfigApplyFailed', () => {
+  it('clears configQueued and stores the applyFailed text', () => {
+    useStore.getState().receiveConfigQueued('s1');
+    useStore.getState().receiveConfigApplyFailed('s1', '⚠ Failed to apply queued config: boom');
+    const entry = useStore.getState().sessionConfigs.s1;
+    expect(entry.configQueued).toBe(false);
+    expect(entry.applyFailed).toBe('⚠ Failed to apply queued config: boom');
+  });
+
+  it('defaults the text when missing', () => {
+    useStore.getState().receiveConfigApplyFailed('s1');
+    expect(useStore.getState().sessionConfigs.s1.applyFailed).toBe('Config apply failed');
   });
 });
 

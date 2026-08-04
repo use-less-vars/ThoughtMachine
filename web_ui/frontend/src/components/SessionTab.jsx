@@ -93,6 +93,11 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const [staleSession, setStaleSession] = useState(false)
   const staleSessionRef = useRef(false)
   const pendingAdoptRef = useRef(null)
+  // Fix 4d: set while awaiting the reply to a recovery new_session (load_error
+  // path). The reply carries a DIFFERENT id than the dead one this tab was
+  // waiting for — the flag makes the handler accept it via the normal path
+  // instead of re-triggering stale-session detection.
+  const expectingNewSessionRef = useRef(false)
   const [isDeferred, setIsDeferred] = useState(false) // true = load skipped; waiting for activation
   const [totalMessages, setTotalMessages] = useState(0) // total messages in the session
   const [hasMore, setHasMore] = useState(false) // true if older messages are available
@@ -597,6 +602,30 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         }
         break
 
+      case 'config_queued':
+        // Controller was busy → the config is queued on the bridge and will be
+        // applied automatically when the agent goes idle.  Track the queued
+        // state so ConfigPanel does NOT fire its 6s 'Apply timed out' error.
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] config_queued for different session, ignoring:', msg.session_id)
+          break
+        }
+        useStore.getState().receiveConfigQueued(msg.session_id || currentSessionIdRef.current)
+        break
+
+      case 'config_apply_failed':
+        // The (possibly queued) apply failed — clear the queued state and hand
+        // the real server error to ConfigPanel instead of a false timeout.
+        if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
+          console.warn('[SessionTab] config_apply_failed for different session, ignoring:', msg.session_id)
+          break
+        }
+        useStore.getState().receiveConfigApplyFailed(
+          msg.session_id || currentSessionIdRef.current,
+          msg.text || 'Config apply failed'
+        )
+        break
+
       case 'rebuild_result':
         if (msg.session_id && currentSessionIdRef.current && msg.session_id !== currentSessionIdRef.current) {
           console.warn('[SessionTab] rebuild_result for different session, ignoring:', msg.session_id)
@@ -628,6 +657,27 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         }
         if (msg.session_id) {
           const expectedSessionId = currentSessionIdRef.current
+          // Fix 4d: captured before the branches below so the normal path can
+          // tell "fresh new_session reply" from "ordinary load" (used to route
+          // onNewSession when the sessionId prop still points at the dead id).
+          const wasExpectingNew = expectingNewSessionRef.current
+          // Fix 4d: load_error — the backend could not load the requested
+          // session (dead id after a restart). The payload carries the SAME id
+          // the tab requested, so this sits in the id-matching path. Show the
+          // recovery banner and block further commands; 'Start New Session'
+          // creates a fresh one.
+          if (msg.load_error) {
+            console.warn('[SessionTab] LOAD ERROR: session', msg.session_id, 'could not be loaded')
+            staleSessionRef.current = true
+            setStaleSession(true)
+            setSessionReady(false)
+            pendingAdoptRef.current = null
+            useStore.getState().setSessionError(
+              storeKey,
+              'Session could not be loaded (it was lost in a restart).'
+            )
+            break
+          }
           // Fix 3b: stale-session detection. After a backend restart, old
           // session ids are invalid: load_session on a dead id makes the
           // backend create a REPLACEMENT session and reply session_loaded with
@@ -635,7 +685,15 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           // another session's data — show a recovery banner instead.
           // A fresh tab (currentSessionIdRef null/undefined) accepts any
           // session id (normal new-session creation).
-          if (expectedSessionId && expectedSessionId !== msg.session_id) {
+          if (expectingNewSessionRef.current) {
+            // Fix 4d: we asked the backend for a NEW session (load-error
+            // recovery) — whatever id it replies with is authoritative, so skip
+            // the stale detection that would otherwise fire for the dead id.
+            expectingNewSessionRef.current = false
+            staleSessionRef.current = false
+            setStaleSession(false)
+            useStore.getState().clearSessionError(storeKey)
+          } else if (expectedSessionId && expectedSessionId !== msg.session_id) {
             // Intentional replacement (e.g. workspace switch via apply_config):
             // the backend created a NEW session for this tab on purpose and
             // flagged the session_loaded with `replacement: true`. Adopt it
@@ -705,8 +763,10 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           setCurrentSessionId(msg.session_id)
           if (msg.session_name) useStore.getState().updateSessionName(msg.session_id, msg.session_name)
           setSessionReady(true)
-          // Notify parent that this tab now has a real sessionId
-          if (!sessionId) {
+          // Notify parent that this tab now has a real sessionId. wasExpectingNew
+          // (load-error recovery) is treated like a fresh tab: the sessionId prop
+          // still points at the dead id, but App must follow the new one.
+          if (!sessionId || wasExpectingNew) {
             onNewSession?.(msg.session_id, msg.session_name)
           }
         }
@@ -941,7 +1001,14 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     const pending = pendingAdoptRef.current
     pendingAdoptRef.current = null
     if (!pending?.session_id) {
-      console.warn('[SessionTab] startNewSession: no stashed replacement session')
+      // Fix 4d: no stashed replacement (load_error path) — ask the backend for
+      // a brand new session, exactly like a fresh tab does on open. The reply
+      // session_loaded carries a different id than the dead one; the
+      // expectingNewSessionRef flag makes the handler accept it.
+      console.warn('[SessionTab] startNewSession: no stashed replacement session — creating a new one')
+      useStore.getState().clearSessionError(storeKey)
+      expectingNewSessionRef.current = true
+      sendCommand('new_session', { mode: modeRef.current || 'custom' })
       return
     }
     if (pending.workspace_id) setWorkspaceId(pending.workspace_id)
@@ -952,7 +1019,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
     setSessionReady(true)
     useStore.getState().clearSessionError(storeKey)
     onNewSession?.(pending.session_id, pending.session_name)
-  }, [storeKey, onNewSession])
+  }, [storeKey, onNewSession, sendCommand])
 
   // ── Auto-focus delete confirm button ────────────────────────────────────────
   useEffect(() => {
@@ -1093,6 +1160,8 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           wsConnected={wsConnected}
           workspaceId={workspaceId}
           sessionId={currentSessionId}
+          configQueued={sessionConfig?.configQueued ?? false}
+          applyFailed={sessionConfig?.applyFailed ?? null}
           defaultConfigSaveStatus={defaultConfigSaveStatus}
           onClearDefaultSaveStatus={() => {
             setDefaultConfigSaveStatus(null)

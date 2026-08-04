@@ -146,17 +146,52 @@ const useStore = create((set) => ({
     })),
 
   receiveConfigChanged: (sessionId, payload) =>
+    set((state) => {
+      // The backend's config_changed is authoritative for config/permissions,
+      // but it does NOT always carry top-level providers/tools (those arrive
+      // via providers_list / tools_list, and the deferred queued apply sends
+      // only config/settings/permissions/merged_config).  Preserve the previous
+      // lists when the payload omits them so a partial config_changed never
+      // wipes the Tools tab to 0 / 'Loading tool list...'.
+      const existing = state.sessionConfigs[sessionId] || DEFAULT_SESSION_CONFIG
+      return {
+        sessionConfigs: {
+          ...state.sessionConfigs,
+          [sessionId]: {
+            config: payload?.config ?? null,
+            permissions: payload?.permissions ?? null,
+            providers: payload?.providers || existing.providers || [],
+            tools: payload?.tools !== undefined ? normalizeTools(payload.tools) : (existing.tools ?? []),
+            isLoaded: true,
+          },
+        },
+      }
+    }),
+
+  // Controller busy → config queued for deferred apply (FIX7).  Keeps
+  // ConfigPanel's Apply button in a visible "queued" state and disarms its
+  // 6s timeout instead of showing a false 'Apply timed out' error.
+  receiveConfigQueued: (sessionId) =>
     set((state) => ({
-      // REPLACE the whole entry (same shape as receiveSessionLoaded) — do not
-      // merge with the previous config snapshot.
       sessionConfigs: {
         ...state.sessionConfigs,
         [sessionId]: {
-          config: payload?.config ?? null,
-          permissions: payload?.permissions ?? null,
-          providers: payload?.providers || [],
-          tools: normalizeTools(payload?.tools),
-          isLoaded: true,
+          ...(state.sessionConfigs[sessionId] || DEFAULT_SESSION_CONFIG),
+          configQueued: true,
+        },
+      },
+    })),
+
+  // The (possibly queued) apply failed — clear queued state and surface the
+  // real server error to ConfigPanel (FIX7).
+  receiveConfigApplyFailed: (sessionId, text) =>
+    set((state) => ({
+      sessionConfigs: {
+        ...state.sessionConfigs,
+        [sessionId]: {
+          ...(state.sessionConfigs[sessionId] || DEFAULT_SESSION_CONFIG),
+          configQueued: false,
+          applyFailed: text || 'Config apply failed',
         },
       },
     })),

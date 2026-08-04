@@ -2009,11 +2009,19 @@ class WebAgentBridge:
                         self._session_id, "status_message",
                         {"text": f"⚠ Failed to apply queued config: {err_msg}"},
                     )
+                    self._forwarder.broadcast(
+                        self._session_id, "config_apply_failed",
+                        {"text": f"⚠ Failed to apply queued config: {err_msg}"},
+                    )
             except Exception as exc:
                 log('ERROR', 'server.bridge',
                     f"Deferred config apply failed: {exc}")
                 self._forwarder.broadcast(
                     self._session_id, "status_message",
+                    {"text": f"⚠ Queued config apply failed: {exc}"},
+                )
+                self._forwarder.broadcast(
+                    self._session_id, "config_apply_failed",
                     {"text": f"⚠ Queued config apply failed: {exc}"},
                 )
 

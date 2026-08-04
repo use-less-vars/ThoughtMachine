@@ -8,7 +8,7 @@ import { PERMISSION_DEFAULTS } from '../store/useStore';
 const BACKEND_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
 const API_BASE = `http://${window.location.hostname}:${BACKEND_PORT}`;
 
-function ConfigPanel({ mode = null, config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, onClearDefaultSaveStatus, workspaceId, sessionId, containerRebuildResult, onClearRebuildResult, selectedWorker, onSelectWorker, isActive }) {
+function ConfigPanel({ mode = null, config, sendCommand, providers, availableTools, panelWidth, wsConnected, defaultConfigSaveStatus, onClearDefaultSaveStatus, workspaceId, sessionId, containerRebuildResult, onClearRebuildResult, selectedWorker, onSelectWorker, isActive, configQueued = false, applyFailed = null }) {
   const [defaultSaved, setDefaultSaved] = useState(false);  // false | 'pending' | true | 'error'
   const [showManageProviders, setShowManageProviders] = useState(false);
   const [providerVersion, setProviderVersion] = useState(0);  // incremented when a provider is saved
@@ -79,12 +79,15 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
     if (isApplying) {
       setIsApplying(false);
     }
+    setApplyError(null);
   }, [config]);
 
-  // Apply error timeout: if no config change after 6s, show error
+  // Apply error timeout: if no config change after 6s, show error.
+  // Disarmed while the apply is QUEUED (controller busy — the config_changed
+  // arrives later via the deferred apply, so no false 'timed out' error).
   const applyTimeoutRef = React.useRef(null);
   useEffect(() => {
-    if (isApplying) {
+    if (isApplying && !configQueued) {
       applyTimeoutRef.current = setTimeout(() => {
         setIsApplying(false);
         setApplyError('Apply timed out — check server connection');
@@ -96,7 +99,16 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
         applyTimeoutRef.current = null;
       }
     };
-  }, [isApplying]);
+  }, [isApplying, configQueued]);
+
+  // Server-reported apply failure (config_apply_failed) — surface the real
+  // error immediately instead of waiting for the 6s timeout.
+  useEffect(() => {
+    if (applyFailed) {
+      setIsApplying(false);
+      setApplyError(applyFailed);
+    }
+  }, [applyFailed]);
 
   // Auto-clear error after 5 seconds
   useEffect(() => {
@@ -758,7 +770,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           }}
         >
           {isApplying && <span className="config-spinner" />}
-          {isApplying ? 'Applying…' : 'Apply'}
+          {isApplying ? (configQueued ? 'Queued — applying when idle…' : 'Applying…') : 'Apply'}
         </button>
         {!wsConnected && (
           <span style={{ color: '#f9e2af', fontSize: '0.8rem', fontWeight: 500 }}>
