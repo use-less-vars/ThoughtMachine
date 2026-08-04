@@ -67,7 +67,7 @@ function messagesEqual(a, b) {
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
-function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onSessionRenamed, selectedWorker, onSelectWorker, onWorkerEvent, onLoggingConfigChanged }) {
+function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onSessionRenamed, onSessionAdopted, selectedWorker, onSelectWorker, onWorkerEvent, onLoggingConfigChanged }) {
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
   const [isRenaming, setIsRenaming] = useState(false)
   const renameInputRef = useRef(null)
@@ -636,6 +636,38 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
           // A fresh tab (currentSessionIdRef null/undefined) accepts any
           // session id (normal new-session creation).
           if (expectedSessionId && expectedSessionId !== msg.session_id) {
+            // Intentional replacement (e.g. workspace switch via apply_config):
+            // the backend created a NEW session for this tab on purpose and
+            // flagged the session_loaded with `replacement: true`. Adopt it
+            // SILENTLY — no stale banner, no purge of the old session's store
+            // slices (the old session still exists server-side and may be
+            // reopened from the sidebar).
+            if (msg.replacement) {
+              console.log('[SessionTab] Adopting replacement session:', msg.session_id)
+              staleSessionRef.current = false
+              setStaleSession(false)
+              pendingAdoptRef.current = null
+              useStore.getState().clearSessionError(expectedSessionId)
+              useStore.getState().registerSession(msg.session_id)
+              useStore.getState().receiveSessionLoaded(msg.session_id, msg)
+              // F2 parity: re-request providers if the fresh session has none
+              // cached yet so the provider dropdown populates.
+              {
+                const loadedConfig = useStore.getState().sessionConfigs[msg.session_id]
+                const loadedProviders = loadedConfig?.providers
+                if (!loadedProviders || loadedProviders.length === 0) {
+                  sendCommand('get_providers')
+                }
+              }
+              setCurrentSessionId(msg.session_id)
+              if (msg.session_name) useStore.getState().updateSessionName(msg.session_id, msg.session_name)
+              setSessionReady(true)
+              // Notify App so the tab entry and the persisted activeSessionId
+              // follow the tab to its new session id (NOT onNewSession — that
+              // is reserved for fresh tabs whose sessionId prop was null).
+              onSessionAdopted?.(msg.session_id)
+              break
+            }
             console.warn('[SessionTab] STALE SESSION: expected', expectedSessionId, 'got', msg.session_id, '— backend may have restarted')
             // Fix 4c: purge the dead session's store slices (config, messages,
             // state, mode, running state, sessions list, ...) so none of its

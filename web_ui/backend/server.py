@@ -846,6 +846,10 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                     "message_count": 0,
                                     "workspace_id": workspace_id or '',
                                     "workspace_path": _project_path,
+                                    # Intentional replacement (workspace switch): the frontend
+                                    # adopts this session_loaded silently (no stale-session banner)
+                                    # and rebinds the tab to the new session id.
+                                    "replacement": True,
                                     # Fix 4a: embed the config the user just submitted so the
                                     # chat UI renders from the first event; the config_changed
                                     # sent below (step 7) carries the canonical merged config.
@@ -891,6 +895,9 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                     "message_count": 0,
                                     "workspace_id": workspace_id or '',
                                     "workspace_path": _project_path,
+                                    # Intentional replacement (workspace switch): the frontend
+                                    # adopts this session_loaded silently and rebinds the tab.
+                                    "replacement": True,
                                     "config": msg.get("config"),
                                 })
                         except Exception as exc:
@@ -1920,6 +1927,10 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         "workspace_id": bridge._workspace_id,
                         "workspace_path": _project_path,
                         "is_running": bridge._controller.is_busy if bridge._controller else False,
+                        # Intentional replacement (legacy set_project): the frontend adopts
+                        # this session_loaded silently and rebinds the tab (parity with the
+                        # apply_config workspace-switch branch).
+                        "replacement": True,
                         "config": fe_config,
                     })
                     await ws.send_json({

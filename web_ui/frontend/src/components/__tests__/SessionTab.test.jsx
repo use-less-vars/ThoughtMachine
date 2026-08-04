@@ -116,6 +116,7 @@ function renderTab(props = {}) {
   const onSessionRenamed = vi.fn();
   const onWorkerEvent = vi.fn();
   const onLoggingConfigChanged = vi.fn();
+  const onSessionAdopted = vi.fn();
   const mergedProps = {
     sessionId: null,
     tabId: 'tab-1',
@@ -131,6 +132,7 @@ function renderTab(props = {}) {
     onSessionRenamed,
     onWorkerEvent,
     onLoggingConfigChanged,
+    onSessionAdopted,
     ...props,
   };
   const utils = render(<SessionTab {...mergedProps} />);
@@ -143,6 +145,7 @@ function renderTab(props = {}) {
     onSessionRenamed,
     onWorkerEvent,
     onLoggingConfigChanged,
+    onSessionAdopted,
     rerender: (nextProps) =>
       utils.rerender(<SessionTab {...{ ...mergedProps, ...nextProps }} />),
   };
@@ -489,6 +492,58 @@ describe('SessionTab — event handling', () => {
       expect(mocks.onNewSession).toHaveBeenCalledWith('replacement-sess', 'Replacement Session');
     });
     expect(screen.queryByText(/no longer available/i)).not.toBeInTheDocument();
+  });
+
+  // Intentional replacement (workspace switch via apply_config): the backend
+  // flags the new session_loaded with `replacement: true`. The tab must adopt
+  // it SILENTLY — no stale banner, no purge of the old session's store slices
+  // (the old session still exists server-side), and App is notified via
+  // onSessionAdopted so the tab entry tracks the new session id.
+  it('session_loaded with replacement:true silently adopts the new session (no stale banner)', async () => {
+    const mocks = renderTab({ sessionId: 'sess-1' });
+    const ws = await connectWs();
+    await waitFor(() => {
+      const load = sentCommands(ws).find((c) => c.command === 'load_session');
+      expect(load).toBeTruthy();
+    });
+    // Seed store slices for the old session — they must SURVIVE the adoption
+    // (the backend-restart stale path purges them; intentional replacement does not).
+    act(() => {
+      useStore.getState().setSessions([{ session_id: 'sess-1', name: 'Old Session' }]);
+      useStore.getState().setSessionMode('sess-1', 'agent');
+      useStore.getState().setTabRunningState('sess-1', 'RUNNING');
+      useStore.getState().registerSession('sess-1');
+    });
+    act(() =>
+      ws.receive({
+        type: 'session_loaded',
+        session_id: 'replacement-sess',
+        session_name: 'Replacement Session',
+        workspace_id: 'ws-2',
+        replacement: true,
+        config: { mode: 'custom', workspace_path: '/tmp/x' },
+      })
+    );
+    // No stale-session banner and no recovery action.
+    expect(screen.queryByText(/no longer available/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Start New Session' })).not.toBeInTheDocument();
+    // Old session slices are NOT purged (the old session still exists server-side).
+    expect(useStore.getState().sessionModes['sess-1']).toBe('agent');
+    expect(useStore.getState().tabRunningStates['sess-1']).toBe('RUNNING');
+    expect(useStore.getState().sessions.some((s) => s.session_id === 'sess-1')).toBe(true);
+    // The replacement session is adopted through the store...
+    await waitFor(() => {
+      expect(useStore.getState().sessionConfigs['replacement-sess']).toBeDefined();
+      expect(useStore.getState().sessionConfigs['replacement-sess'].isLoaded).toBe(true);
+    });
+    // ...the tab shows the new session name...
+    expect(await screen.findByText('Replacement Session')).toBeInTheDocument();
+    // ...and App is notified so the tab entry follows the new session id.
+    await waitFor(() => {
+      expect(mocks.onSessionAdopted).toHaveBeenCalledWith('replacement-sess');
+    });
+    // This is a rebind, not a new-tab creation — onNewSession must NOT fire.
+    expect(mocks.onNewSession).not.toHaveBeenCalled();
   });
 });
 

@@ -531,6 +531,26 @@ export default function App() {
     }
   }, [])
 
+  // ── Handle tab session adoption (intentional replacement) ────────────────
+  // Called by SessionTab when a session_loaded flagged `replacement: true`
+  // rebinds an existing tab to a NEW session id (workspace switch via
+  // apply_config). The tab keeps its identity; only the session id it points
+  // at changes. Update the tabs entry, keep the dedup set in sync (so a later
+  // open_sessions replay activates this tab instead of duplicating it), and
+  // persist the active session across reloads.
+  const handleSessionAdopted = useCallback((tabId, newSessionId) => {
+    const oldId = tabsRef.current.find((t) => t.tabId === tabId)?.sessionId
+    setTabs((prev) =>
+      prev.map((t) => (t.tabId === tabId ? { ...t, sessionId: newSessionId } : t))
+    )
+    loadedSessionIdsRef.current.add(newSessionId)
+    if (oldId && localStorage.getItem('activeSessionId') === oldId) {
+      localStorage.setItem('activeSessionId', newSessionId)
+    }
+    // Refresh the sidebar so the replacement session appears in the list.
+    hubSend('list_sessions')
+  }, [hubSend])
+
   const handleOpenNewTab = useCallback((sessionId, sessionName) => {
     // Called by SessionTab when a workspace switch creates a NEW session
     // while the existing tab keeps the old session. Opens a fresh tab.
@@ -749,6 +769,7 @@ export default function App() {
                   loadOnConnect={tab.sessionId === startupActiveSessionId || tab.tabId === activeTabId}
                   onClose={() => removeTab(tab.tabId)}
                   onNewSession={handleNewSessionCreated}
+                  onSessionAdopted={(newId) => handleSessionAdopted(tab.tabId, newId)}
                   onOpenNewTab={handleOpenNewTab}
                   onSessionSaved={handleSessionSaved}
                   onRegister={(actions) => handleRegisterTab(tab.tabId, actions)}
