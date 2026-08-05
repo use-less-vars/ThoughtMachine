@@ -71,6 +71,19 @@
       "description": "LLM temperature override for this worker.",
       "title": "Temperature"
     },
+    "warning_threshold_tokens": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": 65000,
+      "description": "Token count threshold for warning state. Used as ``token_monitor_warning_threshold`` in this worker's AgentConfig. Defaults to 65000.",
+      "title": "Warning Threshold Tokens"
+    },
     "critical_threshold_tokens": {
       "anyOf": [
         {
