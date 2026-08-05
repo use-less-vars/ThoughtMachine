@@ -1833,6 +1833,21 @@ class WebAgentBridge:
         if sid:
             self.save_session()
             self._session_manager.close_session(sid)
+            # Session-scoped container cleanup: stop + remove any containers
+            # labelled with this session id. Never raises and emits no WS
+            # events, so the session_closed/session_cleared contracts are
+            # unaffected.
+            try:
+                from tools.container_manager import cleanup_session
+                import docker
+                result = cleanup_session(sid, docker.from_env())
+                if result.get("removed"):
+                    log('INFO', 'server.bridge',
+                        f'Session container cleanup: removed '
+                        f'{result["removed"]} container(s) for session {sid}')
+            except Exception as exc:
+                log('DEBUG', 'server.bridge',
+                    f'Session container cleanup skipped: {exc}')
 
         # Gracefully stop any worker threads spawned during this session
         if shutdown_workers is not None:
