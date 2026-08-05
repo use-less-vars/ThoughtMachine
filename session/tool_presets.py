@@ -41,6 +41,10 @@ _ALL_TOOLS = [
     "GitInfoTool",
     # Execution
     "DockerCodeRunner",
+    "ContainerStartTool",
+    "ContainerExecTool",
+    "ContainerStopTool",
+    "ContainerStatusTool",
     # Date/time
     "DateTimeTool",
     # Session & agent utilities
@@ -56,7 +60,7 @@ _ALL_TOOLS = [
 
 # ── Tool Lists ────────────────────────────────────────────────────────────
 
-# Agent mode — 21 tools focused on code editing, research, and user interaction
+# Agent mode — 25 tools focused on code editing, research, and user interaction
 AGENT_TOOLS = [
     "ApplyEdits",
     "CheckSystem",
@@ -65,6 +69,10 @@ AGENT_TOOLS = [
     "DirectoryCreator",
     "DirectoryTreeTool",
     "DockerCodeRunner",
+    "ContainerStartTool",
+    "ContainerExecTool",
+    "ContainerStopTool",
+    "ContainerStatusTool",
     "FieldViewer",
     "FileEditor",
     "FileMover",
@@ -92,7 +100,7 @@ ENGINEER_TOOLS = [
     "WorkingDocument",
 ]
 
-# Custom mode — all 25 tools (unrestricted)
+# Custom mode — all 29 tools (unrestricted)
 CUSTOM_TOOLS = list(_ALL_TOOLS)
 
 

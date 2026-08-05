@@ -132,6 +132,15 @@ except ImportError as e:
     logger.warning(f"Failed to import DockerCodeRunner: {e}")
 
 try:
+    from .container_control import ContainerStartTool, ContainerExecTool, ContainerStopTool, ContainerStatusTool
+    TOOL_CLASSES.append(ContainerStartTool)
+    TOOL_CLASSES.append(ContainerExecTool)
+    TOOL_CLASSES.append(ContainerStopTool)
+    TOOL_CLASSES.append(ContainerStatusTool)
+except ImportError as e:
+    logger.warning(f"Failed to import container control tools: {e}")
+
+try:
     from .field_viewer import FieldViewer
     TOOL_CLASSES.append(FieldViewer)
 except ImportError as e:
