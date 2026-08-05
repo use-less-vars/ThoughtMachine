@@ -22,7 +22,8 @@ from unittest.mock import patch, MagicMock, mock_open
 import pytest
 
 from tools.workspace.check_system import CheckSystem
-from tools.workspace.worker import Worker, WorkerThread
+from tools.workspace.worker import Worker, WorkerThread, _restrictive_merge
+from agent.core.worker_context import WorkerContext
 from tools.workspace.edit_dockerfile import EditDockerfile
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -543,7 +544,8 @@ class TestWorker:
         )
         assert thread.worker_name == "test_worker"
         assert thread.status == "ready"
-        assert thread.conversation == []
+        assert thread._worker_ctx is None
+        assert thread._worker_dir == tmp_path / "workers" / "test_worker"
         assert thread.current_task is None
         assert thread.error is None
         assert thread.is_alive() is False  # not started yet
@@ -556,10 +558,10 @@ class TestWorker:
             agent_config={},
             workspace_dir=tmp_path,
         )
-        thread.conversation = [
+        thread._worker_ctx = WorkerContext(user_history=[
             {"role": "system", "content": "You are a test."},
             {"role": "user", "content": "Hello"},
-        ]
+        ])
         thread.status = "busy"
         thread.last_heartbeat = "2025-01-01T00:00:00"
         thread._save_context()
@@ -575,15 +577,19 @@ class TestWorker:
             agent_config={},
             workspace_dir=tmp_path,
         )
-        assert len(thread2.conversation) == 2
-        assert thread2.conversation[1]["content"] == "Hello"
+        ctx = thread2._load_context()
+        assert ctx is not None
+        assert len(ctx.user_history) == 2
+        assert ctx.user_history[1]["content"] == "Hello"
         assert thread2.status == "busy"
 
-    def test_resume_worker_loads_current_system_prompt(self, tmp_path: Path, caplog):
+    def test_resume_worker_loads_current_system_prompt(self, tmp_path: Path):
         """
-        When a persisted context.json has a stale system prompt,
-        WorkerThread.run() replaces it with the current definition's prompt
-        and logs a warning. The rest of the conversation is preserved.
+        Resuming a worker preserves the persisted conversation.
+
+        WorkerThread.run() keeps the loaded conversation intact — the current
+        definition's system prompt is applied later when the worker's Agent is
+        created (agent.core.agent.Agent.__init__ → ensure_system_prompt).
         """
         # Write a persisted context with an OLD system prompt + messages
         ctx = {
@@ -593,6 +599,7 @@ class TestWorker:
                 {"role": "assistant", "content": "Hi there!"},
             ],
             "status": "ready",
+            "worker_name": "resume_test",
         }
         context_path = tmp_path / "workers" / "resume_test" / "context.json"
         context_path.parent.mkdir(parents=True)
@@ -605,27 +612,49 @@ class TestWorker:
             workspace_dir=tmp_path,
         )
 
-        # Before run() — loaded from disk with old prompt
-        assert len(thread.conversation) == 3
-        assert thread.conversation[0]["content"] == "You are an old assistant."
+        # _load_context() restores the persisted conversation untouched
+        loaded = thread._load_context()
+        assert loaded is not None
+        assert len(loaded.user_history) == 3
+        assert loaded.user_history[0]["content"] == "You are an old assistant."
+        assert loaded.worker_name == "resume_test"
 
-        # Start the thread and stop immediately so run() processes the prompt
-        with caplog.at_level(logging.WARNING):
-            thread.start()
-            thread.stop()
-            thread.join(timeout=2)
+        # run() preserves the loaded conversation — no stale-prompt replacement
+        thread._worker_ctx = loaded
+        thread.start()
+        thread.stop()
+        thread.join(timeout=2)
 
-        # After run() — prompt replaced with current definition
-        assert thread.conversation[0]["content"] == "You are a NEW assistant."
+        assert thread._worker_ctx is not None
+        assert len(thread._worker_ctx.user_history) == 3
+        assert thread._worker_ctx.user_history[0]["content"] == "You are an old assistant."
         # User/assistant pair preserved
-        assert thread.conversation[1]["role"] == "user"
-        assert thread.conversation[1]["content"] == "Hello"
-        assert thread.conversation[2]["role"] == "assistant"
-        assert thread.conversation[2]["content"] == "Hi there!"
-        # Warning logged about the change
-        assert "system prompt changed" in caplog.text
-        assert "old assistant" in caplog.text
-        assert "NEW assistant" in caplog.text
+        assert thread._worker_ctx.user_history[1]["role"] == "user"
+        assert thread._worker_ctx.user_history[1]["content"] == "Hello"
+        assert thread._worker_ctx.user_history[2]["role"] == "assistant"
+        assert thread._worker_ctx.user_history[2]["content"] == "Hi there!"
+
+        # The CURRENT definition prompt is what a fresh Agent would receive:
+        # _build_agent_config() reads it from the definition (agent_config
+        # must carry provider/model for the config to be built).
+        assert thread.definition["system_prompt"] == "You are a NEW assistant."
+        cfg_thread = WorkerThread(
+            name="resume_test",
+            definition={"system_prompt": "You are a NEW assistant."},
+            agent_config={
+                "provider": "scripted",
+                "model": "mock-model",
+                "api_key": "sk-test-scripted",
+                "base_url": "http://localhost:9999",
+                "enabled_tools": [],
+                "max_turns": 10,
+                "enable_logging": False,
+            },
+            workspace_dir=tmp_path,
+        )
+        cfg = cfg_thread._build_agent_config()
+        assert cfg is not None
+        assert cfg.system_prompt == "You are a NEW assistant."
 
     def test_worker_thread_send_query_timeout(self, tmp_path: Path):
         """send_query raises TimeoutError when worker doesn't respond."""
@@ -643,9 +672,10 @@ class TestWorker:
     #  Worker tool — list
     # ═══════════════════════════════════════════════════════════════════
 
+    @patch("tools.workspace.worker._load_template_workers", return_value=[])
     @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.worker._workspace_dir")
-    def test_action_list_empty(self, mock_ws_dir, mock_resolve):
+    def test_action_list_empty(self, mock_ws_dir, mock_resolve, mock_templates):
         """list returns zero workers when workers.json is empty list."""
         mock_dir = MagicMock()
         mock_file = MagicMock()
@@ -734,11 +764,9 @@ class TestWorker:
 
     @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.worker._workspace_dir")
-    @patch("tools.workspace.worker.Worker._build_llm_client")
     @patch("tools.workspace.worker.WorkerThread")
-    def test_action_spawn_found(
-        self, mock_thread_cls, mock_build_llm, mock_ws_dir, mock_resolve,
-    ):
+    @patch("tools.workspace.worker._worker_registry", new_callable=dict)
+    def test_action_spawn_found(self, mock_registry, mock_thread_cls, mock_ws_dir, mock_resolve):
         """spawn returns success when worker_name exists in workers.json.
 
         We mock WorkerThread entirely to avoid starting a real thread
@@ -752,15 +780,9 @@ class TestWorker:
         ])
         mock_dir.__truediv__.return_value = mock_file
         mock_ws_dir.return_value = mock_dir
-        mock_build_llm.return_value = MagicMock()
 
         mock_thread = MagicMock()
         mock_thread.status = "ready"
-        mock_thread.wait_for_completion.return_value = json.dumps({
-            "spawned": True,
-            "worker_name": "default",
-            "status": "ready",
-        })
         mock_thread_cls.return_value = mock_thread
 
         tool = Worker(
@@ -774,7 +796,6 @@ class TestWorker:
         assert result["worker_name"] == "default"
         assert result["status"] == "ready"
         mock_thread.start.assert_called_once()
-        mock_thread.wait_for_completion.assert_called_once()
 
     @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.worker._workspace_dir")
@@ -871,9 +892,10 @@ class TestWorker:
         assert "error" in result
         assert "available_actions" in result
 
+    @patch("tools.workspace.worker._load_template_workers", return_value=[])
     @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.worker._workspace_dir")
-    def test_missing_workers_file(self, mock_ws_dir, mock_resolve):
+    def test_missing_workers_file(self, mock_ws_dir, mock_resolve, mock_templates):
         """list returns empty when workers.json doesn't exist."""
         mock_dir = MagicMock()
         mock_file = MagicMock()
@@ -899,11 +921,10 @@ class TestWorker:
     @patch("tools.workspace.worker.check_required_categories")
     @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.worker._workspace_dir")
-    @patch("tools.workspace.worker.Worker._build_llm_client")
     @patch("tools.workspace.worker.WorkerThread")
+    @patch("tools.workspace.worker._worker_registry", new_callable=dict)
     def test_spawn_strips_by_footprint(
-        self, mock_thread_cls, mock_build_llm, mock_ws_dir,
-        mock_resolve, mock_gate,
+        self, mock_registry, mock_thread_cls, mock_ws_dir, mock_resolve, mock_gate,
     ):
         """
         4d — Spawn-time stripping test.
@@ -926,14 +947,9 @@ class TestWorker:
         ])
         mock_dir.__truediv__.return_value = mock_file
         mock_ws_dir.return_value = mock_dir
-        mock_build_llm.return_value = MagicMock()
 
         mock_thread = MagicMock()
         mock_thread.status = "ready"
-        mock_thread.wait_for_completion.return_value = json.dumps({
-            "spawned": True,
-            "worker_name": "reader",
-        })
         mock_thread_cls.return_value = mock_thread
 
         tool = Worker(
@@ -946,15 +962,14 @@ class TestWorker:
         assert result["spawned"] is True
         assert result["worker_name"] == "reader"
         mock_thread.start.assert_called_once()
-        mock_thread.wait_for_completion.assert_called_once()
         # missing_tools are logged via logger.warning, not returned in result
 
     @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.worker._workspace_dir")
-    @patch("tools.workspace.worker.Worker._build_llm_client")
     @patch("tools.workspace.worker.WorkerThread")
+    @patch("tools.workspace.worker._worker_registry", new_callable=dict)
     def test_spawn_strips_blocklisted_tools(
-        self, mock_thread_cls, mock_build_llm, mock_ws_dir, mock_resolve,
+        self, mock_registry, mock_thread_cls, mock_ws_dir, mock_resolve,
     ):
         """
         4e — Blocklist test.
@@ -974,14 +989,9 @@ class TestWorker:
         ])
         mock_dir.__truediv__.return_value = mock_file
         mock_ws_dir.return_value = mock_dir
-        mock_build_llm.return_value = MagicMock()
 
         mock_thread = MagicMock()
         mock_thread.status = "ready"
-        mock_thread.wait_for_completion.return_value = json.dumps({
-            "spawned": True,
-            "worker_name": "safe_worker",
-        })
         mock_thread_cls.return_value = mock_thread
 
         tool = Worker(
@@ -994,7 +1004,6 @@ class TestWorker:
         assert result["spawned"] is True
         assert result["worker_name"] == "safe_worker"
         mock_thread.start.assert_called_once()
-        mock_thread.wait_for_completion.assert_called_once()
         # Blocklisted tools are logged via logger.warning, not returned in result
 
     # ═══════════════════════════════════════════════════════════════════
@@ -1008,8 +1017,6 @@ class TestWorker:
         WorkerThread with ``filesystem:read`` footprint calls FileEditor
         with ``operation=write``.  ``_check_tool_permissions`` should deny it.
         """
-        from tools.file_editor import FileEditor as FECls
-
         thread = WorkerThread(
             name="readonly_worker",
             definition={
@@ -1018,20 +1025,24 @@ class TestWorker:
             },
             agent_config={},
             workspace_dir=tmp_path,
-            tool_classes={"FileEditor": FECls},
             session_permissions={},
         )
 
-        error = thread._check_tool_permissions(
-            "FileEditor",
-            {"operation": "write", "filename": "/dev/null"},
+        # The worker's permission footprint is captured from the definition
+        assert thread._permission_footprint == {"filesystem": "read"}
+
+        # The restrictive merge keeps the worker at read — the session is the
+        # ceiling, so effective permissions never escalate to write.
+        merged = _restrictive_merge(
+            thread._session_permissions, thread._permission_footprint,
         )
-        assert error is not None, (
-            "Expected denial for FileEditor write with filesystem:read footprint"
+        assert merged.get("filesystem") == "read"
+
+        # Even if the session allowed write, the worker footprint wins (read).
+        merged2 = _restrictive_merge(
+            {"filesystem": "write"}, thread._permission_footprint,
         )
-        assert "permission" in error.lower() or "denied" in error.lower(), (
-            f"Error message should mention permission/denied, got: {error}"
-        )
+        assert merged2.get("filesystem") == "read"
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  EditDockerfile
