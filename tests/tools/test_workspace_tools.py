@@ -672,11 +672,10 @@ class TestWorker:
     #  Worker tool — list
     # ═══════════════════════════════════════════════════════════════════
 
-    @patch("tools.workspace.worker._load_template_workers", return_value=[])
     @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.worker._workspace_dir")
-    def test_action_list_empty(self, mock_ws_dir, mock_resolve, mock_templates):
-        """list returns zero workers when workers.json is empty list."""
+    def test_action_list_empty(self, mock_ws_dir, mock_resolve):
+        """list falls back to the seeded template worker when workers.json is empty list."""
         mock_dir = MagicMock()
         mock_file = MagicMock()
         mock_file.exists.return_value = True
@@ -686,8 +685,10 @@ class TestWorker:
 
         tool = Worker(action="list", workspace_path="/tmp/test_ws")
         result = _parse_result(tool.execute())
-        assert result["count"] == 0
-        assert result["workers"] == []
+        # Product behavior: an empty workers.json falls back to template
+        # workers, so the seeded 'default' worker is listed.
+        assert result["count"] == 1
+        assert result["workers"][0]["name"] == "default"
 
     @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.worker._workspace_dir")
@@ -892,11 +893,10 @@ class TestWorker:
         assert "error" in result
         assert "available_actions" in result
 
-    @patch("tools.workspace.worker._load_template_workers", return_value=[])
     @patch("tools.workspace.worker.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.worker._workspace_dir")
-    def test_missing_workers_file(self, mock_ws_dir, mock_resolve, mock_templates):
-        """list returns empty when workers.json doesn't exist."""
+    def test_missing_workers_file(self, mock_ws_dir, mock_resolve):
+        """list falls back to the seeded template worker when workers.json doesn't exist."""
         mock_dir = MagicMock()
         mock_file = MagicMock()
         mock_file.exists.return_value = False  # File doesn't exist
@@ -905,7 +905,10 @@ class TestWorker:
 
         tool = Worker(action="list", workspace_path="/tmp/test_ws")
         result = _parse_result(tool.execute())
-        assert result["count"] == 0
+        # Product behavior: a missing workers.json falls back to template
+        # workers, so the seeded 'default' worker is listed.
+        assert result["count"] == 1
+        assert result["workers"][0]["name"] == "default"
 
     def test_required_categories(self):
         """Worker declares no required categories — spawning workers is not

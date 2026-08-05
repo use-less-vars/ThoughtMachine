@@ -101,13 +101,16 @@ class TestCreateWorker:
         assert data["tools"] == body["tools"]
         assert data["permission_footprint"] == body["permission_footprint"]
 
-        # Verify on disk
+        # Verify on disk: ensure_workspace_dirs seeds the 'default' template
+        # worker, so workers.json holds the seeded default + the new worker.
         ws_dir = _workspace_path(tmp_path)
         workers_path = ws_dir / "workers.json"
         assert workers_path.exists(), "workers.json should exist on disk"
         disk_data = json.loads(workers_path.read_text())
-        assert len(disk_data) == 1
-        assert disk_data[0]["name"] == body["name"]
+        assert len(disk_data) == 2
+        names = [w["name"] for w in disk_data]
+        assert "default" in names
+        assert body["name"] in names
 
     def test_create_duplicate(self, client, tmp_path):
         """POST same worker twice → first 201, second 409."""
@@ -124,10 +127,11 @@ class TestCreateWorker:
             resp2 = client.post(f"/api/workspace/{WS_ID}/workers", json=body)
             assert resp2.status_code == 409
 
-            # Verify only one entry on disk
+            # Verify on disk: seeded 'default' + the one created worker (no duplicate)
             ws_dir = _workspace_path(tmp_path)
             disk_data = json.loads((ws_dir / "workers.json").read_text())
-            assert len(disk_data) == 1
+            assert len(disk_data) == 2
+            assert sum(1 for w in disk_data if w["name"] == body["name"]) == 1
 
     def test_create_invalid_schema(self, client, tmp_path):
         """POST with missing required field → 422."""
@@ -180,11 +184,12 @@ class TestUpdateWorker:
         data = resp.json()
         assert data["system_prompt"] == "Updated system prompt."
 
-        # Verify on disk
+        # Verify on disk: seeded 'default' + the updated worker
         ws_dir = _workspace_path(tmp_path)
         disk_data = json.loads((ws_dir / "workers.json").read_text())
-        assert len(disk_data) == 1
-        assert disk_data[0]["system_prompt"] == "Updated system prompt."
+        assert len(disk_data) == 2
+        updated_on_disk = next(w for w in disk_data if w["name"] == body["name"])
+        assert updated_on_disk["system_prompt"] == "Updated system prompt."
 
     def test_update_nonexistent(self, client, tmp_path):
         """PUT to a worker that doesn't exist → 404."""
@@ -234,10 +239,12 @@ class TestDeleteWorker:
 
         assert resp.status_code == 204, f"Expected 204, got {resp.status_code}"
 
-        # Verify on disk
+        # Verify on disk: the created worker is gone, but the seeded
+        # 'default' template worker remains.
         ws_dir = _workspace_path(tmp_path)
         disk_data = json.loads((ws_dir / "workers.json").read_text())
-        assert len(disk_data) == 0, "workers.json should be empty after delete"
+        assert len(disk_data) == 1
+        assert disk_data[0]["name"] == "default"
 
     def test_delete_nonexistent(self, client, tmp_path):
         """DELETE a non-existent worker → 404."""
@@ -377,23 +384,25 @@ class TestListWorkers:
             worker_b = {**_valid_worker(), "name": "worker-b"}
             client.post(f"/api/workspace/{WS_ID}/workers", json=worker_b)
 
-            # List → should have 2
+            # List → seeded 'default' + worker-a + worker-b = 3
             resp = client.get(f"/api/workspace/{WS_ID}/workers")
             assert resp.status_code == 200
-            assert len(resp.json()) == 2
+            assert len(resp.json()) == 3
 
             # Delete worker A
             client.delete(f"/api/workspace/{WS_ID}/workers/worker-a")
 
-            # List → should have 1
+            # List → seeded 'default' + worker-b = 2
             resp = client.get(f"/api/workspace/{WS_ID}/workers")
             assert resp.status_code == 200
             data = resp.json()
-            assert len(data) == 1
-            assert data[0]["name"] == "worker-b"
+            assert len(data) == 2
+            names = {w["name"] for w in data}
+            assert "worker-b" in names
+            assert "default" in names
 
     def test_list_workers_empty(self, client, tmp_path):
-        """GET workers on workspace with no workers.json → empty list."""
+        """GET workers on a fresh workspace seeds the 'default' template worker."""
         with patch.object(pathlib.Path, "home") as mock_home:
             mock_home.return_value = tmp_path
             _create_workspace(tmp_path)
@@ -401,4 +410,7 @@ class TestListWorkers:
             resp = client.get(f"/api/workspace/{WS_ID}/workers")
 
         assert resp.status_code == 200
-        assert resp.json() == []
+        data = resp.json()
+        # ensure_workspace_dirs seeds workers.json with the 'default' template
+        assert len(data) == 1
+        assert data[0]["name"] == "default"

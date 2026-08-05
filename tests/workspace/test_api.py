@@ -108,10 +108,14 @@ class TestPutDomainAllowlist:
 
 
 class TestGetWorkers:
-    def test_returns_empty_list_initially(self, client):
+    def test_returns_seeded_default_initially(self, client):
+        """GET workers on a fresh workspace returns the seeded 'default' worker."""
         resp = client.get("/api/workspace/test-ws/workers")
         assert resp.status_code == 200
-        assert resp.json() == []
+        data = resp.json()
+        # ensure_workspace_dirs seeds workers.json with the 'default' template
+        assert len(data) == 1
+        assert data[0]["name"] == "default"
 
 
 class TestGetMcpServers:
