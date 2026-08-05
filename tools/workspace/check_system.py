@@ -98,7 +98,8 @@ class CheckSystem(ToolBase):
     """Inspect the runtime environment — permissions, container, workspace, config, and network."""
 
     tool: str = "CheckSystem"
-    required_categories: ClassVar[List[str]] = []
+    # CheckSystem inspects host state and can run subprocesses - always gate it.
+    required_categories: ClassVar[List[str]] = ["system:read"]
 
     query: str = Field(
         description="What to check. Valid values: 'my_config' (full agent config), "
