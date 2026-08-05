@@ -49,6 +49,7 @@ from docker import types
 import hashlib
 import io
 import os
+import re
 import time
 import threading
 import queue
@@ -77,6 +78,66 @@ def _compute_image_tag(workspace_path: str) -> str:
     """
     path_hash = hashlib.sha256(workspace_path.encode()).hexdigest()[:16]
     return f"agent-executor-{path_hash}"
+
+
+def _run_image_build(client, build_path, dockerfile, tag, nocache=False, on_line=None):
+    """Run ``client.api.build`` over a host directory, streaming log lines.
+
+    Shared by :meth:`DockerExecutor._build_image` and
+    ``ContainerManager.build_image`` so the build-stream handling (and its
+    BuildError wrapping) lives in exactly one place.
+
+    Args:
+        client: docker client whose ``api.build`` performs the build.
+        build_path: host path used as the build context.
+        dockerfile: Dockerfile name within the build context.
+        tag: image tag for the built image.
+        nocache: if True, bypass the Docker layer cache.
+        on_line: optional callback invoked with each non-empty log line.
+
+    Returns:
+        (image_id, log_lines) where log_lines is the list of non-empty
+        ``stream`` chunks (plus BuildError lines on failure).
+
+    Raises:
+        RuntimeError: If the build fails (BuildError wrapped with its logs) or
+            the daemon returns no image ID.
+    """
+    log_lines: list[str] = []
+    image_id = None
+    try:
+        build_logs = client.api.build(
+            path=build_path,
+            dockerfile=dockerfile,
+            tag=tag,
+            rm=True,
+            pull=True,
+            nocache=nocache,
+            decode=True,
+        )
+        for chunk in build_logs:
+            if "stream" in chunk:
+                line = chunk["stream"].strip()
+                if line:
+                    log_lines.append(line)
+                    if on_line:
+                        on_line(line)
+            elif "aux" in chunk and "ID" in chunk["aux"]:
+                image_id = chunk["aux"]["ID"]
+    except docker.errors.BuildError as e:
+        error_lines = [str(line) for line in (e.build_log or [])]
+        log_lines.extend(error_lines)
+        for line in error_lines:
+            if on_line:
+                on_line(line)
+        raise RuntimeError(
+            f"Docker build failed: {e}\n"
+            f"Build logs:\n" + "\n".join(error_lines)
+        ) from e
+
+    if image_id is None:
+        raise RuntimeError("Docker build completed but no image ID was returned")
+    return image_id, log_lines
 
 
 def _resolve_workspace_id(workspace_path: str):
@@ -579,8 +640,8 @@ class DockerExecutor:
         # Determine mount: named volume (preferred) vs bind mount (fallback)
         volume_name = self._ensure_volume()
         if volume_name:
-            # One-shot volume population: copy the host workspace into the
-            # named volume on first use (idempotent via .workspace_synced).
+            # Self-healing volume population: keep the named volume in sync
+            # with the host workspace (see ensure_workspace_volume_populated).
             # Best-effort: failures are logged/audited, never fatal.
             ensure_workspace_volume_populated(
                 self.client,
@@ -802,49 +863,32 @@ class DockerExecutor:
             log('DEBUG', 'tools.docker_executor.build',
                 f"Building Docker image {self.image} from temp context {tmpdir}")
 
-            build_logs = self.client.api.build(
-                path=tmpdir,
-                dockerfile="Dockerfile",
-                tag=self.image,
-                rm=True,
-                pull=True,
-                nocache=nocache,
-                decode=True,
+            def _stream_line(line: str) -> None:
+                log_lines.append(line)
+                log('DEBUG', 'tools.docker_executor.build', f"Build: {line}")
+                # Live-stream to the shared cache so the frontend polling
+                # loop sees each line as it arrives
+                with _build_log_cache_lock:
+                    _build_log_cache[normalised] = '\n'.join(log_lines)
+                try:
+                    sys.stdout.write(line + '\n')
+                    sys.stdout.flush()
+                except Exception:
+                    pass  # stdout may be None/closed in headless runtimes
+
+            image_id, _ = _run_image_build(
+                self.client, tmpdir, "Dockerfile", self.image,
+                nocache=nocache, on_line=_stream_line,
             )
-            for chunk in build_logs:
-                if "stream" in chunk:
-                    line = chunk["stream"].strip()
-                    if line:
-                        log_lines.append(line)
-                        log('DEBUG', 'tools.docker_executor.build', f"Build: {line}")
-                        # Live-stream to the shared cache so the frontend polling
-                        # loop sees each line as it arrives
-                        with _build_log_cache_lock:
-                            _build_log_cache[normalised] = '\n'.join(log_lines)
-                        try:
-                            sys.stdout.write(line + '\n')
-                            sys.stdout.flush()
-                        except Exception:
-                            pass  # stdout may be None/closed in headless runtimes
-                elif "aux" in chunk and "ID" in chunk["aux"]:
-                    image_id = chunk["aux"]["ID"]
 
-            if image_id is None:
-                raise RuntimeError("Docker build completed but no image ID was returned")
-
-        except docker.errors.BuildError as e:
-            build_log_str = "\n".join(str(line) for line in (e.build_log or []))
-            log_lines.extend(str(line) for line in (e.build_log or []))
-            with _build_log_cache_lock:
-                cache_value = "\n".join(log_lines)
-                _build_log_cache[self.workspace_path] = cache_value
-                _build_log_cache[_container_name] = cache_value
-            raise RuntimeError(
-                f"Docker build failed: {e}\n"
-                f"Build logs:\n{build_log_str}"
-            ) from e
         except RuntimeError:
-            # Re-raise the committed-requirements error as-is
+            # Re-raise the committed-requirements error as-is, but keep any
+            # partial build output visible in the shared cache
+            if log_lines:
+                with _build_log_cache_lock:
+                    cache_value = "\n".join(log_lines)
+                    _build_log_cache[self.workspace_path] = cache_value
+                    _build_log_cache[_container_name] = cache_value
             raise
         except Exception as e:
             log_lines.append(str(e))
@@ -870,6 +914,112 @@ class DockerExecutor:
         return image_id, log_lines
 
 
+def _compute_host_workspace_manifest(workspace_path: str) -> str:
+    """Compute a host-side fingerprint of the workspace contents.
+
+    Returns a 64-character hex sha256 digest stored in the named volume as
+    ``.workspace_host_sha`` and compared on every container start: a mismatch
+    marks the volume stale and triggers a host -> volume re-seed.  The HOST
+    workspace is the single source of truth; the sync is strictly one-way
+    (host -> volume), so ANY host file change — committed or not, in any
+    nested directory — changes the fingerprint and invalidates the volume on
+    the next container start.
+
+    The fingerprint is a RECURSIVE stat walk: for every file it records
+    (relative path, size, st_mtime_ns); the root directory's own mtime is
+    included too.  Entries are sorted and the serialized list is hashed with
+    sha256.  No git dependency at all — uniformly correct for git repos and
+    plain directories alike.  Excluded dirs (never fingerprinted):
+    .git, __pycache__, node_modules, .venv, temp.  Symlinked dirs are not
+    followed (no cycles); symlinked files are fingerprinted as links.
+    """
+    excluded_dirs = {".git", "__pycache__", "node_modules", ".venv", "temp"}
+    parts = []
+    try:
+        st = os.stat(workspace_path)
+        parts.append(f"root:{int(st.st_mtime_ns)}")
+    except OSError:
+        return hashlib.sha256("root:missing".encode("utf-8")).hexdigest()
+    if not os.path.isdir(workspace_path):
+        try:
+            est = os.stat(workspace_path, follow_symlinks=False)
+            parts.append(f"{os.path.basename(workspace_path)}:{est.st_size}:{est.st_mtime_ns}")
+        except OSError:
+            pass
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+    try:
+        for root_dir, dirnames, filenames in os.walk(workspace_path):
+            dirnames[:] = sorted(d for d in dirnames if d not in excluded_dirs)
+            for filename in sorted(filenames):
+                full = os.path.join(root_dir, filename)
+                try:
+                    est = os.stat(full, follow_symlinks=False)
+                except OSError:
+                    continue  # vanished mid-walk / unreadable -> skip
+                rel = os.path.relpath(full, workspace_path)
+                parts.append(f"{rel}:{est.st_size}:{est.st_mtime_ns}")
+    except OSError:
+        pass
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+
+def _clear_volume_sentinels(client, image, volume_name, **common) -> bool:
+    """Remove the sync sentinels from a named volume (in-place refresh helper).
+
+    Docker refuses ``volume.remove(force=True)`` while any container still
+    has the volume mounted ("volume is in use").  When that happens we fall
+    back to reseeding the EXISTING volume in place; this helper first clears
+    ``.workspace_synced`` and ``.workspace_host_sha`` so a failed reseed
+    never leaves the volume marked as synced with a stale sha.
+    Returns True on success (sentinels gone or already gone); False on
+    failure (logged + audited, never raised).
+    """
+    command = "rm -f /workspace/.workspace_synced /workspace/.workspace_host_sha"
+    container_id = None
+    try:
+        created = client.containers.create(
+            image=image,
+            command=["/bin/sh", "-c", command],
+            mounts=[
+                docker.types.Mount(
+                    target="/workspace",
+                    source=volume_name,
+                    type="volume",
+                    read_only=False,
+                ),
+            ],
+            tmpfs={"/tmp": "rw,noexec,nosuid,size=64m"},
+            **common,
+        )
+        container_id = created.id
+        client.api.start(container_id)
+        wait_result = client.api.wait(container_id)
+        if isinstance(wait_result, dict):
+            exit_code = wait_result.get("StatusCode")
+        else:
+            exit_code = wait_result
+        if exit_code != 0:
+            log("WARNING", "docker.volume_populate",
+                f"In-place sentinel clear exited {exit_code}")
+            _audit("VOLUME_INIT_ERROR",
+                   f"volume={volume_name} phase=refresh_in_place "
+                   f"exit_code={exit_code}")
+            return False
+        return True
+    except Exception as e:
+        log("WARNING", "docker.volume_populate",
+            f"In-place sentinel clear failed: {e}")
+        _audit("VOLUME_INIT_ERROR",
+               f"volume={volume_name} phase=refresh_in_place error={e}")
+        return False
+    finally:
+        if container_id:
+            try:
+                client.api.remove(container_id, force=True)
+            except Exception:
+                pass
+
+
 def ensure_workspace_volume_populated(
     client,
     image: str,
@@ -879,22 +1029,41 @@ def ensure_workspace_volume_populated(
     mem_limit: str = "1g",
     cpu_quota: int = 100000,
 ) -> bool:
-    """Populate a named workspace volume from the host workspace (one-shot).
+    """Populate (and keep fresh) a named workspace volume from the host workspace.
     Called by ``DockerExecutor._ensure_container`` and
     ``tools.container_manager.ContainerManager.start`` right after a named
     volume ``tm-workspace-<workspace_id>`` is ensured.
-    Idempotency is guaranteed by the ``.workspace_synced`` sentinel file
-    inside the volume:
-    1. Sentinel check: run a throwaway container with the volume mounted
-       read-only at /workspace and ``test -f /workspace/.workspace_synced``.
-       Exit 0 -> the volume was already populated -> return True.
-    2. If the sentinel is missing, run a one-shot init container that bind
-       mounts the HOST workspace read-only at /host_workspace, copies it
-       into the volume (``cp -a /host_workspace/. /workspace/``) and then
-       touches ``/workspace/.workspace_synced``.
-    3. If the host workspace directory is absent/empty, only the sentinel
-       is touched so the volume is marked synced (an empty volume degrades
-       gracefully to the pre-existing empty-workspace behaviour).
+
+    Synchronization model (self-healing volume):
+      The HOST workspace is the single source of truth; the sync is strictly
+      one-way (host -> volume).  Container-written files in /workspace are
+      NOT authoritative and are discarded whenever the volume is refreshed.
+
+      A cheap host-side fingerprint (``_compute_host_workspace_manifest``)
+      is stored inside the volume as ``.workspace_host_sha`` next to the
+      ``.workspace_synced`` sentinel:
+
+      1. Staleness check: a throwaway container mounts the volume read-only
+         at /workspace and runs
+         ``test -f /workspace/.workspace_synced && cat /workspace/.workspace_host_sha``.
+         Exit 0 AND the stored sha equals the current host fingerprint -> the
+         volume is up to date -> return True (fast path).
+      2. If the sentinel is present but the stored sha is missing or
+         mismatched (e.g. volumes seeded before this change, or the host
+         workspace changed), the volume is STALE: it is removed
+         (force=True) and recreated, then reseeded from the current host.
+         If a running container still has the volume mounted, docker
+         refuses the removal ("volume is in use"); the sentinels are then
+         cleared and the volume is reseeded IN PLACE, so a refresh can
+         never block container start.
+      3. Reseeding runs a one-shot init container that bind mounts the HOST
+         workspace read-only at /host_workspace, copies it into the volume
+         (``cp -a /host_workspace/. /workspace/``) and then writes
+         ``.workspace_synced`` and ``.workspace_host_sha``.
+      4. If the host workspace directory is absent/empty, only the sentinel
+         and the sha are written so the volume is marked synced (an empty
+         volume degrades gracefully to the pre-existing empty-workspace
+         behaviour).
     Security constraints (mirror the main containers, with one deliberate
     exception — the init container must run as root):
       - no network (network_disabled=True even for bridge sessions — the
@@ -904,7 +1073,7 @@ def ensure_workspace_volume_populated(
         a fresh named volume's root dir is root:root 0755, so only root
         with those capabilities can chown it to 1000:1000 and copy the
         host workspace into it.
-      - the SENTINEL check runs as non-root (1000:1000) with all caps
+      - the STALENESS check runs as non-root (1000:1000) with all caps
         dropped; the INIT container runs as root (0:0) and ends with
         ``chown -R 1000:1000`` so the main container (uid 1000) can write.
       - same mem_limit/cpu_quota as main
@@ -948,12 +1117,18 @@ def ensure_workspace_volume_populated(
     init_common = dict(common)
     init_common["user"] = "0:0"
     init_common["cap_add"] = ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
-    # ── 1. Sentinel check ────────────────────────────────────────────
+    # ── 1. Staleness check: sentinel + stored host sha ───────────────
+    host_sha = _compute_host_workspace_manifest(workspace_path)
     container_id = None
+    stored_sha = None
     try:
         created = client.containers.create(
             image=image,
-            command=["test", "-f", "/workspace/.workspace_synced"],
+            command=[
+                "sh", "-c",
+                "test -f /workspace/.workspace_synced "
+                "&& cat /workspace/.workspace_host_sha",
+            ],
             mounts=[
                 docker.types.Mount(
                     target="/workspace",
@@ -969,12 +1144,29 @@ def ensure_workspace_volume_populated(
         wait_result = client.api.wait(container_id)
         exit_code = _normalize_exit_code(wait_result)
         if exit_code == 0:
+            # Capture the sha written into the volume.  The output may be
+            # multiplexed by the daemon (non-tty container), so extract the
+            # 64-hex digest with a regex instead of relying on raw bytes.
+            try:
+                raw_logs = created.logs(stdout=True, stderr=False) or b""
+            except Exception:
+                raw_logs = b""
+            m = re.search(rb"[0-9a-f]{64}", raw_logs)
+            stored_sha = m.group(0).decode("ascii") if m else None
+        if exit_code == 0 and stored_sha == host_sha:
             _audit("VOLUME_POPULATE",
                    f"volume={volume_name} action=check status=synced")
             return True
+        if exit_code == 0:
+            _audit("VOLUME_STALE",
+                   f"volume={volume_name} action=check status=stale "
+                   f"stored_sha={stored_sha!r} host_sha={host_sha!r}")
+        else:
+            _audit("VOLUME_STALE",
+                   f"volume={volume_name} action=check status=unsynced")
     except Exception as e:
         log("WARNING", "docker.volume_populate",
-            f"Sentinel check failed: {e}")
+            f"Staleness check failed: {e}")
         _audit("VOLUME_INIT_ERROR", f"volume={volume_name} phase=check error={e}")
         return False
     finally:
@@ -983,13 +1175,54 @@ def ensure_workspace_volume_populated(
                 client.api.remove(container_id, force=True)
             except Exception:
                 pass
-    # ── 2. Volume not synced — one-shot init container ───────────────
+    # ── 2. Stale / never synced -> wipe + recreate the volume ────────
+    # Container-written files inside /workspace are discarded here: the host
+    # is the single source of truth and the sync is strictly one-way.
+    try:
+        volume = client.volumes.get(volume_name)
+        volume.remove(force=True)
+        client.volumes.create(volume_name)
+        _audit("VOLUME_REFRESH",
+               f"volume={volume_name} action=recreate host_sha={host_sha}")
+    except docker.errors.APIError as e:
+        if "in use" not in str(e).lower():
+            log("WARNING", "docker.volume_populate",
+                f"Volume refresh (remove+recreate) failed: {e}")
+            _audit("VOLUME_INIT_ERROR",
+                   f"volume={volume_name} phase=refresh error={e}")
+            return False
+        # Volume mounted by a running container -> reseed in place: clear the
+        # stale sentinels, then the init container (section 3) re-copies the
+        # host workspace over the existing volume contents.
+        _audit("VOLUME_REFRESH",
+               f"volume={volume_name} action=in_place host_sha={host_sha}")
+        if not _clear_volume_sentinels(client, image, volume_name, **init_common):
+            return False
+    except docker.errors.NotFound:
+        # Volume vanished between the check and the wipe (raced with another
+        # refresh) — recreate it so the init container has something to fill.
+        try:
+            client.volumes.create(volume_name)
+        except Exception as e:
+            log("WARNING", "docker.volume_populate",
+                f"Volume recreate after race failed: {e}")
+            _audit("VOLUME_INIT_ERROR",
+                   f"volume={volume_name} phase=refresh error={e}")
+            return False
+    except Exception as e:
+        log("WARNING", "docker.volume_populate",
+            f"Volume refresh (remove+recreate) failed: {e}")
+        _audit("VOLUME_INIT_ERROR",
+               f"volume={volume_name} phase=refresh error={e}")
+        return False
+    # ── 3. One-shot init container: reseed from the current host ─────
     host_dir_missing = not os.path.isdir(workspace_path)
     if host_dir_missing:
         # Empty/absent host workspace: mark the volume synced as-is.
         # chown first so the main container (uid 1000) can write the volume.
-        command = ("chown 1000:1000 /workspace "
-                   "&& touch /workspace/.workspace_synced")
+        command = (f"chown 1000:1000 /workspace "
+                   f"&& touch /workspace/.workspace_synced "
+                   f"&& echo {host_sha} > /workspace/.workspace_host_sha")
         mounts = [
             docker.types.Mount(
                 target="/workspace",
@@ -999,10 +1232,11 @@ def ensure_workspace_volume_populated(
             ),
         ]
     else:
-        command = ("chown 1000:1000 /workspace "
-                   "&& cp -a /host_workspace/. /workspace/ "
-                   "&& (chown -R 1000:1000 /workspace 2>/dev/null || true) "
-                   "&& touch /workspace/.workspace_synced")
+        command = (f"chown 1000:1000 /workspace "
+                   f"&& cp -a /host_workspace/. /workspace/ "
+                   f"&& (chown -R 1000:1000 /workspace 2>/dev/null || true) "
+                   f"&& touch /workspace/.workspace_synced "
+                   f"&& echo {host_sha} > /workspace/.workspace_host_sha")
         mounts = [
             docker.types.Mount(
                 target="/host_workspace",
@@ -1019,7 +1253,8 @@ def ensure_workspace_volume_populated(
         ]
     _audit("VOLUME_INIT_START",
            f"volume={volume_name} image={image} "
-           f"workspace={workspace_path} host_dir_present={not host_dir_missing}")
+           f"workspace={workspace_path} host_dir_present={not host_dir_missing} "
+           f"host_sha={host_sha}")
     init_id = None
     start_ts = time.time()
     try:
