@@ -34,6 +34,11 @@ except ImportError:
     NotFound = Exception
     APIError = Exception
 
+try:
+    from .container_manager import ContainerManager
+except ImportError:
+    ContainerManager = None
+
 
 class DockerCodeRunner(ToolBase):
     required_categories: ClassVar[List[str]] = ["filesystem:write", "container:true"]
@@ -307,20 +312,12 @@ chmod +x "{script_path}"
             else:
                 workdir = os.path.join("/workspace", rel_path)
 
-        try:
-            # Import DockerExecutor from the existing module
-            # Add parent directory to sys.path
-            import sys
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + '/..')
-            import importlib
-            import docker_executor
-            DockerExecutor = importlib.reload(docker_executor).DockerExecutor
-        except ImportError as e:
+        if ContainerManager is None:
             duration = time.time() - start_time
             return self._truncate_output(self._build_json_response(
                 success=False,
                 exit_code=-1,
-                error=f"Could not import DockerExecutor: {e}. Make sure docker package is installed and docker_executor.py exists.",
+                error="Could not import ContainerManager. Make sure docker package is installed and tools/container_manager.py exists.",
                 duration=duration
             ))
 
@@ -356,43 +353,44 @@ chmod +x "{script_path}"
         session_permissions = getattr(self, 'session_permissions', None)
 
         try:
-            if SECURITY_AVAILABLE:
-                executor = security_setup_docker(
-                    workspace_path=workspace,
-                    image=self.image,
-                    network="none",     # Harmless default; the security gate in docker_executor.py makes the final decision
-                    mem_limit=self.mem_limit,
-                    cpu_quota=self.cpu_quota,
-                    force_rebuild=self.build,
-                    idle_timeout=self.idle_timeout
-                )
-                # Pass session permissions and workspace ID to the executor
-                # so the unified security gate can make real decisions.
-                executor.session_permissions = session_permissions
-                executor.workspace_id = workspace_id
-            else:
-                # Fallback to direct DockerExecutor instantiation
-                executor = DockerExecutor(
-                    workspace_path=workspace,
-                    image=self.image,
-                    network="none",     # Harmless default; the security gate in docker_executor.py makes the final decision
-                    mem_limit=self.mem_limit,
-                    cpu_quota=self.cpu_quota,
-                    force_rebuild=self.build,
-                    idle_timeout=self.idle_timeout,
-                    session_permissions=session_permissions,
-                    workspace_id=workspace_id,
-                )
-
+            # Re-route through the per-session ContainerManager:
+            # start(manager) -> exec -> stop. Network/mount decisions still
+            # come from docker_executor._compute_container_config_from_permissions
+            # (single source of truth), and named volumes are populated from
+            # the host workspace on first use. No per-execute reload of
+            # docker_executor (the old importlib.reload pattern) — the
+            # MODULE_LOAD audit fires once per process instead.
+            manager = ContainerManager(
+                workspace_path=workspace,
+                session_id=getattr(self, 'session_id', None),
+                workspace_id=workspace_id,
+                session_permissions=session_permissions,
+                image=self.image,
+                mem_limit=self.mem_limit,
+                cpu_quota=self.cpu_quota,
+            )
+            if self.build:
+                # Preserve build=True semantics: explicitly rebuild the image
+                # before starting (mirrors DockerExecutor._ensure_image).
+                import docker as _docker
+                self._build_image(_docker.from_env(), self.image)
             with open("/tmp/container_audit.log", "a") as _f:
                 _f.write(f"{time.time()} | CODERUNNER_EXECUTE | workspace={workspace} via_security={SECURITY_AVAILABLE}\n")
-            # Execute command with optional environment and working directory
-            stdout, stderr, exit_code = executor.execute(
-                command=actual_command,
-                timeout=self.timeout,
-                workdir=workdir,
-                environment=self.environment
-            )
+            info = manager.start(image=self.image)
+            try:
+                result = manager.exec(
+                    info["id"],
+                    command=actual_command,
+                    timeout=self.timeout,
+                    workdir=workdir,
+                    environment=self.environment,
+                )
+            finally:
+                manager.stop(info["id"])
+
+            stdout = result["stdout"]
+            stderr = result["stderr"]
+            exit_code = result["exit_code"]
 
             duration = time.time() - start_time
 

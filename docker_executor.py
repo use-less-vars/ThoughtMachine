@@ -107,7 +107,7 @@ def _compute_container_config_from_permissions(
 
     Args:
         workspace_path: Absolute path to the workspace (used for audit logging).
-        workspace_id: Resolved workspace ID, or None.
+        workspace_id: Resolved workspace ID (str), or None — coerced to str.
         session_permissions: The session permissions dict, or None.
 
     Returns:
@@ -115,6 +115,12 @@ def _compute_container_config_from_permissions(
     """
     network_mode = "none"
     workspace_mode = "ro"
+
+    # Normalize workspace_id to str: callers may pass a uuid.UUID object
+    # (e.g. integration tests); pathlib.Path rejects non-str operands with
+    # TypeError, which previously short-circuited the gate into fail-closed
+    # ("none","ro") instead of falling through to session permissions.
+    workspace_id = str(workspace_id) if workspace_id is not None else None
 
     if workspace_id and session_permissions is not None:
         try:
@@ -573,6 +579,18 @@ class DockerExecutor:
         # Determine mount: named volume (preferred) vs bind mount (fallback)
         volume_name = self._ensure_volume()
         if volume_name:
+            # One-shot volume population: copy the host workspace into the
+            # named volume on first use (idempotent via .workspace_synced).
+            # Best-effort: failures are logged/audited, never fatal.
+            ensure_workspace_volume_populated(
+                self.client,
+                self.image,
+                self.workspace_path,
+                volume_name,
+                network_mode=network_mode,
+                mem_limit=self.mem_limit,
+                cpu_quota=self.cpu_quota,
+            )
             mounts = [
                 docker.types.Mount(
                     target="/workspace",
@@ -850,6 +868,192 @@ class DockerExecutor:
             _build_log_cache[_container_name] = cache_value
 
         return image_id, log_lines
+
+
+def ensure_workspace_volume_populated(
+    client,
+    image: str,
+    workspace_path: str,
+    volume_name: str,
+    network_mode: str = "none",
+    mem_limit: str = "1g",
+    cpu_quota: int = 100000,
+) -> bool:
+    """Populate a named workspace volume from the host workspace (one-shot).
+    Called by ``DockerExecutor._ensure_container`` and
+    ``tools.container_manager.ContainerManager.start`` right after a named
+    volume ``tm-workspace-<workspace_id>`` is ensured.
+    Idempotency is guaranteed by the ``.workspace_synced`` sentinel file
+    inside the volume:
+    1. Sentinel check: run a throwaway container with the volume mounted
+       read-only at /workspace and ``test -f /workspace/.workspace_synced``.
+       Exit 0 -> the volume was already populated -> return True.
+    2. If the sentinel is missing, run a one-shot init container that bind
+       mounts the HOST workspace read-only at /host_workspace, copies it
+       into the volume (``cp -a /host_workspace/. /workspace/``) and then
+       touches ``/workspace/.workspace_synced``.
+    3. If the host workspace directory is absent/empty, only the sentinel
+       is touched so the volume is marked synced (an empty volume degrades
+       gracefully to the pre-existing empty-workspace behaviour).
+    Security constraints (mirror the main containers, with one deliberate
+    exception — the init container must run as root):
+      - no network (network_disabled=True even for bridge sessions — the
+        init container only copies files and needs no connectivity)
+      - all capabilities dropped (no-new-privileges, read-only root fs)
+        EXCEPT the init container adds back CHOWN/FOWNER/DAC_OVERRIDE:
+        a fresh named volume's root dir is root:root 0755, so only root
+        with those capabilities can chown it to 1000:1000 and copy the
+        host workspace into it.
+      - the SENTINEL check runs as non-root (1000:1000) with all caps
+        dropped; the INIT container runs as root (0:0) and ends with
+        ``chown -R 1000:1000`` so the main container (uid 1000) can write.
+      - same mem_limit/cpu_quota as main
+    The host bind mount is visible ONLY to this short-lived init container;
+    main containers never see it.
+    The volume is mounted writable in the init container (it must copy INTO
+    the volume) regardless of the main container's workspace_mode.
+    Best-effort: any failure is logged + audited (VOLUME_INIT_ERROR) and
+    returns False — it never raises and never blocks container creation.
+    Note: the init container runs as root, so ``cp -a`` can read and copy
+    any host file; the recursive ``chown -R 1000:1000`` afterwards is
+    best-effort (errors ignored) so a read-only file cannot fail the init.
+    Returns:
+        True if the volume is (or already was) populated; False on failure.
+    """
+    def _normalize_exit_code(result):
+        if isinstance(result, dict):
+            return result.get("StatusCode")
+        return result
+    # Hardening shared by the sentinel + init containers.  Mirrors
+    # DockerExecutor._ensure_container's high-level containers.create/run
+    # kwargs EXACTLY: the low-level ``client.api.create_container`` on the
+    # pinned docker SDK does NOT accept a ``mounts`` argument (it must be
+    # passed via host_config), so we create via the high-level API which
+    # routes mount/host-config kwargs correctly.  network="none" is used
+    # instead of network_disabled=True (same effect, proven on this SDK).
+    common = dict(
+        network="none",  # init needs no network — stricter than main config
+        read_only=True,
+        user="1000:1000",  # sentinel check runs as non-root (read-only test -f)
+        cap_drop=["ALL"],
+        security_opt=["no-new-privileges:true"],
+        mem_limit=mem_limit,
+        cpu_quota=cpu_quota,
+    )
+    # The INIT container must run as root with the ownership-manipulation
+    # capabilities: a fresh named volume's root dir is root:root 0755, so
+    # uid 1000 cannot chown it or copy into it.  Root chowns the volume to
+    # 1000:1000 and fixes file ownership after copying.  All OTHER caps stay
+    # dropped and the rootfs stays read-only.
+    init_common = dict(common)
+    init_common["user"] = "0:0"
+    init_common["cap_add"] = ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
+    # ── 1. Sentinel check ────────────────────────────────────────────
+    container_id = None
+    try:
+        created = client.containers.create(
+            image=image,
+            command=["test", "-f", "/workspace/.workspace_synced"],
+            mounts=[
+                docker.types.Mount(
+                    target="/workspace",
+                    source=volume_name,
+                    type="volume",
+                    read_only=True,
+                ),
+            ],
+            **common,
+        )
+        container_id = created.id
+        client.api.start(container_id)
+        wait_result = client.api.wait(container_id)
+        exit_code = _normalize_exit_code(wait_result)
+        if exit_code == 0:
+            _audit("VOLUME_POPULATE",
+                   f"volume={volume_name} action=check status=synced")
+            return True
+    except Exception as e:
+        log("WARNING", "docker.volume_populate",
+            f"Sentinel check failed: {e}")
+        _audit("VOLUME_INIT_ERROR", f"volume={volume_name} phase=check error={e}")
+        return False
+    finally:
+        if container_id:
+            try:
+                client.api.remove(container_id, force=True)
+            except Exception:
+                pass
+    # ── 2. Volume not synced — one-shot init container ───────────────
+    host_dir_missing = not os.path.isdir(workspace_path)
+    if host_dir_missing:
+        # Empty/absent host workspace: mark the volume synced as-is.
+        # chown first so the main container (uid 1000) can write the volume.
+        command = ("chown 1000:1000 /workspace "
+                   "&& touch /workspace/.workspace_synced")
+        mounts = [
+            docker.types.Mount(
+                target="/workspace",
+                source=volume_name,
+                type="volume",
+                read_only=False,
+            ),
+        ]
+    else:
+        command = ("chown 1000:1000 /workspace "
+                   "&& cp -a /host_workspace/. /workspace/ "
+                   "&& (chown -R 1000:1000 /workspace 2>/dev/null || true) "
+                   "&& touch /workspace/.workspace_synced")
+        mounts = [
+            docker.types.Mount(
+                target="/host_workspace",
+                source=workspace_path,
+                type="bind",
+                read_only=True,
+            ),
+            docker.types.Mount(
+                target="/workspace",
+                source=volume_name,
+                type="volume",
+                read_only=False,
+            ),
+        ]
+    _audit("VOLUME_INIT_START",
+           f"volume={volume_name} image={image} "
+           f"workspace={workspace_path} host_dir_present={not host_dir_missing}")
+    init_id = None
+    start_ts = time.time()
+    try:
+        init = client.containers.create(
+            image=image,
+            command=["/bin/sh", "-c", command],
+            mounts=mounts,
+            tmpfs={"/tmp": "rw,noexec,nosuid,size=64m"},
+            **init_common,
+        )
+        init_id = init.id
+        client.api.start(init_id)
+        init_result = client.api.wait(init_id)
+        init_exit = _normalize_exit_code(init_result)
+        duration_ms = int((time.time() - start_ts) * 1000)
+        _audit("VOLUME_INIT_DONE",
+               f"volume={volume_name} exit_code={init_exit} duration_ms={duration_ms}")
+        if init_exit == 0:
+            return True
+        log("WARNING", "docker.volume_populate",
+            f"Volume init copy failed with exit code {init_exit}")
+        return False
+    except Exception as e:
+        duration_ms = int((time.time() - start_ts) * 1000)
+        log("WARNING", "docker.volume_populate", f"Volume init failed: {e}")
+        _audit("VOLUME_INIT_ERROR",
+               f"volume={volume_name} phase=init duration_ms={duration_ms} error={e}")
+        return False
+    finally:
+        if init_id:
+            try:
+                client.api.remove(init_id, force=True)
+            except Exception:
+                pass
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Container status helper (used by Flask endpoint)
