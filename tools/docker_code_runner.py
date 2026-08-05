@@ -10,10 +10,18 @@ from .base import ToolBase
 
 # Import centralized security
 try:
-    from thoughtmachine.security import setup_docker_sandbox as security_setup_docker, set_logger as security_set_logger
+    from thoughtmachine.security import (
+        setup_docker_sandbox as security_setup_docker,
+        set_logger as security_set_logger,
+        DockerSetupError,
+    )
     SECURITY_AVAILABLE = True
 except ImportError:
     SECURITY_AVAILABLE = False
+
+    class DockerSetupError(RuntimeError):
+        """Raised when Docker sandbox setup fails (fallback if thoughtmachine.security is unavailable)."""
+        pass
 
 try:
     import docker
@@ -264,9 +272,12 @@ chmod +x "{script_path}"
         # Validate workspace path
         ws_path = self._resolve_registry_workspace()
         if ws_path is None:
-            workspace = os.getcwd()
-        else:
-            workspace = ws_path
+            # Never fall back to cwd: the current directory may be outside the
+            # workspace, and mounting it would leak host files into the container.
+            raise DockerSetupError(
+                "workspace path could not be resolved; refusing to mount cwd"
+            )
+        workspace = ws_path
 
         # Build absolute path for working directory
         workdir = "/workspace"
