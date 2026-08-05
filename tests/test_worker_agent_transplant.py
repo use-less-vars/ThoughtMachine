@@ -1086,8 +1086,12 @@ class TestReasoningPassthrough:
                 content="",
                 reasoning="I need to think about this carefully...",
                 tool_calls=[{
-                    "name": "Thought",
-                    "arguments": {"content": "thinking step 1"},
+                    "id": "call_mock_001",
+                    "type": "function",
+                    "function": {
+                        "name": "Thought",
+                        "arguments": json.dumps({"content": "thinking step 1"}),
+                    },
                 }],
                 usage={"prompt_tokens": 10, "completion_tokens": 8},
                 provider="scripted",
