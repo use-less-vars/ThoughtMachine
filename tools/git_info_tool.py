@@ -9,6 +9,12 @@ from pathlib import Path
 from .base import ToolBase
 
 
+# Clone URL protocol allowlist. ``git clone`` accepts arbitrary transport URLs
+# (including ``ext::`` shell executors and ``file://`` local access), so clone
+# URLs are restricted to these schemes plus scp-like ``user@host:path`` syntax.
+ALLOWED_GIT_PROTOCOLS = ["https://", "http://", "git://", "ssh://"]
+
+
 class GitInfoTool(ToolBase):
     """
     Git repository tool with read-only operations (status, diff, log, branch, show,
@@ -129,6 +135,48 @@ class GitInfoTool(ToolBase):
         description="Config name to retrieve (if not specified, list all configs)"
     )
     
+    @staticmethod
+    def _validate_clone_url(clone_url: str) -> bool:
+        """
+        Validate that a clone URL uses an allowed transport.
+
+        Returns ``True`` on success and raises ``ValueError`` (message
+        ``Unsupported git protocol: <clone_url>``) otherwise.
+
+        Rules:
+        - ``https://``, ``http://``, ``git://`` and ``ssh://`` are allowed;
+          scheme comparison is case-insensitive (RFC 3986).
+        - scp-like ``user@host:path`` is allowed when no ``://`` scheme is
+          present: the URL must contain ``@`` with a ``:`` after it and before
+          any ``/``.
+        - Empty strings and URLs with leading/trailing whitespace are rejected
+          (whitespace is deliberately *not* stripped — a padded URL is a
+          paste-injection red flag).
+        - Anything else (``ext::`` transports, ``file://``, ``ftp://``, local
+          paths, ...) is rejected.
+        """
+        if not clone_url or clone_url != clone_url.strip():
+            raise ValueError(f"Unsupported git protocol: {clone_url}")
+
+        # Scheme-based URLs. Only allowlisted schemes are permitted; the scheme
+        # prefix is compared case-insensitively.
+        if "://" in clone_url:
+            scheme = clone_url.split("://", 1)[0] + "://"
+            if scheme.lower() in ALLOWED_GIT_PROTOCOLS:
+                return True
+            raise ValueError(f"Unsupported git protocol: {clone_url}")
+
+        # scp-like syntax: user@host:path. Only reached when no '://' scheme
+        # was found, so 'https://user@host/repo.git' never hits this branch.
+        at_index = clone_url.find("@")
+        if at_index != -1:
+            colon_index = clone_url.find(":", at_index)
+            slash_index = clone_url.find("/")
+            if colon_index != -1 and (slash_index == -1 or colon_index < slash_index):
+                return True
+
+        raise ValueError(f"Unsupported git protocol: {clone_url}")
+
     def execute(self) -> str:
         # Atomic permission re-check for network operations
         operation = self.operation
@@ -143,6 +191,13 @@ class GitInfoTool(ToolBase):
                 f"{operation} on remote"
             ):
                 return json.dumps({"error": f"Atomic permission check failed: network:outbound required for {operation}"})
+
+        # Validate the clone URL protocol BEFORE any subprocess can run.
+        # This check sits outside the try/except below so the ValueError
+        # surfaces to the caller instead of being swallowed into an error
+        # string by the catch-all handler.
+        if operation == "clone" and self.clone_url:
+            self._validate_clone_url(self.clone_url)
 
         try:
             # Determine working directory
@@ -417,6 +472,11 @@ class GitInfoTool(ToolBase):
         """Clone a remote git repository into the workspace."""
         if not self.clone_url:
             return "Error: clone_url is required for clone operation"
+
+        # Protocol allowlist check — reject ext::/file:///unknown schemes
+        # before the URL is handed to a git subprocess. (execute() also
+        # validates pre-try; this is defense-in-depth for direct callers.)
+        self._validate_clone_url(self.clone_url)
 
         args = ["clone", self.clone_url]
         if self.clone_target:
