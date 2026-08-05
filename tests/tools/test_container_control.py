@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from tools.container_control import ContainerBuildTool, ContainerListTool, ContainerLogsTool
 from tools.container_manager import (
@@ -321,21 +322,21 @@ class TestContainerManagerBuildImage:
         )
 
     @patch("tools.container_manager.DOCKER_AVAILABLE", True)
-    def test_missing_dockerfile_raises(self, tmp_path):
-        """No Dockerfile in workspace -> clear RuntimeError, executor never used."""
+    def test_missing_vault_dockerfile_raises(self, tmp_path):
+        """No vault Dockerfile in workspace -> clear RuntimeError, executor never used."""
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path))
 
         with patch("tools.container_manager._load_docker_executor") as mock_load:
-            with pytest.raises(RuntimeError, match="Dockerfile not found"):
+            with pytest.raises(RuntimeError, match="Vault Dockerfile not found"):
                 manager.build_image()
 
         mock_load.assert_not_called()
 
     @patch("tools.container_manager.DOCKER_AVAILABLE", True)
-    def test_custom_dockerfile_and_tag(self, tmp_path):
-        """Explicit dockerfile_path + tag -> used as-is, auto-tag skipped."""
-        (tmp_path / "Dockerfile.custom").write_text("FROM python:3.12-slim\n")
+    def test_vault_dockerfile_with_explicit_tag(self, tmp_path):
+        """Explicit tag + vault Dockerfile -> used as-is, auto-tag skipped."""
+        (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path))
 
@@ -344,11 +345,11 @@ class TestContainerManagerBuildImage:
             dex._run_image_build.return_value = ("sha256:def", ["Step 1"])
             mock_load.return_value = dex
 
-            result = manager.build_image(dockerfile_path="Dockerfile.custom", tag="my-tag:1")
+            result = manager.build_image(tag="my-tag:1")
 
         assert result["image_tag"] == "my-tag:1"
         dex._run_image_build.assert_called_once_with(
-            mock_client, str(tmp_path), "Dockerfile.custom", "my-tag:1"
+            mock_client, str(tmp_path), "Dockerfile", "my-tag:1"
         )
         dex._compute_image_tag.assert_not_called()
 
@@ -386,6 +387,19 @@ class TestContainerManagerBuildImage:
             with pytest.raises(RuntimeError, match="boom"):
                 manager.build_image()
 
+    @patch("tools.container_manager.DOCKER_AVAILABLE", True)
+    def test_planted_non_vault_dockerfile_not_used(self, tmp_path):
+        """Vault-gating: a planted non-vault Dockerfile is NOT a fallback."""
+        (tmp_path / "Dockerfile.custom").write_text("FROM python:3.12-slim\n")
+        mock_client = MagicMock()
+        manager = self._manager(mock_client, str(tmp_path))
+
+        with patch("tools.container_manager._load_docker_executor") as mock_load:
+            with pytest.raises(RuntimeError, match="Vault Dockerfile not found"):
+                manager.build_image(tag="x:1")
+
+        mock_load.assert_not_called()  # planted file ignored, no build attempted
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ContainerBuildTool
@@ -410,7 +424,7 @@ class TestContainerBuildTool:
             result = _parse_result(tool.execute())
 
         mock_cls.assert_called_once()  # _make_manager() built exactly one manager
-        mock_manager.build_image.assert_called_once_with(dockerfile_path=None, tag=None)
+        mock_manager.build_image.assert_called_once_with(tag=None)
         assert set(result.keys()) == {"success", "image_tag", "build_log", "duration"}
         assert result["success"] is True
         assert result["image_tag"] == "agent-executor-abc"
@@ -422,7 +436,7 @@ class TestContainerBuildTool:
         with patch("tools.container_control.ContainerManager") as mock_cls:
             mock_manager = MagicMock()
             mock_manager.build_image.side_effect = RuntimeError(
-                "Dockerfile not found at /x/Dockerfile"
+                "Vault Dockerfile not found at /x/Dockerfile"
             )
             mock_cls.return_value = mock_manager
 
@@ -433,7 +447,7 @@ class TestContainerBuildTool:
             result = _parse_result(tool.execute())
 
         assert result["success"] is False
-        assert "Dockerfile not found at /x/Dockerfile" in result["error"]
+        assert "Vault Dockerfile not found at /x/Dockerfile" in result["error"]
         assert result["duration"] >= 0
 
     def test_execute_returns_error_json_on_unexpected_error(self):
@@ -460,8 +474,47 @@ class TestContainerBuildTool:
             workspace_path="/tmp/test_ws",
             session_permissions={"container": True},
         )
-        assert tool.dockerfile_path is None
         assert tool.tag is None
+
+    def test_dockerfile_path_rejected(self):
+        """Vault-gating: dockerfile_path is no longer a tool parameter."""
+        with pytest.raises(ValidationError):
+            ContainerBuildTool(
+                workspace_path="/tmp/test_ws",
+                session_permissions={"container": True},
+                dockerfile_path="Dockerfile.custom",
+            )
+
+    def test_dockerfile_path_absent_from_schema(self):
+        """Vault-gating: dockerfile_path absent from the tool's parameter schema."""
+        assert "dockerfile_path" not in ContainerBuildTool.model_fields
+        assert "dockerfile_path" not in ContainerBuildTool.model_json_schema().get(
+            "properties", {}
+        )
+        assert "tag" in ContainerBuildTool.model_fields  # sanity: tag remains
+
+    def test_vault_dockerfile_missing_returns_clean_error_no_fallback(self):
+        """Missing vault Dockerfile -> clean error JSON; NO fallback build attempt."""
+        with patch("tools.container_control.ContainerManager") as mock_cls:
+            mock_manager = MagicMock()
+            mock_manager.build_image.side_effect = RuntimeError(
+                "Vault Dockerfile not found at /x/Dockerfile. "
+                "The vault-managed <workspace>/Dockerfile must exist before building."
+            )
+            mock_cls.return_value = mock_manager
+
+            tool = ContainerBuildTool(
+                workspace_path="/tmp/test_ws",
+                session_permissions={"container": True},
+            )
+            result = _parse_result(tool.execute())
+
+        mock_cls.assert_called_once()  # exactly one manager built
+        mock_manager.build_image.assert_called_once_with(tag=None)
+        assert mock_manager.build_image.call_count == 1  # no fallback retry/build
+        assert result["success"] is False
+        assert "Vault Dockerfile not found" in result["error"]
+        assert result["duration"] >= 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════

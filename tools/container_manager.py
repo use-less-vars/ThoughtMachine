@@ -513,18 +513,17 @@ class ContainerManager:
             })
         return result
 
-    def build_image(self, dockerfile_path=None, tag=None):
+    def build_image(self, tag=None):
         """Build a Docker image from the HOST workspace directory.
 
-        Unlike ``docker_executor``'s temp-context build, the build context here
-        is the workspace directory itself (``<workspace>/Dockerfile`` by
-        default), so the Dockerfile can COPY the local tree directly. The build
-        runs synchronously and its output is returned (not just a bool).
+        Vault-gated: always builds from the vault-managed
+        ``<workspace>/Dockerfile`` (the resolved registry workspace root — no
+        ``dockerfile_path`` override) in the HOST workspace directory — not the
+        session volume — as the build context, so the Dockerfile can COPY the
+        local tree directly. The build runs synchronously and its output is
+        returned (not just a bool).
 
         Args:
-            dockerfile_path: Path to the Dockerfile, absolute or relative to
-                the workspace (default: ``Dockerfile``). Must stay inside the
-                workspace.
             tag: Image tag; auto-generated from the workspace path (the same
                 ``agent-executor-<hash>`` convention ``docker_executor`` uses)
                 when omitted.
@@ -534,30 +533,25 @@ class ContainerManager:
             truncated to 100KB with a truncation notice).
 
         Raises:
-            RuntimeError: If the Dockerfile is missing, escapes the workspace,
-                or the build fails.
+            RuntimeError: If the vault Dockerfile is missing or the build fails.
         """
         if not DOCKER_AVAILABLE or self.client is None:
             raise RuntimeError("Docker Python SDK not available")
 
         ws = self.workspace_path
-        dockerfile = dockerfile_path or "Dockerfile"
-        resolved = dockerfile if os.path.isabs(dockerfile) else os.path.join(ws, dockerfile)
+        resolved = os.path.join(ws, "Dockerfile")
         if not os.path.exists(resolved):
             raise RuntimeError(
-                f"Dockerfile not found at {resolved}. "
-                "Place a Dockerfile in the workspace or pass dockerfile_path."
+                f"Vault Dockerfile not found at {resolved}. "
+                "The vault-managed <workspace>/Dockerfile must exist before building."
             )
-        rel = os.path.relpath(resolved, ws)
-        if rel.startswith(".."):
-            raise RuntimeError(f"dockerfile_path {dockerfile} escapes the workspace")
 
         dex = _load_docker_executor()
         if not tag:
             tag = dex._compute_image_tag(ws)
 
         try:
-            _, log_lines = dex._run_image_build(self.client, ws, rel, tag)
+            _, log_lines = dex._run_image_build(self.client, ws, "Dockerfile", tag)
         except RuntimeError:
             raise
         except Exception as e:

@@ -438,7 +438,8 @@ class ContainerListTool(_ContainerControlBase):
 class ContainerBuildTool(_ContainerControlBase):
     """Build a Docker image from the host workspace directory.
 
-    Uses ``<workspace>/Dockerfile`` (or an explicit ``dockerfile_path``) inside
+    Vault-gated: always builds from the vault-managed ``<workspace>/Dockerfile``
+    (the resolved registry workspace root — no ``dockerfile_path`` override) in
     the HOST workspace directory — not the session volume — as the build
     context, so the Dockerfile can COPY the local tree directly. When ``tag``
     is omitted it is auto-generated from the workspace path (the same
@@ -456,10 +457,6 @@ class ContainerBuildTool(_ContainerControlBase):
     """
     tool: Literal["ContainerBuildTool"] = "ContainerBuildTool"
 
-    dockerfile_path: Optional[str] = Field(
-        None,
-        description="Path to the Dockerfile relative to the workspace (default: Dockerfile).",
-    )
     tag: Optional[str] = Field(
         None,
         description="Image tag to build (auto-generated from the workspace path when absent).",
@@ -469,10 +466,7 @@ class ContainerBuildTool(_ContainerControlBase):
         start_time = time.time()
         try:
             manager = self._make_manager()
-            result = manager.build_image(
-                dockerfile_path=self.dockerfile_path,
-                tag=self.tag,
-            )
+            result = manager.build_image(tag=self.tag)
             return self._respond(
                 True,
                 **result,

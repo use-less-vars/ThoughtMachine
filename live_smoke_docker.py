@@ -437,7 +437,6 @@ def main() -> int:
                 session_id=p2_session,
                 session_permissions=sp,
                 tag=p2_image_tag,
-                dockerfile_path=None,  # default: <workspace>/Dockerfile
             ).execute())
             ok(b.get("success") is True,
                "ContainerBuildTool failed: %s" % b.get("error"))
