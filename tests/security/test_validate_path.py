@@ -17,6 +17,7 @@ from thoughtmachine.security import (
     PathOutsideWorkspaceError,
     VAULT_ROOT,
     VAULT_BLOCKED_SUBDIRS,
+    WORKSPACE_BLOCKED_PATH_PREFIXES,
     validate_path,
 )
 
@@ -169,13 +170,13 @@ class TestEdgeCases:
         with pytest.raises(PathOutsideWorkspaceError):
             validate_path(symlink_path, workspace_path=ws)
 
-    def test_symlink_pointing_outside_workspace_is_allowed(self, tmp_path: Path):
-        """A symlink inside workspace pointing outside is allowed.
+    def test_symlink_pointing_outside_workspace_is_blocked(self, tmp_path: Path):
+        """A symlink inside workspace resolving outside is blocked.
 
-        The symlink file itself resides inside the workspace, so it passes path
-        validation. The resolved target is not checked against the workspace
-        boundary — that is a deliberate design choice (the original code's
-        comment: 'If symlink points outside workspace or is broken, that's OK').
+        (F4-2) After symlink resolution the workspace boundary is re-checked,
+        so the resolved target must stay inside the workspace. Previously only
+        the vault was re-checked post-resolution; now a link resolving to /tmp
+        is rejected because /tmp lies outside the workspace.
         """
         ws = str(tmp_path)
         symlink_path = os.path.join(ws, "link_outside")
@@ -184,6 +185,91 @@ class TestEdgeCases:
         except (OSError, NotImplementedError):
             pytest.skip("Symlinks not supported on this OS/filesystem")
 
-        result = validate_path(symlink_path, workspace_path=ws)
-        # The resolved path should point to /tmp (the symlink target)
-        assert result == "/tmp"
+        with pytest.raises(PathOutsideWorkspaceError):
+            validate_path(symlink_path, workspace_path=ws)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Sensitive workspace-internal paths (.git/.ssh/.npmrc/.env)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestBlockedWorkspaceInternalPaths:
+    """Deny-listed paths inside the workspace are rejected, component-aware.
+
+    Matching is against the FIRST path components of the workspace-relative
+    path — never a naive substring. Only the three sensitive .git entries are
+    blocked (.git/hooks, .git/config, .git/HEAD); the rest of .git (refs,
+    objects) stays usable so normal repo tooling keeps working.
+    """
+
+    @pytest.mark.parametrize("rel_path", WORKSPACE_BLOCKED_PATH_PREFIXES)
+    def test_every_deny_list_entry_is_blocked(self, tmp_path: Path, rel_path: str):
+        ws = str(tmp_path)
+        with pytest.raises(PathOutsideWorkspaceError) as exc_info:
+            validate_path(rel_path, workspace_path=ws)
+        msg = str(exc_info.value)
+        assert "blocked" in msg.lower()   # message makes clear it is blocked
+        assert rel_path in msg            # message names the blocked path
+
+    @pytest.mark.parametrize(
+        "rel_path",
+        [
+            ".git/hooks/pre-commit",       # nested under a deny-listed dir
+            ".git/hooks/post-checkout",
+            ".git/config",
+            ".git/HEAD",
+            ".ssh/config",
+            ".ssh/any/deep/nested/key",
+            ".npmrc",
+            ".env",
+            ".env.local",                  # dotfile variant of .env
+        ],
+    )
+    def test_sensitive_paths_blocked(self, tmp_path: Path, rel_path: str):
+        ws = str(tmp_path)
+        with pytest.raises(PathOutsideWorkspaceError):
+            validate_path(rel_path, workspace_path=ws)
+
+    @pytest.mark.parametrize(
+        "rel_path",
+        [
+            "src/main.py",                    # normal file
+            "src/sub/nested/deep/file.txt",   # normal nested file
+            ".gitignore",                     # NOT on the deny list
+            "not-really-.env",                # substring, not a path component
+            ".env2",                          # dotfile-variant rule requires '.'
+            ".git/refs/heads/main",           # NOT on the deny list (design note)
+        ],
+    )
+    def test_legitimate_paths_allowed(self, tmp_path: Path, rel_path: str):
+        ws = str(tmp_path)
+        result = validate_path(rel_path, workspace_path=ws)
+        assert os.path.isabs(result)
+        assert result.startswith(ws)
+
+    def test_symlink_pointing_to_etc_passwd_is_blocked(self, tmp_path: Path):
+        """A symlink inside workspace pointing to /etc/passwd is rejected."""
+        ws = str(tmp_path)
+        symlink_path = os.path.join(ws, "link_to_passwd")
+        try:
+            os.symlink("/etc/passwd", symlink_path)
+        except (OSError, NotImplementedError):
+            pytest.skip("Symlinks not supported on this OS/filesystem")
+
+        with pytest.raises(PathOutsideWorkspaceError):
+            validate_path(symlink_path, workspace_path=ws)
+
+    def test_symlink_to_blocked_file_inside_workspace_is_blocked(self, tmp_path: Path):
+        """A symlink resolving to a deny-listed file inside the workspace is
+        rejected too (the deny list is re-checked after resolution)."""
+        ws = str(tmp_path)
+        Path(os.path.join(ws, ".env")).write_text("SECRET=1")
+        symlink_path = os.path.join(ws, "innocent_link")
+        try:
+            os.symlink(os.path.join(ws, ".env"), symlink_path)
+        except (OSError, NotImplementedError):
+            pytest.skip("Symlinks not supported on this OS/filesystem")
+
+        with pytest.raises(PathOutsideWorkspaceError):
+            validate_path(symlink_path, workspace_path=ws)

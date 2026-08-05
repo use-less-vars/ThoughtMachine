@@ -62,6 +62,25 @@ VAULT_BLOCKED_SUBDIRS = [
 
 VAULT_ROOT = os.path.join(os.path.expanduser("~"), ".thoughtmachine")
 
+# Workspace-internal paths that file tools may never access even when they
+# resolve inside the workspace. Matched component-aware against the FIRST
+# path components of the workspace-relative path (see
+# _match_blocked_workspace_path) — never a naive substring.
+#
+# Design note: only three .git entries are blocked (.git/hooks, .git/config,
+# .git/HEAD) rather than all of .git. Normal tooling legitimately reads the
+# repo's own refs/objects (e.g. .git/refs/heads/main) and must keep working;
+# the blocked entries are precisely the ones that can execute code on a
+# checkout (hooks) or leak credentials (config/HEAD).
+WORKSPACE_BLOCKED_PATH_PREFIXES = [
+    ".git/hooks",
+    ".git/config",
+    ".git/HEAD",
+    ".ssh",
+    ".npmrc",
+    ".env",
+]
+
 # Security exceptions
 class SecurityError(Exception):
     """Base security exception."""
@@ -248,6 +267,42 @@ def _redact_sensitive_data(data: Any) -> Any:
         return data
 
 
+def _match_blocked_workspace_path(rel_path: str) -> Optional[str]:
+    """Return the deny-list entry matching a workspace-relative path, or None.
+
+    Matching is component-aware against the FIRST path components of the
+    relative path (never a naive substring):
+
+    - Multi-component entries (``.git/hooks``) match the path itself or
+      anything beneath it: ``.git/hooks`` -> ``.git/hooks/pre-commit``.
+    - Single-component entries match the path itself, anything beneath it as
+      a directory (``.ssh`` -> ``.ssh/config``), and dotfile variants
+      (``.env`` -> ``.env.local``; the separator must be a dot, so ``.env2``
+      does NOT match).
+    - Everything else stays unblocked: ``not-really-.env``, ``.gitignore``,
+      ``.git/refs/heads/main``, ``src/main.py``.
+    """
+    if not rel_path:
+        return None
+    # Normalize separators so matching is platform-independent.
+    rel_norm = rel_path.replace(os.sep, "/").lstrip("/")
+    for entry in WORKSPACE_BLOCKED_PATH_PREFIXES:
+        if "/" in entry:
+            # Directory-prefix entry: match the entry or anything below it.
+            if rel_norm == entry or rel_norm.startswith(entry + "/"):
+                return entry
+        else:
+            # Single-component entry: exact file, directory beneath it, or
+            # dotfile variant (".env" -> ".env.local", but not ".env2").
+            if (
+                rel_norm == entry
+                or rel_norm.startswith(entry + "/")
+                or rel_norm.startswith(entry + ".")
+            ):
+                return entry
+    return None
+
+
 def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] = None) -> str:
     """
     Validate that a given path is within the allowed workspace.
@@ -374,7 +429,36 @@ def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] =
             }
         )
         raise PathOutsideWorkspaceError(f"Path {original_path} is outside workspace {workspace_abs}")
-    
+
+    # ── BLOCK SENSITIVE WORKSPACE-INTERNAL PATHS ──────────────────────────
+    # Even inside the workspace, deny file-tool access to git hook/config
+    # files, ssh keys, and env/secret files. Matching is component-aware
+    # against the FIRST path components of the workspace-relative path (see
+    # _match_blocked_workspace_path) — never a naive substring.
+    blocked_entry = _match_blocked_workspace_path(target_rel)
+    if blocked_entry:
+        _log_security_event(
+            event_type=LogEventType.SECURITY_VIOLATION if LOGGING_AVAILABLE else None,
+            message=(
+                f"Blocked sensitive workspace path: '{original_path}' "
+                f"(relative: '{target_rel}', blocked entry: '{blocked_entry}')"
+            ),
+            level=LogLevel.WARNING if LOGGING_AVAILABLE else logging.WARNING,
+            data={
+                "path": original_path,
+                "resolved_path": target_abs,
+                "workspace": workspace_abs,
+                "mode": mode,
+                "relative_path": target_rel,
+                "blocked_entry": blocked_entry,
+                "reason": "workspace_blocked_path"
+            }
+        )
+        raise PathOutsideWorkspaceError(
+            f"Path '{original_path}' is blocked: workspace-relative path "
+            f"'{target_rel}' matches blocked entry '{blocked_entry}'"
+        )
+
     # Try to get canonical path (following symlinks) for return value
     canonical_abs = target_abs
     try:
@@ -410,6 +494,64 @@ def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] =
                 }
             )
             raise PathOutsideWorkspaceError(f"Access to vault via symlink is blocked: '{original_path}' -> '{canonical_resolved}'")
+
+        # ── RE-CHECK WORKSPACE BOUNDARY AFTER SYMLINK RESOLUTION ──────────
+        # A symlink inside the workspace may resolve to a location OUTSIDE the
+        # workspace. The pre-resolution checks only saw the symlink's own
+        # location, so re-verify the resolved target against the boundary.
+        try:
+            canonical_rel = os.path.relpath(canonical_resolved, workspace_abs)
+        except ValueError:
+            # Paths on different drives (Windows) -> outside the workspace
+            canonical_rel = ".."
+        if canonical_rel.startswith("..") or os.path.isabs(canonical_rel):
+            _log_security_event(
+                event_type=LogEventType.SECURITY_VIOLATION if LOGGING_AVAILABLE else None,
+                message=(
+                    f"Path violation attempt via symlink: '{original_path}' "
+                    f"resolves to '{canonical_resolved}' outside workspace '{workspace_abs}'"
+                ),
+                level=LogLevel.WARNING if LOGGING_AVAILABLE else logging.WARNING,
+                data={
+                    "path": original_path,
+                    "resolved_path": canonical_resolved,
+                    "symlink_target": canonical_abs,
+                    "workspace": workspace_abs,
+                    "mode": mode,
+                    "reason": "outside_workspace_via_symlink"
+                }
+            )
+            raise PathOutsideWorkspaceError(
+                f"Path {original_path} is outside workspace {workspace_abs} "
+                f"(resolved symlink target '{canonical_resolved}')"
+            )
+
+        # Also re-check the deny list against the resolved path, so a symlink
+        # cannot smuggle access to a blocked file that lives inside the
+        # workspace (e.g. a link named 'notes' -> workspace/.env).
+        resolved_blocked = _match_blocked_workspace_path(canonical_rel)
+        if resolved_blocked:
+            _log_security_event(
+                event_type=LogEventType.SECURITY_VIOLATION if LOGGING_AVAILABLE else None,
+                message=(
+                    f"Blocked sensitive workspace path via symlink: '{original_path}' "
+                    f"resolves to '{canonical_resolved}' (blocked entry: '{resolved_blocked}')"
+                ),
+                level=LogLevel.WARNING if LOGGING_AVAILABLE else logging.WARNING,
+                data={
+                    "path": original_path,
+                    "resolved_path": canonical_resolved,
+                    "symlink_target": canonical_abs,
+                    "workspace": workspace_abs,
+                    "mode": mode,
+                    "blocked_entry": resolved_blocked,
+                    "reason": "workspace_blocked_path_via_symlink"
+                }
+            )
+            raise PathOutsideWorkspaceError(
+                f"Path '{original_path}' is blocked: resolved symlink target "
+                f"'{canonical_resolved}' matches blocked entry '{resolved_blocked}'"
+            )
 
     # Log successful access
     try:
