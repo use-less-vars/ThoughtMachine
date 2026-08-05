@@ -23,7 +23,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tools.container_control import ContainerBuildTool, ContainerListTool, ContainerLogsTool
-from tools.container_manager import ContainerManager, NotFound, EXEC_OUTPUT_LIMIT_BYTES
+from tools.container_manager import (
+    ContainerManager,
+    NotFound,
+    EXEC_OUTPUT_LIMIT_BYTES,
+    _TRUNCATION_NOTICE,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -349,7 +354,7 @@ class TestContainerManagerBuildImage:
 
     @patch("tools.container_manager.DOCKER_AVAILABLE", True)
     def test_build_log_truncated_at_100kb(self, tmp_path):
-        """Build log > 100KB -> truncated with a truncation notice appended."""
+        """Build log > EXEC_OUTPUT_LIMIT_BYTES (100 KiB) -> truncated + notice."""
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path))
@@ -364,7 +369,7 @@ class TestContainerManagerBuildImage:
             result = manager.build_image()
 
         assert "truncated" in result["build_log"]
-        assert len(result["build_log"]) <= 100_000 + 40
+        assert len(result["build_log"]) <= EXEC_OUTPUT_LIMIT_BYTES + len(_TRUNCATION_NOTICE)
 
     @patch("tools.container_manager.DOCKER_AVAILABLE", True)
     def test_build_failure_raises_runtime_error(self, tmp_path):
