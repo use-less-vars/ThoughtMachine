@@ -70,6 +70,9 @@ try:
         ContainerStartTool,
         ContainerStatusTool,
         ContainerStopTool,
+        ContainerBuildTool,
+        ContainerListTool,
+        ContainerLogsTool,
     )
     from tools.container_manager import (  # noqa: E402
         ContainerManager,
@@ -113,6 +116,18 @@ def main() -> int:
     build_ctx = None
     created_volumes = []
     image_built = False
+    # Phase-2 (Commit 6) state - separate workspace/session/image from Phase-1
+    p2_ws = None
+    p2_ws_id = None
+    p2_image_tag = None
+    p2_containers = []          # [a, b, c, d] - explicit teardown in finally
+    p2_cid_a = None
+    p2_cid_b = None
+    p2_cid_c = None
+    p2_cid_d = None
+    p2_session = str(uuid.uuid4())     # a & b share one session (list filter)
+    p2_session_c = str(uuid.uuid4())   # fresh session for container c
+    p2_session_d = str(uuid.uuid4())   # fresh session for container d
     fatal = False
 
     def check(name, fn):
@@ -390,6 +405,252 @@ def main() -> int:
         if not fatal:
             check("wiring-ctl", _wiring_ctl)
 
+        # ---------------- PHASE 2 (Commit 6): steps 11-16 ----------------
+        # ContainerBuildTool / ContainerListTool / ContainerLogsTool
+        # end-to-end against real Docker, plus a true-staleness volume
+        # refresh sequence.
+        # Documented deviation: containers a & b deliberately share ONE
+        # session id (p2_session) because ContainerListTool filters on the
+        # single `thoughtmachine.session_id` label - with different session
+        # ids no single list call could observe both. Containers c and d use
+        # their own fresh session ids.
+        sp = {"network": "write", "filesystem": "write", "container": True}
+
+        def _p2_build():
+            nonlocal p2_ws, p2_image_tag
+            p2_ws = tempfile.mkdtemp(prefix="tm-smoke-p2-ws-")
+            with open(os.path.join(p2_ws, "Dockerfile"), "w") as fh:
+                # python:3.11-slim reuses the cached base from STEP 1,
+                # avoiding a slow 3.12 pull. start() overrides CMD anyway.
+                fh.write("\n".join([
+                    "FROM python:3.11-slim",
+                    "WORKDIR /workspace",
+                    "COPY . .",
+                    'CMD ["python", "-c", "print(\'smoke-ready\')"]',
+                    "",
+                ]))
+            with open(os.path.join(p2_ws, "marker.txt"), "w") as fh:
+                fh.write("tm-smoke-p2-marker-%s\n" % tag)
+            p2_image_tag = "tm-smoke-p2-%s:latest" % tag
+            b = json.loads(ContainerBuildTool(
+                workspace_path=p2_ws,
+                session_id=p2_session,
+                session_permissions=sp,
+                tag=p2_image_tag,
+                dockerfile_path=None,  # default: <workspace>/Dockerfile
+            ).execute())
+            ok(b.get("success") is True,
+               "ContainerBuildTool failed: %s" % b.get("error"))
+            ok(b.get("image_tag") == p2_image_tag,
+               "unexpected image_tag %r" % b.get("image_tag"))
+            ok(bool(b.get("build_log")), "build_log empty")
+            return "image %s built (build_log %d chars)" % (
+                p2_image_tag, len(b.get("build_log") or ""))
+
+        def _p2_start():
+            nonlocal p2_cid_a, p2_cid_b
+            sa = json.loads(ContainerStartTool(
+                name="smoke-p2-a-%s" % tag,
+                workspace_path=p2_ws,
+                session_id=p2_session,
+                session_permissions=sp,
+                image=p2_image_tag,
+                mem_limit="512m",
+                cpu_quota=50000,
+            ).execute())
+            ok(sa.get("success") is True, "start a failed: %r" % sa)
+            ok(sa.get("status") == "created",
+               "start a status %r (expected 'created')" % sa.get("status"))
+            p2_cid_a = sa["container_id"]
+            p2_containers.append(p2_cid_a)
+            sb = json.loads(ContainerStartTool(
+                name="smoke-p2-b-%s" % tag,
+                workspace_path=p2_ws,
+                session_id=p2_session,
+                session_permissions=sp,
+                image=p2_image_tag,
+                mem_limit="512m",
+                cpu_quota=50000,
+            ).execute())
+            ok(sb.get("success") is True, "start b failed: %r" % sb)
+            ok(sb.get("status") == "created",
+               "start b status %r (expected 'created')" % sb.get("status"))
+            p2_cid_b = sb["container_id"]
+            p2_containers.append(p2_cid_b)
+            return "started %s, %s" % (p2_cid_a[:12], p2_cid_b[:12])
+
+        def _p2_list():
+            lst = json.loads(ContainerListTool(
+                workspace_path=p2_ws,
+                session_id=p2_session,
+                session_permissions=sp,
+            ).execute())
+            ok(lst.get("success") is True, "ContainerListTool failed: %r" % lst)
+            containers = lst.get("containers") or []
+            ok(lst.get("count", 0) >= 2, "count %r < 2" % lst.get("count"))
+            names = [c.get("name") for c in containers]
+            ok("smoke-p2-a-%s" % tag in names and "smoke-p2-b-%s" % tag in names,
+               "missing containers; got %r" % names)
+            for c in containers:
+                ok(set(c.keys()) == {"container_id", "name", "image", "status",
+                                     "uptime_seconds"},
+                   "unexpected entry keys %r" % sorted(c.keys()))
+            return "listed %d container(s): %s" % (len(containers),
+                                                   ", ".join(names))
+
+        def _p2_logs():
+            # start() hardcodes PID 1 = `tail -f /dev/null`; docker logs
+            # captures ONLY PID-1 output - exec streams are never logged. So
+            # the counter writes into PID 1's stdout pipe via /proc/1/fd/1
+            # (both PID 1 and the exec run as uid 1000, so the write is
+            # permitted). Foreground, not `&`: exec teardown may reap
+            # background children; 20*0.5s=10s < exec timeout (an exec
+            # timeout KILLS the whole container).
+            counter_cmd = (
+                "i=0; while [ $i -lt 20 ]; do "
+                "echo tick-$i > /proc/1/fd/1; i=$((i+1)); sleep 0.5; done"
+            )
+            e = json.loads(ContainerExecTool(
+                container_id=p2_cid_a,
+                command=counter_cmd,
+                timeout=30,
+                workspace_path=p2_ws,
+                session_id=p2_session,
+                session_permissions=sp,
+            ).execute())
+            ok(e.get("success") is True, "counter exec failed: %r" % e)
+            ok(e.get("exit_code") == 0,
+               "counter exit_code %r" % e.get("exit_code"))
+            lr = json.loads(ContainerLogsTool(
+                container_id=p2_cid_a,
+                tail=50,
+                workspace_path=p2_ws,
+                session_id=p2_session,
+                session_permissions=sp,
+            ).execute())
+            ok(lr.get("success") is True, "ContainerLogsTool failed: %r" % lr)
+            # tty=True => unframed raw stream => _split fallback => stdout
+            ok("tick-" in (lr.get("stdout") or ""),
+               "tick- not in logs stdout: %r" % (lr.get("stdout") or "")[:200])
+            return "counter -> PID-1 log capture (20 ticks)"
+
+        def _p2_volume_refresh():
+            nonlocal p2_ws_id, p2_cid_c, p2_cid_d
+            # TRUE staleness test: populate a named volume, remove the
+            # container to free it, add a NEW file on the host, then start a
+            # second container against the same workspace_id - the Commit-1
+            # host-manifest sha check must detect the change and refresh the
+            # volume (merge, not wipe).
+            p2_ws_id = str(uuid.uuid4())
+            mgr_c = ContainerManager(
+                workspace_path=p2_ws,
+                session_id=p2_session_c,
+                workspace_id=p2_ws_id,
+                session_permissions=sp,
+                image=p2_image_tag,
+                mem_limit="512m",
+                cpu_quota=50000,
+            )
+            c = mgr_c.start(name="smoke-p2-c-%s" % tag)
+            ok(c.get("status") == "created",
+               "start c status %r (expected 'created')" % c.get("status"))
+            p2_cid_c = c["id"]  # ContainerManager.start() key is "id"
+            p2_containers.append(p2_cid_c)
+            created_volumes.append("tm-workspace-%s" % p2_ws_id)
+            e1 = json.loads(ContainerExecTool(
+                container_id=p2_cid_c,
+                command="cat /workspace/marker.txt",
+                timeout=20,
+                workspace_path=p2_ws,
+                session_id=p2_session_c,
+                session_permissions=sp,
+            ).execute())
+            ok(e1.get("success") is True
+               and "tm-smoke-p2-marker-%s" % tag in (e1.get("stdout") or ""),
+               "marker not in volume after first populate: %r" % e1)
+            # free the volume, then mutate the host workspace
+            pc = client.containers.get(p2_cid_c)
+            try:
+                pc.stop(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+            pc.remove(force=True)
+            with open(os.path.join(p2_ws, "refresh-probe.txt"), "w") as fh:
+                fh.write("refresh-probe-%s\n" % tag)
+            # second container, same workspace_id => staleness refresh
+            mgr_d = ContainerManager(
+                workspace_path=p2_ws,
+                session_id=p2_session_d,
+                workspace_id=p2_ws_id,
+                session_permissions=sp,
+                image=p2_image_tag,
+                mem_limit="512m",
+                cpu_quota=50000,
+            )
+            d = mgr_d.start(name="smoke-p2-d-%s" % tag)
+            ok(d.get("status") == "created",
+               "start d status %r (expected 'created')" % d.get("status"))
+            p2_cid_d = d["id"]
+            p2_containers.append(p2_cid_d)
+            e2 = json.loads(ContainerExecTool(
+                container_id=p2_cid_d,
+                command="cat /workspace/refresh-probe.txt; cat /workspace/marker.txt",
+                timeout=20,
+                workspace_path=p2_ws,
+                session_id=p2_session_d,
+                session_permissions=sp,
+            ).execute())
+            ok(e2.get("success") is True, "refresh exec failed: %r" % e2)
+            out = e2.get("stdout") or ""
+            ok("refresh-probe-%s" % tag in out,
+               "refresh-probe missing (volume NOT refreshed): %r" % out)
+            ok("tm-smoke-p2-marker-%s" % tag in out,
+               "marker missing after refresh (partial wipe?): %r" % out)
+            return "volume refreshed: host probe + original marker both present"
+
+        def _p2_stop_verify():
+            # container c was already removed in the volume-refresh step;
+            # a, b and d are stopped here.
+            for cid, sess in ((p2_cid_a, p2_session),
+                              (p2_cid_b, p2_session),
+                              (p2_cid_d, p2_session_d)):
+                st = json.loads(ContainerStopTool(
+                    container_id=cid,
+                    workspace_path=p2_ws,
+                    session_id=sess,
+                    session_permissions=sp,
+                ).execute())
+                ok(st.get("status") == "stopped",
+                   "stop %s status %r (%s)" % (cid[:12], st.get("status"),
+                                               st.get("error")))
+            lst = json.loads(ContainerListTool(
+                workspace_path=p2_ws,
+                session_id=p2_session,
+                session_permissions=sp,
+            ).execute())
+            ok(lst.get("success") is True, "final list failed: %r" % lst)
+            by_name = {c.get("name"): c for c in (lst.get("containers") or [])}
+            ok("smoke-p2-a-%s" % tag in by_name
+               and "smoke-p2-b-%s" % tag in by_name,
+               "final list missing a/b: %r" % sorted(by_name))
+            for nm in ("smoke-p2-a-%s" % tag, "smoke-p2-b-%s" % tag):
+                ok(by_name[nm].get("status") != "running",
+                   "%s still running (%r)" % (nm, by_name[nm].get("status")))
+            return "a, b, d stopped; final list shows a/b non-running"
+
+        if not fatal:
+            check("phase2-build", _p2_build)
+        if not fatal:
+            check("phase2-start", _p2_start)
+        if not fatal:
+            check("phase2-list", _p2_list)
+        if not fatal:
+            check("phase2-logs", _p2_logs)
+        if not fatal:
+            check("phase2-volume-refresh", _p2_volume_refresh)
+        if not fatal:
+            check("phase2-stop-verify", _p2_stop_verify)
+
     finally:
         # ---------------- STEP 7: cleanup ----------------
         issues = []
@@ -421,6 +682,30 @@ def main() -> int:
                     pass
                 except Exception as exc:  # noqa: BLE001
                     issues.append("image remove: %s: %s" % (type(exc).__name__, exc))
+            # --- Phase-2 teardown (separate session/image from Phase-1) ---
+            # cleanup_session + the ancestor sweep above cover ONLY the main
+            # session/image; p2 containers + image need explicit removal.
+            for cid in p2_containers:
+                try:
+                    pc = client.containers.get(cid)
+                    try:
+                        pc.stop(timeout=5)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    pc.remove(force=True)
+                except docker.errors.NotFound:
+                    pass  # already removed (volume-refresh step)
+                except Exception as exc:  # noqa: BLE001
+                    issues.append("p2-container %s: %s: %s"
+                                  % (cid[:12], type(exc).__name__, exc))
+            if p2_image_tag:
+                try:
+                    client.images.remove(p2_image_tag, force=True)
+                except docker.errors.ImageNotFound:
+                    pass
+                except Exception as exc:  # noqa: BLE001
+                    issues.append("p2-image remove: %s: %s"
+                                  % (type(exc).__name__, exc))
             # verify nothing is left behind
             try:
                 left = list_session_containers(session_id, client)
@@ -443,6 +728,8 @@ def main() -> int:
             shutil.rmtree(workspace_dir, ignore_errors=True)
         if build_ctx:
             shutil.rmtree(build_ctx, ignore_errors=True)
+        if p2_ws:
+            shutil.rmtree(p2_ws, ignore_errors=True)
         rows.append(("cleanup", "PASS" if not issues else "FAIL",
                      "; ".join(issues) or "all resources removed"))
 
