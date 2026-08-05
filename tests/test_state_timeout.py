@@ -103,7 +103,7 @@ class TestRestrictionReason:
         state.current_conversation_tokens = 1000000
         state.max_conversation_tokens = 1000
         state.token_warning_threshold = 500
-        events = state.update_token_state()
+        events = state.update_token_state(state.current_conversation_tokens)
         assert state.restriction_reason == 'token', (
             f"Expected 'token', got {state.restriction_reason}"
         )
@@ -111,9 +111,9 @@ class TestRestrictionReason:
 
     def test_restriction_reason_set_on_turn_critical(self, state: AgentState):
         """Turn CRITICAL state should set restriction_reason to 'turn'."""
+        # product reads max_turns from config (agent/core/state.py:265)
         state.current_turn = 19
-        state.max_turns = 20
-        state.turn_warning_threshold = 15
+        state.config.max_turns = 20
         events = state.update_turn_state(state.current_turn)
         assert state.restriction_reason == 'turn', (
             f"Expected 'turn', got {state.restriction_reason}"
@@ -143,21 +143,20 @@ class TestRestrictionReason:
         state.current_conversation_tokens = 1000000
         state.max_conversation_tokens = 1000
         state.token_warning_threshold = 500
-        state.update_token_state()
+        state.update_token_state(state.current_conversation_tokens)
         assert state.restriction_reason == 'token'
 
         # Now reduce tokens below threshold
         state.current_conversation_tokens = 100
-        state.update_token_state()
+        state.update_token_state(state.current_conversation_tokens)
         assert state.restriction_reason is None, (
             f"Expected None after tokens return to LOW, got {state.restriction_reason}"
         )
 
     def test_restriction_reason_cleared_when_turn_returns_to_low(self, state: AgentState):
         """When turn state goes back to LOW, restriction_reason should be cleared."""
-        # First trigger CRITICAL (max_turns=100, critical at 95)
-        state.current_turn = 95
-        state.max_turns = 100
+        # First trigger CRITICAL: product critical_turn = max(max_turns-5, max_turns-1) = 99 for max_turns=100
+        state.current_turn = 99
         state.update_turn_state(state.current_turn)
         assert state.restriction_reason == 'turn'
 
@@ -182,7 +181,11 @@ class TestTimeoutWarningMessage:
 
     def test_timeout_warning_message_contains_restriction_hint(self):
         """The time warning message should mention tool restrictions."""
-        state = AgentState(logger=MagicMock())
+        mock_config = MagicMock()
+        mock_config.time_monitor_enabled = True
+        mock_config.timeout_seconds = 300
+        mock_config.time_warning_threshold = 240
+        state = AgentState(config=mock_config, logger=MagicMock())
         state.reset()
         state.time_start = 0.0
         state.timeout_seconds = 300
@@ -193,14 +196,18 @@ class TestTimeoutWarningMessage:
         events = state.update_time_state(250.0)
         warning_events = [e for e in events if e['type'] == 'time_warning']
         assert len(warning_events) > 0
-        msg = warning_events[0].get('message', '')
+        msg = warning_events[0].get('warning_message', '')
         assert 'Tool restrictions will be applied' in msg, (
             f"Warning message should mention restrictions. Got: {msg}"
         )
 
     def test_timeout_critical_message_contains_only_respond_hint(self):
         """The time critical message should mention only Respond is available."""
-        state = AgentState(logger=MagicMock())
+        mock_config = MagicMock()
+        mock_config.time_monitor_enabled = True
+        mock_config.timeout_seconds = 300
+        mock_config.time_warning_threshold = 240
+        state = AgentState(config=mock_config, logger=MagicMock())
         state.reset()
         state.time_start = 0.0
         state.timeout_seconds = 300
@@ -211,7 +218,7 @@ class TestTimeoutWarningMessage:
         events = state.update_time_state(301.0)
         warning_events = [e for e in events if e['type'] == 'time_warning']
         assert len(warning_events) > 0
-        msg = warning_events[0].get('message', '')
+        msg = warning_events[0].get('warning_message', '')
         assert 'Only the Respond tool is available' in msg, (
             f"Critical message should mention only Respond. Got: {msg}"
         )
