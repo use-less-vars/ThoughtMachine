@@ -196,9 +196,9 @@ class TestCheckSystem:
         assert "nonexistent_query" in result["error"]
         assert "valid_queries" in result
 
-    def test_required_categories_empty(self):
-        """CheckSystem declares no required categories."""
-        assert CheckSystem.required_categories == []
+    def test_required_categories_requires_system_read(self):
+        """CheckSystem requires system:read because it inspects host state and can run subprocesses."""
+        assert CheckSystem.required_categories == ["system:read"]
 
     # ── New query tests ────────────────────────────────────────────────
 
