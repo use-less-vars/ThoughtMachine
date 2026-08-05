@@ -13,8 +13,9 @@ Verifies:
 3. With ``system: read`` session permissions, the same query is ALLOWED.
 
 Uses the benign ``workspace_info`` query: the gate check happens before any
-query logic runs, and ``workspace_info`` avoids the known BUG003
-(nonexistent ``DockerExecutor.run_command`` inside ``_query_network_diagnostics``).
+query logic runs. (Historical note: ``_query_network_diagnostics`` previously
+called a nonexistent ``DockerExecutor.run_command`` - BUG003 - which was fixed
+by rewriting it to use the real ``ContainerManager.start/exec/stop`` API.)
 
 Docker note: ``tests/security/conftest.py`` fixes ``sys.path`` so the real
 ``security/`` package is imported instead of the pytest-injected ``tests/`` dir.

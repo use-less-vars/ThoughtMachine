@@ -66,6 +66,20 @@ except ImportError:
     DOCKER_EXECUTOR_CLS_AVAILABLE = False
     DockerExecutor = None
 
+try:
+    from tools.container_manager import (
+        ContainerManager as _ContainerManager,
+        DOCKER_AVAILABLE as CONTAINER_MANAGER_AVAILABLE,
+    )
+except ImportError:
+    _ContainerManager = None
+    CONTAINER_MANAGER_AVAILABLE = False
+
+try:
+    from docker.errors import ImageNotFound as _ImageNotFound
+except ImportError:
+    _ImageNotFound = None
+
 # Worker registry access (for running_workers query)
 try:
     from tools.workspace.worker_registry import WorkerRegistry as _WorkerRegistry
@@ -367,32 +381,102 @@ class CheckSystem(ToolBase):
         return {"error": "agent_config not available"}
 
     def _query_network_diagnostics(self, ws_id: Optional[str], ws_path: Optional[str]) -> dict:
-        """Quick connectivity checks, running inside container if available."""
+        """Quick connectivity check inside a throwaway Docker probe container.
+
+        The probe container is created with the SAME isolation the session's
+        sandboxes get (network_mode/workspace_mode derived from session
+        permissions via ContainerManager), so the result reflects what
+        containers in this session actually see. The probe container is
+        always stopped afterwards (finally-cleanup). No image pull is
+        performed - the probe only runs if ``python:3.11-slim`` is already
+        present locally, so a down daemon can never hang this query.
+        """
         ws_path = ws_path or getattr(self, 'workspace_path', None)
         if not ws_path:
             return {"container": False, "message": "No workspace path"}
 
-        if DOCKER_EXECUTOR_CLS_AVAILABLE and DockerExecutor:
+        # Keep the existing guard: the legacy test contract expects a clean
+        # {"container": False} when the Docker executor is unavailable.
+        if not (DOCKER_EXECUTOR_CLS_AVAILABLE and DockerExecutor):
+            return {"container": False, "message": "Docker executor not available"}
+
+        if not CONTAINER_MANAGER_AVAILABLE or _ContainerManager is None:
+            return {"container": False, "message": "Container manager not available"}
+
+        import uuid
+        name = f"tm-net-diag-{uuid.uuid4().hex[:8]}"
+        result = {
+            "daemon": False,
+            "container": False,
+            "container_id": None,
+            "container_status": None,
+            "image_present": False,
+            "probe": None,
+            "egress": False,
+            "message": "",
+        }
+        manager = None
+        container_id = None
+        try:
+            manager = _ContainerManager(
+                workspace_path=ws_path,
+                session_permissions=self.session_permissions or {},
+            )
+            # Daemon reachability + image presence in one API call. No pull:
+            # a missing image is reported and the probe is skipped.
             try:
-                executor = DockerExecutor(workspace_path=ws_path)
-                result = {}
-
-                # DNS checks
-                for host in ["pypi.org", "api.github.com"]:
-                    dns_result = executor.run_command(f"nslookup {host}")
-                    http_result = executor.run_command(
-                        f"curl -s -o /dev/null -w '%{{http_code}}' https://{host}"
-                    )
-                    result[host] = {
-                        "dns": "ok" if dns_result else "error",
-                        "http": http_result.strip() if http_result else "error",
-                    }
-
-                return result
+                manager.client.images.get("python:3.11-slim")
+                result["daemon"] = True
+                result["image_present"] = True
             except Exception as e:
-                return {"container": False, "message": f"No container running: {e}"}
+                if _ImageNotFound is not None and isinstance(e, _ImageNotFound):
+                    result["message"] = (
+                        "python:3.11-slim image not present locally; probe skipped"
+                    )
+                else:
+                    result["message"] = f"Docker daemon unreachable: {e}"
+                return result
 
-        return {"container": False, "message": "No container running"}
+            started = manager.start(image="python:3.11-slim", name=name)
+            result["container"] = True
+            container_id = started.get("id")
+            result["container_id"] = container_id
+            result["container_status"] = started.get("status")
+
+            probe_cmd = (
+                "python3 - <<'PY'\n"
+                "import urllib.request\n"
+                "try:\n"
+                "    r = urllib.request.urlopen('https://example.com', timeout=8)\n"
+                "    print('EGRESS_OK', r.status)\n"
+                "except Exception as e:\n"
+                "    print('EGRESS_BLOCKED', type(e).__name__, e)\n"
+                "PY\n"
+            )
+            out = manager.exec(container_id, probe_cmd, timeout=30)
+            result["probe"] = {
+                "exit_code": out.get("exit_code"),
+                "stdout": out.get("stdout", ""),
+                "stderr": out.get("stderr", ""),
+            }
+            egress = (
+                out.get("exit_code") == 0
+                and "EGRESS_OK" in (out.get("stdout") or "")
+            )
+            result["egress"] = egress
+            result["message"] = (
+                "egress OK (bridge network)" if egress
+                else "egress blocked (no network / DNS failure)"
+            )
+        except Exception as e:
+            result["message"] = f"Network diagnostics failed: {e}"
+        finally:
+            if manager is not None and container_id:
+                try:
+                    manager.stop(container_id)
+                except Exception:
+                    pass
+        return result
 
     # ── new query handlers ─────────────────────────────────────────
 

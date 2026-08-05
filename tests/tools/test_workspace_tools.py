@@ -188,6 +188,107 @@ class TestCheckSystem:
         result = _parse_result(tool.execute())
         assert result["container"] is False
 
+    @patch("tools.workspace.check_system.DOCKER_EXECUTOR_CLS_AVAILABLE", True)
+    @patch("tools.workspace.check_system.resolve_workspace_id", return_value=None)
+    @patch("tools.workspace.check_system._ContainerManager")
+    def test_network_diagnostics_daemon_unreachable(self, mock_cm, mock_resolve):
+        """network_diagnostics reports daemon unreachable when images.get raises."""
+        instance = MagicMock()
+        instance.client.images.get.side_effect = Exception("connection refused")
+        mock_cm.return_value = instance
+
+        tool = CheckSystem(
+            query="network_diagnostics",
+            workspace_path="/tmp/test_ws",
+            session_permissions={},
+        )
+        result = _parse_result(tool.execute())
+        assert result["daemon"] is False
+        assert result["container"] is False
+        assert result["image_present"] is False
+        assert "unreachable" in result["message"]
+        instance.start.assert_not_called()
+
+    @patch("tools.workspace.check_system.DOCKER_EXECUTOR_CLS_AVAILABLE", True)
+    @patch("tools.workspace.check_system.resolve_workspace_id", return_value=None)
+    @patch("tools.workspace.check_system._ContainerManager")
+    def test_network_diagnostics_probe_ok(self, mock_cm, mock_resolve):
+        """network_diagnostics reports egress OK and always stops the probe."""
+        instance = MagicMock()
+        instance.client.images.get.return_value = MagicMock()
+        instance.start.return_value = {
+            "id": "abc", "name": "tm-net-diag-test", "status": "created"
+        }
+        instance.exec.return_value = {
+            "stdout": "EGRESS_OK 200\n", "stderr": "", "exit_code": 0,
+        }
+        instance.stop.return_value = {
+            "status": "stopped", "container_id": "abc", "name": "tm-net-diag-test",
+        }
+        mock_cm.return_value = instance
+
+        tool = CheckSystem(
+            query="network_diagnostics",
+            workspace_path="/tmp/test_ws",
+            session_permissions={"network": "write"},
+        )
+        result = _parse_result(tool.execute())
+        assert result["daemon"] is True
+        assert result["container"] is True
+        assert result["image_present"] is True
+        assert result["container_id"] == "abc"
+        assert result["egress"] is True
+        assert result["probe"]["stdout"] == "EGRESS_OK 200\n"
+        assert result["probe"]["exit_code"] == 0
+        # finally-cleanup verified: stop() called with the container id
+        instance.stop.assert_called_once_with("abc")
+        # session permissions passed through so the probe uses session isolation
+        _, kwargs = mock_cm.call_args
+        assert kwargs["workspace_path"] == "/tmp/test_ws"
+        assert kwargs["session_permissions"] == {"network": "write"}
+
+    @patch("tools.workspace.check_system.DOCKER_EXECUTOR_CLS_AVAILABLE", True)
+    @patch("tools.workspace.check_system.resolve_workspace_id", return_value=None)
+    @patch("tools.workspace.check_system._ContainerManager")
+    def test_network_diagnostics_probe_blocked(self, mock_cm, mock_resolve):
+        """network_diagnostics reports egress False when the probe is blocked."""
+        instance = MagicMock()
+        instance.client.images.get.return_value = MagicMock()
+        instance.start.return_value = {
+            "id": "abc", "name": "tm-net-diag-test", "status": "created"
+        }
+        instance.exec.return_value = {
+            "stdout": "EGRESS_BLOCKED URLError <urlopen error timed out>\n",
+            "stderr": "", "exit_code": 0,
+        }
+        mock_cm.return_value = instance
+
+        tool = CheckSystem(
+            query="network_diagnostics",
+            workspace_path="/tmp/test_ws",
+            session_permissions={"network": "read"},
+        )
+        result = _parse_result(tool.execute())
+        assert result["egress"] is False
+        assert "EGRESS_BLOCKED" in result["probe"]["stdout"]
+        assert "blocked" in result["message"]
+
+    @pytest.mark.skipif(
+        os.environ.get("TM_LIVE_NETWORK_TEST") != "1",
+        reason="live docker probe (set TM_LIVE_NETWORK_TEST=1)",
+    )
+    def test_network_diagnostics_live_probe(self, tmp_path):
+        """LIVE: real docker daemon probe with a temp workspace."""
+        tool = CheckSystem(
+            query="network_diagnostics",
+            workspace_path=str(tmp_path),
+            session_permissions={"network": "write"},
+        )
+        result = _parse_result(tool.execute())
+        for field in ("daemon", "container", "container_id", "container_status",
+                      "image_present", "probe", "egress", "message"):
+            assert field in result
+
     def test_unknown_query(self):
         """Unknown query returns error with valid queries."""
         tool = CheckSystem(query="nonexistent_query", workspace_path="/tmp/test_ws")
