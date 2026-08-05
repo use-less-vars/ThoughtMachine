@@ -132,11 +132,22 @@ except ImportError as e:
     logger.warning(f"Failed to import DockerCodeRunner: {e}")
 
 try:
-    from .container_control import ContainerStartTool, ContainerExecTool, ContainerStopTool, ContainerStatusTool
+    from .container_control import (
+        ContainerStartTool,
+        ContainerExecTool,
+        ContainerStopTool,
+        ContainerStatusTool,
+        ContainerListTool,
+        ContainerBuildTool,
+        ContainerLogsTool,
+    )
     TOOL_CLASSES.append(ContainerStartTool)
     TOOL_CLASSES.append(ContainerExecTool)
     TOOL_CLASSES.append(ContainerStopTool)
     TOOL_CLASSES.append(ContainerStatusTool)
+    TOOL_CLASSES.append(ContainerListTool)
+    TOOL_CLASSES.append(ContainerBuildTool)
+    TOOL_CLASSES.append(ContainerLogsTool)
 except ImportError as e:
     logger.warning(f"Failed to import container control tools: {e}")
 

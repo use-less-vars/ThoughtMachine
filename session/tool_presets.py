@@ -45,6 +45,9 @@ _ALL_TOOLS = [
     "ContainerExecTool",
     "ContainerStopTool",
     "ContainerStatusTool",
+    "ContainerListTool",
+    "ContainerBuildTool",
+    "ContainerLogsTool",
     # Date/time
     "DateTimeTool",
     # Session & agent utilities
@@ -73,6 +76,9 @@ AGENT_TOOLS = [
     "ContainerExecTool",
     "ContainerStopTool",
     "ContainerStatusTool",
+    "ContainerListTool",
+    "ContainerBuildTool",
+    "ContainerLogsTool",
     "FieldViewer",
     "FileEditor",
     "FileMover",

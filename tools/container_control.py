@@ -7,6 +7,9 @@ These tools expose a persistent, composable container lifecycle to the agent:
 - ``ContainerExecTool``    - run a shell command inside an existing container
 - ``ContainerStopTool``    - stop a container (idempotent)
 - ``ContainerStatusTool``  - report a container's status
+- ``ContainerListTool``    - list this session's containers
+- ``ContainerBuildTool``   - build a Docker image from the host workspace
+- ``ContainerLogsTool``    - fetch a container's stdout/stderr logs
 
 Unlike ``DockerCodeRunner`` (start -> exec -> stop in a single call), these
 tools *compose across calls*: ``ContainerStartTool`` leaves the container
@@ -381,3 +384,167 @@ class ContainerStatusTool(_ContainerControlBase):
             return self._respond(False, error=str(e))
         except Exception as e:
             return self._respond(False, error=f"Unexpected error: {e}")
+
+
+class ContainerListTool(_ContainerControlBase):
+    """List the containers currently tracked for this session.
+
+    Queries the Docker daemon for every container (running or not) carrying
+    this session's ``thoughtmachine.session_id`` label — the exact label
+    source ``ContainerStartTool`` applies — so containers started by other
+    sessions, or unlabeled ones, never appear. This tool never raises —
+    failures are returned in the JSON response.
+
+    Returns JSON with structure:
+    {
+      "success": bool,
+      "containers": [
+        {
+          "container_id": str,
+          "name": str,
+          "image": str | null,
+          "status": str,
+          "uptime_seconds": int | null
+        }
+      ],
+      "count": int,
+      "duration": float,
+      "error": str (optional)
+    }
+    """
+    tool: Literal["ContainerListTool"] = "ContainerListTool"
+
+    def execute(self) -> str:
+        start_time = time.time()
+        try:
+            manager = self._make_manager()
+            containers = manager.list_containers()
+            return self._respond(
+                True,
+                containers=containers,
+                count=len(containers),
+                duration=time.time() - start_time,
+            )
+        except RuntimeError as e:
+            return self._respond(False, error=str(e), duration=time.time() - start_time)
+        except Exception as e:
+            return self._respond(
+                False,
+                error=f"Unexpected error: {e}",
+                duration=time.time() - start_time,
+            )
+
+
+class ContainerBuildTool(_ContainerControlBase):
+    """Build a Docker image from the host workspace directory.
+
+    Uses ``<workspace>/Dockerfile`` (or an explicit ``dockerfile_path``) inside
+    the HOST workspace directory — not the session volume — as the build
+    context, so the Dockerfile can COPY the local tree directly. When ``tag``
+    is omitted it is auto-generated from the workspace path (the same
+    ``agent-executor-<hash>`` convention ``docker_executor`` uses). This tool
+    never raises — failures are returned in the JSON response.
+
+    Returns JSON with structure:
+    {
+      "success": bool,
+      "image_tag": str,
+      "build_log": str,
+      "duration": float,
+      "error": str (optional)
+    }
+    """
+    tool: Literal["ContainerBuildTool"] = "ContainerBuildTool"
+
+    dockerfile_path: Optional[str] = Field(
+        None,
+        description="Path to the Dockerfile relative to the workspace (default: Dockerfile).",
+    )
+    tag: Optional[str] = Field(
+        None,
+        description="Image tag to build (auto-generated from the workspace path when absent).",
+    )
+
+    def execute(self) -> str:
+        start_time = time.time()
+        try:
+            manager = self._make_manager()
+            result = manager.build_image(
+                dockerfile_path=self.dockerfile_path,
+                tag=self.tag,
+            )
+            return self._respond(
+                True,
+                **result,
+                duration=time.time() - start_time,
+            )
+        except RuntimeError as e:
+            return self._respond(False, error=str(e), duration=time.time() - start_time)
+        except Exception as e:
+            return self._respond(
+                False,
+                error=f"Unexpected error: {e}",
+                duration=time.time() - start_time,
+            )
+
+
+class ContainerLogsTool(_ContainerControlBase):
+    """Fetch the stdout/stderr logs of a running (or exited) container.
+
+    Returns the last ``tail`` lines of the container's log output as separate
+    ``stdout`` and ``stderr`` strings (each truncated to 100KB). ``since`` is
+    passed through to Docker unmodified — it accepts a duration such as
+    ``'10m'``, an RFC3339 timestamp, or a Unix timestamp. This tool never
+    raises — failures are returned in the JSON response.
+
+    Returns JSON with structure:
+    {
+      "success": bool,
+      "stdout": str,
+      "stderr": str,
+      "duration": float,
+      "error": str (optional)
+    }
+    """
+    tool: Literal["ContainerLogsTool"] = "ContainerLogsTool"
+
+    container_id: str = Field(
+        ...,
+        min_length=1,
+        description="Container ID or name to fetch logs for.",
+    )
+    tail: int = Field(
+        100,
+        description="Number of log lines to fetch from the end (default: 100).",
+    )
+    since: Optional[str] = Field(
+        None,
+        description=(
+            "Fetch logs emitted after this time — a duration (e.g. '10m'), "
+            "RFC3339 timestamp, or Unix timestamp; passed through to Docker."
+        ),
+    )
+
+    def execute(self) -> str:
+        start_time = time.time()
+        try:
+            manager = self._make_manager()
+            result = manager.get_logs(
+                container_id=self.container_id,
+                tail=self.tail,
+                since=self.since,
+            )
+            return self._respond(
+                True,
+                **result,
+                duration=time.time() - start_time,
+            )
+        except RuntimeError as e:
+            return self._respond(False, error=str(e), duration=time.time() - start_time)
+        except Exception as e:
+            return self._respond(
+                False,
+                error=f"Unexpected error: {e}",
+                duration=time.time() - start_time,
+            )
+

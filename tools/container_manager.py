@@ -107,6 +107,45 @@ def _truncate_output(output):
     return data[:EXEC_OUTPUT_LIMIT_BYTES].decode("utf-8", errors="replace") + _TRUNCATION_NOTICE
 
 
+def _split_docker_log_streams(raw):
+    """Split docker-py's multiplexed log stream into (stdout_bytes, stderr_bytes).
+
+    When ``stdout=True`` and ``stderr=True`` are requested together, the Docker
+    API multiplexes both streams into one byte stream of 8-byte frames:
+
+        byte 0    = stream id (1 = stdout, 2 = stderr)
+        bytes 1-3 = unused
+        bytes 4-7 = payload length, big-endian
+        payload   = that many bytes of log output
+
+    If the data does not look like a valid multiplexed stream (e.g. the
+    container was created with ``tty=True``, in which case docker returns raw
+    output with no frame headers), the whole payload is treated as stdout.
+    """
+    stdout_chunks, stderr_chunks = [], []
+    offset = 0
+    length = len(raw)
+    while offset + 8 <= length:
+        header = raw[offset:offset + 8]
+        stream_id = header[0]
+        payload_len = int.from_bytes(header[4:8], "big")
+        if stream_id not in (0, 1, 2) or payload_len > length - offset - 8:
+            # Malformed frame (or raw tty output with no headers) — keep the
+            # remainder as stdout rather than dropping it.
+            stdout_chunks.append(raw[offset:])
+            break
+        payload = raw[offset + 8:offset + 8 + payload_len]
+        if stream_id == 2:
+            stderr_chunks.append(payload)
+        else:
+            # stream 1 = stdout, stream 0 = init/stdin output — fold into stdout.
+            stdout_chunks.append(payload)
+        offset += 8 + payload_len
+    if offset == 0:
+        return raw, b""
+    return b"".join(stdout_chunks), b"".join(stderr_chunks)
+
+
 def _safe_session_tag(session_id):
     """Return a docker-safe short tag for a session id (container names).
 
@@ -424,6 +463,169 @@ class ContainerManager:
             "uptime_seconds": uptime_seconds,
             "memory_usage_bytes": memory_usage_bytes,
         }
+
+    def list_containers(self):
+        """List containers carrying this session's label; NEVER raises.
+
+        Queries the daemon for all containers (running or not) whose
+        ``thoughtmachine.session_id`` label matches this manager's session id
+        (the exact label source ``start()`` applies), so containers from other
+        sessions — or unlabeled ones — never appear. Returns a list of dicts
+        with EXACTLY: ``container_id``, ``name``, ``image``, ``status``,
+        ``uptime_seconds``.
+        """
+        sid = str(self.session_id) if self.session_id is not None else ""
+        try:
+            containers = self.client.containers.list(
+                all=True,
+                filters={"label": f"thoughtmachine.session_id={sid}"},
+            )
+        except Exception:
+            return []
+
+        result = []
+        for container in containers:
+            # uptime: now - StartedAt (mirrors status()); None when missing/unparseable
+            uptime_seconds = None
+            started_at = (container.attrs.get("State") or {}).get("StartedAt")
+            if started_at:
+                try:
+                    ts = datetime.fromisoformat(started_at.replace("Z", "+00:00")).timestamp()
+                    uptime_seconds = max(0, int(time.time() - ts))
+                except Exception:
+                    uptime_seconds = None
+
+            # image: first tag when available; None when image/tags missing
+            image = None
+            try:
+                image_obj = getattr(container, "image", None)
+                tags = getattr(image_obj, "tags", None) or []
+                image = tags[0] if tags else None
+            except Exception:
+                image = None
+
+            result.append({
+                "container_id": container.id,
+                "name": container.name,
+                "image": image,
+                "status": container.status,
+                "uptime_seconds": uptime_seconds,
+            })
+        return result
+
+    def build_image(self, dockerfile_path=None, tag=None):
+        """Build a Docker image from the HOST workspace directory.
+
+        Unlike ``docker_executor``'s temp-context build, the build context here
+        is the workspace directory itself (``<workspace>/Dockerfile`` by
+        default), so the Dockerfile can COPY the local tree directly. The build
+        runs synchronously and its output is returned (not just a bool).
+
+        Args:
+            dockerfile_path: Path to the Dockerfile, absolute or relative to
+                the workspace (default: ``Dockerfile``). Must stay inside the
+                workspace.
+            tag: Image tag; auto-generated from the workspace path (the same
+                ``agent-executor-<hash>`` convention ``docker_executor`` uses)
+                when omitted.
+
+        Returns:
+            Dict with EXACTLY ``image_tag`` and ``build_log`` (the build log,
+            truncated to 100KB with a truncation notice).
+
+        Raises:
+            RuntimeError: If the Dockerfile is missing, escapes the workspace,
+                or the build fails.
+        """
+        if not DOCKER_AVAILABLE or self.client is None:
+            raise RuntimeError("Docker Python SDK not available")
+
+        ws = self.workspace_path
+        dockerfile = dockerfile_path or "Dockerfile"
+        resolved = dockerfile if os.path.isabs(dockerfile) else os.path.join(ws, dockerfile)
+        if not os.path.exists(resolved):
+            raise RuntimeError(
+                f"Dockerfile not found at {resolved}. "
+                "Place a Dockerfile in the workspace or pass dockerfile_path."
+            )
+        rel = os.path.relpath(resolved, ws)
+        if rel.startswith(".."):
+            raise RuntimeError(f"dockerfile_path {dockerfile} escapes the workspace")
+
+        dex = _load_docker_executor()
+        if not tag:
+            tag = dex._compute_image_tag(ws)
+
+        try:
+            _, log_lines = dex._run_image_build(self.client, ws, rel, tag)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Docker build failed: {e}") from e
+
+        build_log = "\n".join(log_lines)
+        if len(build_log) > EXEC_OUTPUT_LIMIT_BYTES:
+            build_log = build_log[:EXEC_OUTPUT_LIMIT_BYTES] + _TRUNCATION_NOTICE
+        return {"image_tag": tag, "build_log": build_log}
+
+    def get_logs(self, container_id, tail=100, since=None):
+        """Fetch the stdout/stderr logs of a container.
+
+        Args:
+            container_id: Container ID or name.
+            tail: Number of log lines to fetch from the end (default 100).
+            since: Optional timestamp/duration (e.g. ``'10m'``, RFC3339, or a
+                Unix timestamp) passed through to Docker unmodified — only log
+                entries emitted after this time are returned.
+
+        Returns:
+            Dict with EXACTLY ``stdout`` and ``stderr`` — each a utf-8 string,
+            individually truncated to 100KB with a truncation notice.
+
+        Raises:
+            RuntimeError: If the container does not exist, the daemon cannot be
+                reached, or log retrieval fails.
+        """
+        if not DOCKER_AVAILABLE or self.client is None:
+            raise RuntimeError("Docker Python SDK not available")
+
+        try:
+            container = self.client.containers.get(container_id)
+        except NotFound:
+            raise RuntimeError(f"Container {container_id} not found") from None
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to access container {container_id}: {e}"
+            ) from e
+
+        try:
+            raw = container.logs(
+                stdout=True, stderr=True, tail=tail, since=since
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to fetch logs for container {container_id}: {e}"
+            ) from e
+
+        if not isinstance(raw, bytes):
+            raw = str(raw).encode("utf-8", errors="replace")
+
+        stdout_bytes, stderr_bytes = _split_docker_log_streams(raw)
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
+        stderr = stderr_bytes.decode("utf-8", errors="replace")
+
+        if len(stdout) > EXEC_OUTPUT_LIMIT_BYTES:
+            stdout = stdout[:EXEC_OUTPUT_LIMIT_BYTES] + _TRUNCATION_NOTICE
+        if len(stderr) > EXEC_OUTPUT_LIMIT_BYTES:
+            stderr = stderr[:EXEC_OUTPUT_LIMIT_BYTES] + _TRUNCATION_NOTICE
+
+        log(
+            "DEBUG",
+            "docker.container_manager",
+            f"get_logs container={container_id} tail={tail} since={since} "
+            f"stdout={len(stdout_bytes)}B stderr={len(stderr_bytes)}B",
+        )
+        return {"stdout": stdout, "stderr": stderr}
 
     # ── Internals ──────────────────────────────────────────────────────────
     def _ensure_volume(self):
