@@ -154,9 +154,16 @@ class KnowledgeBaseTool(ToolBase):
 
     @classmethod
     def get_required_categories(cls, params: dict | None = None) -> list[str]:
-        """Return filesystem:write only for write modes (append, update, create_domain)."""
+        """Return the permission categories required for each KB operation.
+
+        Read-only operations (read, search, list) require ``filesystem:read``;
+        write operations (append, update, create_domain) require ``filesystem:write``.
+        Other modes (status, summary) require no special permissions.
+        """
         if params:
             mode = params.get("mode", "")
+            if mode in ("read", "search", "list"):
+                return ["filesystem:read"]
             if mode in ("append", "update", "create_domain"):
                 return ["filesystem:write"]
         return []
@@ -321,8 +328,29 @@ class KnowledgeBaseTool(ToolBase):
         If ``for_write=True`` and the domain exists in ``system/``, raises
         ``ValueError`` because system domains are read-only.
 
-        Raises ValueError if the domain cannot be found.
+        Raises ValueError if the domain cannot be found, or if the domain name
+        could escape the knowledge base root (path traversal).
         """
+        # ── Path traversal guard (security remediation) ──────────────────
+        # Explicitly reject any domain containing parent-directory tokens or
+        # starting with an absolute ('/') or home ('~') path prefix.
+        if ".." in domain_name or domain_name.startswith(("/", "~")):
+            raise ValueError(
+                f"Domain path escapes knowledge base: invalid domain name '{domain_name}'"
+            )
+
+        # Resolve containment: every path returned from this method must stay
+        # inside kb_root even after symlink/`..` resolution.
+        kb_root_resolved = kb_root.resolve()
+
+        def _assert_inside_kb(candidate: Path) -> None:
+            """Raise ValueError if *candidate* resolves outside kb_root."""
+            if not candidate.resolve().is_relative_to(kb_root_resolved):
+                raise ValueError(
+                    f"Domain path escapes knowledge base: '{domain_name}' "
+                    "resolves outside the knowledge base"
+                )
+
         if self.scope == "global":
             # ── Global scope ────────────────────────────────────────────────
             system_path = kb_root / "system" / f"{domain_name}.md"
@@ -335,12 +363,15 @@ class KnowledgeBaseTool(ToolBase):
                         f"Use a different domain name for personal notes, or use scope=workspace."
                     )
                 # Always write to user/
+                _assert_inside_kb(user_path)
                 return user_path, f"user/{domain_name}.md"
 
             # Read: check system/ first, then user/
             if system_path.exists():
+                _assert_inside_kb(system_path)
                 return system_path, f"system/{domain_name}.md"
             if user_path.exists():
+                _assert_inside_kb(user_path)
                 return user_path, f"user/{domain_name}.md"
 
             raise ValueError(
@@ -353,6 +384,7 @@ class KnowledgeBaseTool(ToolBase):
         rel_path = DOMAINS.get(domain_name)
         if rel_path:
             file_path = kb_root / rel_path
+            _assert_inside_kb(file_path)
             if file_path.exists():
                 return file_path, rel_path
             return file_path, rel_path
@@ -360,6 +392,7 @@ class KnowledgeBaseTool(ToolBase):
         # Scan filesystem for custom domain files
         for subdir in ["project", "personal"]:
             candidate = kb_root / subdir / f"{domain_name}.md"
+            _assert_inside_kb(candidate)
             if candidate.exists():
                 rel = f"{subdir}/{domain_name}.md"
                 return candidate, rel
