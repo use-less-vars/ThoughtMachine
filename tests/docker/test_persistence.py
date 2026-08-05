@@ -3,7 +3,8 @@ Persistence integration test for named Docker volumes.
 
 Tests that:
   1. A named volume survives container stop + remove
-  2. pip-installed packages persist across container restarts
+  2. pip-installed packages (installed into the workspace volume via
+     --target) persist across container restarts
   3. Files written to /workspace persist across container restarts
 
 Requires a real Docker daemon. Skipped if Docker is unavailable.
@@ -18,6 +19,11 @@ import time
 
 import docker
 import pytest
+
+_SRC_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _SRC_ROOT not in sys.path:
+    sys.path.insert(0, _SRC_ROOT)
+from docker_executor import ensure_workspace_volume_populated  # noqa: E402
 
 
 # ── Docker availability check ──────────────────────────────────────────
@@ -88,15 +94,15 @@ class TestVolumePersistence:
             self.client.containers.get(
                 f"tm-test-persist-{self.workspace_id}"
             ).remove(force=True)
-        except docker.errors.NotFound:
+        except (docker.errors.NotFound, docker.errors.APIError):
             pass
         try:
-            self.client.volumes.get(self.volume_name).remove()
-        except docker.errors.NotFound:
+            self.client.volumes.get(self.volume_name).remove(force=True)
+        except (docker.errors.NotFound, docker.errors.APIError):
             pass
         try:
-            self.client.images.get(image_tag).remove()
-        except docker.errors.NotFound:
+            self.client.images.get(image_tag).remove(force=True)
+        except (docker.errors.NotFound, docker.errors.APIError):
             pass
 
     def _ensure_volume(self):
@@ -117,6 +123,17 @@ class TestVolumePersistence:
             pass
 
         vol = self._ensure_volume()
+        # Raw-SDK mount: a freshly created named volume is root-owned (0755),
+        # so the container (uid 1000:1000) cannot write to it. Populate/chown
+        # it via the product helper before mounting — this mirrors what the
+        # real executor does in its create path.
+        ensure_workspace_volume_populated(
+            self.client,
+            self.image_tag,
+            str(self.workspace_dir),
+            self.volume_name,
+            network_mode="none",
+        )
         container = self.client.containers.run(
             image=self.image_tag,
             name=container_name,
@@ -136,19 +153,30 @@ class TestVolumePersistence:
         )
         return container
 
-    def _exec(self, container, cmd: str) -> tuple[str, str, int]:
-        """Run a command inside the container and return (stdout, stderr, exit_code)."""
-        exit_code, output = container.exec_run(cmd)
+    def _exec(self, container, cmd: str, env=None) -> tuple[str, str, int]:
+        """Run a command inside the container and return (stdout, stderr, exit_code).
+
+        NOTE: ``cmd`` is handed to docker-py's ``exec_run``, which
+        shlex-splits strings into argv — no shell is involved, so shell
+        syntax (``&&``, ``;``, pipes, ``VAR=x`` prefixes) must not be used.
+        Pass environment variables via ``env`` instead.
+        """
+        exit_code, output = container.exec_run(cmd, environment=env)
         stdout = output.decode() if isinstance(output, bytes) else str(output)
         return stdout, "", exit_code
 
     def test_pip_install_survives_container_restart(self):
-        """Install a package, destroy the container, recreate, verify it's still there."""
+        """Install a package into the volume, destroy the container, recreate, verify it's still there."""
         # ── First container ────────────────────────────────────────────
         container1 = self._create_container()
         time.sleep(1)  # let container fully start
 
-        stdout, _, rc = self._exec(container1, "pip install requests")
+        # Install into the workspace volume (--target): a plain `pip install`
+        # would write to the container's writable layer, which is destroyed
+        # when container1 is removed below.
+        stdout, _, rc = self._exec(
+            container1, "pip install --target /workspace/pylibs requests"
+        )
         assert rc == 0, f"pip install failed: {stdout}"
 
         # Write a file to the workspace
@@ -156,8 +184,8 @@ class TestVolumePersistence:
         assert rc == 0, f"touch failed: {stdout}"
 
         # Verify file exists
-        stdout, _, rc = self._exec(container1, "test -f /workspace/testfile && echo OK")
-        assert "OK" in stdout, f"File not found immediately after creation: {stdout}"
+        stdout, _, rc = self._exec(container1, "cat /workspace/testfile")
+        assert rc == 0, f"File not found immediately after creation: {stdout}"
 
         # ── Destroy first container ────────────────────────────────────
         container1.stop()
@@ -168,13 +196,17 @@ class TestVolumePersistence:
         time.sleep(1)
 
         # Verify the package is still installed
-        stdout, _, rc = self._exec(container2, "python -c 'import requests; print(\"OK\")'")
+        stdout, _, rc = self._exec(
+            container2,
+            "python -c 'import requests; print(\"OK\")'",
+            env={"PYTHONPATH": "/workspace/pylibs"},
+        )
         assert rc == 0, f"Package import failed: {stdout}"
         assert "OK" in stdout, f"Package import output missing 'OK': {stdout}"
 
         # Verify the test file still exists
-        stdout, _, rc = self._exec(container2, "test -f /workspace/testfile && echo OK")
-        assert rc == 0 and "OK" in stdout, (
+        stdout, _, rc = self._exec(container2, "cat /workspace/testfile")
+        assert rc == 0, (
             f"/workspace/testfile missing after container restart: stdout={stdout!r}"
         )
 

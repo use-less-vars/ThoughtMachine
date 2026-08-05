@@ -239,9 +239,13 @@ class TestAskPermissionRestrictive:
         mock_container: MagicMock,
     ):
         """filesystem='ask' → container gets workspace mount mode='ro'."""
+        # workspace_id=None so the BIND path is exercised: this test asserts
+        # the ``volumes`` dict representation (a truthy workspace_id would
+        # take the named-volume path where volumes=None and mounts=[Mount]).
         executor = _make_executor(
             mock_docker,
             session_permissions={"network": "write", "filesystem": "ask", "container": True},
+            workspace_id=None,
         )
 
         with patch.object(
@@ -303,9 +307,11 @@ class TestAskPermissionRestrictive:
         mock_container.attrs["HostConfig"]["NetworkMode"] = "none"
         mock_container.attrs["Mounts"][0]["Mode"] = "ro"
 
+        # workspace_id=None → bind path (volumes dict assertion below).
         executor = _make_executor(
             mock_docker,
             session_permissions={"network": "ask", "filesystem": "ask", "container": True},
+            workspace_id=None,
         )
 
         with patch.object(
@@ -333,9 +339,11 @@ class TestAskPermissionRestrictive:
         mock_container: MagicMock,
     ):
         """write→ask triggers recreation (bridge→none, rw→ro)."""
+        # workspace_id=None → bind path (volumes dict assertion below).
         executor = _make_executor(
             mock_docker,
             session_permissions={"network": "write", "filesystem": "write", "container": True},
+            workspace_id=None,
         )
 
         with patch.object(
