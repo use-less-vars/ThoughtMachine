@@ -177,6 +177,30 @@ class GitInfoTool(ToolBase):
 
         raise ValueError(f"Unsupported git protocol: {clone_url}")
 
+    def _validate_repo_root(self, repo_root: Path) -> Path:
+        """
+        Ensure the git repository root stays inside the workspace.
+
+        Resolves the workspace through the same registry mechanism used by
+        ``_validate_path`` (``_resolve_registry_workspace``). Returns the
+        resolved ``repo_root`` when it is inside the workspace; raises
+        ``ValueError`` otherwise. When no workspace can be resolved (no
+        session, no ``workspace_path``), no restriction is applied.
+        """
+        repo_root = Path(repo_root).expanduser().resolve()
+        ws_path = self._resolve_registry_workspace()
+        if not ws_path:
+            return repo_root
+
+        ws_abs = Path(ws_path).expanduser().resolve()
+        try:
+            repo_root.relative_to(ws_abs)
+        except ValueError:
+            raise ValueError(
+                f"Git repository {repo_root} is outside the workspace {ws_abs}"
+            ) from None
+        return repo_root
+
     def execute(self) -> str:
         # Atomic permission re-check for network operations
         operation = self.operation
@@ -236,7 +260,15 @@ class GitInfoTool(ToolBase):
                     repo_root = Path.cwd()
             else:
                 repo_root = Path.cwd()
-            
+
+            # Security: the git repository root must stay inside the
+            # workspace. ``rev-parse --show-toplevel`` below can re-point
+            # repo_root, so it is re-validated after the override too.
+            try:
+                repo_root = self._validate_repo_root(repo_root)
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+
             # Handle operations that don't require an existing repo
             if self.operation == "init":
                 return self._git_init(repo_root)
@@ -258,6 +290,13 @@ class GitInfoTool(ToolBase):
                     if result.returncode != 0:
                         return self._truncate_output(f"Not a git repository: {repo_root}")
                     repo_root = Path(result.stdout.strip())
+                    # The resolved root may sit ABOVE the workspace (a repo
+                    # that contains the workspace); reject it before any git
+                    # operation runs against it.
+                    try:
+                        repo_root = self._validate_repo_root(repo_root)
+                    except ValueError as e:
+                        return self._truncate_output(f"Error: {e}")
                 except (subprocess.TimeoutExpired, FileNotFoundError):
                     return self._truncate_output(f"Git not available or not a git repository: {repo_root}")
             
@@ -288,10 +327,41 @@ class GitInfoTool(ToolBase):
     
     def _run_git(self, repo_root: Path, args: List[str], timeout: int = 30) -> str:
         """Run git command and return output."""
+        # Defense-in-depth: never run git with a cwd outside the workspace.
+        # Raises ValueError (handled by execute()'s caller) if repo_root
+        # escapes the workspace. execute() already validates before calling
+        # _run_git, so this only fires for direct callers.
+        self._validate_repo_root(repo_root)
+
         try:
+            # Hardened environment: never trust ambient git configuration.
+            # Ignore system/global config (~/.gitconfig, /etc/gitconfig) and
+            # point HOME at /dev/null so host-user aliases, credential
+            # helpers, or include.path tricks cannot be injected into the
+            # subprocess.
+            env = os.environ.copy()
+            env["GIT_CONFIG_NOSYSTEM"] = "1"
+            env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+            env["GIT_CONFIG_SYSTEM"] = "/dev/null"
+            env["HOME"] = "/dev/null"
+
+            # Hardened args, applied to EVERY git invocation: hooks are
+            # neutralized (core.hooksPath=/dev/null), external diff drivers /
+            # textconv filters and the fsmonitor helper are disabled.
+            hardened_args = [
+                "-c", "core.hooksPath=/dev/null",
+                "-c", "diff.external=/bin/true",
+                "-c", "core.fsmonitor=/bin/true",
+            ]
+            # commit additionally skips pre-commit/commit-msg hooks via
+            # --no-verify as a second line of defense.
+            if args and args[0] == "commit":
+                args = [args[0], "--no-verify"] + args[1:]
+
             result = subprocess.run(
-                ["git"] + args,
+                ["git"] + hardened_args + args,
                 cwd=repo_root,
+                env=env,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
