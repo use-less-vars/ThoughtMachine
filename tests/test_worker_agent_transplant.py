@@ -795,8 +795,14 @@ class TestGateDenialInstant:
         """When effective permission is 'ask', gate denies via NullEventBus instantly."""
         # Script: call FileEditor with write operation (requires filesystem:write)
         # Patch global_event_bus to None to simulate worker context with no interactive user
+        # NullEventBus = BOTH module-level bindings must be None:
+        #  - agent.core.agent.global_event_bus feeds ToolExecutor(event_bus=...) (agent.py L120)
+        #  - agent.core.tool_executor.global_event_bus is the executor's own fallback
+        #    (tool_executor.py L270: event_bus=self._event_bus or global_event_bus)
         patcher = patch('agent.core.tool_executor.global_event_bus', None)
+        patcher2 = patch('agent.core.agent.global_event_bus', None)
         patcher.start()
+        patcher2.start()
         config._provider_responses = [
             _tool_response(
                 "FileEditor",
@@ -840,8 +846,12 @@ class TestGateDenialInstant:
 
             denied_result = tool_results[0]
             result_content = str(denied_result.get("result", ""))
-            assert "Permission denied" in result_content, (
-                f"Expected 'Permission denied' in tool result, got: {result_content}"
+            # ACTUAL agent-path denial message: security_gate.check_required_categories,
+            # no-event-bus branch. The gate denies BEFORE the tool runs, so the
+            # in-tool atomic message ('Atomic permission check failed: ...') never
+            # appears on this path.
+            assert "Permission denied: filesystem:write required by 'FileEditor'" in result_content, (
+                f"Expected gate denial message in tool result, got: {result_content}"
             )
 
             # Should mention 'no interactive user available' (the NullEventBus message)
@@ -863,6 +873,7 @@ class TestGateDenialInstant:
                 f"Expected agent_responded even after gate denial, got: {event_types}"
             )
         finally:
+            patcher2.stop()
             patcher.stop()
             ScriptedProvider.__init__ = original_init
 
