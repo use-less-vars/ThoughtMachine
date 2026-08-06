@@ -1388,14 +1388,24 @@ class TestTokenEstimation:
             f"than long message ({long_tokens})"
         )
 
-    def test_worker_thread_token_properties(self, worker_thread):
+    def test_worker_thread_token_properties(self, tmp_path):
         """WorkerThread should expose current_context_tokens and max_context_tokens."""
-        # worker_thread fixture creates a WorkerThread with _agent_config_dict
+        from tools.workspace.worker import WorkerThread
+
+        # Build a WorkerThread with an injected _agent_config_dict
+        worker_thread = WorkerThread(
+            name="token-props-test",
+            definition={"system_prompt": "test"},
+            agent_config={"model": "gpt-4o", "provider": "openai"},
+            workspace_dir=tmp_path,
+        )
         tokens = worker_thread.get_current_context_tokens()
         max_tokens = worker_thread.max_context_tokens
 
         assert isinstance(tokens, int)
+        assert tokens == 0  # no conversation started yet
         assert isinstance(max_tokens, int) and max_tokens > 0
+        assert max_tokens == 128000  # gpt-4o context window
 
     def test_max_context_tokens_from_model(self):
         """max_context_tokens should derive from the model name in _agent_config_dict."""

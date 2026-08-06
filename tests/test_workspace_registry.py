@@ -104,7 +104,7 @@ class TestResolveByRoot:
         assert entry is None
 
     @patch.object(os.path, "normcase", side_effect=lambda p: p.lower())
-    def test_resolve_windows_case_insensitive(self, registry: WorkspaceRegistry, _mock_normcase):
+    def test_resolve_windows_case_insensitive(self, mock_normcase, registry: WorkspaceRegistry):
         """Simulate Windows: register with one casing, look up with different
         casing — must still match."""
         registry.register_workspace("ws-win", "/TMP/MYPROJECT")
@@ -114,7 +114,7 @@ class TestResolveByRoot:
 
     @patch.object(os.path, "normcase", side_effect=lambda p: p.lower())
     def test_resolve_windows_case_insensitive_reverse(
-        self, registry: WorkspaceRegistry, _mock_normcase
+        self, mock_normcase, registry: WorkspaceRegistry
     ):
         """Register in lowercase, look up in uppercase."""
         registry.register_workspace("ws-win", "/tmp/myproject")
@@ -141,7 +141,7 @@ class TestRegisterByRoot:
 
     @patch.object(os.path, "normcase", side_effect=lambda p: p.lower())
     def test_register_existing_different_casing(
-        self, registry: WorkspaceRegistry
+        self, mock_normcase, registry: WorkspaceRegistry
     ):
         """Simulate Windows: first register with uppercase, then try with
         lowercase — should return the existing entry, not create a new one."""
@@ -168,7 +168,7 @@ class TestRegisterWorkspace:
         assert "/../" not in entry.root_path
 
     @patch.object(os.path, "normcase", side_effect=lambda p: p.lower())
-    def test_stores_lowercased_on_windows(self, registry: WorkspaceRegistry, _mock_normcase):
+    def test_stores_lowercased_on_windows(self, mock_normcase, registry: WorkspaceRegistry):
         entry = registry.register_workspace("ws-win", "/TMP/PROJECT")
         assert entry.root_path == "/tmp/project"
 
