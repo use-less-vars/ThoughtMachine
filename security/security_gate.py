@@ -113,9 +113,9 @@ def get_effective_permissions(
     """
     Merge the session's permission profile with the workspace's capabilities.
 
-    Returns a flat dict with keys matching the six permission categories::
+    Returns a flat dict with keys matching the seven permission categories::
 
-        {"filesystem": ..., "network": ..., "container": ..., "git": ..., "system": ..., "execution": ...}
+        {"filesystem": ..., "network": ..., "container": ..., "git": ..., "system": ..., "mcp": ..., "execution": ...}
 
     Each value is either a boolean (``True`` / ``False``) for hard allow/deny,
     a string level (``"write"``, ``"read"``, ``"none"``, ``"banned"``, ``"ask"``, ``"outbound"``),
@@ -146,6 +146,7 @@ def get_effective_permissions(
         "container": container,
         "git": git,
         "system": system,
+        "mcp": session.mcp,
         "execution": session.execution,
     }
 
@@ -251,7 +252,7 @@ def _value_satisfies(required: str, allowed: object) -> bool | str:
     else:
         aliases = {"deny": "banned", "denied": "banned", "all": "full"}
         level_name = aliases.get(required_lower, required_lower)
-        level_map = {"banned": 0, "ask": 1, "read": 2, "write": 3, "full": 4}
+        level_map = {"banned": 0, "ask": 1, "read": 2, "connect": 3, "write": 3, "full": 4}
         required_level = level_map.get(level_name)
 
     # --- Handle allowed value ---
@@ -271,7 +272,7 @@ def _value_satisfies(required: str, allowed: object) -> bool | str:
 
     # --- String comparison ---
     aliases = {"deny": "banned", "denied": "banned", "all": "full"}
-    level_map = {"banned": 0, "ask": 1, "read": 2, "write": 3, "full": 4}
+    level_map = {"banned": 0, "ask": 1, "read": 2, "connect": 3, "write": 3, "full": 4}
     allowed_level_name = aliases.get(allowed_str, allowed_str)
     allowed_level = level_map.get(allowed_level_name)
 

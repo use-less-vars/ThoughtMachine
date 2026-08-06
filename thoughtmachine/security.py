@@ -112,6 +112,7 @@ class SessionPermissions(BaseModel):
     - **system**:   ``'banned' | 'read' | 'write' | 'full' | 'ask'``
     - **git**:        ``'banned' | 'read' | 'write' | 'full' | 'ask'``
     - **execution**:  ``'banned' | 'read' | 'write' | 'full' | 'ask'``
+    - **mcp**:        ``'banned' | 'connect' | 'full'``
     """
 
     container: bool = Field(
@@ -137,6 +138,10 @@ class SessionPermissions(BaseModel):
     execution: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
         default='banned',
         description='Code execution access level for the session.',
+    )
+    mcp: Literal['banned', 'connect', 'full'] = Field(
+        default='banned',
+        description='MCP server connection access level.',
     )
 
     @field_validator('network', mode='before')
@@ -172,6 +177,7 @@ PERMISSION_SCHEMA: Dict[str, tuple] = {
     "container":  (True, False),
     "execution":  ("banned", "ask", "read", "write"),
     "git":        VALID_PERMISSION_LEVELS,
+    "mcp":        ("banned", "connect", "full"),
     "system":     VALID_PERMISSION_LEVELS,
 }
 SAFE_DEFAULTS: Dict[str, Any] = {
@@ -179,6 +185,7 @@ SAFE_DEFAULTS: Dict[str, Any] = {
     "execution": "banned",
     "filesystem": "read",
     "git": "read",
+    "mcp": "banned",
     "network": "banned",
     "system": "read",
 }

@@ -81,6 +81,7 @@ class SandboxedExecution:
         required_category: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
         strip_env: bool = True,
+        input: Optional[str] = None,
     ) -> subprocess.CompletedProcess:
         """
         Execute ``command`` under the sandbox policy.
@@ -102,6 +103,9 @@ class SandboxedExecution:
                 environment (``HOME=/dev/null`` + fixed ``PATH``, plus git
                 hardening for ``git`` commands). When False, the child inherits
                 ``os.environ``.
+            input: Optional string written to the child's stdin (text mode --
+                ``subprocess.run(..., text=True)``). ``None`` (default) leaves
+                stdin unconnected, preserving existing caller behaviour.
 
         Returns:
             ``subprocess.CompletedProcess`` from ``subprocess.run``.
@@ -145,6 +149,7 @@ class SandboxedExecution:
             env=env,
             capture_output=True,
             text=True,
+            input=input,
         )
 
     # -- internal helpers ------------------------------------------------

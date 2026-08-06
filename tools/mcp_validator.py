@@ -7,6 +7,7 @@ Supports both single-server and multi-server configurations.
 import json
 import os
 import logging
+import warnings
 from typing import ClassVar, Dict, Any, List, Optional, Union, Literal
 from pathlib import Path
 from pydantic import Field
@@ -15,6 +16,13 @@ from .mcp_client import create_mcp_client
 from .base import ToolBase
 
 logger = logging.getLogger(__name__)
+
+warnings.warn(
+    "MCPValidator is deprecated. Use MCPServerConnect instead. "
+    "MCPValidator will be removed in a future version.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 
 class MCPValidator(ToolBase):
@@ -176,6 +184,8 @@ class MCPValidator(ToolBase):
     
     def execute(self) -> str:
         """Validate MCP configuration and optionally test connection."""
+        # Deprecated: MCPValidator is superseded by MCPServerConnect.
+        return "Error: MCPValidator is deprecated. Use MCPServerConnect with a registered server name instead."
         # Get parameters from instance attributes
         config_path = self.config_path
         transport = self.transport

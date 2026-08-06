@@ -46,7 +46,7 @@ except ImportError:
     resolve_workspace_id = None
 
 # ---------------------------------------------------------------------------
-# Default session permissions profile (six categories)
+# Default session permissions profile (seven categories)
 # ---------------------------------------------------------------------------
 # Fallback used when no live SessionPermissions model is available on config.
 DEFAULT_SESSION_PERMISSIONS = {
@@ -55,6 +55,7 @@ DEFAULT_SESSION_PERMISSIONS = {
     "filesystem": "read",
     "system": "read",
     "git": "read",
+    "mcp": "banned",
     "execution": "banned",
 }
 
