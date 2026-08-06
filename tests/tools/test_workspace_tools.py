@@ -38,8 +38,43 @@ def _parse_result(result: str) -> dict:
 #  CheckSystem
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Full set of queries CheckSystem can answer (mirrors the vault allowlist in
+# tests/security/test_checksystem_allowlist.py).  Pinned here so these tests are
+# deterministic regardless of the host's ~/.thoughtmachine vault state.
+FULL_ALLOWLIST = [
+    "capabilities",
+    "container_status",
+    "dockerfile",
+    "effective_permissions",
+    "event_bus_status",
+    "event_log",
+    "mcp_servers",
+    "my_config",
+    "network_diagnostics",
+    "running_workers",
+    "workers",
+    "workspace_info",
+]
+
+
 class TestCheckSystem:
     """Tests for CheckSystem (all 5 query types + unknown)."""
+
+    @pytest.fixture(autouse=True)
+    def _pin_vault_allowlist(self):
+        """Pin the vault allowlist so query handlers are reached deterministically.
+
+        execute() reloads the allowlist from the vault on every call.  On hosts
+        with no bootstrapped vault (e.g. the container verification env) the
+        allowlist is EMPTY, and CheckSystem fail-closes by denying EVERY query,
+        which would fail every test here.  Patching the loader to the full
+        allowlist exercises the real product flow (allowlist enforcement for
+        valid queries + query handlers) independent of the host vault state.
+        """
+        with patch.object(
+            CheckSystem, "_load_allowlist_from_vault", return_value=FULL_ALLOWLIST
+        ):
+            yield
 
     @patch("tools.workspace.check_system.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.check_system._workspace_dir")
@@ -291,12 +326,12 @@ class TestCheckSystem:
             assert field in result
 
     def test_unknown_query(self):
-        """Unknown query returns error with valid queries."""
+        """Unknown query is denied by the vault allowlist (fail-closed)."""
         tool = CheckSystem(query="nonexistent_query", workspace_path="/tmp/test_ws")
         result = _parse_result(tool.execute())
         assert "error" in result
         assert "nonexistent_query" in result["error"]
-        assert "valid_queries" in result
+        assert result["status"] == "denied"
 
     def test_required_categories_requires_system_read(self):
         """CheckSystem requires system:read because it inspects host state and can run subprocesses."""
@@ -515,13 +550,13 @@ class TestCheckSystem:
         assert result["count"] == 1
         assert result["mcp_servers"][0]["name"] == "my-mcp"
 
-    def test_unknown_query_returns_valid_queries(self):
-        """Unknown query returns error with valid_queries list."""
+    def test_unknown_query_denied_no_valid_queries(self):
+        """Unknown query denied when allowlist active: no valid_queries leak."""
         tool = CheckSystem(query="nonexistent", workspace_path="/tmp/test_ws")
         result = json.loads(tool.execute())
         assert "error" in result
-        assert "valid_queries" in result
-        assert isinstance(result["valid_queries"], list)
+        assert result["status"] == "denied"
+        assert "valid_queries" not in result
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Worker
