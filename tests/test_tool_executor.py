@@ -54,7 +54,9 @@ class FakeConfig:
     """Minimal config stub for ToolExecutor."""
     workspace_path = None
     tool_output_token_limit = None
-    session_permissions = None
+
+    def __init__(self, permissions=None):
+        self.session_permissions = permissions
 
 
 class FakeState:
@@ -65,10 +67,12 @@ class FakeState:
 class TestToolExecutorPermissions:
     """Integration tests: ToolExecutor rejects/accepts tools based on categories."""
 
-    def _make_executor(self, tool_classes):
+    def _make_executor(self, tool_classes, permissions=None):
+        # The permissions MUST be wired into the executor's config so the
+        # gate reads config.session_permissions (tool_executor.py:253-257).
         return ToolExecutor(
             tool_classes=tool_classes,
-            config=FakeConfig(),
+            config=FakeConfig(permissions),
             state=FakeState(),
             logger=None,
             security_available=False,
@@ -85,7 +89,7 @@ class TestToolExecutorPermissions:
         assert result["tool_type"] == "normal"
 
     def test_container_tool_denied(self):
-        executor = self._make_executor([ContainerTool])
+        executor = self._make_executor([ContainerTool], permissions=SessionPermissions(container=False))
         result = executor._execute_single_tool(
             ContainerTool, {}, "ContainerTool", 0,
             lambda: False, lambda: None, lambda: 0
@@ -95,7 +99,11 @@ class TestToolExecutorPermissions:
         assert result["tool_type"] == "normal"
 
     def test_multiple_requirements(self):
-        executor = self._make_executor([NetworkAndFilesystemTool])
+        # Explicit restrictive profile: both network:true and filesystem:write denied
+        executor = self._make_executor(
+            [NetworkAndFilesystemTool],
+            permissions=SessionPermissions(network=False, filesystem="read"),
+        )
         result = executor._execute_single_tool(
             NetworkAndFilesystemTool, {}, "NetworkAndFilesystemTool", 0,
             lambda: False, lambda: None, lambda: 0
@@ -107,8 +115,9 @@ class TestToolExecutorPermissions:
     def test_respects_custom_permissions_via_check_permissions(self):
         """If we monkey-patch _check_permissions, the executor still works.
         This tests the integration point. We use the ToolExecutor with a tool
-        that requires nothing and verify it passes through."""
-        executor = self._make_executor([PermissiveTool])
+        that requires nothing and verify it passes through even under a
+        restrictive explicit profile."""
+        executor = self._make_executor([PermissiveTool], permissions=SessionPermissions(filesystem="read"))
         result = executor._execute_single_tool(
             PermissiveTool, {}, "PermissiveTool", 0,
             lambda: False, lambda: None, lambda: 0
@@ -118,13 +127,15 @@ class TestToolExecutorPermissions:
     def test_error_returned_as_normal_tool_type(self):
         """Permission errors must be returned with tool_type='normal' so the LLM
         sees them as ordinary tool failures."""
-        executor = self._make_executor([ContainerTool])
+        executor = self._make_executor([ContainerTool], permissions=SessionPermissions(container=False))
         result = executor._execute_single_tool(
             ContainerTool, {}, "ContainerTool", 0,
             lambda: False, lambda: None, lambda: 0
         )
         assert result["tool_type"] == "normal"
-        assert result["result"].startswith("Permission denied")
+        # Actual executor-path message (verified at runtime in the container):
+        # 'Permission denied: Tool requires container:true, but session allows container:False'
+        assert result["result"].startswith("Permission denied: Tool requires container:true")
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +255,7 @@ class TestToolExecutorCustomPermissions:
             lambda: False, lambda: None, lambda: 0
         )
         assert "Permission denied" in result["result"]
+        assert "container:true" in result["result"]
 
     def test_mixed_allowed_and_denied(self):
         """Multiple requirements: allow container but deny network."""
@@ -269,14 +281,41 @@ class TestToolExecutorCustomPermissions:
         )
         assert result["result"] == "Network + FS OK"
 
+    def test_permissive_default_profile_allows_tools(self):
+        """Tools are ALLOWED under the permissive default profile
+        (resources/default_config.json: container=true, network=true -> 'write',
+        filesystem='write') — Docker Phase 2 deliberate refactor."""
+        perms = SessionPermissions(
+            container=True,
+            network=True,  # coerces to 'write'
+            filesystem="write",
+            system="read",
+            git="read",
+            execution="banned",
+        )
+        executor = self._make_executor([ContainerTool, NetworkAndFilesystemTool], permissions=perms)
+        r1 = executor._execute_single_tool(
+            ContainerTool, {}, "ContainerTool", 0,
+            lambda: False, lambda: None, lambda: 0
+        )
+        assert r1["result"] == "Container OK"
+        r2 = executor._execute_single_tool(
+            NetworkAndFilesystemTool, {}, "NetworkAndFilesystemTool", 0,
+            lambda: False, lambda: None, lambda: 0
+        )
+        assert r2["result"] == "Network + FS OK"
+
     def test_none_permissions_falls_back_to_default(self):
-        """When session_permissions is None, defaults are used (container denied)."""
+        """When session_permissions is None, the executor falls back to the
+        CONSERVATIVE SessionPermissions() model defaults (tool_executor.py:253-255),
+        so a container tool is denied. Verified at runtime in the container."""
         executor = self._make_executor([ContainerTool], permissions=None)
         result = executor._execute_single_tool(
             ContainerTool, {}, "ContainerTool", 0,
             lambda: False, lambda: None, lambda: 0
         )
         assert "Permission denied" in result["result"]
+        assert "container:true" in result["result"]
 
     def test_respond_tool_dynamic_category_integration(self):
         """Respond without report_body passes even with restrictive permissions."""

@@ -284,11 +284,16 @@ class TestConfigFileRoundTrip:
         loaded_dict = load_config(temp_config_path)
         cfg2 = AgentConfig(**loaded_dict)
 
-        # Should have factory defaults (layered config)
+        # Should have factory defaults (layered config: resources/default_config.json
+        # deep-merges the PERMISSIVE profile — verified at runtime in the container:
+        # SessionPermissions(container=True, network='write', filesystem='write',
+        #                    system='read', git='read', execution='banned'))
         sp = cfg2.session_permissions
-        assert sp.container is False
+        assert sp.container is True
         assert sp.network == "write"  # factory default (True coerces to 'write')
         assert sp.filesystem == "write"  # factory default
+        assert sp.system == "read"  # factory default
+        assert sp.git == "read"  # factory default
         assert sp.execution == "banned"
 
     def test_partial_permissions_backfilled_from_defaults(self, temp_config_path):
