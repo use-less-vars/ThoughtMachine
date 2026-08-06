@@ -329,3 +329,70 @@ def test_normal_git_operations(hardened_repo):
         result = tool.execute()
         assert "Git command failed" not in result
         assert "Error running git command" not in result
+
+def test_textconv_driver_never_executes_via_show(tmp_path):
+    """A repo-local textconv diff driver must never run during git show.
+
+    Full exploit chain: a nested repo carries .gitattributes routing *.bin
+    through a diff driver and .git/config defines that driver's textconv as
+    an external script. Rendering the diff would execute the script; the
+    tool's --no-textconv flag prevents it.
+    """
+    workspace = tmp_path / "workspace"
+    nested = workspace / "nested"
+    nested.mkdir(parents=True)
+    _run_git_clean(nested, "init", "-q")
+    _run_git_clean(nested, "config", "user.name", "Test User")
+    _run_git_clean(nested, "config", "user.email", "test@example.com")
+
+    marker = workspace / "textconv_marker.txt"
+    evil = nested / "evil.sh"
+    evil.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    evil.chmod(0o755)
+    _run_git_clean(nested, "config", "diff.test.textconv", str(evil))
+    (nested / ".gitattributes").write_text("*.bin diff=test\n")
+
+    data = nested / "data.bin"
+    data.write_bytes(b"\x00\x01binary\xff\xfe\n")
+    _run_git_clean(nested, "add", ".")
+    commit = _run_git_clean(nested, "commit", "-q", "-m", "base")
+    assert commit.returncode == 0, commit.stderr
+
+    tool = GitInfoTool(
+        operation="show",
+        commit="HEAD",
+        working_dir=str(nested),
+        workspace_path=str(workspace),
+    )
+    result = tool.execute()
+    assert "Git command failed" not in result
+    assert "Error running git command" not in result
+    assert not marker.exists(), (
+        "textconv executed during git show despite --no-textconv"
+    )
+
+
+def test_textconv_disabled_but_builtin_diff_works(tmp_path):
+    """With --no-textconv, normal diff output stays correct."""
+    workspace = tmp_path / "workspace"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+    _run_git_clean(repo, "init", "-q")
+    _run_git_clean(repo, "config", "user.name", "Test User")
+    _run_git_clean(repo, "config", "user.email", "test@example.com")
+
+    (repo / "hello.txt").write_text("line1\n")
+    _run_git_clean(repo, "add", "hello.txt")
+    commit = _run_git_clean(repo, "commit", "-q", "-m", "base")
+    assert commit.returncode == 0, commit.stderr
+
+    (repo / "hello.txt").write_text("line1\nline2\n")
+    tool = GitInfoTool(
+        operation="diff",
+        working_dir=str(repo),
+        workspace_path=str(workspace),
+    )
+    result = tool.execute()
+    assert "Git command failed" not in result
+    assert "+line2" in result
+

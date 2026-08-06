@@ -393,3 +393,46 @@ def test_mcp_connect_valid_server_works(tmp_path, monkeypatch):
     assert parsed["status"] == "connected"
     assert parsed["server"] == "mock"
     assert "tools" in parsed["capabilities"]
+
+@pytest.mark.usefixtures("git_available")
+def test_nested_repo_textconv_blocked(tmp_path):
+    """Nested-repo textconv exploit chain: no execution via git show.
+
+    The attacker's report chain: a nested repo inside the workspace carries
+    .gitattributes routing *.bin through a diff driver and .git/config
+    defining that driver's textconv as an executable script. git show would
+    render the diff via textconv and execute the script; GitInfoTool passes
+    --no-textconv, so the marker must never appear.
+    """
+    workspace = tmp_path / "workspace"
+    nested = workspace / "pwn"
+    nested.mkdir(parents=True)
+    _init_repo(nested)
+
+    marker = workspace / "pwn_textconv_marker.txt"
+    evil = nested / "evil.sh"
+    evil.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    evil.chmod(0o755)
+    config = _run_git_clean(nested, "config", "diff.test.textconv", str(evil))
+    assert config.returncode == 0, config.stderr
+    (nested / ".gitattributes").write_text("*.bin diff=test\n")
+
+    data = nested / "data.bin"
+    data.write_bytes(b"\x00\x01binary\xff\xfe\n")
+    add = _run_git_clean(nested, "add", ".")
+    assert add.returncode == 0, add.stderr
+    commit = _run_git_clean(nested, "commit", "-q", "-m", "payload")
+    assert commit.returncode == 0, commit.stderr
+
+    tool = GitInfoTool(
+        operation="show",
+        commit="HEAD",
+        working_dir=str(nested),
+        session_permissions=FULL_PERMISSIONS,
+    )
+    result = tool.execute()
+    assert "Git command failed" not in result
+    assert not marker.exists(), (
+        "textconv executed during git show despite --no-textconv"
+    )
+

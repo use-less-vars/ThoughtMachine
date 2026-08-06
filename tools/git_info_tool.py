@@ -352,6 +352,7 @@ class GitInfoTool(ToolBase):
             # executable behavior.
             hardened_args = [
                 "-c", "core.hooksPath=/dev/null",
+                "-c", "core.attributesFile=/dev/null",
                 "-c", "diff.external=",
                 "-c", "core.fsmonitor=",
                 "-c", "filter.clean=",
@@ -477,7 +478,7 @@ class GitInfoTool(ToolBase):
         # Belt-and-suspenders for Bug A: --no-ext-diff guarantees external
         # diff drivers can never render diffs (hardened_args also clears
         # diff.external).
-        args = ["diff", "--no-ext-diff"]
+        args = ["diff", "--no-ext-diff", "--no-textconv"]
         if self.commit1:
             args.append(self.commit1)
         if self.commit2:
@@ -511,7 +512,7 @@ class GitInfoTool(ToolBase):
     
     def _git_log(self, repo_root: Path) -> str:
         """Run git log."""
-        args = ["log", f"--max-count={self.max_count}", "--oneline"]
+        args = ["log", "--no-ext-diff", "--no-textconv", f"--max-count={self.max_count}", "--oneline"]
         if self.since:
             args.append(f"--since={self.since}")
         if self.until:
@@ -554,7 +555,7 @@ class GitInfoTool(ToolBase):
     
     def _git_show(self, repo_root: Path) -> str:
         """Run git show."""
-        args = ["show"]
+        args = ["show", "--no-ext-diff", "--no-textconv"]
         if self.format:
             args.append(f"--format={self.format}")
         args.append(self.commit)
