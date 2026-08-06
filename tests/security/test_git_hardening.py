@@ -237,7 +237,8 @@ def test_vault_pre_commit_hook_runs(tmp_path, monkeypatch):
     hooks_dir.mkdir(parents=True)
     hook = hooks_dir / "pre-commit"
     hook.write_text("#!/bin/sh\ntouch vault_marker.txt\n")
-    hook.chmod(0o111)
+    # sh must READ the script file to interpret it, so hooks need read+exec.
+    hook.chmod(0o755)
     monkeypatch.setenv("HOME", str(tmp_path))
     vault_marker = repo / "vault_marker.txt"
 
@@ -267,7 +268,8 @@ def test_vault_pre_commit_hook_failure_aborts_commit(tmp_path, monkeypatch):
     hooks_dir.mkdir(parents=True)
     hook = hooks_dir / "pre-commit"
     hook.write_text("#!/bin/sh\necho 'blocked by policy' >&2\nexit 1\n")
-    hook.chmod(0o111)
+    # sh must READ the script file to interpret it, so hooks need read+exec.
+    hook.chmod(0o755)
     monkeypatch.setenv("HOME", str(tmp_path))
 
     (repo / "hello.txt").write_text("hi\n")
