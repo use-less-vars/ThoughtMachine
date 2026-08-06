@@ -121,13 +121,14 @@ class TestRestrictionReason:
         assert state.restrictions_active is True
 
     def test_restriction_reason_cleared_when_time_returns_to_low(self, state: AgentState):
-        """When time state goes back to LOW, restriction_reason is cleared but the
-        restriction itself is intentionally STICKY: restrictions_active stays True.
+        """When time state goes back to LOW, this monitor clears its own
+        restrictions: restriction_reason is reset AND restrictions_active /
+        restrictions_pending are turned off — the timeout is NOT a hard stop
+        for the rest of the turn (mirrors the turn/token LOW branches).
 
         Product semantics (agent/core/state.py): the update_time_state() LOW
-        transition clears only restriction_reason (line 247) and NEVER clears
-        restrictions_active — the timeout is a hard stop for the turn, so work
-        tools remain blocked until the turn ends (state.reset()).
+        transition clears the restrictions it set when
+        restriction_reason == 'timeout'.
         """
         # First trigger CRITICAL
         state.time_start = 0.0
@@ -142,14 +143,14 @@ class TestRestrictionReason:
         assert state.restriction_reason is None, (
             f"Expected None after time returns to LOW, got {state.restriction_reason}"
         )
-        # Hard stop: restrictions stay ACTIVE even though the reason is cleared
-        assert state.restrictions_active is True, (
-            "Expected restrictions_active to STAY True after time returns to LOW "
-            "(timeout is a hard stop for the turn)"
+        # Restrictions are lifted: work tools are available again
+        assert state.restrictions_active is False, (
+            "Expected restrictions_active to be False after time returns to LOW "
+            "(timeout is not a hard stop for the turn)"
         )
-        # Enforcement is still in place: work tools remain blocked
-        assert 'Thought' not in state.get_allowed_tools(), (
-            f"Work tools should remain blocked, got {state.get_allowed_tools()}"
+        assert state.restrictions_pending is False
+        assert state.get_allowed_tools() == [], (
+            f"Expected all tools restored, got {state.get_allowed_tools()}"
         )
 
     def test_restriction_reason_cleared_when_token_returns_to_low(self, state: AgentState):
@@ -170,7 +171,7 @@ class TestRestrictionReason:
 
     def test_restriction_reason_cleared_when_turn_returns_to_low(self, state: AgentState):
         """When turn state goes back to LOW, restriction_reason should be cleared."""
-        # First trigger CRITICAL: product critical_turn = max(max_turns-5, max_turns-1) = 99 for max_turns=100
+        # First trigger CRITICAL: product critical_turn = max(max_turns-5, 1) = 95 for max_turns=100
         state.current_turn = 99
         state.update_turn_state(state.current_turn)
         assert state.restriction_reason == 'turn'

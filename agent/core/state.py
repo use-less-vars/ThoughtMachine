@@ -244,7 +244,14 @@ class AgentState:
 
         if new_state == TimeState.LOW:
             self.last_time_warning_state = TimeState.LOW
-            self.restriction_reason = None
+            # Time returned to LOW — this monitor clears its own restrictions
+            # (mirrors the turn/token LOW branches; timeout is NOT a hard stop
+            # for the rest of the turn). Do NOT clear restrictions set by
+            # other monitors (reason != 'timeout').
+            if self.restriction_reason == 'timeout':
+                self.restrictions_active = False
+                self.restrictions_pending = False
+                self.restriction_reason = None
 
         log('DEBUG', '[STATE_OBSERVE_TIME]', f"time: {old_state.value}→{new_state.value} | elapsed={elapsed_seconds} | timeout={self.config.timeout_seconds} | event={'time_warning' if events else 'none'}")
         return events
@@ -266,7 +273,7 @@ class AgentState:
         log('DEBUG', 'pipeline.warning', f'ENTER update_turn_state: current_turn={current_turn}, max_turns={max_turns}')
 
         # Compute thresholds — guard against small max_turns
-        critical_turn = max(max_turns - 5, max_turns - 1) if max_turns >= 2 else max_turns
+        critical_turn = max(max_turns - 5, 1) if max_turns >= 2 else max_turns
         warning_turn = max(max_turns - 8, 0) if max_turns >= 8 else 0
 
         if current_turn >= critical_turn:
