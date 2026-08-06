@@ -603,8 +603,12 @@ class TestSessionConfigDoesNotBridgeToToolExecution:
 import threading
 import queue
 
+import thoughtmachine.security as _security_module
+from agent.events import EventBus, create_event as _create_event
 from thoughtmachine.security import (
     cancel_pending_prompts,
+    get_default_security_config,
+    is_allowed,
     _prompt_cancelled,
     _pending_security_requests,
     _pending_requests_lock,
@@ -648,50 +652,69 @@ class TestCancelPendingPrompts:
         assert _prompt_cancelled.is_set()
         _prompt_cancelled.clear()
 
-    def test_thread_exits_with_denial_on_cancel(self):
-        """A thread blocked in _request_security_prompt exits with denial
-        when cancel_pending_prompts is called from another thread."""
+    def test_thread_exits_with_denial_on_cancel(self, monkeypatch):
+        """Cancel means deny, through the REAL prompt-resolution flow.
+
+        The prompt is raised through the public ``is_allowed`` API (the same
+        path the live gate / tool-executor uses when a policy is "ask"), then
+        cancelled via ``cancel_pending_prompts`` (the live app's cancel
+        channel). The blocked call must return False (denial).
+
+        (The previous version called the private ``_request_security_prompt``
+        directly; that function short-circuits to "allow" whenever the event
+        system is not wired up at module import time, so the test could see
+        approved=True even though the live system denies on cancel.)
+        """
         import time
-        from thoughtmachine.security import _request_security_prompt
+
+        # Wire a deterministic, isolated event bus so the prompt actually
+        # blocks.  (In some environments the ambient module-level bus ends up
+        # None and _request_security_prompt degrades to an instant "allow" —
+        # exactly the drift this test is fixing.)
+        monkeypatch.setattr(_security_module, "global_event_bus", EventBus())
+        monkeypatch.setattr(_security_module, "EVENT_SYSTEM_AVAILABLE", True)
+        monkeypatch.setattr(_security_module, "create_event", _create_event)
 
         _prompt_cancelled.clear()
         result = {"approved": None}
 
         def waiter():
-            # We pass a config that triggers an "ask" policy
-            config = {
-                "session_policy": {
-                    "tool_overrides": {"TestTool": "ask"},
-                    "default_policy": "allow",
-                    "capability_requirements": {},
-                }
-            }
+            # Real security-config shape with an explicit "ask" override,
+            # which is what makes is_allowed raise a security prompt.
+            config = get_default_security_config()
+            config["session_policy"]["tool_overrides"] = {"TestTool": "ask"}
             try:
-                approved = _request_security_prompt(
+                approved = is_allowed(
                     agent_id="test-agent",
                     tool_name="TestTool",
-                    required_capabilities=[],
-                    arguments={},
                     security_config=config,
-                    policy_type="tool_override",
-                    policy_target="TestTool",
                 )
                 result["approved"] = approved
-            except Exception as e:
+            except Exception as e:  # pragma: no cover - diagnostic only
                 result["exception"] = e
 
         t = threading.Thread(target=waiter, daemon=True)
         t.start()
 
-        # Give the thread time to reach the blocking get
-        time.sleep(0.2)
+        # Wait until the prompt is actually pending (registered in
+        # _pending_security_requests) before cancelling — deterministic, and
+        # avoids the race where cancel fires before the prompt starts blocking.
+        deadline = time.monotonic() + 5.0
+        pending = 0
+        while time.monotonic() < deadline:
+            with _pending_requests_lock:
+                pending = len(_pending_security_requests)
+            if pending:
+                break
+            time.sleep(0.02)
+        assert pending > 0, "Security prompt was never registered as pending"
 
-        # Cancel from main thread
+        # Cancel from the main thread (the live app's cancel channel)
         cancel_pending_prompts()
 
         t.join(timeout=5.0)
         assert not t.is_alive(), "Waiter thread did not exit"
-        assert result["approved"] is False, (
+        assert result.get("approved") is False, (
             f"Expected denial (False) on cancel, got {result}"
         )
 
