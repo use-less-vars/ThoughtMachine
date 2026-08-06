@@ -65,12 +65,22 @@ class TestHealthEndpoint:
             "web_ui.backend.health_routes._WORKSPACES_DIR",
             Path(tempfile.mkdtemp(prefix="test_empty_")),
         ):
-            resp = client.get("/api/system/health")
+            with patch(
+                "session.store.FileSystemSessionStore"
+            ) as MockStore:
+                # Hermetic: the store must report no open sessions instead of
+                # reading the real ~/.thoughtmachine/sessions (host-dependent).
+                MockStore.return_value.get_open_sessions.return_value = []
+                with patch(
+                    "agent.logging.event_logger.EventLogger.get_tail",
+                    return_value=[],
+                ):
+                    resp = client.get("/api/system/health")
             assert resp.status_code == 200
             data = resp.json()
             assert data["running_workers"] == []
             assert data["active_sessions"] == []
-            assert "entries" in data["recent_event_log_tail"]
+            assert data["recent_event_log_tail"]["entries"] == []
 
     def test_legacy_worker_status(self, client, tmp_path: Path):
         """status.json in workers/<name>/ is picked up."""
