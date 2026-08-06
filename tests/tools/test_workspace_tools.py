@@ -654,8 +654,9 @@ class TestWorker:
         WorkerThread.run() keeps the loaded conversation intact — the current
         definition's system prompt is applied later when the worker's Agent is
         created (agent.core.agent.Agent.__init__ → ensure_system_prompt).
-        Whether that prompt actually reaches the LLM depends on the AgentConfig
-        mode-lock — see the comment at the _build_agent_config() call below.
+        Whether that prompt reaches the LLM is governed by the worker_mode
+        guard in _apply_mode_system_prompt — see the comment at the
+        _build_agent_config() call below.
         """
         # Write a persisted context with an OLD system prompt + messages
         ctx = {
@@ -704,19 +705,17 @@ class TestWorker:
         # _build_agent_config() reads it from the definition (agent_config
         # must carry provider/model for the config to be built).
         #
-        # NOTE (mode-lock): the agent_config dict above has no "mode" key, so
-        # AgentConfig defaults to mode='agent' and the _apply_mode_system_prompt
-        # after-validator (agent/config/models.py:159-188) force-loads the mode
-        # factory default (resources/default_system_prompt.txt), discarding the
-        # worker definition's explicit system_prompt. The override only reaches
-        # the LLM when the parent config runs with mode == 'custom' (proved
-        # below) — same contract as
-        # test_worker_system_prompt_override_requires_custom_mode.
+        # worker_mode contract: _build_agent_config() marks the worker's
+        # AgentConfig with worker_mode=True, and _apply_mode_system_prompt
+        # (agent/config/models.py) early-returns for worker_mode configs — so
+        # the definition's explicit system_prompt survives even though the
+        # agent_config dict above has no "mode" key (mode defaults to 'agent').
+        # The mode factory prompt / tool-preset stomp applies to non-worker
+        # configs only.
         #
-        # Legacy GUI gap: Session.mode is never 'custom' in the PyQt GUI, so
-        # worker-definition system_prompt overrides never reach the LLM in
-        # GUI-spawned workers. If the GUI is revived, Session.mode must be set
-        # to 'custom' for worker prompt overrides to apply.
+        # monkeypatch home first so the field-validator fallback is
+        # deterministic (~/.thoughtmachine/custom_system_prompt.txt neutralized).
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
         assert thread.definition["system_prompt"] == "You are a NEW assistant."
         cfg_thread = WorkerThread(
             name="resume_test",
@@ -734,19 +733,13 @@ class TestWorker:
         )
         cfg = cfg_thread._build_agent_config()
         assert cfg is not None
-        # ACTUAL behavior under mode='agent' (the default): the factory default
-        # prompt wins; the worker definition override is discarded.
+        # worker_mode=True → the definition's system_prompt survives the
+        # mode-factory stomp (mode still defaults to 'agent').
+        assert cfg.worker_mode is True
         assert cfg.mode == "agent"
-        _factory_default = (
-            Path(__file__).resolve().parent.parent.parent
-            / "resources" / "default_system_prompt.txt"
-        ).read_text(encoding="utf-8")
-        assert cfg.system_prompt == _factory_default
+        assert cfg.system_prompt == "You are a NEW assistant."
 
-        # The override DOES apply when the parent config runs in mode=='custom'
-        # (monkeypatched home neutralizes ~/.thoughtmachine/custom_system_prompt.txt
-        # so the field-validator fallback is deterministic).
-        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        # Same guarantee under an explicit mode == 'custom' parent config
         custom_thread = WorkerThread(
             name="resume_test_custom",
             definition={"system_prompt": "You are a NEW assistant."},

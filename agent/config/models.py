@@ -168,7 +168,17 @@ class AgentConfig(BaseModel):
         - ``"agent"``     → ``resources/default_system_prompt.txt``
         - ``"engineer"``  → ``resources/engineer_system_prompt.txt``
         - ``"custom"``    → leave the user-provided prompt intact (no override)
+
+        Worker-mode configs (``worker_mode=True``, built by
+        ``WorkerThread._build_agent_config``) are exempt: they carry their
+        definition-provided system prompt and blocklist-filtered enabled_tools,
+        so neither the factory prompt nor the mode preset is applied.
         """
+        # Workers carry their definition-provided system prompt + blocklist-filtered
+        # enabled_tools (tools/workspace/worker.py). The mode factory prompt /
+        # tool-preset stomp must NOT apply to them.
+        if self.worker_mode:
+            return self
         resources_dir = Path(__file__).resolve().parent.parent.parent / 'resources'
         if self.mode == 'agent':
             prompt_path = resources_dir / 'default_system_prompt.txt'

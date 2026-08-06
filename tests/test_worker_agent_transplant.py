@@ -1213,23 +1213,16 @@ class TestWorkerConfigForwarding:
         agent_cfg = worker_thread._build_agent_config()
         assert agent_cfg is not None
 
-        # system_prompt from definition — NOT applied here. AgentConfig
-        # mode-locks the prompt: the _apply_mode_system_prompt after-validator
-        # (agent/config/models.py:159-188) force-loads the mode's factory
-        # default (resources/default_system_prompt.txt) for mode 'agent' and
-        # 'engineer', discarding any explicit value. The fixture agent_config
-        # has no "mode" key, so mode defaults to "agent" and the worker
-        # override is ignored. The override only takes effect when the parent
-        # runs with mode == "custom" — see
-        # test_worker_system_prompt_override_requires_custom_mode below.
+        # system_prompt from definition — applied via worker_mode. Normally
+        # AgentConfig mode-locks the prompt for mode 'agent'/'engineer', but
+        # _build_agent_config() sets worker_mode=True and the
+        # _apply_mode_system_prompt after-validator (agent/config/models.py)
+        # early-returns for worker_mode configs, so the definition's explicit
+        # system_prompt is preserved even though the fixture agent_config has
+        # no "mode" key (mode defaults to "agent").
         assert agent_cfg.mode == "agent"
-        assert agent_cfg.system_prompt != "Worker override prompt."
-        from pathlib import Path
-        _factory_default = (
-            Path(__file__).resolve().parent.parent
-            / "resources" / "default_system_prompt.txt"
-        ).read_text(encoding="utf-8")
-        assert agent_cfg.system_prompt == _factory_default
+        assert agent_cfg.worker_mode is True
+        assert agent_cfg.system_prompt == "Worker override prompt."
 
         # max_turns from definition (5), not parent config (100)
         assert agent_cfg.max_turns == 5
@@ -1247,14 +1240,16 @@ class TestWorkerConfigForwarding:
         assert callable(agent_cfg.stop_check)
         assert agent_cfg.stop_check() is False
 
-    def test_worker_system_prompt_override_requires_custom_mode(
+    def test_worker_system_prompt_override_applies_in_custom_mode(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        """Worker system_prompt override only takes effect when the parent
-        config runs in mode == 'custom'. In 'agent'/'engineer' mode the
-        AgentConfig after-validator (_apply_mode_system_prompt,
-        agent/config/models.py:159-188) replaces it with the mode's factory
-        default prompt."""
+        """Worker system_prompt override applies in mode == 'custom' too.
+        Regardless of the parent config's mode, _build_agent_config() marks
+        the worker's AgentConfig with worker_mode=True and the
+        _apply_mode_system_prompt after-validator (agent/config/models.py)
+        early-returns for worker_mode configs, so the mode factory prompt
+        never replaces the worker's definition prompt (see also
+        test_worker_overrides_take_precedence for the mode='agent' default)."""
         from pathlib import Path as _Path
         from tools.workspace.worker import WorkerThread
 
@@ -1280,6 +1275,7 @@ class TestWorkerConfigForwarding:
         agent_cfg = wt._build_agent_config()
         assert agent_cfg is not None
         assert agent_cfg.mode == "custom"
+        assert agent_cfg.worker_mode is True
         assert agent_cfg.system_prompt == "Worker override prompt."
 
     def test_session_permissions_forwarded(
