@@ -76,6 +76,35 @@ class TestCheckSystem:
         ):
             yield
 
+    @pytest.fixture(autouse=True)
+    def _pin_docker_guards(self):
+        """Pin the Docker-availability guards so this class is order-independent.
+        DOCKER_EXECUTOR_AVAILABLE / CONTAINER_MANAGER_AVAILABLE / DockerExecutor
+        are import-time constants in tools/workspace/check_system.py.  Under the
+        full host suite, an earlier-collected test's module-level import of the
+        ``tools`` package can leave agent.logging mid-import (the circular-import
+        cascade documented in tests/docker/test_container_lifecycle.py), so the
+        ``from docker_executor import ...`` / ``from tools.container_manager
+        import ...`` inside check_system raise ImportError when this file is
+        collected and all three guards land False.  No test in this class ever
+        patches these names, so pinning them makes every test here deterministic
+        regardless of collection order (mirrors _pin_vault_allowlist).
+        """
+        import tools.workspace.check_system as _check_system_mod
+        executor_cls = getattr(_check_system_mod, "DockerExecutor", None)
+        if executor_cls is None:
+            # check_system's import-time docker_executor import failed.  These
+            # tests only truthiness-check DockerExecutor (the ContainerManager is
+            # always mocked), so a stand-in class keeps the daemon branch
+            # reachable.
+            class _DockerExecutorStub:
+                pass
+            executor_cls = _DockerExecutorStub
+        with patch.object(_check_system_mod, "DOCKER_EXECUTOR_AVAILABLE", True), \
+             patch.object(_check_system_mod, "CONTAINER_MANAGER_AVAILABLE", True), \
+             patch.object(_check_system_mod, "DockerExecutor", executor_cls):
+            yield
+
     @patch("tools.workspace.check_system.resolve_workspace_id", return_value="ws_test")
     @patch("tools.workspace.check_system._workspace_dir")
     def test_query_permissions(self, mock_ws_dir, mock_resolve):

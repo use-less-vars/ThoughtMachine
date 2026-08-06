@@ -32,12 +32,18 @@ _SRC_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _SRC_ROOT not in sys.path:
     sys.path.insert(0, _SRC_ROOT)
 
-from tools.container_manager import (  # noqa: E402  (after sys.path bootstrap)
-    ContainerManager,
-    cleanup_session,
-    list_session_containers,
-)
-from docker_executor import ensure_workspace_volume_populated  # noqa: E402
+# NOTE: the container machinery (tools.container_manager / docker_executor) is
+# imported LAZILY inside the test methods, never at module import time.
+# Importing tools.container_manager here would pull in the whole ``tools``
+# package, which triggers a circular-import cascade (agent.logging is left
+# mid-import while thoughtmachine.security runs its ``from agent.events
+# import global_event_bus, EventType, create_event``). That ImportError sends
+# thoughtmachine.security down its ``except ImportError`` branch, permanently
+# setting global_event_bus=EventType=create_event=None and
+# EVENT_SYSTEM_AVAILABLE=False for the whole pytest process. Because
+# tests/docker/ collects FIRST, a broken thoughtmachine.security then
+# silently disables the security gate / prompt machinery for every later
+# test suite (ask_permission, permissions_roundtrip, tool_executor, ...).
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +134,7 @@ class TestContainerLifecycle:
 
     def _start_manager(self, session_permissions=None, workspace_id=None, session_id=None):
         """Start a ContainerManager-backed container and track it for teardown."""
+        from tools.container_manager import ContainerManager  # lazy (see module docstring)
         manager = ContainerManager(
             workspace_path=str(self.workspace_dir),
             session_id=session_id,
@@ -154,6 +161,7 @@ class TestContainerLifecycle:
 
     def test_volume_population_syncs_workspace(self):
         """Workspace files are copied into the named volume (copy, not bind)."""
+        from docker_executor import ensure_workspace_volume_populated  # lazy (see module docstring)
         workspace_id = uuid.uuid4()
         session_id = uuid.uuid4()
         manager, res = self._start_manager(
@@ -208,6 +216,7 @@ class TestContainerLifecycle:
 
     def test_session_cleanup_removes_containers(self):
         """cleanup_session removes every container labelled with the session id."""
+        from tools.container_manager import cleanup_session, list_session_containers  # lazy
         session_id = uuid.uuid4()
         manager, res = self._start_manager(session_id=session_id)
         assert res["status"] == "created"
@@ -222,6 +231,7 @@ class TestContainerLifecycle:
 
     def test_orphan_cleanup_fake_label(self):
         """Orphaned containers carrying a session label are reclaimed."""
+        from tools.container_manager import cleanup_session, list_session_containers  # lazy
         fake_session_id = str(uuid.uuid4())
         orphan = self.client.containers.run(
             image=self.image_tag,
