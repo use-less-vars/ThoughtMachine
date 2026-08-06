@@ -285,6 +285,7 @@ class ToolExecutor:
             # Inject effective permissions for in-tool atomic re-checks
             if GATE_AVAILABLE and session_perms_obj is not None:
                 tool_args['effective_permissions'] = effective
+                tool_args['workspace_id'] = ws_id
             else:
                 tool_args['effective_permissions'] = {}
 

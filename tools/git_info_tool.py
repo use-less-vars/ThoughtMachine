@@ -7,6 +7,7 @@ import subprocess
 import os
 from pathlib import Path
 from .base import ToolBase
+from security.sandboxed_execution import SandboxedExecution
 
 
 # Clone URL protocol allowlist. ``git clone`` accepts arbitrary transport URLs
@@ -49,6 +50,12 @@ class GitInfoTool(ToolBase):
     working_dir: Optional[str] = Field(
         default=None,
         description="Path to git repository root (defaults to workspace root)"
+    )
+
+    workspace_id: Optional[str] = Field(
+        default=None,
+        description="Workspace identifier used to locate vault-backed hooks "
+        "(~/.thoughtmachine/hooks/<workspace_id>/<hook_name>)"
     )
     
     # Operation-specific parameters
@@ -323,6 +330,10 @@ class GitInfoTool(ToolBase):
                 return self._truncate_output(f"Unknown operation: {self.operation}")
         
         except Exception as e:
+            if isinstance(e, (RuntimeError, PermissionError)):
+                # Vault hook failures and permission denials are hard errors:
+                # surface them instead of swallowing into a generic string.
+                raise
             return self._truncate_output(f"Error executing git operation: {e}")
     
     def _run_git(self, repo_root: Path, args: List[str], timeout: int = 30) -> str:
@@ -334,38 +345,48 @@ class GitInfoTool(ToolBase):
         self._validate_repo_root(repo_root)
 
         try:
-            # Hardened environment: never trust ambient git configuration.
-            # Ignore system/global config (~/.gitconfig, /etc/gitconfig) and
-            # point HOME at /dev/null so host-user aliases, credential
-            # helpers, or include.path tricks cannot be injected into the
-            # subprocess.
-            env = os.environ.copy()
-            env["GIT_CONFIG_NOSYSTEM"] = "1"
-            env["GIT_CONFIG_GLOBAL"] = "/dev/null"
-            env["GIT_CONFIG_SYSTEM"] = "/dev/null"
-            env["HOME"] = "/dev/null"
-
             # Hardened args, applied to EVERY git invocation: hooks are
             # neutralized (core.hooksPath=/dev/null), external diff drivers /
-            # textconv filters and the fsmonitor helper are disabled.
+            # textconv filters, fsmonitor helpers and credential helpers are
+            # disabled so ambient or repo-local config cannot inject
+            # executable behavior.
             hardened_args = [
                 "-c", "core.hooksPath=/dev/null",
-                "-c", "diff.external=/bin/true",
-                "-c", "core.fsmonitor=/bin/true",
+                "-c", "diff.external=",
+                "-c", "core.fsmonitor=",
+                "-c", "filter.clean=",
+                "-c", "filter.smudge=",
+                "-c", "diff.textconv=",
+                "-c", "credential.helper=",
             ]
             # commit additionally skips pre-commit/commit-msg hooks via
             # --no-verify as a second line of defense.
             if args and args[0] == "commit":
                 args = [args[0], "--no-verify"] + args[1:]
 
-            result = subprocess.run(
+            executor = SandboxedExecution(
+                session_permissions=self.session_permissions,
+                workspace_id=getattr(self, "workspace_id", None),
+                logger=getattr(self, "_logger", None) or logging.getLogger(__name__),
+            )
+            # Permission gate: enforce git:read/git:write ONLY when session
+            # permissions are present (the ToolExecutor always injects them,
+            # falling back to DEFAULT_SESSION_PERMISSIONS; legacy/direct
+            # callers without permissions keep the hermetic-environment
+            # guarantees but skip the gate).
+            required_category = None
+            if self.session_permissions is not None:
+                required_category = f"git:{self._get_operation_level(args)}"
+
+            result = executor.run(
                 ["git"] + hardened_args + args,
-                cwd=repo_root,
-                env=env,
-                capture_output=True,
-                text=True,
+                cwd=str(repo_root),
                 timeout=timeout,
-                check=False  # We'll handle errors manually
+                required_category=required_category,
+                extra_env={
+                    "GIT_PAGER": "cat",
+                    "GIT_CONFIG_SYSTEM": "/dev/null",
+                },
             )
             if result.returncode != 0:
                 return f"Git command failed (exit code {result.returncode}):\n{result.stderr}"
@@ -374,9 +395,75 @@ class GitInfoTool(ToolBase):
             return "Git command timed out"
         except FileNotFoundError:
             return "Git command not found (git may not be installed)"
+        except PermissionError:
+            # Fail closed: a denied git:read/git:write permission must surface
+            # to the caller, not be swallowed into a generic error string.
+            raise
         except Exception as e:
             return f"Error running git command: {e}"
     
+    def _get_operation_level(self, args: List[str]) -> str:
+        """Return the permission level ('read'/'write') for a git invocation.
+
+        Derived from the declared operation: anything that mutates repository
+        state (commit/init/clone) requires ``git:write``; everything else is
+        ``git:read``. ``args`` is accepted for future operation-level
+        granularity (e.g. write detection for internal helper invocations).
+        """
+        if self.operation in ("commit", "init", "clone"):
+            return "write"
+        return "read"
+
+    def _run_vault_hooks(self, repo_root: Path, hook_name: str) -> None:
+        """Run a vault-managed hook script before a git operation.
+
+        Vault hooks live in ``~/.thoughtmachine/hooks/<workspace_id>/<hook_name>``
+        and are the ONLY sanctioned extension point for policy injection:
+        repository-local ``.git/hooks/`` scripts are never executed (the
+        hardened runner neutralizes them via ``core.hooksPath=/dev/null`` and
+        ``--no-verify``).
+
+        Raises:
+            RuntimeError: if the hook exists but exits non-zero.
+            PermissionError: if session permissions deny ``git:write``
+                (fail closed -- hooks are write-side policy).
+        """
+        workspace_id = getattr(self, "workspace_id", None)
+        if not workspace_id:
+            if getattr(self, "_logger", None):
+                self._logger.debug(
+                    "GitInfoTool: no workspace_id, skipping vault %s hook", hook_name
+                )
+            return
+
+        hook_path = (
+            Path.home() / ".thoughtmachine" / "hooks" / str(workspace_id) / hook_name
+        )
+        if not hook_path.is_file():
+            if getattr(self, "_logger", None):
+                self._logger.debug("GitInfoTool: vault hook not found: %s", hook_path)
+            return
+
+        executor = SandboxedExecution(
+            session_permissions=self.session_permissions,
+            workspace_id=str(workspace_id),
+            logger=getattr(self, "_logger", None) or logging.getLogger(__name__),
+        )
+        # Enforce git:write only when session permissions are present (the
+        # ToolExecutor always injects them; legacy/direct callers without
+        # permissions keep the sandbox's hermetic-environment guarantees).
+        required_category = "git:write" if self.session_permissions is not None else None
+        result = executor.run(
+            [str(hook_path)],
+            cwd=str(repo_root),
+            required_category=required_category,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Vault {hook_name} hook failed (exit {result.returncode}): "
+                f"{result.stderr.strip()}"
+            )
+
     def _git_status(self, repo_root: Path) -> str:
         """Run git status."""
         output = self._run_git(repo_root, ["status", "--porcelain=v1"])
@@ -387,7 +474,10 @@ class GitInfoTool(ToolBase):
     
     def _git_diff(self, repo_root: Path) -> str:
         """Run git diff."""
-        args = ["diff"]
+        # Belt-and-suspenders for Bug A: --no-ext-diff guarantees external
+        # diff drivers can never render diffs (hardened_args also clears
+        # diff.external).
+        args = ["diff", "--no-ext-diff"]
         if self.commit1:
             args.append(self.commit1)
         if self.commit2:
@@ -396,15 +486,24 @@ class GitInfoTool(ToolBase):
             # If only commit1 is specified, compare commit1 to working tree
             pass
         if self.file_path:
-            # Validate file path is within workspace
+            # Validate file paths are within workspace (list-safe)
             try:
-                # Compute absolute path relative to repo_root
-                file_abs = (repo_root / self.file_path).resolve()
-                validated_abs = self._validate_path(str(file_abs))
-                # Convert to path relative to repo_root for git
-                file_rel = Path(validated_abs).relative_to(repo_root)
-                args.append("--")
-                args.append(str(file_rel))
+                paths = self.file_path if isinstance(self.file_path, list) else [self.file_path]
+                rels = []
+                for p in paths:
+                    if not isinstance(p, str):
+                        raise ValueError(
+                            f"Invalid file path type: {type(p).__name__} (expected str)"
+                        )
+                    # Compute absolute path relative to repo_root
+                    file_abs = (repo_root / p).resolve()
+                    validated_abs = self._validate_path(str(file_abs))
+                    # Convert to path relative to repo_root for git
+                    rels.append(str(Path(validated_abs).relative_to(repo_root)))
+                # Single '--' marker, then all paths (not one marker per path)
+                if rels:
+                    args.append("--")
+                    args.extend(rels)
             except ValueError as e:
                 return self._truncate_output(f"Error: {e}")
         output = self._run_git(repo_root, args)
@@ -422,15 +521,24 @@ class GitInfoTool(ToolBase):
         if self.grep:
             args.append(f"--grep={self.grep}")
         if self.file_path:
-            # Validate file path is within workspace
+            # Validate file paths are within workspace (list-safe)
             try:
-                # Compute absolute path relative to repo_root
-                file_abs = (repo_root / self.file_path).resolve()
-                validated_abs = self._validate_path(str(file_abs))
-                # Convert to path relative to repo_root for git
-                file_rel = Path(validated_abs).relative_to(repo_root)
-                args.append("--")
-                args.append(str(file_rel))
+                paths = self.file_path if isinstance(self.file_path, list) else [self.file_path]
+                rels = []
+                for p in paths:
+                    if not isinstance(p, str):
+                        raise ValueError(
+                            f"Invalid file path type: {type(p).__name__} (expected str)"
+                        )
+                    # Compute absolute path relative to repo_root
+                    file_abs = (repo_root / p).resolve()
+                    validated_abs = self._validate_path(str(file_abs))
+                    # Convert to path relative to repo_root for git
+                    rels.append(str(Path(validated_abs).relative_to(repo_root)))
+                # Single '--' marker, then all paths (not one marker per path)
+                if rels:
+                    args.append("--")
+                    args.extend(rels)
             except ValueError as e:
                 return self._truncate_output(f"Error: {e}")
         output = self._run_git(repo_root, args)
@@ -526,6 +634,12 @@ class GitInfoTool(ToolBase):
         # Then commit
         if not self.message:
             return "Error: message is required for commit operation"
+
+        # Vault-backed pre-commit hook (write-side policy). Runs after staging
+        # (mirroring git semantics) and BEFORE the commit; a non-zero exit
+        # aborts the commit. Repository-local .git/hooks are never consulted.
+        self._run_vault_hooks(repo_root, "pre-commit")
+
         args = ["commit", "-m", self.message]
         output = self._run_git(repo_root, args)
         return self._truncate_output(output)

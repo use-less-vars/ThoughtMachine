@@ -17,6 +17,7 @@ NOTE: this suite intentionally never writes to the real $HOME. Any hostile
 so even monkeypatched HOME values in this file are purely belt-and-braces).
 """
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -39,6 +40,17 @@ def _run_git_clean(cwd: Path, *args) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
     )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def git_available():
+    """Skip the whole module when git is not installed (e.g. minimal containers).
+
+    The hardening contract is exercised with real git on hosts that have it;
+    in sandboxes without a git binary the suite skips instead of erroring.
+    """
+    if shutil.which("git") is None:
+        pytest.skip("git binary not available in this environment")
 
 
 @pytest.fixture
@@ -150,3 +162,168 @@ def test_ambient_global_config_is_ignored(hardened_repo, monkeypatch, tmp_path):
     log = _run_git_clean(repo, "log", "--format=%an <%ae>")
     assert "EVIL_GLOBAL" not in log.stdout
     assert "Test User <test@example.com>" in log.stdout
+
+
+# -- Deliverable 2: vault-backed hooks + hardened runner extensions ----------
+
+FULL_PERMISSIONS = {
+    "git": "write",
+    "container": False,
+    "network": "banned",
+    "filesystem": "read",
+    "system": "read",
+    "execution": "banned",
+}
+
+
+def _vault_commit_tool(workspace, repo, ws_id, message="vault hook commit"):
+    return GitInfoTool(
+        operation="commit",
+        message=message,
+        working_dir=str(repo),
+        workspace_path=str(workspace),
+        workspace_id=ws_id,
+        session_permissions=dict(FULL_PERMISSIONS),
+    )
+
+
+def test_repo_hooks_never_execute(hardened_repo):
+    """A post-commit hook in the repo must never run during a commit."""
+    workspace, repo, _ = hardened_repo
+    hook = repo / ".git" / "hooks" / "post-commit"
+    hook.write_text("#!/bin/sh\necho PWNED > post_commit_marker.txt\n")
+    hook.chmod(0o111)
+    post_marker = repo / "post_commit_marker.txt"
+
+    (repo / "hello.txt").write_text("hi\n")
+    _run_git_clean(repo, "add", "hello.txt")
+    result = _commit_tool(workspace, repo).execute()
+    assert "Git command failed" not in result
+    assert not post_marker.exists()
+
+
+def test_fsmonitor_config_not_executed(hardened_repo):
+    """A repo-local core.fsmonitor helper must never be executed."""
+    workspace, repo, _ = hardened_repo
+    helper = repo / "fsmonitor_helper.sh"
+    helper.write_text("#!/bin/sh\necho PWNED > fsmonitor_marker.txt\n")
+    helper.chmod(0o111)
+    _run_git_clean(repo, "config", "core.fsmonitor", str(helper))
+    fsmon_marker = repo / "fsmonitor_marker.txt"
+
+    (repo / "a.txt").write_text("a\n")
+    tool = GitInfoTool(
+        operation="status",
+        working_dir=str(repo),
+        workspace_path=str(workspace),
+    )
+    result = tool.execute()
+    assert "a.txt" in result
+    assert "Git command failed" not in result
+    assert not fsmon_marker.exists()
+
+
+def test_vault_pre_commit_hook_runs(tmp_path, monkeypatch):
+    """A vault-managed pre-commit hook runs before the commit and passes."""
+    workspace = tmp_path / "workspace"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+    _run_git_clean(repo, "init", "-q")
+    _run_git_clean(repo, "config", "user.name", "Test User")
+    _run_git_clean(repo, "config", "user.email", "test@example.com")
+
+    ws_id = "ws-vault-test"
+    hooks_dir = tmp_path / ".thoughtmachine" / "hooks" / ws_id
+    hooks_dir.mkdir(parents=True)
+    hook = hooks_dir / "pre-commit"
+    hook.write_text("#!/bin/sh\ntouch vault_marker.txt\n")
+    hook.chmod(0o111)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    vault_marker = repo / "vault_marker.txt"
+
+    (repo / "hello.txt").write_text("hi\n")
+    _run_git_clean(repo, "add", "hello.txt")
+    result = _vault_commit_tool(workspace, repo, ws_id).execute()
+    assert "Git command failed" not in result
+    assert "Error executing git operation" not in result
+    assert vault_marker.exists()  # the vault hook actually ran
+
+    log = _run_git_clean(repo, "log", "--oneline")
+    assert log.returncode == 0
+    assert "vault hook commit" in log.stdout
+
+
+def test_vault_pre_commit_hook_failure_aborts_commit(tmp_path, monkeypatch):
+    """A vault pre-commit hook exiting non-zero aborts the commit."""
+    workspace = tmp_path / "workspace"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+    _run_git_clean(repo, "init", "-q")
+    _run_git_clean(repo, "config", "user.name", "Test User")
+    _run_git_clean(repo, "config", "user.email", "test@example.com")
+
+    ws_id = "ws-vault-fail"
+    hooks_dir = tmp_path / ".thoughtmachine" / "hooks" / ws_id
+    hooks_dir.mkdir(parents=True)
+    hook = hooks_dir / "pre-commit"
+    hook.write_text("#!/bin/sh\necho 'blocked by policy' >&2\nexit 1\n")
+    hook.chmod(0o111)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    (repo / "hello.txt").write_text("hi\n")
+    _run_git_clean(repo, "add", "hello.txt")
+    with pytest.raises(RuntimeError):
+        _vault_commit_tool(workspace, repo, ws_id).execute()
+
+    log = _run_git_clean(repo, "log", "--oneline")
+    assert log.returncode != 0  # no commit was created
+
+
+def test_commit_denied_without_git_write_permission(hardened_repo):
+    """Committing without git:write fails closed with PermissionError."""
+    workspace, repo, _ = hardened_repo
+    (repo / "hello.txt").write_text("hi\n")
+    _run_git_clean(repo, "add", "hello.txt")
+    tool = GitInfoTool(
+        operation="commit",
+        message="nope",
+        working_dir=str(repo),
+        workspace_path=str(workspace),
+        session_permissions={
+            "git": "read",
+            "container": False,
+            "network": "banned",
+            "filesystem": "read",
+            "system": "read",
+            "execution": "banned",
+        },
+    )
+    with pytest.raises(PermissionError):
+        tool.execute()
+    log = _run_git_clean(repo, "log", "--oneline")
+    assert log.returncode != 0  # nothing was committed
+
+
+def test_normal_git_operations(hardened_repo):
+    """Read-only operations keep working through the hardened runner."""
+    workspace, repo, _ = hardened_repo
+    (repo / "a.txt").write_text("a\n")
+    _run_git_clean(repo, "add", "a.txt")
+    _commit_tool(workspace, repo, message="base").execute()
+
+    for op, kwargs in (
+        ("status", {}),
+        ("diff", {}),
+        ("log", {}),
+        ("show", {"commit": "HEAD"}),
+        ("config", {}),
+    ):
+        tool = GitInfoTool(
+            operation=op,
+            working_dir=str(repo),
+            workspace_path=str(workspace),
+            **kwargs,
+        )
+        result = tool.execute()
+        assert "Git command failed" not in result
+        assert "Error running git command" not in result
