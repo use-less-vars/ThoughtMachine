@@ -121,7 +121,14 @@ class TestRestrictionReason:
         assert state.restrictions_active is True
 
     def test_restriction_reason_cleared_when_time_returns_to_low(self, state: AgentState):
-        """When time state goes back to LOW, restriction_reason should be cleared."""
+        """When time state goes back to LOW, restriction_reason is cleared but the
+        restriction itself is intentionally STICKY: restrictions_active stays True.
+
+        Product semantics (agent/core/state.py): the update_time_state() LOW
+        transition clears only restriction_reason (line 247) and NEVER clears
+        restrictions_active — the timeout is a hard stop for the turn, so work
+        tools remain blocked until the turn ends (state.reset()).
+        """
         # First trigger CRITICAL
         state.time_start = 0.0
         state.timeout_seconds = 1
@@ -129,13 +136,21 @@ class TestRestrictionReason:
         state.update_time_state(999.0)
         assert state.restriction_reason == 'timeout'
 
-        # Now simulate time returning to LOW (reset)
+        # Now simulate time returning to LOW (elapsed back under the timeout)
         state.time_start = None
         state.update_time_state(0.0)
         assert state.restriction_reason is None, (
             f"Expected None after time returns to LOW, got {state.restriction_reason}"
         )
-        assert state.restrictions_active is False
+        # Hard stop: restrictions stay ACTIVE even though the reason is cleared
+        assert state.restrictions_active is True, (
+            "Expected restrictions_active to STAY True after time returns to LOW "
+            "(timeout is a hard stop for the turn)"
+        )
+        # Enforcement is still in place: work tools remain blocked
+        assert 'Thought' not in state.get_allowed_tools(), (
+            f"Work tools should remain blocked, got {state.get_allowed_tools()}"
+        )
 
     def test_restriction_reason_cleared_when_token_returns_to_low(self, state: AgentState):
         """When token state goes back to LOW, restriction_reason should be cleared."""

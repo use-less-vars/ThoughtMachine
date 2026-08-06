@@ -381,8 +381,16 @@ class TestTimeoutEnforcesRestrictions:
             assert agent.state.restrictions_active, (
                 "Expected restrictions_active=True after timeout"
             )
-            assert agent.state.restriction_reason == 'timeout', (
-                f"Expected restriction_reason='timeout', got {agent.state.restriction_reason}"
+            # Both monitors are CRITICAL here: timeout_seconds=0 makes time_state
+            # CRITICAL on every turn, and max_turns=5 makes turn_state CRITICAL at
+            # turn 4 (critical_turn = max(5-5, 5-1) = 4, state.py:269). In the agent
+            # loop update_turn_state runs AFTER update_time_state
+            # (agent/core/agent.py:947 vs 969) and its CRITICAL branch overwrites the
+            # reason with 'turn' (agent/core/state.py:304) — last writer wins.
+            # Both reasons enforce the same outcome: only Respond is allowed.
+            assert agent.state.restriction_reason == 'turn', (
+                f"Expected restriction_reason='turn' (turn monitor is last writer), "
+                f"got {agent.state.restriction_reason}"
             )
             # Only Respond should be allowed
             allowed = agent.state.get_allowed_tools()
@@ -1205,8 +1213,23 @@ class TestWorkerConfigForwarding:
         agent_cfg = worker_thread._build_agent_config()
         assert agent_cfg is not None
 
-        # system_prompt from definition
-        assert agent_cfg.system_prompt == "Worker override prompt."
+        # system_prompt from definition — NOT applied here. AgentConfig
+        # mode-locks the prompt: the _apply_mode_system_prompt after-validator
+        # (agent/config/models.py:159-188) force-loads the mode's factory
+        # default (resources/default_system_prompt.txt) for mode 'agent' and
+        # 'engineer', discarding any explicit value. The fixture agent_config
+        # has no "mode" key, so mode defaults to "agent" and the worker
+        # override is ignored. The override only takes effect when the parent
+        # runs with mode == "custom" — see
+        # test_worker_system_prompt_override_requires_custom_mode below.
+        assert agent_cfg.mode == "agent"
+        assert agent_cfg.system_prompt != "Worker override prompt."
+        from pathlib import Path
+        _factory_default = (
+            Path(__file__).resolve().parent.parent
+            / "resources" / "default_system_prompt.txt"
+        ).read_text(encoding="utf-8")
+        assert agent_cfg.system_prompt == _factory_default
 
         # max_turns from definition (5), not parent config (100)
         assert agent_cfg.max_turns == 5
@@ -1223,6 +1246,41 @@ class TestWorkerConfigForwarding:
         # stop_check is a callable that returns False initially
         assert callable(agent_cfg.stop_check)
         assert agent_cfg.stop_check() is False
+
+    def test_worker_system_prompt_override_requires_custom_mode(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Worker system_prompt override only takes effect when the parent
+        config runs in mode == 'custom'. In 'agent'/'engineer' mode the
+        AgentConfig after-validator (_apply_mode_system_prompt,
+        agent/config/models.py:159-188) replaces it with the mode's factory
+        default prompt."""
+        from pathlib import Path as _Path
+        from tools.workspace.worker import WorkerThread
+
+        # Neutralize ~/.thoughtmachine/custom_system_prompt.txt so the
+        # field-validator fallback is deterministic on any machine.
+        monkeypatch.setattr(_Path, "home", staticmethod(lambda: tmp_path))
+
+        wt = WorkerThread(
+            name="test-custom-mode-prompt",
+            definition={"system_prompt": "Worker override prompt."},
+            agent_config={
+                "provider": "scripted",
+                "model": "mock-model",
+                "api_key": "sk-test",
+                "mode": "custom",
+            },
+            workspace_dir=tmp_path,
+            tool_classes={},
+            session_permissions={},
+            project_root=None,
+            timeout_seconds=30,
+        )
+        agent_cfg = wt._build_agent_config()
+        assert agent_cfg is not None
+        assert agent_cfg.mode == "custom"
+        assert agent_cfg.system_prompt == "Worker override prompt."
 
     def test_session_permissions_forwarded(
         self, worker_thread: Any
