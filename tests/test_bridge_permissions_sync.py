@@ -55,17 +55,19 @@ class TestBridgePermissionsRoundtrip:
 
     def test_apply_config_accepts_custom_permissions(self, temp_store):
         """apply_config with filesystem=banned stores it on self._config."""
-        bridge = WebAgentBridge(event_callback=lambda e: None)
-        bridge._session_store = temp_store
+        bridge = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
 
         result = bridge.apply_config({
             "session_permissions": {"filesystem": "banned"},
         })
-        assert result == {"success": True}, f"apply_config failed: {result}"
-
+        # apply_config now returns an enriched dict, not {"success": True}
+        assert "config" in result and "merged_config" in result, f"apply_config failed: {result}"
+        assert result["permissions"]["filesystem"] == "banned", (
+            f"Expected permissions.filesystem=banned, got {result['permissions']}"
+        )
         config = bridge.get_config()
         assert config is not None
-        assert config.session_permissions.filesystem == "banned"
+        assert config["session_permissions"]["filesystem"] == "banned"
 
     # ------------------------------------------------------------------
     # 1b) roundtrip: save → load ⇒ permissions preserved
@@ -74,8 +76,7 @@ class TestBridgePermissionsRoundtrip:
     def test_roundtrip_preserves_permissions(self, temp_store):
         """save_session followed by load_session preserves filesystem=banned."""
         # ── write ─────────────────────────────────────────────────────
-        bridge = WebAgentBridge(event_callback=lambda e: None)
-        bridge._session_store = temp_store
+        bridge = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
 
         bridge.apply_config({
             "session_permissions": {"filesystem": "banned"},
@@ -89,21 +90,20 @@ class TestBridgePermissionsRoundtrip:
         assert path is not None, "session file not found on disk"
         with open(path, "r") as f:
             raw = json.load(f)
-        perms_disk = raw.get("metadata", {}).get("agent_config", {}).get("session_permissions", {})
+        perms_disk = raw.get("metadata", {}).get("session_config", {}).get("session_permissions", {})
         assert perms_disk.get("filesystem") == "banned", (
             f"Expected filesystem=banned on disk, got {perms_disk}"
         )
 
         # ── read ──────────────────────────────────────────────────────
-        bridge2 = WebAgentBridge(event_callback=lambda e: None)
-        bridge2._session_store = temp_store
+        bridge2 = WebAgentBridge(event_callback=lambda e: None, session_store=temp_store)
         loaded_ok = bridge2.load_session(session_id)
         assert loaded_ok, "load_session returned False"
 
         config = bridge2.get_config()
         assert config is not None
-        assert config.session_permissions.filesystem == "banned", (
-            f"Expected filesystem=banned after load, got {config.session_permissions.filesystem}"
+        assert config["session_permissions"]["filesystem"] == "banned", (
+            f"Expected filesystem=banned after load, got {config['session_permissions']}"
         )
 
 

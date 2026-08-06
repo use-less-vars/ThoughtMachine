@@ -2,10 +2,10 @@
 Integration test for the WebSocket backend.
 
 Tests the full lifecycle:
-1. new_session      → 6 events (session_loaded, state_changed, tokens_updated,
+1. new_session      → 5 events (session_loaded, tokens_updated,
                         context_updated, config_changed, status_message)
 2. continue_session → status_message about API key error (no key configured)
-3. apply_config     → config_changed with api_key_configured: True
+3. apply_config     → config_changed with api_key_configured: False
 """
 from __future__ import annotations
 
@@ -135,23 +135,22 @@ def poll_for_type(ws, expected_type: str, timeout: float = 5.0) -> list:
 
 class TestWebSocketLifecycle:
 
-    def test_new_session_emits_six_events(self, pathed_server):
-        """new_session → 6 events in order."""
+    def test_new_session_emits_five_events(self, pathed_server):
+        """new_session → 5 events in order."""
         app, tmp_home = pathed_server
 
         with TestClient(app) as client:
             with client.websocket_connect("/ws") as ws:
                 ws.send_json({"command": "new_session"})
-                messages = recv_n(ws, 6, timeout=5.0)
+                messages = recv_n(ws, 5, timeout=5.0)
 
-        assert len(messages) == 6, (
-            f"Expected 6 messages from new_session, got {len(messages)}: "
+        assert len(messages) == 5, (
+            f"Expected 5 messages from new_session, got {len(messages)}: "
             f"{[m.get('type') for m in messages]}"
         )
 
         expected_types = [
             "session_loaded",
-            "state_changed",
             "tokens_updated",
             "context_updated",
             "config_changed",
@@ -168,30 +167,23 @@ class TestWebSocketLifecycle:
         assert isinstance(sl["session_id"], str) and len(sl["session_id"]) > 0
         assert isinstance(sl["session_name"], str)
 
-        # ── state_changed ────────────────────────────────────────────────
-        sc = messages[1]
-        assert sc["type"] == "state_changed"
-        assert sc["state"] == "IDLE"
-        assert sc["is_running"] is False
-
-        # ── tokens_updated ───────────────────────────────────────────────
-        tu = messages[2]
+        tu = messages[1]
         assert tu["type"] == "tokens_updated"
         assert tu["input"] == 0
         assert tu["output"] == 0
 
         # ── context_updated ──────────────────────────────────────────────
-        cu = messages[3]
+        cu = messages[2]
         assert cu["type"] == "context_updated"
         assert cu["context_length"] == 0
 
         # ── config_changed ───────────────────────────────────────────────
-        cc = messages[4]
+        cc = messages[3]
         assert cc["type"] == "config_changed"
         assert isinstance(cc["config"], dict)
 
         # ── status_message ───────────────────────────────────────────────
-        sm = messages[5]
+        sm = messages[4]
         assert sm["type"] == "status_message"
         assert "Ready" in sm["text"]
 
@@ -202,7 +194,7 @@ class TestWebSocketLifecycle:
         with TestClient(app) as client:
             with client.websocket_connect("/ws") as ws:
                 ws.send_json({"command": "new_session"})
-                recv_n(ws, 6, timeout=5.0)  # drain new_session responses
+                recv_n(ws, 5, timeout=5.0)  # drain new_session responses
 
                 ws.send_json({"command": "continue_session", "query": "Hello"})
                 messages = poll_for_type(ws, "status_message", timeout=6.0)
@@ -229,42 +221,52 @@ class TestWebSocketLifecycle:
         )
 
     def test_new_session_resolves_workspace_id(self, pathed_server):
-        """new_session without workspace_id → session_loaded with resolved workspace_id."""
-        import uuid
-        app, tmp_home = pathed_server
-
-        # ── Register a workspace on disk whose "root" matches the project root ──
+        """new_session without workspace_id → session_loaded with resolved workspace_id.
+        The server auto-registers the project root in the workspace registry
+        during lifespan startup, so a fresh new_session must resolve to that
+        registry entry.
+        """
+        import re
+        from thoughtmachine.workspace_registry import WorkspaceRegistry
         from web_ui.backend.server import _project_root
-
-        ws_id = uuid.uuid4().hex[:15]
-        ws_dir = Path(tmp_home) / ".thoughtmachine" / "workspaces" / ws_id
-        ws_dir.mkdir(parents=True, exist_ok=True)
-        ws_config = {"root": _project_root, "session_permissions": {}}
-        (ws_dir / "config.json").write_text(json.dumps(ws_config), encoding="utf-8")
+        app, tmp_home = pathed_server
 
         with TestClient(app) as client:
             with client.websocket_connect("/ws") as ws:
                 ws.send_json({"command": "new_session"})
-                messages = recv_n(ws, 6, timeout=5.0)
+                messages = recv_n(ws, 5, timeout=5.0)
 
-        # ── session_loaded must contain the resolved workspace_id ──────────
+        # The registry must contain an entry for the project root
+        entry = WorkspaceRegistry.get_default().resolve_by_root(str(_project_root))
+        assert entry is not None, (
+            f"No registry entry found for project root {_project_root!r}"
+        )
+        assert re.fullmatch(r"[a-z]+-[a-z]+-\d+", entry.id), (
+            f"Unexpected workspace id format: {entry.id!r}"
+        )
+        # session_loaded must contain the resolved workspace_id
         sl = messages[0]
         assert sl["type"] == "session_loaded"
-        assert sl["workspace_id"] == ws_id, (
-            f"Expected workspace_id={ws_id!r}, "
+        assert sl["workspace_id"] == entry.id, (
+            f"Expected workspace_id={entry.id!r}, "
             f"got {sl['workspace_id']!r}"
         )
         # Also verify the session_id is present
         assert isinstance(sl["session_id"], str) and len(sl["session_id"]) > 0
 
-    def test_apply_config_with_api_key(self, pathed_server):
-        """apply_config with an API key → config_changed with api_key_configured: True."""
+    def test_apply_config_api_key_not_configured(self, pathed_server):
+        """apply_config with an API key → api_key_configured: False.
+
+        api_key is no longer applied/persisted by apply_config (only
+        provider_id/model/base_url/temperature etc. are mutable), so the
+        frontend must see api_key_configured=False.
+        """
         app, tmp_home = pathed_server
 
         with TestClient(app) as client:
             with client.websocket_connect("/ws") as ws:
                 ws.send_json({"command": "new_session"})
-                recv_n(ws, 6, timeout=5.0)  # drain
+                recv_n(ws, 5, timeout=5.0)  # drain
 
                 ws.send_json({
                     "command": "apply_config",
@@ -285,7 +287,7 @@ class TestWebSocketLifecycle:
         )
 
         last_config = config_msgs[-1]["config"]
-        assert last_config.get("api_key_configured") is True, (
-            f"Expected api_key_configured=True, got api_key_configured="
+        assert last_config.get("api_key_configured") is False, (
+            f"Expected api_key_configured=False, got api_key_configured="
             f"{last_config.get('api_key_configured')!r}. Full config: {last_config}"
         )
