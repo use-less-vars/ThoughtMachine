@@ -1,11 +1,14 @@
 """
-Persistence integration test for named Docker volumes.
+Persistence integration test for the Phase-2 mount model.
 
 Tests that:
-  1. A named volume survives container stop + remove
-  2. pip-installed packages (installed into the workspace volume via
-     --target) persist across container restarts
-  3. Files written to /workspace persist across container restarts
+  1. The host workspace directory is bind-mounted at /workspace: files
+     written inside a container land in the host dir and survive container
+     stop + remove (recreate with the same workspace dir).
+  2. User-site packages (``pip install --user`` with PYTHONUSERBASE pointing
+     at /home/agent/.local) are backed by a per-workspace named volume
+     ``tm-packages-<workspace_id>``: they survive container stop + remove
+     and are visible to a new container created with the same workspace_id.
 
 Requires a real Docker daemon. Skipped if Docker is unavailable.
 """
@@ -13,7 +16,6 @@ Requires a real Docker daemon. Skipped if Docker is unavailable.
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 import time
 
@@ -23,10 +25,9 @@ import pytest
 _SRC_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _SRC_ROOT not in sys.path:
     sys.path.insert(0, _SRC_ROOT)
-from docker_executor import ensure_workspace_volume_populated  # noqa: E402
 
 
-# ── Docker availability check ──────────────────────────────────────────
+# ── Docker availability check ───────────────────────────────────────────────
 
 _DOCKER_AVAILABLE: bool = False
 """Cached result of the Docker daemon check."""
@@ -52,12 +53,12 @@ needs_docker = pytest.mark.skipif(
 )
 
 
-# ── Test ───────────────────────────────────────────────────────────────
+# ── Test ────────────────────────────────────────────────────────────────────
 
 
 @needs_docker
 class TestVolumePersistence:
-    """Verify that data written to a named volume survives container lifecycle."""
+    """Verify workspace + package persistence across container lifecycles."""
 
     @pytest.fixture(autouse=True)
     def _setup(self, tmp_path):
@@ -76,11 +77,13 @@ class TestVolumePersistence:
 
         self.client = docker.from_env()
         self.workspace_id = "test-persistence-001"
-        self.volume_name = f"tm-workspace-{self.workspace_id}"
+        # Phase-2: per-workspace package volume (mirrors docker_executor's
+        # tm-packages-<workspace_id> volume mounted at /home/agent/.local).
+        self.pkg_volume_name = f"tm-packages-{self.workspace_id}"
 
         # Build image
         image_tag = "tm-test-persistence:latest"
-        image, build_log = self.client.images.build(
+        self.client.images.build(
             path=str(self.workspace_dir),
             tag=image_tag,
             rm=True,
@@ -89,7 +92,7 @@ class TestVolumePersistence:
 
         yield
 
-        # Teardown: remove containers, volume, image
+        # Teardown: remove containers, package volume, image
         try:
             self.client.containers.get(
                 f"tm-test-persist-{self.workspace_id}"
@@ -97,7 +100,7 @@ class TestVolumePersistence:
         except (docker.errors.NotFound, docker.errors.APIError):
             pass
         try:
-            self.client.volumes.get(self.volume_name).remove(force=True)
+            self.client.volumes.get(self.pkg_volume_name).remove(force=True)
         except (docker.errors.NotFound, docker.errors.APIError):
             pass
         try:
@@ -105,16 +108,16 @@ class TestVolumePersistence:
         except (docker.errors.NotFound, docker.errors.APIError):
             pass
 
-    def _ensure_volume(self):
-        """Create the named volume if it doesn't exist."""
-        try:
-            vol = self.client.volumes.get(self.volume_name)
-        except docker.errors.NotFound:
-            vol = self.client.volumes.create(self.volume_name)
-        return vol
-
     def _create_container(self):
-        """Create a new container using the named volume."""
+        """Create a container with the Phase-2 mount layout.
+
+        - host workspace dir bind-mounted at /workspace (rw)
+        - named package volume ``tm-packages-<workspace_id>`` at
+          /home/agent/.local (auto-created by Docker on first mount; the
+          same name across restarts means the same persistent volume)
+        - PYTHONUSERBASE=/home/agent/.local so ``pip install --user`` lands
+          inside the package volume
+        """
         container_name = f"tm-test-persist-{self.workspace_id}"
         try:
             existing = self.client.containers.get(container_name)
@@ -122,27 +125,20 @@ class TestVolumePersistence:
         except docker.errors.NotFound:
             pass
 
-        vol = self._ensure_volume()
-        # Raw-SDK mount: a freshly created named volume is root-owned (0755),
-        # so the container (uid 1000:1000) cannot write to it. Populate/chown
-        # it via the product helper before mounting — this mirrors what the
-        # real executor does in its create path.
-        ensure_workspace_volume_populated(
-            self.client,
-            self.image_tag,
-            str(self.workspace_dir),
-            self.volume_name,
-            network_mode="none",
-        )
         container = self.client.containers.run(
             image=self.image_tag,
             name=container_name,
             mounts=[
                 docker.types.Mount(
                     target="/workspace",
-                    source=self.volume_name,
-                    type="volume",
+                    source=str(self.workspace_dir),
+                    type="bind",
                     read_only=False,
+                ),
+                docker.types.Mount(
+                    target="/home/agent/.local",
+                    source=self.pkg_volume_name,
+                    type="volume",
                 ),
             ],
             detach=True,
@@ -150,6 +146,7 @@ class TestVolumePersistence:
             stdin_open=True,
             command=["tail", "-f", "/dev/null"],
             user="1000:1000",
+            environment=["PYTHONUSERBASE=/home/agent/.local"],
         )
         return container
 
@@ -165,51 +162,54 @@ class TestVolumePersistence:
         stdout = output.decode() if isinstance(output, bytes) else str(output)
         return stdout, "", exit_code
 
-    def test_pip_install_survives_container_restart(self):
-        """Install a package into the volume, destroy the container, recreate, verify it's still there."""
-        # ── First container ────────────────────────────────────────────
+    def test_workspace_files_survive_container_restart(self):
+        """A file written to /workspace survives stop + remove (host dir persists)."""
+        # ── First container ────────────────────────────────────────────────
         container1 = self._create_container()
         time.sleep(1)  # let container fully start
 
-        # Install into the workspace volume (--target): a plain `pip install`
-        # would write to the container's writable layer, which is destroyed
-        # when container1 is removed below.
-        stdout, _, rc = self._exec(
-            container1, "pip install --target /workspace/pylibs requests"
-        )
-        assert rc == 0, f"pip install failed: {stdout}"
-
-        # Write a file to the workspace
         stdout, _, rc = self._exec(container1, "touch /workspace/testfile")
         assert rc == 0, f"touch failed: {stdout}"
 
-        # Verify file exists
         stdout, _, rc = self._exec(container1, "cat /workspace/testfile")
         assert rc == 0, f"File not found immediately after creation: {stdout}"
 
-        # ── Destroy first container ────────────────────────────────────
+        # ── Destroy first container ────────────────────────────────────────
         container1.stop()
         container1.remove()
 
-        # ── Second container ───────────────────────────────────────────
+        # ── Second container: same host workspace dir (bind) ───────────────
         container2 = self._create_container()
         time.sleep(1)
 
-        # Verify the package is still installed
-        stdout, _, rc = self._exec(
-            container2,
-            "python -c 'import requests; print(\"OK\")'",
-            env={"PYTHONPATH": "/workspace/pylibs"},
-        )
-        assert rc == 0, f"Package import failed: {stdout}"
-        assert "OK" in stdout, f"Package import output missing 'OK': {stdout}"
-
-        # Verify the test file still exists
         stdout, _, rc = self._exec(container2, "cat /workspace/testfile")
         assert rc == 0, (
             f"/workspace/testfile missing after container restart: stdout={stdout!r}"
         )
 
-        # Clean up second container
+        container2.stop()
+        container2.remove()
+
+    def test_user_packages_persist_via_package_volume(self):
+        """pip install --user lands in tm-packages-<id> and survives restart."""
+        # ── First container ────────────────────────────────────────────────
+        container1 = self._create_container()
+        time.sleep(1)
+
+        stdout, _, rc = self._exec(container1, "pip install --user six")
+        assert rc == 0, f"pip install --user six failed: {stdout}"
+
+        # ── Destroy first container ────────────────────────────────────────
+        container1.stop()
+        container1.remove()
+
+        # ── Second container: same workspace_id -> same package volume ─────
+        container2 = self._create_container()
+        time.sleep(1)
+
+        stdout, _, rc = self._exec(container2, "python -c 'import six; print(\"OK\")'")
+        assert rc == 0, f"Package import failed: {stdout}"
+        assert "OK" in stdout, f"Package import output missing 'OK': {stdout}"
+
         container2.stop()
         container2.remove()
