@@ -121,7 +121,8 @@ class CheckSystem(ToolBase):
                       "'worker/<name>' (specific worker config), 'capabilities' (workspace features), "
                       "'dockerfile' (container environment), 'mcp_servers' (external tool servers), "
                       "'effective_permissions' (session × workspace permissions), "
-                      "'container_status' (Docker status), 'workspace_info' (workspace metadata), "
+                      "'container_status' (Docker status), 'containers' (per-workspace container list with notes), "
+                      "'workspace_info' (workspace metadata), "
                       "'network_diagnostics' (connectivity checks), "
                       "'event_bus_status' (EventBus subscriber info), "
                       "'event_log' (tail recent EventLogger entries).",
@@ -225,6 +226,7 @@ class CheckSystem(ToolBase):
             handler_map = {
                 "effective_permissions": lambda: self._query_permissions(ws_id),
                 "container_status": lambda: self._query_container_status(workspace_path),
+                "containers": lambda: self._query_containers(workspace_path),
                 "workspace_info": lambda: self._query_workspace_info(ws_id),
                 "my_config": lambda: self._query_my_config(),
                 "network_diagnostics": lambda: self._query_network_diagnostics(ws_id, workspace_path),
@@ -306,6 +308,53 @@ class CheckSystem(ToolBase):
                 return {"status": "error", "error": str(e)}
 
         return {"status": "unavailable", "reason": "Docker executor not available"}
+
+    def _query_containers(self, ws_path: Optional[str]) -> dict:
+        """Return the per-workspace container list with sticky notes; NEVER raises.
+
+        Delegates to ``ContainerManager.list_containers()`` so the result is
+        scoped by the ``thoughtmachine.workspace_id`` label and each entry's
+        ``note`` comes from the vault bulletin board
+        (``<vault_root>/workspaces/<workspace_id>/container_notes.json``),
+        not from Docker labels.
+        """
+        ws_path = ws_path or getattr(self, 'workspace_path', None)
+        if not ws_path:
+            return {"containers": [], "count": 0, "reason": "No workspace path",
+                    "status": "unavailable"}
+
+        sp = self.session_permissions or {}
+        if not sp.get("container"):
+            return {"containers": [], "count": 0,
+                    "reason": "no container permission", "status": "unavailable"}
+
+        if _ContainerManager is None:
+            return {"containers": [], "count": 0,
+                    "reason": "Container manager not available",
+                    "status": "unavailable"}
+
+        try:
+            manager = _ContainerManager(
+                workspace_path=ws_path,
+                session_id=getattr(self, "session_id", None),
+                workspace_id=getattr(self, "workspace_id", None),
+                session_permissions=sp,
+            )
+            entries = manager.list_containers()
+        except Exception as e:
+            return {"containers": [], "count": 0,
+                    "reason": f"failed: {e}", "status": "error"}
+
+        containers = [
+            {
+                "name": entry.get("name"),
+                "status": entry.get("status"),
+                "note": entry.get("note", ""),
+                "uptime_seconds": entry.get("uptime_seconds"),
+            }
+            for entry in entries
+        ]
+        return {"containers": containers, "count": len(containers), "status": "ok"}
 
     def _query_workspace_info(self, ws_id: Optional[str]) -> dict:
         """Return workspace info including workers and MCP tools."""

@@ -148,12 +148,13 @@ class ContainerStartTool(_ContainerControlBase):
     - Non-root user execution (uid 1000:1000)
     - Memory and CPU quotas (mem_limit / cpu_quota)
 
-    Sticky notes: the optional ``note`` field attaches a note to the container
-    (stored in the ``thoughtmachine.note`` label). On a fresh create the note is
-    written into the container labels; on reuse the new note is applied
-    best-effort (docker has no label-update API, so on a stock engine the
-    daemon-side label is immutable after create) and the RESPONSE carries the
-    new note value regardless.
+    Sticky notes: the optional ``note`` field attaches a note to the container.
+    Notes live on a per-workspace vault bulletin board
+    (``<vault_root>/workspaces/<workspace_id>/container_notes.json``), never in
+    Docker labels (docker has no label-update API, so labels are immutable
+    after create on a stock engine). On a fresh create the note is written to
+    the bulletin board; on reuse a new note overwrites the stored entry, and
+    the RESPONSE carries the new note value regardless.
 
     Returns JSON with structure:
     {
@@ -178,7 +179,7 @@ class ContainerStartTool(_ContainerControlBase):
     )
     note: Optional[str] = Field(
         default=None,
-        description="Optional sticky note attached to the container (stored in the thoughtmachine.note label). On reuse, updates the note best-effort and returns the new value."
+        description="Optional sticky note attached to the container. Stored in the per-workspace vault bulletin board (container_notes.json), not in Docker labels. On reuse, overwrites the stored note and returns the new value."
     )
     mem_limit: str = Field(
         default="512m",

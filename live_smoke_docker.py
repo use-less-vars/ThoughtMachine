@@ -564,12 +564,12 @@ def main() -> int:
 
         def _p2_sticky_note():
             nonlocal p2_cid_note
-            # Sticky notes: the note label is set at CREATE time; on reuse the
-            # note is returned at the response level only. docker SDK 7.1.0 has
-            # no label-update API (Container.update forwards unknown kwargs to
-            # POST /containers/{id}/update, which ignores them), so on a real
-            # daemon the daemon-side label is immutable — we assert the
-            # response note, never the list note, for the reuse case.
+            # Sticky notes: notes live on the per-workspace vault bulletin
+            # board (<vault_root>/workspaces/<workspace_id>/container_notes.json),
+            # NOT in Docker labels (docker SDK 7.1.0 has no label-update API,
+            # so daemon-side labels are immutable after create). The note is
+            # persisted on create/reuse and read back via status() and
+            # list_containers() from any manager of the workspace.
             s1 = json.loads(ContainerStartTool(
                 name="smoke-p2-note-%s" % tag,
                 note="smoke-note-1",
@@ -613,17 +613,30 @@ def main() -> int:
             ok(s2.get("note") == "smoke-note-2",
                "reuse note %r (expected smoke-note-2)" % s2.get("note"))
             mgr_note = ContainerManager(
-                workspace_path=p2_ws, session_id=p2_session,
+                workspace_path=p2_ws, session_id=str(uuid.uuid4()),
                 workspace_id="default",
                 session_permissions=sp, image=p2_image_tag,
                 mem_limit="512m", cpu_quota=50000,
             )
+            entries = mgr_note.list_containers()
+            by_name = {c.get("name"): c for c in entries}
+            ne = by_name.get("smoke-p2-note-%s" % tag)
+            ok(ne is not None, "second-manager list missing note container")
+            ok(ne.get("note") == "smoke-note-2",
+               "second-manager list note %r (expected smoke-note-2)" % ne.get("note"))
+            s3 = mgr_note.start(name="smoke-p2-note-%s" % tag, image=p2_image_tag)
+            ok(s3.get("status") == "reused",
+               "second-manager reuse status %r (expected reused)" % s3.get("status"))
+            ok(s3.get("id") == p2_cid_note, "second-manager reuse id changed")
+            ok(s3.get("note") == "smoke-note-2",
+               "second-manager reuse note %r (expected smoke-note-2)" % s3.get("note"))
             sn = mgr_note.set_note(p2_cid_note, "smoke-note-3")
             ok(sn.get("success") is True, "set_note failed: %r" % sn)
             ok(sn.get("note") == "smoke-note-3",
                "set_note note %r (expected smoke-note-3)" % sn.get("note"))
             return ("sticky note: create(note-1) -> list note-1 -> "
-                    "reuse(note-2 response) -> set_note ok")
+                    "reuse(note-2) -> second-manager list/reuse note-2 -> "
+                    "set_note ok")
 
         def _p2_logs():
             # start() hardcodes PID 1 = `tail -f /dev/null`; docker logs

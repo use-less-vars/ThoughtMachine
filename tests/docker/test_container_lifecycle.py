@@ -17,6 +17,7 @@ config only (no network call).
 Style mirrors tests/docker/test_persistence.py.
 """
 
+import json
 import os
 import shutil
 import sys
@@ -24,6 +25,7 @@ import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import docker
@@ -460,11 +462,13 @@ class TestContainerLifecycle:
 # ─────────────────────────────────────────────────────────────────────────────
 # Sticky-note tests (mock-based, no daemon needed).
 #
-# The note feature has no real daemon-side label-update path (docker SDK 7.1.0
-# has no update_labels; Container.update(**kwargs) forwards to
-# POST /containers/{id}/update which ignores unknown fields), so these tests
-# verify the API contract with a fake client: label set at create, note in the
-# start/status/list responses, best-effort label update on reuse + set_note.
+# Notes live on a per-workspace vault bulletin board
+# (<vault_root>/workspaces/<workspace_id>/container_notes.json), NOT in Docker
+# labels (docker SDK 7.1.0 has no update_labels; Container.update(**kwargs)
+# forwards to POST /containers/{id}/update which ignores unknown fields), so
+# these tests verify the API contract with a fake client: note persisted to the
+# JSON file on create/reuse/set_note, note in the start/status/list responses,
+# no thoughtmachine.note label anywhere, and per-workspace isolation.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -543,10 +547,15 @@ class FakeContainers:
         return c
 
 
-class TestContainerNoteStickyLabel:
-    """Mock-based tests for the sticky-note feature (no daemon required)."""
+class TestContainerNoteFileStore:
+    """Mock-based tests for the sticky-note vault bulletin board (no daemon needed).
 
-    def _make_manager(self, fake_containers, workspace_id):
+    Notes are persisted to ``<vault_root>/workspaces/<workspace_id>/container_notes.json``
+    and shared by every manager of the workspace; Docker labels never carry the
+    note (docker has no label-update API, so labels are immutable after create).
+    """
+
+    def _make_manager(self, fake_containers, workspace_id, vault_root):
         # Lazy import: top-level import of tools.container_manager triggers the
         # thoughtmachine.security circular-import cascade (see module docstring).
         from tools.container_manager import ContainerManager
@@ -555,6 +564,7 @@ class TestContainerNoteStickyLabel:
         manager.workspace_path = "/tmp/tm-note-test-ws"
         manager.session_id = "note-test-session"
         manager.workspace_id = workspace_id
+        manager.vault_root = str(vault_root)
         manager.session_permissions = None
         manager.image = "agent-executor"
         manager.mem_limit = "512m"
@@ -563,70 +573,118 @@ class TestContainerNoteStickyLabel:
         manager.workspace_config = {}
         manager.max_containers = 4
         manager.client = SimpleNamespace(containers=fake_containers)
+        manager.container_notes = manager._load_container_notes()
         manager._compute_config = lambda ws, wid, sp: ("none", "ro")
         return manager
 
-    def test_start_with_note_sets_label_on_create(self):
-        fake = FakeContainers()
-        manager = self._make_manager(fake, workspace_id=str(uuid.uuid4()))
-        result = manager.start(name="note-create", note="hello")
-        assert result["status"] == "created"
-        assert result["note"] == "hello"
-        container = fake.get(result["id"])
-        assert container.labels["thoughtmachine.note"] == "hello"
+    def _notes_file(self, vault_root, workspace_id):
+        return Path(vault_root) / "workspaces" / str(workspace_id) / "container_notes.json"
 
-    def test_start_reuse_updates_note_same_container(self):
-        fake = FakeContainers()
-        manager = self._make_manager(fake, workspace_id=str(uuid.uuid4()))
-        r1 = manager.start(name="note-reuse", note="hello")
-        r2 = manager.start(name="note-reuse", note="world")
-        assert r2["status"] == "reused"
-        assert r2["id"] == r1["id"]
-        assert r2["note"] == "world"
-        container = fake.get(r1["id"])
-        assert container.labels["thoughtmachine.note"] == "world"
-        assert any("labels" in call for call in container.update_calls)
+    def _read_notes(self, vault_root, workspace_id):
+        path = self._notes_file(vault_root, workspace_id)
+        if not path.exists():
+            return {}
+        return json.loads(path.read_text(encoding="utf-8"))
 
-    def test_set_note_updates_label_and_list(self):
-        fake = FakeContainers()
-        manager = self._make_manager(fake, workspace_id=str(uuid.uuid4()))
-        r = manager.start(name="note-set", note="initial")
-        assert r["status"] == "created"
-        sn = manager.set_note(r["id"], "sticky")
-        assert sn == {"success": True, "note": "sticky"}
-        container = fake.get(r["id"])
-        assert container.labels["thoughtmachine.note"] == "sticky"
-        entries = manager.list_containers()
-        assert entries[0]["note"] == "sticky"
-        # Missing container -> error dict, never raises.
-        missing = manager.set_note("fake-nonexistent", "x")
-        assert missing["success"] is False
-        assert "error" in missing
+    def test_set_note_writes_bulletin_board_file(self):
+        vault_root = tempfile.mkdtemp(prefix="tm-note-")
+        try:
+            workspace_id = str(uuid.uuid4())
+            fake = FakeContainers()
+            manager = self._make_manager(fake, workspace_id, vault_root)
+            r = manager.start(name="note-write", note="hello")
+            assert r["status"] == "created"
+            container = fake.get(r["id"])
+            assert "thoughtmachine.note" not in container.labels
+            assert self._read_notes(vault_root, workspace_id) == {
+                "note-write": {"note": "hello"}
+            }
+            sn = manager.set_note(r["id"], "sticky")
+            assert sn == {"success": True, "note": "sticky"}
+            assert self._read_notes(vault_root, workspace_id) == {
+                "note-write": {"note": "sticky"}
+            }
+        finally:
+            shutil.rmtree(vault_root, ignore_errors=True)
 
-    def test_note_visible_in_status_and_list(self):
-        fake = FakeContainers()
-        manager = self._make_manager(fake, workspace_id=str(uuid.uuid4()))
-        r = manager.start(name="note-status", note="hello")
-        st = manager.status(r["id"])
-        assert st["status"] == "running"
-        assert st["note"] == "hello"
-        entries = manager.list_containers()
-        assert entries[0]["note"] == "hello"
+    def test_note_loaded_for_running_container(self):
+        vault_root = tempfile.mkdtemp(prefix="tm-note-")
+        try:
+            workspace_id = str(uuid.uuid4())
+            fake = FakeContainers()
+            manager = self._make_manager(fake, workspace_id, vault_root)
+            r = manager.start(name="note-status", note="hello")
+            assert r["status"] == "created"
+            st = manager.status(r["id"])
+            assert st["status"] == "running"
+            assert st["note"] == "hello"
+            entries = manager.list_containers()
+            assert entries[0]["note"] == "hello"
+        finally:
+            shutil.rmtree(vault_root, ignore_errors=True)
 
-    def test_note_persists_across_sessions_same_workspace(self):
-        workspace_id = str(uuid.uuid4())
-        fake = FakeContainers()
-        manager1 = self._make_manager(fake, workspace_id=workspace_id)
-        r1 = manager1.start(name="note-cross", note="sticky")
-        assert r1["status"] == "created"
+    def test_unknown_container_has_no_note(self):
+        vault_root = tempfile.mkdtemp(prefix="tm-note-")
+        try:
+            workspace_id = str(uuid.uuid4())
+            fake = FakeContainers()
+            manager = self._make_manager(fake, workspace_id, vault_root)
+            missing = manager.set_note("fake-nonexistent", "x")
+            assert missing["success"] is False
+            assert "error" in missing
+            notes_path = self._notes_file(vault_root, workspace_id)
+            if notes_path.exists():
+                assert json.loads(notes_path.read_text(encoding="utf-8")) == {}
+        finally:
+            shutil.rmtree(vault_root, ignore_errors=True)
 
-        # A different session, same workspace + name -> reuse, same container.
-        manager2 = self._make_manager(fake, workspace_id=workspace_id)
-        manager2.session_id = "other-session"
-        r2 = manager2.start(name="note-cross")
-        assert r2["status"] == "reused"
-        assert r2["id"] == r1["id"]
-        assert r2["note"] == "sticky"
-        entries = manager2.list_containers()
-        assert entries[0]["note"] == "sticky"
+    def test_no_thoughtmachine_note_label_on_create(self):
+        vault_root = tempfile.mkdtemp(prefix="tm-note-")
+        try:
+            workspace_id = str(uuid.uuid4())
+            fake = FakeContainers()
+            manager = self._make_manager(fake, workspace_id, vault_root)
+            r1 = manager.start(name="note-label-1", note="hello")
+            assert r1["status"] == "created"
+            assert "thoughtmachine.note" not in fake.get(r1["id"]).labels
+            r2 = manager.start(name="note-label-2")
+            assert r2["status"] == "created"
+            assert "thoughtmachine.note" not in fake.get(r2["id"]).labels
+        finally:
+            shutil.rmtree(vault_root, ignore_errors=True)
+
+    def test_notes_isolated_by_workspace(self):
+        vault_root = tempfile.mkdtemp(prefix="tm-note-")
+        try:
+            workspace_x = str(uuid.uuid4())
+            workspace_y = str(uuid.uuid4())
+            fake = FakeContainers()
+            manager1 = self._make_manager(fake, workspace_x, vault_root)
+            r1 = manager1.start(name="note-cross", note="sticky")
+            assert r1["status"] == "created"
+            assert r1["note"] == "sticky"
+
+            # A different session, same workspace + name -> reuse, same container,
+            # and the note is re-read from the bulletin board file.
+            manager2 = self._make_manager(fake, workspace_x, vault_root)
+            manager2.session_id = "other-session"
+            r2 = manager2.start(name="note-cross")
+            assert r2["status"] == "reused"
+            assert r2["id"] == r1["id"]
+            assert r2["note"] == "sticky"
+            entries = manager2.list_containers()
+            assert entries[0]["note"] == "sticky"
+
+            # Different workspace, same fake daemon: the workspace label filter
+            # hides X's containers, and the fresh create gets no note and writes
+            # no bulletin-board entry for Y.
+            manager3 = self._make_manager(fake, workspace_y, vault_root)
+            assert manager3.list_containers() == []
+            r3 = manager3.start(name="note-cross")
+            assert r3["status"] == "created"
+            assert r3["id"] != r1["id"]
+            assert r3["note"] == ""
+            assert "note-cross" not in self._read_notes(vault_root, workspace_y)
+        finally:
+            shutil.rmtree(vault_root, ignore_errors=True)
 
