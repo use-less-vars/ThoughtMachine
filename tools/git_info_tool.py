@@ -1,6 +1,6 @@
 # tools/git_info_tool.py
 import json
-from typing import ClassVar, Literal, Optional, List, Union
+from typing import Any, ClassVar, Literal, Optional, List, Union
 from pydantic import Field
 import logging
 import subprocess
@@ -22,6 +22,15 @@ class GitInfoTool(ToolBase):
     remote, blame, config) and write operations (commit, init, clone).
     Write operations are subject to the agent's ask policy.
     """
+
+    # ------------------------------------------------------------------
+    # Private runtime state. Leading-underscore attributes are assignable in
+    # Pydantic v2 (same pattern as ToolBase._logger): they are not validated
+    # fields, so they never conflict with extra="forbid".
+    # ------------------------------------------------------------------
+    _resource_manager: Optional[Any] = None
+    _resolved_workspace_path: Optional[str] = None
+    _resolved_workspace_id: Optional[str] = None
 
     @classmethod
     def get_required_categories(cls, params: dict | None = None) -> list[str]:
@@ -209,6 +218,11 @@ class GitInfoTool(ToolBase):
         return repo_root
 
     def execute(self) -> str:
+        # Reset per-call runtime state (tool instances may be reused).
+        self._resource_manager = None
+        self._resolved_workspace_path = None
+        self._resolved_workspace_id = None
+
         # Atomic permission re-check for network operations
         operation = self.operation
         network_ops = {"remote", "clone", "push", "pull", "fetch", "merge", "rebase"}
@@ -239,20 +253,21 @@ class GitInfoTool(ToolBase):
                 except ValueError as e:
                     return self._truncate_output(f"Error: {e}")
                 repo_root = Path(validated_working_dir).expanduser().resolve()
+                # Resolve the registry workspace (if any) so container-backed
+                # git execution can map host paths to /workspace. Only
+                # registry-resolved workspaces enable container mode; the
+                # deprecated workspace_path fallback and direct test callers
+                # keep the legacy host execution path.
+                ws_id, ws_path = self._resolve_registry_workspace_info()
+                if ws_path:
+                    self._resolved_workspace_id = ws_id
+                    self._resolved_workspace_path = ws_path
             elif getattr(self, 'session_id', None) or getattr(self, 'workspace_path', None):
                 # === Resolve workspace path from registries (primary) ===
-                ws_path = None
-                if self.session_id:
-                    try:
-                        from session.session_registry import SessionRegistry
-                        from thoughtmachine.workspace_registry import WorkspaceRegistry
-                        session_info = SessionRegistry.get_default().get(self.session_id)
-                        ws_id = session_info.get("workspace_id") if session_info else None
-                        if ws_id:
-                            entry = WorkspaceRegistry.get_default().get_workspace(ws_id)
-                            ws_path = entry.root_path if entry else None
-                    except Exception:
-                        pass
+                ws_id, ws_path = self._resolve_registry_workspace_info()
+                if ws_path:
+                    self._resolved_workspace_id = ws_id
+                    self._resolved_workspace_path = ws_path
 
                 # Fallback to deprecated AgentConfig.workspace_path
                 if not ws_path:
@@ -282,30 +297,25 @@ class GitInfoTool(ToolBase):
             elif self.operation == "clone":
                 return self._git_clone(repo_root)
 
-            # Validate git repository
-            git_dir = repo_root / ".git"
-            if not git_dir.exists() and not git_dir.is_dir():
-                # Try to find git root
-                try:
-                    result = subprocess.run(
-                        ["git", "rev-parse", "--show-toplevel"],
-                        cwd=repo_root,
-                        capture_output=True,
-                        text=True,
-                        timeout=10
-                    )
-                    if result.returncode != 0:
-                        return self._truncate_output(f"Not a git repository: {repo_root}")
-                    repo_root = Path(result.stdout.strip())
-                    # The resolved root may sit ABOVE the workspace (a repo
-                    # that contains the workspace); reject it before any git
-                    # operation runs against it.
-                    try:
-                        repo_root = self._validate_repo_root(repo_root)
-                    except ValueError as e:
-                        return self._truncate_output(f"Error: {e}")
-                except (subprocess.TimeoutExpired, FileNotFoundError):
-                    return self._truncate_output(f"Git not available or not a git repository: {repo_root}")
+            # Validate git repository. _git_repo_root() re-points repo_root to
+            # the actual repository root (via `git rev-parse
+            # --show-toplevel`) when <repo_root>/.git is absent; in container
+            # mode the returned /workspace path is reverse-mapped to the host
+            # path before re-validation.
+            try:
+                resolved_root = self._git_repo_root(repo_root)
+            except (subprocess.TimeoutExpired, TimeoutError, FileNotFoundError):
+                return self._truncate_output(f"Git not available or not a git repository: {repo_root}")
+            if resolved_root is None:
+                return self._truncate_output(f"Not a git repository: {repo_root}")
+            repo_root = resolved_root
+            # The resolved root may sit ABOVE the workspace (a repo
+            # that contains the workspace); reject it before any git
+            # operation runs against it.
+            try:
+                repo_root = self._validate_repo_root(repo_root)
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
             
             # Execute operation
             if self.operation == "status":
@@ -345,54 +355,15 @@ class GitInfoTool(ToolBase):
         self._validate_repo_root(repo_root)
 
         try:
-            # Hardened args, applied to EVERY git invocation: hooks are
-            # neutralized (core.hooksPath=/dev/null), external diff drivers /
-            # textconv filters, fsmonitor helpers and credential helpers are
-            # disabled so ambient or repo-local config cannot inject
-            # executable behavior.
-            hardened_args = [
-                "-c", "core.hooksPath=/dev/null",
-                "-c", "core.attributesFile=/dev/null",
-                "-c", "diff.external=",
-                "-c", "core.fsmonitor=",
-                "-c", "filter.clean=",
-                "-c", "filter.smudge=",
-                "-c", "diff.textconv=",
-                "-c", "credential.helper=",
-            ]
-            # commit additionally skips pre-commit/commit-msg hooks via
-            # --no-verify as a second line of defense.
-            if args and args[0] == "commit":
-                args = [args[0], "--no-verify"] + args[1:]
-
-            executor = SandboxedExecution(
-                session_permissions=self.session_permissions,
-                workspace_id=getattr(self, "workspace_id", None),
-                logger=getattr(self, "_logger", None) or logging.getLogger(__name__),
+            exit_code, stdout, stderr = self._run_git_raw(
+                repo_root, args, timeout=timeout
             )
-            # Permission gate: enforce git:read/git:write ONLY when session
-            # permissions are present (the ToolExecutor always injects them,
-            # falling back to DEFAULT_SESSION_PERMISSIONS; legacy/direct
-            # callers without permissions keep the hermetic-environment
-            # guarantees but skip the gate).
-            required_category = None
-            if self.session_permissions is not None:
-                required_category = f"git:{self._get_operation_level(args)}"
-
-            result = executor.run(
-                ["git"] + hardened_args + args,
-                cwd=str(repo_root),
-                timeout=timeout,
-                required_category=required_category,
-                extra_env={
-                    "GIT_PAGER": "cat",
-                    "GIT_CONFIG_SYSTEM": "/dev/null",
-                },
-            )
-            if result.returncode != 0:
-                return f"Git command failed (exit code {result.returncode}):\n{result.stderr}"
-            return result.stdout
+            if exit_code != 0:
+                return f"Git command failed (exit code {exit_code}):\n{stderr}"
+            return stdout
         except subprocess.TimeoutExpired:
+            return "Git command timed out"
+        except TimeoutError:
             return "Git command timed out"
         except FileNotFoundError:
             return "Git command not found (git may not be installed)"
@@ -402,6 +373,279 @@ class GitInfoTool(ToolBase):
             raise
         except Exception as e:
             return f"Error running git command: {e}"
+
+    def _run_git_raw(
+        self, repo_root: Path, args: List[str], timeout: int = 30
+    ) -> tuple:
+        """Execute git in the active execution mode.
+
+        Returns ``(exit_code, stdout, stderr)``. Dispatches between the host
+        hermetic sandbox and the workspace resource container based on
+        ``_use_container_mode()``. No path validation is performed here --
+        that lives in ``_run_git`` so internal callers (e.g.
+        ``_git_repo_root``) do not re-validate.
+        """
+        if self._use_container_mode():
+            return self._exec_container_raw(repo_root, args, timeout=timeout)
+        return self._exec_host_raw(repo_root, args, timeout=timeout)
+
+    def _exec_host_raw(
+        self, repo_root: Path, args: List[str], timeout: int = 30
+    ) -> tuple:
+        """Run git on the host inside the hermetic sandbox."""
+        # Hardened args, applied to EVERY git invocation: hooks are
+        # neutralized (core.hooksPath=/dev/null), external diff drivers /
+        # textconv filters, fsmonitor helpers and credential helpers are
+        # disabled so ambient or repo-local config cannot inject
+        # executable behavior.
+        hardened_args = [
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "core.attributesFile=/dev/null",
+            "-c", "diff.external=",
+            "-c", "core.fsmonitor=",
+            "-c", "filter.clean=",
+            "-c", "filter.smudge=",
+            "-c", "diff.textconv=",
+            "-c", "credential.helper=",
+        ]
+        # commit additionally skips pre-commit/commit-msg hooks via
+        # --no-verify as a second line of defense.
+        if args and args[0] == "commit":
+            args = [args[0], "--no-verify"] + args[1:]
+
+        executor = SandboxedExecution(
+            session_permissions=self.session_permissions,
+            workspace_id=getattr(self, "workspace_id", None),
+            logger=getattr(self, "_logger", None) or logging.getLogger(__name__),
+        )
+        # Permission gate: enforce git:read/git:write ONLY when session
+        # permissions are present (the ToolExecutor always injects them,
+        # falling back to DEFAULT_SESSION_PERMISSIONS; legacy/direct
+        # callers without permissions keep the hermetic-environment
+        # guarantees but skip the gate).
+        required_category = None
+        if self.session_permissions is not None:
+            required_category = f"git:{self._get_operation_level(args)}"
+
+        result = executor.run(
+            ["git"] + hardened_args + args,
+            cwd=str(repo_root),
+            timeout=timeout,
+            required_category=required_category,
+            extra_env={
+                "GIT_PAGER": "cat",
+                "GIT_CONFIG_SYSTEM": "/dev/null",
+            },
+        )
+        return (result.returncode, result.stdout, result.stderr)
+
+    def _exec_container_raw(
+        self, repo_root: Path, args: List[str], timeout: int = 30
+    ) -> tuple:
+        """Run git inside the workspace resource container.
+
+        Only reached when a registry-derived workspace is present
+        (``_use_container_mode()``), so host paths are mapped to
+        ``/workspace/...`` before dispatch. The same git:read/git:write
+        permission gate as the host path is enforced here (fail closed).
+        """
+        manager = self._ensure_resource_container()
+
+        # Permission gate: enforce git:read/git:write ONLY when session
+        # permissions are present (mirrors the host path).
+        if self.session_permissions is not None:
+            from security.security_gate import check_atomic_operation
+
+            level = self._get_operation_level(args)
+            effective = self.effective_permissions or {}
+            if not check_atomic_operation(
+                f"git:{level}",
+                effective,
+                "GitInfoTool",
+                f"git {' '.join(args)}",
+            ):
+                raise PermissionError(
+                    f"Permission denied: git:{level} required for this operation"
+                )
+
+        # commit additionally skips pre-commit/commit-msg hooks via
+        # --no-verify as a second line of defense (same as host path).
+        if args and args[0] == "commit":
+            args = [args[0], "--no-verify"] + args[1:]
+
+        environment = {
+            "GIT_PAGER": "cat",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        }
+        agent_config = getattr(self, "agent_config", None) or {}
+        git_env = agent_config.get("git_environment")
+        if isinstance(git_env, dict):
+            for key, value in git_env.items():
+                if isinstance(key, str) and isinstance(value, str):
+                    environment[key] = value
+
+        result = manager.exec(
+            ["git"] + args,
+            workdir=self._to_container_path(repo_root),
+            environment=environment,
+            timeout=timeout,
+        )
+        return (result["exit_code"], result["stdout"], result["stderr"])
+
+    def _git_repo_root(self, repo_root: Path) -> Optional[Path]:
+        """Resolve the actual repository root, or None when not a repo.
+
+        Fast path: ``<repo_root>/.git`` exists as a directory. Otherwise
+        consult ``git rev-parse --show-toplevel``; in container mode the
+        returned ``/workspace`` path is reverse-mapped to the host path.
+        """
+        dot_git = repo_root / ".git"
+        if dot_git.exists() and dot_git.is_dir():
+            return repo_root
+
+        exit_code, stdout, _stderr = self._run_git_raw(
+            repo_root, ["rev-parse", "--show-toplevel"], timeout=10
+        )
+        if exit_code != 0 or not stdout.strip():
+            return None
+        if self._use_container_mode():
+            return self._from_container_path(stdout.strip())
+        return Path(stdout.strip())
+
+    def _git_execution_mode(self) -> str:
+        """Return 'host' or 'container' for git execution.
+
+        Precedence: ``agent_config['git_execution_mode']`` (per-session),
+        then workspace metadata ``git_execution_mode``, then the default
+        ``'container'``. Container mode additionally requires a
+        registry-derived workspace (enforced by ``_use_container_mode()``).
+        """
+        config = getattr(self, "agent_config", None) or {}
+        mode = config.get("git_execution_mode")
+        if mode not in ("host", "container"):
+            mode = self._workspace_metadata().get("git_execution_mode")
+        return mode if mode in ("host", "container") else "container"
+
+    def _workspace_metadata(self) -> dict:
+        """Return metadata of the session's registered workspace.
+
+        Best-effort: any registry failure or missing entry yields ``{}`` so
+        execution-mode resolution can fall back to the default.
+        """
+        session_id = getattr(self, "session_id", None)
+        if not session_id:
+            return {}
+        try:
+            from session.session_registry import SessionRegistry
+            from thoughtmachine.workspace_registry import WorkspaceRegistry
+
+            session_info = SessionRegistry.get_default().get(session_id)
+            if not session_info:
+                return {}
+            ws_id = session_info.get("workspace_id") if session_info else None
+            if not ws_id:
+                return {}
+            entry = WorkspaceRegistry.get_default().get_workspace(ws_id)
+            metadata = getattr(entry, "metadata", None)
+            return dict(metadata) if metadata else {}
+        except Exception:
+            return {}
+
+    def _use_container_mode(self) -> bool:
+        """True when git must run inside the resource container.
+
+        Container mode requires (a) an explicit execution mode other than
+        'host' AND (b) a registry-derived workspace (id + path). The
+        registry requirement keeps deprecated ``workspace_path`` callers and
+        direct test invocations on the host path, so tests without a docker
+        daemon never enter container mode.
+        """
+        return (
+            self._git_execution_mode() != "host"
+            and bool(self._resolved_workspace_path)
+            and bool(self._resolved_workspace_id)
+        )
+
+    def _ensure_resource_container(self) -> Any:
+        """Return (creating if needed) the workspace git resource container."""
+        if self._resource_manager is not None:
+            return self._resource_manager
+        if not self._resolved_workspace_path:
+            raise RuntimeError(
+                "GitInfoTool: no registry workspace available for container-backed git execution"
+            )
+
+        try:
+            from security.security_gate import get_expected_container_config
+
+            expected = get_expected_container_config(
+                self.session_permissions or {}, None
+            )
+            network_mode = expected.get("network_mode", "none")
+        except Exception:
+            network_mode = "none"
+
+        from infra.resource_container_manager import ResourceContainerManager
+
+        manager = ResourceContainerManager(
+            workspace_id=self._resolved_workspace_id or self.workspace_id or "default",
+            workspace_path=self._resolved_workspace_path,
+            network_mode=network_mode,
+        )
+        manager.ensure_container()
+        self._resource_manager = manager
+        return manager
+
+    def _to_container_path(self, host_path) -> str:
+        """Map a host path inside the resolved workspace to ``/workspace/...``."""
+        ws = Path(self._resolved_workspace_path).expanduser().resolve()
+        try:
+            rel = Path(host_path).expanduser().resolve().relative_to(ws)
+        except ValueError:
+            raise ValueError(
+                f"Git repository {host_path} is outside the workspace {ws}"
+            ) from None
+        if not rel.parts:
+            return "/workspace"
+        return "/workspace/" + "/".join(rel.parts)
+
+    def _from_container_path(self, container_path) -> Path:
+        """Reverse-map a ``/workspace`` path to a host path."""
+        ws = Path(self._resolved_workspace_path).expanduser().resolve()
+        container_path = str(container_path).strip()
+        if container_path == "/workspace":
+            return ws
+        if container_path.startswith("/workspace/"):
+            return ws / container_path[len("/workspace/"):]
+        return ws / container_path.lstrip("/")
+
+    def _resolve_registry_workspace_info(self) -> tuple:
+        """Resolve ``(workspace_id, root_path)`` from the session registries.
+
+        Returns ``(None, None)`` when no session is present, no workspace is
+        registered, or registry lookup fails (best-effort). Mirrors
+        ``ToolBase._resolve_registry_workspace`` but also returns the
+        workspace id, which container-backed git execution needs.
+        """
+        session_id = getattr(self, "session_id", None)
+        if not session_id:
+            return (None, None)
+        try:
+            from session.session_registry import SessionRegistry
+            from thoughtmachine.workspace_registry import WorkspaceRegistry
+
+            session_info = SessionRegistry.get_default().get(session_id)
+            if not session_info:
+                return (None, None)
+            ws_id = session_info.get("workspace_id") if session_info else None
+            if not ws_id:
+                return (None, None)
+            entry = WorkspaceRegistry.get_default().get_workspace(ws_id)
+            if not entry:
+                return (None, None)
+            return (ws_id, entry.root_path)
+        except Exception:
+            return (None, None)
     
     def _get_operation_level(self, args: List[str]) -> str:
         """Return the permission level ('read'/'write') for a git invocation.
@@ -669,6 +913,10 @@ class GitInfoTool(ToolBase):
             try:
                 target_abs = (repo_root / self.clone_target).resolve()
                 validated_target = self._validate_path(str(target_abs))
+                # In container mode the target must be passed as the
+                # container-visible /workspace path.
+                if self._use_container_mode():
+                    validated_target = self._to_container_path(Path(validated_target))
                 args.append(validated_target)
             except ValueError as e:
                 return self._truncate_output(f"Error: {e}")
