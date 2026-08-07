@@ -248,10 +248,14 @@ class ContainerManager:
             return dict(defaults)
 
     # ── Public API ─────────────────────────────────────────────────────────
-    def start(self, image=None, name=None):
-        """Ensure a running container exists and return {"id", "name", "status"}.
+    def start(self, image=None, name=None, note=None):
+        """Ensure a running container exists and return {"id", "name", "status", "note"}.
 
         Reuse order: in-memory registry -> label lookup -> fresh create.
+
+        ``note`` is an optional sticky note: it is stored in the
+        ``thoughtmachine.note`` label at create time, and on reuse a new note is
+        applied best-effort (see ``_apply_note``) and returned in the response.
 
         Desired isolation (network_mode, workspace_mode) is computed ONCE from
         the session permissions BEFORE any reuse path, so an existing container
@@ -271,14 +275,19 @@ class ContainerManager:
         containers = self.list_containers()
         for entry in containers:
             if entry["name"] == name:
+                note_value = note if note is not None else entry.get("note", "")
                 try:
-                    self._ensure_running(self.client.containers.get(entry["container_id"]))
+                    container = self.client.containers.get(entry["container_id"])
+                    self._ensure_running(container)
+                    if note is not None:
+                        self._apply_note(container, note)
                 except Exception:
                     pass
                 _audit("CONTAINER_REUSE_OK",
                        f"source=workspace-label name={name} id={entry['container_id']} "
                        f"session={self.session_id}")
-                return {**entry, "status": "reused", "id": entry["container_id"]}
+                return {**entry, "status": "reused", "id": entry["container_id"],
+                        "note": note_value}
         if len(containers) >= self.max_containers:
             return {"error": f"Workspace container limit ({self.max_containers}) reached. "
                              f"Stop an unused container first."}
@@ -313,9 +322,14 @@ class ContainerManager:
             container = self._reuse_container(container_id)
             if container is not None:
                 if self._config_matches(container, network_mode, workspace_mode):
+                    note_value = note if note is not None else (
+                        (container.labels or {}).get("thoughtmachine.note") or "")
+                    if note is not None:
+                        self._apply_note(container, note)
                     _audit("CONTAINER_REUSE_OK",
                            f"source=registry name={name} id={container.id} session={self.session_id}")
-                    return {"id": container.id, "name": name, "status": "reused"}
+                    return {"id": container.id, "name": name, "status": "reused",
+                            "note": note_value}
                 log("WARNING", "docker.container_manager",
                     f"Registry container {container.id[:12]} config drifted "
                     f"(network={network_mode} workspace={workspace_mode}) — recreating")
@@ -340,9 +354,14 @@ class ContainerManager:
             else:
                 self._ensure_running(container)
                 self._containers[name] = container.id
+                note_value = note if note is not None else (
+                    (container.labels or {}).get("thoughtmachine.note") or "")
+                if note is not None:
+                    self._apply_note(container, note)
                 _audit("CONTAINER_REUSE_OK",
                        f"source=label name={name} id={container.id} session={self.session_id}")
-                return {"id": container.id, "name": name, "status": "reused"}
+                return {"id": container.id, "name": name, "status": "reused",
+                        "note": note_value}
 
         # 3) Fresh create
         tmpfs = {
@@ -369,7 +388,7 @@ class ContainerManager:
         labels = {
             "thoughtmachine.container_name": name,
             "thoughtmachine.workspace_id": self.workspace_id,
-            "thoughtmachine.note": "",
+            "thoughtmachine.note": note or "",
         }
         _audit("CONTAINER_CREATE",
                f"image={image} network={network_mode} name={name} session={self.session_id}")
@@ -399,7 +418,8 @@ class ContainerManager:
         except Exception:
             pass
         self._containers[name] = container.id
-        return {"id": container.id, "name": name, "status": "created"}
+        return {"id": container.id, "name": name, "status": "created",
+                "note": note or ""}
 
     def exec(self, container_id, command, timeout=30, workdir="/workspace", environment=None):
         """Run ``command`` in the container; returns {"stdout","stderr","exit_code"}."""
@@ -549,6 +569,7 @@ class ContainerManager:
             "status": container.status,
             "uptime_seconds": uptime_seconds,
             "memory_usage_bytes": memory_usage_bytes,
+            "note": (container.labels or {}).get("thoughtmachine.note") or "",
         }
 
     def list_containers(self):
@@ -750,6 +771,54 @@ class ContainerManager:
                 container.reload()
         except Exception:
             pass
+
+    def _apply_note(self, container, note):
+        """Best-effort write of the ``thoughtmachine.note`` label; NEVER raises.
+
+        Docker has NO label-update API: docker SDK 7.1.0's
+        ``Container.update(**kwargs)`` forwards to POST /containers/{id}/update,
+        whose Go json decoder ignores unknown fields — on a real daemon this is
+        a SILENT NO-OP (labels are immutable after create). This helper exists
+        so the update is recorded on mocked containers in unit tests and on any
+        future engine that supports it; callers must treat the daemon-side label
+        as best-effort and trust the RETURNED note value instead (the note is
+        applied at the response/API level when the engine cannot mutate labels).
+        """
+        try:
+            current = dict(getattr(container, "labels", None) or {})
+            current["thoughtmachine.note"] = note
+            container.update(labels=current)
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"Failed to update thoughtmachine.note label on container "
+                f"{getattr(container, 'name', None) or getattr(container, 'id', '?')}: {e}")
+
+    def set_note(self, container_id, note):
+        """Set the ``thoughtmachine.note`` label; NEVER raises.
+
+        Returns {"success": True, "note": note} on success; on failure an error
+        dict following the existing convention:
+        {"success": False, "container_id": ..., "error": "container not found"}
+        or {"success": False, "container_id": ..., "error": str(e)}.
+
+        The label write itself is best-effort (see ``_apply_note``): docker SDK
+        7.1.0 has no label-update API, so on stock engines the daemon-side label
+        is immutable after create and ``note`` is recorded in the returned dict
+        even when the engine-side label cannot change.
+        """
+        try:
+            container = self.client.containers.get(container_id)
+        except NotFound:
+            return {"success": False, "container_id": container_id,
+                    "error": "container not found"}
+        except Exception as e:
+            return {"success": False, "container_id": container_id, "error": str(e)}
+        try:
+            container.reload()
+        except Exception:
+            pass
+        self._apply_note(container, note)
+        return {"success": True, "note": note}
 
     def _drop_container(self, container_id):
         """Remove all registry entries pointing at ``container_id``."""

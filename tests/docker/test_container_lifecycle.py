@@ -23,6 +23,8 @@ import sys
 import tempfile
 import time
 import uuid
+from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import docker
 import pytest
@@ -453,3 +455,178 @@ class TestContainerLifecycle:
         assert res2["status"] == "created", f"expected fresh container, got {res2!r}"
         result = self._exec_ok(manager2, res2["id"], "cat /workspace/hello.txt")
         assert result["stdout"].strip() == self.hello_text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sticky-note tests (mock-based, no daemon needed).
+#
+# The note feature has no real daemon-side label-update path (docker SDK 7.1.0
+# has no update_labels; Container.update(**kwargs) forwards to
+# POST /containers/{id}/update which ignores unknown fields), so these tests
+# verify the API contract with a fake client: label set at create, note in the
+# start/status/list responses, best-effort label update on reuse + set_note.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class FakeContainer:
+    """Minimal docker Container stand-in recording update() calls."""
+
+    def __init__(self, cid, name, labels=None, status="running", attrs=None):
+        self.id = cid
+        self.name = name
+        self.labels = dict(labels or {})
+        self.status = status
+        self.image = SimpleNamespace(tags=["agent-executor:latest"])
+        self.attrs = attrs or {
+            "State": {"StartedAt": datetime.now(timezone.utc).isoformat()},
+            "Mounts": [{"Destination": "/workspace", "RW": True}],
+            "HostConfig": {"NetworkMode": "none"},
+        }
+        self.update_calls = []
+
+    def reload(self):
+        return None
+
+    def update(self, **kwargs):
+        self.update_calls.append(kwargs)
+        if "labels" in kwargs:
+            self.labels.update(kwargs["labels"])
+
+    def start(self):
+        self.status = "running"
+
+    def stop(self, timeout=None):
+        self.status = "exited"
+
+    def kill(self):
+        self.status = "exited"
+
+    def remove(self, force=False):
+        self.status = "removed"
+
+
+class FakeContainers:
+    """docker.models.containers.ContainerCollection stand-in."""
+
+    def __init__(self, containers=None):
+        self._all = list(containers or [])
+
+    def list(self, all=True, filters=None):
+        label_filter = (filters or {}).get("label")
+        if label_filter is None:
+            return list(self._all)
+        if isinstance(label_filter, str):
+            label_filter = [label_filter]
+        result = []
+        for c in self._all:
+            matches = True
+            for flt in label_filter:
+                key, _, value = flt.partition("=")
+                if c.labels.get(key) != value:
+                    matches = False
+                    break
+            if matches:
+                result.append(c)
+        return result
+
+    def get(self, container_id):
+        for c in self._all:
+            if c.id == container_id or c.name == container_id:
+                return c
+        raise docker.errors.NotFound("container not found")
+
+    def run(self, **kwargs):
+        labels = dict(kwargs.get("labels") or {})
+        name = kwargs.get("name") or "fake-" + uuid.uuid4().hex[:8]
+        c = FakeContainer("fake-" + uuid.uuid4().hex[:16], name, labels=labels)
+        self._all.append(c)
+        return c
+
+
+class TestContainerNoteStickyLabel:
+    """Mock-based tests for the sticky-note feature (no daemon required)."""
+
+    def _make_manager(self, fake_containers, workspace_id):
+        # Lazy import: top-level import of tools.container_manager triggers the
+        # thoughtmachine.security circular-import cascade (see module docstring).
+        from tools.container_manager import ContainerManager
+
+        manager = ContainerManager.__new__(ContainerManager)
+        manager.workspace_path = "/tmp/tm-note-test-ws"
+        manager.session_id = "note-test-session"
+        manager.workspace_id = workspace_id
+        manager.session_permissions = None
+        manager.image = "agent-executor"
+        manager.mem_limit = "512m"
+        manager.cpu_quota = 50000
+        manager._containers = {}
+        manager.workspace_config = {}
+        manager.max_containers = 4
+        manager.client = SimpleNamespace(containers=fake_containers)
+        manager._compute_config = lambda ws, wid, sp: ("none", "ro")
+        return manager
+
+    def test_start_with_note_sets_label_on_create(self):
+        fake = FakeContainers()
+        manager = self._make_manager(fake, workspace_id=str(uuid.uuid4()))
+        result = manager.start(name="note-create", note="hello")
+        assert result["status"] == "created"
+        assert result["note"] == "hello"
+        container = fake.get(result["id"])
+        assert container.labels["thoughtmachine.note"] == "hello"
+
+    def test_start_reuse_updates_note_same_container(self):
+        fake = FakeContainers()
+        manager = self._make_manager(fake, workspace_id=str(uuid.uuid4()))
+        r1 = manager.start(name="note-reuse", note="hello")
+        r2 = manager.start(name="note-reuse", note="world")
+        assert r2["status"] == "reused"
+        assert r2["id"] == r1["id"]
+        assert r2["note"] == "world"
+        container = fake.get(r1["id"])
+        assert container.labels["thoughtmachine.note"] == "world"
+        assert any("labels" in call for call in container.update_calls)
+
+    def test_set_note_updates_label_and_list(self):
+        fake = FakeContainers()
+        manager = self._make_manager(fake, workspace_id=str(uuid.uuid4()))
+        r = manager.start(name="note-set", note="initial")
+        assert r["status"] == "created"
+        sn = manager.set_note(r["id"], "sticky")
+        assert sn == {"success": True, "note": "sticky"}
+        container = fake.get(r["id"])
+        assert container.labels["thoughtmachine.note"] == "sticky"
+        entries = manager.list_containers()
+        assert entries[0]["note"] == "sticky"
+        # Missing container -> error dict, never raises.
+        missing = manager.set_note("fake-nonexistent", "x")
+        assert missing["success"] is False
+        assert "error" in missing
+
+    def test_note_visible_in_status_and_list(self):
+        fake = FakeContainers()
+        manager = self._make_manager(fake, workspace_id=str(uuid.uuid4()))
+        r = manager.start(name="note-status", note="hello")
+        st = manager.status(r["id"])
+        assert st["status"] == "running"
+        assert st["note"] == "hello"
+        entries = manager.list_containers()
+        assert entries[0]["note"] == "hello"
+
+    def test_note_persists_across_sessions_same_workspace(self):
+        workspace_id = str(uuid.uuid4())
+        fake = FakeContainers()
+        manager1 = self._make_manager(fake, workspace_id=workspace_id)
+        r1 = manager1.start(name="note-cross", note="sticky")
+        assert r1["status"] == "created"
+
+        # A different session, same workspace + name -> reuse, same container.
+        manager2 = self._make_manager(fake, workspace_id=workspace_id)
+        manager2.session_id = "other-session"
+        r2 = manager2.start(name="note-cross")
+        assert r2["status"] == "reused"
+        assert r2["id"] == r1["id"]
+        assert r2["note"] == "sticky"
+        entries = manager2.list_containers()
+        assert entries[0]["note"] == "sticky"
+

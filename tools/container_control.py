@@ -148,12 +148,20 @@ class ContainerStartTool(_ContainerControlBase):
     - Non-root user execution (uid 1000:1000)
     - Memory and CPU quotas (mem_limit / cpu_quota)
 
+    Sticky notes: the optional ``note`` field attaches a note to the container
+    (stored in the ``thoughtmachine.note`` label). On a fresh create the note is
+    written into the container labels; on reuse the new note is applied
+    best-effort (docker has no label-update API, so on a stock engine the
+    daemon-side label is immutable after create) and the RESPONSE carries the
+    new note value regardless.
+
     Returns JSON with structure:
     {
       "success": bool,
       "container_id": str,
       "name": str,
       "status": "created" | "reused",
+      "note": str,
       "duration": float,
       "error": str (optional)
     }
@@ -168,6 +176,10 @@ class ContainerStartTool(_ContainerControlBase):
         default=None,
         description="Optional container name. If omitted, an auto-generated per-session name is used (agent-exec-<workspace-hash>-<session-tag>)."
     )
+    note: Optional[str] = Field(
+        default=None,
+        description="Optional sticky note attached to the container (stored in the thoughtmachine.note label). On reuse, updates the note best-effort and returns the new value."
+    )
     mem_limit: str = Field(
         default="512m",
         description="Memory limit (e.g., '512m', '1g')"
@@ -181,7 +193,7 @@ class ContainerStartTool(_ContainerControlBase):
         start_time = time.time()
         try:
             manager = self._make_manager()
-            info = manager.start(image=self.image, name=self.name)
+            info = manager.start(image=self.image, name=self.name, note=self.note)
             if "error" in info:
                 return self._respond(
                     False,
@@ -193,6 +205,7 @@ class ContainerStartTool(_ContainerControlBase):
                 container_id=info["id"],
                 name=info["name"],
                 status=info["status"],
+                note=info.get("note"),
                 duration=time.time() - start_time,
             )
         except RuntimeError as e:

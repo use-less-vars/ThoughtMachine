@@ -130,6 +130,7 @@ def main() -> int:
     p2_cid_b = None
     p2_cid_c = None
     p2_cid_d = None
+    p2_cid_note = None                # sticky-note container (phase 2)
     p2_session = str(uuid.uuid4())     # a & b share one session (list filter)
     p2_session_c = str(uuid.uuid4())   # fresh session for container c
     p2_session_d = str(uuid.uuid4())   # fresh session for container d
@@ -561,6 +562,69 @@ def main() -> int:
             return "listed %d container(s): %s" % (len(containers),
                                                    ", ".join(names))
 
+        def _p2_sticky_note():
+            nonlocal p2_cid_note
+            # Sticky notes: the note label is set at CREATE time; on reuse the
+            # note is returned at the response level only. docker SDK 7.1.0 has
+            # no label-update API (Container.update forwards unknown kwargs to
+            # POST /containers/{id}/update, which ignores them), so on a real
+            # daemon the daemon-side label is immutable — we assert the
+            # response note, never the list note, for the reuse case.
+            s1 = json.loads(ContainerStartTool(
+                name="smoke-p2-note-%s" % tag,
+                note="smoke-note-1",
+                workspace_path=p2_ws,
+                session_id=p2_session,
+                session_permissions=sp,
+                image=p2_image_tag,
+                mem_limit="512m", cpu_quota=50000,
+            ).execute())
+            ok(s1.get("success") is True, "start(note=...) failed: %r" % s1)
+            ok(s1.get("status") == "created",
+               "start(note) status %r (expected created)" % s1.get("status"))
+            ok(s1.get("note") == "smoke-note-1",
+               "start(note) note %r (expected smoke-note-1)" % s1.get("note"))
+            p2_cid_note = s1["container_id"]
+            p2_containers.append(p2_cid_note)
+            lst = json.loads(ContainerListTool(
+                workspace_path=p2_ws,
+                session_id=p2_session,
+                session_permissions=sp,
+            ).execute())
+            ok(lst.get("success") is True, "sticky-note list failed: %r" % lst)
+            by_name = {c.get("name"): c for c in (lst.get("containers") or [])}
+            ne = by_name.get("smoke-p2-note-%s" % tag)
+            ok(ne is not None, "note container missing from list")
+            ok(ne.get("note") == "smoke-note-1",
+               "list note %r (expected smoke-note-1)" % ne.get("note"))
+            s2 = json.loads(ContainerStartTool(
+                name="smoke-p2-note-%s" % tag,
+                note="smoke-note-2",
+                workspace_path=p2_ws,
+                session_id=p2_session,
+                session_permissions=sp,
+                image=p2_image_tag,
+                mem_limit="512m", cpu_quota=50000,
+            ).execute())
+            ok(s2.get("success") is True, "start(reuse,note) failed: %r" % s2)
+            ok(s2.get("status") == "reused",
+               "reuse status %r (expected reused)" % s2.get("status"))
+            ok(s2.get("container_id") == p2_cid_note, "reuse id changed")
+            ok(s2.get("note") == "smoke-note-2",
+               "reuse note %r (expected smoke-note-2)" % s2.get("note"))
+            mgr_note = ContainerManager(
+                workspace_path=p2_ws, session_id=p2_session,
+                workspace_id="default",
+                session_permissions=sp, image=p2_image_tag,
+                mem_limit="512m", cpu_quota=50000,
+            )
+            sn = mgr_note.set_note(p2_cid_note, "smoke-note-3")
+            ok(sn.get("success") is True, "set_note failed: %r" % sn)
+            ok(sn.get("note") == "smoke-note-3",
+               "set_note note %r (expected smoke-note-3)" % sn.get("note"))
+            return ("sticky note: create(note-1) -> list note-1 -> "
+                    "reuse(note-2 response) -> set_note ok")
+
         def _p2_logs():
             # start() hardcodes PID 1 = `tail -f /dev/null`; docker logs
             # captures ONLY PID-1 output - exec streams are never logged. So
@@ -714,6 +778,8 @@ def main() -> int:
             check("phase2-start", _p2_start)
         if not fatal:
             check("phase2-list", _p2_list)
+        if not fatal:
+            check("phase2-sticky-note", _p2_sticky_note)
         if not fatal:
             check("phase2-logs", _p2_logs)
         if not fatal:

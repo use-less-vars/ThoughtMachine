@@ -124,3 +124,4 @@ config_snapshot.json
 # Local working docs — not part of the repo
 docs/
 
+Dockerfile
