@@ -239,9 +239,9 @@ class TestAskPermissionRestrictive:
         mock_container: MagicMock,
     ):
         """filesystem='ask' → container gets workspace mount mode='ro'."""
-        # workspace_id=None so the BIND path is exercised: this test asserts
-        # the ``volumes`` dict representation (a truthy workspace_id would
-        # take the named-volume path where volumes=None and mounts=[Mount]).
+        # workspace_id=None → the BIND path is exercised: this test asserts
+        # the Phase-2 ``mounts`` list representation (a bind mount for the
+        # workspace plus the per-workspace package volume).
         executor = _make_executor(
             mock_docker,
             session_permissions={"network": "write", "filesystem": "ask", "container": True},
@@ -255,11 +255,18 @@ class TestAskPermissionRestrictive:
             executor._ensure_container()
 
         _, kwargs = mock_docker.containers.run.call_args
-        vol_cfg = kwargs.get("volumes", {})
-        mode = vol_cfg.get("/tmp/test-workspace", {}).get("mode", "?")
-        assert mode == "ro", (
-            f"filesystem='ask' → expected mode='ro', got {mode!r}"
+        mounts = kwargs.get("mounts") or []
+        ws_mounts = [m for m in mounts
+                     if m.get("Target") == "/workspace" and m.get("Type") == "bind"]
+        assert ws_mounts, f"no /workspace bind mount in mounts={mounts!r}"
+        assert ws_mounts[0].get("ReadOnly") is True, (
+            f"filesystem='ask' → expected ReadOnly=True, got {ws_mounts[0]!r}"
         )
+        assert ws_mounts[0].get("Source") == "/tmp/test-workspace", f"{ws_mounts[0]!r}"
+        pkg_mounts = [m for m in mounts if m.get("Target") == "/home/agent/.local"]
+        assert pkg_mounts, f"no package volume mount in mounts={mounts!r}"
+        assert pkg_mounts[0].get("Type") == "volume", f"{pkg_mounts[0]!r}"
+        assert pkg_mounts[0].get("Source") == "tm-packages-default", f"{pkg_mounts[0]!r}"
 
     def test_ask_not_recreated_when_already_restrictive(
         self,
@@ -307,7 +314,7 @@ class TestAskPermissionRestrictive:
         mock_container.attrs["HostConfig"]["NetworkMode"] = "none"
         mock_container.attrs["Mounts"][0]["Mode"] = "ro"
 
-        # workspace_id=None → bind path (volumes dict assertion below).
+        # workspace_id=None → bind path (mounts assertion below).
         executor = _make_executor(
             mock_docker,
             session_permissions={"network": "ask", "filesystem": "ask", "container": True},
@@ -329,9 +336,11 @@ class TestAskPermissionRestrictive:
         assert mock_container.remove.called
         _, kwargs = mock_docker.containers.run.call_args
         assert kwargs.get("network") == "bridge"
-        vol_cfg = kwargs.get("volumes", {})
-        mode = vol_cfg.get("/tmp/test-workspace", {}).get("mode", "?")
-        assert mode == "rw"
+        mounts = kwargs.get("mounts") or []
+        ws_mounts = [m for m in mounts
+                     if m.get("Target") == "/workspace" and m.get("Type") == "bind"]
+        assert ws_mounts, f"no /workspace bind mount in mounts={mounts!r}"
+        assert ws_mounts[0].get("ReadOnly") is False, f"{ws_mounts[0]!r}"
 
     def test_write_to_ask_recreates_container(
         self,
@@ -339,7 +348,7 @@ class TestAskPermissionRestrictive:
         mock_container: MagicMock,
     ):
         """write→ask triggers recreation (bridge→none, rw→ro)."""
-        # workspace_id=None → bind path (volumes dict assertion below).
+        # workspace_id=None → bind path (mounts assertion below).
         executor = _make_executor(
             mock_docker,
             session_permissions={"network": "write", "filesystem": "write", "container": True},
@@ -361,6 +370,8 @@ class TestAskPermissionRestrictive:
         assert mock_container.remove.called
         _, kwargs = mock_docker.containers.run.call_args
         assert kwargs.get("network") == "none"
-        vol_cfg = kwargs.get("volumes", {})
-        mode = vol_cfg.get("/tmp/test-workspace", {}).get("mode", "?")
-        assert mode == "ro"
+        mounts = kwargs.get("mounts") or []
+        ws_mounts = [m for m in mounts
+                     if m.get("Target") == "/workspace" and m.get("Type") == "bind"]
+        assert ws_mounts, f"no /workspace bind mount in mounts={mounts!r}"
+        assert ws_mounts[0].get("ReadOnly") is True, f"{ws_mounts[0]!r}"
