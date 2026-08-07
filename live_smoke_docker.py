@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 live_smoke_docker.py — standalone, host-runnable live end-to-end smoke test
-for ThoughtMachine Docker Phase-1.
+for the ThoughtMachine Docker stack.
 
 Run from the repo root with the project venv python:
 
@@ -16,11 +16,12 @@ What it exercises (in order):
                         for (fs=write,net=none), (fs=read,net=none),
                         (fs=write,net=bridge) — both the workspace_id path
                         (security_gate) and the workspace_id=None fallback
-  3. volume           — ensure_workspace_volume_populated: one-shot copy
-                        into a named volume + .workspace_synced sentinel
+  3. volume           — host workspace bind-mounted at /workspace: host
+                        marker visible immediately; host-side file changes
+                        visible in running containers (no population)
   4. persist          — create -> exec -> stop -> REUSE (stable container
                         id, no CONTAINER_RECREATE_MISMATCH) -> write ->
-                        stop/restart -> data survives (volume persistence)
+                        stop/restart -> data survives (host-dir persistence)
   5. isolation        — ro workspace blocks writes; no-network blocks
                         egress; bridge grants egress (host-network
                         dependent; documented exception, see below)
@@ -62,7 +63,6 @@ try:
 
     from docker_executor import (  # noqa: E402
         _compute_container_config_from_permissions,
-        ensure_workspace_volume_populated,
     )
     # from tools import ... also verifies the tools/__init__.py re-exports
     from tools import (  # noqa: E402
@@ -213,36 +213,57 @@ def main() -> int:
 
         # ---------------- STEP 3: volume population ----------------
         def _volume():
-            nonlocal created_volumes
-            ws_id = str(uuid.uuid4())
-            vol = "tm-workspace-%s" % ws_id
-            created_volumes.append(vol)
-            ok(ensure_workspace_volume_populated(
-                client, image_tag, str(workspace_dir), vol, network_mode="none"),
-               "ensure_workspace_volume_populated returned False")
+            # Phase-2: the host workspace is bind-mounted at /workspace (no
+            # named volume, no population). A fresh container sees the host
+            # marker immediately, and a host-side write is visible in a
+            # RUNNING container without any refresh step.
             listing = client.containers.run(
                 image_tag,
-                command="ls -a /workspace",
-                mounts=[Mount(target="/workspace", source=vol, type="volume")],
+                command="cat /workspace/host_marker.txt",
+                mounts=[Mount(target="/workspace", source=str(workspace_dir),
+                              type="bind", read_only=True)],
                 network_mode="none",
                 user="1000:1000",
                 remove=True,
             ).decode("utf-8", "replace")
-            ok(".workspace_synced" in listing,
-               "sentinel missing in volume listing: %r" % listing)
-            ok("host_marker.txt" in listing,
-               "host marker missing in volume listing: %r" % listing)
-            return "volume %s populated; sentinel + host_marker present" % vol
+            ok("tm-smoke-host-marker-%s" % tag in listing,
+               "host marker not visible via bind mount: %r" % listing)
+            live = client.containers.run(
+                image_tag,
+                name="smoke-volume-live-%s" % tag,
+                mounts=[Mount(target="/workspace", source=str(workspace_dir),
+                              type="bind", read_only=True)],
+                network_mode="none",
+                user="1000:1000",
+                detach=True,
+                tty=True,
+                stdin_open=True,
+                command=["tail", "-f", "/dev/null"],
+            )
+            try:
+                probe_name = "volume-live-probe-%s.txt" % tag
+                with open(os.path.join(workspace_dir, probe_name), "w") as fh:
+                    fh.write("tm-smoke-volume-live-%s\n" % tag)
+                exit_code, output = live.exec_run("cat /workspace/%s" % probe_name)
+                decoded = (output.decode("utf-8", "replace")
+                           if isinstance(output, bytes) else str(output))
+                ok(exit_code == 0 and "tm-smoke-volume-live-%s" % tag in decoded,
+                   "live host change not visible in running container "
+                   "(exit %s, out %r)" % (exit_code, decoded))
+            finally:
+                try:
+                    live.remove(force=True)
+                except Exception:  # noqa: BLE001 - best-effort cleanup
+                    pass
+            return ("bind-mounted workspace: host marker visible; live host "
+                    "change visible without recreation")
 
         if not fatal:
             check("volume", _volume)
 
         # ---------------- STEP 4: lifecycle / reuse / persistence ----------------
         def _persist():
-            nonlocal created_volumes
             ws_id = str(uuid.uuid4())
-            vol = "tm-workspace-%s" % ws_id
-            created_volumes.append(vol)
             name = "smoke-persist-%s" % tag
             sp = {"network": "banned", "filesystem": "write", "container": True}
             mgr = manager_for(ws_id, sp)
@@ -285,9 +306,7 @@ def main() -> int:
 
         # ---------------- STEP 5: isolation ----------------
         def _isolation_ro():
-            nonlocal created_volumes
             ws_id = str(uuid.uuid4())
-            created_volumes.append("tm-workspace-%s" % ws_id)
             mgr = manager_for(ws_id, {"network": "banned", "filesystem": "read",
                                       "container": True})
             res, out = start_and_exec(
@@ -298,9 +317,7 @@ def main() -> int:
             return "touch /workspace/blocked.txt -> exit %s (ro enforced)" % out["exit_code"]
 
         def _isolation_nonet():
-            nonlocal created_volumes
             ws_id = str(uuid.uuid4())
-            created_volumes.append("tm-workspace-%s" % ws_id)
             mgr = manager_for(ws_id, {"network": "banned", "filesystem": "write",
                                       "container": True})
             res, out = start_and_exec(
@@ -313,9 +330,7 @@ def main() -> int:
             return "no-network blocks egress (%s)" % detail
 
         def _isolation_bridge():
-            nonlocal created_volumes
             ws_id = str(uuid.uuid4())
-            created_volumes.append("tm-workspace-%s" % ws_id)
             mgr = manager_for(ws_id, {"network": "write", "filesystem": "write",
                                       "container": True})
             res, out = start_and_exec(
@@ -407,8 +422,8 @@ def main() -> int:
 
         # ---------------- PHASE 2 (Commit 6): steps 11-16 ----------------
         # ContainerBuildTool / ContainerListTool / ContainerLogsTool
-        # end-to-end against real Docker, plus a true-staleness volume
-        # refresh sequence.
+        # end-to-end against real Docker, plus a live bind-mount
+        # visibility sequence.
         # Documented deviation: containers a & b deliberately share ONE
         # session id (p2_session) because ContainerListTool filters on the
         # single `thoughtmachine.session_id` label - with different session
@@ -535,11 +550,11 @@ def main() -> int:
 
         def _p2_volume_refresh():
             nonlocal p2_ws_id, p2_cid_c, p2_cid_d
-            # TRUE staleness test: populate a named volume, remove the
-            # container to free it, add a NEW file on the host, then start a
-            # second container against the same workspace_id - the Commit-1
-            # host-manifest sha check must detect the change and refresh the
-            # volume (merge, not wipe).
+            # Phase-2 live bind-mount check: the host workspace is mounted
+            # directly, so a file written on the host while container c is
+            # RUNNING becomes visible inside c immediately (no refresh, no
+            # recreation), and a SECOND container (d) started afterwards for
+            # the same workspace_id sees the live host tree as well.
             p2_ws_id = str(uuid.uuid4())
             mgr_c = ContainerManager(
                 workspace_path=p2_ws,
@@ -555,7 +570,6 @@ def main() -> int:
                "start c status %r (expected 'created')" % c.get("status"))
             p2_cid_c = c["id"]  # ContainerManager.start() key is "id"
             p2_containers.append(p2_cid_c)
-            created_volumes.append("tm-workspace-%s" % p2_ws_id)
             e1 = json.loads(ContainerExecTool(
                 container_id=p2_cid_c,
                 command="cat /workspace/marker.txt",
@@ -566,17 +580,25 @@ def main() -> int:
             ).execute())
             ok(e1.get("success") is True
                and "tm-smoke-p2-marker-%s" % tag in (e1.get("stdout") or ""),
-               "marker not in volume after first populate: %r" % e1)
-            # free the volume, then mutate the host workspace
-            pc = client.containers.get(p2_cid_c)
-            try:
-                pc.stop(timeout=5)
-            except Exception:  # noqa: BLE001
-                pass
-            pc.remove(force=True)
+               "marker not visible in c: %r" % e1)
+            # mutate the host workspace while c is RUNNING
             with open(os.path.join(p2_ws, "refresh-probe.txt"), "w") as fh:
                 fh.write("refresh-probe-%s\n" % tag)
-            # second container, same workspace_id => staleness refresh
+            e_live = json.loads(ContainerExecTool(
+                container_id=p2_cid_c,
+                command="cat /workspace/refresh-probe.txt; cat /workspace/marker.txt",
+                timeout=20,
+                workspace_path=p2_ws,
+                session_id=p2_session_c,
+                session_permissions=sp,
+            ).execute())
+            ok(e_live.get("success") is True, "live exec failed: %r" % e_live)
+            out_live = e_live.get("stdout") or ""
+            ok("refresh-probe-%s" % tag in out_live,
+               "host probe not visible in RUNNING container c: %r" % out_live)
+            ok("tm-smoke-p2-marker-%s" % tag in out_live,
+               "original marker missing in c: %r" % out_live)
+            # second container, same workspace_id => live host tree visible
             mgr_d = ContainerManager(
                 workspace_path=p2_ws,
                 session_id=p2_session_d,
@@ -599,19 +621,19 @@ def main() -> int:
                 session_id=p2_session_d,
                 session_permissions=sp,
             ).execute())
-            ok(e2.get("success") is True, "refresh exec failed: %r" % e2)
+            ok(e2.get("success") is True, "d exec failed: %r" % e2)
             out = e2.get("stdout") or ""
             ok("refresh-probe-%s" % tag in out,
-               "refresh-probe missing (volume NOT refreshed): %r" % out)
+               "host probe missing in fresh container d: %r" % out)
             ok("tm-smoke-p2-marker-%s" % tag in out,
-               "marker missing after refresh (partial wipe?): %r" % out)
-            return "volume refreshed: host probe + original marker both present"
+               "marker missing in fresh container d: %r" % out)
+            return "bind mount live: host probe visible in running c + fresh d"
 
         def _p2_stop_verify():
-            # container c was already removed in the volume-refresh step;
-            # a, b and d are stopped here.
+            # a, b, c and d are stopped here (c is no longer removed early).
             for cid, sess in ((p2_cid_a, p2_session),
                               (p2_cid_b, p2_session),
+                              (p2_cid_c, p2_session_c),
                               (p2_cid_d, p2_session_d)):
                 st = json.loads(ContainerStopTool(
                     container_id=cid,
@@ -635,7 +657,7 @@ def main() -> int:
             for nm in ("smoke-p2-a-%s" % tag, "smoke-p2-b-%s" % tag):
                 ok(by_name[nm].get("status") != "running",
                    "%s still running (%r)" % (nm, by_name[nm].get("status")))
-            return "a, b, d stopped; final list shows a/b non-running"
+            return "a, b, c, d stopped; final list shows a/b non-running"
 
         if not fatal:
             check("phase2-build", _p2_build)
@@ -738,7 +760,7 @@ def main() -> int:
     passes = len(rows) - len(fails) - len(skips)
     print()
     print("=" * 78)
-    print(" live_smoke_docker — ThoughtMachine Docker Phase-1 receipt")
+    print(" live_smoke_docker — ThoughtMachine Docker receipt")
     print("=" * 78)
     print("%-16s | %-4s | %s" % ("check", "res", "detail"))
     print("-" * 78)
