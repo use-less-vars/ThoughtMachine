@@ -1,11 +1,12 @@
 """
 Live-Docker integration suite for the persistent container machinery.
 
-Covers the `ContainerManager` lifecycle: workspace→volume population
-(init-container copy + sentinel), persistence across stop/start, session
-cleanup (including orphaned containers tagged with a session label),
-network/read-only isolation, and the permissive security gate that grants
-bridge networking when session permissions allow it.
+Covers the `ContainerManager` lifecycle: the Phase-2 mount model (host
+workspace bind-mounted at /workspace — live, no named workspace volumes —
+plus a per-workspace package volume), persistence across stop/start,
+session cleanup (including orphaned containers tagged with a session
+label), network/read-only isolation, and the permissive security gate that
+grants bridge networking when session permissions allow it.
 
 These tests talk to a real Docker daemon.  They are skipped cleanly when the
 daemon is unavailable (see `needs_docker`); the only network dependency is
@@ -105,7 +106,7 @@ def lifecycle_image():
 
 @needs_docker
 class TestContainerLifecycle:
-    """Persistent-container lifecycle: volume sync, persistence, cleanup, isolation."""
+    """Persistent-container lifecycle: bind-mount visibility, persistence, cleanup, isolation."""
 
     @pytest.fixture(autouse=True)
     def _setup(self, tmp_path, lifecycle_image):
@@ -117,20 +118,17 @@ class TestContainerLifecycle:
         hello_file.write_text(self.hello_text)
         os.chmod(hello_file, 0o644)
         self.image_tag = lifecycle_image
-        # (container_id, volume_name-or-None) pairs removed at teardown.
+        # Container ids removed at teardown. Phase-2 creates NO named
+        # workspace volumes (host dir is bind-mounted), so there is no
+        # volume tracking anymore.
         self._tracked = []
         yield
         # Exception-safe teardown: never touch anything we did not create.
-        for container_id, volume_name in self._tracked:
+        for container_id in self._tracked:
             try:
                 self.client.containers.get(container_id).remove(force=True)
             except (docker.errors.NotFound, docker.errors.APIError):
                 pass
-            if volume_name is not None:
-                try:
-                    self.client.volumes.get(volume_name).remove(force=True)
-                except (docker.errors.NotFound, docker.errors.APIError):
-                    pass
 
     def _start_manager(self, session_permissions=None, workspace_id=None, session_id=None):
         """Start a ContainerManager-backed container and track it for teardown."""
@@ -143,11 +141,9 @@ class TestContainerLifecycle:
             image=self.image_tag,
         )
         result = manager.start()
-        # Give the init container / first exec a moment to settle
-        # (mirrors test_persistence).
+        # Give the container a moment to settle (mirrors test_persistence).
         time.sleep(1)
-        volume_name = f"tm-workspace-{workspace_id}" if workspace_id is not None else None
-        self._tracked.append((result["id"], volume_name))
+        self._tracked.append(result["id"])
         return manager, result
 
     def _exec_ok(self, manager, container_id, command, timeout=20):
@@ -159,9 +155,8 @@ class TestContainerLifecycle:
         )
         return result
 
-    def test_volume_population_syncs_workspace(self):
-        """Workspace files are copied into the named volume (copy, not bind)."""
-        from docker_executor import ensure_workspace_volume_populated  # lazy (see module docstring)
+    def test_host_workspace_visible_via_bind_mount(self):
+        """The host workspace is bind-mounted: live, read-write, no copies."""
         workspace_id = uuid.uuid4()
         session_id = uuid.uuid4()
         manager, res = self._start_manager(
@@ -174,22 +169,19 @@ class TestContainerLifecycle:
         result = self._exec_ok(manager, container_id, "cat /workspace/hello.txt")
         assert result["stdout"].strip() == self.hello_text
 
-        # Delete the host file, then re-run population: the copy survives
-        # (a bind mount would lose the file), and the sentinel is already in
-        # place so the re-population is a no-op.
+        # Bind mounts are LIVE: deleting the host file makes it disappear
+        # from the running container immediately, and recreating it brings
+        # it back — no population/refresh step in between.
         os.remove(self.workspace_dir / "hello.txt")
-        assert ensure_workspace_volume_populated(
-            self.client,
-            self.image_tag,
-            str(self.workspace_dir),
-            f"tm-workspace-{workspace_id}",
-            network_mode="none",
-        ) is True
+        gone = manager.exec(container_id, "cat /workspace/hello.txt", timeout=20)
+        assert gone["exit_code"] != 0, (
+            f"expected cat to fail after host file removal, got {gone!r}"
+        )
+        (self.workspace_dir / "hello.txt").write_text(self.hello_text)
         result = self._exec_ok(manager, container_id, "cat /workspace/hello.txt")
         assert result["stdout"].strip() == self.hello_text
-        self._exec_ok(manager, container_id, "test -f /workspace/.workspace_synced")
 
-        # Volume is mounted read-write: writes from inside the container stick.
+        # Mount is read-write: writes from inside the container stick.
         self._exec_ok(manager, container_id, "echo marker > /workspace/marker.txt")
 
     def test_persistence_across_stop_start(self):
@@ -241,7 +233,7 @@ class TestContainerLifecycle:
             detach=True,
             user="1000:1000",
         )
-        self._tracked.append((orphan.id, None))
+        self._tracked.append(orphan.id)
 
         cleanup = cleanup_session(fake_session_id, self.client)
         assert cleanup["removed"] >= 1, f"expected orphan removal, got {cleanup!r}"
@@ -296,7 +288,7 @@ class TestContainerLifecycle:
                 workspace_mount = mount
                 break
         assert workspace_mount is not None, "no /workspace mount found"
-        # Docker reports Mode 'z' for named volume mounts on this host, so
+        # Docker reports Mode strings like 'z'/'rw,z' for some mounts, so
         # Mode cannot distinguish ro from rw — RW is the authoritative flag.
         assert workspace_mount.get("RW") is False, (
             f"expected read-only workspace mount, got RW={workspace_mount.get('RW')!r}"
@@ -308,13 +300,13 @@ class TestContainerLifecycle:
             "expected HostConfig /workspace mount ReadOnly=True"
         )
 
-    def test_stale_volume_refreshed_on_second_start(self):
-        """A host workspace change re-seeds the volume for a later container.
+    def test_host_changes_visible_to_new_container(self):
+        """A host workspace change is visible to a later container.
 
-        First start seeds the named volume (sentinels + copy). Touching a host
-        file changes the manifest hash; starting a SECOND container for the
-        same workspace path must detect the stale volume and refresh it, so
-        the new file is visible inside the fresh container.
+        Phase-2 bind-mounts the host directory directly: no named volume, no
+        manifest/sha tracking. A file added on the host while the first
+        container runs is immediately visible to a SECOND container started
+        for the same workspace path (the bind reflects the live host tree).
         """
         workspace_id = uuid.uuid4()
         session_id_1 = uuid.uuid4()
@@ -322,74 +314,46 @@ class TestContainerLifecycle:
             workspace_id=workspace_id, session_id=session_id_1
         )
         container_id_1 = res1["id"]
-        # Volume is seeded on first start.
-        self._exec_ok(manager1, container_id_1, "test -f /workspace/.workspace_synced")
+        self._exec_ok(manager1, container_id_1, "cat /workspace/hello.txt")
 
-        # Change the host workspace OUTSIDE the manifest's excluded dirs
-        # (.git, __pycache__, node_modules, .venv, temp) so the stored
-        # workspace sha no longer matches the host.
+        # Change the host workspace while the first container is running.
         probe_text = f"refreshed-{uuid.uuid4()}"
         (self.workspace_dir / "refresh-probe.txt").write_text(probe_text)
 
-        # Second container, same workspace path / same named volume, new
-        # session: forces a fresh create whose population sees the stale sha
-        # and refreshes the volume in place (the first container still holds
-        # it, so a recreate would fail with "volume in use").
+        # Second container, same workspace path, new session: the bind mount
+        # reflects the live host tree, so the new file is visible immediately.
         session_id_2 = uuid.uuid4()
         manager2, res2 = self._start_manager(
             workspace_id=workspace_id, session_id=session_id_2
         )
         assert res2["status"] == "created", f"expected fresh container, got {res2!r}"
 
-        # The new host file is visible inside the refreshed volume...
         result = self._exec_ok(manager2, res2["id"], "cat /workspace/refresh-probe.txt")
         assert result["stdout"].strip() == probe_text
-        # ...and the original workspace file survived the refresh (merge, not wipe).
+        # ...and the original workspace file is still visible via the bind.
         result = self._exec_ok(manager2, res2["id"], "cat /workspace/hello.txt")
         assert result["stdout"].strip() == self.hello_text
 
-    def test_unchanged_workspace_fast_path_preserves_sentinel(self):
-        """Unchanged workspace: second start takes the fast path, no re-seed.
-
-        The volume keeps its original .workspace_synced mtime, proving
-        ensure_workspace_volume_populated returned on the stored-sha match
-        instead of re-initialising the volume.
-        """
+    def test_no_workspace_volume_created(self):
+        """Phase-2 creates NO named workspace volume (host dir is bind-mounted)."""
         workspace_id = uuid.uuid4()
-        volume_name = f"tm-workspace-{workspace_id}"
         session_id_1 = uuid.uuid4()
         manager1, res1 = self._start_manager(
             workspace_id=workspace_id, session_id=session_id_1
         )
         container_id_1 = res1["id"]
-        # Volume is seeded on first start.
-        self._exec_ok(manager1, container_id_1, "test -f /workspace/.workspace_synced")
+        self._exec_ok(manager1, container_id_1, "cat /workspace/hello.txt")
 
-        def _sentinel_mtime():
-            """Full-precision mtime of .workspace_synced via a throwaway container."""
-            output = self.client.containers.run(
-                image=self.image_tag,
-                command=["stat", "-c", "%y", "/workspace/.workspace_synced"],
-                volumes={volume_name: {"bind": "/workspace", "mode": "rw"}},
-                remove=True,
-                network_disabled=True,
-            )
-            return output.strip()
+        # The old model's named workspace volume must never be created.
+        with pytest.raises(docker.errors.NotFound):
+            self.client.volumes.get(f"tm-workspace-{workspace_id}")
 
-        mtime_before = _sentinel_mtime()
-        assert mtime_before, "sentinel stat returned empty output"
-
-        # Second container, same workspace path, host untouched: the stored
-        # sha matches, so population short-circuits and the sentinel is left
-        # alone (no touch, no re-copy).
+        # Second container, same workspace path: still created fresh, and the
+        # workspace files are visible via the bind mount (no population step).
         session_id_2 = uuid.uuid4()
         manager2, res2 = self._start_manager(
             workspace_id=workspace_id, session_id=session_id_2
         )
         assert res2["status"] == "created", f"expected fresh container, got {res2!r}"
-
-        mtime_after = _sentinel_mtime()
-        assert mtime_after == mtime_before, (
-            "sentinel mtime changed: volume was re-seeded despite an "
-            f"unchanged host workspace ({mtime_before!r} -> {mtime_after!r})"
-        )
+        result = self._exec_ok(manager2, res2["id"], "cat /workspace/hello.txt")
+        assert result["stdout"].strip() == self.hello_text
