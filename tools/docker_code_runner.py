@@ -377,6 +377,11 @@ chmod +x "{script_path}"
             with open("/tmp/container_audit.log", "a") as _f:
                 _f.write(f"{time.time()} | CODERUNNER_EXECUTE | workspace={workspace} via_security={SECURITY_AVAILABLE}\n")
             info = manager.start(image=self.image)
+            # start() returns {"error": ...} (no "id") when the per-workspace
+            # container limit is reached or any pre-create check fails -
+            # surface that as a clear RuntimeError instead of a KeyError('id').
+            if "error" in info:
+                raise RuntimeError(info["error"])
             try:
                 result = manager.exec(
                     info["id"],
