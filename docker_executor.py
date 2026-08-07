@@ -24,6 +24,7 @@ between integrity checks and container creation/recreation.
 
 from agent.logging import log
 import docker
+import docker.types
 import hashlib
 import os
 import time
@@ -584,13 +585,34 @@ class DockerExecutor:
 
         audit_event("CONTAINER_CREATE",
                    f"image={self.image} network={network_mode} name={container_name}")
-        volumes = {self.workspace_path: {"bind": "/workspace", "mode": workspace_mode}}
-        mounts = None
+        # Workspace bind mount via docker.types.Mount so it can be combined
+        # with a named volume for the persistent package cache.
+        host_workspace = self.workspace_path
+        read_only = workspace_mode == "ro"
+        workspace_mount = docker.types.Mount(
+            target="/workspace", source=host_workspace, type="bind", read_only=read_only
+        )
+        pkg_mount = None
+        try:
+            pkg_volume_name = f"tm-packages-{self.workspace_id or 'default'}"
+            try:
+                self.client.volumes.get_or_create(name=pkg_volume_name)
+            except (docker.errors.APIError, docker.errors.NotFound):
+                self.client.volumes.create(name=pkg_volume_name)
+            pkg_mount = docker.types.Mount(
+                target="/home/agent/.local", source=pkg_volume_name, type="volume"
+            )
+        except Exception as e:
+            log("WARNING", "tools.docker_executor.container",
+                f"Package volume setup failed; continuing without persistent package cache: {e}")
+        mounts = [workspace_mount]
+        if pkg_mount is not None:
+            mounts.append(pkg_mount)
+        container_env = ["PYTHONUSERBASE=/home/agent/.local"]
 
         self.container = self.client.containers.run(
             image=self.image,
             name=container_name,
-            volumes=volumes,
             mounts=mounts,
             tmpfs=tmpfs,
             network=network_mode,
@@ -604,6 +626,7 @@ class DockerExecutor:
             command=["tail", "-f", "/dev/null"],
             mem_limit=self.mem_limit,
             cpu_quota=self.cpu_quota,
+            environment=container_env,
         )
         # Workspace bind mount already has correct UID (matches host)
         self.last_used = time.time()
