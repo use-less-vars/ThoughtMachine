@@ -62,7 +62,7 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -576,6 +576,8 @@ class ContainerManager:
 
         stdout = output[0].decode(errors="replace") if output and output[0] else ""
         stderr = output[1].decode(errors="replace") if output and output[1] else ""
+        # Phase 6: persistent usage log (best-effort; never affects the result).
+        self._append_usage_log(container_id, command)
         return {
             "stdout": _truncate_output(stdout),
             "stderr": _truncate_output(stderr),
@@ -660,7 +662,7 @@ class ContainerManager:
         except Exception:
             memory_usage_bytes = None
 
-        return {
+        result = {
             "container_id": container_id,
             "name": container.name,
             "status": container.status,
@@ -669,6 +671,193 @@ class ContainerManager:
             "note": ((getattr(self, "container_notes", {}) or {}).get(container.name)
                      or {}).get("note", ""),
         }
+
+        # Phase 6: live introspection only for running containers. Every probe
+        # is best-effort via _exec_checked(); failures never raise and are
+        # reported in introspection_errors (only present when non-empty).
+        if container.status == "running":
+            introspection_errors = []
+
+            exit_code, stdout = (
+                self._exec_checked(container, "pip list --format=json") or (None, "")
+            )
+            if exit_code == 0:
+                try:
+                    packages = json.loads(stdout)
+                    if isinstance(packages, list):
+                        result["installed_packages"] = [
+                            {"name": p.get("name"), "version": p.get("version")}
+                            for p in packages if isinstance(p, dict)
+                        ]
+                    else:
+                        introspection_errors.append("pip list returned non-list JSON")
+                except (ValueError, TypeError):
+                    introspection_errors.append("pip list JSON unparseable")
+            else:
+                introspection_errors.append("pip list failed")
+
+            exit_code, stdout = (
+                self._exec_checked(
+                    container,
+                    "for p in /proc/[0-9]*; do pid=${p#/proc/}; "
+                    "cmd=$(tr '\\0' ' ' < \"$p/cmdline\" 2>/dev/null); "
+                    "[ -n \"$cmd\" ] && printf '%s\\t%s\\n' \"$pid\" \"$cmd\"; done",
+                )
+                or (None, "")
+            )
+            if exit_code == 0:
+                processes = []
+                for line in stdout.splitlines():
+                    pid, sep, cmd = line.partition("\t")
+                    if sep and pid.isdigit():
+                        processes.append({"pid": int(pid), "command": cmd})
+                result["running_processes"] = processes
+            else:
+                introspection_errors.append("process scan failed")
+
+            exit_code, stdout = (
+                self._exec_checked(
+                    container, "du -sh /workspace /home/agent/.local 2>/dev/null"
+                )
+                or (None, "")
+            )
+            if exit_code == 0:
+                disk = self._parse_disk_usage(stdout)
+                result["disk_usage"] = disk if disk else stdout.strip()
+            else:
+                introspection_errors.append("du failed")
+
+            result["recent_commands"] = self.container_history(container_id, tail=20)
+
+            if introspection_errors:
+                result["introspection_errors"] = introspection_errors
+
+        return result
+
+    def _exec_checked(self, container, command, timeout=10):
+        """Run ``command`` in ``container``; return (exit_code, stdout_str) or None.
+
+        Best-effort introspection helper: NEVER raises and NEVER kills the
+        container. Any failure (daemon error, timeout, missing output) yields
+        None so callers can degrade gracefully.
+        """
+        result_queue = queue.Queue()
+
+        def _run():
+            try:
+                exit_code, output = container.exec_run(
+                    cmd=["/bin/sh", "-c", command], demux=True
+                )
+                result_queue.put((exit_code, output, None))
+            except Exception as e:
+                result_queue.put((None, None, e))
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        thread.join(timeout)
+        if thread.is_alive():
+            return None
+        try:
+            exit_code, output, error = result_queue.get_nowait()
+        except queue.Empty:
+            return None
+        if error is not None:
+            return None
+        stdout = output[0].decode(errors="replace") if output and output[0] else ""
+        return exit_code, stdout
+
+    def _append_usage_log(self, container_id, command):
+        """Append one line to the container's persistent usage log; NEVER raises.
+
+        Line format: ``<utc iso ts> | <session id or anon> | <normalised command>``
+        appended to ``/home/agent/.local/usage.log`` (the persistent package
+        volume, so it survives container recreation). Best-effort: any failure
+        only logs a WARNING and never affects the caller's result. No rotation.
+        """
+        try:
+            container = self.client.containers.get(container_id)
+            ts = datetime.now(timezone.utc).isoformat()
+            session = str(self.session_id) if self.session_id is not None else "anon"
+            line = f"{ts} | {session} | {' '.join(command.split())}"
+            escaped = line.replace("'", "'\\''")
+            self._exec_checked(
+                container,
+                f"printf '%s\\n' '{escaped}' >> /home/agent/.local/usage.log",
+            )
+        except Exception as e:
+            log("WARNING", "docker.container_manager", f"usage log append failed: {e}")
+
+    def container_history(self, container_id, tail=50):
+        """Return the last ``tail`` usage-log lines for a container; NEVER raises.
+
+        Reads ``/home/agent/.local/usage.log`` via a best-effort exec. Missing,
+        non-running containers and any exec failure yield [].
+        """
+        try:
+            container = self.client.containers.get(container_id)
+            container.reload()
+            if container.status != "running":
+                return []
+            result = self._exec_checked(
+                container,
+                f"tail -n {int(tail)} /home/agent/.local/usage.log 2>/dev/null",
+            )
+            if result is None:
+                return []
+            exit_code, stdout = result
+            if exit_code != 0:
+                return []
+            return stdout.splitlines()
+        except Exception:
+            return []
+
+    def container_summary(self, container_id):
+        """Compact introspection for list-style responses; {} unless running.
+
+        Runs only two best-effort execs (pip list + du) so callers can decorate
+        container entries cheaply. NEVER raises.
+        """
+        try:
+            container = self.client.containers.get(container_id)
+            container.reload()
+            if container.status != "running":
+                return {}
+            summary = {}
+            exit_code, stdout = self._exec_checked(container, "pip list --format=json")
+            if exit_code == 0:
+                try:
+                    packages = json.loads(stdout)
+                    if isinstance(packages, list):
+                        summary["packages_count"] = len(packages)
+                except (ValueError, TypeError):
+                    pass
+            exit_code, stdout = self._exec_checked(
+                container, "du -sh /workspace /home/agent/.local 2>/dev/null"
+            )
+            if exit_code == 0:
+                disk = self._parse_disk_usage(stdout)
+                if disk:
+                    summary["disk_usage"] = disk
+            return summary
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _parse_disk_usage(text):
+        """Parse ``du -sh`` output into {"workspace": size, "packages": size}."""
+        try:
+            usage = {}
+            for line in text.splitlines():
+                parts = line.split("\t")
+                if len(parts) == 2:
+                    size, path = parts
+                    if path == "/workspace":
+                        usage["workspace"] = size
+                    elif path == "/home/agent/.local":
+                        usage["packages"] = size
+            return usage
+        except Exception:
+            return {}
 
     def list_containers(self):
         """List containers carrying this workspace's label; NEVER raises.

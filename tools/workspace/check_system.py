@@ -345,15 +345,24 @@ class CheckSystem(ToolBase):
             return {"containers": [], "count": 0,
                     "reason": f"failed: {e}", "status": "error"}
 
-        containers = [
-            {
+        containers = []
+        for entry in entries:
+            item = {
                 "name": entry.get("name"),
                 "status": entry.get("status"),
                 "note": entry.get("note", ""),
                 "uptime_seconds": entry.get("uptime_seconds"),
             }
-            for entry in entries
-        ]
+            # Phase 6: decorate running containers with a cheap live summary
+            # (packages_count + disk_usage); best-effort, never raises.
+            if entry.get("status") == "running":
+                try:
+                    summary = manager.container_summary(entry.get("container_id"))
+                    if summary:
+                        item.update(summary)
+                except Exception:
+                    pass
+            containers.append(item)
         return {"containers": containers, "count": len(containers), "status": "ok"}
 
     def _query_workspace_info(self, ws_id: Optional[str]) -> dict:

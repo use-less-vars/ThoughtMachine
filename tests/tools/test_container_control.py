@@ -767,3 +767,188 @@ class TestContainerLogsTool:
         assert ContainerLogsTool.model_fields["container_id"].is_required()
         assert ContainerLogsTool.model_fields["tail"].default == 100
         assert ContainerLogsTool.model_fields["since"].default is None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ContainerManager.status introspection (Phase 6)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _introspection_exec_run(raise_on_usage_log=False, pip_output=None):
+    """Build a fake.exec_run dispatcher for the Phase 6 introspection tests.
+
+    Matches the commands issued by ``_exec_checked()`` (cmd lists with
+    ``/bin/sh -c <command>``) and returns demux-style
+    ``(exit_code, (stdout_bytes, stderr_bytes))`` tuples. Any unrecognised
+    command (e.g. the exec() quota probe ``du -s ...``) yields an empty,
+    successful result.
+    """
+
+    def dispatcher(cmd, **kwargs):
+        command = cmd[2] if isinstance(cmd, list) and len(cmd) >= 3 else str(cmd)
+        if "usage.log" in command:
+            if raise_on_usage_log:
+                raise RuntimeError("append failed")
+            return (0, (b"2025-01-01T00:00:00+00:00 | s1 | echo hi\n", b""))
+        if "pip list --format=json" in command:
+            return (0, (pip_output or b'[{"name":"requests","version":"2.31.0"}]', b""))
+        if "/proc/" in command:
+            return (0, (b"1\t/bin/sh\n42\tpython3 main.py\n", b""))
+        if "du -sh /workspace" in command:
+            return (0, (b"12M\t/workspace\n3M\t/home/agent/.local\n", b""))
+        if "echo hello" in command:
+            return (0, (b"hello\n", b""))
+        return (0, (b"", b""))
+
+    return dispatcher
+
+
+class TestContainerManagerStatusIntrospection:
+    """Phase 6: status() live introspection + persistent usage log."""
+
+    @staticmethod
+    def _manager(dispatcher=None):
+        manager = ContainerManager.__new__(ContainerManager)  # skip docker.from_env()
+        client = MagicMock()
+        fake = MagicMock()
+        fake.id = "c1"
+        fake.name = "tm-1"
+        fake.status = "running"
+        fake.attrs = {"State": {"StartedAt": _iso_dt(120)}}
+        if dispatcher is not None:
+            fake.exec_run.side_effect = dispatcher
+        client.containers.get.return_value = fake
+        client.stats.return_value = {"memory_stats": {"usage": 1234}}
+        manager.client = client
+        manager.workspace_id = "ws-1"
+        manager.session_id = "sess-1"
+        manager.container_notes = {}
+        manager.workspace_config = {}
+        return manager, fake
+
+    def test_status_running_includes_introspection(self):
+        """Running container: packages, processes, disk, history all present."""
+        manager, _ = self._manager(_introspection_exec_run())
+        result = manager.status("c1")
+
+        assert result["container_id"] == "c1"
+        assert result["name"] == "tm-1"
+        assert result["status"] == "running"
+        assert result["memory_usage_bytes"] == 1234
+        assert result["note"] == ""
+        assert isinstance(result["uptime_seconds"], int)
+        assert 110 <= result["uptime_seconds"] <= 130
+        assert result["installed_packages"] == [
+            {"name": "requests", "version": "2.31.0"}
+        ]
+        assert result["running_processes"] == [
+            {"pid": 1, "command": "/bin/sh"},
+            {"pid": 42, "command": "python3 main.py"},
+        ]
+        assert result["disk_usage"] == {"workspace": "12M", "packages": "3M"}
+        assert result["recent_commands"] == [
+            "2025-01-01T00:00:00+00:00 | s1 | echo hi"
+        ]
+        assert "introspection_errors" not in result
+
+    def test_status_introspection_failures_degrade(self):
+        """Daemon exec failures -> error entries, no raise, no partial keys."""
+        manager, fake = self._manager()
+        fake.exec_run.side_effect = Exception("daemon down")
+
+        result = manager.status("c1")
+
+        assert result["status"] == "running"
+        assert "installed_packages" not in result
+        assert "running_processes" not in result
+        assert "disk_usage" not in result
+        assert result["recent_commands"] == []
+        assert result["introspection_errors"] == [
+            "pip list failed",
+            "process scan failed",
+            "du failed",
+        ]
+
+    def test_status_bad_pip_json_reported(self):
+        """Unparseable pip JSON -> introspection_errors, packages absent."""
+        manager, _ = self._manager(_introspection_exec_run(pip_output=b"not json"))
+        result = manager.status("c1")
+
+        assert "installed_packages" not in result
+        assert result["introspection_errors"] == ["pip list JSON unparseable"]
+        assert result["running_processes"]  # other probes still succeed
+
+    def test_status_stopped_has_no_introspection(self):
+        """Stopped container: no Phase 6 keys, no exec probes issued."""
+        manager, fake = self._manager(_introspection_exec_run())
+        fake.status = "exited"
+
+        result = manager.status("c1")
+
+        assert result["status"] == "exited"
+        for key in ("installed_packages", "running_processes", "disk_usage",
+                    "recent_commands", "introspection_errors"):
+            assert key not in result
+        fake.exec_run.assert_not_called()
+
+    def test_exec_appends_usage_log(self):
+        """exec() success appends a session-scoped line to usage.log."""
+        manager, fake = self._manager(_introspection_exec_run())
+
+        result = manager.exec("c1", "echo hello")
+
+        assert result["stdout"] == "hello\n"
+        assert result["stderr"] == ""
+        assert result["exit_code"] == 0
+        append_calls = [
+            c for c in fake.exec_run.call_args_list
+            if c.kwargs.get("cmd") and "usage.log" in " ".join(c.kwargs["cmd"])
+        ]
+        assert len(append_calls) == 1
+        cmd = append_calls[0].kwargs["cmd"]
+        assert cmd[:2] == ["/bin/sh", "-c"]
+        assert cmd[2].startswith("printf '%s\\n' '")
+        assert "echo hello" in cmd[2]
+        assert "sess-1" in cmd[2]
+
+    def test_exec_usage_log_failure_ignored(self):
+        """usage.log append failure never affects the exec result."""
+        manager, _ = self._manager(_introspection_exec_run(raise_on_usage_log=True))
+
+        result = manager.exec("c1", "echo hello")
+
+        assert result["stdout"] == "hello\n"
+        assert result["exit_code"] == 0
+
+    def test_container_history_returns_lines(self):
+        """container_history() returns tail lines for a running container."""
+        manager, _ = self._manager(_introspection_exec_run())
+
+        lines = manager.container_history("c1", tail=20)
+
+        assert lines == ["2025-01-01T00:00:00+00:00 | s1 | echo hi"]
+
+    def test_container_history_stopped_empty(self):
+        """container_history() is [] for non-running containers, no exec."""
+        manager, fake = self._manager(_introspection_exec_run())
+        fake.status = "exited"
+
+        assert manager.container_history("c1", tail=20) == []
+        fake.exec_run.assert_not_called()
+
+    def test_container_summary_running(self):
+        """container_summary() -> packages_count + disk_usage for running."""
+        manager, _ = self._manager(_introspection_exec_run())
+
+        assert manager.container_summary("c1") == {
+            "packages_count": 1,
+            "disk_usage": {"workspace": "12M", "packages": "3M"},
+        }
+
+    def test_container_summary_stopped(self):
+        """container_summary() -> {} for non-running containers."""
+        manager, fake = self._manager(_introspection_exec_run())
+        fake.status = "exited"
+
+        assert manager.container_summary("c1") == {}
+        fake.exec_run.assert_not_called()
+

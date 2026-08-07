@@ -12,7 +12,7 @@ Style mirrors the CheckSystem block in tests/tools/test_workspace_tools.py
 """
 
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from tools.workspace.check_system import CheckSystem
 
@@ -40,6 +40,9 @@ class _FakeManager:
                 "note": "n1",
             }
         ]
+
+    def container_summary(self, container_id):
+        return {}
 
 
 class TestCheckSystemContainers:
@@ -103,3 +106,38 @@ class TestCheckSystemContainers:
         desc = CheckSystem.model_fields["query"].description
         assert "containers" in desc
         assert callable(getattr(CheckSystem, "_query_containers", None))
+
+    @patch("tools.workspace.check_system.resolve_workspace_id", return_value=None)
+    def test_containers_query_merges_running_summary(self, mock_resolve):
+        """Phase 6: running entries are decorated with container_summary();
+        stopped entries are not, and the summary is fetched once per running id."""
+        mock_cls = MagicMock()
+        mock_manager = MagicMock()
+        mock_manager.list_containers.return_value = [
+            {"container_id": "c1", "name": "c1", "status": "running",
+             "note": "n1", "uptime_seconds": 5},
+            {"container_id": "c2", "name": "c2", "status": "exited",
+             "note": "", "uptime_seconds": None},
+        ]
+        mock_manager.container_summary.return_value = {
+            "packages_count": 3,
+            "disk_usage": {"workspace": "12M", "packages": "3M"},
+        }
+        mock_cls.return_value = mock_manager
+        with patch.object(
+            CheckSystem, "_load_allowlist_from_vault", return_value=["containers"]
+        ), patch("tools.workspace.check_system._ContainerManager", mock_cls):
+            tool = CheckSystem(
+                query="containers",
+                workspace_path="/tmp/test_ws",
+                session_permissions={"container": True},
+            )
+            result = _parse_result(tool.execute())
+        assert result["status"] == "ok"
+        assert result["count"] == 2
+        assert result["containers"][0]["packages_count"] == 3
+        assert result["containers"][0]["disk_usage"] == {
+            "workspace": "12M", "packages": "3M",
+        }
+        assert "packages_count" not in result["containers"][1]
+        mock_manager.container_summary.assert_called_once_with("c1")
