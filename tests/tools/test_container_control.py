@@ -1,19 +1,20 @@
 """
-Tests for the per-session container control tools (label-scoped listing).
+Tests for the per-workspace container control tools (label-scoped listing).
 
 Covers
 ------
 - ContainerManager.list_containers(): daemon query scoped by the exact
-  ``thoughtmachine.session_id`` label that ``start()`` applies; the exact
-  {container_id, name, image, status, uptime_seconds} dict shape; uptime from
-  ``attrs['State']['StartedAt']`` with None guards; daemon-error resilience.
+  ``thoughtmachine.workspace_id`` label that ``start()`` applies; the exact
+  {container_id, name, image, status, uptime_seconds, workspace_id, note}
+  dict shape; uptime from ``attrs['State']['StartedAt']`` with None guards;
+  daemon-error resilience.
 - ContainerListTool: the zero-parameter tool wrapper — success JSON with
   ``containers``/``count``, required_categories, error JSON on failure.
 
 No live Docker daemon is needed: the daemon-side label filter is simulated in
-the mock (``containers.list`` only returns containers whose session label
+the mock (``containers.list`` only returns containers whose workspace label
 matches the requested filter), which is exactly how "containers from another
-session (or unlabeled) do NOT appear" is enforced in production.
+workspace (or unlabeled) do NOT appear" is enforced in production.
 """
 
 import json
@@ -80,16 +81,16 @@ def _mock_container(cid, name, status, labels, started_seconds_ago=None, image_t
     return container
 
 
-def _daemon_that_filters_by_session_label(all_containers):
+def _daemon_that_filters_by_workspace_label(all_containers):
     """Simulate the daemon: containers.list returns only label-matching containers."""
     def fake_list(**kwargs):
         label = kwargs["filters"]["label"]
-        prefix = "thoughtmachine.session_id="
+        prefix = "thoughtmachine.workspace_id="
         assert label.startswith(prefix), label
         want = label[len(prefix):]
         return [
             c for c in all_containers
-            if c.labels.get("thoughtmachine.session_id") == want
+            if c.labels.get("thoughtmachine.workspace_id") == want
         ]
     return fake_list
 
@@ -102,43 +103,44 @@ class TestContainerManagerListContainers:
     """Tests for ContainerManager.list_containers() with a mocked daemon."""
 
     @staticmethod
-    def _manager(mock_client, session_id="sess-1"):
+    def _manager(mock_client, workspace_id="ws-1"):
         manager = ContainerManager.__new__(ContainerManager)  # skip docker.from_env()
         manager.client = mock_client
-        manager.session_id = session_id
+        manager.workspace_id = "default" if workspace_id is None else workspace_id
         return manager
 
-    def test_returns_only_session_containers_with_exact_fields(self):
-        """Two session containers appear; other-session and unlabeled do not."""
+    def test_returns_only_workspace_containers_with_exact_fields(self):
+        """Two workspace containers appear; other-workspace and unlabeled do not."""
         mock_client = MagicMock()
         all_containers = [
             _mock_container("abc123", "tm-1", "running",
-                            {"thoughtmachine.session_id": "sess-1"},
+                            {"thoughtmachine.workspace_id": "ws-1"},
                             started_seconds_ago=3600, image_tags=["agent-executor:latest"]),
             _mock_container("def456", "tm-2", "exited",
-                            {"thoughtmachine.session_id": "sess-1"},
+                            {"thoughtmachine.workspace_id": "ws-1"},
                             started_seconds_ago=7200, image_tags=["agent-executor:latest"]),
-            _mock_container("999999", "other-session", "running",
-                            {"thoughtmachine.session_id": "sess-2"},
+            _mock_container("999999", "other-workspace", "running",
+                            {"thoughtmachine.workspace_id": "ws-2"},
                             started_seconds_ago=60, image_tags=["other:tag"]),
             _mock_container("777777", "unlabeled", "created",
                             {},
                             started_seconds_ago=30, image_tags=["other:tag"]),
         ]
-        mock_client.containers.list.side_effect = _daemon_that_filters_by_session_label(
+        mock_client.containers.list.side_effect = _daemon_that_filters_by_workspace_label(
             all_containers
         )
 
-        result = self._manager(mock_client, session_id="sess-1").list_containers()
+        result = self._manager(mock_client, workspace_id="ws-1").list_containers()
 
         mock_client.containers.list.assert_called_once_with(
             all=True,
-            filters={"label": "thoughtmachine.session_id=sess-1"},
+            filters={"label": "thoughtmachine.workspace_id=ws-1"},
         )
         assert len(result) == 2
         for entry in result:
             assert set(entry.keys()) == {
                 "container_id", "name", "image", "status", "uptime_seconds",
+                "workspace_id", "note",
             }
         by_id = {e["container_id"]: e for e in result}
         assert set(by_id) == {"abc123", "def456"}
@@ -148,6 +150,8 @@ class TestContainerManagerListContainers:
             "image": "agent-executor:latest",
             "status": "running",
             "uptime_seconds": by_id["abc123"]["uptime_seconds"],
+            "workspace_id": "ws-1",
+            "note": "",
         }
         # uptime == now - StartedAt (≈3600s, allowing a little clock drift)
         assert isinstance(by_id["abc123"]["uptime_seconds"], int)
@@ -159,7 +163,7 @@ class TestContainerManagerListContainers:
         """attrs['State']['StartedAt'] missing -> uptime_seconds None (guarded)."""
         mock_client = MagicMock()
         container = _mock_container("abc123", "tm-1", "created",
-                                    {"thoughtmachine.session_id": "sess-1"},
+                                    {"thoughtmachine.workspace_id": "ws-1"},
                                     started_seconds_ago=None)
         container.attrs = {}  # no State at all
         mock_client.containers.list.return_value = [container]
@@ -174,7 +178,7 @@ class TestContainerManagerListContainers:
         """Container image without tags -> image None (guarded)."""
         mock_client = MagicMock()
         container = _mock_container("abc123", "tm-1", "running",
-                                    {"thoughtmachine.session_id": "sess-1"},
+                                    {"thoughtmachine.workspace_id": "ws-1"},
                                     started_seconds_ago=10, image_tags=[])
         mock_client.containers.list.return_value = [container]
 
@@ -191,16 +195,16 @@ class TestContainerManagerListContainers:
 
         assert result == []
 
-    def test_none_session_id_uses_empty_label_value(self):
-        """session_id=None -> label value '' (same source start() uses)."""
+    def test_none_workspace_id_uses_default_label_value(self):
+        """workspace_id=None -> label value 'default' (same source start() uses)."""
         mock_client = MagicMock()
         mock_client.containers.list.return_value = []
 
-        result = self._manager(mock_client, session_id=None).list_containers()
+        result = self._manager(mock_client, workspace_id=None).list_containers()
 
         mock_client.containers.list.assert_called_once_with(
             all=True,
-            filters={"label": "thoughtmachine.session_id="},
+            filters={"label": "thoughtmachine.workspace_id=default"},
         )
         assert result == []
 

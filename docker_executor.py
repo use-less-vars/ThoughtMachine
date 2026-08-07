@@ -627,6 +627,11 @@ class DockerExecutor:
             mem_limit=self.mem_limit,
             cpu_quota=self.cpu_quota,
             environment=container_env,
+            labels={
+                "thoughtmachine.workspace_id": str(self.workspace_id)
+                if self.workspace_id is not None else "default",
+                "thoughtmachine.note": "",
+            },
         )
         # Workspace bind mount already has correct UID (matches host)
         self.last_used = time.time()

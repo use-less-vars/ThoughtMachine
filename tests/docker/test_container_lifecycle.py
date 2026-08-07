@@ -4,9 +4,10 @@ Live-Docker integration suite for the persistent container machinery.
 Covers the `ContainerManager` lifecycle: the Phase-2 mount model (host
 workspace bind-mounted at /workspace — live, no named workspace volumes —
 plus a per-workspace package volume), persistence across stop/start,
-session cleanup (including orphaned containers tagged with a session
-label), network/read-only isolation, and the permissive security gate that
-grants bridge networking when session permissions allow it.
+workspace-scoped cleanup (including orphaned containers tagged with a
+workspace label), cross-session container sharing, the per-workspace
+container limit, network/read-only isolation, and the permissive security
+gate that grants bridge networking when session permissions allow it.
 
 These tests talk to a real Docker daemon.  They are skipped cleanly when the
 daemon is unavailable (see `needs_docker`); the only network dependency is
@@ -206,38 +207,133 @@ class TestContainerLifecycle:
         result = self._exec_ok(manager, restart["id"], "cat /workspace/persist.txt")
         assert result["stdout"].strip() == "persisted"
 
-    def test_session_cleanup_removes_containers(self):
-        """cleanup_session removes every container labelled with the session id."""
-        from tools.container_manager import cleanup_session, list_session_containers  # lazy
+    def test_workspace_cleanup_removes_containers(self):
+        """cleanup_workspace removes every container labelled with the workspace id."""
+        from tools.container_manager import cleanup_workspace  # lazy
+        workspace_id = uuid.uuid4()
         session_id = uuid.uuid4()
-        manager, res = self._start_manager(session_id=session_id)
+        manager, res = self._start_manager(workspace_id=workspace_id, session_id=session_id)
         assert res["status"] == "created"
 
-        cleanup = cleanup_session(session_id, self.client)
+        cleanup = cleanup_workspace(workspace_id, self.client)
         assert cleanup["removed"] >= 1, f"expected >=1 removal, got {cleanup!r}"
-        assert list_session_containers(session_id, self.client) == []
+        assert manager.list_containers() == []
 
         # Second pass is a no-op.
-        cleanup_again = cleanup_session(session_id, self.client)
+        cleanup_again = cleanup_workspace(workspace_id, self.client)
         assert cleanup_again["removed"] == 0, f"expected no removals, got {cleanup_again!r}"
 
-    def test_orphan_cleanup_fake_label(self):
-        """Orphaned containers carrying a session label are reclaimed."""
-        from tools.container_manager import cleanup_session, list_session_containers  # lazy
-        fake_session_id = str(uuid.uuid4())
+    def test_orphan_cleanup_fake_workspace_label(self):
+        """Orphaned containers carrying a workspace label are reclaimed."""
+        from tools.container_manager import cleanup_workspace  # lazy
+        fake_workspace_id = str(uuid.uuid4())
         orphan = self.client.containers.run(
             image=self.image_tag,
             name=f"tm-orphan-{uuid.uuid4().hex[:8]}",
-            labels={"thoughtmachine.session_id": fake_session_id},
+            labels={"thoughtmachine.workspace_id": fake_workspace_id},
             command=["tail", "-f", "/dev/null"],
             detach=True,
             user="1000:1000",
         )
         self._tracked.append(orphan.id)
 
-        cleanup = cleanup_session(fake_session_id, self.client)
+        cleanup = cleanup_workspace(fake_workspace_id, self.client)
         assert cleanup["removed"] >= 1, f"expected orphan removal, got {cleanup!r}"
-        assert list_session_containers(fake_session_id, self.client) == []
+        leftovers = self.client.containers.list(
+            all=True,
+            filters={"label": f"thoughtmachine.workspace_id={fake_workspace_id}"},
+        )
+        assert leftovers == []
+
+    def test_multi_session_shares_container_for_same_workspace(self):
+        """Same workspace_id + same name across sessions reuses ONE container."""
+        from tools.container_manager import ContainerManager  # lazy
+        workspace_id = uuid.uuid4()
+        session_id_1 = uuid.uuid4()
+        session_id_2 = uuid.uuid4()
+        manager1, res1 = self._start_manager(
+            workspace_id=workspace_id, session_id=session_id_1
+        )
+        name = res1["name"]
+        assert res1["status"] == "created", f"expected created, got {res1!r}"
+
+        # Second manager: SAME workspace_id, DIFFERENT session_id.
+        manager2 = ContainerManager(
+            workspace_path=str(self.workspace_dir),
+            session_id=session_id_2,
+            workspace_id=workspace_id,
+            session_permissions=None,
+            image=self.image_tag,
+        )
+        res2 = manager2.start(name=name)
+        assert res2["status"] == "reused", f"expected reuse, got {res2!r}"
+        assert (res2.get("container_id") or res2.get("id")) == res1["id"], (
+            f"expected same container, got {res1!r} vs {res2!r}"
+        )
+        # Exactly one container carries the workspace label.
+        labeled = self.client.containers.list(
+            all=True,
+            filters={"label": f"thoughtmachine.workspace_id={workspace_id}"},
+        )
+        assert len(labeled) == 1, (
+            f"expected exactly 1 workspace container, found {len(labeled)}"
+        )
+
+    def test_container_limit_enforced_before_create(self):
+        """max_containers=1: second distinct name rejected, same name reused."""
+        from tools.container_manager import ContainerManager  # lazy
+        workspace_id = uuid.uuid4()
+        manager = ContainerManager(
+            workspace_path=str(self.workspace_dir),
+            session_id=uuid.uuid4(),
+            workspace_id=workspace_id,
+            image=self.image_tag,
+        )
+        manager.max_containers = 1
+        name_a = f"limit-a-{uuid.uuid4().hex[:8]}"
+        name_b = f"limit-b-{uuid.uuid4().hex[:8]}"
+
+        r_a = manager.start(name=name_a)
+        assert r_a["status"] == "created", f"expected created, got {r_a!r}"
+        self._tracked.append(r_a["id"])
+
+        r_b = manager.start(name=name_b)
+        assert r_b == {
+            "error": "Workspace container limit (1) reached. "
+                      "Stop an unused container first."
+        }, f"unexpected limit result: {r_b!r}"
+
+        r_a_again = manager.start(name=name_a)
+        assert r_a_again["status"] == "reused", (
+            f"expected reuse of existing container, got {r_a_again!r}"
+        )
+        assert (r_a_again.get("container_id") or r_a_again.get("id")) == r_a["id"]
+
+    def test_created_container_has_workspace_and_package_mounts(self):
+        """start() mounts BOTH the /workspace bind and the tm-packages volume."""
+        workspace_id = uuid.uuid4()
+        manager, res = self._start_manager(
+            workspace_id=workspace_id, session_id=uuid.uuid4()
+        )
+        attrs = self.client.containers.get(res["id"]).attrs
+        mounts = attrs["Mounts"]
+
+        bind_mounts = [
+            m for m in mounts
+            if m.get("Type") == "bind" and m.get("Destination") == "/workspace"
+        ]
+        assert bind_mounts, f"no /workspace bind mount in {mounts!r}"
+
+        pkg_mounts = [
+            m for m in mounts
+            if m.get("Type") == "volume"
+            and m.get("Destination") == "/home/agent/.local"
+        ]
+        assert pkg_mounts, f"no /home/agent/.local volume mount in {mounts!r}"
+        pkg = pkg_mounts[0]
+        assert (pkg.get("Name") or pkg.get("Source")) == f"tm-packages-{workspace_id}", (
+            f"unexpected package volume source: {pkg!r}"
+        )
 
     def test_isolation_network_banned(self):
         """Default isolation: network banned, rootfs read-only, workspace ro."""

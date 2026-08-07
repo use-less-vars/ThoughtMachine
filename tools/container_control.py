@@ -16,12 +16,12 @@ tools *compose across calls*: ``ContainerStartTool`` leaves the container
 running so the agent can ``ContainerExecTool`` into it repeatedly, then
 ``ContainerStopTool`` shuts it down. Each tool call constructs a fresh
 ``ContainerManager``, so cross-call reuse is achieved through the
-``thoughtmachine.container_name`` / ``thoughtmachine.session_id`` docker
-labels (same session/name) rather than the manager's in-memory registry.
+``thoughtmachine.container_name`` / ``thoughtmachine.workspace_id`` docker
+labels (same workspace/name) rather than the manager's in-memory registry.
 
-``cleanup_session()`` in ``container_manager`` remains available as a
+``cleanup_workspace()`` in ``container_manager`` remains available as a
 belt-and-braces sweep that stops and removes every container carrying a
-session label (used when a session dies unexpectedly).
+workspace label (used when a workspace is decommissioned).
 
 Security posture is identical to ``DockerCodeRunner``: Docker isolation with a
 read-only root filesystem, dropped capabilities, no-new-privileges, non-root
@@ -182,6 +182,12 @@ class ContainerStartTool(_ContainerControlBase):
         try:
             manager = self._make_manager()
             info = manager.start(image=self.image, name=self.name)
+            if "error" in info:
+                return self._respond(
+                    False,
+                    error=info["error"],
+                    duration=time.time() - start_time,
+                )
             return self._respond(
                 True,
                 container_id=info["id"],
@@ -387,12 +393,12 @@ class ContainerStatusTool(_ContainerControlBase):
 
 
 class ContainerListTool(_ContainerControlBase):
-    """List the containers currently tracked for this session.
+    """List the containers currently tracked for this workspace.
 
     Queries the Docker daemon for every container (running or not) carrying
-    this session's ``thoughtmachine.session_id`` label — the exact label
+    this workspace's ``thoughtmachine.workspace_id`` label — the exact label
     source ``ContainerStartTool`` applies — so containers started by other
-    sessions, or unlabeled ones, never appear. This tool never raises —
+    workspaces, or unlabeled ones, never appear. This tool never raises —
     failures are returned in the JSON response.
 
     Returns JSON with structure:
@@ -404,7 +410,9 @@ class ContainerListTool(_ContainerControlBase):
           "name": str,
           "image": str | null,
           "status": str,
-          "uptime_seconds": int | null
+          "uptime_seconds": int | null,
+          "workspace_id": str,
+          "note": str
         }
       ],
       "count": int,

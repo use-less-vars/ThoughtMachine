@@ -345,40 +345,12 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log('DEBUG', 'server', f'Startup container scan skipped: {exc}')
 
-    # ── Startup stale-session container prune ───────────────────────────
-    # Second pass: remove containers labelled ``thoughtmachine.session_id``
-    # whose session is no longer in the session registry (deleted or
-    # unregistered sessions). Containers belonging to registered (active)
-    # sessions are kept. This pass never raises; if the registry cannot be
-    # read (empty), nothing is removed.
-    try:
-        import docker
-        client = docker.from_env()
-        active_session_ids = set(SessionRegistry.get_default().get_all().keys())
-        if active_session_ids:
-            labeled_containers = client.containers.list(
-                all=True,
-                filters={"label": "thoughtmachine.session_id"},
-            )
-            for c in labeled_containers:
-                labels = (c.attrs.get("Config") or {}).get("Labels") or {}
-                sid = labels.get("thoughtmachine.session_id")
-                if sid and sid not in active_session_ids:
-                    try:
-                        c.remove()
-                    except Exception:
-                        try:
-                            c.remove(force=True)
-                        except Exception as exc:
-                            log('WARNING', 'server',
-                                f'Startup prune: could not remove orphan '
-                                f'container {c.name} (session {sid}): {exc}')
-                            continue
-                    log('INFO', 'server',
-                        f'Startup prune: removed orphan container {c.name} '
-                        f'for session {sid}')
-    except Exception as exc:
-        log('DEBUG', 'server', f'Startup container prune skipped: {exc}')
+    # ── Startup stale-session container prune: REMOVED (Phase 3) ─────────
+    # Containers are now WORKSPACE-scoped (thoughtmachine.workspace_id label)
+    # and survive session close, so there is nothing to prune on startup.
+    # Workspace-scoped containers are swept by cleanup_workspace() when a
+    # workspace is decommissioned; no startup pass runs here.
+    pass
 
     yield
     log('INFO', 'server', 'Server shutting down.')

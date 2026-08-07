@@ -1,4 +1,4 @@
-"""Per-session Docker container manager for the ThoughtMachine agent.
+"""Per-workspace Docker container manager for the ThoughtMachine agent.
 
 ``ContainerManager`` is a thin, security-hardened wrapper around the Docker
 SDK that owns the containers for ONE session. It replaces the old
@@ -13,8 +13,9 @@ Lifecycle
 2. ``exec()``  — run one command inside the container with a timeout.
 3. ``stop()``  — stop the container (idempotent, never raises).
 
-``cleanup_session()`` is a belt-and-braces sweep that stops and removes all
-containers carrying a session label (used when a session dies unexpectedly).
+Containers are scoped to the WORKSPACE, not the session: they survive session
+close and are swept by the module-level ``cleanup_workspace()`` when a
+workspace is decommissioned.
 
 Security posture (identical to docker_executor.DockerExecutor)
 --------------------------------------------------------------
@@ -23,14 +24,17 @@ Security posture (identical to docker_executor.DockerExecutor)
 - all capabilities dropped, no-new-privileges, read-only root filesystem
 - non-root user (1000:1000), tight memory + CPU quotas
 - bind-mounts the host session workspace at ``/workspace`` (read-only when
-  the session lacks write permission); no named volumes are used
+  the session lacks write permission); a per-workspace package volume
+  (``tm-packages-<workspace_id>``) is mounted at ``/home/agent/.local``
+  (with ``PYTHONUSERBASE`` set) — no named *workspace* volumes are used
 
 Label scheme
 ------------
 Every container created by this module carries:
 - ``thoughtmachine.container_name=<name>``
-- ``thoughtmachine.session_id=<session_id>``
-Used for label-based reuse lookups and ``cleanup_session()`` sweeps.
+- ``thoughtmachine.workspace_id=<workspace_id>``
+- ``thoughtmachine.note=<note>`` ('' by default)
+Used for label-based reuse lookups and ``cleanup_workspace()`` sweeps.
 
 No-reload guarantee
 -------------------
@@ -53,6 +57,7 @@ from pathlib import Path
 try:
     import docker
     from docker.errors import APIError, ImageNotFound, NotFound
+    from docker.types import Mount
     DOCKER_AVAILABLE = True
 except ImportError:
     DOCKER_AVAILABLE = False
@@ -60,6 +65,7 @@ except ImportError:
     APIError = Exception
     ImageNotFound = Exception
     NotFound = Exception
+    Mount = None
 
 from agent.logging import log
 from thoughtmachine.audit_logger import audit_event
@@ -258,6 +264,25 @@ class ContainerManager:
             ws_hash = hashlib.sha256(self.workspace_path.encode()).hexdigest()[:12]
             name = f"agent-exec-{ws_hash}-{_safe_session_tag(self.session_id)}"
 
+        # Phase 3: workspace-scoped reuse + container-limit enforcement BEFORE
+        # any create. An existing container with the same name is reused as-is
+        # (never counted against the limit); otherwise the running container
+        # count for THIS workspace decides whether a new one may be created.
+        containers = self.list_containers()
+        for entry in containers:
+            if entry["name"] == name:
+                try:
+                    self._ensure_running(self.client.containers.get(entry["container_id"]))
+                except Exception:
+                    pass
+                _audit("CONTAINER_REUSE_OK",
+                       f"source=workspace-label name={name} id={entry['container_id']} "
+                       f"session={self.session_id}")
+                return {**entry, "status": "reused", "id": entry["container_id"]}
+        if len(containers) >= self.max_containers:
+            return {"error": f"Workspace container limit ({self.max_containers}) reached. "
+                             f"Stop an unused container first."}
+
         # ── Desired isolation from session permissions (all paths) ─────────
         network_mode, workspace_mode = self._compute_config(
             self.workspace_path, self.workspace_id, self.session_permissions
@@ -327,12 +352,24 @@ class ContainerManager:
         if os.path.isdir(os.path.join(self.workspace_path, ".git")):
             tmpfs["/workspace/.git"] = ""
 
-        volumes = {self.workspace_path: {"bind": "/workspace", "mode": workspace_mode}}
-        mounts = None
+        volumes = None
+        mounts = [
+            Mount(
+                target="/workspace", source=self.workspace_path, type="bind",
+                read_only=(workspace_mode != "rw"),
+            ),
+            # Per-workspace package cache volume (mirrors docker_executor).
+            Mount(
+                target="/home/agent/.local",
+                source=f"tm-packages-{self.workspace_id}",
+                type="volume",
+            ),
+        ]
 
         labels = {
             "thoughtmachine.container_name": name,
-            "thoughtmachine.session_id": str(self.session_id) if self.session_id is not None else "",
+            "thoughtmachine.workspace_id": self.workspace_id,
+            "thoughtmachine.note": "",
         }
         _audit("CONTAINER_CREATE",
                f"image={image} network={network_mode} name={name} session={self.session_id}")
@@ -354,6 +391,7 @@ class ContainerManager:
             command=["tail", "-f", "/dev/null"],
             mem_limit=self.mem_limit,
             cpu_quota=self.cpu_quota,
+            environment={"PYTHONUSERBASE": "/home/agent/.local"},
             labels=labels,
         )
         try:
@@ -514,20 +552,19 @@ class ContainerManager:
         }
 
     def list_containers(self):
-        """List containers carrying this session's label; NEVER raises.
+        """List containers carrying this workspace's label; NEVER raises.
 
         Queries the daemon for all containers (running or not) whose
-        ``thoughtmachine.session_id`` label matches this manager's session id
-        (the exact label source ``start()`` applies), so containers from other
-        sessions — or unlabeled ones — never appear. Returns a list of dicts
-        with EXACTLY: ``container_id``, ``name``, ``image``, ``status``,
-        ``uptime_seconds``.
+        ``thoughtmachine.workspace_id`` label matches this manager's workspace
+        id (the exact label source ``start()`` applies), so containers from
+        other workspaces — or unlabeled ones — never appear. Returns a list of
+        dicts with EXACTLY: ``container_id``, ``name``, ``image``, ``status``,
+        ``uptime_seconds``, ``workspace_id``, ``note``.
         """
-        sid = str(self.session_id) if self.session_id is not None else ""
         try:
             containers = self.client.containers.list(
                 all=True,
-                filters={"label": f"thoughtmachine.session_id={sid}"},
+                filters={"label": f"thoughtmachine.workspace_id={self.workspace_id}"},
             )
         except Exception:
             return []
@@ -559,6 +596,9 @@ class ContainerManager:
                 "image": image,
                 "status": container.status,
                 "uptime_seconds": uptime_seconds,
+                "workspace_id": (container.labels.get("thoughtmachine.workspace_id")
+                                 or self.workspace_id),
+                "note": container.labels.get("thoughtmachine.note") or "",
             })
         return result
 
@@ -691,7 +731,7 @@ class ContainerManager:
                 filters={
                     "label": [
                         f"thoughtmachine.container_name={name}",
-                        f"thoughtmachine.session_id={str(self.session_id) if self.session_id is not None else ''}",
+                        f"thoughtmachine.workspace_id={self.workspace_id}",
                     ]
                 },
             )
@@ -780,19 +820,17 @@ class ContainerManager:
             pass
 
 
-# ── Module-level session helpers ────────────────────────────────────────────
-def cleanup_session(session_id, docker_client):
-    """Stop + remove every container labelled with ``session_id``.
+# ── Module-level workspace helpers ──────────────────────────────────────────
+def cleanup_workspace(workspace_id, docker_client):
+    """Stop + remove every container labelled with ``workspace_id``.
 
     Returns {"removed": n}. Never raises.
     """
-    # Normalise so a uuid.UUID object matches the str(uuid) label value
-    # written by ContainerManager at create time.
-    sid = str(session_id) if session_id is not None else ""
+    wid = str(workspace_id) if workspace_id is not None else "default"
     removed = 0
     try:
         containers = docker_client.containers.list(
-            all=True, filters={"label": f"thoughtmachine.session_id={sid}"}
+            all=True, filters={"label": f"thoughtmachine.workspace_id={wid}"}
         )
     except Exception:
         containers = []
@@ -808,20 +846,5 @@ def cleanup_session(session_id, docker_client):
             removed += 1
         except Exception:
             pass
-    _audit("CONTAINER_CLEANUP", f"session={sid} count={removed}")
+    _audit("CONTAINER_CLEANUP", f"workspace={wid} count={removed}")
     return {"removed": removed}
-
-
-def list_session_containers(session_id, docker_client):
-    """List containers labelled with ``session_id``. Never raises."""
-    sid = str(session_id) if session_id is not None else ""
-    try:
-        containers = docker_client.containers.list(
-            all=True, filters={"label": f"thoughtmachine.session_id={sid}"}
-        )
-        return [
-            {"id": c.id, "name": c.name, "status": c.status}
-            for c in containers
-        ]
-    except Exception:
-        return []

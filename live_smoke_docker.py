@@ -22,12 +22,15 @@ What it exercises (in order):
   4. persist          — create -> exec -> stop -> REUSE (stable container
                         id, no CONTAINER_RECREATE_MISMATCH) -> write ->
                         stop/restart -> data survives (host-dir persistence)
-  5. isolation        — ro workspace blocks writes; no-network blocks
+  5. share            — the SAME workspace_id + name started from a SECOND,
+                        different session reuses the SAME container (1 live
+                        instance, workspace-label lookup, no recreation)
+  6. isolation        — ro workspace blocks writes; no-network blocks
                         egress; bridge grants egress (host-network
                         dependent; documented exception, see below)
-  6. wiring           — DockerCodeRunner + ContainerStart/Exec/Status/Stop
+  7. wiring           — DockerCodeRunner + ContainerStart/Exec/Status/Stop
                         tools end-to-end via their JSON APIs
-  7. cleanup          — session container sweep, volume + image removal
+  8. cleanup          — session container sweep, volume + image removal
 
 Notes / documented deviations:
   * network permissions: the no-network scenarios use
@@ -39,8 +42,9 @@ Notes / documented deviations:
     limitation, not a code failure.
   * tools/runner resolve the workspace via ToolBase's deprecated
     workspace_path fallback field (the tmpdir session is not registered in
-    SessionRegistry/WorkspaceRegistry); session_id is still passed so the
-    containers carry the session label and are swept by cleanup_session.
+    SessionRegistry/WorkspaceRegistry); containers carry the
+    thoughtmachine.workspace_id label (the resolved workspace id, or
+    "default" for unregistered paths) and are swept by cleanup_workspace.
 
 No pytest, no git operations, no edits to any other file.
 """
@@ -76,8 +80,7 @@ try:
     )
     from tools.container_manager import (  # noqa: E402
         ContainerManager,
-        cleanup_session,
-        list_session_containers,
+        cleanup_workspace,
     )
     from tools.docker_code_runner import DockerCodeRunner  # noqa: E402
 except Exception as _import_err:  # pragma: no cover - environment guard
@@ -116,6 +119,8 @@ def main() -> int:
     build_ctx = None
     created_volumes = []
     image_built = False
+    # Phase-1 container workspace ids (tracked for cleanup_workspace sweep)
+    phase1_ws_ids = []
     # Phase-2 (Commit 6) state - separate workspace/session/image from Phase-1
     p2_ws = None
     p2_ws_id = None
@@ -157,6 +162,8 @@ def main() -> int:
         return res, out
 
     def manager_for(ws_id, sp):
+        if ws_id is not None and ws_id not in phase1_ws_ids:
+            phase1_ws_ids.append(ws_id)
         return ContainerManager(
             workspace_path=str(workspace_dir),
             session_id=session_id,
@@ -304,7 +311,48 @@ def main() -> int:
         if not fatal:
             check("persist", _persist)
 
-        # ---------------- STEP 5: isolation ----------------
+        # ---------------- STEP 5: share-across-sessions ----------------
+        def _share_across_sessions():
+            # The workspace label (not the session label) is the sharing key:
+            # a second manager with a DIFFERENT session_id but the SAME
+            # workspace_id + name reuses the existing container instead of
+            # creating a second one. Exactly 1 live container must remain.
+            ws_id = str(uuid.uuid4())
+            name = "smoke-share-%s" % tag
+            sp = {"network": "banned", "filesystem": "write", "container": True}
+            mgr1 = manager_for(ws_id, sp)
+            r1 = mgr1.start(name=name)
+            ok(r1["status"] == "created",
+               "first start status=%r (expected 'created')" % r1["status"])
+
+            mgr2 = ContainerManager(
+                workspace_path=str(workspace_dir),
+                session_id=str(uuid.uuid4()),
+                workspace_id=ws_id,
+                session_permissions=sp,
+                image=image_tag,
+                mem_limit="512m",
+                cpu_quota=50000,
+            )
+            r2 = mgr2.start(name=name)
+            ok(r2["status"] == "reused",
+               "second-session start status=%r (expected 'reused')" % r2["status"])
+            cid2 = r2.get("container_id") or r2.get("id")
+            ok(cid2 == r1["id"],
+               "shared container id mismatch: %s vs %s" % (r1["id"], cid2))
+            live = client.containers.list(all=True,
+                                          filters={"name": "^%s$" % name})
+            ok(len(live) == 1,
+               "expected exactly 1 live container named %s, found %d"
+               % (name, len(live)))
+            mgr2.stop(cid2)
+            return ("session A created; session B (same workspace_id) reused "
+                    "the same container; 1 live instance")
+
+        if not fatal:
+            check("share-across-sessions", _share_across_sessions)
+
+        # ---------------- STEP 6: isolation ----------------
         def _isolation_ro():
             ws_id = str(uuid.uuid4())
             mgr = manager_for(ws_id, {"network": "banned", "filesystem": "read",
@@ -425,10 +473,11 @@ def main() -> int:
         # end-to-end against real Docker, plus a live bind-mount
         # visibility sequence.
         # Documented deviation: containers a & b deliberately share ONE
-        # session id (p2_session) because ContainerListTool filters on the
-        # single `thoughtmachine.session_id` label - with different session
-        # ids no single list call could observe both. Containers c and d use
-        # their own fresh session ids.
+        # workspace id (the unregistered tmpdir resolves to "default")
+        # because ContainerListTool filters on the single
+        # `thoughtmachine.workspace_id` label - with different workspace ids
+        # no single list call could observe both. Containers c and d use
+        # their own fresh workspace ids.
         sp = {"network": "write", "filesystem": "write", "container": True}
 
         def _p2_build():
@@ -507,7 +556,7 @@ def main() -> int:
                "missing containers; got %r" % names)
             for c in containers:
                 ok(set(c.keys()) == {"container_id", "name", "image", "status",
-                                     "uptime_seconds"},
+                                     "uptime_seconds", "workspace_id", "note"},
                    "unexpected entry keys %r" % sorted(c.keys()))
             return "listed %d container(s): %s" % (len(containers),
                                                    ", ".join(names))
@@ -677,9 +726,10 @@ def main() -> int:
         issues = []
         if client is not None:
             try:
-                cleanup_session(session_id, client)
+                for wid in phase1_ws_ids:
+                    cleanup_workspace(wid, client)
             except Exception as exc:  # noqa: BLE001
-                issues.append("cleanup_session: %s: %s" % (type(exc).__name__, exc))
+                issues.append("cleanup_workspace: %s: %s" % (type(exc).__name__, exc))
             try:
                 # Sweep any unlabeled leftovers (runner/ctl containers created
                 # without a registered session still carry our unique image tag).
@@ -729,9 +779,15 @@ def main() -> int:
                                   % (type(exc).__name__, exc))
             # verify nothing is left behind
             try:
-                left = list_session_containers(session_id, client)
+                left = []
+                for wid in phase1_ws_ids:
+                    left += client.containers.list(
+                        all=True,
+                        filters={"label": f"thoughtmachine.workspace_id={wid}"},
+                    )
                 if left:
-                    issues.append("session containers remain: %r" % left)
+                    issues.append("workspace containers remain: %r"
+                                  % [c.name for c in left])
                 for c in client.containers.list(all=True,
                                                 filters={"ancestor": image_tag}):
                     issues.append("container remains: %s" % c.name)
