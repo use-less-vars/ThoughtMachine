@@ -40,6 +40,7 @@ execution path anymore.
 """
 
 import hashlib
+import json
 import os
 import queue
 import re
@@ -47,6 +48,7 @@ import sys
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 try:
     import docker
@@ -193,9 +195,51 @@ class ContainerManager:
         self._resolve_workspace_id = dex._resolve_workspace_id
         if workspace_id is None:
             workspace_id = self._resolve_workspace_id(self.workspace_path)
-        self.workspace_id = str(workspace_id) if workspace_id is not None else None
+        self.workspace_id = str(workspace_id) if workspace_id is not None else "default"
+
+        # Phase 2: per-workspace config (max_containers, disk_quota_mb) loaded
+        # from ~/.thoughtmachine/workspaces/<workspace_id>/config.json.
+        self.workspace_config = self._load_workspace_config()
+        self.max_containers = self.workspace_config.get("max_containers", 4)
 
         self.client = docker.from_env()
+
+    def _load_workspace_config(self):
+        """Load per-workspace config; returns a dict and NEVER raises.
+
+        Reads ``~/.thoughtmachine/workspaces/<workspace_id>/config.json``.
+        Missing file -> defaults written to disk. Corrupt file -> defaults in
+        memory (file left untouched).
+        """
+        defaults = {"max_containers": 4, "disk_quota_mb": 4096}
+        config_dir = Path.home() / ".thoughtmachine" / "workspaces" / str(self.workspace_id)
+        config_path = config_dir / "config.json"
+        self.workspace_config_path = config_path
+        try:
+            if config_path.exists():
+                try:
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        return data
+                    log("WARNING", "docker.container_manager",
+                        f"Workspace config {config_path} is not a JSON object; using defaults")
+                except (ValueError, OSError) as e:
+                    log("WARNING", "docker.container_manager",
+                        f"Failed to read workspace config {config_path}: {e}; using defaults")
+                return dict(defaults)
+            try:
+                config_dir.mkdir(parents=True, exist_ok=True)
+                with open(config_path, "w", encoding="utf-8") as f:
+                    json.dump(defaults, f, indent=2)
+            except OSError as e:
+                log("WARNING", "docker.container_manager",
+                    f"Failed to write default workspace config {config_path}: {e}")
+            return dict(defaults)
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"Unexpected error loading workspace config {config_path}: {e}")
+            return dict(defaults)
 
     # ── Public API ─────────────────────────────────────────────────────────
     def start(self, image=None, name=None):
@@ -323,6 +367,15 @@ class ContainerManager:
         """Run ``command`` in the container; returns {"stdout","stderr","exit_code"}."""
         container = self.client.containers.get(container_id)
 
+        # Phase 2: disk quota guard for the persistent package cache.
+        quota_mb = (getattr(self, "workspace_config", None) or {}).get("disk_quota_mb", 4096)
+        if quota_mb and quota_mb > 0 and self._exceeds_disk_quota(container, quota_mb):
+            return {
+                "stdout": "",
+                "stderr": f"Package volume exceeds disk quota ({quota_mb} MB). Please clean up unused packages.",
+                "exit_code": 1,
+            }
+
         # Ensure the requested working directory exists (writable by agent)
         if workdir != "/workspace":
             container.exec_run(
@@ -373,6 +426,27 @@ class ContainerManager:
             "stderr": _truncate_output(stderr),
             "exit_code": exit_code,
         }
+
+    def _exceeds_disk_quota(self, container, quota_mb):
+        """True if /home/agent/.local usage (KB) exceeds quota_mb MB.
+
+        Best-effort: any error (missing dir, non-running container, exec
+        failure) returns False so the user command is never blocked.
+        """
+        try:
+            container.reload()
+            if container.status != "running":
+                return False
+            exit_code, output = container.exec_run(
+                cmd=["/bin/sh", "-c", "du -s /home/agent/.local 2>/dev/null || echo 0"]
+            )
+            if exit_code != 0:
+                return False
+            text = output.decode("utf-8", errors="replace") if isinstance(output, bytes) else str(output)
+            kb = int(float(text.strip().split()[0]))
+            return kb > quota_mb * 1024
+        except Exception:
+            return False
 
     def stop(self, container_id):
         """Stop the container. Idempotent; NEVER raises."""
