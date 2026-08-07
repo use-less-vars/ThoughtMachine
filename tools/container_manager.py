@@ -22,9 +22,8 @@ Security posture (identical to docker_executor.DockerExecutor)
   (decided by the shared ``_compute_container_config_from_permissions`` gate)
 - all capabilities dropped, no-new-privileges, read-only root filesystem
 - non-root user (1000:1000), tight memory + CPU quotas
-- named volume ``tm-workspace-<workspace_id>`` populated ONE-SHOT from the
-  host workspace via ``docker_executor.ensure_workspace_volume_populated``;
-  the host bind mount is visible only to the short-lived init container
+- bind-mounts the host session workspace at ``/workspace`` (read-only when
+  the session lacks write permission); no named volumes are used
 
 Label scheme
 ------------
@@ -187,11 +186,10 @@ class ContainerManager:
         # In-memory registry: container name -> container id (per-manager).
         self._containers = {}
 
-        # Borrow the shared decision/populate helpers from docker_executor —
+        # Borrow the shared decision helpers from docker_executor —
         # single source of truth, imported once (never reloaded).
         dex = _load_docker_executor()
         self._compute_config = dex._compute_container_config_from_permissions
-        self._populate_volume = dex.ensure_workspace_volume_populated
         self._resolve_workspace_id = dex._resolve_workspace_id
         if workspace_id is None:
             workspace_id = self._resolve_workspace_id(self.workspace_path)
@@ -278,18 +276,6 @@ class ContainerManager:
                 return {"id": container.id, "name": name, "status": "reused"}
 
         # 3) Fresh create
-        volume_name = self._ensure_volume()
-        if volume_name:
-            self._populate_volume(
-                self.client,
-                image,
-                self.workspace_path,
-                volume_name,
-                network_mode=network_mode,
-                mem_limit=self.mem_limit,
-                cpu_quota=self.cpu_quota,
-            )
-
         tmpfs = {
             "/tmp": "rw,noexec,nosuid,size=64m",
             "/home/agent": "rw,exec,size=256M,uid=1000,gid=1000",
@@ -297,19 +283,8 @@ class ContainerManager:
         if os.path.isdir(os.path.join(self.workspace_path, ".git")):
             tmpfs["/workspace/.git"] = ""
 
-        volumes = None
+        volumes = {self.workspace_path: {"bind": "/workspace", "mode": workspace_mode}}
         mounts = None
-        if volume_name:
-            mounts = [
-                docker.types.Mount(
-                    target="/workspace",
-                    source=volume_name,
-                    type="volume",
-                    read_only=(workspace_mode == "ro"),
-                )
-            ]
-        else:
-            volumes = {self.workspace_path: {"bind": "/workspace", "mode": workspace_mode}}
 
         labels = {
             "thoughtmachine.container_name": name,
@@ -622,27 +597,6 @@ class ContainerManager:
         return {"stdout": stdout, "stderr": stderr}
 
     # ── Internals ──────────────────────────────────────────────────────────
-    def _ensure_volume(self):
-        """Return the named workspace volume (created on first use) or None."""
-        if not self.workspace_id:
-            return None
-        volume_name = f"tm-workspace-{self.workspace_id}"
-        try:
-            self.client.volumes.get(volume_name)
-            _audit("VOLUME_ENSURE", f"volume={volume_name} action=reuse")
-        except NotFound:
-            try:
-                self.client.volumes.create(name=volume_name)
-                _audit("VOLUME_ENSURE", f"volume={volume_name} action=create")
-            except Exception as e:
-                log("WARNING", "docker.volume",
-                    f"Failed to create volume {volume_name}: {e}")
-                return None
-        except Exception as e:
-            log("WARNING", "docker.volume",
-                f"Failed to inspect volume {volume_name}: {e}")
-            return None
-        return volume_name
 
     def _reuse_container(self, container_id):
         """Return a running container for ``container_id`` or None."""
