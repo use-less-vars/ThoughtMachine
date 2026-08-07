@@ -458,13 +458,14 @@ class ContainerListTool(_ContainerControlBase):
 
 
 class ContainerBuildTool(_ContainerControlBase):
-    """Build a Docker image from the host workspace directory.
+    """Build a Docker image from the vault-managed Dockerfile.
 
     Vault-gated: always builds from the vault-managed ``<workspace>/Dockerfile``
-    (the resolved registry workspace root — no ``dockerfile_path`` override) in
-    the HOST workspace directory — not the session volume — as the build
-    context, so the Dockerfile can COPY the local tree directly. When ``tag``
-    is omitted it is auto-generated from the workspace path (the same
+    (the resolved registry workspace root — no ``dockerfile_path`` override).
+    The build context contains ONLY that Dockerfile: it is copied into a
+    temporary build directory, so workspace files are NOT available during
+    builds (``COPY .`` cannot see the local tree). When ``tag`` is omitted it
+    is auto-generated from the workspace path (the same
     ``agent-executor-<hash>`` convention ``docker_executor`` uses). This tool
     never raises — failures are returned in the JSON response.
 

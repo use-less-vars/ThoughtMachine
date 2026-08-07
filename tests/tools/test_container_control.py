@@ -17,7 +17,10 @@ matches the requested filter), which is exactly how "containers from another
 workspace (or unlabeled) do NOT appear" is enforced in production.
 """
 
+import glob
 import json
+import os
+import tempfile
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
@@ -289,10 +292,12 @@ class TestContainerManagerBuildImage:
     """Tests for ContainerManager.build_image() with a mocked docker_executor."""
 
     @staticmethod
-    def _manager(mock_client, ws_path):
+    def _manager(mock_client, ws_path, vault_root=None, workspace_id="default"):
         manager = ContainerManager.__new__(ContainerManager)  # skip docker.from_env()
         manager.client = mock_client
         manager.workspace_path = ws_path
+        manager.vault_root = vault_root
+        manager.workspace_id = workspace_id
         return manager
 
     @staticmethod
@@ -307,13 +312,20 @@ class TestContainerManagerBuildImage:
         """Dockerfile present, tag omitted -> auto-tag; result has EXACT keys."""
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
-        manager = self._manager(mock_client, str(tmp_path))
+        manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
+        captured = {}
 
         with patch("tools.container_manager._load_docker_executor") as mock_load:
             dex = self._mock_dex()
-            dex._run_image_build.return_value = (
-                "sha256:abc", ["Step 1: FROM x", "Step 2: RUN y"],
-            )
+
+            def _capture_build(client, build_path, dockerfile, tag, **kw):
+                # Inspect the temp context WHILE it exists (build_image
+                # removes it before returning).
+                captured["path"] = build_path
+                captured["listing"] = sorted(os.listdir(build_path))
+                return "sha256:abc", ["Step 1: FROM x", "Step 2: RUN y"]
+
+            dex._run_image_build.side_effect = _capture_build
             mock_load.return_value = dex
 
             result = manager.build_image()
@@ -321,15 +333,20 @@ class TestContainerManagerBuildImage:
         assert set(result.keys()) == {"image_tag", "build_log"}
         assert result["image_tag"] == "agent-executor-test"
         assert result["build_log"] == "Step 1: FROM x\nStep 2: RUN y"
-        dex._run_image_build.assert_called_once_with(
-            mock_client, str(tmp_path), "Dockerfile", "agent-executor-test"
-        )
+        dex._run_image_build.assert_called_once()
+        args = dex._run_image_build.call_args.args
+        assert args[0] is mock_client
+        assert args[2] == "Dockerfile"
+        assert args[3] == "agent-executor-test"
+        # Build context = temp dir with ONLY the Dockerfile, NOT the workspace.
+        assert captured["path"] != str(tmp_path)
+        assert captured["listing"] == ["Dockerfile"]
 
     @patch("tools.container_manager.DOCKER_AVAILABLE", True)
     def test_missing_vault_dockerfile_raises(self, tmp_path):
         """No vault Dockerfile in workspace -> clear RuntimeError, executor never used."""
         mock_client = MagicMock()
-        manager = self._manager(mock_client, str(tmp_path))
+        manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
 
         with patch("tools.container_manager._load_docker_executor") as mock_load:
             with pytest.raises(RuntimeError, match="Vault Dockerfile not found"):
@@ -342,7 +359,7 @@ class TestContainerManagerBuildImage:
         """Explicit tag + vault Dockerfile -> used as-is, auto-tag skipped."""
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
-        manager = self._manager(mock_client, str(tmp_path))
+        manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
 
         with patch("tools.container_manager._load_docker_executor") as mock_load:
             dex = self._mock_dex()
@@ -352,9 +369,12 @@ class TestContainerManagerBuildImage:
             result = manager.build_image(tag="my-tag:1")
 
         assert result["image_tag"] == "my-tag:1"
-        dex._run_image_build.assert_called_once_with(
-            mock_client, str(tmp_path), "Dockerfile", "my-tag:1"
-        )
+        dex._run_image_build.assert_called_once()
+        args = dex._run_image_build.call_args.args
+        assert args[0] is mock_client
+        assert args[1] != str(tmp_path)
+        assert args[2] == "Dockerfile"
+        assert args[3] == "my-tag:1"
         dex._compute_image_tag.assert_not_called()
 
     @patch("tools.container_manager.DOCKER_AVAILABLE", True)
@@ -362,7 +382,7 @@ class TestContainerManagerBuildImage:
         """Build log > EXEC_OUTPUT_LIMIT_BYTES (100 KiB) -> truncated + notice."""
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
-        manager = self._manager(mock_client, str(tmp_path))
+        manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
 
         with patch("tools.container_manager._load_docker_executor") as mock_load:
             dex = self._mock_dex()
@@ -381,7 +401,7 @@ class TestContainerManagerBuildImage:
         """_run_image_build raising -> RuntimeError propagates unchanged."""
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
-        manager = self._manager(mock_client, str(tmp_path))
+        manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
 
         with patch("tools.container_manager._load_docker_executor") as mock_load:
             dex = self._mock_dex()
@@ -396,13 +416,81 @@ class TestContainerManagerBuildImage:
         """Vault-gating: a planted non-vault Dockerfile is NOT a fallback."""
         (tmp_path / "Dockerfile.custom").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
-        manager = self._manager(mock_client, str(tmp_path))
+        manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
 
         with patch("tools.container_manager._load_docker_executor") as mock_load:
             with pytest.raises(RuntimeError, match="Vault Dockerfile not found"):
                 manager.build_image(tag="x:1")
 
         mock_load.assert_not_called()  # planted file ignored, no build attempted
+
+    @patch("tools.container_manager.DOCKER_AVAILABLE", True)
+    def test_build_image_context_excludes_workspace_files(self, tmp_path):
+        """Security: build context contains ONLY the vault Dockerfile.
+
+        The resolved vault Dockerfile is copied into a temporary build
+        directory; the workspace tree (with sensitive_file.txt) is never part
+        of the build context.
+        """
+        vault_root = tmp_path / "vault"
+        vault_ws = vault_root / "workspaces" / "ws-1"
+        vault_ws.mkdir(parents=True)
+        (vault_ws / "Dockerfile").write_text("FROM python:3.12-slim\n")
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "Dockerfile").write_text("FROM python:3.11-slim\n")
+        (ws / "sensitive_file.txt").write_text("TOP SECRET\n")
+        mock_client = MagicMock()
+        manager = self._manager(
+            mock_client, str(ws), vault_root=str(vault_root), workspace_id="ws-1"
+        )
+
+        captured = {}
+
+        def _capture_build(client, build_path, dockerfile, tag, **kw):
+            # Inspect the context WHILE it exists (build_image removes the
+            # temp dir before returning).
+            captured["path"] = build_path
+            captured["dockerfile"] = dockerfile
+            captured["tag"] = tag
+            assert build_path != str(ws), "workspace leaked as build context"
+            assert build_path != str(vault_ws), "vault workspace leaked as context"
+            assert sorted(os.listdir(build_path)) == ["Dockerfile"]
+            assert "sensitive_file.txt" not in os.listdir(build_path)
+            with open(os.path.join(build_path, "Dockerfile")) as fh:
+                assert fh.read() == "FROM python:3.12-slim\n"
+            return "sha256:abc123", ["Step 1/2 : FROM python:3.12-slim"]
+
+        with patch("tools.container_manager._load_docker_executor") as mock_load:
+            dex = self._mock_dex()
+            dex._run_image_build.side_effect = _capture_build
+            mock_load.return_value = dex
+
+            result = manager.build_image()
+
+        assert captured["dockerfile"] == "Dockerfile"
+        assert captured["tag"] == "agent-executor-test"
+        assert result["image_tag"] == "agent-executor-test"
+        assert "Step 1/2" in result["build_log"]
+        assert not os.path.exists(captured["path"])  # temp build dir cleaned up
+        assert (ws / "sensitive_file.txt").exists()  # workspace file untouched
+
+    @patch("tools.container_manager.DOCKER_AVAILABLE", True)
+    def test_build_image_tempdir_cleaned_up(self, tmp_path):
+        """Temporary build directory is removed after a successful build."""
+        (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
+        before = set(glob.glob(os.path.join(tempfile.gettempdir(), "tm_build_*")))
+        mock_client = MagicMock()
+        manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
+
+        with patch("tools.container_manager._load_docker_executor") as mock_load:
+            dex = self._mock_dex()
+            dex._run_image_build.return_value = ("sha256:x", ["Step 1"])
+            mock_load.return_value = dex
+            manager.build_image()
+
+        after = set(glob.glob(os.path.join(tempfile.gettempdir(), "tm_build_*")))
+        assert after == before
 
 
 # ══════════════════════════════════════════════════════════════════════════════

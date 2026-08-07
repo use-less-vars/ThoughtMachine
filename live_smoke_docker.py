@@ -487,10 +487,17 @@ def main() -> int:
             with open(os.path.join(p2_ws, "Dockerfile"), "w") as fh:
                 # python:3.11-slim reuses the cached base from STEP 1,
                 # avoiding a slow 3.12 pull. start() overrides CMD anyway.
+                # SECURITY (build-context isolation): ContainerBuildTool copies
+                # ONLY this Dockerfile into a temporary build context, so
+                # workspace files are NOT available during builds. marker.txt
+                # (written below next to the Dockerfile) must therefore be
+                # ABSENT from the build context — the RUN test below fails the
+                # build if it ever leaks in. marker.txt stays visible at
+                # runtime via the /workspace bind-mount.
                 fh.write("\n".join([
                     "FROM python:3.11-slim",
                     "WORKDIR /workspace",
-                    "COPY . .",
+                    "RUN test ! -f marker.txt",
                     'CMD ["python", "-c", "print(\'smoke-ready\')"]',
                     "",
                 ]))
@@ -508,6 +515,9 @@ def main() -> int:
             ok(b.get("image_tag") == p2_image_tag,
                "unexpected image_tag %r" % b.get("image_tag"))
             ok(bool(b.get("build_log")), "build_log empty")
+            ok("test ! -f marker.txt" in (b.get("build_log") or ""),
+               "build log missing context-exclusion step: %s"
+               % (b.get("build_log") or "")[:300])
             return "image %s built (build_log %d chars)" % (
                 p2_image_tag, len(b.get("build_log") or ""))
 

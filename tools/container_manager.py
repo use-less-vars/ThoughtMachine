@@ -57,7 +57,9 @@ import json
 import os
 import queue
 import re
+import shutil
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -723,14 +725,15 @@ class ContainerManager:
         return result
 
     def build_image(self, tag=None):
-        """Build a Docker image from the HOST workspace directory.
+        """Build a Docker image from ONLY the vault-managed Dockerfile.
 
-        Vault-gated: always builds from the vault-managed
-        ``<workspace>/Dockerfile`` (the resolved registry workspace root — no
-        ``dockerfile_path`` override) in the HOST workspace directory — not the
-        session volume — as the build context, so the Dockerfile can COPY the
-        local tree directly. The build runs synchronously and its output is
-        returned (not just a bool).
+        Vault-gated: always builds from the vault-managed ``<workspace>/Dockerfile``
+        (resolved from ``<vault_root>/workspaces/<workspace_id>/Dockerfile``,
+        falling back to ``<workspace_path>/Dockerfile`` — no ``dockerfile_path``
+        override). The build context contains ONLY that Dockerfile: it is copied
+        into a temporary build directory, so the workspace tree is NOT part of
+        the build context and ``COPY .`` cannot read workspace files. The build
+        runs synchronously and its output is returned (not just a bool).
 
         Args:
             tag: Image tag; auto-generated from the workspace path (the same
@@ -748,19 +751,35 @@ class ContainerManager:
             raise RuntimeError("Docker Python SDK not available")
 
         ws = self.workspace_path
-        resolved = os.path.join(ws, "Dockerfile")
-        if not os.path.exists(resolved):
-            raise RuntimeError(
-                f"Vault Dockerfile not found at {resolved}. "
-                "The vault-managed <workspace>/Dockerfile must exist before building."
-            )
+        # Vault-gated resolution: prefer the vault-managed Dockerfile
+        # (<vault_root>/workspaces/<workspace_id>/Dockerfile), falling back to
+        # the workspace-path Dockerfile for legacy workspaces.
+        vault_dockerfile = (
+            Path(self.vault_root) / "workspaces" / str(self.workspace_id) / "Dockerfile"
+        )
+        if not vault_dockerfile.exists():
+            legacy = Path(ws) / "Dockerfile"
+            if legacy.exists():
+                vault_dockerfile = legacy
+            else:
+                raise RuntimeError(
+                    f"Vault Dockerfile not found at {vault_dockerfile}. "
+                    "The vault-managed <workspace>/Dockerfile must exist before building."
+                )
 
         dex = _load_docker_executor()
         if not tag:
             tag = dex._compute_image_tag(ws)
 
         try:
-            _, log_lines = dex._run_image_build(self.client, ws, "Dockerfile", tag)
+            # SECURITY: the build context contains ONLY the vault Dockerfile.
+            # It is copied into a temporary build directory so the workspace
+            # tree is never part of the build context (no COPY . exfiltration).
+            with tempfile.TemporaryDirectory(prefix="tm_build_") as tmpdir:
+                shutil.copy2(str(vault_dockerfile), os.path.join(tmpdir, "Dockerfile"))
+                _, log_lines = dex._run_image_build(
+                    self.client, tmpdir, "Dockerfile", tag
+                )
         except RuntimeError:
             raise
         except Exception as e:
