@@ -124,4 +124,6 @@ config_snapshot.json
 # Local working docs — not part of the repo
 docs/
 
-Dockerfile
+# Root-only Dockerfile pattern: ignores the repo-root Dockerfile (a stray
+# build artifact) but NOT docker/resource/Dockerfile (the git sandbox image).
+/Dockerfile

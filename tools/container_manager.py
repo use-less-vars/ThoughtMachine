@@ -905,6 +905,12 @@ class ContainerManager:
 
         result = []
         for container in containers:
+            # Skip hidden resource containers (e.g. the git sandbox from
+            # infra/resource_container_manager.py, label thoughtmachine.resource):
+            # they carry the workspace_id label so cleanup_workspace sweeps them,
+            # but must stay invisible to agent-facing listings.
+            if (container.labels or {}).get("thoughtmachine.resource"):
+                continue
             # uptime: now - StartedAt (mirrors status()); None when missing/unparseable
             uptime_seconds = None
             started_at = (container.attrs.get("State") or {}).get("StartedAt")

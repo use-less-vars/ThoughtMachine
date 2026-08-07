@@ -14,7 +14,7 @@ authors = [
 requires-python = ">=3.11"
 
 [tool.setuptools]
-packages = { find = { include = ["thoughtmachine*", "agent*", "tools*", "security*", "web_ui*", "llm_providers*"] } }
+packages = { find = { include = ["thoughtmachine*", "agent*", "tools*", "security*", "web_ui*", "llm_providers*", "infra*"] } }
 
 [tool.setuptools.package-data]
 thoughtmachine = [
