@@ -117,8 +117,8 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
-from fastapi import FastAPI, Form, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import Body, FastAPI, Form, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from agent.logging import log
 from contextlib import asynccontextmanager
@@ -2376,6 +2376,234 @@ def container_status(workspace: str = ""):
     except Exception as exc:
         log("ERROR", "server.container_status", f"Container status failed: {exc}")
         return {"status": "error", "capabilities": {}, "build_log": str(exc)}
+
+
+# --- Phase 7: per-workspace container lifecycle API ---
+# Lifecycle endpoints (list/status/start/stop/delete) address containers by
+# NAME (stable, human-meaningful) and resolve them to container IDs via
+# ContainerManager.list_containers(). Workspace resolution: the explicit
+# `workspace_path` query param wins; otherwise the workspace registry is used.
+# All endpoints mirror the JSON-error style of the existing /api/container/*.
+
+def _resolve_workspace_path(workspace_id: str, workspace_path: str = ""):
+    """Resolve the workspace root path for a container manager.
+
+    The explicit ``workspace_path`` query param wins; otherwise fall back to
+    the workspace registry. Returns None when the workspace is unknown or the
+    path cannot be resolved.
+    """
+    if workspace_path:
+        return workspace_path
+    try:
+        entry = WorkspaceRegistry.get_default().get_workspace(workspace_id)
+        return entry.root_path if entry is not None else None
+    except Exception:
+        return None
+
+
+def _make_container_manager(workspace_id: str, workspace_path: str = ""):
+    """Build a ContainerManager for the workspace.
+
+    Returns None when the workspace path cannot be resolved; raises when the
+    manager itself cannot be constructed. Lazy import avoids circular imports.
+    """
+    path = _resolve_workspace_path(workspace_id, workspace_path)
+    if not path:
+        return None
+    from tools.container_manager import ContainerManager
+    return ContainerManager(
+        workspace_path=path,
+        workspace_id=workspace_id,
+        session_id=None,
+        session_permissions=None,
+    )
+
+
+def _find_container_id(manager, name: str):
+    """Resolve a container name to its container_id via list_containers().
+
+    Raises when list_containers() fails; callers translate that into an error
+    response.
+    """
+    for entry in manager.list_containers() or []:
+        if entry.get("name") == name:
+            return entry.get("container_id")
+    return None
+
+
+def _json_error(message: str, status_code: int = 500):
+    """JSON error response mirroring the existing API error style."""
+    return JSONResponse({"error": message}, status_code=status_code)
+
+
+@app.get("/api/workspace/{workspace_id}/containers")
+def workspace_containers(workspace_id: str, workspace_path: str = ""):
+    """List containers for the workspace."""
+    try:
+        manager = _make_container_manager(workspace_id, workspace_path)
+    except Exception as exc:
+        log("ERROR", "server.workspace_containers",
+            f"ContainerManager construction failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if manager is None:
+        return _json_error(
+            f"workspace '{workspace_id}' not found or path unresolvable",
+            status_code=404)
+    try:
+        return {"containers": manager.list_containers()}
+    except Exception as exc:
+        log("ERROR", "server.workspace_containers", f"List failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+
+
+@app.get("/api/workspace/{workspace_id}/containers/{container_name}/status")
+def workspace_container_status(workspace_id: str, container_name: str,
+                               workspace_path: str = ""):
+    """Report status for a single named container in the workspace."""
+    try:
+        manager = _make_container_manager(workspace_id, workspace_path)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_status",
+            f"ContainerManager construction failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if manager is None:
+        return _json_error(
+            f"workspace '{workspace_id}' not found or path unresolvable",
+            status_code=404)
+    try:
+        container_id = _find_container_id(manager, container_name)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_status",
+            f"Container lookup failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if container_id is None:
+        return _json_error(f"container '{container_name}' not found",
+                           status_code=404)
+    try:
+        return manager.status(container_id)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_status",
+            f"Status failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+
+
+@app.post("/api/workspace/{workspace_id}/containers/{container_name}/start")
+def workspace_container_start(workspace_id: str, container_name: str,
+                              workspace_path: str = "",
+                              body: Optional[dict] = Body(default=None)):
+    """Start (or reuse) the named container in the workspace."""
+    try:
+        manager = _make_container_manager(workspace_id, workspace_path)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_start",
+            f"ContainerManager construction failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if manager is None:
+        return _json_error(
+            f"workspace '{workspace_id}' not found or path unresolvable",
+            status_code=404)
+    note = (body or {}).get("note") if isinstance(body, dict) else None
+    try:
+        result = manager.start(name=container_name, note=note)
+        if isinstance(result, dict) and result.get("error"):
+            return _json_error(result["error"], status_code=409)
+        return result
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_start",
+            f"Start failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+
+
+@app.post("/api/workspace/{workspace_id}/containers/{container_name}/stop")
+def workspace_container_stop(workspace_id: str, container_name: str,
+                             workspace_path: str = ""):
+    """Stop the named container in the workspace."""
+    try:
+        manager = _make_container_manager(workspace_id, workspace_path)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_stop",
+            f"ContainerManager construction failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if manager is None:
+        return _json_error(
+            f"workspace '{workspace_id}' not found or path unresolvable",
+            status_code=404)
+    try:
+        container_id = _find_container_id(manager, container_name)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_stop",
+            f"Container lookup failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if container_id is None:
+        return _json_error(f"container '{container_name}' not found",
+                           status_code=404)
+    try:
+        result = manager.stop(container_id)
+        if result.get("status") == "missing":
+            return _json_error(result.get("error", "container not found"),
+                               status_code=404)
+        if result.get("status") == "error":
+            return _json_error(result.get("error", "stop failed"),
+                               status_code=503)
+        return result
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_stop",
+            f"Stop failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+
+
+@app.delete("/api/workspace/{workspace_id}/containers/{container_name}")
+def workspace_container_delete(workspace_id: str, container_name: str,
+                               workspace_path: str = ""):
+    """Remove the named container in the workspace."""
+    try:
+        manager = _make_container_manager(workspace_id, workspace_path)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_delete",
+            f"ContainerManager construction failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if manager is None:
+        return _json_error(
+            f"workspace '{workspace_id}' not found or path unresolvable",
+            status_code=404)
+    try:
+        container_id = _find_container_id(manager, container_name)
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_delete",
+            f"Container lookup failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+    if container_id is None:
+        return _json_error(f"container '{container_name}' not found",
+                           status_code=404)
+    try:
+        result = manager.remove(container_id)
+        if result.get("status") == "missing":
+            return _json_error(result.get("error", "container not found"),
+                               status_code=404)
+        if result.get("status") == "error":
+            return _json_error(result.get("error", "remove failed"),
+                               status_code=503)
+        return result
+    except Exception as exc:
+        log("ERROR", "server.workspace_container_delete",
+            f"Remove failed: {exc}")
+        return _json_error(str(exc), status_code=503)
+
+
+@app.get("/api/health/containers")
+def health_containers():
+    """Report whether the Docker daemon is reachable from the server."""
+    try:
+        import docker as _docker
+        client = _docker.from_env()
+        try:
+            client.ping()
+        finally:
+            client.close()
+        return {"status": "ok", "docker": "reachable"}
+    except Exception:
+        return {"status": "degraded", "docker": "unreachable"}
+
 
 @app.get("/")
 async def root():

@@ -632,6 +632,30 @@ class ContainerManager:
             return {"status": "error", "container_id": container_id, "error": str(e),
                     "name": getattr(container, "name", "")}
 
+    def remove(self, container_id):
+        """Remove the container. Idempotent; NEVER raises.
+
+        Stops the container first (best-effort, via :meth:`stop`) then removes
+        it with ``force=True``. Returns one of:
+            {"status": "removed", "container_id": ...}
+            {"status": "error", "container_id": ..., "error": ...}
+        """
+        stopped = self.stop(container_id)
+        if stopped.get("status") not in ("stopped", "missing"):
+            return stopped
+        try:
+            container = self.client.containers.get(container_id)
+        except NotFound:
+            return {"status": "removed", "container_id": container_id}
+        except Exception as e:
+            return {"status": "error", "container_id": container_id, "error": str(e)}
+        try:
+            container.remove(force=True)
+            self._drop_container(container_id)
+            return {"status": "removed", "container_id": container_id}
+        except Exception as e:
+            return {"status": "error", "container_id": container_id, "error": str(e)}
+
     def status(self, container_id):
         """Report container status; NEVER raises."""
         try:

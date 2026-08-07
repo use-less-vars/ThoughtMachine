@@ -25,6 +25,7 @@ import subprocess
 import sys as sys_mod
 import tempfile
 from pathlib import Path
+from unittest import mock
 from unittest.mock import patch
 
 import pytest
@@ -122,3 +123,249 @@ def test_health_endpoint_reports_git_revision(contract_server):
         payload = resp.json()
         assert payload["revision"] == expected
         assert payload["revision"] == server_mod._SERVER_REVISION
+
+
+# -----------------------------------------------------------------------------
+# Case 2 - Phase 7: per-workspace container lifecycle API
+# (GET /api/workspace/{ws_id}/containers, .../{name}/status,
+#  POST .../start, POST .../stop, DELETE .../{name}, GET /api/health/containers)
+# All ContainerManager use is mocked; Docker daemon is never touched.
+# -----------------------------------------------------------------------------
+
+class _FakeContainerManager:
+    """Canned ContainerManager double: records calls, returns fixed results.
+
+    Mirrors the real ContainerManager contract (list_containers/status/start/
+    stop/remove, none of which raise).
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.workspace_path = kwargs.get("workspace_path")
+        self.workspace_id = kwargs.get("workspace_id")
+        self.list_calls = 0
+        self.status_calls = []
+        self.start_calls = []
+        self.stop_calls = []
+        self.remove_calls = []
+        self.start_result = None  # optional override (e.g. limit-conflict error)
+
+    def list_containers(self):
+        self.list_calls += 1
+        return [{
+            "container_id": "c1",
+            "name": "box-a",
+            "image": "agent-executor",
+            "status": "running",
+            "uptime_seconds": 5,
+            "workspace_id": "ws-1",
+            "note": "n1",
+        }]
+
+    def status(self, container_id):
+        self.status_calls.append(container_id)
+        return {
+            "container_id": container_id,
+            "name": "box-a",
+            "status": "running",
+            "uptime_seconds": 5,
+            "memory_usage_bytes": None,
+            "note": "",
+        }
+
+    def start(self, image=None, name=None, note=None):
+        self.start_calls.append({"image": image, "name": name, "note": note})
+        if self.start_result is not None:
+            return self.start_result
+        return {"id": "c1", "name": name, "status": "reused", "note": note or ""}
+
+    def stop(self, container_id):
+        self.stop_calls.append(container_id)
+        return {"status": "stopped", "container_id": container_id, "name": "box-a"}
+
+    def remove(self, container_id):
+        self.remove_calls.append(container_id)
+        return {"status": "removed", "container_id": container_id}
+
+
+def _make_fake_manager():
+    """Return a fresh _FakeContainerManager bound to the canned container."""
+    return _FakeContainerManager(workspace_path="/tmp/ws", workspace_id="ws-1")
+
+
+# -- GET /api/workspace/{workspace_id}/containers ------------------------------
+
+def test_list_containers_endpoint(contract_server):
+    """GET .../containers?workspace_path=... -> 200 with the container list."""
+    app, _ = contract_server
+    fake = _make_fake_manager()
+    with TestClient(app) as client:
+        with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+            cm_cls.return_value = fake
+            resp = client.get(
+                "/api/workspace/ws-1/containers", params={"workspace_path": "/tmp/ws"}
+            )
+    assert resp.status_code == 200
+    assert resp.json() == {"containers": fake.list_containers()}
+    assert fake.list_calls >= 1
+
+
+def test_list_containers_unknown_workspace(contract_server):
+    """No workspace_path and unknown ws_id -> 404 (registry lookup fails)."""
+    app, _ = contract_server
+    with TestClient(app) as client:
+        resp = client.get("/api/workspace/ws-1/containers")
+    assert resp.status_code == 404
+    assert resp.json() == {
+        "error": "workspace 'ws-1' not found or path unresolvable"
+    }
+
+
+def test_list_containers_manager_failure(contract_server):
+    """ContainerManager construction failure -> 503 with the error text."""
+    app, _ = contract_server
+    with TestClient(app) as client:
+        with mock.patch(
+            "tools.container_manager.ContainerManager",
+            side_effect=RuntimeError("boom"),
+        ):
+            resp = client.get(
+                "/api/workspace/ws-1/containers", params={"workspace_path": "/tmp/ws"}
+            )
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "boom"}
+
+
+# -- GET /api/workspace/{workspace_id}/containers/{name}/status ----------------
+
+def test_status_endpoint(contract_server):
+    """Status lookup by container NAME -> 200, resolves to the real container_id."""
+    app, _ = contract_server
+    fake = _make_fake_manager()
+    with TestClient(app) as client:
+        with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+            cm_cls.return_value = fake
+            resp = client.get(
+                "/api/workspace/ws-1/containers/box-a/status",
+                params={"workspace_path": "/tmp/ws"},
+            )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "running"
+    assert resp.json()["container_id"] == "c1"
+    assert fake.status_calls == ["c1"]
+
+
+def test_status_not_found(contract_server):
+    """Unknown container name -> 404."""
+    app, _ = contract_server
+    fake = _make_fake_manager()
+    with TestClient(app) as client:
+        with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+            cm_cls.return_value = fake
+            resp = client.get(
+                "/api/workspace/ws-1/containers/nope/status",
+                params={"workspace_path": "/tmp/ws"},
+            )
+    assert resp.status_code == 404
+    assert resp.json() == {"error": "container 'nope' not found"}
+
+
+# -- POST /api/workspace/{workspace_id}/containers/{name}/start ----------------
+
+def test_start_with_note(contract_server):
+    """POST .../start with a JSON note -> 200 and start(name=..., note=...)."""
+    app, _ = contract_server
+    fake = _make_fake_manager()
+    with TestClient(app) as client:
+        with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+            cm_cls.return_value = fake
+            resp = client.post(
+                "/api/workspace/ws-1/containers/box-a/start",
+                params={"workspace_path": "/tmp/ws"},
+                json={"note": "hi"},
+            )
+    assert resp.status_code == 200
+    assert resp.json() == {"id": "c1", "name": "box-a", "status": "reused", "note": "hi"}
+    assert fake.start_calls == [{"image": None, "name": "box-a", "note": "hi"}]
+
+
+def test_start_limit_conflict(contract_server):
+    """Workspace container limit reached -> 409 with the manager's error."""
+    app, _ = contract_server
+    fake = _make_fake_manager()
+    fake.start_result = {
+        "error": "Workspace container limit (4) reached. "
+                 "Delete a container or raise the limit before starting a new one."
+    }
+    with TestClient(app) as client:
+        with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+            cm_cls.return_value = fake
+            resp = client.post(
+                "/api/workspace/ws-1/containers/box-a/start",
+                params={"workspace_path": "/tmp/ws"},
+                json={},
+            )
+    assert resp.status_code == 409
+    assert resp.json() == {"error": fake.start_result["error"]}
+
+
+# -- POST /api/workspace/{workspace_id}/containers/{name}/stop -----------------
+
+def test_stop_endpoint(contract_server):
+    """POST .../stop -> 200 and stop() called with the resolved container_id."""
+    app, _ = contract_server
+    fake = _make_fake_manager()
+    with TestClient(app) as client:
+        with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+            cm_cls.return_value = fake
+            resp = client.post(
+                "/api/workspace/ws-1/containers/box-a/stop",
+                params={"workspace_path": "/tmp/ws"},
+            )
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "stopped", "container_id": "c1", "name": "box-a"}
+    assert fake.stop_calls == ["c1"]
+
+
+# -- DELETE /api/workspace/{workspace_id}/containers/{name} --------------------
+
+def test_delete_endpoint(contract_server):
+    """DELETE .../containers/{name} -> 200 and remove() called with c1."""
+    app, _ = contract_server
+    fake = _make_fake_manager()
+    with TestClient(app) as client:
+        with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+            cm_cls.return_value = fake
+            resp = client.delete(
+                "/api/workspace/ws-1/containers/box-a",
+                params={"workspace_path": "/tmp/ws"},
+            )
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "removed", "container_id": "c1"}
+    assert fake.remove_calls == ["c1"]
+
+
+# -- GET /api/health/containers ------------------------------------------------
+
+def test_health_containers_ok(contract_server):
+    """Docker daemon reachable -> {"status": "ok", "docker": "reachable"}."""
+    app, _ = contract_server
+    fake_client = mock.MagicMock()
+    fake_client.ping.return_value = True
+    with TestClient(app) as client:
+        with mock.patch("docker.from_env", return_value=fake_client):
+            resp = client.get("/api/health/containers")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "docker": "reachable"}
+    fake_client.ping.assert_called_once()
+    fake_client.close.assert_called_once()
+
+
+def test_health_containers_degraded(contract_server):
+    """Docker daemon unreachable -> {"status": "degraded", "docker": "unreachable"}."""
+    app, _ = contract_server
+    with TestClient(app) as client:
+        with mock.patch("docker.from_env", side_effect=RuntimeError("no docker")):
+            resp = client.get("/api/health/containers")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "degraded", "docker": "unreachable"}
+
