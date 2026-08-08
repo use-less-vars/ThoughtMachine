@@ -36,6 +36,8 @@ import WorkerOutputPanel from './components/WorkerOutputPanel'
 import { isWorkerEventRenderable } from './components/chat/adaptWorkerEvent'
 import LoggingPanel from './components/LoggingPanel'
 import SessionCreationModal from './components/SessionCreationModal'
+import WorkspaceSelector from './components/WorkspaceSelector'
+import { useRoute } from './router'
 import './styles.css'
 
 const WS_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
@@ -66,6 +68,8 @@ export default function App() {
   })
 
   const [showCreationModal, setShowCreationModal] = useState(false)
+  // --- Route (dependency-free hash router — see src/router.js) ---
+  const route = useRoute()
   const [showLoggingPanel, setShowLoggingPanel] = useState(false)
   const [loggingConfig, setLoggingConfig] = useState(null)
   const [loggingConfigError, setLoggingConfigError] = useState(null)
@@ -744,28 +748,13 @@ export default function App() {
       <div className="app-main">
         {/* All tabs stay mounted; inactive ones hidden with display:none */}
         <div className="app-center tab-content-area">
-          {tabs.length === 0 ? (
+          {route?.view === 'workspace' ? (
             <div className="empty-state">
-              <p>Open a session or create a new one to get started.</p>
-              <button
-                className="create-session-btn"
-                onClick={() => setShowCreationModal(true)}
-                style={{
-                  background: '#89b4fa',
-                  color: '#1e1e2e',
-                  border: 'none',
-                  borderRadius: '4px',
-                  padding: '0.5rem 1rem',
-                  cursor: 'pointer',
-                  fontWeight: 600,
-                  fontSize: '0.85rem',
-                  marginTop: '0.5rem',
-                  marginLeft: '0.5rem',
-                }}
-              >
-                Create New Session
-              </button>
+              <p>Workspace Panel: {route.id}</p>
+              <a className="ws-back-link" href="#/workspaces" style={{ color: '#89b4fa', fontSize: '0.85rem', marginTop: '0.5rem', display: 'inline-block' }}>← Back to workspaces</a>
             </div>
+          ) : tabs.length === 0 ? (
+            <WorkspaceSelector />
           ) : (
             tabs.map((tab, index) => (
               <div

@@ -1,0 +1,116 @@
+[
+  {
+    "id": "code-development",
+    "label": "Code Development",
+    "icon": "💻",
+    "description": "Build and maintain software in a code repository with read/write access to the workspace.",
+    "risk": "Low",
+    "requiresDocker": true,
+    "recommendedSettings": "Git: read/write, Filesystem: read/write within workspace, Network: read-only, Docker enabled.",
+    "defaults": {
+      "resources": ["git", "filesystem", "network", "container"],
+      "permissions": { "git": "write", "filesystem": "write", "network": "read" },
+      "tools": ["FileEditor", "FileReader", "GitTool", "DockerTool", "SearchCodebase"],
+      "sessionDefaults": {
+        "max_turns": 50,
+        "temperature": 0.7,
+        "system_prompt": "You are a senior software engineer working in a code repository. Write clean, tested, maintainable code, and explain your changes clearly."
+      }
+    }
+  },
+  {
+    "id": "social-media-bot",
+    "label": "Social Media Bot",
+    "icon": "📣",
+    "description": "Draft and publish social media posts with confirmed, platform-appropriate content.",
+    "risk": "Medium",
+    "requiresDocker": false,
+    "recommendedSettings": "Network: write (posting), Filesystem: read-only, no container isolation.",
+    "defaults": {
+      "resources": ["filesystem", "network"],
+      "permissions": { "network": "write", "filesystem": "read" },
+      "tools": ["FileReader", "HttpTool"],
+      "sessionDefaults": {
+        "max_turns": 30,
+        "temperature": 0.9,
+        "system_prompt": "You are a social media content manager. Draft platform-appropriate posts and confirm before publishing anything."
+      }
+    }
+  },
+  {
+    "id": "writing-research",
+    "label": "Writing & Research",
+    "icon": "📝",
+    "description": "Research topics and produce written material with claims grounded in sources.",
+    "risk": "Low",
+    "requiresDocker": false,
+    "recommendedSettings": "Filesystem: read, Network: read-only (research), no container required.",
+    "defaults": {
+      "resources": ["filesystem", "network"],
+      "permissions": { "filesystem": "read", "network": "read" },
+      "tools": ["FileReader", "SearchCodebase"],
+      "sessionDefaults": {
+        "max_turns": 40,
+        "temperature": 0.8,
+        "system_prompt": "You are a research assistant and writer. Ground claims in sources and cite them."
+      }
+    }
+  },
+  {
+    "id": "hardware-hacking",
+    "label": "Hardware Hacking",
+    "icon": "🔧",
+    "description": "Work with embedded devices, serial interfaces, and firmware in a controlled environment.",
+    "risk": "High",
+    "requiresDocker": true,
+    "recommendedSettings": "Container: enabled with device passthrough, Network: ask (restricted), Filesystem: read-only outside workspace.",
+    "defaults": {
+      "resources": ["container", "serial", "filesystem"],
+      "permissions": { "container": "true", "serial": "true", "filesystem": "read", "network": "ask" },
+      "tools": ["SerialTool", "FileEditor", "FileReader", "DockerTool"],
+      "sessionDefaults": {
+        "max_turns": 60,
+        "temperature": 0.5,
+        "system_prompt": "You are an embedded systems engineer. Work with real devices carefully and never exfiltrate firmware or credentials."
+      }
+    }
+  },
+  {
+    "id": "security-research",
+    "label": "Security Research",
+    "icon": "🛡️",
+    "description": "Analyze systems and code for vulnerabilities inside a mandatory isolated sandbox.",
+    "risk": "Critical",
+    "requiresDocker": true,
+    "recommendedSettings": "Container: mandatory isolation, Network: read-only, Filesystem: read-only, no host access.",
+    "defaults": {
+      "resources": ["container", "network"],
+      "permissions": { "container": "true", "network": "read", "filesystem": "read" },
+      "tools": ["DockerTool", "FileReader", "SearchCodebase"],
+      "sessionDefaults": {
+        "max_turns": 80,
+        "temperature": 0.4,
+        "system_prompt": "You are a security researcher operating in an isolated sandbox. Only test systems you are explicitly authorized to test."
+      }
+    }
+  },
+  {
+    "id": "blank",
+    "label": "Blank Workspace",
+    "icon": "⬜",
+    "description": "Start from a clean slate with no resources, permissions, or tools pre-enabled.",
+    "risk": "Low",
+    "requiresDocker": false,
+    "recommendedSettings": "No resources, permissions, or tools pre-enabled — configure everything from scratch.",
+    "defaults": {
+      "resources": [],
+      "permissions": {},
+      "tools": [],
+      "sessionDefaults": {
+        "max_turns": 20,
+        "temperature": 0.7,
+        "system_prompt": "You are a helpful assistant."
+      }
+    }
+  }
+]
