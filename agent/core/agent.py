@@ -215,6 +215,18 @@ class Agent:
                     f'No API key available for provider "{new_config.provider_type}". '
                     f'Set {new_config.provider_type.upper()}_API_KEY environment variable '
                     f'or provide an api_key in the configuration.')
+                # Permissions are HOT_SWAPPABLE and must not wait for a restart
+                # that cannot succeed (no API key): apply the session_permissions
+                # portion synchronously, mirroring _hot_swap's propagation to
+                # state.config and tool_executor.config. Other fields stay pending
+                # for retry on the next turn.
+                if new_config.session_permissions != self.config.session_permissions:
+                    self.config.session_permissions = new_config.session_permissions
+                    self.state.config.session_permissions = new_config.session_permissions
+                    self.tool_executor.config.session_permissions = new_config.session_permissions
+                    log('DEBUG', 'core.agent',
+                        'Applied session_permissions synchronously from preserved '
+                        'pending config (restart deferred: no API key)')
                 return False
             success = self._restart_with_config(new_config)
             if success:

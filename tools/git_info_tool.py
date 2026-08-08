@@ -223,19 +223,24 @@ class GitInfoTool(ToolBase):
         self._resolved_workspace_path = None
         self._resolved_workspace_id = None
 
-        # Atomic permission re-check for network operations
+        # Atomic permission re-check for network operations. An 'ask' level
+        # is NOT re-checked here: it defers to the ToolExecutor's outer gate,
+        # which already prompted the user and approved this call, so effective
+        # permissions still read 'ask'. Missing/banned/False stay fail-closed
+        # (the atomic check runs and denies).
         operation = self.operation
         network_ops = {"remote", "clone", "push", "pull", "fetch", "merge", "rebase"}
         if operation in network_ops:
-            from security.security_gate import check_atomic_operation
             effective = self.effective_permissions or {}
-            if not check_atomic_operation(
-                "network:outbound",
-                effective,
-                "GitInfoTool",
-                f"{operation} on remote"
-            ):
-                return json.dumps({"error": f"Atomic permission check failed: network:outbound required for {operation}"})
+            if effective.get("network") != "ask":
+                from security.security_gate import check_atomic_operation
+                if not check_atomic_operation(
+                    "network:outbound",
+                    effective,
+                    "GitInfoTool",
+                    f"{operation} on remote"
+                ):
+                    return json.dumps({"error": f"Atomic permission check failed: network:outbound required for {operation}"})
 
         # Validate the clone URL protocol BEFORE any subprocess can run.
         # This check sits outside the try/except below so the ValueError
@@ -422,10 +427,14 @@ class GitInfoTool(ToolBase):
         # permissions are present (the ToolExecutor always injects them,
         # falling back to DEFAULT_SESSION_PERMISSIONS; legacy/direct
         # callers without permissions keep the hermetic-environment
-        # guarantees but skip the gate).
+        # guarantees but skip the gate). An 'ask' level defers outward to
+        # the ToolExecutor's outer ask/prompt flow -- SandboxedExecution
+        # treats 'ASK' as denied, so the category must be left unset here
+        # or the host path would hard-deny before the user is ever asked.
         required_category = None
         if self.session_permissions is not None:
-            required_category = f"git:{self._get_operation_level(args)}"
+            if (self.effective_permissions or {}).get("git") != "ask":
+                required_category = f"git:{self._get_operation_level(args)}"
 
         result = executor.run(
             ["git"] + hardened_args + args,
@@ -452,21 +461,27 @@ class GitInfoTool(ToolBase):
         manager = self._ensure_resource_container()
 
         # Permission gate: enforce git:read/git:write ONLY when session
-        # permissions are present (mirrors the host path).
+        # permissions are present (mirrors the host path). The gate hard-denies
+        # only definitively-denied levels ('banned'/False/missing category -
+        # the missing-category case stays fail-closed for legacy/direct
+        # callers without effective_permissions). An 'ask' level is NOT
+        # denied here: it defers to the ToolExecutor's outer gate, which owns
+        # the interactive user-prompt flow.
         if self.session_permissions is not None:
-            from security.security_gate import check_atomic_operation
-
             level = self._get_operation_level(args)
             effective = self.effective_permissions or {}
-            if not check_atomic_operation(
-                f"git:{level}",
-                effective,
-                "GitInfoTool",
-                f"git {' '.join(args)}",
-            ):
-                raise PermissionError(
-                    f"Permission denied: git:{level} required for this operation"
-                )
+            if effective.get("git") != "ask":
+                from security.security_gate import check_atomic_operation
+
+                if not check_atomic_operation(
+                    f"git:{level}",
+                    effective,
+                    "GitInfoTool",
+                    f"git {' '.join(args)}",
+                ):
+                    raise PermissionError(
+                        f"Permission denied: git:{level} required for this operation"
+                    )
 
         # commit additionally skips pre-commit/commit-msg hooks via
         # --no-verify as a second line of defense (same as host path).
@@ -697,7 +712,15 @@ class GitInfoTool(ToolBase):
         # Enforce git:write only when session permissions are present (the
         # ToolExecutor always injects them; legacy/direct callers without
         # permissions keep the sandbox's hermetic-environment guarantees).
-        required_category = "git:write" if self.session_permissions is not None else None
+        # An 'ask' level defers outward: the outer gate already prompted and
+        # approved, and SandboxedExecution would treat 'ASK' as denied, so
+        # the category is left unset (the hook script still executes).
+        required_category = (
+            "git:write"
+            if self.session_permissions is not None
+            and (self.effective_permissions or {}).get("git") != "ask"
+            else None
+        )
         result = executor.run(
             [str(hook_path)],
             cwd=str(repo_root),
