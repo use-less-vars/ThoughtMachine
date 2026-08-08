@@ -6,8 +6,8 @@
 // tabs from localStorage 'activeSessionId' on the hub session list.
 
 import React, { useEffect, useState } from 'react'
-import useWorkspaceStore from '../../store/workspaceStore'
-import './WorkspacePanel.css'
+import useWorkspaceStore from '../../../store/workspaceStore'
+import '../WorkspacePanel.css'
 
 const MODES = [
   { id: 'agent', label: 'Agent', desc: 'Full tools, no worker' },

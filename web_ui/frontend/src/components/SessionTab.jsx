@@ -26,6 +26,7 @@ import QueryBar from './QueryBar'
 import StatusBar from './StatusBar'
 import ConfigPanel from './ConfigPanel'
 import SecurityDialog from './SecurityDialog'
+import SessionSidebar from './SessionSidebar'
 
 const CONFIG_PANEL_MIN_WIDTH = 200
 const CONFIG_PANEL_MAX_WIDTH = 500
@@ -72,6 +73,7 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   const [isRenaming, setIsRenaming] = useState(false)
   const renameInputRef = useRef(null)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
+  const [sidebarOpen, setSidebarOpen] = useState(false) // session details slide-out panel
   const deleteConfirmRef = useRef(null)
   const currentSessionIdRef = useRef(currentSessionId)
   const [workspaceId, setWorkspaceId] = useState(null) // session metadata; no store slice yet (kept local)
@@ -1089,6 +1091,13 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
                 Rename
               </button>
               <div className="session-header-spacer" />
+              <button
+                className="session-header-btn session-header-details-btn"
+                onClick={() => setSidebarOpen((v) => !v)}
+                title="Toggle session details panel"
+              >
+                Details
+              </button>
 
               {showDeleteConfirm ? (
                 <span className="session-header-delete-confirm">
@@ -1198,6 +1207,15 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         </div>
         {/* Session list is rendered by App, not per-tab */}
       </div>
+      {sidebarOpen && (
+        <SessionSidebar
+          workspaceId={workspaceId}
+          config={config}
+          tools={availableTools}
+          sendCommand={sendCommand}
+          onClose={() => setSidebarOpen(false)}
+        />
+      )}
     </div>
   )
 }
