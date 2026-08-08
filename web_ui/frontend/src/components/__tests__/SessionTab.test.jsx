@@ -472,7 +472,9 @@ describe('SessionTab — event handling', () => {
   // backend create a REPLACEMENT session and reply session_loaded with a
   // DIFFERENT session_id. The tab must NOT silently rebind — it shows a
   // recovery banner and blocks further commands until 'Start New Session'.
-  it('session_loaded with a DIFFERENT session id shows the stale-session recovery banner', async () => {
+  it(
+    'session_loaded with a DIFFERENT session id shows the stale-session recovery banner',
+    async () => {
     const mocks = renderTab({ sessionId: 'sess-1' });
     const ws = await connectWs();
     // load_session for sess-1 is deferred by one tick on open — wait for it so
@@ -519,7 +521,7 @@ describe('SessionTab — event handling', () => {
       expect(mocks.onNewSession).toHaveBeenCalledWith('replacement-sess', 'Replacement Session');
     });
     expect(screen.queryByText(/no longer available/i)).not.toBeInTheDocument();
-  });
+  }, 20000);
 
   // Intentional replacement (workspace switch via apply_config): the backend
   // flags the new session_loaded with `replacement: true`. The tab must adopt

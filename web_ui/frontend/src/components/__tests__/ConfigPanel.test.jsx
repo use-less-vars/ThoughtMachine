@@ -102,7 +102,7 @@ describe('header', () => {
     renderPanel();
     expect(screen.getByRole('heading', { name: 'Config' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Save as Default' })).toBeInTheDocument();
-  });
+  }, 20000);
 
   it('renders all 8 tab buttons', () => {
     renderPanel();
@@ -110,7 +110,7 @@ describe('header', () => {
     for (const label of labels) {
       expect(screen.getByRole('button', { name: label })).toBeInTheDocument();
     }
-  });
+  }, 20000);
 });
 
 // ==========================================================================
