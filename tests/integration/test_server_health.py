@@ -17,6 +17,7 @@ Run (from repo root):
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import os
 import pathlib
@@ -192,18 +193,46 @@ def _make_fake_manager():
     return _FakeContainerManager(workspace_path="/tmp/ws", workspace_id="ws-1")
 
 
+@contextlib.contextmanager
+def _registered_ws(tmp_home: str):
+    """Temporarily register workspace 'ws-1' at an in-home path.
+
+    The container lifecycle endpoints validate an explicit ``workspace_path``
+    against $HOME (excluding the vault) and require the workspace to be
+    registered, so the fixture's temp HOME is used instead of a hardcoded
+    /tmp path.  The entry is removed afterwards so
+    test_list_containers_unknown_workspace keeps its 404 contract (ws-1 is
+    unresolvable without an explicit workspace_path).
+
+    Yields the in-home workspace path to pass as the query parameter.
+    """
+    from thoughtmachine.workspace_registry import WorkspaceRegistry
+
+    ws_path = os.path.join(tmp_home, "ws")
+    os.makedirs(ws_path, exist_ok=True)
+    registry = WorkspaceRegistry.get_default()
+    if registry.get_workspace("ws-1") is None:
+        registry.register_workspace("ws-1", ws_path)
+    try:
+        yield ws_path
+    finally:
+        registry.unregister_workspace("ws-1")
+
+
 # -- GET /api/workspace/{workspace_id}/containers ------------------------------
 
 def test_list_containers_endpoint(contract_server):
     """GET .../containers?workspace_path=... -> 200 with the container list."""
-    app, _ = contract_server
+    app, tmp_home = contract_server
     fake = _make_fake_manager()
-    with TestClient(app) as client:
-        with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
-            cm_cls.return_value = fake
-            resp = client.get(
-                "/api/workspace/ws-1/containers", params={"workspace_path": "/tmp/ws"}
-            )
+    with _registered_ws(tmp_home) as ws_path:
+        with TestClient(app) as client:
+            with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+                cm_cls.return_value = fake
+                resp = client.get(
+                    "/api/workspace/ws-1/containers",
+                    params={"workspace_path": ws_path},
+                )
     assert resp.status_code == 200
     assert resp.json() == {"containers": fake.list_containers()}
     assert fake.list_calls >= 1
@@ -222,15 +251,17 @@ def test_list_containers_unknown_workspace(contract_server):
 
 def test_list_containers_manager_failure(contract_server):
     """ContainerManager construction failure -> 503 with the error text."""
-    app, _ = contract_server
-    with TestClient(app) as client:
-        with mock.patch(
-            "tools.container_manager.ContainerManager",
-            side_effect=RuntimeError("boom"),
-        ):
-            resp = client.get(
-                "/api/workspace/ws-1/containers", params={"workspace_path": "/tmp/ws"}
-            )
+    app, tmp_home = contract_server
+    with _registered_ws(tmp_home) as ws_path:
+        with TestClient(app) as client:
+            with mock.patch(
+                "tools.container_manager.ContainerManager",
+                side_effect=RuntimeError("boom"),
+            ):
+                resp = client.get(
+                    "/api/workspace/ws-1/containers",
+                    params={"workspace_path": ws_path},
+                )
     assert resp.status_code == 503
     assert resp.json() == {"error": "boom"}
 
@@ -239,15 +270,16 @@ def test_list_containers_manager_failure(contract_server):
 
 def test_status_endpoint(contract_server):
     """Status lookup by container NAME -> 200, resolves to the real container_id."""
-    app, _ = contract_server
+    app, tmp_home = contract_server
     fake = _make_fake_manager()
-    with TestClient(app) as client:
-        with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
-            cm_cls.return_value = fake
-            resp = client.get(
-                "/api/workspace/ws-1/containers/box-a/status",
-                params={"workspace_path": "/tmp/ws"},
-            )
+    with _registered_ws(tmp_home) as ws_path:
+        with TestClient(app) as client:
+            with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+                cm_cls.return_value = fake
+                resp = client.get(
+                    "/api/workspace/ws-1/containers/box-a/status",
+                    params={"workspace_path": ws_path},
+                )
     assert resp.status_code == 200
     assert resp.json()["status"] == "running"
     assert resp.json()["container_id"] == "c1"
@@ -256,15 +288,16 @@ def test_status_endpoint(contract_server):
 
 def test_status_not_found(contract_server):
     """Unknown container name -> 404."""
-    app, _ = contract_server
+    app, tmp_home = contract_server
     fake = _make_fake_manager()
-    with TestClient(app) as client:
-        with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
-            cm_cls.return_value = fake
-            resp = client.get(
-                "/api/workspace/ws-1/containers/nope/status",
-                params={"workspace_path": "/tmp/ws"},
-            )
+    with _registered_ws(tmp_home) as ws_path:
+        with TestClient(app) as client:
+            with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+                cm_cls.return_value = fake
+                resp = client.get(
+                    "/api/workspace/ws-1/containers/nope/status",
+                    params={"workspace_path": ws_path},
+                )
     assert resp.status_code == 404
     assert resp.json() == {"error": "container 'nope' not found"}
 
@@ -273,16 +306,17 @@ def test_status_not_found(contract_server):
 
 def test_start_with_note(contract_server):
     """POST .../start with a JSON note -> 200 and start(name=..., note=...)."""
-    app, _ = contract_server
+    app, tmp_home = contract_server
     fake = _make_fake_manager()
-    with TestClient(app) as client:
-        with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
-            cm_cls.return_value = fake
-            resp = client.post(
-                "/api/workspace/ws-1/containers/box-a/start",
-                params={"workspace_path": "/tmp/ws"},
-                json={"note": "hi"},
-            )
+    with _registered_ws(tmp_home) as ws_path:
+        with TestClient(app) as client:
+            with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+                cm_cls.return_value = fake
+                resp = client.post(
+                    "/api/workspace/ws-1/containers/box-a/start",
+                    params={"workspace_path": ws_path},
+                    json={"note": "hi"},
+                )
     assert resp.status_code == 200
     assert resp.json() == {"id": "c1", "name": "box-a", "status": "reused", "note": "hi"}
     assert fake.start_calls == [{"image": None, "name": "box-a", "note": "hi"}]
@@ -290,20 +324,21 @@ def test_start_with_note(contract_server):
 
 def test_start_limit_conflict(contract_server):
     """Workspace container limit reached -> 409 with the manager's error."""
-    app, _ = contract_server
+    app, tmp_home = contract_server
     fake = _make_fake_manager()
     fake.start_result = {
         "error": "Workspace container limit (4) reached. "
                  "Delete a container or raise the limit before starting a new one."
     }
-    with TestClient(app) as client:
-        with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
-            cm_cls.return_value = fake
-            resp = client.post(
-                "/api/workspace/ws-1/containers/box-a/start",
-                params={"workspace_path": "/tmp/ws"},
-                json={},
-            )
+    with _registered_ws(tmp_home) as ws_path:
+        with TestClient(app) as client:
+            with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+                cm_cls.return_value = fake
+                resp = client.post(
+                    "/api/workspace/ws-1/containers/box-a/start",
+                    params={"workspace_path": ws_path},
+                    json={},
+                )
     assert resp.status_code == 409
     assert resp.json() == {"error": fake.start_result["error"]}
 
@@ -312,15 +347,16 @@ def test_start_limit_conflict(contract_server):
 
 def test_stop_endpoint(contract_server):
     """POST .../stop -> 200 and stop() called with the resolved container_id."""
-    app, _ = contract_server
+    app, tmp_home = contract_server
     fake = _make_fake_manager()
-    with TestClient(app) as client:
-        with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
-            cm_cls.return_value = fake
-            resp = client.post(
-                "/api/workspace/ws-1/containers/box-a/stop",
-                params={"workspace_path": "/tmp/ws"},
-            )
+    with _registered_ws(tmp_home) as ws_path:
+        with TestClient(app) as client:
+            with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+                cm_cls.return_value = fake
+                resp = client.post(
+                    "/api/workspace/ws-1/containers/box-a/stop",
+                    params={"workspace_path": ws_path},
+                )
     assert resp.status_code == 200
     assert resp.json() == {"status": "stopped", "container_id": "c1", "name": "box-a"}
     assert fake.stop_calls == ["c1"]
@@ -330,15 +366,16 @@ def test_stop_endpoint(contract_server):
 
 def test_delete_endpoint(contract_server):
     """DELETE .../containers/{name} -> 200 and remove() called with c1."""
-    app, _ = contract_server
+    app, tmp_home = contract_server
     fake = _make_fake_manager()
-    with TestClient(app) as client:
-        with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
-            cm_cls.return_value = fake
-            resp = client.delete(
-                "/api/workspace/ws-1/containers/box-a",
-                params={"workspace_path": "/tmp/ws"},
-            )
+    with _registered_ws(tmp_home) as ws_path:
+        with TestClient(app) as client:
+            with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+                cm_cls.return_value = fake
+                resp = client.delete(
+                    "/api/workspace/ws-1/containers/box-a",
+                    params={"workspace_path": ws_path},
+                )
     assert resp.status_code == 200
     assert resp.json() == {"status": "removed", "container_id": "c1"}
     assert fake.remove_calls == ["c1"]
