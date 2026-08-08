@@ -37,6 +37,7 @@ import { isWorkerEventRenderable } from './components/chat/adaptWorkerEvent'
 import LoggingPanel from './components/LoggingPanel'
 import SessionCreationModal from './components/SessionCreationModal'
 import WorkspaceSelector from './components/WorkspaceSelector'
+import WorkspacePanel from './components/workspace/WorkspacePanel'
 import { useRoute } from './router'
 import './styles.css'
 
@@ -749,10 +750,7 @@ export default function App() {
         {/* All tabs stay mounted; inactive ones hidden with display:none */}
         <div className="app-center tab-content-area">
           {route?.view === 'workspace' ? (
-            <div className="empty-state">
-              <p>Workspace Panel: {route.id}</p>
-              <a className="ws-back-link" href="#/workspaces" style={{ color: '#89b4fa', fontSize: '0.85rem', marginTop: '0.5rem', display: 'inline-block' }}>← Back to workspaces</a>
-            </div>
+            <WorkspacePanel />
           ) : tabs.length === 0 ? (
             <WorkspaceSelector />
           ) : (
