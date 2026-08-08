@@ -43,7 +43,10 @@ Security model
   executor's tmpfs-shadowing of ``/workspace/.git``: the resource container's
   purpose is to operate on the REAL git metadata. Blast radius is bounded by
   the workspace bind being the ONLY mount plus no network / no socket / no
-  vault / read-only rootfs.
+  vault / read-only rootfs. One documented exception: for a git linked
+  worktree (``.git`` is a ``gitdir:`` pointer file) the MAIN repository is
+  additionally bind-mounted at its original host path so the pointer
+  resolves inside the container (see ``_resolve_worktree_main_repo``).
 
 Exec semantics
 --------------
@@ -71,6 +74,106 @@ except ImportError:  # pragma: no cover - environment without docker SDK
     APIError = Exception
     NotFound = Exception
     Mount = None
+
+
+def _resolve_worktree_main_repo(workspace_path, vault_root=None):
+    """Resolve the MAIN repository of a git linked worktree, or None.
+
+    A linked worktree's ``.git`` is a FILE containing a ``gitdir: <path>``
+    pointer into the main repository (``<main>/.git/worktrees/<name>``).
+    The resource container bind-mounts only the workspace at ``/workspace``,
+    so git inside the container cannot resolve the host-only pointer and
+    fails with "Not a git repository". This helper validates the pointer
+    and returns the main repository root when an extra bind mount is
+    warranted, so ``ensure_container()`` can mount it at its original host
+    path (making the pointer resolve inside the container).
+
+    Returns None for: regular repositories (``.git`` is a directory),
+    missing/malformed ``.git`` files, submodule-style gitdirs (under
+    ``.git/modules/...``), missing targets, main repos that are not real
+    git directories, filesystem roots, and pointers into the vault or into
+    the workspace itself (already covered by the ``/workspace`` bind).
+
+    Args:
+        workspace_path: Host path of the workspace (str or os.PathLike).
+        vault_root: Vault root that must NEVER be mounted; defaults to
+            ``~/.thoughtmachine``.
+
+    Returns:
+        str or None: absolute host path of the main repository, or None.
+    """
+    if vault_root is None:
+        vault_root = os.path.join(os.path.expanduser("~"), ".thoughtmachine")
+
+    dot_git = os.path.join(str(workspace_path), ".git")
+    if not os.path.isfile(dot_git):
+        return None
+    try:
+        with open(dot_git, "r", encoding="utf-8") as fh:
+            content = fh.read()
+    except OSError:
+        return None
+
+    lines = content.splitlines()
+    if not lines:
+        return None
+    first = lines[0].strip()
+    if not first.startswith("gitdir:"):
+        return None
+    target = first[len("gitdir:"):].strip()
+    if not target:
+        return None
+
+    target = os.path.expanduser(target)
+    if not os.path.isabs(target):
+        # git resolves relative gitdir pointers against the .git file's dir.
+        target = os.path.join(str(workspace_path), target)
+    gitdir = os.path.realpath(target)
+
+    # Linked-worktree gitdir shape: <main>/.git/worktrees/<name>. Anything
+    # else (plain repo, submodule modules/<name>, relocated repo) is not a
+    # linked worktree and gets no extra mount.
+    if os.path.basename(os.path.dirname(gitdir)) != "worktrees":
+        return None
+    if not os.path.isdir(gitdir):
+        return None
+
+    # <main>/.git/worktrees/<name> -- three parents up is the main repo.
+    main_root = os.path.dirname(os.path.dirname(os.path.dirname(gitdir)))
+    main_dot_git = os.path.join(main_root, ".git")
+    if not os.path.isdir(main_dot_git):
+        return None
+    # Must actually look like a git dir (HEAD / objects / refs present).
+    if not any(
+        os.path.exists(os.path.join(main_dot_git, part))
+        for part in ("HEAD", "objects", "refs")
+    ):
+        return None
+
+    mr = os.path.realpath(main_root)
+    ws = os.path.realpath(str(workspace_path))
+    # Already covered by the /workspace bind — never double-mount.
+    if mr == ws or _path_is_within(mr, ws):
+        return None
+    # Filesystem root — never mount that.
+    if os.path.dirname(mr) == mr:
+        return None
+    # The vault (secrets, credentials) is NEVER mounted.
+    if _path_is_within(mr, vault_root):
+        return None
+    return mr
+
+
+def _path_is_within(path, parent):
+    """True when ``path`` equals or is nested inside ``parent`` (abs paths)."""
+    p = os.path.realpath(str(path))
+    base = os.path.realpath(str(parent))
+    if not base:
+        return False
+    try:
+        return os.path.commonpath([p, base]) == base
+    except ValueError:  # pragma: no cover - different drives (windows)
+        return False
 
 
 class ResourceContainerManager:
@@ -182,7 +285,8 @@ class ResourceContainerManager:
         # Workspace bind mount, READ-WRITE: git writes .git + index on the
         # REAL workspace. Documented divergence from the executor's ro/.git-
         # tmpfs scheme — this container's whole purpose is operating on git
-        # metadata; isolation comes from it being the ONLY mount.
+        # metadata; isolation comes from it being the ONLY mount (one
+        # exception: the linked-worktree main repo below).
         mounts = [
             Mount(
                 target="/workspace",
@@ -191,6 +295,25 @@ class ResourceContainerManager:
                 read_only=False,
             )
         ]
+        # Linked-worktree fix: when /workspace/.git is a FILE (a "gitdir: ..."
+        # pointer), git inside the container cannot resolve the host-only
+        # pointer and reports "Not a git repository". Bind the MAIN repository
+        # at its ORIGINAL host path (rw: worktree commits write objects/refs
+        # to the main repo's common git dir). This is the only extra mount
+        # ever added — _resolve_worktree_main_repo() refuses pointers into
+        # the vault, filesystem roots, and the workspace itself.
+        main_repo = _resolve_worktree_main_repo(
+            self.workspace_path, self.vault_root
+        )
+        if main_repo:
+            mounts.append(
+                Mount(
+                    target=main_repo,
+                    source=main_repo,
+                    type="bind",
+                    read_only=False,
+                )
+            )
         # tmpfs (same entries as ContainerManager.start / docker_executor,
         # minus the /workspace/.git shadow — we need the real .git).
         tmpfs = {
