@@ -16,12 +16,15 @@ try:
         DockerSetupError,
     )
     SECURITY_AVAILABLE = True
-except ImportError:
-    SECURITY_AVAILABLE = False
-
-    class DockerSetupError(RuntimeError):
-        """Raised when Docker sandbox setup fails (fallback if thoughtmachine.security is unavailable)."""
-        pass
+except ImportError as _security_import_error:
+    # thoughtmachine.security is REQUIRED: DockerSetupError must always be
+    # the security layer's class (tests enforce that contract), so no local
+    # fallback class is ever defined here. Fail the import loudly instead of
+    # silently degrading.
+    raise ImportError(
+        "thoughtmachine.security is required by tools.docker_code_runner: "
+        "DockerSetupError must come from thoughtmachine.security"
+    ) from _security_import_error
 
 try:
     import docker

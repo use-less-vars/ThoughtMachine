@@ -24,8 +24,13 @@ RUN apt-get update \
 # user="1000:1000" the manager passes to containers.run — Docker resolves
 # "1000:1000" numerically, so the uid/gid, not the name, is what matters).
 # -m creates /home/agent (the manager mounts tmpfs there, writable).
+# Pre-create /home/agent/.local owned by uid 1000: the tm-packages named
+# volume mounts there at runtime, and a fresh volume root inherits the image
+# dir's ownership, so pip --user installs work as the agent user.
 RUN groupadd -g 1000 agent \
-    && useradd -m -u 1000 -g 1000 -s /bin/bash agent
+    && useradd -m -u 1000 -g 1000 -s /bin/bash agent \
+    && mkdir -p /home/agent/.local \
+    && chown 1000:1000 /home/agent/.local
 
 # Layer 4: HOME for git's global config (~/.gitconfig lives on the /home/agent
 # tmpfs, so `git config --global safe.directory ...` works and persists only

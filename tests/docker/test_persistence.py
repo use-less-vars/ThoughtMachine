@@ -71,6 +71,10 @@ class TestVolumePersistence:
         dockerfile.write_text(
             "FROM python:3.11-slim\n"
             "RUN adduser --uid 1000 --disabled-password --gecos '' agent\n"
+            # Pre-create /home/agent/.local owned by uid 1000: a fresh named
+            # volume mounted there inherits the image dir's ownership, so
+            # pip --user installs work as the agent user.
+            "RUN mkdir -p /home/agent/.local && chown 1000:1000 /home/agent/.local\n"
             "USER agent\n"
             'CMD ["tail", "-f", "/dev/null"]\n'
         )
