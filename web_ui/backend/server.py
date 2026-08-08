@@ -2233,11 +2233,60 @@ app.include_router(prompt_router)
 #  REST endpoints (health, information)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── Host path confinement (path browser + container lifecycle) ──────────────
+# The browser and the container lifecycle endpoints accept arbitrary host
+# paths. Confine them to $HOME minus the vault root (~/.thoughtmachine) so a
+# malicious or buggy client cannot read/create directories or mount host
+# paths outside the user's home directory.
+
+def _vault_root_path() -> str:
+    """Absolute, normalized vault root (~/.thoughtmachine)."""
+    root = os.path.join(os.path.expanduser("~"), ".thoughtmachine")
+    try:
+        return os.path.realpath(root)
+    except Exception:
+        return root
+
+
+def _path_is_within(path: str, prefix: str) -> bool:
+    """True when *path* equals *prefix* or lies beneath it (component-aware)."""
+    path = os.path.normpath(path)
+    prefix = os.path.normpath(prefix)
+    return path == prefix or path.startswith(prefix + os.sep)
+
+
+def _confine_to_home(path: str) -> str:
+    """Resolve *path* (empty → $HOME) and require it to be under $HOME and
+    outside the vault root (~/.thoughtmachine).
+
+    Returns the absolute, normalized, symlink-resolved path. Raises ValueError
+    when the path escapes those bounds.
+    """
+    raw = os.path.expanduser(path or "~")
+    resolved = os.path.realpath(os.path.abspath(raw))
+    home = os.path.realpath(os.path.expanduser("~"))
+    if not _path_is_within(resolved, home):
+        raise ValueError(
+            f"Path '{path}' resolves to '{resolved}', which is outside the "
+            f"allowed home directory '{home}'"
+        )
+    vault = _vault_root_path()
+    if _path_is_within(resolved, vault):
+        raise ValueError(
+            f"Path '{path}' resolves into the protected vault directory '{vault}'"
+        )
+    return resolved
+
+
 @app.get("/api/browse")
 async def browse_directory(path: str = ""):
-    """List directory contents for the workspace path browser."""
+    """List directory contents for the workspace path browser.
+
+    Confined to $HOME minus the vault root (~/.thoughtmachine): paths that
+    resolve outside the home directory or into the vault are rejected.
+    """
     try:
-        base_path = path or os.path.expanduser("~")
+        base_path = _confine_to_home(path)
         if not os.path.isdir(base_path):
             return {"success": False, "error": f"Not a directory: {base_path}", "entries": []}
         entries = []
@@ -2282,13 +2331,23 @@ async def api_get_tools():
 
 @app.post("/api/browse/create")
 async def create_directory(body: dict):
-    """Create a new directory for the workspace path browser."""
+    """Create a new directory for the workspace path browser.
+
+    The parent path is confined to $HOME minus the vault root
+    (~/.thoughtmachine), and the resulting path is checked to stay within the
+    parent (blocking ``../`` traversal and absolute-name escapes).
+    """
     try:
         parent_path = body.get("parent_path", "")
         dir_name = body.get("name", "")
         if not dir_name:
             return {"success": False, "error": "Directory name is required"}
-        new_path = os.path.join(parent_path, dir_name)
+        parent = _confine_to_home(parent_path)
+        if not os.path.isdir(parent):
+            return {"success": False, "error": f"Not a directory: {parent}"}
+        new_path = os.path.normpath(os.path.join(parent, dir_name))
+        if not _path_is_within(new_path, parent):
+            return {"success": False, "error": f"Invalid directory name: {dir_name}"}
         if os.path.exists(new_path):
             return {"success": False, "error": f"Already exists: {dir_name}"}
         os.makedirs(new_path, exist_ok=True)
@@ -2385,15 +2444,71 @@ def container_status(workspace: str = ""):
 # `workspace_path` query param wins; otherwise the workspace registry is used.
 # All endpoints mirror the JSON-error style of the existing /api/container/*.
 
+class WorkspacePathError(ValueError):
+    """Raised when an explicit ``workspace_path`` fails host-side validation."""
+
+
+class WorkspacePathForbiddenError(WorkspacePathError):
+    """Raised when an explicit ``workspace_path`` is valid but lies outside the
+    registered workspace root for the requested workspace id (HTTP 403)."""
+
+
+def _validate_workspace_path(workspace_path: str, workspace_id: str) -> str:
+    """Validate an explicit container ``workspace_path`` query parameter.
+
+    The path must resolve (after ~ expansion and symlink resolution) to an
+    existing directory under $HOME and outside the vault root
+    (~/.thoughtmachine), AND it must lie within the registered workspace root
+    for *workspace_id*. This keeps the container lifecycle endpoints from
+    mounting arbitrary host paths (e.g. /, /etc, another user's home, the
+    vault, or a non-registered home directory) into a container.
+
+    Returns the resolved absolute path. Raises WorkspacePathError (HTTP 400)
+    for invalid input or an unregistered workspace, and
+    WorkspacePathForbiddenError (HTTP 403) when the path escapes the
+    registered workspace root.
+    """
+    if not workspace_path:
+        raise WorkspacePathError("workspace_path is required")
+    try:
+        resolved = _confine_to_home(workspace_path)
+    except ValueError as exc:
+        raise WorkspacePathError(str(exc)) from exc
+    if not os.path.isdir(resolved):
+        raise WorkspacePathError(
+            f"workspace_path '{workspace_path}' resolves to '{resolved}', "
+            f"which is not an existing directory"
+        )
+    # The explicit path must stay within the registered workspace root so a
+    # container cannot bind-mount arbitrary (even in-home) directories.
+    try:
+        entry = WorkspaceRegistry.get_default().get_workspace(workspace_id)
+    except Exception as exc:
+        raise WorkspacePathError(
+            f"workspace '{workspace_id}' is not registered"
+        ) from exc
+    if entry is None:
+        raise WorkspacePathError(f"workspace '{workspace_id}' is not registered")
+    root = os.path.realpath(entry.root_path)
+    if not _path_is_within(resolved, root):
+        raise WorkspacePathForbiddenError(
+            f"workspace_path '{workspace_path}' resolves to '{resolved}', "
+            f"which is outside the registered workspace root '{root}' "
+            f"for workspace '{workspace_id}'"
+        )
+    return resolved
+
+
 def _resolve_workspace_path(workspace_id: str, workspace_path: str = ""):
     """Resolve the workspace root path for a container manager.
 
-    The explicit ``workspace_path`` query param wins; otherwise fall back to
-    the workspace registry. Returns None when the workspace is unknown or the
-    path cannot be resolved.
+    The explicit ``workspace_path`` query param wins and is validated against
+    $HOME minus the vault root (raises WorkspacePathError); otherwise fall
+    back to the workspace registry. Returns None when the workspace is
+    unknown or the path cannot be resolved.
     """
     if workspace_path:
-        return workspace_path
+        return _validate_workspace_path(workspace_path, workspace_id)
     try:
         entry = WorkspaceRegistry.get_default().get_workspace(workspace_id)
         return entry.root_path if entry is not None else None
@@ -2441,6 +2556,10 @@ def workspace_containers(workspace_id: str, workspace_path: str = ""):
     """List containers for the workspace."""
     try:
         manager = _make_container_manager(workspace_id, workspace_path)
+    except WorkspacePathForbiddenError as exc:
+        return _json_error(str(exc), status_code=403)
+    except WorkspacePathError as exc:
+        return _json_error(str(exc), status_code=400)
     except Exception as exc:
         log("ERROR", "server.workspace_containers",
             f"ContainerManager construction failed: {exc}")
@@ -2462,6 +2581,10 @@ def workspace_container_status(workspace_id: str, container_name: str,
     """Report status for a single named container in the workspace."""
     try:
         manager = _make_container_manager(workspace_id, workspace_path)
+    except WorkspacePathForbiddenError as exc:
+        return _json_error(str(exc), status_code=403)
+    except WorkspacePathError as exc:
+        return _json_error(str(exc), status_code=400)
     except Exception as exc:
         log("ERROR", "server.workspace_container_status",
             f"ContainerManager construction failed: {exc}")
@@ -2494,6 +2617,10 @@ def workspace_container_start(workspace_id: str, container_name: str,
     """Start (or reuse) the named container in the workspace."""
     try:
         manager = _make_container_manager(workspace_id, workspace_path)
+    except WorkspacePathForbiddenError as exc:
+        return _json_error(str(exc), status_code=403)
+    except WorkspacePathError as exc:
+        return _json_error(str(exc), status_code=400)
     except Exception as exc:
         log("ERROR", "server.workspace_container_start",
             f"ContainerManager construction failed: {exc}")
@@ -2520,6 +2647,10 @@ def workspace_container_stop(workspace_id: str, container_name: str,
     """Stop the named container in the workspace."""
     try:
         manager = _make_container_manager(workspace_id, workspace_path)
+    except WorkspacePathForbiddenError as exc:
+        return _json_error(str(exc), status_code=403)
+    except WorkspacePathError as exc:
+        return _json_error(str(exc), status_code=400)
     except Exception as exc:
         log("ERROR", "server.workspace_container_stop",
             f"ContainerManager construction failed: {exc}")
@@ -2558,6 +2689,10 @@ def workspace_container_delete(workspace_id: str, container_name: str,
     """Remove the named container in the workspace."""
     try:
         manager = _make_container_manager(workspace_id, workspace_path)
+    except WorkspacePathForbiddenError as exc:
+        return _json_error(str(exc), status_code=403)
+    except WorkspacePathError as exc:
+        return _json_error(str(exc), status_code=400)
     except Exception as exc:
         log("ERROR", "server.workspace_container_delete",
             f"ContainerManager construction failed: {exc}")
@@ -2720,19 +2855,12 @@ def _setup_frontend_serving() -> bool:
     return False
 
 
-def main():
-    """Run the server via `python -m web_ui.backend.server`.
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser (extracted for testability).
 
-    Usage:
-        python -m web_ui.backend.server
-        python -m web_ui.backend.server --serve-frontend
-        python -m web_ui.backend.server --serve-frontend --host 127.0.0.1 --port 8080
-
-    The frontend can pass ?project=<path> as a URL query param to select
-    which workspace/project to use (each tab's WebSocket sends it).
+    The default bind host is 127.0.0.1 (loopback only); override with the
+    HOST environment variable or ``--host``.
     """
-    import uvicorn
-
     parser = argparse.ArgumentParser(description="ThoughtMachine Web UI Server")
     parser.add_argument(
         "--serve-frontend",
@@ -2741,8 +2869,8 @@ def main():
     )
     parser.add_argument(
         "--host",
-        default=os.environ.get("HOST", "0.0.0.0"),
-        help="Host to bind to (default: 0.0.0.0)",
+        default=os.environ.get("HOST", "127.0.0.1"),
+        help="Host to bind to (default: 127.0.0.1; override with HOST env var)",
     )
     parser.add_argument(
         "--port",
@@ -2756,8 +2884,23 @@ def main():
         default=os.environ.get("RELOAD", "false").lower() == "true",
         help="Enable auto-reload (default: from RELOAD env var)",
     )
+    return parser
 
-    args = parser.parse_args()
+
+def main():
+    """Run the server via `python -m web_ui.backend.server`.
+
+    Usage:
+        python -m web_ui.backend.server
+        python -m web_ui.backend.server --serve-frontend
+        python -m web_ui.backend.server --serve-frontend --host 127.0.0.1 --port 8080
+
+    The frontend can pass ?project=<path> as a URL query param to select
+    which workspace/project to use (each tab's WebSocket sends it).
+    """
+    import uvicorn
+
+    args = build_parser().parse_args()
 
     # Rebuild global session registry from disk
     registry = SessionRegistry.get_default()
