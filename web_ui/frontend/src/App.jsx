@@ -3,18 +3,14 @@
  *
  * Root component — hub WebSocket for sessions list + tab management.
  *
- * Architecture (multi-tab):
+ * Architecture (workspace panel shell, Phase 4):
  *   ┌──────────────────────────────────────────────────┐
- *   │                   TabBar                          │
+ *   │  [WorkspacePanel | WorkspaceSelector]   route    │
+ *   │  ┌─ SessionTab ─┐ (all tabs stay mounted; the    │
+ *   │  │ (own WS)     │  route-active one is visible)  │
+ *   │  └──────────────┘                                │
  *   ├──────────────────────────────────────────────────┤
- *   │  ┌─ Tab 1 ──┐  ┌─ Tab 2 ──┐  ┌─ Tab 3 ──┐      │
- *   │  │ SessionTab │  │ SessionTab │  │ SessionTab │  │
- *   │  │ (own WS)  │  │ (own WS)  │  │ (own WS)  │  │
- *   │  └───────────┘  └───────────┘  └───────────┘      │
- *   ├──────────────────────────────────────────────────┤
- *   │              SessionList (sidebar)                │
- *   ├──────────────────────────────────────────────────┤
- *   │           WorkerOutputPanel (sidebar)             │
+ *   │           WorkerOutputPanel (sidebar)            │
  *   └──────────────────────────────────────────────────┘
  *
  * App maintains one "hub" WebSocket that only handles:
@@ -25,20 +21,22 @@
  *
  * Each SessionTab creates its OWN WebSocket for session interaction.
  * App manages a tabs array: [ { tabId, sessionId }, ... ]
+ *
+ * Routing (see src/router.js):
+ *   #/workspaces          → WorkspaceSelector
+ *   #/workspace/:id       → WorkspacePanel
+ *   #/session/:sessionId  → the matching SessionTab (created on demand)
  */
 
 import React, { useEffect, useRef, useCallback, useState, useMemo } from 'react'
 import useStore from './store/useStore'
 import SessionTab from './components/SessionTab'
-import SessionList from './components/SessionList'
-import TabBar from './components/TabBar'
 import WorkerOutputPanel from './components/WorkerOutputPanel'
 import { isWorkerEventRenderable } from './components/chat/adaptWorkerEvent'
 import LoggingPanel from './components/LoggingPanel'
-import SessionCreationModal from './components/SessionCreationModal'
 import WorkspaceSelector from './components/WorkspaceSelector'
 import WorkspacePanel from './components/workspace/WorkspacePanel'
-import { useRoute } from './router'
+import { useRoute, useNavigate } from './router'
 import './styles.css'
 
 const WS_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
@@ -49,12 +47,10 @@ let nextTabId = 1
 export default function App() {
   const [tabs, setTabs] = useState([])           // { tabId, sessionId }
   const [activeTabId, setActiveTabId] = useState(null)
-  const [showSessions, setShowSessions] = useState(false)
   const wsRef = useRef(null)
   const [hubWs, setHubWs] = useState(null)
   const hubHasConnectedOnceRef = useRef(false)   // persist past StrictMode double-mount
   const loadedSessionIdsRef = useRef(new Set())   // robust dedup: track sessions already converted to tabs
-  const firstLaunchHandledRef = useRef(false)
   const [hubReady, setHubReady] = useState(false)
   // ── Worker panel state per session ─────────────────────────────────
   // Map: sessionId -> { name, workspaceId } | null
@@ -68,9 +64,9 @@ export default function App() {
     }
   })
 
-  const [showCreationModal, setShowCreationModal] = useState(false)
   // --- Route (dependency-free hash router — see src/router.js) ---
   const route = useRoute()
+  const navigate = useNavigate()
   const [showLoggingPanel, setShowLoggingPanel] = useState(false)
   const [loggingConfig, setLoggingConfig] = useState(null)
   const [loggingConfigError, setLoggingConfigError] = useState(null)
@@ -229,11 +225,6 @@ export default function App() {
     switch (msg.type) {
       case 'sessions_list':
         store.setSessions(msg.sessions ?? [])
-        // First-launch: auto-show creation modal if no sessions exist
-        if (!firstLaunchHandledRef.current && (!msg.sessions || msg.sessions.length === 0)) {
-          firstLaunchHandledRef.current = true
-          setShowCreationModal(true)
-        }
         break
       case 'session_saved':
         // session_saved is never sent to the hub WS (only to tab WSes).
@@ -247,6 +238,11 @@ export default function App() {
           useStore.getState().removeSession(deletedId)
           const affectedTabs = tabsRef.current.filter((t) => t.sessionId === deletedId)
           affectedTabs.forEach((t) => removeTab(t.tabId))
+          // If the user is viewing the deleted session, leave it — the route
+          // no longer has a matching tab, so drop back to the workspace list.
+          if (route?.view === 'session' && route.id === deletedId) {
+            navigate('/workspaces')
+          }
         }
         wsRef.current?.send(JSON.stringify({ command: 'list_sessions' }))
         break
@@ -265,8 +261,15 @@ export default function App() {
         // page load), so we persist the session ID instead.
         const savedSessionId = localStorage.getItem('activeSessionId')
         if (msg.sessions && msg.sessions.length > 0) {
+          // Activate the persisted session when it is still open; otherwise
+          // fall back to the first open session (loadTab navigates for the
+          // preferred one).
+          const openIds = new Set(msg.sessions.map((s) => s.session_id))
+          const preferred = (savedSessionId && openIds.has(savedSessionId))
+            ? savedSessionId
+            : msg.sessions[0].session_id
           msg.sessions.forEach(s => {
-            loadTab(s.session_id, savedSessionId)
+            loadTab(s.session_id, preferred)
           })
         }
         // hubReady is set to true in onmessage after handleHubEvent returns
@@ -308,13 +311,7 @@ export default function App() {
   }, [hubSend])
 
   // ── Tab management ──────────────────────────────────────────────────────
-  const addTab = useCallback((sessionId = null) => {
-    const tabId = `tab-${nextTabId++}`
-    setTabs((prev) => [...prev, { tabId, sessionId }])
-    setActiveTabId(tabId)
-  }, [])
-
-  // Open a tab for an existing session (auto-load from hub WS or sidebar)
+  // Open a tab for an existing session (auto-load from hub WS or route).
   // preferredSessionId — if set, only make this tab active if its sessionId matches.
   const loadTab = useCallback((sessionId, preferredSessionId) => {
     console.log(`[DEBUG App.loadTab] sessionId=${sessionId}, preferredSessionId=${preferredSessionId}`)
@@ -331,6 +328,7 @@ export default function App() {
       if (existing && (!preferredSessionId || existing.sessionId === preferredSessionId)) {
         setActiveTabId(existing.tabId)
         tabLoadTriggeredRef.current[existing.tabId] = true
+        navigate(`/session/${encodeURIComponent(sessionId)}`)
       }
       return
     }
@@ -358,24 +356,12 @@ export default function App() {
       // once the SessionTab WS connects. Without this, new tabs created
       // via "+" would get stuck in deferred mode (empty placeholder).
       tabLoadTriggeredRef.current[tabId] = true
+      navigate(`/session/${encodeURIComponent(sessionId)}`)
       console.log(`[DEBUG App.loadTab] Set active + triggered for new tab ${tabId}`)
     } else {
       console.log(`[DEBUG App.loadTab] NOT preferred — skipping setActive/trigger for new tab ${tabId}`)
     }
-  }, [])
-
-  // Initiate close: send close_session over the tab's own WS.
-  // Do NOT remove from DOM yet — wait for server acknowledgement.
-  const initiateCloseTab = useCallback((tabId) => {
-    const tab = tabsRef.current.find(t => t.tabId === tabId)
-    const actions = tabActionsRef.current[tabId]
-    if (actions?.sendCommand) {
-      actions.sendCommand('close_session', { session_id: tab?.sessionId })
-    } else {
-      // No WS connected — remove immediately
-      removeTab(tabId)
-    }
-  }, [])
+  }, [navigate])
 
   // Actually remove the tab from DOM (called when server acknowledges close
   // via session_closed event, or on unexpected WS close).
@@ -401,50 +387,6 @@ export default function App() {
     })
     delete tabActionsRef.current[tabId]
   }, [activeTabId, hubSend])
-
-  const handleNewTab = useCallback(() => {
-    setShowCreationModal(true)
-  }, [])
-
-  const handleCreateSession = useCallback(async (mode, workspaceId, workspacePath) => {
-    try {
-      const payload = { mode }
-      if (workspaceId) payload.workspace_id = workspaceId
-      if (workspacePath) payload.workspace_path = workspacePath
-
-      const response = await fetch('/api/session/create', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.detail || 'Failed to create session')
-
-      localStorage.setItem('lastSessionMode', mode)
-
-      useStore.getState().setSessionMode(data.session_id, mode)
-      setShowCreationModal(false)
-      loadTab(data.session_id)
-
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ command: 'list_sessions' }))
-      }
-    } catch (err) {
-      console.error('Failed to create session:', err)
-      alert('Failed to create session: ' + err.message)
-    }
-  }, [loadTab])
-
-  // Open an existing session in a tab (called from SessionList sidebar)
-  const handleOpenTab = useCallback((sessionId) => {
-    loadTab(sessionId)
-  }, [loadTab])
-
-  // Open session from creation modal (step 2 session list)
-  const handleOpenSession = useCallback((sessionId) => {
-    setShowCreationModal(false)
-    loadTab(sessionId)
-  }, [loadTab])
 
   const handleSelectWorker = useCallback((workerName, workspaceId) => {
     if (!activeSessionId) {
@@ -547,7 +489,10 @@ export default function App() {
     }
     // Refresh the sidebar so the new session appears in the list.
     hubSend('list_sessions')
-  }, [hubSend])
+    // Follow the new session in the router — the session route shows the
+    // freshly rebound tab (route effect activates it by tab.sessionId).
+    navigate(`/session/${encodeURIComponent(sessionId)}`)
+  }, [hubSend, navigate])
 
   // ── Handle tab session adoption (intentional replacement) ────────────────
   // Called by SessionTab when a session_loaded flagged `replacement: true`
@@ -567,7 +512,9 @@ export default function App() {
     }
     // Refresh the sidebar so the replacement session appears in the list.
     hubSend('list_sessions')
-  }, [hubSend])
+    // Follow the adopted session in the router.
+    navigate(`/session/${encodeURIComponent(newSessionId)}`)
+  }, [hubSend, navigate])
 
   const handleOpenNewTab = useCallback((sessionId, sessionName) => {
     // Called by SessionTab when a workspace switch creates a NEW session
@@ -588,21 +535,7 @@ export default function App() {
     }
   }, [loadTab])
 
-  // ── Tab selection handler with deferred-load trigger ─────────────────
-  const handleSelectTab = useCallback((tabId) => {
-    console.log(`[DEBUG App.handleSelectTab] tabId=${tabId}, tabs=`, tabsRef.current.map(t => t.tabId),
-      'loadTriggered=', tabLoadTriggeredRef.current[tabId],
-      'sessionId=', tabsRef.current.find(t => t.tabId === tabId)?.sessionId,
-      'actionsExist=', !!tabActionsRef.current[tabId])
-    setActiveTabId(tabId)
-    // If this tab was deferred (didn't load on WS connect), trigger its load now
-    // Fix 4b: load_session is owned by the tab's onopen (single deduped path);
-    // the tab reloads itself on every connect, so no deferred trigger here.
-    // Keep the trigger flag so the "already triggered" diagnostics stay valid.
-    tabLoadTriggeredRef.current[tabId] = true
-  }, [])
-
-  // ── Tab action registry (for save from SessionList) ───────────────────
+  // ── Tab action registry (for save from SessionTab) ─────────────────────
   const handleRegisterTab = useCallback((tabId, actions) => {
     console.log(`[DEBUG App.handleRegisterTab] tabId=${tabId}, triggered=${!!tabLoadTriggeredRef.current[tabId]}, sent=${!!deferredLoadSentRef.current[tabId]}, sessionId=`, tabsRef.current.find(t => t.tabId === tabId)?.sessionId)
     tabActionsRef.current[tabId] = actions
@@ -611,67 +544,6 @@ export default function App() {
     // their WS registered — racing the tab's onopen send and producing
     // duplicate load_session commands. The tab owns the single load path.
   }, [])
-
-  // ── Reliable rename via per-tab WS (Task 2) ──────────────────────────
-  const handleRename = useCallback((sessionId, newName) => {
-    // Find a tab that owns this session
-    const tabEntry = tabs.find((t) => t.sessionId === sessionId)
-    if (tabEntry) {
-      const actions = tabActionsRef.current[tabEntry.tabId]
-      if (actions?.sendCommand) {
-        actions.sendCommand('rename_session', { session_id: sessionId, new_name: newName })
-        return
-      }
-    }
-    // Fallback: use hub WS if no tab is open for this session
-    hubSend('rename_session', { session_id: sessionId, new_name: newName })
-  }, [tabs, hubSend])
-
-  // ── Reliable delete via per-tab WS (Task 3) ──────────────────────────
-  const handleDelete = useCallback((sessionId) => {
-    // Find a tab that owns this session
-    const tabEntry = tabs.find((t) => t.sessionId === sessionId)
-    if (tabEntry) {
-      const actions = tabActionsRef.current[tabEntry.tabId]
-      if (actions?.sendCommand) {
-        // Close the tab first, then delete
-        initiateCloseTab(tabEntry.tabId)
-        actions.sendCommand('delete_session', { session_id: sessionId })
-        // Refresh sessions list immediately so the sidebar updates
-        hubSend('list_sessions')
-        return
-      }
-    }
-    // Fallback: use hub WS if no tab is open for this session
-    hubSend('delete_session', { session_id: sessionId })
-    hubSend('list_sessions')
-  }, [tabs, hubSend, initiateCloseTab])
-
-  // ── Derive tab names from sessions list ─────────────────────────────────
-  const sessions = useStore((s) => s.sessions)
-  const tabRunningStates = useStore((s) => s.tabRunningStates)
-  const sessionMap = {}
-  for (const s of sessions) {
-    sessionMap[s.session_id] = s.name || 'Untitled'
-  }
-
-  const tabItems = tabs.map((t) => ({
-    id: t.tabId,
-    name: t.sessionId ? (sessionMap[t.sessionId] || t.sessionId.slice(0, 8)) : 'New Session',
-  }))
-
-  // TabBar indexes running states by tab.id (= tabId); the store is keyed by
-  // sessionId, so derive a tabId-keyed map for TabBar (TabBar is not modified
-  // in this phase).
-  const runningStatesByTabId = useMemo(() => {
-    const map = {}
-    for (const t of tabs) {
-      if (t.sessionId) map[t.tabId] = tabRunningStates[t.sessionId]
-    }
-    return map
-  }, [tabs, tabRunningStates])
-
-  const activeSessionName = activeSessionId ? (sessionMap[activeSessionId] || 'Untitled') : 'New Session'
 
   // ── Persist worker panel state to localStorage ──────────────────────────
   useEffect(() => {
@@ -701,6 +573,23 @@ export default function App() {
       }))
     }
   }, [activeSessionId])
+
+  // ── Route-driven session loading ────────────────────────────────────────
+  // The session route (#/session/<id>) is the single entry point for opening
+  // a session: if a tab for that session already exists, activate it;
+  // otherwise create one (loadTab navigates + activates for the new tab).
+  useEffect(() => {
+    if (route?.view !== 'session' || !route.id) return
+    const existing = tabsRef.current.find((t) => t.sessionId === route.id)
+    if (existing) {
+      setActiveTabId(existing.tabId)
+      tabLoadTriggeredRef.current[existing.tabId] = true
+      return
+    }
+    if (!loadedSessionIdsRef.current.has(route.id)) {
+      loadTab(route.id)
+    }
+  }, [route, loadTab])
 
   // ── Fetch logging config (callable for retry) ────────────────────────────────────
   const fetchLoggingConfig = useCallback(() => {
@@ -736,29 +625,18 @@ export default function App() {
   // ── Render ──────────────────────────────────────────────────────────────
   return (
     <div className="app-container">
-      <TabBar
-        tabs={tabItems}
-        activeTabId={activeTabId}
-        onSelectTab={handleSelectTab}
-        onCloseTab={initiateCloseTab}
-        onNewTab={handleNewTab}
-        runningStates={runningStatesByTabId}
-        onLoggingClick={() => setShowLoggingPanel(prev => !prev)}
-      />
-
       <div className="app-main">
-        {/* All tabs stay mounted; inactive ones hidden with display:none */}
+        {/* All tabs stay mounted (hidden via display:none) so each keeps its
+            per-session WebSocket alive across route changes. The visible tab
+            is the one matching the session route. */}
         <div className="app-center tab-content-area">
-          {route?.view === 'workspace' ? (
-            <WorkspacePanel />
-          ) : tabs.length === 0 ? (
-            <WorkspaceSelector />
-          ) : (
-            tabs.map((tab, index) => (
+          {tabs.map((tab, index) => {
+            const visible = route?.view === 'session' && route.id === tab.sessionId
+            return (
               <div
                 key={tab.tabId}
                 className="tab-wrapper"
-                style={{ display: tab.tabId === activeTabId ? '' : 'none' }}
+                style={{ display: visible ? '' : 'none' }}
               >
                 <SessionTab
                   sessionId={tab.sessionId}
@@ -766,7 +644,7 @@ export default function App() {
                   hubReady={hubReady}
                   isActive={tab.tabId === activeTabId}
                   staggerMs={(index + 1) * 200}   // +1 so first tab doesn't connect at 0ms (page still loading)
-                  loadOnConnect={tab.sessionId === startupActiveSessionId || tab.tabId === activeTabId}
+                  loadOnConnect={tab.sessionId === startupActiveSessionId || tab.sessionId === route?.id}
                   onClose={() => removeTab(tab.tabId)}
                   onNewSession={(sid, name) => handleNewSessionCreated(tab.tabId, sid, name)}
                   onSessionAdopted={(newId) => handleSessionAdopted(tab.tabId, newId)}
@@ -782,7 +660,14 @@ export default function App() {
                   onLoggingConfigChanged={(config) => setLoggingConfig(config)}
                 />
               </div>
-            ))
+            )
+          })}
+
+          {/* Route views — rendered above the (hidden) tabs */}
+          {route?.view === 'workspace' && <WorkspacePanel />}
+          {route?.view === 'selector' && <WorkspaceSelector />}
+          {route?.view === 'session' && !tabs.some((t) => t.sessionId === route.id) && (
+            <div className="session-loading-placeholder">Loading session…</div>
           )}
         </div>
 
@@ -809,17 +694,6 @@ export default function App() {
           />
         )}
 
-        {/* Sessions sidebar — always visible when no tabs are open, toggle via ⚙️ cogwheel */}
-        <div className={`session-sidebar ${(showSessions || tabs.length === 0) ? 'open' : ''}`}>
-          <SessionList
-            sessions={sessions}
-            onNew={handleNewTab}
-            onOpenTab={handleOpenTab}
-            onDelete={handleDelete}
-            onRename={handleRename}
-          />
-        </div>
-
         {/* Worker Output Panel — right sidebar for worker event logs */}
         <div className="worker-output-panel">
           {selectedWorker && (
@@ -834,14 +708,6 @@ export default function App() {
         </div>
 
       </div>
-
-      <SessionCreationModal
-        show={showCreationModal}
-        onCreate={handleCreateSession}
-        onOpen={handleOpenSession}
-        onCancel={() => setShowCreationModal(false)}
-        isFirstLaunch={tabs.length === 0 && sessions.length === 0 && !localStorage.getItem('lastSessionMode')}
-      />
     </div>
   )
 }

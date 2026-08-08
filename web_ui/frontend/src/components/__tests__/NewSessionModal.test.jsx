@@ -194,7 +194,7 @@ describe('NewSessionModal — sessions list', () => {
     await waitFor(() => expect(screen.getByText('Auth refactor')).toBeInTheDocument())
     fireEvent.click(screen.getByRole('button', { name: 'Open' }))
     expect(localStorage.getItem('activeSessionId')).toBe('s-1')
-    expect(window.location.hash).toBe('#/')
+    expect(window.location.hash).toBe('#/session/s-1')
   })
 })
 
@@ -334,6 +334,6 @@ describe('NewSessionModal — creation', () => {
     await waitFor(() => expect(screen.getByText('Session created.')).toBeInTheDocument())
     fireEvent.click(screen.getByRole('button', { name: 'Open Session' }))
     expect(localStorage.getItem('activeSessionId')).toBe('s-new')
-    expect(window.location.hash).toBe('#/')
+    expect(window.location.hash).toBe('#/session/s-new')
   })
 })

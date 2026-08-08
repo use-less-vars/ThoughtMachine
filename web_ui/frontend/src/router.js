@@ -16,6 +16,10 @@ export function parseHash(hash) {
   if (match) {
     return { view: 'workspace', id: decodeURIComponent(match[1]) }
   }
+  const sessionMatch = path.match(/^\/session\/([^/]+)$/)
+  if (sessionMatch) {
+    return { view: 'session', id: decodeURIComponent(sessionMatch[1]) }
+  }
   return null
 }
 

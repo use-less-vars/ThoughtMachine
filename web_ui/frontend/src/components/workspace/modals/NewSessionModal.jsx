@@ -2,8 +2,8 @@
 // Phase 3: real session management for the Workspace Panel. Lists the
 // workspace's existing sessions (GET /api/session/list), creates new ones
 // (POST /api/session/create), and deletes them (DELETE /api/session/{id}).
-// "Open" hands off to the main app by navigating to '#/' — App.jsx restores
-// tabs from localStorage 'activeSessionId' on the hub session list.
+// "Open" hands off to the main app by navigating to '#/session/<id>' —
+// App.jsx's session route loads the session tab directly.
 
 import React, { useEffect, useState } from 'react'
 import useWorkspaceStore from '../../../store/workspaceStore'
@@ -74,11 +74,10 @@ export default function NewSessionModal({ workspace, onClose }) {
     }
   }
 
-  // App.jsx restores tabs from localStorage 'activeSessionId' on the hub
-  // session list, so navigating home is enough to open the session.
+  // Navigate straight to the session route; App.jsx opens a tab for it.
   const openSession = (sessionId) => {
     localStorage.setItem('activeSessionId', sessionId)
-    window.location.hash = '#/'
+    window.location.hash = '#/session/' + encodeURIComponent(sessionId)
   }
 
   const formatTime = (iso) => {

@@ -284,6 +284,31 @@ const useWorkspaceStore = create((set, get) => ({
     return workspace.id
   },
 
+  // POST /api/workspace/resolve {path} → registers an existing folder as a
+  // backend workspace. Returns { workspace_id, root }; prepends it to the list
+  // (unless it is already present) so the sidebar shows it immediately.
+  resolveWorkspacePath: async (path) => {
+    const res = await fetch(`${API_BASE}/api/workspace/resolve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.error || data.detail || 'Failed to resolve workspace')
+    set((state) => {
+      const exists = state.workspaceList.some((w) => w.id === data.workspace_id)
+      if (exists) return {}
+      const name = String(path).split('/').filter(Boolean).pop() || path
+      return {
+        workspaceList: [
+          { id: data.workspace_id, name, path: data.root || path, root: data.root || path },
+          ...state.workspaceList,
+        ],
+      }
+    })
+    return data
+  },
+
   // Loads everything the panel needs for one workspace in parallel: list
   // entry, effective permissions, Docker health, workers, containers and the
   // workspace's sessions. Local-only parts come from the overlay (or the
