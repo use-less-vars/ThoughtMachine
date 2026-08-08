@@ -64,6 +64,6 @@ attempt — **rotate it immediately**:
 
 ## Red-team audit findings
 
-- Finding 1 (Never commit secrets): git history search clean — `git log --all -S 'sk-'` and `git log -p` show no key material in any past commit.
-- Finding 2 (Never persist keys to disk): `api_key` absent from serialized config, session state, `/health` payloads, and logs; keys sourced from env or `~/.thoughtmachine` vault only; `.env` git-ignored.
-- Finding 3 (Rotate on exposure): rotation procedure documented and verified — revoke -> generate + update stores (env, `.env`, CI/CD, `~/.thoughtmachine`) -> search history -> verify old key dead and new key works.
+Never commit secrets
+Never persist keys to disk
+Rotate on exposure
