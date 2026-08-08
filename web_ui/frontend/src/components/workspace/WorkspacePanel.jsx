@@ -1,15 +1,16 @@
 // --- WorkspacePanel.jsx ---
-// Phase 2: the /workspace/:id page — a single-page "office blueprint" with
+// Phase 3: the /workspace/:id page — a single-page "office blueprint" with
 // tabbed sections (Resources, Permissions, Tools, Credentials, Containers,
 // Workers, Session Defaults) plus a persistent safety advisory sidebar.
-// All API calls go through the existing MOCK actions in workspaceStore.js
-// (fetchWorkspaceConfig / updateWorkspaceConfig); real backend wiring lands
-// in a later phase. Routing uses the dependency-free hash router (src/router.js).
+// All API calls go through the REAL actions in workspaceStore.js
+// (fetchWorkspaceConfig / updateWorkspaceConfig / fetchContainers /
+// containerAction). Routing uses the dependency-free hash router (src/router.js).
 
 import React, { useEffect, useState, useMemo } from 'react'
 import { useRoute } from '../../router'
 import useWorkspaceStore from '../../store/workspaceStore'
 import purposeDefinitions from '../../data/purposeDefinitions.json'
+import NewSessionModal from './NewSessionModal'
 import './WorkspacePanel.css'
 
 const TABS = ['Resources', 'Permissions', 'Tools', 'Credentials', 'Containers', 'Workers', 'Session Defaults']
@@ -23,8 +24,7 @@ const PERM_RANK = { banned: 0, read: 1, write: 2, ask: 3, full: 4 }
 const PROVIDERS = ['Local LLM', 'OpenAI', 'Anthropic', 'DeepSeek']
 const PRESET_OPTIONS = ['Agent (full)', 'Engineer (read-only)', 'Custom']
 
-const CONTAINER_LIMIT = 4          // hardcoded workspace container limit
-const DOCKER_AVAILABLE = true      // hardcoded until real docker detection (Phase 4)
+const CONTAINER_LIMIT = 4          // workspace container limit (matches the backend)
 const PROMPT_PREVIEW_LENGTH = 120  // worker systemPrompt truncation
 
 // --- Permissions reconciliation ---
@@ -69,7 +69,7 @@ function countOf(value) {
 }
 
 // --- Safety advisory (computed from the workspace, not the store's copy) ---
-function computeAdvisory(workspace) {
+function computeAdvisory(workspace, dockerAvailable) {
   const risk = workspace.risk
   const resources = workspace.resources || []
   // Phase 1 resources carry `containerized` (boolean). A resource with
@@ -99,7 +99,7 @@ function computeAdvisory(workspace) {
     for (const r of hostOnlyEnabled) {
       suggestions.push({ action: 'disable-resource', label: `Disable ${r.name}`, resource: r.name })
     }
-    if (DOCKER_AVAILABLE) {
+    if (dockerAvailable !== false) {
       if (status === 'green') {
         status = 'amber'
         message = 'Host-only resources enabled — containerize or disable them.'
@@ -127,10 +127,11 @@ function computeAdvisory(workspace) {
 }
 
 // --- Small shared placeholder modal ---
-function PlaceholderModal({ message, onClose }) {
+function PlaceholderModal({ title, message, onClose }) {
   return (
     <div className="wp-modal-overlay" onClick={onClose}>
-      <div className="wp-modal" role="dialog" aria-label={message} onClick={(e) => e.stopPropagation()}>
+      <div className="wp-modal" role="dialog" aria-label={title || message} onClick={(e) => e.stopPropagation()}>
+        {title && <h3 className="wp-modal-title">{title}</h3>}
         <p>{message}</p>
         <button className="wp-btn" onClick={onClose}>Close</button>
       </div>
@@ -147,12 +148,141 @@ function Toggle({ checked, onChange, label }) {
   )
 }
 
+// # --- Resource catalog modal ---
+// Add Resource: checklist of available resources. The server catalog
+// (GET /api/resource-catalog) does not exist in the backend yet (see
+// apiContracts.js pending section) — store.fetchResourceCatalog falls back to
+// a bundled placeholder list so the modal always has items to offer.
+function ResourceCatalogModal({ onAdd, onClose }) {
+  const fetchResourceCatalog = useWorkspaceStore((s) => s.fetchResourceCatalog)
+  const [catalog, setCatalog] = useState([])
+  const [checked, setChecked] = useState({})
+
+  useEffect(() => {
+    let alive = true
+    fetchResourceCatalog().then((items) => {
+      if (!alive) return
+      const list = Array.isArray(items) ? items : []
+      setCatalog(list)
+      setChecked(Object.fromEntries(list.map((it) => [it.name, true])))
+    })
+    return () => { alive = false }
+  }, [fetchResourceCatalog])
+
+  const toggleCheck = (name) => setChecked((prev) => ({ ...prev, [name]: !prev[name] }))
+
+  const handleAdd = () => {
+    const selected = catalog
+      .filter((it) => checked[it.name])
+      .map((it) => ({
+        name: it.name,
+        description: it.description || it.name,
+        icon: '•',
+        containerized: true,
+        risk: 'Low',
+        enabled: true,
+      }))
+    if (selected.length > 0) onAdd(selected)
+    onClose()
+  }
+
+  return (
+    <div className="wp-modal-overlay" onClick={onClose}>
+      <div className="wp-modal" role="dialog" aria-label="Add resource" onClick={(e) => e.stopPropagation()}>
+        <h3 className="wp-modal-title">Add resource</h3>
+        <div className="wp-modal-body">
+          <div className="wp-checkbox-list">
+            {catalog.map((it) => (
+              <div key={it.name}>
+                <label className="wp-checkbox">
+                  <input
+                    type="checkbox"
+                    checked={!!checked[it.name]}
+                    onChange={() => toggleCheck(it.name)}
+                  />
+                  <span>{it.name}</span>
+                </label>
+                <p className="wp-resource-desc">{it.description}</p>
+              </div>
+            ))}
+          </div>
+          <p className="wp-modal-hint">Server catalog coming soon — showing bundled placeholder list.</p>
+        </div>
+        <div className="wp-modal-footer">
+          <button className="wp-btn" onClick={onClose}>Cancel</button>
+          <button className="wp-btn wp-btn-primary" onClick={handleAdd}>Add selected</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// # --- Vault credential modal ---
+const VAULT_PLACEHOLDERS = [
+  { name: 'openai_api_key', hint: 'stored in vault' },
+  { name: 'github_token', hint: 'stored in vault' },
+  { name: 'docker_registry_auth', hint: 'stored in vault' },
+  { name: 'ssh_deploy_key', hint: 'stored in vault' },
+  { name: 'huggingface_token', hint: 'stored in vault' },
+]
+
+function CredentialModal({ onAdd, onClose }) {
+  const [checked, setChecked] = useState({})
+
+  const toggleCheck = (name) => setChecked((prev) => ({ ...prev, [name]: !prev[name] }))
+
+  const handleAdd = () => {
+    const selected = VAULT_PLACEHOLDERS
+      .filter((it) => checked[it.name])
+      .map((it) => ({
+        name: it.name,
+        hint: it.hint,
+        type: 'vault',
+        assigned: true,
+        placeholder: `{{credential:${it.name}}}`,
+      }))
+    if (selected.length > 0) onAdd(selected)
+    onClose()
+  }
+
+  return (
+    <div className="wp-modal-overlay" onClick={onClose}>
+      <div className="wp-modal" role="dialog" aria-label="Add credential" onClick={(e) => e.stopPropagation()}>
+        <h3 className="wp-modal-title">Add credential</h3>
+        <div className="wp-modal-body">
+          <div className="wp-checkbox-list">
+            {VAULT_PLACEHOLDERS.map((c) => (
+              <label key={c.name} className="wp-checkbox">
+                <input
+                  type="checkbox"
+                  checked={!!checked[c.name]}
+                  onChange={() => toggleCheck(c.name)}
+                />
+                <span>{c.name}</span>
+              </label>
+            ))}
+          </div>
+          <p className="wp-modal-hint">Vault integration coming soon — placeholder entries.</p>
+        </div>
+        <div className="wp-modal-footer">
+          <button className="wp-btn" onClick={onClose}>Cancel</button>
+          <button className="wp-btn wp-btn-primary" onClick={handleAdd}>Add selected</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // # --- Resources tab ---
 function ResourcesTab({ workspace, update }) {
   const [showCatalog, setShowCatalog] = useState(false)
   const resources = workspace.resources || []
   const toggleResource = (name, enabled) => {
     update('resources', resources.map((r) => (r.name === name ? { ...r, enabled } : r)))
+  }
+  const addResources = (items) => {
+    const existing = new Set(resources.map((r) => r.name))
+    update('resources', [...resources, ...items.filter((it) => !existing.has(it.name))])
   }
   return (
     <div className="wp-section">
@@ -190,7 +320,7 @@ function ResourcesTab({ workspace, update }) {
       <div className="wp-section-footer">
         <button className="wp-btn" onClick={() => setShowCatalog(true)}>Add Resource</button>
       </div>
-      {showCatalog && <PlaceholderModal message="Resource catalog coming soon" onClose={() => setShowCatalog(false)} />}
+      {showCatalog && <ResourceCatalogModal onAdd={addResources} onClose={() => setShowCatalog(false)} />}
     </div>
   )
 }
@@ -290,6 +420,10 @@ function CredentialsTab({ workspace, update }) {
   const toggleAssigned = (name, assigned) => {
     update('credentials', credentials.map((c) => (c.name === name ? { ...c, assigned } : c)))
   }
+  const addCredentials = (items) => {
+    const existing = new Set(credentials.map((c) => c.name))
+    update('credentials', [...credentials, ...items.filter((it) => !existing.has(it.name))])
+  }
   return (
     <div className="wp-section">
       <div className="wp-section-header">
@@ -310,24 +444,43 @@ function CredentialsTab({ workspace, update }) {
           ))}
         </ul>
       )}
-      {showVault && <PlaceholderModal message="Vault credential manager coming soon" onClose={() => setShowVault(false)} />}
+      {showVault && <CredentialModal onAdd={addCredentials} onClose={() => setShowVault(false)} />}
     </div>
   )
 }
 
 // # --- Containers tab ---
-function ContainersTab({ workspace }) {
+function fmtUptime(seconds) {
+  if (seconds == null || Number.isNaN(Number(seconds))) return '—'
+  const s = Math.max(0, Math.floor(Number(seconds)))
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m ${s % 60}s`
+  const h = Math.floor(m / 60)
+  return `${h}h ${m % 60}m`
+}
+
+function ContainersTab({ workspace, dockerAvailable, containerStatus, busyContainers, onRefresh, onAction, onError }) {
+  const [logsFor, setLogsFor] = useState(null)
   // Filter out the system resource container (prefix tm-resource-).
   const containers = (workspace.containers || []).filter((c) => !(c.name || '').startsWith('tm-resource-'))
   const count = containers.length
   const isRunning = (status) => /^(running|active|up|started)$/i.test(status || '')
+  const runAction = (name, action) => {
+    if (!onAction) return
+    onAction(name, action).catch((err) => onError && onError(err.message || String(err)))
+  }
   return (
     <div className="wp-section">
       <div className="wp-section-header">
         <h3>Containers</h3>
         <span className="wp-limit">{count} of {CONTAINER_LIMIT} containers used</span>
       </div>
-      {count === 0 ? (
+      {dockerAvailable === false ? (
+        <div className="wp-empty">
+          <p className="wp-error-text">Docker is unreachable from the server — container actions are disabled.</p>
+        </div>
+      ) : count === 0 ? (
         <p className="wp-empty">No containers running for this workspace.</p>
       ) : (
         <table className="wp-table">
@@ -341,37 +494,206 @@ function ContainersTab({ workspace }) {
             </tr>
           </thead>
           <tbody>
-            {containers.map((c) => (
-              <tr key={c.name}>
-                <td>{c.name}</td>
-                <td>
-                  <span className={`wp-dot ${isRunning(c.status) ? 'wp-dot-green' : 'wp-dot-red'}`} />
-                  {c.status || 'unknown'}
-                </td>
-                <td>{c.uptime || '—'}</td>
-                <td>{c.note || '—'}</td>
-                <td>
-                  <div className="wp-btn-row">
-                    <button className="wp-btn" onClick={() => console.log('[Containers] start', c.name)}>Start</button>
-                    <button className="wp-btn" onClick={() => console.log('[Containers] stop', c.name)}>Stop</button>
-                    <button className="wp-btn" onClick={() => console.log('[Containers] logs', c.name)}>Logs</button>
-                  </div>
-                </td>
-              </tr>
-            ))}
+            {containers.map((c) => {
+              const status = (containerStatus && containerStatus[c.name]) || c.status || 'unknown'
+              const running = isRunning(status)
+              const busy = !!(busyContainers && busyContainers[c.name])
+              return (
+                <tr key={c.name} className={busy ? 'wp-busy' : ''}>
+                  <td>{c.name}</td>
+                  <td>
+                    <span className={`wp-dot ${running ? 'wp-dot-green' : 'wp-dot-red'}`} />
+                    {status}
+                  </td>
+                  <td>{fmtUptime(c.uptime_seconds)}</td>
+                  <td>{c.note || '—'}</td>
+                  <td>
+                    <div className="wp-container-actions">
+                      {running ? (
+                        <button className="wp-btn" disabled={busy} onClick={() => runAction(c.name, 'stop')}>
+                          {busy ? '…' : 'Stop'}
+                        </button>
+                      ) : (
+                        <button className="wp-btn" disabled={busy} onClick={() => runAction(c.name, 'start')}>
+                          {busy ? '…' : 'Start'}
+                        </button>
+                      )}
+                      <button className="wp-btn wp-btn-danger" disabled={busy} onClick={() => runAction(c.name, 'remove')}>
+                        {busy ? '…' : 'Remove'}
+                      </button>
+                      <button className="wp-btn" onClick={() => setLogsFor(c.name)}>Logs</button>
+                    </div>
+                  </td>
+                </tr>
+              )
+            })}
           </tbody>
         </table>
+      )}
+      <div className="wp-section-footer">
+        <span className="wp-poll-hint">Auto-refreshes every 5s while this tab is open.</span>
+        <button className="wp-btn wp-refresh-btn" onClick={onRefresh} disabled={dockerAvailable === false}>Refresh</button>
+      </div>
+      {logsFor && (
+        <PlaceholderModal title="Container logs" message="Live container logs are coming soon." onClose={() => setLogsFor(null)} />
       )}
     </div>
   )
 }
 
+// # --- Worker editor modal ---
+function WorkerEditor({ worker, onSave, onClose, allTools, allPermissions }) {
+  const isNew = !worker
+  const [name, setName] = useState(isNew ? '' : (worker.name || ''))
+  const [description, setDescription] = useState(worker ? (worker.description || '') : '')
+  const [systemPrompt, setSystemPrompt] = useState(worker ? (worker.systemPrompt || '') : '')
+  // Tools: array of enabled tool name strings (store worker.tools shape).
+  const [tools, setTools] = useState(worker && Array.isArray(worker.tools) ? [...worker.tools] : [])
+  // Permissions: [name, value] footprint pairs (store worker.workerPermissions shape).
+  const [permissionEntries, setPermissionEntries] = useState(
+    worker && worker.workerPermissions ? Object.entries(worker.workerPermissions) : []
+  )
+  const [customTool, setCustomTool] = useState('')
+  const [customPermission, setCustomPermission] = useState('')
+  const [error, setError] = useState('')
+  const toolNames = (allTools || []).map((t) => (typeof t === 'string' ? t : t.name)).filter(Boolean)
+  const allToolNames = Array.from(new Set([...toolNames, ...tools]))
+  const permNames = (allPermissions || []).map((p) => (typeof p === 'string' ? p : p.name)).filter(Boolean)
+  const allPermNames = Array.from(new Set([...permNames, ...permissionEntries.map(([k]) => k)]))
+  const permValue = (permName) => {
+    const entry = permissionEntries.find(([k]) => k === permName)
+    if (entry) return entry[1]
+    const wp = (allPermissions || []).find((p) => (typeof p === 'string' ? p : p.name) === permName)
+    return wp && typeof wp === 'object' ? (wp.effective || wp.ceiling || 'read') : 'read'
+  }
+  const toggleTool = (toolName) => {
+    setTools((prev) => (prev.includes(toolName) ? prev.filter((t) => t !== toolName) : [...prev, toolName]))
+  }
+  const togglePermission = (permName) => {
+    setPermissionEntries((prev) => {
+      const has = prev.some(([k]) => k === permName)
+      if (has) return prev.filter(([k]) => k !== permName)
+      return [...prev, [permName, permValue(permName)]]
+    })
+  }
+  const addCustomTool = () => {
+    const t = customTool.trim()
+    if (!t) return
+    setTools((prev) => (prev.includes(t) ? prev : [...prev, t]))
+    setCustomTool('')
+  }
+  const addCustomPermission = () => {
+    const raw = customPermission.trim()
+    if (!raw) return
+    const idx = raw.indexOf(':')
+    const key = (idx > 0 ? raw.slice(0, idx) : raw).trim()
+    const value = idx > 0 ? raw.slice(idx + 1).trim() : permValue(key)
+    if (!key) return
+    setPermissionEntries((prev) => [...prev.filter(([k]) => k !== key), [key, value]])
+    setCustomPermission('')
+  }
+
+  const handleSave = () => {
+    const trimmedName = name.trim()
+    if (!trimmedName) {
+      setError('Worker name is required.')
+      return
+    }
+    const workerPermissions = {}
+    for (const [k, v] of permissionEntries) workerPermissions[k] = v
+    onSave({
+      name: trimmedName,
+      description: description.trim(),
+      systemPrompt,
+      tools,
+      workerPermissions,
+    })
+  }
+
+  return (
+    <div className="wp-modal-overlay" onClick={onClose}>
+      <div
+        className="wp-modal wp-worker-editor"
+        role="dialog"
+        aria-label={isNew ? 'Add worker preset' : `Edit ${worker.name}`}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 className="wp-modal-title">{isNew ? 'Add Worker Preset' : `Edit ${worker.name}`}</h3>
+        <div className="wp-modal-body">
+          <label className="wp-field">
+            <span className="wp-field-label">Name</span>
+            <input className="wp-input" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. code-reviewer" />
+          </label>
+          <label className="wp-field">
+            <span className="wp-field-label">Description</span>
+            <input className="wp-input" value={description} onChange={(e) => setDescription(e.target.value)} placeholder="What this worker does" />
+          </label>
+          <label className="wp-field">
+            <span className="wp-field-label">System prompt</span>
+            <textarea className="wp-textarea" rows={5} value={systemPrompt} onChange={(e) => setSystemPrompt(e.target.value)} />
+          </label>
+          <div className="wp-field">
+            <span className="wp-field-label">Tools</span>
+            <div className="wp-checkbox-list">
+              {allToolNames.map((t) => (
+                <label key={t} className="wp-checkbox">
+                  <input type="checkbox" checked={tools.includes(t)} onChange={() => toggleTool(t)} />
+                  <span>{t}</span>
+                </label>
+              ))}
+            </div>
+            <div className="wp-add-custom">
+              <input className="wp-input" value={customTool} onChange={(e) => setCustomTool(e.target.value)} placeholder="custom tool name" />
+              <button className="wp-btn" onClick={addCustomTool}>Add</button>
+            </div>
+          </div>
+          <div className="wp-field">
+            <span className="wp-field-label">Permissions</span>
+            <div className="wp-checkbox-list">
+              {allPermNames.map((p) => (
+                <label key={p} className="wp-checkbox">
+                  <input type="checkbox" checked={permissionEntries.some(([k]) => k === p)} onChange={() => togglePermission(p)} />
+                  <span>{p}</span>
+                </label>
+              ))}
+            </div>
+            <div className="wp-add-custom">
+              <input className="wp-input" value={customPermission} onChange={(e) => setCustomPermission(e.target.value)} placeholder="custom:value (e.g. filesystem:write)" />
+              <button className="wp-btn" onClick={addCustomPermission}>Add</button>
+            </div>
+          </div>
+          {error && <p className="wp-error-text">{error}</p>}
+        </div>
+        <div className="wp-modal-footer">
+          <button className="wp-btn" onClick={onClose}>Cancel</button>
+          <button className="wp-btn wp-btn-primary" onClick={handleSave}>Save</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // # --- Workers tab ---
-function WorkersTab({ workspace }) {
+function WorkersTab({ workspace, update }) {
   const [expanded, setExpanded] = useState(null)
+  const [editing, setEditing] = useState(null)  // worker being edited (null = new)
   const [showEditor, setShowEditor] = useState(false)
   const [showAddPreset, setShowAddPreset] = useState(false)
   const workers = workspace.workers || []
+
+  const handleSaveWorker = (next) => {
+    if (editing) {
+      // Replace in place, keyed by the previously edited name.
+      update('workers', workers.map((w) => (w.name === editing.name ? next : w)))
+    } else {
+      // Append a new preset; the backend rejects duplicate names (409).
+      update('workers', [...workers, next])
+    }
+    setShowEditor(false)
+    setShowAddPreset(false)
+    setEditing(null)
+  }
+
   return (
     <div className="wp-section">
       <div className="wp-section-header">
@@ -391,7 +713,13 @@ function WorkersTab({ workspace }) {
               <div className="wp-worker-card" key={w.name}>
                 <div className="wp-worker-top">
                   <h4 className="wp-worker-name">{w.name}</h4>
-                  <button className="wp-btn" onClick={() => setShowEditor(true)}>Edit</button>
+                  <span className="wp-badge wp-badge-muted">{w.runtimeStatus || 'ready'}</span>
+                  <button
+                    className="wp-btn"
+                    onClick={() => { setEditing(w); setShowEditor(true) }}
+                  >
+                    Edit
+                  </button>
                 </div>
                 <button
                   className="wp-worker-prompt"
@@ -402,7 +730,7 @@ function WorkersTab({ workspace }) {
                 </button>
                 <div className="wp-worker-meta">
                   <span>{countOf(w.tools)} tools</span>
-                  <span>{countOf(w.permissions)} permissions</span>
+                  <span>{countOf(w.workerPermissions)} permissions</span>
                   <span>{w.tokenLimit ?? '—'} tokens</span>
                 </div>
               </div>
@@ -411,10 +739,10 @@ function WorkersTab({ workspace }) {
         </div>
       )}
       <div className="wp-section-footer">
-        <button className="wp-btn" onClick={() => setShowAddPreset(true)}>Add Preset</button>
+        <button className="wp-btn" onClick={() => { setEditing(null); setShowAddPreset(true) }}>Add Preset</button>
       </div>
-      {showEditor && <PlaceholderModal message="Worker preset editor coming soon" onClose={() => setShowEditor(false)} />}
-      {showAddPreset && <PlaceholderModal message="Worker preset editor coming soon" onClose={() => setShowAddPreset(false)} />}
+      {showEditor && <WorkerEditor key={editing ? editing.name : 'new'} worker={editing} onSave={handleSaveWorker} onClose={() => setShowEditor(false)} allTools={workspace.tools || []} allPermissions={normalizePermissions(workspace.permissions)} />}
+      {showAddPreset && <WorkerEditor key="new-preset" worker={null} onSave={handleSaveWorker} onClose={() => setShowAddPreset(false)} allTools={workspace.tools || []} allPermissions={normalizePermissions(workspace.permissions)} />}
     </div>
   )
 }
@@ -575,8 +903,18 @@ export default function WorkspacePanel() {
   const isLoading = useWorkspaceStore((s) => s.isLoading)
   const fetchWorkspaceConfig = useWorkspaceStore((s) => s.fetchWorkspaceConfig)
   const updateWorkspaceConfig = useWorkspaceStore((s) => s.updateWorkspaceConfig)
+  const dockerAvailable = useWorkspaceStore((s) => s.dockerAvailable)
+  const containerStatus = useWorkspaceStore((s) => s.containerStatus)
+  const busyContainers = useWorkspaceStore((s) => s.busyContainers)
+  const fetchContainers = useWorkspaceStore((s) => s.fetchContainers)
+  const containerAction = useWorkspaceStore((s) => s.containerAction)
+  const storeError = useWorkspaceStore((s) => s.error)
+  const clearError = useWorkspaceStore((s) => s.clearError)
 
   const [activeTab, setActiveTab] = useState(DEFAULT_TAB)
+  const [showNewSession, setShowNewSession] = useState(false)
+  const [actionError, setActionError] = useState('')
+  const [advisoryDockerHint, setAdvisoryDockerHint] = useState('')
   // Distinguishes "fetch not yet run for this id" (spinner) from
   // "fetched and not found" (error) when navigating between workspaces.
   const [fetchedId, setFetchedId] = useState(null)
@@ -587,6 +925,17 @@ export default function WorkspacePanel() {
       setFetchedId(workspaceId)
     }
   }, [workspaceId, fetchWorkspaceConfig])
+
+  // Poll the containers list while the Containers tab is open (5s cadence).
+  // Uses workspace?.id / workspace?.root in deps (workspace object identity
+  // changes on every store update).
+  useEffect(() => {
+    if (activeTab !== 'Containers' || !workspace || !workspace.root) return undefined
+    const poll = () => fetchContainers(workspace.id).catch(() => {})
+    poll()
+    const timer = setInterval(poll, 5000)
+    return () => clearInterval(timer)
+  }, [activeTab, workspace?.id, workspace?.root, fetchContainers])
 
   if (!workspaceId) {
     return (
@@ -625,7 +974,7 @@ export default function WorkspacePanel() {
   }
 
   const update = (field, value) => updateWorkspaceConfig(workspace.id, { [field]: value })
-  const advisory = computeAdvisory(workspace)
+  const advisory = computeAdvisory(workspace, dockerAvailable)
 
   const handleSuggestion = (suggestion) => {
     if (suggestion.action === 'disable-resource') {
@@ -635,9 +984,23 @@ export default function WorkspacePanel() {
     } else if (suggestion.action === 'lower-network') {
       update('permissions', permissionsWithCeiling(workspace.permissions, 'network', suggestion.level))
     } else if (suggestion.action === 'install-docker') {
-      // DOCKER_AVAILABLE is hardcoded true, so this branch is unreachable today.
-      console.log('[WorkspacePanel] Install Docker requested (Phase 4 will wire real detection)')
+      setAdvisoryDockerHint('Install Docker and restart the server to enable containerized execution.')
     }
+  }
+
+  const handleContainerAction = (name, action) => {
+    setActionError('')
+    return containerAction(workspace.id, name, action)
+  }
+
+  const handleDismissError = () => {
+    setActionError('')
+    clearError()
+  }
+  const handleRetryError = () => {
+    setActionError('')
+    fetchWorkspaceConfig(workspaceId)
+    clearError()
   }
 
   return (
@@ -651,11 +1014,26 @@ export default function WorkspacePanel() {
         <p className="wp-path">{workspace.path}</p>
         <button
           className="wp-btn wp-btn-primary wp-new-session"
-          onClick={() => console.log('New session for workspace', workspace.id)}
+          onClick={() => setShowNewSession(true)}
         >
           New Session
         </button>
       </header>
+
+      {(storeError || actionError) && (
+        <div className="wp-error-banner">
+          <p className="wp-error-text">{actionError || storeError}</p>
+          <div className="wp-banner-actions">
+            <button className="wp-btn" onClick={handleDismissError}>Dismiss</button>
+            <button className="wp-btn" onClick={handleRetryError}>Retry</button>
+          </div>
+        </div>
+      )}
+      {dockerAvailable === null && (
+        <div className="wp-warn-banner">
+          <p className="wp-warn-text">Could not verify Docker status — container actions may fail.</p>
+        </div>
+      )}
 
       <div className="wp-body">
         <aside className="wp-advisory">
@@ -676,6 +1054,9 @@ export default function WorkspacePanel() {
                 </li>
               ))}
             </ul>
+            {advisoryDockerHint && (
+              <p className="wp-error-text wp-advisory-hint">{advisoryDockerHint}</p>
+            )}
           </div>
         </aside>
 
@@ -699,14 +1080,25 @@ export default function WorkspacePanel() {
             {activeTab === 'Permissions' && <PermissionsTab workspace={workspace} update={update} />}
             {activeTab === 'Tools' && <ToolsTab workspace={workspace} update={update} />}
             {activeTab === 'Credentials' && <CredentialsTab workspace={workspace} update={update} />}
-            {activeTab === 'Containers' && <ContainersTab workspace={workspace} />}
-            {activeTab === 'Workers' && <WorkersTab workspace={workspace} />}
+            {activeTab === 'Containers' && (
+              <ContainersTab
+                workspace={workspace}
+                dockerAvailable={dockerAvailable}
+                containerStatus={containerStatus}
+                busyContainers={busyContainers}
+                onRefresh={() => fetchContainers(workspace.id).catch(() => {})}
+                onAction={handleContainerAction}
+                onError={setActionError}
+              />
+            )}
+            {activeTab === 'Workers' && <WorkersTab workspace={workspace} update={update} />}
             {activeTab === 'Session Defaults' && (
               <SessionDefaultsTab key={workspace.id} workspace={workspace} update={update} />
             )}
           </section>
         </main>
       </div>
+      {showNewSession && <NewSessionModal workspace={workspace} onClose={() => setShowNewSession(false)} />}
     </div>
   )
 }
