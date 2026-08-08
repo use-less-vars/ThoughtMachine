@@ -198,9 +198,11 @@ class TestBlockedWorkspaceInternalPaths:
     """Deny-listed paths inside the workspace are rejected, component-aware.
 
     Matching is against the FIRST path components of the workspace-relative
-    path — never a naive substring. Only the three sensitive .git entries are
-    blocked (.git/hooks, .git/config, .git/HEAD); the rest of .git (refs,
-    objects) stays usable so normal repo tooling keeps working.
+    path — never a naive substring. Only the two sensitive .git entries are
+    blocked (.git/config, .git/HEAD); .git/hooks is deliberately allowed (the
+    resource container is the security boundary, so repo-local hook scripts
+    run inside it) and the rest of .git (refs, objects) stays usable so
+    normal repo tooling keeps working.
     """
 
     @pytest.mark.parametrize("rel_path", WORKSPACE_BLOCKED_PATH_PREFIXES)
@@ -215,8 +217,6 @@ class TestBlockedWorkspaceInternalPaths:
     @pytest.mark.parametrize(
         "rel_path",
         [
-            ".git/hooks/pre-commit",       # nested under a deny-listed dir
-            ".git/hooks/post-checkout",
             ".git/config",
             ".git/HEAD",
             ".ssh/config",
@@ -240,6 +240,8 @@ class TestBlockedWorkspaceInternalPaths:
             "not-really-.env",                # substring, not a path component
             ".env2",                          # dotfile-variant rule requires '.'
             ".git/refs/heads/main",           # NOT on the deny list (design note)
+            ".git/hooks/pre-commit",          # hooks allowed (container is boundary)
+            ".git/hooks/post-checkout",
         ],
     )
     def test_legitimate_paths_allowed(self, tmp_path: Path, rel_path: str):

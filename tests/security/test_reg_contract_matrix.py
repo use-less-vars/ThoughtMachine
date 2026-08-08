@@ -4,8 +4,11 @@ This module pins down the end-to-end *contracts* hardened in the D3 security
 pass:
 
 * GitInfoTool neutralizes repository-local hooks (post-commit, pre-commit),
-  fsmonitor and textconv/external diff drivers, and rejects non-whitelisted
-  clone transports (``ext::`` and friends) before any subprocess can run.
+  fsmonitor and textconv/external diff drivers on the HOST fallback path,
+  and rejects non-whitelisted clone transports (``ext::`` and friends)
+  before any subprocess can run. In container mode (resource container =
+  security boundary) repo-local hooks are allowed to run -- see the
+  container-mode companion tests below.
 * MCPServerConnect refuses shell-metacharacter payloads (the
   SandboxedExecution ValueError propagates fail-closed) and never executes
   anything for unregistered servers.
@@ -236,8 +239,13 @@ def test_clone_ext_transport_rejected(tmp_path):
 
 
 @pytest.mark.usefixtures("git_available")
-def test_file_write_to_hooks_then_commit_hook_ignored(tmp_path):
-    """A pre-commit hook planted via Path.write_text must be ignored by commit."""
+def test_host_file_write_to_hooks_then_commit_hook_ignored(tmp_path):
+    """HOST path: a pre-commit hook planted via Path.write_text is ignored.
+
+    This caller passes only ``working_dir``/``session_permissions`` (no
+    registry workspace), so git runs through the host hermetic sandbox,
+    which neutralizes hooks via core.hooksPath=/dev/null + --no-verify.
+    """
     workspace = tmp_path / "workspace"
     repo = workspace / "repo"
     _init_repo(repo)
@@ -258,6 +266,38 @@ def test_file_write_to_hooks_then_commit_hook_ignored(tmp_path):
     log = _run_git_clean(repo, "log", "--oneline")
     assert log.returncode == 0, log.stderr
     assert "add hello" in log.stdout, "commit did not land"
+
+
+class _FakeManager:
+    """Resource-container stand-in recording exec() invocations."""
+
+    def __init__(self):
+        self.calls = []
+
+    def exec(self, command, **kwargs):
+        self.calls.append((command, kwargs))
+        return {"exit_code": 0, "stdout": "ok", "stderr": ""}
+
+
+def test_container_commit_does_not_skip_hooks(tmp_path):
+    """CONTAINER path: commit must NOT pass --no-verify to git.
+
+    The resource container is the security boundary, so repo-local hooks
+    (e.g. the pre-commit above) are allowed to run inside it. This pins the
+    command contract: no --no-verify is injected in container mode.
+    """
+    manager = _FakeManager()
+    tool = GitInfoTool(operation="commit", message="x")
+    object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
+    object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
+    object.__setattr__(tool, "_ensure_resource_container", lambda: manager)
+
+    tool._exec_container_raw(tmp_path, ["commit", "-m", "x"])
+
+    assert len(manager.calls) == 1
+    command, _kwargs = manager.calls[0]
+    assert command == ["git", "commit", "-m", "x"]
+    assert "--no-verify" not in command
 
 
 @pytest.mark.usefixtures("git_available")

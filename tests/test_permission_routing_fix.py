@@ -132,7 +132,9 @@ class TestContainerPath:
         assert result == (0, "ok", "")
         assert len(manager.calls) == 1
         command, _kwargs = manager.calls[0]
-        assert command == ["git", "commit", "--no-verify", "-m", "x"]
+        # Container path does NOT inject --no-verify: the resource container
+        # is the security boundary, so repo-local hooks run inside it.
+        assert command == ["git", "commit", "-m", "x"]
 
     def test_container_banned_commit_denied(self, tmp_path):
         manager = FakeManager()

@@ -67,13 +67,14 @@ VAULT_ROOT = os.path.join(os.path.expanduser("~"), ".thoughtmachine")
 # path components of the workspace-relative path (see
 # _match_blocked_workspace_path) — never a naive substring.
 #
-# Design note: only three .git entries are blocked (.git/hooks, .git/config,
-# .git/HEAD) rather than all of .git. Normal tooling legitimately reads the
-# repo's own refs/objects (e.g. .git/refs/heads/main) and must keep working;
-# the blocked entries are precisely the ones that can execute code on a
-# checkout (hooks) or leak credentials (config/HEAD).
+# Design note: only two .git entries are blocked (.git/config, .git/HEAD)
+# rather than all of .git. Normal tooling legitimately reads the repo's own
+# refs/objects (e.g. .git/refs/heads/main) and must keep working; the blocked
+# entries are precisely the ones that can leak credentials (config/HEAD).
+# .git/hooks is deliberately NOT blocked: the resource container is the
+# security boundary, so repo-local hook scripts are allowed to run inside it
+# (the host fallback still neutralizes them via core.hooksPath=/dev/null).
 WORKSPACE_BLOCKED_PATH_PREFIXES = [
-    ".git/hooks",
     ".git/config",
     ".git/HEAD",
     ".ssh",
@@ -280,14 +281,15 @@ def _match_blocked_workspace_path(rel_path: str) -> Optional[str]:
     Matching is component-aware against the FIRST path components of the
     relative path (never a naive substring):
 
-    - Multi-component entries (``.git/hooks``) match the path itself or
-      anything beneath it: ``.git/hooks`` -> ``.git/hooks/pre-commit``.
+    - Multi-component entries (``.git/config``) match the path itself or
+      anything beneath it: ``.git/config`` (the file) and
+      ``.git/config/anything-below`` (structural prefix match).
     - Single-component entries match the path itself, anything beneath it as
       a directory (``.ssh`` -> ``.ssh/config``), and dotfile variants
       (``.env`` -> ``.env.local``; the separator must be a dot, so ``.env2``
       does NOT match).
     - Everything else stays unblocked: ``not-really-.env``, ``.gitignore``,
-      ``.git/refs/heads/main``, ``src/main.py``.
+      ``.git/refs/heads/main``, ``.git/hooks/pre-commit``, ``src/main.py``.
     """
     if not rel_path:
         return None

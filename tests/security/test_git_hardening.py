@@ -5,8 +5,11 @@ Verifies that:
    config (~/.gitconfig, /etc/gitconfig) and the host HOME are ignored, so
    ambient aliases, credential helpers, and include.path tricks cannot be
    injected into the subprocess.
-2. Git hooks never execute: core.hooksPath is pointed at /dev/null for every
-   invocation, and commit additionally passes --no-verify.
+2. Git hooks never execute on the HOST fallback path: core.hooksPath is
+   pointed at /dev/null for every invocation and commit additionally passes
+   --no-verify. The container path (resource container = security boundary)
+   deliberately does NOT neutralize hooks -- repo-local hook scripts run
+   inside the sandbox (see test_container_path_commit_has_no_no_verify).
 3. External diff drivers / textconv filters and the fsmonitor helper are
    disabled on every invocation.
 4. A repository root that resolves OUTSIDE the workspace is rejected before
@@ -81,14 +84,50 @@ def _commit_tool(workspace, repo, message="test commit"):
     )
 
 
-def test_pre_commit_hook_does_not_run(hardened_repo):
-    """A pre-commit hook in the repo must never execute during a commit."""
+def test_host_path_pre_commit_hook_does_not_run(hardened_repo):
+    """HOST path: a pre-commit hook in the repo must never execute.
+
+    This caller passes ``workspace_path=`` directly (no registry workspace),
+    so git runs through the host hermetic sandbox, which neutralizes hooks
+    via core.hooksPath=/dev/null + --no-verify.
+    """
     workspace, repo, marker = hardened_repo
     (repo / "hello.txt").write_text("hi\n")
     _run_git_clean(repo, "add", "hello.txt")
     result = _commit_tool(workspace, repo).execute()
     assert "PWNED" not in result
     assert not marker.exists() or "PWNED" not in marker.read_text()
+
+
+class _FakeManager:
+    """Resource-container stand-in recording exec() invocations."""
+
+    def __init__(self):
+        self.calls = []
+
+    def exec(self, command, **kwargs):
+        self.calls.append((command, kwargs))
+        return {"exit_code": 0, "stdout": "ok", "stderr": ""}
+
+
+def test_container_path_commit_has_no_no_verify(tmp_path):
+    """Container mode lets repo-local hooks run: no --no-verify injected.
+
+    The resource container IS the security boundary, so the container git
+    path must NOT neutralize .git/hooks scripts the way the host path does.
+    """
+    manager = _FakeManager()
+    tool = GitInfoTool(operation="commit", message="x")
+    object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
+    object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
+    object.__setattr__(tool, "_ensure_resource_container", lambda: manager)
+
+    tool._exec_container_raw(tmp_path, ["commit", "-m", "x"])
+
+    assert len(manager.calls) == 1
+    command, _kwargs = manager.calls[0]
+    assert command == ["git", "commit", "-m", "x"]
+    assert "--no-verify" not in command
 
 
 def test_commit_still_succeeds(hardened_repo):

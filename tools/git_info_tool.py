@@ -483,11 +483,9 @@ class GitInfoTool(ToolBase):
                         f"Permission denied: git:{level} required for this operation"
                     )
 
-        # commit additionally skips pre-commit/commit-msg hooks via
-        # --no-verify as a second line of defense (same as host path).
-        if args and args[0] == "commit":
-            args = [args[0], "--no-verify"] + args[1:]
-
+        # NOTE: no --no-verify here. The resource container IS the security
+        # boundary, so repo-local .git/hooks scripts are allowed to run
+        # (unlike the host path, which neutralizes them).
         environment = {
             "GIT_PAGER": "cat",
             "GIT_CONFIG_SYSTEM": "/dev/null",
