@@ -42,11 +42,14 @@ Security model
   index, so ``read_only=False``. This intentionally DIVERGES from the
   executor's tmpfs-shadowing of ``/workspace/.git``: the resource container's
   purpose is to operate on the REAL git metadata. Blast radius is bounded by
-  the workspace bind being the ONLY mount plus no network / no socket / no
-  vault / read-only rootfs. One documented exception: for a git linked
-  worktree (``.git`` is a ``gitdir:`` pointer file) the MAIN repository is
-  additionally bind-mounted at its original host path so the pointer
-  resolves inside the container (see ``_resolve_worktree_main_repo``).
+  no network / no socket / no vault / read-only rootfs. Two documented extra
+  mounts: (1) for a git linked worktree (``.git`` is a ``gitdir:`` pointer
+  file) the MAIN repository is additionally bind-mounted at its original
+  host path so the pointer resolves inside the container (see
+  ``_resolve_worktree_main_repo``); (2) the project's ``.venv`` is
+  bind-mounted READ-ONLY at its original host path so the pre-commit hook
+  can run pytest with the workspace's exact dependencies (see
+  ``_resolve_venv``).
 
 Exec semantics
 --------------
@@ -59,6 +62,7 @@ with actionable messages (see per-method docstrings).
 """
 
 import hashlib
+import logging
 import os
 import queue
 import threading
@@ -74,6 +78,30 @@ except ImportError:  # pragma: no cover - environment without docker SDK
     APIError = Exception
     NotFound = Exception
     Mount = None
+
+
+_LOG = logging.getLogger(__name__)
+
+
+def _resolve_venv(workspace_path):
+    """Find the project's ``.venv`` directory, or None.
+
+    Walks up from ``workspace_path`` looking for a ``.venv`` directory (the
+    conventional virtualenv location) and returns the first one found, or
+    None if none exists. Mirrors the host-path discovery pattern used for
+    the linked-worktree main-repo mount (``_resolve_worktree_main_repo``).
+    """
+    if not workspace_path:
+        return None
+    path = os.path.abspath(str(workspace_path))
+    while True:
+        candidate = os.path.join(path, ".venv")
+        if os.path.isdir(candidate):
+            return candidate
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None
+        path = parent
 
 
 def _resolve_worktree_main_repo(workspace_path, vault_root=None):
@@ -285,8 +313,9 @@ class ResourceContainerManager:
         # Workspace bind mount, READ-WRITE: git writes .git + index on the
         # REAL workspace. Documented divergence from the executor's ro/.git-
         # tmpfs scheme — this container's whole purpose is operating on git
-        # metadata; isolation comes from it being the ONLY mount (one
-        # exception: the linked-worktree main repo below).
+        # metadata; isolation comes from it being the ONLY mount (two
+        # documented exceptions: the linked-worktree main repo and the
+        # read-only .venv below).
         mounts = [
             Mount(
                 target="/workspace",
@@ -313,6 +342,27 @@ class ResourceContainerManager:
                     type="bind",
                     read_only=False,
                 )
+            )
+        # .venv bind mount, READ-ONLY: expose the project's virtualenv at its
+        # ORIGINAL host path so the pre-commit hook can run pytest with the
+        # workspace's exact dependencies. Read-only keeps the sandbox safe —
+        # the container never mutates the venv. Skipped (with a warning) when
+        # no .venv exists; the hook then just won't run.
+        venv_path = _resolve_venv(self.workspace_path)
+        if venv_path:
+            mounts.append(
+                Mount(
+                    target=venv_path,
+                    source=venv_path,
+                    type="bind",
+                    read_only=True,
+                )
+            )
+        else:
+            _LOG.warning(
+                "No .venv found for workspace %s — pre-commit hook pytest "
+                "run unavailable (skipping .venv mount)",
+                self.workspace_path,
             )
         # tmpfs (same entries as ContainerManager.start / docker_executor,
         # minus the /workspace/.git shadow — we need the real .git).
