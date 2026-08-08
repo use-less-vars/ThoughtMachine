@@ -359,3 +359,104 @@ def test_container_list_rejects_vault_path(client, clean_home):
                       params={"workspace_path": vault})
     assert resp.status_code == 400
     assert "vault" in resp.json()["error"].lower()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Fix 4 — /api/workspace/resolve registration confinement
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_resolve_registers_new_path_under_home(client, clean_home):
+    """A NEW registration under $HOME (outside the vault) succeeds and is
+    idempotent: a second resolve returns the same workspace id."""
+    _, _, tmp_home = clean_home
+    ws_dir = os.path.join(tmp_home, "ws-new")
+    os.makedirs(ws_dir, exist_ok=True)
+
+    resp = client.post("/api/workspace/resolve", json={"path": ws_dir})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["workspace_id"]
+    assert data["root"] == os.path.realpath(ws_dir)
+
+    resp2 = client.post("/api/workspace/resolve", json={"path": ws_dir})
+    assert resp2.status_code == 200
+    assert resp2.json()["workspace_id"] == data["workspace_id"]
+
+
+def test_resolve_rejects_root_403(client):
+    """The filesystem root is outside $HOME → HTTP 403."""
+    resp = client.post("/api/workspace/resolve", json={"path": "/"})
+    assert resp.status_code == 403
+    assert "outside the allowed home" in resp.json()["detail"]
+
+
+def test_resolve_rejects_etc_403(client):
+    """A system directory outside $HOME → HTTP 403."""
+    resp = client.post("/api/workspace/resolve", json={"path": "/etc"})
+    assert resp.status_code == 403
+    assert "outside the allowed home" in resp.json()["detail"]
+
+
+def test_resolve_rejects_vault_403(client, clean_home):
+    """~/.thoughtmachine (the trust anchor) must never be registered → 403."""
+    _, _, tmp_home = clean_home
+    vault = os.path.join(tmp_home, ".thoughtmachine")
+    resp = client.post("/api/workspace/resolve", json={"path": vault})
+    assert resp.status_code == 403
+    assert "vault" in resp.json()["detail"].lower()
+
+
+def test_resolve_rejects_nonexistent_400(client, clean_home):
+    """A path that is not an existing directory → HTTP 400."""
+    _, _, tmp_home = clean_home
+    resp = client.post("/api/workspace/resolve",
+                       json={"path": os.path.join(tmp_home, "does-not-exist")})
+    assert resp.status_code == 400
+    assert "not an existing directory" in resp.json()["detail"]
+
+
+def test_resolve_rejects_empty_path_400(client):
+    """An empty path is a client error, not a registration attempt."""
+    resp = client.post("/api/workspace/resolve", json={"path": ""})
+    assert resp.status_code == 400
+    assert "path is required" in resp.json()["detail"]
+
+
+def test_resolve_rejects_symlink_escape_403(client, clean_home):
+    """A symlink inside $HOME pointing outside must be rejected after
+    resolution (no symlink-based escape from the confinement)."""
+    _, _, tmp_home = clean_home
+    outside = tempfile.mkdtemp(prefix="test_outside_home_")
+    try:
+        link = os.path.join(tmp_home, "resolve-escape-link")
+        os.symlink(outside, link)
+        resp = client.post("/api/workspace/resolve", json={"path": link})
+        assert resp.status_code == 403
+        assert "outside the allowed home" in resp.json()["detail"]
+    finally:
+        shutil.rmtree(outside, ignore_errors=True)
+
+
+def test_resolve_registered_under_home_returns_existing(client, registered_ws):
+    """An already-registered workspace under $HOME resolves to its id."""
+    resp = client.post("/api/workspace/resolve",
+                       json={"path": registered_ws["root"]})
+    assert resp.status_code == 200
+    assert resp.json()["workspace_id"] == registered_ws["ws_id"]
+
+
+def test_resolve_pre_registered_outside_home_still_resolves(client, clean_home):
+    """Registry entries written by trusted code (bootstrap/server startup)
+    resolve even when outside $HOME — only NEW registrations are confined to
+    home-minus-vault (the registry itself lives in the vault/trust anchor)."""
+    outside = tempfile.mkdtemp(prefix="test_pre_registered_")
+    try:
+        WorkspaceRegistry.get_default().register_workspace(
+            "ws-pre-registered", outside, label="pre-registered-outside"
+        )
+        resp = client.post("/api/workspace/resolve", json={"path": outside})
+        assert resp.status_code == 200
+        assert resp.json()["workspace_id"] == "ws-pre-registered"
+    finally:
+        shutil.rmtree(outside, ignore_errors=True)
+

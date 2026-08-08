@@ -49,22 +49,99 @@ class ResolvePathBody(BaseModel):
     path: str
 
 
+# ── Path confinement helpers (mirror of web_ui/backend/server.py) ───────────────────────────────────────────────────────────────────
+# Duplicated here rather than imported from server.py to avoid a circular
+# import (server.py imports this router at module level).  Keep both copies
+# in sync — or extract into a shared helper module.
+
+def _vault_root_path() -> Path:
+    """Return the vault root — the trust anchor for this server."""
+    return Path.home() / ".thoughtmachine"
+
+
+def _path_is_within(path: str, prefix: str) -> bool:
+    """Return True if *path* equals *prefix* or is nested under it."""
+    norm = os.path.normpath(path)
+    base = os.path.normpath(prefix)
+    return norm == base or norm.startswith(base + os.sep)
+
+
+def _confine_to_home(path: str) -> str:
+    """Resolve *path* and confine it to $HOME minus the vault root.
+
+    TRUST ANCHOR: ``~/.thoughtmachine`` is the trust anchor for this server —
+    it holds the workspace registry, credentials, configuration and session
+    state.  User-reachable endpoints (browse, create, workspace registration)
+    must never resolve into it: a workspace rooted there would hand the agent
+    the trust anchor and everything inside it.  Raises ``ValueError`` when the
+    resolved path is outside $HOME or inside the vault root.
+    """
+    resolved = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+    home = os.path.realpath(os.path.expanduser("~"))
+    if not _path_is_within(resolved, home):
+        raise ValueError(
+            f"Path '{path}' resolves outside the allowed home directory '{home}'"
+        )
+    vault = os.path.realpath(str(_vault_root_path()))
+    if _path_is_within(resolved, vault):
+        raise ValueError(
+            f"Path '{path}' resolves into the protected vault directory '{vault}'"
+        )
+    return resolved
+
+
 @router.post("/resolve")
 async def resolve_workspace_path(body: ResolvePathBody) -> Dict[str, Any]:
     """Resolve a filesystem path to a workspace ID.
 
     If the path is already registered, returns the existing workspace ID.
     Otherwise, registers it as a new workspace and returns the new ID.
+
+    TRUST ANCHOR: ``~/.thoughtmachine`` is the trust anchor for this server.
+    New registrations are confined to $HOME minus the vault root: a path that
+    resolves outside the home directory or into ``~/.thoughtmachine`` is
+    rejected with HTTP 403 Forbidden, and a non-existent path with HTTP 400.
+    Already-registered paths are returned as-is — their entries were written
+    only by trusted code (bootstrap, server startup, or this same confined
+    endpoint), so they are trusted.
     """
     try:
+        if not body.path or not body.path.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="path is required",
+            )
+
         registry = WorkspaceRegistry.get_default()
-        entry = registry.register_by_root(body.path)
+
+        # Already registered → return the existing (trusted) entry untouched.
+        existing = registry.resolve_by_root(body.path)
+        if existing is not None:
+            return {"workspace_id": existing.id, "root": existing.root_path}
+
+        # New registration: confine to $HOME minus the vault root.
+        try:
+            confined = _confine_to_home(body.path)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=str(exc),
+            )
+        if not os.path.isdir(confined):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Path '{confined}' is not an existing directory",
+            )
+
+        entry = registry.register_by_root(confined)
         if entry:
             return {"workspace_id": entry.id, "root": entry.root_path}
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to register workspace path",
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
