@@ -570,6 +570,11 @@ class WorkerThread(threading.Thread):
         self._worker_dir = workspace_dir / "workers" / name
         self._worker_dir.mkdir(parents=True, exist_ok=True)
 
+        # F2: generation token — a monotonic per-worker counter that guards
+        # context.json against stale-thread overwrites after a force-spawn
+        # (a still-alive old thread must not clobber the replacement's file).
+        self._generation: int = self._allocate_generation()
+
         # Tool classes available to this worker (name -> class)
         self._tool_classes: Dict[str, type[ToolBase]] = tool_classes or {}
 
@@ -608,6 +613,15 @@ class WorkerThread(threading.Thread):
 
         # Cached authoritative token count from agent's token_update events
         self._cached_context_tokens: Optional[int] = None
+
+        # F1 markers: last query dequeued, and last query that completed.
+        # Persisted in context.json so a force-respawn can tell whether the
+        # previous attempt finished (last_query == last_completed_query) or
+        # was cut short by a soft timeout / force-stop. If it never completed
+        # and the new spawn carries a DIFFERENT query, the stale partial
+        # attempt is pruned before the new context is merged (no doubling).
+        self._last_query: Optional[str] = None
+        self._last_completed_query: Optional[str] = None
 
         # Agent instance + WorkerContext (created lazily in run())
         self._agent: Optional[Any] = None
@@ -1182,6 +1196,16 @@ class WorkerThread(threading.Thread):
                 # When context.json exists, we preserve the loaded conversation and
                 # merge _initial_context into it rather than replacing it.
                 if self._initial_context:
+                    # F1: prune an incomplete attempt for a DIFFERENT query
+                    # before merging the new context. Prevents context doubling
+                    # on force-respawn after a soft timeout: the loaded
+                    # history's last attempt belongs to a previous task
+                    # (last_query != new query) and never completed
+                    # (last_query != last_completed_query). Completed attempts
+                    # are preserved.
+                    initial_query = self._initial_context.get("query")
+                    if initial_query:
+                        self._prune_stale_attempt_before_merge(initial_query)
                     # Add initial context as a system message for continuity
                     ctx_msg = {
                         "role": "system",
@@ -1200,7 +1224,6 @@ class WorkerThread(threading.Thread):
                             self.worker_name,
                         )
                     # Auto-queue the query if present
-                    initial_query = self._initial_context.get("query")
                     if initial_query:
                         logger.debug(
                             "Auto-queueing initial query for worker '%s' (loaded context)",
@@ -1223,6 +1246,11 @@ class WorkerThread(threading.Thread):
                     continue
                 if query is None or self._stop_event.is_set():
                     break
+
+                # F1: record the most recent query dequeued (even if it times
+                # out mid-attempt) so a later force-respawn can tell whether
+                # the last attempt completed.
+                self._last_query = query
 
                 # ── Create Agent lazily (first query only) ────────────
                 if self._agent is None:
@@ -1402,6 +1430,12 @@ class WorkerThread(threading.Thread):
                 self.current_task = None
                 self.last_heartbeat = datetime.now(timezone.utc).isoformat()
 
+                # F1: mark this query as completed — unless a soft timeout cut
+                # it short, in which case the attempt is left incomplete so a
+                # later force-respawn can prune it.
+                if not self._timeout_triggered:
+                    self._last_completed_query = query
+
                 # Compact conversation history after summarization
                 # (Agent inserts summary messages but doesn't remove old ones)
                 if self._worker_ctx is not None:
@@ -1514,6 +1548,53 @@ class WorkerThread(threading.Thread):
     def _context_path(self) -> Path:
         return self._worker_dir / "context.json"
 
+    def _allocate_generation(self) -> int:
+        """F2: allocate a monotonic per-worker generation token.
+
+        Reads the current generation from a small sidecar file
+        (``worker_dir/generation``) plus any generation already persisted in
+        context.json, then writes ``max + 1`` back to the sidecar.  Every new
+        WorkerThread instance therefore holds a strictly higher generation than
+        any thread it replaces, so a still-alive stale thread's
+        ``_save_context()`` is rejected by the guard once the replacement has
+        persisted.  The context.json fallback keeps the counter monotonic even
+        if the sidecar file is lost.
+        """
+        gen_file = self._worker_dir / "generation"
+        base = 0
+        try:
+            if gen_file.exists():
+                base = max(base, int(gen_file.read_text(encoding="utf-8").strip() or 0))
+        except (OSError, ValueError):
+            pass
+        ctx_path = self._context_path()
+        if ctx_path.exists():
+            try:
+                base = max(base, int(json.loads(ctx_path.read_text(encoding="utf-8")).get("generation") or 0))
+            except (json.JSONDecodeError, OSError, TypeError, ValueError):
+                pass
+        new_gen = base + 1
+        try:
+            fd, tmp_path_str = tempfile.mkstemp(
+                dir=str(self._worker_dir), prefix=".generation_", suffix=".tmp",
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(str(new_gen))
+                if FileLock is not None:
+                    with FileLock(str(gen_file)):
+                        os.replace(tmp_path_str, str(gen_file))
+                else:
+                    os.replace(tmp_path_str, str(gen_file))
+            except Exception:
+                try:
+                    if os.path.exists(tmp_path_str):
+                        os.unlink(tmp_path_str)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        return new_gen
 
     def _load_context(self) -> Optional[WorkerContext]:
         """Load WorkerContext from disk, if present. Returns None if not found."""
@@ -1525,12 +1606,53 @@ class WorkerThread(threading.Thread):
                 self.status = data.get("status", "ready")
                 self.error = data.get("error")
                 self.last_heartbeat = data.get("last_heartbeat")
+                self._last_query = data.get("last_query")
+                self._last_completed_query = data.get("last_completed_query")
+                # F2: restore generation; keep the max so this thread's saves
+                # are never rejected against a file it just loaded.
+                try:
+                    file_gen = int(data.get("generation") or 0)
+                except (TypeError, ValueError):
+                    file_gen = 0
+                self._generation = max(self._generation, file_gen)
                 return ctx
             except (json.JSONDecodeError, OSError) as exc:
                 logger.warning(
                     "Failed to load worker context %s: %s", path, exc
                 )
         return None
+
+    def _prune_stale_attempt_before_merge(self, new_query: str) -> None:
+        """F1: drop an incomplete attempt for a DIFFERENT query before merging new context.
+
+        Prevents context doubling on force-respawn after a soft timeout: the loaded
+        history's last attempt belongs to a previous task (last_query != new_query)
+        and never completed (last_query != last_completed_query). Truncate from the
+        last "Initial context" boundary so the new query does not execute against
+        (and double) the stale partial attempt. Completed attempts are preserved.
+        """
+        last_query = self._last_query
+        last_completed = self._last_completed_query
+        if not last_query or last_query == new_query:
+            return  # same-task retry (or legacy context w/o marker) — keep history
+        if last_query == last_completed:
+            return  # last attempt completed — completed work is kept
+        history = self._worker_ctx.user_history
+        ic_indices = [
+            i for i, msg in enumerate(history)
+            if msg.get("role") == "system"
+            and isinstance(msg.get("content"), str)
+            and msg["content"].startswith("Initial context: ")
+        ]
+        if not ic_indices:
+            return
+        boundary = ic_indices[-1]
+        del history[boundary:]
+        logger.debug(
+            "Pruned incomplete attempt for query %r before merging new context (worker '%s')",
+            last_query,
+            self.worker_name,
+        )
 
     def _write_status_file(self) -> None:
         """
@@ -1585,6 +1707,24 @@ class WorkerThread(threading.Thread):
         if self._worker_ctx is None:
             self._write_status_file()
             return
+        target = self._context_path()
+        # F2: generation guard — a stale writer (an older WorkerThread instance
+        # still alive after a force-spawn) must not overwrite the replacement
+        # thread's context.json.  Skip the save if the file already carries a
+        # NEWER generation than this thread's.
+        if target.exists():
+            try:
+                existing = json.loads(target.read_text(encoding="utf-8"))
+                existing_gen = int(existing.get("generation") or 0)
+                if existing_gen > self._generation:
+                    logger.debug(
+                        "Stale worker '%s' (generation %d) skipped context save: "
+                        "file already has generation %d",
+                        self.worker_name, self._generation, existing_gen,
+                    )
+                    return
+            except (json.JSONDecodeError, OSError, TypeError, ValueError):
+                pass
         ctx_data = self._worker_ctx.to_persistable_dict()
         data = {
             **ctx_data,
@@ -1592,8 +1732,10 @@ class WorkerThread(threading.Thread):
             "error": self.error,
             "current_task": self.current_task,
             "last_heartbeat": self.last_heartbeat,
+            "last_query": self._last_query,
+            "last_completed_query": self._last_completed_query,
+            "generation": self._generation,
         }
-        target = self._context_path()
         target.parent.mkdir(parents=True, exist_ok=True)
         # Write to a temp file in the same directory (atomic on same filesystem)
         fd, tmp_path_str = tempfile.mkstemp(
@@ -2015,6 +2157,10 @@ class Worker(ToolBase):
                 except Exception as exc:
                     logger.exception("Error stopping stale worker '%s': %s", worker_label, exc)
                 finally:
+                    # F3: compact summarized history before persisting so a
+                    # force-stop right after SummarizeTool does not persist ~2x.
+                    if thread._worker_ctx is not None:
+                        thread._worker_ctx.compact_after_summary()
                     thread._save_context()
                     with _registry_lock:
                         _worker_registry.pop((sid, self.worker_name), None)
@@ -2054,19 +2200,22 @@ class Worker(ToolBase):
             resume_paused_worker.resume()
 
             # Drain stale None signals left by pause() in the input queue.
-            # The worker thread will pick up our real query below.
+            # If a real query was queued by someone else, keep it — but the
+            # NEW spawn query runs FIRST (F4 FIFO): it is enqueued before the
+            # stale item, which is re-queued at the tail and processed after.
+            stale_query = None
             try:
                 while True:
                     item = resume_paused_worker._input_queue.get_nowait()
                     if item is not None:
-                        # Real query queued by someone else — put it back,
-                        # then append ours after it.
-                        resume_paused_worker._input_queue.put(item)
+                        stale_query = item
                         break
             except queue.Empty:
                 pass
 
             resume_paused_worker._input_queue.put(query)
+            if stale_query is not None:
+                resume_paused_worker._input_queue.put(stale_query)
             try:
                 final_result = resume_paused_worker._output_queue.get(timeout=SPAWN_QUEUE_TIMEOUT)
             except queue.Empty:
@@ -2445,6 +2594,8 @@ class Worker(ToolBase):
                     logger.exception("Error stopping worker '%s'", worker_label)
                     stopped_info.append({"session_id": sid, "error": str(exc)})
                 finally:
+                    if t._worker_ctx is not None:
+                        t._worker_ctx.compact_after_summary()
                     t._save_context()
                     with _registry_lock:
                         _worker_registry.pop((sid, self.worker_name), None)
@@ -2465,6 +2616,8 @@ class Worker(ToolBase):
         if not thread.is_alive():
             with _registry_lock:
                 _worker_registry.pop((session_key, self.worker_name), None)
+            if thread._worker_ctx is not None:
+                thread._worker_ctx.compact_after_summary()
             thread._save_context()
             return {
                 "worker_name": self.worker_name,
@@ -2504,6 +2657,8 @@ class Worker(ToolBase):
                 "error": f"Error stopping worker '{self.worker_name}': {exc}",
             }
         finally:
+            if thread._worker_ctx is not None:
+                thread._worker_ctx.compact_after_summary()
             thread._save_context()
             with _registry_lock:
                 _worker_registry.pop((session_key, self.worker_name), None)

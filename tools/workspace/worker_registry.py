@@ -152,6 +152,10 @@ class WorkerRegistry:
                 logger.exception("Error joining worker '%s' during shutdown", worker_label)
             finally:
                 try:
+                    # F3: compact summarized history before persisting so a
+                    # shutdown right after SummarizeTool does not persist ~2x.
+                    if thread._worker_ctx is not None:
+                        thread._worker_ctx.compact_after_summary()
                     thread._save_context()
                 except Exception:
                     logger.exception("Error saving context for worker '%s' during shutdown", worker_label)
