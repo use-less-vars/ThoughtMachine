@@ -123,6 +123,7 @@ config_snapshot.json
 
 # Local working docs — not part of the repo
 docs/
+docs/container_registry_design.md
 
 # Root-only Dockerfile pattern: ignores the repo-root Dockerfile (a stray
 # build artifact) but NOT resources/resource_dockerfile.txt — the tracked seed
