@@ -99,6 +99,15 @@ RESOURCE_IMAGE_BUILD_CMD = (
     f"docker build -t {RESOURCE_IMAGE_TAG} {RESOURCE_IMAGE_DOCKERFILE_DIR}"
 )
 
+# Phase 3: optional ContainerRegistry delegation behind the session-config
+# `use_container_registry` flag. Defensive import — the registry must never
+# break the legacy path when it is unavailable.
+try:
+    from infra.registry_wiring import get_active_registry, is_registry_active
+except Exception:  # pragma: no cover - registry not wired
+    get_active_registry = None
+    is_registry_active = lambda session_config: False  # noqa: E731
+
 # Module-level image-readiness cache + single-flight lock. Only SUCCESS is
 # cached (_RESOURCE_IMAGE_READY=True); a failed check/build is retried on the
 # next call.
@@ -367,6 +376,13 @@ class ResourceContainerManager:
                 docker build -t tm-resource-git ~/.thoughtmachine/docker/resource/
         vault_root: Reserved for future audit/config use; NEVER mounted into
             the container.
+        session_config: Optional session config dict; the registry feature
+            flag ``use_container_registry`` is read from it. When set and
+            the registry is active, ``ensure_container`` delegates the fresh
+            create to ``ContainerRegistry.create_resource_container``
+            (design doc docs/container_registry_design.md §6).
+        session_id: Optional session id the resource container is registered
+            under (registry bookkeeping only).
     """
 
     # Resource marker label: any value of ``thoughtmachine.resource`` marks a
@@ -383,6 +399,8 @@ class ResourceContainerManager:
         network_mode="none",
         image=RESOURCE_IMAGE_TAG,
         vault_root=None,
+        session_config=None,
+        session_id=None,
     ):
         if docker is None:
             raise RuntimeError(
@@ -393,11 +411,33 @@ class ResourceContainerManager:
         self.network_mode = network_mode or "none"
         self.image = image
         self.vault_root = vault_root
+        self.session_config = session_config
+        self.session_id = session_id
         # Fixed quotas (mirror the agent-tool defaults; not constructor params
         # by design — the git sandbox is a fixed-shape resource).
         self.mem_limit = "512m"
         self.cpu_quota = 50000
         self.client = docker.from_env()
+
+    # -------------------------------------------------- registry facade
+    @property
+    def _registry_active(self) -> bool:
+        """True when the registry feature flag is on AND usable.
+
+        Falls back to the legacy create path when the registry is disabled
+        or has no usable docker client.
+        """
+        try:
+            return bool(is_registry_active(self.session_config))
+        except Exception:
+            return False
+
+    @property
+    def _registry(self):
+        """Lazily-resolved registry facade for this manager's session config."""
+        if get_active_registry is None:
+            return None
+        return get_active_registry(self.session_config)
 
     # ------------------------------------------------------------------ names
     @property
@@ -525,6 +565,29 @@ class ResourceContainerManager:
             "/home/agent": "rw,exec,size=256M,uid=1000,gid=1000",
         }
         try:
+            if self._registry_active:
+                # Phase 3: the registry facade owns the hardened create
+                # (design doc §6.2). The /workspace bind is always added by
+                # the registry from workspace_path (rw); the linked-worktree
+                # main-repo and .venv mounts computed above are passed as
+                # extras. The registry returns the same shape of handle; its
+                # create failure is wrapped identically below.
+                handle = self._registry.create_resource_container(
+                    session_id=self.session_id or "resource",
+                    workspace_id=self.workspace_id,
+                    network_mode=self.network_mode,
+                    workspace_path=self.workspace_path,
+                    name=name,
+                    mounts=[
+                        {
+                            "source": m["source"],
+                            "target": m["target"],
+                            "mode": "ro" if m["read_only"] else "rw",
+                        }
+                        for m in mounts[1:]
+                    ],
+                )
+                return handle["id"]
             container = self.client.containers.run(
                 image=self.image,
                 name=name,

@@ -83,6 +83,16 @@ from thoughtmachine.audit_logger import audit_event
 
 _audit = lambda event, data: audit_event(event, data)
 
+try:
+    from infra.registry_wiring import get_active_registry, is_registry_active
+except ImportError:  # pragma: no cover - defensive
+    def get_active_registry(session_config=None):
+        return None
+
+    def is_registry_active(session_config=None):
+        return False
+
+
 # ── Output truncation (mirrors DockerCodeRunner._truncate_output) ──────────
 EXEC_OUTPUT_LIMIT_BYTES = 100 * 1024
 _TRUNCATION_NOTICE = "\n...[output truncated at 100KB]..."
@@ -360,6 +370,27 @@ class ContainerManager:
                 f"Unexpected error writing container notes {notes_path}: {e}")
 
     # ── Public API ─────────────────────────────────────────────────────────
+    @property
+    def _registry(self):
+        """Lazily-resolved ContainerRegistry facade (wired per session config)."""
+        return get_active_registry(self._session_config)
+
+    def _resolve_registry_name(self, container_id):
+        """Map a container id (or name) to the registry's registered name.
+
+        Returns None when the container is not tracked by the registry (e.g.
+        a legacy container created before the flag was enabled) — callers
+        then fall back to the legacy docker path.
+        """
+        try:
+            handles = self._registry.list_all()
+        except Exception:
+            return None
+        for handle in handles or []:
+            if handle.get("id") == container_id or handle.get("name") == container_id:
+                return handle.get("name")
+        return None
+
     def start(self, image=None, name=None, note=None):
         """Ensure a running container exists and return {"id", "name", "status", "note"}.
 
@@ -403,7 +434,10 @@ class ContainerManager:
                 return {**entry, "status": "reused", "id": entry["container_id"],
                         "note": note_value}
         limit = self._get_max_containers()
-        if len(containers) >= limit:
+        # When the registry is active it owns the per-session limit; the
+        # legacy workspace-scoped check is skipped so the registry is the
+        # single source of truth for container counts.
+        if len(containers) >= limit and not is_registry_active(self._session_config):
             return {"error": f"Workspace container limit ({limit}) reached. "
                              f"Stop an unused container first."}
 
@@ -510,6 +544,49 @@ class ContainerManager:
         }
         _audit("CONTAINER_CREATE",
                f"image={image} network={network_mode} name={name} session={self.session_id}")
+
+        # Phase 3 facade: with the registry active, the fresh create (and the
+        # per-session limit) is delegated to the registry's single hardened
+        # creation path.  The registry generates the docker name; the facade
+        # keeps its own ``name`` as the label ``thoughtmachine.container_name``
+        # so label-based reuse still works on later start() calls.
+        if is_registry_active(self._session_config):
+            registry = self._registry
+            try:
+                handle = registry.request_container(
+                    self.session_id or "unknown",
+                    self.session_id or "default",
+                    self.session_permissions or {},
+                    image=image,
+                    mem_limit=self.mem_limit,
+                    cpu_quota=self.cpu_quota,
+                    oom_score_adj=1000,
+                    labels=labels,
+                    environment={"PYTHONUSERBASE": "/home/agent/.local"},
+                    mounts=[{
+                        "source": self.workspace_path,
+                        "target": "/workspace",
+                        "mode": "ro" if workspace_mode != "rw" else "rw",
+                    }],
+                    volumes=[f"tm-packages-{self.workspace_id}:/home/agent/.local"],
+                    tmpfs=tmpfs,
+                    name=name,
+                )
+            except RuntimeError as exc:
+                if "Container limit reached" in str(exc):
+                    return {"error": f"Workspace container limit reached: {exc}"}
+                raise
+            container_id = handle["id"]
+            container_name = handle["name"]
+            self._containers[name] = container_id
+            if note is not None:
+                self.container_notes[name] = {"note": note}
+                self._save_container_notes()
+            _audit("CONTAINER_CREATE",
+                   f"source=registry image={image} name={container_name} "
+                   f"session={self.session_id} workspace_id={self.workspace_id}")
+            return {"id": container_id, "name": name, "status": "created",
+                    "note": note or ""}
 
         container = self.client.containers.run(
             image=image,
@@ -632,6 +709,17 @@ class ContainerManager:
 
     def stop(self, container_id):
         """Stop the container. Idempotent; NEVER raises."""
+        if is_registry_active(self._session_config):
+            name = self._resolve_registry_name(container_id)
+            if name is not None:
+                try:
+                    self._registry.destroy_container(name)
+                except Exception as e:
+                    return {"status": "error", "container_id": container_id,
+                            "error": str(e)}
+                self._drop_container(container_id)
+                return {"status": "stopped", "container_id": container_id,
+                        "name": name}
         try:
             container = self.client.containers.get(container_id)
         except NotFound:
@@ -665,6 +753,17 @@ class ContainerManager:
             {"status": "removed", "container_id": ...}
             {"status": "error", "container_id": ..., "error": ...}
         """
+        if is_registry_active(self._session_config):
+            name = self._resolve_registry_name(container_id)
+            if name is not None:
+                try:
+                    self._registry.destroy_container(name)
+                except Exception as e:
+                    return {"status": "error", "container_id": container_id,
+                            "error": str(e)}
+                self._drop_container(container_id)
+                return {"status": "removed", "container_id": container_id,
+                        "name": name}
         stopped = self.stop(container_id)
         if stopped.get("status") not in ("stopped", "missing"):
             return stopped

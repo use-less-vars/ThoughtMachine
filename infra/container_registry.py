@@ -17,6 +17,7 @@ standalone and imports nothing from the rest of the tree.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 import time
@@ -57,6 +58,16 @@ log = logging.getLogger("infra.container_registry")
 
 # Mirrors infra/resource_container_manager.py L96 (the resource git image tag).
 RESOURCE_IMAGE_TAG = "tm-resource-git"
+
+# Resource-container identity (mirrors infra/resource_container_manager.py
+# RESOURCE_LABEL / RESOURCE_KIND / _labels L374-421 and the deterministic
+# tm-res-<sha256(workspace_path)[:12]>-git name L404-413).
+RESOURCE_LABEL = "thoughtmachine.resource"
+RESOURCE_KIND = "git"
+WORKSPACE_ID_LABEL = "thoughtmachine.workspace_id"
+CONTAINER_NAME_LABEL = "thoughtmachine.container_name"
+RESOURCE_MEM_LIMIT = "512m"
+RESOURCE_CPU_QUOTA = 50000
 
 # Mirrors infra/container_manager.py's default image.
 DEFAULT_IMAGE = "agent-executor"
@@ -344,6 +355,126 @@ class ContainerRegistry:
             "status": "running",
             "container_type": container_type,
         }
+
+    def create_resource_container(self, session_id, workspace_id, network_mode, *,
+                                  workspace_path=None, mounts=None, name=None) -> dict:
+        """Create + register the workspace's hidden git resource container.
+
+        The privileged counterpart to ``request_container`` for the
+        main-agent / ResourceContainerManager path (design doc §6): bypasses
+        the resource guard because THIS method is the sanctioned
+        resource-container factory (``request_container`` keeps rejecting
+        ``tm-res-*`` / ``resource`` requests, §2.7).
+
+        Mirrors ``ResourceContainerManager.ensure_container``'s fresh-create
+        shape (resource_container_manager.py L404-546):
+          name       tm-res-<sha256(workspace_path)[:12]>-git (or caller name)
+          image      RESOURCE_IMAGE_TAG ("tm-resource-git")
+          labels     thoughtmachine.resource=git + workspace/container-name
+          mem/cpu    "512m" / 50000; oom_score_adj 500 (resource default)
+          mounts     /workspace bind ALWAYS rw (added from workspace_path)
+                     + caller-supplied extras (linked-worktree main repo rw,
+                     .venv ro) — resolved by the caller
+          no package volume / no PYTHONUSERBASE (absent by design, §6.2)
+        ``network_mode`` defaults to "none" when falsy (fail closed, §6.3).
+
+        The image is ensured via ``resource_container_manager._ensure_resource_image``
+        (single-flight, success-cached, never raises — §6.1: the registry
+        never builds/copies the Dockerfile itself); an unavailable image
+        raises RuntimeError with the manual build command.
+
+        Raises:
+            RuntimeError  when disabled / no docker client / image missing.
+            ValueError    when neither ``workspace_path`` nor ``name`` is
+                          given (no deterministic name can be derived).
+
+        Returns a handle dict {"id", "name", "status": "running",
+        "container_type": "resource"}.
+        """
+        if not self.is_enabled():
+            raise RuntimeError("ContainerRegistry is disabled")
+        if not self._docker_available or self._docker_client is None:
+            raise RuntimeError("Docker client unavailable")
+        if name is None and not workspace_path:
+            raise ValueError(
+                "create_resource_container requires workspace_path (or name)"
+            )
+        if name is None:
+            ws_hash = hashlib.sha256(workspace_path.encode("utf-8")).hexdigest()[:12]
+            name = f"tm-res-{ws_hash}-git"
+
+        self._ensure_resource_image_or_raise()
+
+        profile_mounts = []
+        if workspace_path:
+            # The workspace bind is ALWAYS read-write for the git sandbox
+            # (resource_container_manager.py L467-480); never caller-tunable.
+            profile_mounts.append(
+                {"source": workspace_path, "target": "/workspace", "mode": "rw"}
+            )
+        for extra in mounts or []:
+            profile_mounts.append(dict(extra))
+
+        profile = ContainerProfile(
+            image=RESOURCE_IMAGE_TAG,
+            container_type="resource",
+            network_mode=network_mode or "none",
+            mem_limit=RESOURCE_MEM_LIMIT,
+            cpu_quota=RESOURCE_CPU_QUOTA,
+            labels={
+                RESOURCE_LABEL: RESOURCE_KIND,
+                WORKSPACE_ID_LABEL: str(workspace_id),
+                CONTAINER_NAME_LABEL: name,
+            },
+            mounts=profile_mounts,
+        )
+        container = create_hardened_container(self._docker_client, profile, name)
+        container_id = getattr(container, "id", "") or ""
+        self.register(name, session_id, workspace_id, "resource", profile)
+        with self._lock:
+            state = self._containers.get(name)
+            if state is not None:
+                state["status"] = "running"
+                state["container_id"] = container_id
+        log.info(
+            "create_resource_container: created %s (network=%s) for session %s",
+            name, profile.network_mode, session_id,
+        )
+        return {
+            "id": container_id,
+            "name": name,
+            "status": "running",
+            "container_type": "resource",
+        }
+
+    def _ensure_resource_image_or_raise(self) -> None:
+        """Ensure the resource git image exists (auto-build if needed).
+
+        Lazy import of ``resource_container_manager._ensure_resource_image``
+        keeps this module standalone at import time (design doc §6.1); a
+        defensive fallback checks the local image via our own docker client.
+        Never caches a failure here — raises RuntimeError with the manual
+        build command instead.
+        """
+        try:
+            from infra.resource_container_manager import _ensure_resource_image
+        except Exception:  # pragma: no cover - defensive
+            _ensure_resource_image = None
+        if _ensure_resource_image is not None:
+            if _ensure_resource_image():
+                return
+        else:
+            try:
+                self._docker_client.images.get(RESOURCE_IMAGE_TAG)
+                return
+            except (docker.errors.ImageNotFound, docker.errors.DockerException, AttributeError):
+                pass
+        raise RuntimeError(
+            f"Resource image '{RESOURCE_IMAGE_TAG}' is not available "
+            f"(auto-build failed or Docker unreachable). "
+            f"Build it manually: docker build -t {RESOURCE_IMAGE_TAG} "
+            f"<vault_root>/docker/resource"
+        )
 
     def get_containers_for_session(self, session_id) -> list:
         """Handles (id/name/status/container_type) for a session's containers."""
