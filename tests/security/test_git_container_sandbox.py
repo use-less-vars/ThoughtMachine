@@ -203,11 +203,11 @@ def test_resource_container_hidden_from_agent_listing(resource_manager, tmp_path
     any container whose labels contain ``thoughtmachine.resource``.
 
     NOTE: this assertion FAILS against the current (un-patched)
-    ``tools/container_manager.py`` — the resource container would appear,
+    ``infra.container_manager.py`` — the resource container would appear,
     because the listing filters by workspace label only. The test documents
     and guards the contract; it passes once the exclusion diff is applied.
     """
-    from tools.container_manager import ContainerManager
+    from infra.container_manager import ContainerManager
 
     # vault_root is pinned inside tmp_path so the REAL ContainerManager never
     # touches the user's ~/.thoughtmachine during the test.
@@ -225,5 +225,5 @@ def test_resource_container_hidden_from_agent_listing(resource_manager, tmp_path
     assert resource_id not in listed_ids, (
         "resource container leaked into agent-facing list_containers() — "
         "apply the thoughtmachine.resource exclusion diff "
-        "(tools/container_manager.py list_containers)"
+        "(infra.container_manager.py list_containers)"
     )

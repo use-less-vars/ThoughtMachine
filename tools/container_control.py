@@ -52,7 +52,7 @@ except ImportError:
     NotFound = Exception
 
 try:
-    from .container_manager import ContainerManager
+    from infra.container_manager import ContainerManager
 except ImportError:
     ContainerManager = None
 
@@ -98,7 +98,7 @@ class _ContainerControlBase(ToolBase):
         if ContainerManager is None:
             raise RuntimeError(
                 "Could not import ContainerManager. Make sure docker package is "
-                "installed and tools/container_manager.py exists."
+                "installed and infra.container_manager.py exists."
             )
         ws = self._resolve_registry_workspace()
         if ws is None:

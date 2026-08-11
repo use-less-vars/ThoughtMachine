@@ -227,7 +227,7 @@ def test_list_containers_endpoint(contract_server):
     fake = _make_fake_manager()
     with _registered_ws(tmp_home) as ws_path:
         with TestClient(app) as client:
-            with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+            with mock.patch("infra.container_manager.ContainerManager") as cm_cls:
                 cm_cls.return_value = fake
                 resp = client.get(
                     "/api/workspace/ws-1/containers",
@@ -255,7 +255,7 @@ def test_list_containers_manager_failure(contract_server):
     with _registered_ws(tmp_home) as ws_path:
         with TestClient(app) as client:
             with mock.patch(
-                "tools.container_manager.ContainerManager",
+                "infra.container_manager.ContainerManager",
                 side_effect=RuntimeError("boom"),
             ):
                 resp = client.get(
@@ -274,7 +274,7 @@ def test_status_endpoint(contract_server):
     fake = _make_fake_manager()
     with _registered_ws(tmp_home) as ws_path:
         with TestClient(app) as client:
-            with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+            with mock.patch("infra.container_manager.ContainerManager") as cm_cls:
                 cm_cls.return_value = fake
                 resp = client.get(
                     "/api/workspace/ws-1/containers/box-a/status",
@@ -292,7 +292,7 @@ def test_status_not_found(contract_server):
     fake = _make_fake_manager()
     with _registered_ws(tmp_home) as ws_path:
         with TestClient(app) as client:
-            with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+            with mock.patch("infra.container_manager.ContainerManager") as cm_cls:
                 cm_cls.return_value = fake
                 resp = client.get(
                     "/api/workspace/ws-1/containers/nope/status",
@@ -310,7 +310,7 @@ def test_start_with_note(contract_server):
     fake = _make_fake_manager()
     with _registered_ws(tmp_home) as ws_path:
         with TestClient(app) as client:
-            with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+            with mock.patch("infra.container_manager.ContainerManager") as cm_cls:
                 cm_cls.return_value = fake
                 resp = client.post(
                     "/api/workspace/ws-1/containers/box-a/start",
@@ -332,7 +332,7 @@ def test_start_limit_conflict(contract_server):
     }
     with _registered_ws(tmp_home) as ws_path:
         with TestClient(app) as client:
-            with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+            with mock.patch("infra.container_manager.ContainerManager") as cm_cls:
                 cm_cls.return_value = fake
                 resp = client.post(
                     "/api/workspace/ws-1/containers/box-a/start",
@@ -351,7 +351,7 @@ def test_stop_endpoint(contract_server):
     fake = _make_fake_manager()
     with _registered_ws(tmp_home) as ws_path:
         with TestClient(app) as client:
-            with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+            with mock.patch("infra.container_manager.ContainerManager") as cm_cls:
                 cm_cls.return_value = fake
                 resp = client.post(
                     "/api/workspace/ws-1/containers/box-a/stop",
@@ -370,7 +370,7 @@ def test_delete_endpoint(contract_server):
     fake = _make_fake_manager()
     with _registered_ws(tmp_home) as ws_path:
         with TestClient(app) as client:
-            with mock.patch("tools.container_manager.ContainerManager") as cm_cls:
+            with mock.patch("infra.container_manager.ContainerManager") as cm_cls:
                 cm_cls.return_value = fake
                 resp = client.delete(
                     "/api/workspace/ws-1/containers/box-a",

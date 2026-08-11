@@ -2525,7 +2525,7 @@ def _make_container_manager(workspace_id: str, workspace_path: str = ""):
     path = _resolve_workspace_path(workspace_id, workspace_path)
     if not path:
         return None
-    from tools.container_manager import ContainerManager
+    from infra.container_manager import ContainerManager
     return ContainerManager(
         workspace_path=path,
         workspace_id=workspace_id,

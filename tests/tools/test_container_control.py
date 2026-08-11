@@ -28,7 +28,7 @@ import pytest
 from pydantic import ValidationError
 
 from tools.container_control import ContainerBuildTool, ContainerListTool, ContainerLogsTool
-from tools.container_manager import (
+from infra.container_manager import (
     ContainerManager,
     NotFound,
     EXEC_OUTPUT_LIMIT_BYTES,
@@ -307,7 +307,7 @@ class TestContainerManagerBuildImage:
         dex._compute_image_tag.side_effect = lambda ws: "agent-executor-test"
         return dex
 
-    @patch("tools.container_manager.DOCKER_AVAILABLE", True)
+    @patch("infra.container_manager.DOCKER_AVAILABLE", True)
     def test_build_success_with_auto_tag_and_exact_keys(self, tmp_path):
         """Dockerfile present, tag omitted -> auto-tag; result has EXACT keys."""
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
@@ -315,7 +315,7 @@ class TestContainerManagerBuildImage:
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
         captured = {}
 
-        with patch("tools.container_manager._load_docker_executor") as mock_load:
+        with patch("infra.container_manager._load_docker_executor") as mock_load:
             dex = self._mock_dex()
 
             def _capture_build(client, build_path, dockerfile, tag, **kw):
@@ -342,26 +342,26 @@ class TestContainerManagerBuildImage:
         assert captured["path"] != str(tmp_path)
         assert captured["listing"] == ["Dockerfile"]
 
-    @patch("tools.container_manager.DOCKER_AVAILABLE", True)
+    @patch("infra.container_manager.DOCKER_AVAILABLE", True)
     def test_missing_vault_dockerfile_raises(self, tmp_path):
         """No vault Dockerfile in workspace -> clear RuntimeError, executor never used."""
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
 
-        with patch("tools.container_manager._load_docker_executor") as mock_load:
+        with patch("infra.container_manager._load_docker_executor") as mock_load:
             with pytest.raises(RuntimeError, match="Vault Dockerfile not found"):
                 manager.build_image()
 
         mock_load.assert_not_called()
 
-    @patch("tools.container_manager.DOCKER_AVAILABLE", True)
+    @patch("infra.container_manager.DOCKER_AVAILABLE", True)
     def test_vault_dockerfile_with_explicit_tag(self, tmp_path):
         """Explicit tag + vault Dockerfile -> used as-is, auto-tag skipped."""
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
 
-        with patch("tools.container_manager._load_docker_executor") as mock_load:
+        with patch("infra.container_manager._load_docker_executor") as mock_load:
             dex = self._mock_dex()
             dex._run_image_build.return_value = ("sha256:def", ["Step 1"])
             mock_load.return_value = dex
@@ -377,14 +377,14 @@ class TestContainerManagerBuildImage:
         assert args[3] == "my-tag:1"
         dex._compute_image_tag.assert_not_called()
 
-    @patch("tools.container_manager.DOCKER_AVAILABLE", True)
+    @patch("infra.container_manager.DOCKER_AVAILABLE", True)
     def test_build_log_truncated_at_100kb(self, tmp_path):
         """Build log > EXEC_OUTPUT_LIMIT_BYTES (100 KiB) -> truncated + notice."""
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
 
-        with patch("tools.container_manager._load_docker_executor") as mock_load:
+        with patch("infra.container_manager._load_docker_executor") as mock_load:
             dex = self._mock_dex()
             dex._run_image_build.return_value = (
                 "sha256:abc", ["x" * 50000, "y" * 50000, "z" * 5000],
@@ -396,14 +396,14 @@ class TestContainerManagerBuildImage:
         assert "truncated" in result["build_log"]
         assert len(result["build_log"]) <= EXEC_OUTPUT_LIMIT_BYTES + len(_TRUNCATION_NOTICE)
 
-    @patch("tools.container_manager.DOCKER_AVAILABLE", True)
+    @patch("infra.container_manager.DOCKER_AVAILABLE", True)
     def test_build_failure_raises_runtime_error(self, tmp_path):
         """_run_image_build raising -> RuntimeError propagates unchanged."""
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
 
-        with patch("tools.container_manager._load_docker_executor") as mock_load:
+        with patch("infra.container_manager._load_docker_executor") as mock_load:
             dex = self._mock_dex()
             dex._run_image_build.side_effect = RuntimeError("Docker build failed: boom")
             mock_load.return_value = dex
@@ -411,20 +411,20 @@ class TestContainerManagerBuildImage:
             with pytest.raises(RuntimeError, match="boom"):
                 manager.build_image()
 
-    @patch("tools.container_manager.DOCKER_AVAILABLE", True)
+    @patch("infra.container_manager.DOCKER_AVAILABLE", True)
     def test_planted_non_vault_dockerfile_not_used(self, tmp_path):
         """Vault-gating: a planted non-vault Dockerfile is NOT a fallback."""
         (tmp_path / "Dockerfile.custom").write_text("FROM python:3.12-slim\n")
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
 
-        with patch("tools.container_manager._load_docker_executor") as mock_load:
+        with patch("infra.container_manager._load_docker_executor") as mock_load:
             with pytest.raises(RuntimeError, match="Vault Dockerfile not found"):
                 manager.build_image(tag="x:1")
 
         mock_load.assert_not_called()  # planted file ignored, no build attempted
 
-    @patch("tools.container_manager.DOCKER_AVAILABLE", True)
+    @patch("infra.container_manager.DOCKER_AVAILABLE", True)
     def test_build_image_context_excludes_workspace_files(self, tmp_path):
         """Security: build context contains ONLY the vault Dockerfile.
 
@@ -461,7 +461,7 @@ class TestContainerManagerBuildImage:
                 assert fh.read() == "FROM python:3.12-slim\n"
             return "sha256:abc123", ["Step 1/2 : FROM python:3.12-slim"]
 
-        with patch("tools.container_manager._load_docker_executor") as mock_load:
+        with patch("infra.container_manager._load_docker_executor") as mock_load:
             dex = self._mock_dex()
             dex._run_image_build.side_effect = _capture_build
             mock_load.return_value = dex
@@ -475,7 +475,7 @@ class TestContainerManagerBuildImage:
         assert not os.path.exists(captured["path"])  # temp build dir cleaned up
         assert (ws / "sensitive_file.txt").exists()  # workspace file untouched
 
-    @patch("tools.container_manager.DOCKER_AVAILABLE", True)
+    @patch("infra.container_manager.DOCKER_AVAILABLE", True)
     def test_build_image_tempdir_cleaned_up(self, tmp_path):
         """Temporary build directory is removed after a successful build."""
         (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
@@ -483,7 +483,7 @@ class TestContainerManagerBuildImage:
         mock_client = MagicMock()
         manager = self._manager(mock_client, str(tmp_path), vault_root=str(tmp_path))
 
-        with patch("tools.container_manager._load_docker_executor") as mock_load:
+        with patch("infra.container_manager._load_docker_executor") as mock_load:
             dex = self._mock_dex()
             dex._run_image_build.return_value = ("sha256:x", ["Step 1"])
             mock_load.return_value = dex
@@ -625,7 +625,7 @@ class TestContainerManagerGetLogs:
         manager.client.containers.get.return_value = logs_mock
         return manager, logs_mock
 
-    @patch("tools.container_manager.DOCKER_AVAILABLE", True)
+    @patch("infra.container_manager.DOCKER_AVAILABLE", True)
     def test_success_decodes_stdout_and_stderr(self):
         manager, logs_mock = self._manager(
             _framed_logs([b"hello\n", b"world\n"], [b"err1\n", b"err2\n"])
@@ -639,7 +639,7 @@ class TestContainerManagerGetLogs:
             stdout=True, stderr=True, tail=100, since=None
         )
 
-    @patch("tools.container_manager.DOCKER_AVAILABLE", True)
+    @patch("infra.container_manager.DOCKER_AVAILABLE", True)
     def test_tail_and_since_passthrough(self):
         manager, logs_mock = self._manager()
         manager.get_logs(container_id="c1", tail=50, since="10m")
@@ -647,7 +647,7 @@ class TestContainerManagerGetLogs:
             stdout=True, stderr=True, tail=50, since="10m"
         )
 
-    @patch("tools.container_manager.DOCKER_AVAILABLE", True)
+    @patch("infra.container_manager.DOCKER_AVAILABLE", True)
     def test_truncated_at_100kb(self):
         big = b"x" * 103000  # > EXEC_OUTPUT_LIMIT_BYTES (102400)
         manager, _ = self._manager(_framed_logs([b"ok\n"], [big]))
@@ -658,7 +658,7 @@ class TestContainerManagerGetLogs:
         assert len(result["stderr"]) <= EXEC_OUTPUT_LIMIT_BYTES + 40
         assert result["stdout"] == "ok\n"  # small stream untouched
 
-    @patch("tools.container_manager.DOCKER_AVAILABLE", True)
+    @patch("infra.container_manager.DOCKER_AVAILABLE", True)
     def test_raw_tty_output_falls_back_to_stdout(self):
         # No frame headers (tty containers) -> whole payload treated as stdout.
         manager, _ = self._manager(b"plain log line\n")
@@ -666,7 +666,7 @@ class TestContainerManagerGetLogs:
         assert result["stdout"] == "plain log line\n"
         assert result["stderr"] == ""
 
-    @patch("tools.container_manager.DOCKER_AVAILABLE", True)
+    @patch("infra.container_manager.DOCKER_AVAILABLE", True)
     def test_container_not_found_raises(self):
         manager = ContainerManager.__new__(ContainerManager)
         manager.client = MagicMock()
@@ -676,7 +676,7 @@ class TestContainerManagerGetLogs:
         with pytest.raises(RuntimeError, match="Container abc not found"):
             manager.get_logs(container_id="abc")
 
-    @patch("tools.container_manager.DOCKER_AVAILABLE", True)
+    @patch("infra.container_manager.DOCKER_AVAILABLE", True)
     def test_access_error_raises(self):
         manager = ContainerManager.__new__(ContainerManager)
         manager.client = MagicMock()
@@ -684,7 +684,7 @@ class TestContainerManagerGetLogs:
         with pytest.raises(RuntimeError, match="Failed to access container abc"):
             manager.get_logs(container_id="abc")
 
-    @patch("tools.container_manager.DOCKER_AVAILABLE", True)
+    @patch("infra.container_manager.DOCKER_AVAILABLE", True)
     def test_daemon_error_raises(self):
         manager, logs_mock = self._manager()
         logs_mock.logs.side_effect = Exception("daemon down")

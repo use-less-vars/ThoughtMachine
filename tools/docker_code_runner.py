@@ -38,7 +38,7 @@ except ImportError:
     APIError = Exception
 
 try:
-    from .container_manager import ContainerManager
+    from infra.container_manager import ContainerManager
 except ImportError:
     ContainerManager = None
 
@@ -320,7 +320,7 @@ chmod +x "{script_path}"
             return self._truncate_output(self._build_json_response(
                 success=False,
                 exit_code=-1,
-                error="Could not import ContainerManager. Make sure docker package is installed and tools/container_manager.py exists.",
+                error="Could not import ContainerManager. Make sure docker package is installed and infra.container_manager.py exists.",
                 duration=duration
             ))
 

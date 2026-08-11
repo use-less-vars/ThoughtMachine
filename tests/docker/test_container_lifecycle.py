@@ -38,9 +38,9 @@ _SRC_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _SRC_ROOT not in sys.path:
     sys.path.insert(0, _SRC_ROOT)
 
-# NOTE: the container machinery (tools.container_manager / docker_executor) is
+# NOTE: the container machinery (infra.container_manager / docker_executor) is
 # imported LAZILY inside the test methods, never at module import time.
-# Importing tools.container_manager here would pull in the whole ``tools``
+# Importing infra.container_manager here would pull in the whole ``tools``
 # package, which triggers a circular-import cascade (agent.logging is left
 # mid-import while thoughtmachine.security runs its ``from agent.events
 # import global_event_bus, EventType, create_event``). That ImportError sends
@@ -137,7 +137,7 @@ class TestContainerLifecycle:
 
     def _start_manager(self, session_permissions=None, workspace_id=None, session_id=None):
         """Start a ContainerManager-backed container and track it for teardown."""
-        from tools.container_manager import ContainerManager  # lazy (see module docstring)
+        from infra.container_manager import ContainerManager  # lazy (see module docstring)
         manager = ContainerManager(
             workspace_path=str(self.workspace_dir),
             session_id=session_id,
@@ -213,7 +213,7 @@ class TestContainerLifecycle:
 
     def test_workspace_cleanup_removes_containers(self):
         """cleanup_workspace removes every container labelled with the workspace id."""
-        from tools.container_manager import cleanup_workspace  # lazy
+        from infra.container_manager import cleanup_workspace  # lazy
         workspace_id = uuid.uuid4()
         session_id = uuid.uuid4()
         manager, res = self._start_manager(workspace_id=workspace_id, session_id=session_id)
@@ -229,7 +229,7 @@ class TestContainerLifecycle:
 
     def test_orphan_cleanup_fake_workspace_label(self):
         """Orphaned containers carrying a workspace label are reclaimed."""
-        from tools.container_manager import cleanup_workspace  # lazy
+        from infra.container_manager import cleanup_workspace  # lazy
         fake_workspace_id = str(uuid.uuid4())
         orphan = self.client.containers.run(
             image=self.image_tag,
@@ -251,7 +251,7 @@ class TestContainerLifecycle:
 
     def test_multi_session_shares_container_for_same_workspace(self):
         """Same workspace_id + same name across sessions reuses ONE container."""
-        from tools.container_manager import ContainerManager  # lazy
+        from infra.container_manager import ContainerManager  # lazy
         workspace_id = uuid.uuid4()
         session_id_1 = uuid.uuid4()
         session_id_2 = uuid.uuid4()
@@ -285,7 +285,7 @@ class TestContainerLifecycle:
 
     def test_container_limit_enforced_before_create(self):
         """max_containers=1: second distinct name rejected, same name reused."""
-        from tools.container_manager import ContainerManager  # lazy
+        from infra.container_manager import ContainerManager  # lazy
         workspace_id = uuid.uuid4()
         manager = ContainerManager(
             workspace_path=str(self.workspace_dir),
@@ -556,9 +556,9 @@ class TestContainerNoteFileStore:
     """
 
     def _make_manager(self, fake_containers, workspace_id, vault_root):
-        # Lazy import: top-level import of tools.container_manager triggers the
+        # Lazy import: top-level import of infra.container_manager triggers the
         # thoughtmachine.security circular-import cascade (see module docstring).
-        from tools.container_manager import ContainerManager
+        from infra.container_manager import ContainerManager
 
         manager = ContainerManager.__new__(ContainerManager)
         manager.workspace_path = "/tmp/tm-note-test-ws"

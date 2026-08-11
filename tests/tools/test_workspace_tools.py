@@ -84,7 +84,7 @@ class TestCheckSystem:
         full host suite, an earlier-collected test's module-level import of the
         ``tools`` package can leave agent.logging mid-import (the circular-import
         cascade documented in tests/docker/test_container_lifecycle.py), so the
-        ``from docker_executor import ...`` / ``from tools.container_manager
+        ``from docker_executor import ...`` / ``from infra.container_manager
         import ...`` inside check_system raise ImportError when this file is
         collected and all three guards land False.  No test in this class ever
         patches these names, so pinning them makes every test here deterministic
