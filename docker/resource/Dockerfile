@@ -2,7 +2,7 @@
 #
 # Build: docker build -f docker/resource/Dockerfile -t tm-resource-git docker/resource
 #
-# Security intent: the SMALLEST image that can run git against the real
+# Security intent: the SMALLEST image that can run git and Node.js against the real
 # workspace. No docker CLI, no docker socket, no python packages, no vault.
 # The container is launched by ResourceContainerManager with a read-only
 # rootfs, all capabilities dropped, no-new-privileges, no network, and only
@@ -13,11 +13,11 @@
 # a separate runtime.
 FROM python:3.12-slim
 
-# Layer 2: git + CA certificates. --no-install-recommends keeps it small;
+# Layer 2: git + CA certificates + curl + Node.js (nodejs/npm). --no-install-recommends keeps it small;
 # ca-certificates is required for https remotes (git:// and ssh remotes would
 # need openssh-client — deliberately omitted to shrink the image).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates \
+    && apt-get install -y --no-install-recommends git ca-certificates curl nodejs npm \
     && rm -rf /var/lib/apt/lists/*
 
 # Layer 3: non-root user 'agent' with UID 1000 (must match the
