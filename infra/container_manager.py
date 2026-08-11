@@ -496,6 +496,7 @@ class ContainerManager:
             network=network_mode,
             cap_drop=["ALL"],
             security_opt=["no-new-privileges:true"],
+            oom_score_adj=1000,  # user containers are the first OOM-kill victims
             read_only=True,
             user="1000:1000",
             detach=True,

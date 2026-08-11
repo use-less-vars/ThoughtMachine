@@ -379,6 +379,7 @@ class ResourceContainerManager:
                 network_mode=self.network_mode,
                 cap_drop=["ALL"],
                 security_opt=["no-new-privileges:true"],
+                oom_score_adj=500,  # resource (git) containers get a moderate OOM score
                 read_only=True,
                 user="1000:1000",  # must match the agent user in the Dockerfile
                 detach=True,
