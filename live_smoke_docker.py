@@ -103,6 +103,11 @@ CONNECT_CMD = (
     "socket.create_connection(('example.com', 80), 3); print('CONNECTED')\""
 )
 
+# Session-config override for the smoke run: raise the per-workspace container
+# limit to 6 so phase-2 scenarios (main + note + c + d containers) never trip
+# the default limit of 4.
+SMOKE_SESSION_CONFIG = {"container_limits": {"max_containers": 6}}
+
 
 class SmokeFail(Exception):
     """Raise with a human-readable detail message to fail one check."""
@@ -173,6 +178,7 @@ def main() -> int:
             image=image_tag,
             mem_limit="512m",
             cpu_quota=50000,
+            session_config=SMOKE_SESSION_CONFIG,
         )
 
     try:
@@ -334,6 +340,7 @@ def main() -> int:
                 image=image_tag,
                 mem_limit="512m",
                 cpu_quota=50000,
+                session_config=SMOKE_SESSION_CONFIG,
             )
             r2 = mgr2.start(name=name)
             ok(r2["status"] == "reused",
@@ -627,6 +634,7 @@ def main() -> int:
                 workspace_id="default",
                 session_permissions=sp, image=p2_image_tag,
                 mem_limit="512m", cpu_quota=50000,
+                session_config=SMOKE_SESSION_CONFIG,
             )
             entries = mgr_note.list_containers()
             by_name = {c.get("name"): c for c in entries}
@@ -700,6 +708,7 @@ def main() -> int:
                 image=p2_image_tag,
                 mem_limit="512m",
                 cpu_quota=50000,
+                session_config=SMOKE_SESSION_CONFIG,
             )
             c = mgr_c.start(name="smoke-p2-c-%s" % tag)
             ok(c.get("status") == "created",
@@ -743,6 +752,7 @@ def main() -> int:
                 image=p2_image_tag,
                 mem_limit="512m",
                 cpu_quota=50000,
+                session_config=SMOKE_SESSION_CONFIG,
             )
             d = mgr_d.start(name="smoke-p2-d-%s" % tag)
             ok(d.get("status") == "created",

@@ -191,6 +191,7 @@ class ContainerManager:
         mem_limit="1g",
         cpu_quota=100000,
         vault_root=None,
+        session_config=None,
     ):
         if docker is None:
             raise RuntimeError(
@@ -199,6 +200,8 @@ class ContainerManager:
         self.workspace_path = os.path.abspath(workspace_path).rstrip("/")
         self.session_id = session_id
         self.session_permissions = session_permissions
+        # Per-session config (e.g. container_limits.max_containers); falls back to workspace config.
+        self._session_config = session_config
         self.image = image
         self.mem_limit = mem_limit
         self.cpu_quota = cpu_quota
@@ -266,6 +269,26 @@ class ContainerManager:
             log("WARNING", "docker.container_manager",
                 f"Unexpected error loading workspace config {config_path}: {e}")
             return dict(defaults)
+
+    def _get_max_containers(self) -> int:
+        """Effective per-workspace container limit.
+
+        Precedence: session config (``container_limits.max_containers``) ->
+        workspace config (``self.max_containers``, which the workspace
+        config.json or tests may override). Never raises: invalid values fall
+        back to the default, and values below 1 clamp to 1.
+        """
+        default = self.max_containers
+        try:
+            limits = (self._session_config or {}).get("container_limits", {})
+            value = int(limits.get("max_containers", default))
+        except (AttributeError, TypeError, ValueError):
+            return default
+        if value < 1:
+            log("WARNING", "docker.container_manager",
+                f"Configured max_containers ({value}) is invalid; clamping to 1")
+            return 1
+        return value
 
     @staticmethod
     def _resolve_vault_root(vault_root=None):
@@ -379,8 +402,9 @@ class ContainerManager:
                        f"session={self.session_id}")
                 return {**entry, "status": "reused", "id": entry["container_id"],
                         "note": note_value}
-        if len(containers) >= self.max_containers:
-            return {"error": f"Workspace container limit ({self.max_containers}) reached. "
+        limit = self._get_max_containers()
+        if len(containers) >= limit:
+            return {"error": f"Workspace container limit ({limit}) reached. "
                              f"Stop an unused container first."}
 
         # ── Desired isolation from session permissions (all paths) ─────────
