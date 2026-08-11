@@ -61,6 +61,8 @@ class AgentConfig(BaseModel):
         'time_monitor_enabled': HOT_SWAPPABLE,
         'time_warning_threshold': HOT_SWAPPABLE,
         'worker_mode': HOT_SWAPPABLE,
+        'use_workspace_lifecycle_manager': HOT_SWAPPABLE,
+        'use_container_registry': HOT_SWAPPABLE,
         'mode': RESTART_REQUIRED,
     }
 
@@ -112,6 +114,14 @@ class AgentConfig(BaseModel):
     session_permissions: SessionPermissions = Field(
         default_factory=SessionPermissions,
         description='Session permissions profile controlling tool access categories.',
+    )
+    use_workspace_lifecycle_manager: bool = Field(
+        default=False,
+        description='Enable the Workspace Lifecycle Manager for worker queries (feature flag).',
+    )
+    use_container_registry: bool = Field(
+        default=False,
+        description='Enable ContainerRegistry delegation for container lifecycle in worker queries (feature flag).',
     )
 
     @field_validator('system_prompt')

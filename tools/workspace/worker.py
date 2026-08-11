@@ -782,8 +782,19 @@ class WorkerThread(threading.Thread):
         return supervisor
 
     def _wlm_flag_enabled(self) -> bool:
-        """True when the workspace lifecycle manager feature flag is set."""
-        cfg = (self._agent_config_dict or {}).get("session_config")
+        """True when the workspace lifecycle manager feature flag is set.
+
+        The flag is read from (in priority order):
+        1. top-level ``use_workspace_lifecycle_manager`` in the injected
+           agent-config dict (production plumbing: SessionConfig →
+           AgentConfig → ToolExecutor → Worker tool),
+        2. the legacy nested ``session_config`` dict (tests / live smoke),
+        3. the worker definition.
+        """
+        acfg = self._agent_config_dict or {}
+        if acfg.get("use_workspace_lifecycle_manager"):
+            return True
+        cfg = acfg.get("session_config")
         if isinstance(cfg, dict) and cfg.get("use_workspace_lifecycle_manager"):
             return True
         return bool((self.definition or {}).get("use_workspace_lifecycle_manager", False))
@@ -2263,6 +2274,26 @@ class Worker(ToolBase):
             legacy_ws = getattr(self, 'workspace_path', None)
             if legacy_ws:
                 result["workspace_path"] = legacy_ws
+
+        # Propagate the workspace-lifecycle-manager feature flag so the
+        # WorkerThread's _wlm_flag_enabled() sees it at the top level.
+        # ToolExecutor normally injects it already; the nested fallback
+        # covers direct callers that pass the legacy ``session_config``
+        # shape.
+        if "use_workspace_lifecycle_manager" not in result:
+            nested_cfg = cfg.get("session_config") or {}
+            result["use_workspace_lifecycle_manager"] = bool(
+                nested_cfg.get("use_workspace_lifecycle_manager")
+            )
+
+        # Propagate the container-registry feature flag the same way.
+        # The ToolExecutor normally injects it already; the nested fallback
+        # covers direct callers that pass the legacy ``session_config`` shape.
+        if "use_container_registry" not in result:
+            nested_cfg = cfg.get("session_config") or {}
+            result["use_container_registry"] = bool(
+                nested_cfg.get("use_container_registry")
+            )
 
         return result
 

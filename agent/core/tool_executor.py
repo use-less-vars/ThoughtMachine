@@ -302,6 +302,8 @@ class ToolExecutor:
                     'tool_output_token_limit': getattr(self.config, 'tool_output_token_limit', None),
                     'token_monitor_warning_threshold': getattr(self.config, 'token_monitor_warning_threshold', None),
                     'token_monitor_critical_threshold': getattr(self.config, 'token_monitor_critical_threshold', None),
+                    'use_workspace_lifecycle_manager': getattr(self.config, 'use_workspace_lifecycle_manager', False),
+                    'use_container_registry': getattr(self.config, 'use_container_registry', False),
                 }
             else:
                 tool_args['agent_config'] = None

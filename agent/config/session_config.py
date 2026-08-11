@@ -133,6 +133,14 @@ class SessionConfig(BaseModel):
         default=None,
         description='Session-level permission overrides.',
     )
+    use_workspace_lifecycle_manager: bool = Field(
+        default=False,
+        description='Enable the Workspace Lifecycle Manager for worker queries in this session (feature flag).',
+    )
+    use_container_registry: bool = Field(
+        default=False,
+        description='Enable the ContainerRegistry delegation for container lifecycle in this session (feature flag).',
+    )
 
     # ── Validators ──────────────────────────────────────────────────────
 
@@ -241,6 +249,9 @@ class SessionConfig(BaseModel):
 
         if self.session_permissions is not None:
             kwargs['session_permissions'] = dict(self.session_permissions)
+
+        kwargs['use_workspace_lifecycle_manager'] = bool(self.use_workspace_lifecycle_manager)
+        kwargs['use_container_registry'] = bool(self.use_container_registry)
 
         return AgentConfig(**kwargs)
 

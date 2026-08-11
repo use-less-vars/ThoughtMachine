@@ -20,7 +20,10 @@ import pytest
 
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar, List, Optional
 from unittest import mock
+
+from tools.base import ToolBase
 
 from infra.workspace_lifecycle_manager import (
     EXEC_KILL_GRACE,
@@ -688,4 +691,147 @@ def test_wlm_integration_real_docker(tmp_path, caplog, monkeypatch):
     conv = data["conversation"]
     assert sum(1 for m in conv if m.get("role") == "system") == 1
     assert len(conv) <= 3
+
+
+# ---------------------------------------------------------------------------
+# 12. Production plumbing: SessionConfig -> AgentConfig -> ToolExecutor ->
+#     Worker tool _build_agent_config -> WorkerThread._wlm_flag_enabled
+# ---------------------------------------------------------------------------
+
+
+class ProbeTool(ToolBase):
+    """Minimal ToolBase capturing the injected agent_config dict."""
+
+    required_categories: ClassVar[List[str]] = []
+    captured: ClassVar[List[Optional[dict]]] = []
+
+    workspace_path: Optional[str] = None
+    token_limit: Optional[int] = None
+    session_permissions: Optional[dict] = None
+    effective_permissions: Optional[dict] = None
+    workspace_id: Optional[str] = None
+    session_id: Optional[str] = None
+    agent_config: Optional[dict] = None
+
+    @classmethod
+    def get_required_categories(cls, params=None):
+        return cls.required_categories
+
+    def execute(self) -> str:
+        ProbeTool.captured.append(self.agent_config)
+        return "ok"
+
+
+def _make_probe_executor(config):
+    from agent.core.tool_executor import ToolExecutor
+
+    return ToolExecutor(
+        tool_classes=[ProbeTool],
+        config=config,
+        state=SimpleNamespace(
+            is_tool_allowed=lambda name: True,
+            get_allowed_tools=lambda: ["ProbeTool"],
+        ),
+    )
+
+
+def _run_probe(executor) -> dict:
+    ProbeTool.captured.clear()
+    result = executor._execute_single_tool(
+        ProbeTool, {}, "ProbeTool", 1,
+        lambda: False, lambda: None, lambda: 0,
+    )
+    assert result["result"] == "ok"
+    assert ProbeTool.captured, "probe tool never executed"
+    return ProbeTool.captured[-1]
+
+
+def _build_via_worker_tool(injected: dict) -> dict:
+    from tools.workspace.worker import Worker
+
+    worker_tool = SimpleNamespace(
+        agent_config=injected,
+        workspace_path=None,
+        _resolve_registry_workspace=lambda: None,
+    )
+    worker_tool._build_agent_config = Worker._build_agent_config.__get__(worker_tool)
+    return worker_tool._build_agent_config()
+
+
+def test_plumbing_wlm_flag_on_end_to_end(tmp_path):
+    """SessionConfig(flag=True) reaches WorkerThread._wlm_flag_enabled()."""
+    from agent.config.session_config import SessionConfig
+    from agent.config.models import AgentConfig
+    from tools.workspace.worker import WorkerThread
+
+    session = SessionConfig(mode="custom", use_workspace_lifecycle_manager=True)
+    acfg = session.to_agent_config(workspace_path=str(tmp_path))
+    assert isinstance(acfg, AgentConfig)
+    assert acfg.use_workspace_lifecycle_manager is True
+
+    injected = _run_probe(_make_probe_executor(acfg))
+    assert injected["use_workspace_lifecycle_manager"] is True
+
+    built = _build_via_worker_tool(injected)
+    assert built.get("use_workspace_lifecycle_manager") is True
+
+    thread = WorkerThread(
+        name="w-plumb-on",
+        definition={},
+        agent_config=built,
+        workspace_dir=Path(tmp_path) / "ws",
+        session_id="s1",
+        timeout_seconds=60,
+    )
+    assert thread._wlm_flag_enabled() is True
+
+
+def test_plumbing_wlm_flag_off_end_to_end(tmp_path):
+    """Default-off session yields False all the way down the chain."""
+    from agent.config.session_config import SessionConfig
+    from tools.workspace.worker import WorkerThread
+
+    session = SessionConfig(mode="custom")
+    acfg = session.to_agent_config(workspace_path=str(tmp_path))
+    assert acfg.use_workspace_lifecycle_manager is False
+
+    injected = _run_probe(_make_probe_executor(acfg))
+    assert injected["use_workspace_lifecycle_manager"] is False
+
+    built = _build_via_worker_tool(injected)
+    assert built.get("use_workspace_lifecycle_manager") is False
+
+    thread = WorkerThread(
+        name="w-plumb-off",
+        definition={},
+        agent_config=built,
+        workspace_dir=Path(tmp_path) / "ws2",
+        session_id="s1",
+        timeout_seconds=60,
+    )
+    assert thread._wlm_flag_enabled() is False
+
+
+def test_plumbing_container_registry_flag_forwarding(tmp_path):
+    """use_container_registry forwards through the same chain (default False)."""
+    from agent.config.session_config import SessionConfig
+    from agent.config.models import AgentConfig
+
+    session = SessionConfig(mode="custom", use_container_registry=True)
+    acfg = session.to_agent_config(workspace_path=str(tmp_path))
+    assert isinstance(acfg, AgentConfig)
+    assert acfg.use_container_registry is True
+
+    injected = _run_probe(_make_probe_executor(acfg))
+    assert injected["use_container_registry"] is True
+
+    built = _build_via_worker_tool(injected)
+    assert built.get("use_container_registry") is True
+
+    off = SessionConfig(mode="custom").to_agent_config()
+    assert off.use_container_registry is False
+    off_injected = _run_probe(_make_probe_executor(off))
+    assert off_injected["use_container_registry"] is False
+    off_built = _build_via_worker_tool(off_injected)
+    assert off_built.get("use_container_registry") is False
 
