@@ -190,6 +190,43 @@ def ensure_vault_defaults(
     return created
 
 
+_RESOURCE_DOCKERFILE_RELPATH = "docker/resource/Dockerfile"
+
+
+def ensure_resource_dockerfile(
+    resources_dir: Path,
+    overwrite_existing: bool = False,
+) -> list[str]:
+    """Seed the vault-managed git sandbox image Dockerfile.
+
+    Copies ``resources/resource_dockerfile.txt`` to
+    ``~/.thoughtmachine/docker/resource/Dockerfile`` (the build context used
+    by ``infra.resource_container_manager`` to auto-build the
+    ``tm-resource-git`` image). Seeding the Dockerfile into the vault — which
+    is agent-write-blocked — keeps the image definition out of agent reach:
+    the image can never be built from a tampered file.
+
+    Callers MUST pass ``overwrite_existing=False`` (the default): an existing
+    vault copy is a trust anchor and must never be replaced by bootstrap.
+
+    Args:
+        resources_dir: Absolute path to the project-level ``resources/``
+            directory.
+        overwrite_existing: If ``True``, overwrite an existing vault copy.
+            Keep ``False`` (the default) — see docstring above.
+
+    Returns:
+        A list of absolute paths to files that were written.
+    """
+    created: list[str] = []
+    _copy_resource(
+        resources_dir / "resource_dockerfile.txt",
+        vault_root() / _RESOURCE_DOCKERFILE_RELPATH,
+        overwrite_existing, created,
+    )
+    return created
+
+
 def load_factory_defaults() -> dict:
     """Load and return the factory defaults from the vault.
 

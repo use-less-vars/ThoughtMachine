@@ -125,5 +125,7 @@ config_snapshot.json
 docs/
 
 # Root-only Dockerfile pattern: ignores the repo-root Dockerfile (a stray
-# build artifact) but NOT docker/resource/Dockerfile (the git sandbox image).
+# build artifact) but NOT resources/resource_dockerfile.txt — the tracked seed
+# for the vault-managed git sandbox image Dockerfile
+# (~/.thoughtmachine/docker/resource/Dockerfile).
 /Dockerfile

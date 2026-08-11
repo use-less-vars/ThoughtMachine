@@ -37,6 +37,12 @@
       "source": "engineer_system_prompt.txt",
       "dest": "engineer_system_prompt.txt",
       "description": "System prompt for the engineer/architect agent role"
+    },
+    {
+      "source": "resource_dockerfile.txt",
+      "dest": "docker/resource/Dockerfile",
+      "description": "Git sandbox image Dockerfile for the hidden resource container — deployed to the vault (~/.thoughtmachine/docker/resource/) so the image definition is NOT agent-writable; never overwritten once present",
+      "never_overwrite": true
     }
   ],
   "directories": [

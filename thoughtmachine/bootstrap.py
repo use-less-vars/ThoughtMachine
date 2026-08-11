@@ -98,6 +98,8 @@ def ensure_user_defaults(overwrite_existing: bool = False) -> list[str]:
     1. Create the vault compartment structure via ``ensure_vault_structure()``.
     2. Deploy all spec files via ``ensure_vault_defaults()`` (factory defaults,
        provider config, system prompts, registry stubs, etc).
+    2b. Seed the vault-managed resource image Dockerfile via
+       ``ensure_resource_dockerfile()`` (never overwritten).
     3. Deploy individual resource files from the manifest.
     4. Deploy directories from the manifest (e.g., worker_templates).
     5. Ensure the global knowledge base.
@@ -111,11 +113,21 @@ def ensure_user_defaults(overwrite_existing: bool = False) -> list[str]:
         **overwritten**.
     """
     # Step 1: Create the vault structure (idempotent)
-    from thoughtmachine.vault import ensure_vault_structure, ensure_vault_defaults, vault_root
+    from thoughtmachine.vault import (
+        ensure_vault_structure,
+        ensure_vault_defaults,
+        ensure_resource_dockerfile,
+        vault_root,
+    )
     created = ensure_vault_structure()
 
     # Step 2: Deploy all spec files via vault defaults
     created.extend(ensure_vault_defaults(_resources_dir(), overwrite_existing))
+
+    # Step 2b: Seed the vault-managed resource image Dockerfile. Hard-coded
+    # overwrite_existing=False: an existing vault copy is a trust anchor and
+    # must never be replaced by bootstrap.
+    created.extend(ensure_resource_dockerfile(_resources_dir(), overwrite_existing=False))
 
     # Step 3: Deploy individual files from manifest
     manifest = _load_manifest()
@@ -123,9 +135,13 @@ def ensure_user_defaults(overwrite_existing: bool = False) -> list[str]:
         if entry.get("internal"):
             continue  # skip internal files (e.g., .version)
         dst = _resolve_dest(entry["dest"])
-        if dst.exists() and not overwrite_existing:
+        # never_overwrite entries (e.g. the resource image Dockerfile) are
+        # trust anchors: even a factory reset must not clobber them.
+        may_overwrite = overwrite_existing and not entry.get("never_overwrite")
+        if dst.exists() and not may_overwrite:
             continue
         src = _resolve_source(entry["source"])
+        dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(str(src), str(dst))
         created.append(str(dst))
 

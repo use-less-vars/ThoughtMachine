@@ -1,6 +1,6 @@
-# docker/resource/Dockerfile — minimal git sandbox for the hidden resource container.
+# ~/.thoughtmachine/docker/resource/Dockerfile — minimal git sandbox for the hidden resource container.
 #
-# Build: docker build -f docker/resource/Dockerfile -t tm-resource-git docker/resource
+# Build: docker build -t tm-resource-git ~/.thoughtmachine/docker/resource/
 #
 # Security intent: the SMALLEST image that can run git and Node.js against the real
 # workspace. No docker CLI, no docker socket, no python packages, no vault.

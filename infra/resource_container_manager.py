@@ -69,18 +69,160 @@ import threading
 
 try:
     import docker
-    from docker.errors import APIError, NotFound
+    from docker.errors import APIError, ImageNotFound, NotFound
     from docker.types import Mount
     DOCKER_AVAILABLE = True
 except ImportError:  # pragma: no cover - environment without docker SDK
     DOCKER_AVAILABLE = False
     docker = None
     APIError = Exception
+    ImageNotFound = Exception
     NotFound = Exception
     Mount = None
 
 
+# The resource image Dockerfile is defined in the VAULT (agent-write-blocked)
+# at <vault>/docker/resource/Dockerfile; resolve it via the shared resolver
+# (thoughtmachine.vault.vault_root, i.e. ~/.thoughtmachine).
+from thoughtmachine.vault import vault_root
+
+
 _LOG = logging.getLogger(__name__)
+
+# Resource image identity. The Dockerfile lives in the vault
+# (~/.thoughtmachine/docker/resource/Dockerfile, seeded from
+# resources/resource_dockerfile.txt) so the image definition is NOT
+# agent-writable — the image can never be built from a tampered file.
+RESOURCE_IMAGE_TAG = "tm-resource-git"
+RESOURCE_IMAGE_DOCKERFILE_DIR = vault_root() / "docker" / "resource"
+RESOURCE_IMAGE_BUILD_CMD = (
+    f"docker build -t {RESOURCE_IMAGE_TAG} {RESOURCE_IMAGE_DOCKERFILE_DIR}"
+)
+
+# Module-level image-readiness cache + single-flight lock. Only SUCCESS is
+# cached (_RESOURCE_IMAGE_READY=True); a failed check/build is retried on the
+# next call.
+_RESOURCE_IMAGE_READY = False
+_RESOURCE_IMAGE_LOCK = threading.Lock()
+
+
+def _ensure_resource_image() -> bool:
+    """Ensure the ``tm-resource-git`` image exists locally, building it if needed.
+
+    Single-flight: concurrent callers serialize on ``_RESOURCE_IMAGE_LOCK``
+    (double-checked — the image is re-checked inside the lock before the
+    build). Success is cached in ``_RESOURCE_IMAGE_READY``; failures are never
+    cached so the next call retries. NEVER raises — failures are logged (with
+    the manual ``docker build`` command) and reported as ``False``.
+
+    Returns:
+        bool: True when the image is available, False otherwise.
+    """
+    global _RESOURCE_IMAGE_READY
+    if _RESOURCE_IMAGE_READY:
+        return True
+    if docker is None:
+        _LOG.warning(
+            "Docker SDK unavailable — cannot ensure resource image %s. "
+            "Build it manually: %s",
+            RESOURCE_IMAGE_TAG,
+            RESOURCE_IMAGE_BUILD_CMD,
+        )
+        return False
+    try:
+        client = docker.from_env()
+    except Exception as exc:
+        _LOG.warning(
+            "Cannot reach the Docker daemon to ensure resource image %s: %s. "
+            "Build it manually: %s",
+            RESOURCE_IMAGE_TAG,
+            exc,
+            RESOURCE_IMAGE_BUILD_CMD,
+        )
+        return False
+    try:
+        client.images.get(RESOURCE_IMAGE_TAG)
+        _RESOURCE_IMAGE_READY = True
+        return True
+    except ImageNotFound:
+        pass
+    except Exception as exc:
+        _LOG.warning(
+            "Failed to check for resource image %s: %s. Build it manually: %s",
+            RESOURCE_IMAGE_TAG,
+            exc,
+            RESOURCE_IMAGE_BUILD_CMD,
+        )
+        return False
+    # Image missing — build it from the vault-managed Dockerfile, single-flight.
+    with _RESOURCE_IMAGE_LOCK:
+        if _RESOURCE_IMAGE_READY:
+            return True
+        try:
+            client.images.get(RESOURCE_IMAGE_TAG)
+            _RESOURCE_IMAGE_READY = True
+            return True
+        except ImageNotFound:
+            pass
+        except Exception as exc:
+            _LOG.warning(
+                "Failed to re-check for resource image %s: %s. Build it manually: %s",
+                RESOURCE_IMAGE_TAG,
+                exc,
+                RESOURCE_IMAGE_BUILD_CMD,
+            )
+            return False
+        try:
+            _LOG.info(
+                "Resource image %s missing — building from %s",
+                RESOURCE_IMAGE_TAG,
+                RESOURCE_IMAGE_DOCKERFILE_DIR,
+            )
+            _, build_log = client.images.build(
+                path=str(RESOURCE_IMAGE_DOCKERFILE_DIR),
+                dockerfile="Dockerfile",
+                tag=RESOURCE_IMAGE_TAG,
+                rm=True,
+            )
+            try:
+                for entry in build_log:
+                    _LOG.debug("resource image build: %s", entry)
+            except Exception:
+                pass  # noisy build-log stream must never fail the build path
+            _LOG.info(
+                "Resource image %s built successfully from %s",
+                RESOURCE_IMAGE_TAG,
+                RESOURCE_IMAGE_DOCKERFILE_DIR,
+            )
+            _RESOURCE_IMAGE_READY = True
+            return True
+        except Exception as exc:
+            _LOG.warning(
+                "Failed to build resource image %s from %s: %s. "
+                "Build it manually: %s",
+                RESOURCE_IMAGE_TAG,
+                RESOURCE_IMAGE_DOCKERFILE_DIR,
+                exc,
+                RESOURCE_IMAGE_BUILD_CMD,
+            )
+            return False
+
+
+def is_resource_image_available() -> bool:
+    """True when the ``tm-resource-git`` image exists locally.
+
+    Shares the cached success state with ``_ensure_resource_image``; never
+    raises — returns False when Docker is unreachable or the image is missing.
+    """
+    if _RESOURCE_IMAGE_READY:
+        return True
+    if docker is None:
+        return False
+    try:
+        docker.from_env().images.get(RESOURCE_IMAGE_TAG)
+        return True
+    except Exception:
+        return False
 
 
 def _resolve_venv(workspace_path):
@@ -216,10 +358,13 @@ class ResourceContainerManager:
             The caller should resolve this from
             ``security_gate.get_expected_container_config``; anything other
             than an explicit grant must stay 'none'.
-        image: Image to run. Default 'tm-resource-git' — build it from
-            ``docker/resource/Dockerfile``::
+        image: Image to run. Default 'tm-resource-git' — auto-built from
+            the vault-managed Dockerfile ``~/.thoughtmachine/docker/resource/Dockerfile``
+            (seeded from ``resources/resource_dockerfile.txt``; the vault is
+            agent-write-blocked, so the image definition cannot be tampered
+            with)::
 
-                docker build -f docker/resource/Dockerfile -t tm-resource-git docker/resource
+                docker build -t tm-resource-git ~/.thoughtmachine/docker/resource/
         vault_root: Reserved for future audit/config use; NEVER mounted into
             the container.
     """
@@ -236,7 +381,7 @@ class ResourceContainerManager:
         workspace_id,
         workspace_path,
         network_mode="none",
-        image="tm-resource-git",
+        image=RESOURCE_IMAGE_TAG,
         vault_root=None,
     ):
         if docker is None:
@@ -291,6 +436,15 @@ class ResourceContainerManager:
         Returns:
             str: the container id (full id).
         """
+        # The image is required even for the reuse path; auto-build it (from
+        # the vault-managed Dockerfile) when it is missing.
+        if not _ensure_resource_image():
+            raise RuntimeError(
+                f"Resource image '{RESOURCE_IMAGE_TAG}' is not available "
+                f"(auto-build failed or Docker unreachable). "
+                f"Build it manually: {RESOURCE_IMAGE_BUILD_CMD}"
+            )
+
         name = self.container_name
         try:
             candidates = self.client.containers.list(
@@ -394,8 +548,7 @@ class ResourceContainerManager:
             # Wrap image-missing with actionable build instructions.
             raise RuntimeError(
                 f"Failed to create git resource container: {e}. "
-                f"Build the image first: "
-                f"docker build -f docker/resource/Dockerfile -t {self.image} docker/resource"
+                f"Build the image first: {RESOURCE_IMAGE_BUILD_CMD}"
             ) from e
         return container.id
 
