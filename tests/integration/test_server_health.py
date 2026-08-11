@@ -98,6 +98,7 @@ def test_health_endpoint_status_ok(contract_server):
         assert payload["service"] == "thoughtmachine-web-ui"
 
 
+@pytest.mark.skipif(shutil.which('git') is None, reason='git binary not available in CI sandbox')
 def test_health_endpoint_reports_git_revision(contract_server):
     """GET /health → revision equals the repo's git HEAD at import time.
 
