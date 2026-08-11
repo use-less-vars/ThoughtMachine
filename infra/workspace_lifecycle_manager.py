@@ -29,6 +29,7 @@ main agent).
 
 from __future__ import annotations
 
+import collections
 import enum
 import logging
 import os
@@ -120,6 +121,41 @@ class ExecutionTracker:
 
     def __init__(self) -> None:
         self._executions: Dict[str, dict] = {}
+        self.kill_grace_seconds: float = EXEC_KILL_GRACE
+
+    def register(
+        self,
+        worker_id: str,
+        query_id: Optional[str] = None,
+        tool_call_id: Optional[str] = None,
+        container_id: Optional[str] = None,
+        exec_id: Optional[str] = None,
+        pid: Optional[int] = None,
+        tool_name: Optional[str] = None,
+        type: str = "subprocess",
+    ) -> str:
+        """Register a new execution and return its id.
+
+        The id is deterministic when a ``tool_call_id`` is available
+        (``worker_id:tool_call_id``); otherwise it is generated from the
+        worker and query ids. Stores a details dict with the same shape the
+        termination paths read.
+        """
+        if tool_call_id:
+            execution_id = f"{worker_id}:{tool_call_id}"
+        else:
+            execution_id = f"{worker_id}:{query_id}:{uuid.uuid4().hex[:8]}"
+        self._executions[execution_id] = {
+            "query_id": query_id,
+            "tool_call_id": tool_call_id,
+            "container_id": container_id,
+            "exec_id": exec_id,
+            "start_time": time.monotonic(),
+            "type": type,
+            "tool_name": tool_name,
+            "pid": pid,
+        }
+        return execution_id
 
     def add(self, execution_id: str, details: dict) -> None:
         """Record an execution under ``execution_id``."""
@@ -245,9 +281,43 @@ class ExecutionTracker:
                 _log("INFO", "workspace.lifecycle",
                      f"terminate_all: subprocess {execution_id} — "
                      f"kill({pid}, SIGTERM)")
+            self._escalate_subprocess_kill(int(pid))
         except Exception as exc:
             _log("WARNING", "workspace.lifecycle",
                  f"terminate_all: subprocess {execution_id} kill failed: {exc}")
+
+    def _escalate_subprocess_kill(self, pid: int) -> None:
+        """SIGKILL the process group if it is still alive after the grace period.
+
+        Polls for process-group death with ``os.killpg(pid, 0)`` every 50ms up
+        to ``kill_grace_seconds``; only escalates to SIGKILL when the group is
+        still alive. A dead group (``ProcessLookupError``) returns immediately
+        so a successful SIGTERM never triggers an extra SIGKILL.
+        """
+        grace = getattr(self, "kill_grace_seconds", EXEC_KILL_GRACE)
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pid, 0)
+            except ProcessLookupError:
+                return  # already dead
+            except OSError:
+                pass
+            time.sleep(0.05)
+        try:
+            os.killpg(pid, signal.SIGKILL)
+            _log("INFO", "workspace.lifecycle",
+                 f"subprocess {pid} still alive after {grace}s grace — "
+                 f"killpg({pid}, SIGKILL)")
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                os.kill(pid, signal.SIGKILL)
+                _log("INFO", "workspace.lifecycle",
+                     f"subprocess {pid} still alive after {grace}s grace — "
+                     f"kill({pid}, SIGKILL)")
+            except Exception as exc:
+                _log("WARNING", "workspace.lifecycle",
+                     f"subprocess {pid} SIGKILL escalation failed: {exc}")
 
 
 class WorkerSupervisor:
@@ -267,10 +337,14 @@ class WorkerSupervisor:
         resource_container_manager: Any,
         *,
         feature_flag_check: Optional[Callable[[], bool]] = None,
+        session_id: Optional[str] = None,
+        permissions_provider: Optional[Callable[[], Any]] = None,
     ) -> None:
         self.worker_id = worker_id
         self._container_manager = container_manager
         self._resource_container_manager = resource_container_manager
+        self.session_id = session_id
+        self.permissions_provider = permissions_provider
 
         if feature_flag_check is None:
             cfg = _get_session_config(container_manager)
@@ -290,6 +364,14 @@ class WorkerSupervisor:
         self._pending_query: Optional[str] = None
         # Assigned by the integration layer (not a constructor param).
         self.query_handler: Optional[Callable[[Any, str], None]] = None
+
+        # Soft-timeout warning (80% of the wait budget), emitted once per query.
+        self.soft_timeout_warning_emitted = False
+        self.soft_timeout_warning_callback: Optional[Callable[[str], None]] = None
+        self._query_started_at: Optional[float] = None
+        # Bounded per-query outcome log (abandoned/completed) used by the
+        # worker integration to prune stale attempts before merging context.
+        self._query_log: "collections.deque" = collections.deque(maxlen=2)
 
         if not self._feature_flag_check():
             _log("WARNING", "workspace.lifecycle",
@@ -316,6 +398,8 @@ class WorkerSupervisor:
                 )
             self._state = WorkerState.BUSY
             self._timeout_triggered = False
+            self.soft_timeout_warning_emitted = False
+            self._query_started_at = time.monotonic()
             self._drain_output_queue()
             self._query_id = QUERY_ID_PREFIX + uuid.uuid4().hex
             return self._query_id
@@ -354,6 +438,7 @@ class WorkerSupervisor:
                 )
             self._state = WorkerState.TIMED_OUT
             self._timeout_triggered = True
+            self._record_query_outcome(self._query_id, abandoned=True)
         self._terminate_all()
         return True
 
@@ -369,6 +454,7 @@ class WorkerSupervisor:
                     f"transition_stopping: invalid from state {self._state.value}"
                 )
             self._state = WorkerState.STOPPING
+            self._record_query_outcome(self._query_id, abandoned=True)
         self._terminate_all()
         return True
 
@@ -460,6 +546,8 @@ class WorkerSupervisor:
                 raise TimeoutError(
                     f"query {query_id} timed out after {wait_bound}s"
                 )
+            if not self.soft_timeout_warning_emitted and remaining <= 0.2 * wait_bound:
+                self._emit_soft_timeout_warning(query_id)
             try:
                 qid, reply = self._output_queue.get(timeout=min(remaining, 0.5))
             except queue.Empty:
@@ -487,6 +575,7 @@ class WorkerSupervisor:
         """BUSY -> IDLE (or re-pause when the query auto-resumed)."""
         with self._lock:
             state = self._state
+            self._record_query_outcome(query_id, abandoned=False)
         try:
             if state == WorkerState.BUSY:
                 self.transition_idle()
@@ -503,6 +592,69 @@ class WorkerSupervisor:
     def _publish_reply(self, query_id: str, reply: Any) -> None:
         """Publish a (query_id, reply) tuple — hook for integration/tests."""
         self._output_queue.put((query_id, reply))
+
+    # ------------------------------------------------------------------
+    # Query outcome log (for abandoned-attempt pruning)
+    # ------------------------------------------------------------------
+
+    @property
+    def current_query_id(self) -> Optional[str]:
+        """Query id of the in-flight query (None when idle)."""
+        with self._lock:
+            return self._query_id
+
+    def _record_query_outcome(self, query_id: Optional[str], abandoned: bool) -> None:
+        """Record an outcome for ``query_id`` in the bounded log (under lock).
+
+        Dedupes: re-recording an id already in the log only updates the
+        existing entry, so a query that is recorded twice (e.g. stopped after
+        timing out) stays a single row.
+        """
+        if not query_id:
+            return
+        for entry in self._query_log:
+            if entry["query_id"] == query_id:
+                if abandoned:
+                    entry["abandoned"] = True
+                    entry.pop("completed_at", None)
+                else:
+                    entry["abandoned"] = False
+                    entry["completed_at"] = time.monotonic()
+                return
+        self._query_log.append(
+            {
+                "query_id": query_id,
+                "started_at": time.monotonic(),
+                "completed_at": None if abandoned else time.monotonic(),
+                "abandoned": abandoned,
+            }
+        )
+
+    def abandoned_query_ids(self) -> list:
+        """Query ids recorded as abandoned (most recent first)."""
+        with self._lock:
+            return [e["query_id"] for e in reversed(self._query_log) if e["abandoned"]]
+
+    def completed_query_ids(self) -> list:
+        """Query ids recorded as completed (most recent first)."""
+        with self._lock:
+            return [e["query_id"] for e in reversed(self._query_log) if not e["abandoned"]]
+
+    def _emit_soft_timeout_warning(self, query_id: str) -> None:
+        """Emit the 80%-budget soft-timeout warning exactly once per query."""
+        with self._lock:
+            if self.soft_timeout_warning_emitted:
+                return
+            self.soft_timeout_warning_emitted = True
+        _log("WARNING", "workspace.lifecycle",
+             f"[WLM] soft timeout warning (80% of budget) query_id={query_id}")
+        callback = self.soft_timeout_warning_callback
+        if callback is not None:
+            try:
+                callback(query_id)
+            except Exception as exc:
+                _log("WARNING", "workspace.lifecycle",
+                     f"soft_timeout_warning_callback failed for {query_id}: {exc}")
 
     # ------------------------------------------------------------------
     # Public control API
@@ -635,9 +787,13 @@ class WorkerSupervisor:
         """Drop queued stale replies (must be called under ``self._lock``)."""
         while True:
             try:
-                self._output_queue.get_nowait()
+                stale = self._output_queue.get_nowait()
             except queue.Empty:
                 return
+            stale_qid = stale[0] if isinstance(stale, tuple) and stale else stale
+            _log("INFO", "workspace.lifecycle",
+                 f"[WLM-DRAIN] query_id={stale_qid} state={self._state.value} "
+                 f"dropping stale reply")
 
     def _terminate_all(self) -> None:
         """Run the execution tracker's terminate_all (no lock held)."""

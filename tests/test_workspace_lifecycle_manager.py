@@ -8,10 +8,19 @@ integration wiring in tools/workspace/worker.py.
 
 from __future__ import annotations
 
+import json
+import logging
 import queue
 import signal
+import subprocess
+import threading
+import time
 
 import pytest
+
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from infra.workspace_lifecycle_manager import (
     EXEC_KILL_GRACE,
@@ -353,7 +362,10 @@ def test_terminate_all_subprocess_killpg_fallback_kill(monkeypatch):
     tracker = ExecutionTracker()
     tracker.add("e1", {"type": "subprocess", "pid": 4242})
     tracker.terminate_all("w1", None, None)
-    assert calls["killpg"] == [(4242, signal.SIGTERM)]
+    # killpg(SIGTERM) fails -> kill(SIGTERM) fallback; the escalation path
+    # then probes liveness with killpg(pid, 0) and, seeing the group is
+    # already dead (ProcessLookupError), skips the SIGKILL.
+    assert calls["killpg"] == [(4242, signal.SIGTERM), (4242, 0)]
     assert calls["kill"] == [(4242, signal.SIGTERM)]
 
 
@@ -433,6 +445,8 @@ class FakeWorkerThread:
         self.worker_name = "fake-worker"
         self._agent_config_dict = agent_config or {}
         self.definition = definition or {}
+        self.session_id = None
+        self._session_permissions = {}
         self._input_queue = queue.Queue()
         self._output_queue = queue.Queue()
 
@@ -478,3 +492,200 @@ def test_worker_wlm_wiring_flag_off():
     # definition-key variant enables the flag too
     fake2 = FakeWorkerThread(definition={"use_workspace_lifecycle_manager": True})
     assert fake2._get_wlm() is not None
+
+
+# ---------------------------------------------------------------------------
+# 11. WLM Phase 4: session/permissions plumbing, soft-timeout warning,
+#     query outcome log, ExecutionTracker details, worker integration.
+# ---------------------------------------------------------------------------
+
+
+def _docker_available():
+    try:
+        import docker
+
+        docker.from_env().ping()
+        return True
+    except Exception:
+        return False
+
+
+def test_supervisor_ctor_accepts_session_and_permissions_provider():
+    sup = make_supervisor(session_id="sess-1", permissions_provider=lambda: {"x": 1})
+    assert sup.session_id == "sess-1"
+    assert sup.permissions_provider() == {"x": 1}
+
+
+def test_soft_timeout_warning_emitted_once():
+    sup = make_supervisor()
+    calls = []
+    release = threading.Event()
+    sup.soft_timeout_warning_callback = lambda qid: calls.append(qid)
+
+    def slow_handler(query, query_id):
+        release.wait(5.0)
+        sup._publish_reply(query_id, {"ok": query})
+
+    sup.query_handler = slow_handler
+    with pytest.raises(TimeoutError):
+        sup.process_query("x", timeout=0.6)
+    assert sup.soft_timeout_warning_emitted is True
+    assert len(calls) == 1
+    assert calls[0].startswith("q_")
+    assert sup.status_report()["state"] == WorkerState.TIMED_OUT
+    release.set()
+
+
+def test_drain_logs_wlm_drain_prefix(caplog, monkeypatch):
+    monkeypatch.setattr("infra.workspace_lifecycle_manager._agent_log", None)
+    caplog.set_level("INFO")
+    sup = make_supervisor()
+    sup._output_queue.put(("q_old", "stale"))
+    sup.transition_busy()
+    assert "[WLM-DRAIN]" in caplog.text
+    assert "q_old" in caplog.text
+
+
+def test_query_log_marks_abandoned_on_timeout():
+    sup = make_supervisor()
+    with pytest.raises(TimeoutError):
+        sup.process_query("x", timeout=0.2)
+    ab = sup.abandoned_query_ids()
+    assert len(ab) == 1 and ab[0].startswith("q_")
+    assert sup.completed_query_ids() == []
+
+
+def test_query_log_ttl_bounded_to_2():
+    sup = make_supervisor()
+    qids = []
+
+    def handler(query, query_id):
+        qids.append(query_id)
+        sup._publish_reply(query_id, {"ok": query})
+
+    sup.query_handler = handler
+    for i in range(3):
+        sup.process_query(f"q{i}", timeout=2.0)
+    assert sup.completed_query_ids() == list(reversed(qids[-2:]))
+    assert sup.abandoned_query_ids() == []
+
+
+def test_execution_tracker_register_and_terminate_all_clears():
+    tracker = ExecutionTracker()
+    eid = tracker.register(
+        "w1", query_id="q1", tool_call_id="tc1", container_id="c1",
+        exec_id="x1", pid=None, tool_name="bash",
+    )
+    assert eid == "w1:tc1"
+    assert tracker.active_count() == 1
+    d = tracker._executions[eid]
+    assert d["query_id"] == "q1"
+    assert d["tool_call_id"] == "tc1"
+    assert d["container_id"] == "c1"
+    assert d["exec_id"] == "x1"
+    assert d["type"] == "subprocess"
+    assert d["tool_name"] == "bash"
+    assert d["pid"] is None
+    eid2 = tracker.register("w1", query_id="q1")
+    assert eid2.startswith("w1:q1:") and eid2 != eid
+    assert tracker.active_count() == 2
+    tracker.terminate_all("w1", None, None)
+    assert tracker.active_count() == 0
+
+
+@pytest.mark.skipif(not _docker_available(), reason="Docker daemon not available")
+def test_wlm_integration_real_docker(tmp_path, caplog, monkeypatch):
+    """End-to-end: send_query delegates to the WLM supervisor; a worker
+    subprocess tool that overruns the query budget is killed on timeout, the
+    stale reply is drained, and the supervisor returns to IDLE."""
+    class _FakeEventBus:
+        def __init__(self, *a, **k):
+            pass
+
+        def publish(self, *a, **k):
+            return None
+
+    monkeypatch.setattr("tools.workspace.worker.EventBus", _FakeEventBus)
+    monkeypatch.setattr("tools.workspace.worker.register_worker_event_bus", lambda *a, **k: None)
+    monkeypatch.setattr("tools.workspace.worker.unregister_worker_event_bus", lambda *a, **k: None)
+    monkeypatch.setattr("tools.workspace.worker.global_event_bus", None)
+    monkeypatch.setattr("infra.workspace_lifecycle_manager._agent_log", None)
+    caplog.set_level("INFO")
+
+    from tools.workspace.worker import WorkerThread
+
+    thread = WorkerThread(
+        name="w-wlm-int",
+        definition={"system_prompt": "sys"},
+        agent_config={"model": "gpt-4o", "session_config": {"use_workspace_lifecycle_manager": True}},
+        workspace_dir=Path(tmp_path) / "ws",
+        session_id="s1",
+        timeout_seconds=60,
+    )
+    thread._agent = SimpleNamespace(state=SimpleNamespace(
+        current_turn=0, turn_state=None, last_turn_warning_state=None,
+        restrictions_active=False, restrictions_pending=False,
+        restriction_reason=None, time_start=0.0, last_time_warning_state=None,
+        time_state=SimpleNamespace(value="LOW"),
+    ))
+    release = threading.Event()
+    proc_holder = {}
+
+    def fake_run_tool_loop(self, query):
+        if query == "run":
+            proc = subprocess.Popen(["sleep", "60"])
+            proc_holder["proc"] = proc
+            wlm = getattr(self, "_wlm", None)
+            if wlm is not None:
+                wlm.execution_tracker.register(
+                    worker_id=self.worker_name,
+                    query_id=wlm.current_query_id,
+                    tool_call_id="tc-sleep",
+                    tool_name="bash",
+                    pid=proc.pid,
+                )
+            release.wait(30.0)
+        self._last_elapsed_val = 1.0
+        self._final_token_usage = self.get_current_context_tokens()
+        return "done"
+
+    with mock.patch.object(thread, "_run_tool_loop", new=fake_run_tool_loop.__get__(thread, WorkerThread)):
+        worker_t = threading.Thread(target=thread.run, daemon=True)
+        worker_t.start()
+        try:
+            with pytest.raises(TimeoutError):
+                thread.send_query("run", timeout=2.0)
+        finally:
+            release.set()
+            thread._stop_event.set()
+            thread._input_queue.put(None)
+            worker_t.join(timeout=5.0)
+
+    report = thread._wlm.status_report()
+    assert report["state"] == WorkerState.TIMED_OUT
+    assert report["timeout_triggered"] is True
+
+    proc = proc_holder["proc"]
+    proc.wait(timeout=5.0)
+    assert proc.poll() is not None
+    assert thread._wlm.execution_tracker.active_count() == 0
+
+    deadline = time.monotonic() + 5.0
+    while not thread._output_queue.empty() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert thread._output_queue.empty()
+
+    # A fresh query drains the stale reply left over from the timed-out one.
+    thread._wlm._output_queue.put(("q_stale", "stale"))
+    thread._wlm.query_handler = lambda q, qid: thread._wlm._publish_reply(qid, {"ok": q})
+    reply = thread._wlm.process_query("final", timeout=2.0)
+    assert reply == {"ok": "final"}
+    assert thread._wlm.status_report()["state"] == WorkerState.IDLE
+    assert "[WLM-DRAIN]" in caplog.text
+    assert "q_stale" in caplog.text
+
+    data = json.loads((thread._worker_dir / "context.json").read_text(encoding="utf-8"))
+    conv = data["conversation"]
+    assert sum(1 for m in conv if m.get("role") == "system") == 1
+    assert len(conv) <= 3
+

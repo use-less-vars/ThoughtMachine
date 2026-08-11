@@ -608,6 +608,7 @@ class WorkerThread(threading.Thread):
         # Telemetry tracking
         self._tool_call_count: int = 0
         self._timeout_triggered: bool = False
+        self._wlm_soft_warning_received: bool = False
         self._final_token_usage: Optional[int] = None
         self._respond_metadata: Dict[str, Any] = {}  # captures status/confidence/meta from last Respond call
 
@@ -622,6 +623,9 @@ class WorkerThread(threading.Thread):
         # attempt is pruned before the new context is merged (no doubling).
         self._last_query: Optional[str] = None
         self._last_completed_query: Optional[str] = None
+        # WLM query id of the last attempt — persisted alongside the F1 markers
+        # so a WLM-enabled force-respawn can prune abandoned attempts exactly.
+        self._last_query_id: Optional[str] = None
 
         # Agent instance + WorkerContext (created lazily in run())
         self._agent: Optional[Any] = None
@@ -758,6 +762,8 @@ class WorkerThread(threading.Thread):
             container_manager=None,
             resource_container_manager=None,
             feature_flag_check=lambda: True,
+            session_id=self.session_id,
+            permissions_provider=lambda: self._session_permissions,
         )
 
         def _wlm_handler(query, query_id):
@@ -795,6 +801,13 @@ class WorkerThread(threading.Thread):
 
     def stop(self) -> None:
         """Signal the worker to stop after completing its current task."""
+        wlm = getattr(self, "_wlm", None)
+        if self._wlm_flag_enabled() and wlm is not None:
+            try:
+                wlm.stop()
+            except Exception as exc:
+                log("WARNING", "tools.worker",
+                    f"WLM stop delegation failed for worker '{self.worker_name}': {exc}")
         self._stop_event.set()
         # Write a stop command file for cross-process signalling
         try:
@@ -807,6 +820,13 @@ class WorkerThread(threading.Thread):
 
     def pause(self) -> None:
         """Signal the worker to pause after completing its current task."""
+        wlm = getattr(self, "_wlm", None)
+        if self._wlm_flag_enabled() and wlm is not None:
+            try:
+                wlm.pause()
+            except Exception as exc:
+                log("WARNING", "tools.worker",
+                    f"WLM pause delegation failed for worker '{self.worker_name}': {exc}")
         self._pause_event.set()
         self._resume_event.clear()
         # Write command file for cross-process signalling
@@ -820,6 +840,13 @@ class WorkerThread(threading.Thread):
 
     def resume(self) -> None:
         """Resume a paused worker."""
+        wlm = getattr(self, "_wlm", None)
+        if self._wlm_flag_enabled() and wlm is not None:
+            try:
+                wlm.resume()
+            except Exception as exc:
+                log("WARNING", "tools.worker",
+                    f"WLM resume delegation failed for worker '{self.worker_name}': {exc}")
         self._pause_event.clear()
         self._resume_event.set()
         self.status = "ready"
@@ -1062,6 +1089,22 @@ class WorkerThread(threading.Thread):
                     })
                     break
 
+                # WLM: surface the supervisor's soft-timeout warning to the
+                # worker log exactly once per query (the worker loop keeps
+                # running; the supervisor enforces the hard deadline).
+                wlm = getattr(self, "_wlm", None)
+                if (
+                    self._wlm_flag_enabled()
+                    and wlm is not None
+                    and getattr(wlm, "soft_timeout_warning_emitted", False)
+                    and not self._wlm_soft_warning_received
+                ):
+                    self._wlm_soft_warning_received = True
+                    log("WARNING", "tools.worker",
+                        f"[WLM] soft timeout warning received "
+                        f"query_id={getattr(wlm, 'current_query_id', None)} "
+                        f"worker={self.worker_name}")
+
                 event_type = event.get("type", "")
 
                 # Feed each event through the EventProcessor BEFORE the existing chain
@@ -1095,6 +1138,21 @@ class WorkerThread(threading.Thread):
                 # Track tool call count
                 if event_type == "tool_call":
                     self._tool_call_count += 1
+                    # WLM: register the in-flight execution so the supervisor
+                    # can terminate it on timeout/stop.
+                    wlm = getattr(self, "_wlm", None)
+                    if self._wlm_flag_enabled() and wlm is not None:
+                        try:
+                            wlm.execution_tracker.register(
+                                worker_id=self.worker_name,
+                                query_id=wlm.current_query_id,
+                                tool_call_id=event.get("tool_call_id"),
+                                tool_name=event.get("name") or event.get("tool_name"),
+                            )
+                        except Exception as exc:
+                            log("WARNING", "tools.worker",
+                                f"WLM execution registration failed for worker "
+                                f"'{self.worker_name}': {exc}")
 
                 elif event_type == "stopped":
                     stop_reason = event.get("stop_reason", "unknown")
@@ -1265,7 +1323,10 @@ class WorkerThread(threading.Thread):
                     # are preserved.
                     initial_query = self._initial_context.get("query")
                     if initial_query:
-                        self._prune_stale_attempt_before_merge(initial_query)
+                        if self._wlm_flag_enabled() and getattr(self, "_wlm", None) is not None:
+                            self._prune_abandoned_attempt_via_wlm(initial_query)
+                        else:
+                            self._prune_stale_attempt_before_merge(initial_query)
                     # Add initial context as a system message for continuity
                     ctx_msg = {
                         "role": "system",
@@ -1502,6 +1563,11 @@ class WorkerThread(threading.Thread):
                     self._worker_ctx.compact_after_summary()
 
                 # Persist and log
+                if self._wlm_flag_enabled() and getattr(self, "_wlm", None) is not None:
+                    try:
+                        self._last_query_id = self._wlm.current_query_id
+                    except Exception:
+                        pass
                 self._save_context()
 
                 # Send the response back to the waiting tool call
@@ -1527,6 +1593,14 @@ class WorkerThread(threading.Thread):
                     "meta": self._respond_metadata.get("meta"),
                     "telemetry": telemetry,
                 }
+
+                # WLM: expose the supervisor's query id in the envelope so the
+                # caller can correlate the reply with the lifecycle manager.
+                if self._wlm_flag_enabled() and getattr(self, "_wlm", None) is not None:
+                    try:
+                        envelope["query_id"] = self._wlm.current_query_id
+                    except Exception:
+                        pass
 
                 # If reply is already JSON (error case), parse and merge
                 if reply:
@@ -1668,6 +1742,7 @@ class WorkerThread(threading.Thread):
                 self.last_heartbeat = data.get("last_heartbeat")
                 self._last_query = data.get("last_query")
                 self._last_completed_query = data.get("last_completed_query")
+                self._last_query_id = data.get("last_query_id")
                 # F2: restore generation; keep the max so this thread's saves
                 # are never rejected against a file it just loaded.
                 try:
@@ -1711,6 +1786,56 @@ class WorkerThread(threading.Thread):
         logger.debug(
             "Pruned incomplete attempt for query %r before merging new context (worker '%s')",
             last_query,
+            self.worker_name,
+        )
+
+    def _prune_abandoned_attempt_via_wlm(self, new_query: str) -> None:
+        """WLM variant of F1: prune an attempt the supervisor marked abandoned.
+
+        Uses the supervisor's query outcome log: when the last attempt's query
+        id is recorded as abandoned (timed out / stopped mid-query), truncate
+        the loaded history from the last "Initial context" boundary before the
+        new context is merged. Falls back to the legacy F1 heuristic whenever
+        the WLM signal is unavailable (no supervisor, no query id, or the id
+        is not in the log).
+        """
+        wlm = getattr(self, "_wlm", None)
+        if wlm is None:
+            self._prune_stale_attempt_before_merge(new_query)
+            return
+        try:
+            abandoned = set(wlm.abandoned_query_ids())
+            completed = set(wlm.completed_query_ids())
+        except Exception as exc:
+            log("WARNING", "tools.worker",
+                f"WLM query-log read failed for worker '{self.worker_name}' "
+                f"(falling back to F1): {exc}")
+            self._prune_stale_attempt_before_merge(new_query)
+            return
+        last_qid = getattr(self, "_last_query_id", None)
+        if not last_qid:
+            self._prune_stale_attempt_before_merge(new_query)
+            return
+        if last_qid in completed:
+            return  # last attempt completed — completed work is kept
+        if last_qid not in abandoned:
+            # WLM has no verdict for this id (e.g. pre-WLM context) — fall back.
+            self._prune_stale_attempt_before_merge(new_query)
+            return
+        history = self._worker_ctx.user_history
+        ic_indices = [
+            i for i, msg in enumerate(history)
+            if msg.get("role") == "system"
+            and isinstance(msg.get("content"), str)
+            and msg["content"].startswith("Initial context: ")
+        ]
+        if not ic_indices:
+            return
+        boundary = ic_indices[-1]
+        del history[boundary:]
+        logger.debug(
+            "Pruned WLM-abandoned attempt (query_id=%s) before merging new context (worker '%s')",
+            last_qid,
             self.worker_name,
         )
 
@@ -1794,6 +1919,7 @@ class WorkerThread(threading.Thread):
             "last_heartbeat": self.last_heartbeat,
             "last_query": self._last_query,
             "last_completed_query": self._last_completed_query,
+            "last_query_id": getattr(self, "_last_query_id", None),
             "generation": self._generation,
         }
         target.parent.mkdir(parents=True, exist_ok=True)

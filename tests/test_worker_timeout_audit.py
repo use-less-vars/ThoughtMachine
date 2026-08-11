@@ -619,5 +619,192 @@ class TestStopPathCompacts(_RunSafetyPatches):
             )
 
 
+class _FakeWlmSupervisor:
+    """Duck-typed WorkerSupervisor for worker.py delegation tests."""
+
+    def __init__(self, current_query_id=None, abandoned=None, completed=None):
+        self.current_query_id = current_query_id
+        self.soft_timeout_warning_emitted = False
+        self.execution_tracker = SimpleNamespace(register=lambda **kw: None)
+        self._abandoned = list(abandoned or [])
+        self._completed = list(completed or [])
+        self.pause_calls = []
+        self.resume_calls = []
+        self.stop_calls = []
+
+    def abandoned_query_ids(self):
+        return list(self._abandoned)
+
+    def completed_query_ids(self):
+        return list(self._completed)
+
+    def pause(self):
+        self.pause_calls.append(True)
+
+    def resume(self):
+        self.resume_calls.append(True)
+
+    def stop(self):
+        self.stop_calls.append(True)
+
+
+class TestWlmWorkerDelegation(_RunSafetyPatches):
+    """WLM flag-on delegation from WorkerThread: envelope query_id,
+    pause/resume/stop forwarding, and abandoned-attempt pruning on merge."""
+
+    def _write_context(self, thread, ctx, status="busy",
+                       last_query=None, last_completed_query=None):
+        thread._worker_dir.mkdir(parents=True, exist_ok=True)
+        data = {
+            **ctx.to_persistable_dict(),
+            "status": status,
+            "error": None,
+            "last_heartbeat": None,
+            "last_query": last_query,
+            "last_completed_query": last_completed_query,
+        }
+        (thread._worker_dir / "context.json").write_text(
+            json.dumps(data), encoding="utf-8"
+        )
+
+    def _run_and_get_queue(self, thread):
+        # Pre-fill None so the loop breaks right after the auto-queued query.
+        thread._input_queue.put(None)
+        thread.run()
+        return list(thread._input_queue.queue)
+
+    def test_wlm_envelope_includes_query_id_flag_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = make_thread(tmp, name="w-wlm-env")
+            thread._agent_config_dict = {
+                "model": "gpt-4o",
+                "session_config": {"use_workspace_lifecycle_manager": True},
+            }
+            thread._wlm = _FakeWlmSupervisor(current_query_id="q_test")
+            thread._agent = make_fake_agent()
+
+            def fake_run_tool_loop(self, query):
+                self._last_elapsed_val = 1.0
+                self._final_token_usage = self.get_current_context_tokens()
+                return "done"
+
+            thread._input_queue.put("query-1")
+            thread._input_queue.put(None)
+            with mock.patch.object(thread, "_run_tool_loop",
+                                   new=fake_run_tool_loop.__get__(thread, WorkerThread)):
+                thread.run()
+            env = json.loads(thread._output_queue.get_nowait())
+            self.assertEqual(env["query_id"], "q_test")
+
+    def test_wlm_envelope_no_query_id_flag_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = make_thread(tmp, name="w-wlm-env2")
+            thread._agent = make_fake_agent()
+
+            def fake_run_tool_loop(self, query):
+                self._last_elapsed_val = 1.0
+                self._final_token_usage = self.get_current_context_tokens()
+                return "done"
+
+            thread._input_queue.put("query-1")
+            thread._input_queue.put(None)
+            with mock.patch.object(thread, "_run_tool_loop",
+                                   new=fake_run_tool_loop.__get__(thread, WorkerThread)):
+                thread.run()
+            env = json.loads(thread._output_queue.get_nowait())
+            self.assertNotIn("query_id", env)
+
+    def test_wlm_pause_delegation_flag_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = make_thread(tmp, name="w-wlm-pause")
+            thread._agent_config_dict = {
+                "model": "gpt-4o",
+                "session_config": {"use_workspace_lifecycle_manager": True},
+            }
+            thread._wlm = _FakeWlmSupervisor()
+            thread.pause()
+            self.assertEqual(thread._wlm.pause_calls, [True])
+
+    def test_wlm_resume_delegation_flag_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = make_thread(tmp, name="w-wlm-resume")
+            thread._agent_config_dict = {
+                "model": "gpt-4o",
+                "session_config": {"use_workspace_lifecycle_manager": True},
+            }
+            thread._wlm = _FakeWlmSupervisor()
+            thread.resume()
+            self.assertEqual(thread._wlm.resume_calls, [True])
+
+    def test_wlm_stop_delegation_flag_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = make_thread(tmp, name="w-wlm-stop")
+            thread._agent_config_dict = {
+                "model": "gpt-4o",
+                "session_config": {"use_workspace_lifecycle_manager": True},
+            }
+            thread._wlm = _FakeWlmSupervisor()
+            thread.stop()
+            self.assertEqual(thread._wlm.stop_calls, [True])
+
+    def test_wlm_prune_abandoned_attempt_flag_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = make_thread(tmp, name="w-wlm-prune")
+            thread._agent_config_dict = {
+                "model": "gpt-4o",
+                "session_config": {"use_workspace_lifecycle_manager": True},
+            }
+            thread._wlm = _FakeWlmSupervisor(abandoned=["q_old1"])
+            ctx = WorkerContext(
+                session_id="s1",
+                worker_name="w-wlm-prune",
+                user_history=[
+                    {"role": "system", "content": SYS_PROMPT},
+                    initial_ctx_msg({"query": "OLD QUERY", "config": {"v": 1}}),
+                    {"role": "user", "content": "old attempt query"},
+                    {"role": "assistant", "content": "old attempt partial work"},
+                ],
+            )
+            self._write_context(thread, ctx, status="busy",
+                                last_query="OLD QUERY", last_completed_query=None)
+            data = json.loads((thread._worker_dir / "context.json").read_text(encoding="utf-8"))
+            data["last_query_id"] = "q_old1"
+            (thread._worker_dir / "context.json").write_text(json.dumps(data), encoding="utf-8")
+            thread._initial_context = {"query": "NEW QUERY", "config": {"x": 1}}
+            thread._agent = make_fake_agent()
+            queued = self._run_and_get_queue(thread)
+            self.assertEqual(queued, ["NEW QUERY"])
+            self.assertEqual(
+                [m["content"] for m in thread._worker_ctx.user_history],
+                [SYS_PROMPT,
+                 initial_ctx_msg({"query": "NEW QUERY", "config": {"x": 1}})["content"]],
+            )
+
+    def test_wlm_prune_falls_back_to_f1_flag_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = make_thread(tmp, name="w-f1-off")
+            ctx = WorkerContext(
+                session_id="s1",
+                worker_name="w-f1-off",
+                user_history=[
+                    {"role": "system", "content": SYS_PROMPT},
+                    initial_ctx_msg({"query": "OLD QUERY", "config": {"v": 1}}),
+                    {"role": "user", "content": "old attempt query"},
+                ],
+            )
+            self._write_context(thread, ctx, status="busy",
+                                last_query="OLD QUERY", last_completed_query=None)
+            data = json.loads((thread._worker_dir / "context.json").read_text(encoding="utf-8"))
+            data["last_query_id"] = "q_old1"
+            (thread._worker_dir / "context.json").write_text(json.dumps(data), encoding="utf-8")
+            thread._initial_context = {"query": "OLD QUERY", "config": {"v": 1}}
+            thread._agent = make_fake_agent()
+            queued = self._run_and_get_queue(thread)
+            self.assertEqual(queued, ["OLD QUERY"])
+            # Same-query reload: F1 keeps the loaded context intact (no
+            # duplicate initial-context message, no pruning) -> 3 entries.
+            self.assertEqual(len(thread._worker_ctx.user_history), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
