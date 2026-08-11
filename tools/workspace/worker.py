@@ -704,6 +704,10 @@ class WorkerThread(threading.Thread):
 
     def send_query(self, query: str, timeout: float = 120.0) -> str:
         """Send a query to this worker and block for a response."""
+        # Workspace Lifecycle Manager fast path (feature-flagged, default off)
+        used, reply = self._process_query_via_wlm(query, timeout=timeout)
+        if used:
+            return reply
         # Push query before checking heartbeat (query clears the queue)
         self._input_queue.put(query)
         try:
@@ -732,6 +736,62 @@ class WorkerThread(threading.Thread):
             raise TimeoutError(
                 f"Worker '{self.worker_name}' did not respond within {timeout}s{detail}"
             )
+
+    # ------------------------------------------------------------------
+    # Workspace Lifecycle Manager wiring (feature-flagged, default off).
+    # When enabled, send_query delegates to the supervisor; the legacy
+    # queue-based path above remains byte-for-byte untouched and is used
+    # whenever the flag is off or the supervisor is unavailable.
+    # ------------------------------------------------------------------
+
+    def _get_wlm(self):
+        """Return the lazily-created WorkerSupervisor, or None when disabled."""
+        existing = getattr(self, "_wlm", None)
+        if existing is not None:
+            return existing
+        if not self._wlm_flag_enabled():
+            return None
+        from infra.workspace_lifecycle_manager import WorkerSupervisor, HARD_TIMEOUT
+
+        supervisor = WorkerSupervisor(
+            worker_id=self.worker_name,
+            container_manager=None,
+            resource_container_manager=None,
+            feature_flag_check=lambda: True,
+        )
+
+        def _wlm_handler(query, query_id):
+            """Bridge the supervisor to the worker's existing run() loop."""
+            self._input_queue.put(query)
+            try:
+                reply = self._output_queue.get(timeout=HARD_TIMEOUT)
+            except queue.Empty:
+                reply = json.dumps({"error": "Worker did not respond in time."})
+            supervisor._publish_reply(query_id, reply)
+
+        supervisor.query_handler = _wlm_handler
+        self._wlm = supervisor
+        log("INFO", "tools.worker",
+            f"Workspace Lifecycle Manager enabled for worker '{self.worker_name}'")
+        return supervisor
+
+    def _wlm_flag_enabled(self) -> bool:
+        """True when the workspace lifecycle manager feature flag is set."""
+        cfg = (self._agent_config_dict or {}).get("session_config")
+        if isinstance(cfg, dict) and cfg.get("use_workspace_lifecycle_manager"):
+            return True
+        return bool((self.definition or {}).get("use_workspace_lifecycle_manager", False))
+
+    def _process_query_via_wlm(self, query: str, timeout=None):
+        """Route a query through the supervisor when enabled.
+
+        Returns (used, reply): used=False means the caller should fall back
+        to the legacy queue-based path.
+        """
+        supervisor = self._get_wlm()
+        if supervisor is None:
+            return (False, None)
+        return (True, supervisor.process_query(query, timeout=timeout))
 
     def stop(self) -> None:
         """Signal the worker to stop after completing its current task."""
