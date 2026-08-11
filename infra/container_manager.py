@@ -373,7 +373,7 @@ class ContainerManager:
     @property
     def _registry(self):
         """Lazily-resolved ContainerRegistry facade (wired per session config)."""
-        return get_active_registry(self._session_config)
+        return get_active_registry(getattr(self, "_session_config", None))
 
     def _resolve_registry_name(self, container_id):
         """Map a container id (or name) to the registry's registered name.
@@ -437,7 +437,7 @@ class ContainerManager:
         # When the registry is active it owns the per-session limit; the
         # legacy workspace-scoped check is skipped so the registry is the
         # single source of truth for container counts.
-        if len(containers) >= limit and not is_registry_active(self._session_config):
+        if len(containers) >= limit and not is_registry_active(getattr(self, "_session_config", None)):
             return {"error": f"Workspace container limit ({limit}) reached. "
                              f"Stop an unused container first."}
 
@@ -550,7 +550,7 @@ class ContainerManager:
         # creation path.  The registry generates the docker name; the facade
         # keeps its own ``name`` as the label ``thoughtmachine.container_name``
         # so label-based reuse still works on later start() calls.
-        if is_registry_active(self._session_config):
+        if is_registry_active(getattr(self, "_session_config", None)):
             registry = self._registry
             try:
                 handle = registry.request_container(
@@ -709,7 +709,7 @@ class ContainerManager:
 
     def stop(self, container_id):
         """Stop the container. Idempotent; NEVER raises."""
-        if is_registry_active(self._session_config):
+        if is_registry_active(getattr(self, "_session_config", None)):
             name = self._resolve_registry_name(container_id)
             if name is not None:
                 try:
@@ -753,7 +753,7 @@ class ContainerManager:
             {"status": "removed", "container_id": ...}
             {"status": "error", "container_id": ..., "error": ...}
         """
-        if is_registry_active(self._session_config):
+        if is_registry_active(getattr(self, "_session_config", None)):
             name = self._resolve_registry_name(container_id)
             if name is not None:
                 try:
