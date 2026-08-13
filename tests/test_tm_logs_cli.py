@@ -1,9 +1,10 @@
 """Chunk 4 - CLI tests for ``tm-logs`` (agent.cli.logs), run in-process.
 
-Hermetic: THOUGHTMACHINE_VAULT_ROOT is set per-test to a tmp_path, the
-lifecycle LOG_DIR module attribute (import-time bound) is re-pointed there,
-and sys.argv is monkeypatched before calling agent.cli.logs.main().  The CLI
-resolves its log root at runtime from THOUGHTMACHINE_VAULT_ROOT.
+Hermetic: THOUGHTMACHINE_VAULT_ROOT is set per-test to a tmp_path (HOME is
+set too), and sys.argv is monkeypatched before calling
+agent.cli.logs.main().  Both the writers and the CLI resolve the log root
+at runtime from THOUGHTMACHINE_VAULT_ROOT via the shared
+agent._log_root.get_log_root helper.
 """
 from __future__ import annotations
 
@@ -50,7 +51,6 @@ def seeded_vault(tmp_path, monkeypatch):
     """Seed all four lifecycle streams under a temp vault root."""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path))
-    monkeypatch.setattr(lifecycle, "LOG_DIR", str(tmp_path / "logs"))
     _seed_all_streams()
     lifecycle.close_streams()
     return tmp_path

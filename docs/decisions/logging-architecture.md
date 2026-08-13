@@ -70,8 +70,10 @@ deliberately deviates (see Consequences).
 ### Central redaction
 
 `agent/logging/redaction.py::redact()` is the single redaction utility applied to
-every sink that can carry free-form text: `provider_raw.jsonl` (whole-line) and
-`event_log.jsonl` (whole-line). Patterns: OpenAI `sk-*`, GitHub PATs
+every sink that can carry free-form text: `provider_raw.jsonl`, `event_log.jsonl`,
+and all lifecycle streams (`session.log`, `worker_*.log`, `container.log`) — each
+is redacted whole-line at write time (`JsonlStreamWriter.write()` defaults
+`redact_line=True`). Patterns: OpenAI `sk-*`, GitHub PATs
 (`gh[pousr2]_*`), `Bearer` tokens, AWS `AKIA` access key ids, case-insensitive
 `key=value` pairs for known secret names, and PEM private-key blocks. `redact()`
 never raises and is JSON-safe.
@@ -117,23 +119,19 @@ stream file (script-friendly), `2` for bad arguments, `1` for unreadable files.
 ### Positive
 
 - Predictable location and bounded disk usage (~10 MB max per stream).
-- All secrets pass through one redaction utility; provider and event streams are
-  redacted at the line level.
+- All secrets pass through one redaction utility; provider, event, and lifecycle
+  streams are redacted at the line level by default.
 - Operators can query logs with `tm-logs` without touching the files directly.
 - Logging is best-effort everywhere: a logging failure can never crash the
   caller.
 
 ### Trade-offs / known deviations (accepted)
 
-- **Import-time `LOG_DIR` binding** in `agent/logging/lifecycle.py`: the
-  lifecycle log directory is fixed when the module is first imported. Setting
-  `THOUGHTMACHINE_VAULT_ROOT` afterwards does not relocate already-imported
-  lifecycle streams. `tm-logs` re-resolves the root at runtime, so a mismatch
-  between writer and reader is possible if the env var changes mid-process.
-- **`EventLogger` ignores `THOUGHTMACHINE_VAULT_ROOT`**: its log directory is
-  always `~/.thoughtmachine/logs` (`expanduser`), so with the env var set,
-  `event_log.jsonl` lands in the default location while the lifecycle streams
-  land under the vault root. Known asymmetry; the constructor accepts
+- **Log root is resolved dynamically, never at import time**: one shared
+  `agent._log_root.get_log_root()` serves lifecycle, EventLogger, `_AgentLogger`,
+  and `tm-logs`; setting `THOUGHTMACHINE_VAULT_ROOT` mid-process takes effect at
+  the next writer open / CLI invocation. Writers already opened under a previous
+  root stay there until closed. The `EventLogger` constructor still accepts
   `workspace_path` but the implementation does not use it.
 - **`event_log.jsonl` schema deviation**: records carry `timestamp` (naive
   ISO-8601, no `Z`/offset — from `EventMetadata.timestamp = datetime.now()`),
@@ -146,10 +144,6 @@ stream file (script-friendly), `2` for bad arguments, `1` for unreadable files.
   retained data is bounded by 2 × max_bytes; records beyond that window are
   discarded by design (surviving records across `path` + `path.1` are always a
   contiguous suffix of the written sequence).
-- **Lifecycle event streams are not line-redacted**: `session.log`,
-  `worker_*.log`, `container.log` are written with `redact_line=False`; their
-  `data` payloads are caller-supplied, so callers must not place secrets in
-  them.
 - **`provider_raw.jsonl` covers successful completions only**: provider errors
   are raised as `LLMError` before `_log_provider_response` runs, so error
   diagnostics do not appear in this stream.

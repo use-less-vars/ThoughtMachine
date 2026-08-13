@@ -9,6 +9,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import tiktoken
 from pydantic import ValidationError
 from agent.logging import log
+from agent._log_root import get_log_root
 from fast_json_repair import loads as repair_loads
 from agent.core.turn_transaction import TurnTransaction
 from tools.respond import Respond
@@ -133,7 +134,7 @@ class ToolExecutor:
             arguments_str = tool_call['function']['arguments']
             # ── RAW TOOL CALL DIAGNOSTIC (vault path) ──
             import os as _os, time as _time
-            _raw_log_dir = _os.path.join(_os.path.expanduser("~"), ".thoughtmachine", "logs")
+            _raw_log_dir = str(get_log_root())
             _os.makedirs(_raw_log_dir, exist_ok=True)
             _raw_log_path = _os.path.join(_raw_log_dir, "tool_calls_raw_debug.log")
             # Size-limited: max 2MB, single file, no debris

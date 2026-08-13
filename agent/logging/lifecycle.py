@@ -2,7 +2,10 @@
 and container lifecycle events.
 
 Streams (JSONL, written via :class:`~agent.logging.streams.JsonlStreamWriter`)
-all live under the canonical vault log directory ``~/.thoughtmachine/logs``:
+all live under the canonical vault log directory -- ``~/.thoughtmachine/logs``
+by default, or ``$THOUGHTMACHINE_VAULT_ROOT/logs`` when that env var is set.
+The root is resolved at runtime via :func:`agent._log_root.get_log_root`,
+never bound at import time:
 
 - ``session.log``          — controller events (wired in ``_emit_event``)
 - ``worker_<name>.log``    — per-worker lifecycle (spawned / stopped)
@@ -25,14 +28,7 @@ import threading
 from typing import Dict, Optional
 
 from agent.logging.streams import JsonlStreamWriter
-
-#: Canonical vault log directory (mirrors EventLogger + _AgentLogger).
-#: ``THOUGHTMACHINE_VAULT_ROOT`` (when set) redirects the vault root.
-_VAULT_ROOT = os.environ.get("THOUGHTMACHINE_VAULT_ROOT")
-if _VAULT_ROOT:
-    LOG_DIR = os.path.join(_VAULT_ROOT, "logs")
-else:
-    LOG_DIR = os.path.join(os.path.expanduser("~"), ".thoughtmachine", "logs")
+from agent._log_root import get_log_root
 
 #: stdlib logger used for the human-readable console summary lines.
 _console_logger = logging.getLogger("thoughtmachine.lifecycle")
@@ -43,12 +39,18 @@ _writers_lock = threading.Lock()
 
 
 def get_log_dir() -> str:
-    """Return the canonical vault log directory, creating it if needed."""
+    """Return the canonical vault log directory, creating it if needed.
+
+    The directory is resolved dynamically from
+    :func:`agent._log_root.get_log_root` on every call, so
+    ``THOUGHTMACHINE_VAULT_ROOT`` takes effect even when set after import.
+    """
+    log_dir = str(get_log_root())
     try:
-        os.makedirs(LOG_DIR, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
     except Exception:
         pass
-    return LOG_DIR
+    return log_dir
 
 
 def _safe_name(name: str) -> str:
@@ -59,9 +61,10 @@ def _safe_name(name: str) -> str:
 def _writer(filename: str) -> JsonlStreamWriter:
     """Return the lazily-created JsonlStreamWriter for *filename*.
 
-    Writers are cached by full resolved path so a LOG_DIR re-point
-    (e.g. hermetic test fixtures) takes effect even when a writer for the
-    same file name was already created under a different directory.
+    Writers are cached by full resolved path so a change of log root
+    (e.g. via the THOUGHTMACHINE_VAULT_ROOT env var) takes effect even
+    when a writer for the same file name was already created under a
+    different directory.
     """
     with _writers_lock:
         path = os.path.join(get_log_dir(), filename)

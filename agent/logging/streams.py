@@ -3,7 +3,8 @@ size-based rotation.
 
 Used by the lifecycle event streams (``session.log``, ``worker_*.log``,
 ``container.log``) which live in the canonical vault log directory
-``~/.thoughtmachine/logs``.  All public methods are best-effort and never
+(``~/.thoughtmachine/logs`` by default, ``$THOUGHTMACHINE_VAULT_ROOT/logs``
+when that env var is set).  All public methods are best-effort and never
 raise, so lifecycle logging can never break the caller's control flow.
 """
 
@@ -81,16 +82,17 @@ class JsonlStreamWriter:
     def file_path(self) -> str:
         return self.path
 
-    def write(self, record: dict, redact_line: bool = False) -> None:
+    def write(self, record: dict, redact_line: bool = True) -> None:
         """Serialize *record* to a single JSON line and append it.
 
         Common envelope fields (timestamp, level, logger, pid, thread_id,
         and empty session_id / worker_id / query_id / correlation_id /
-        container_id) are injected when absent.  When *redact_line* is
-        True, the fully serialized line is passed through
+        container_id) are injected when absent.  Line redaction is on by
+        default: the fully serialized line is passed through
         :func:`agent.logging.redaction.redact` before writing, so secrets
         embedded anywhere in the record (e.g. raw content previews) never
-        hit disk.  Never raises.
+        hit disk.  Pass *redact_line* as False to skip redaction.  Never
+        raises.
         """
         try:
             out = dict(record or {})

@@ -8,8 +8,9 @@ Covers:
 (b) Redaction unit tests for agent.logging.redaction.redact().
 (c) JsonlStreamWriter rotation (size-based, keep 1 backup, no lost records).
 (d) Hermeticity: lifecycle + EventLogger activity never writes to the repo
-    root (HOME / THOUGHTMACHINE_VAULT_ROOT are patched to tmp_path and
-    lifecycle.LOG_DIR is re-pointed - it is import-time bound).
+    root (HOME / THOUGHTMACHINE_VAULT_ROOT are patched to tmp_path; the log
+    root is resolved dynamically from the env var via
+    agent._log_root.get_log_root - no import-time binding).
 
 Hermetic by construction: tmp_path + monkeypatch only, no real vault, no
 network, no codebase log writes.
@@ -76,10 +77,9 @@ def _assert_lifecycle_envelope(
 
 @pytest.fixture
 def hermetic(tmp_path, monkeypatch):
-    """Point HOME + THOUGHTMACHINE_VAULT_ROOT + lifecycle.LOG_DIR at tmp_path."""
+    """Point HOME + THOUGHTMACHINE_VAULT_ROOT at tmp_path."""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path))
-    monkeypatch.setattr(lifecycle, "LOG_DIR", str(tmp_path / "logs"))
     yield tmp_path
     lifecycle.close_streams()
     from agent.logging.event_logger import EventLogger
@@ -207,7 +207,7 @@ class TestStreamJsonEnvelope:
             logger.stop()
         finally:
             EventLogger._instance = None
-        path = os.path.join(str(hermetic), ".thoughtmachine", "logs", "event_log.jsonl")
+        path = os.path.join(str(hermetic), "logs", "event_log.jsonl")
         assert os.path.isfile(path)
         records = _read_jsonl(path)
         assert len(records) == 2
@@ -225,6 +225,32 @@ class TestStreamJsonEnvelope:
         raw = open(path, encoding="utf-8").read()
         assert "sk-abcdefghijklmnopqrstuvwxyz123456" not in raw
         assert "sk-<REDACTED>" in raw
+
+    def test_lifecycle_session_data_redacted_at_write_time(self, hermetic):
+        """Whole-line redaction applies to lifecycle streams by default.
+
+        A secret placed in caller-supplied ``data`` must never reach disk in
+        any form.  Note: for ``api_key`` key=value pairs the redaction
+        patterns fully replace the value with ``<REDACTED>`` (the ``sk-``
+        prefix is consumed by the later key=value pattern), while free-text
+        occurrences keep the ``sk-<REDACTED>`` form (covered by the provider
+        stream test above).
+        """
+        secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+        lifecycle.log_session_event(
+            "session_started",
+            session_id="sess-redact",
+            data={"api_key": secret},
+        )
+        lifecycle.close_streams()
+        path = os.path.join(str(hermetic), "logs", "session.log")
+        raw = open(path, encoding="utf-8").read()
+        assert secret not in raw
+        assert "<REDACTED>" in raw
+        for line in raw.splitlines():
+            if line.strip():
+                rec = json.loads(line)
+                assert rec["data"]["api_key"] == "<REDACTED>"
 
 
 # ---------------------------------------------------------------------------

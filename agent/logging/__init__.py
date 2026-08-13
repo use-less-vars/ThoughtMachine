@@ -7,6 +7,8 @@ import logging as python_logging
 import os
 import threading
 
+from agent._log_root import get_log_root
+
 
 def _safe_err_print(message: str) -> None:
     """Print *message* to stderr without crashing when stderr is None.
@@ -122,7 +124,7 @@ class _AgentLogger:
             if env_list:
                 self.enabled_categories = [LogCategory(cat) for cat in env_list]
         if log_dir is None:
-            log_dir = os.path.join(os.path.expanduser("~"), ".thoughtmachine", "logs")
+            log_dir = str(get_log_root())
         self.log_dir = os.path.abspath(log_dir)
         if log_level == LogLevel.INFO and hasattr(config, 'log_level'):
             log_level = config.log_level

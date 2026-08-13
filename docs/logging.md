@@ -15,22 +15,24 @@ All structured logs live in the **canonical vault log directory**:
 $THOUGHTMACHINE_VAULT_ROOT/logs           (when the env var is set)
 ```
 
-Resolution rules differ slightly by module — read carefully:
+One shared helper — `agent/_log_root.py::get_log_root()` — resolves the root
+**dynamically on every call** (side-effect-free, no import-time binding):
 
-| Module | Resolution | When |
+| Consumer | Resolution | When |
 |---|---|---|
-| `agent/logging/lifecycle.py` | `LOG_DIR` computed at **import time** from `THOUGHTMACHINE_VAULT_ROOT` (fallback `~/.thoughtmachine/logs`) | import |
-| `agent/logging/event_logger.py` | `log_dir = ~/.thoughtmachine/logs` via `expanduser` — **ignores `THOUGHTMACHINE_VAULT_ROOT`** | `EventLogger.__init__` |
-| `agent/cli/logs.py` | `_log_root()` resolved at **runtime** from `THOUGHTMACHINE_VAULT_ROOT` (fallback `~/.thoughtmachine/logs`) | each invocation |
+| `agent/logging/lifecycle.py` | `get_log_root()` via `get_log_dir()` | each stream open (`_writer`) |
+| `agent/logging/event_logger.py` | `get_log_root()` | `EventLogger.__init__` |
+| `agent/logging/__init__.py` (`_AgentLogger`) | `get_log_root()` | `_AgentLogger.__init__` (when no explicit `log_dir`) |
+| `agent/cli/logs.py` (`tm-logs`) | `get_log_root()` | each invocation |
 
 Practical consequences:
 
-- In a fresh process with `THOUGHTMACHINE_VAULT_ROOT` set, everything lands under
-  `$THOUGHTMACHINE_VAULT_ROOT/logs` (lifecycle streams honor it at import time and
-  `tm-logs` honors it at run time).
-- If you set the variable *after* `agent.logging.lifecycle` was imported, lifecycle
-  streams still use the old `LOG_DIR` for the rest of the process.
-- `EventLogger` always writes to `~/.thoughtmachine/logs` regardless of the env var.
+- In a fresh process with `THOUGHTMACHINE_VAULT_ROOT` set, **every** writer and the
+  CLI resolve `$THOUGHTMACHINE_VAULT_ROOT/logs`; with the variable unset, all fall
+  back to `~/.thoughtmachine/logs`. There is exactly one resolution rule.
+- Setting the variable mid-process takes effect at the next writer open / CLI
+  invocation (no import-time binding anywhere); writers are cached per resolved
+  path, so streams already opened under the old root stay there until closed.
 
 ### The codebase never writes logs into the repo
 
@@ -202,11 +204,12 @@ The **whole serialized line** is passed through `redact()` before writing
 `agent/logging/redaction.py::redact(text)` is the central secret-redaction
 utility. It is applied to **every sink that can carry free-form text**:
 
-- `provider_raw.jsonl` — whole-line redaction (`redact_line=True`).
+- `provider_raw.jsonl` — whole-line redaction (`redact_line=True`, explicit).
 - `event_log.jsonl` — whole-line redaction in the writer thread.
-- (The lifecycle event streams `session.log` / `worker_*.log` / `container.log`
-  are **not** line-redacted: their `data` payloads are caller-supplied, so
-  callers must not place secrets there.)
+- `session.log` / `worker_*.log` / `container.log` — whole-line redaction too:
+  `JsonlStreamWriter.write()` defaults `redact_line=True`, so every lifecycle
+  stream is redacted at write time even though their `data` payloads are
+  caller-supplied.
 
 Patterns (in order, first match wins per position; group 1 is preserved as a
 recognizable prefix):

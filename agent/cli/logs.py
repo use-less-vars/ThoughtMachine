@@ -39,9 +39,10 @@ Missing stream file: a friendly message is printed to stderr and the CLI
 exits 0, so scripts/pipelines do not break when a stream has not been
 written yet.
 
-The log root is resolved at runtime from ``THOUGHTMACHINE_VAULT_ROOT``
-(mirroring ``agent.logging.lifecycle``'s canonical logic) so the CLI honors
-the variable however it is invoked.
+The log root is resolved at runtime from the shared
+:func:`agent._log_root.get_log_root` helper (``THOUGHTMACHINE_VAULT_ROOT``
+when set, else ``~/.thoughtmachine/logs``), so the CLI honors the variable
+however it is invoked.
 """
 
 from __future__ import annotations
@@ -53,23 +54,16 @@ import re
 import sys
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple
+from agent._log_root import get_log_root
 
 # ---------------------------------------------------------------------------
-# canonical log-root + filename resolution (mirrors agent.logging.lifecycle)
+# canonical log-root + filename resolution (shared agent._log_root helper)
 # ---------------------------------------------------------------------------
 
 
 def _safe_name(name: str) -> str:
     """Sanitize a name for use in a file name (mirrors lifecycle._safe_name)."""
     return re.sub(r"[^A-Za-z0-9_.\-]", "_", str(name or ""))
-
-
-def _log_root() -> str:
-    """Resolve the canonical vault log directory at runtime."""
-    root = os.environ.get("THOUGHTMACHINE_VAULT_ROOT")
-    if root:
-        return os.path.join(root, "logs")
-    return os.path.join(os.path.expanduser("~"), ".thoughtmachine", "logs")
 
 
 _STREAM_FILES = {
@@ -385,7 +379,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _run(args, parser: argparse.ArgumentParser) -> int:
-    log_dir = _log_root()
+    log_dir = str(get_log_root())
     filename = _STREAM_FILES[args.subcommand]
     if args.subcommand == "worker":
         filename = f"worker_{_safe_name(args.worker_name)}.log"

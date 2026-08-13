@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Optional
 from agent.events import EventBus, BaseEvent, EventType, global_event_bus
 from agent.logging.redaction import redact
+from agent._log_root import get_log_root
 
 
 class EventLogger:
@@ -52,7 +53,7 @@ class EventLogger:
         self._subscriptions: list[tuple[EventBus, Optional[EventType]]] = []
 
         # Determine log directory and file path — always use vault path
-        vault_log_dir = os.path.join(os.path.expanduser("~"), ".thoughtmachine", "logs")
+        vault_log_dir = str(get_log_root())
         self.log_dir = vault_log_dir
         self._file_path = os.path.join(vault_log_dir, "event_log.jsonl")
 
