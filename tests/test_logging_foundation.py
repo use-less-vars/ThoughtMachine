@@ -17,7 +17,9 @@ network, no codebase log writes.
 """
 from __future__ import annotations
 
+import io
 import json
+import logging
 import os
 import re
 from datetime import datetime
@@ -251,6 +253,27 @@ class TestStreamJsonEnvelope:
             if line.strip():
                 rec = json.loads(line)
                 assert rec["data"]["api_key"] == "<REDACTED>"
+
+
+class TestClosedConsoleStream:
+    """log_session_event must never propagate ValueError when the console
+    stream has been closed (e.g. stderr torn down during logging teardown)."""
+
+    def test_closed_console_stream_does_not_raise(self, hermetic):
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        stream.close()  # simulate teardown closing the handler stream
+        console = logging.getLogger("thoughtmachine.lifecycle")
+        console.addHandler(handler)
+        try:
+            # must not raise ValueError: I/O operation on closed file
+            lifecycle.log_session_event("session_started", session_id="s-1")
+        finally:
+            console.removeHandler(handler)
+        lifecycle.close_streams()
+        path = os.path.join(str(hermetic), "logs", "session.log")
+        assert os.path.isfile(path)
+        assert len(_read_jsonl(path)) == 1
 
 
 class TestToolCallRawStream:

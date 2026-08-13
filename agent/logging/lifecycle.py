@@ -93,9 +93,14 @@ def log_session_event(
             "data": data or {},
         }
         _writer("session.log").write(record)
-        _console_logger.info(
-            "session %s session_id=%s", event_type, session_id or "-"
-        )
+        try:
+            _console_logger.info(
+                "session %s session_id=%s", event_type, session_id or "-"
+            )
+        except ValueError:
+            # Console stream may already be closed during teardown; lifecycle
+            # logging must never raise.
+            pass
     except Exception:
         pass
 
