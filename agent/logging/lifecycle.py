@@ -35,6 +35,50 @@ from agent._log_root import get_log_root
 _console_logger = logging.getLogger("thoughtmachine.lifecycle")
 _console_logger.setLevel(logging.INFO)
 
+
+class _ClosedStreamSafeHandler(logging.StreamHandler):
+    """StreamHandler that silently drops records once the stream is closed.
+
+    The stdlib ``StreamHandler.emit`` catches write errors on a closed stream
+    and routes them through ``handleError``, which prints a
+    "--- Logging error ---" traceback to stderr.  During interpreter teardown
+    ``sys.stderr`` may already be closed, so lifecycle logging must tolerate
+    that without producing noise or raising.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        stream = self.stream
+        if stream is None or getattr(stream, "closed", False):
+            return
+        try:
+            msg = self.format(record)
+            stream.write(msg + self.terminator)
+            self.flush()
+        except RecursionError:
+            raise
+        except (ValueError, OSError):
+            # Stream closed between the check above and the write.
+            pass
+        except Exception:
+            self.handleError(record)
+
+
+#: Console handler for lifecycle summary lines; tolerates a closed stderr.
+#: The formatter mirrors agent.logging.console._FORMAT/_DATEFMT so console
+#: output stays identical to the parent logger's plain handler.
+_console_handler = _ClosedStreamSafeHandler()
+_console_handler.setFormatter(
+    logging.Formatter(
+        "%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+)
+_console_logger.addHandler(_console_handler)
+# Lifecycle records must not reach the parent "thoughtmachine" logger's plain
+# StreamHandler (attached by configure_console_logging): with stderr closed
+# that handler would print "--- Logging error ---" noise via handleError.
+_console_logger.propagate = False
+
 _writers: Dict[str, JsonlStreamWriter] = {}
 _writers_lock = threading.Lock()
 

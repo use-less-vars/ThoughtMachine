@@ -256,12 +256,13 @@ class TestStreamJsonEnvelope:
 
 
 class TestClosedConsoleStream:
-    """log_session_event must never propagate ValueError when the console
-    stream has been closed (e.g. stderr torn down during logging teardown)."""
+    """lifecycle's console handler must tolerate a closed stream (e.g. stderr
+    torn down during logging teardown): no raise, no "--- Logging error ---"
+    handleError noise, and the JSONL stream still written."""
 
-    def test_closed_console_stream_does_not_raise(self, hermetic):
+    def test_closed_console_stream_does_not_raise(self, hermetic, capsys):
         stream = io.StringIO()
-        handler = logging.StreamHandler(stream)
+        handler = lifecycle._ClosedStreamSafeHandler(stream)
         stream.close()  # simulate teardown closing the handler stream
         console = logging.getLogger("thoughtmachine.lifecycle")
         console.addHandler(handler)
@@ -270,10 +271,25 @@ class TestClosedConsoleStream:
             lifecycle.log_session_event("session_started", session_id="s-1")
         finally:
             console.removeHandler(handler)
+        err = capsys.readouterr().err
+        assert "--- Logging error ---" not in err
+        assert "I/O operation on closed file" not in err
         lifecycle.close_streams()
         path = os.path.join(str(hermetic), "logs", "session.log")
         assert os.path.isfile(path)
         assert len(_read_jsonl(path)) == 1
+
+    def test_open_stream_message_written(self):
+        """Open streams behave exactly like a plain StreamHandler."""
+        stream = io.StringIO()
+        handler = lifecycle._ClosedStreamSafeHandler(stream)
+        console = logging.getLogger("thoughtmachine.lifecycle")
+        console.addHandler(handler)
+        try:
+            console.info("hello %s", "world")
+        finally:
+            console.removeHandler(handler)
+        assert "hello world" in stream.getvalue()
 
 
 class TestToolCallRawStream:
