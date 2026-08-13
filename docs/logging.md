@@ -43,7 +43,7 @@ write log files under the repository tree — there is a hermeticity test
 (`tests/test_logging_foundation.py::TestHermeticity`) that fails if lifecycle or
 EventLogger activity creates anything new at the repo root.
 
-## 2. The five JSONL streams
+## 2. The six JSONL streams
 
 All files are append-only JSON Lines (one JSON object per line, UTF-8,
 `ensure_ascii=False`).
@@ -82,7 +82,7 @@ Record schema — **differs from the lifecycle envelope**:
 
 ### 2.2 Lifecycle streams (`agent/logging/lifecycle.py`)
 
-Four streams share one writer (`agent/logging/streams.py::JsonlStreamWriter`) and
+Five streams share one writer (`agent/logging/streams.py::JsonlStreamWriter`) and
 one **envelope** (see §3). All lifecycle functions are best-effort and **never
 raise**.
 
@@ -92,9 +92,17 @@ raise**.
 | `worker_<safe_name>.log` | `log_worker_event(worker_name, event_type, *, session_id, worker_id, data)` | `event`, `stream: "worker"`, `worker_name`, `worker_id`, `session_id`, `data` |
 | `container.log` | `log_container_event(event_type, *, container_id, session_id, workspace_id, data)` | `event`, `stream: "container"`, `container_id`, `session_id`, `workspace_id`, `data` |
 | `provider_raw.jsonl` | `log_provider_event(*, content, model_name, request_id, token_usage, latency, finish_reason, stop_reason, tool_call_count, temperature, session_id, worker_id, query_id, correlation_id, container_id)` | see §5 |
+| `tool_calls_raw_debug.log` | `log_tool_call_raw(*, tool_name, tool_call_id, arguments_raw, json_repair_needed, session_id)` | `event`, `stream: "tool_call"`, `tool_name`, `tool_call_id`, `arguments_preview` (500-char truncation), `arguments_truncated`, `json_repair_needed`, `session_id` |
 
 Worker stream filenames are sanitized: `_safe_name` replaces every character not
 in `[A-Za-z0-9_.-]` with `_` (e.g. `worker "My Worker!"` → `worker_My_Worker_.log`).
+
+`tool_calls_raw_debug.log` holds raw pre-parse tool-call argument diagnostics: a
+diagnostic aid for malformed tool-call JSON (written by `log_tool_call_raw`).
+Only the first **500 characters** of the arguments string are stored
+(`arguments_preview`; `arguments_truncated` flags longer payloads). The whole
+line is redacted at write time (the `redact_line=True` default), and it uses the
+same 5 MB / one-backup rotation policy as the other lifecycle streams.
 
 ## 3. The lifecycle envelope
 
@@ -210,6 +218,8 @@ utility. It is applied to **every sink that can carry free-form text**:
   `JsonlStreamWriter.write()` defaults `redact_line=True`, so every lifecycle
   stream is redacted at write time even though their `data` payloads are
   caller-supplied.
+- `tool_calls_raw_debug.log` — whole-line redaction via the `redact_line=True`
+  default (same as the other lifecycle streams).
 
 Patterns (in order, first match wins per position; group 1 is preserved as a
 recognizable prefix):

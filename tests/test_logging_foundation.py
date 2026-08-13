@@ -253,6 +253,48 @@ class TestStreamJsonEnvelope:
                 assert rec["data"]["api_key"] == "<REDACTED>"
 
 
+class TestToolCallRawStream:
+    """tool_calls_raw_debug.log: structured JSONL, whole-line redacted, rotating."""
+
+    def test_tool_call_raw_redacted_envelope_and_json(self, hermetic):
+        secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+        lifecycle.log_tool_call_raw(
+            tool_name="ReadFile",
+            tool_call_id="call_1",
+            arguments_raw='{"path": "%s"}' % secret,
+            json_repair_needed=True,
+            session_id="sess-1",
+        )
+        lifecycle.close_streams()
+        path = os.path.join(str(hermetic), "logs", "tool_calls_raw_debug.log")
+        raw = open(path, encoding="utf-8").read()
+        assert secret not in raw
+        assert "sk-<REDACTED>" in raw
+        records = _read_jsonl(path)
+        assert len(records) == 1
+        rec = records[0]
+        _assert_lifecycle_envelope(rec, event="tool_call_raw", stream="tool_call")
+        assert rec["tool_name"] == "ReadFile"
+        assert rec["tool_call_id"] == "call_1"
+        assert rec["json_repair_needed"] is True
+        assert rec["session_id"] == "sess-1"
+        assert rec["arguments_truncated"] is False
+        assert "sk-<REDACTED>" in rec["arguments_preview"]
+
+    def test_tool_call_raw_rotation(self, hermetic):
+        payload = "界" * 500  # ~1500 B/line once serialized
+        for _ in range(5000):
+            lifecycle.log_tool_call_raw(tool_name="ReadFile", arguments_raw=payload)
+        lifecycle.close_streams()
+        path = os.path.join(str(hermetic), "logs", "tool_calls_raw_debug.log")
+        assert os.path.isfile(path)
+        assert os.path.isfile(path + ".1")
+        assert not os.path.isfile(path + ".2")
+        for rec in _read_jsonl(path):
+            assert rec["event"] == "tool_call_raw"
+            assert rec["arguments_truncated"] is False
+
+
 # ---------------------------------------------------------------------------
 # (b) redaction
 # ---------------------------------------------------------------------------

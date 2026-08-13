@@ -9,7 +9,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import tiktoken
 from pydantic import ValidationError
 from agent.logging import log
-from agent._log_root import get_log_root
+from agent.logging.lifecycle import log_tool_call_raw
 from fast_json_repair import loads as repair_loads
 from agent.core.turn_transaction import TurnTransaction
 from tools.respond import Respond
@@ -132,28 +132,13 @@ class ToolExecutor:
                 executed_tools.append({'name': tool_name, 'arguments': {}, 'result': tool_result})
                 continue
             arguments_str = tool_call['function']['arguments']
-            # ── RAW TOOL CALL DIAGNOSTIC (vault path) ──
-            import os as _os, time as _time
-            _raw_log_dir = str(get_log_root())
-            _os.makedirs(_raw_log_dir, exist_ok=True)
-            _raw_log_path = _os.path.join(_raw_log_dir, "tool_calls_raw_debug.log")
-            # Size-limited: max 2MB, single file, no debris
-            _max_bytes = 2048 * 1024  # 2 MB
-            try:
-                if _os.path.isfile(_raw_log_path) and _os.path.getsize(_raw_log_path) >= _max_bytes:
-                    # Truncate — start fresh, no leftover files
-                    with open(_raw_log_path, "w", encoding="utf-8") as _f_trunc:
-                        _f_trunc.write(f"# TRUNCATED at {_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            except OSError:
-                pass  # best-effort
-            with open(_raw_log_path, "a", encoding="utf-8") as _f:
-                _f.write(f"{_time.strftime('%Y-%m-%d %H:%M:%S')} | {tool_name} | {arguments_str}\n")
-            # ────────────────────────────────
+            json_repair_needed = False
             try:
                 arguments = json.loads(arguments_str)
             except json.JSONDecodeError:
                 try:
                     arguments = repair_loads(arguments_str)
+                    json_repair_needed = True
                     if self.logger:
                         log('INFO', 'core.tool_executor', f'JSON repaired for {tool_name}')
                 except Exception as e:
@@ -162,7 +147,9 @@ class ToolExecutor:
                         self.logger.log_error('JSON_DECODE_ERROR', f'Failed to parse JSON for {tool_name}: {e}')
                     add_tool_result({'role': 'tool', 'tool_call_id': tool_call['id'], 'content': tool_result})
                     executed_tools.append({'name': tool_name, 'arguments': {'error': 'Invalid JSON', 'raw': arguments_str}, 'result': tool_result})
+                    log_tool_call_raw(tool_name=tool_name, tool_call_id=tool_call['id'], arguments_raw=arguments_str, json_repair_needed=True, session_id=session_id)
                     continue
+            log_tool_call_raw(tool_name=tool_name, tool_call_id=tool_call['id'], arguments_raw=arguments_str, json_repair_needed=json_repair_needed, session_id=session_id)
             if self.logger:
                 self.logger.log_tool_call(tool_name, arguments, tool_call['id'])
             tool_class = next((cls for cls in self.tool_classes if cls.__name__ == tool_name), None)

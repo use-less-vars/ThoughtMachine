@@ -7,12 +7,18 @@ Covers:
   - Denied categories produce the right error message
 """
 
+import json
+import os
 from typing import ClassVar, List
+
+import pytest
+
 from agent.core.tool_executor import (
     DEFAULT_SESSION_PERMISSIONS,
     ToolExecutor,
 )
 from tools.base import ToolBase
+from agent.logging import lifecycle
 
 
 # ---------------------------------------------------------------------------
@@ -327,3 +333,58 @@ class TestToolExecutorCustomPermissions:
         )
         # No report_body → empty required_categories → always passes
         assert result["result"] == "OK"
+
+
+# ---------------------------------------------------------------------------
+# Raw tool-call diagnostic stream (tool_calls_raw_debug.log)
+# ---------------------------------------------------------------------------
+
+class _AllowAllState:
+    """State stub that allows every tool."""
+
+    security_config = None
+
+    def is_tool_allowed(self, tool_name):
+        return True
+
+
+class TestToolCallRawDiagnosticStream:
+    """execute_tool_calls must emit redacted, structured tool-call diagnostics."""
+
+    @pytest.fixture
+    def hermetic(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path))
+        yield tmp_path
+        lifecycle.close_streams()
+
+    def test_execute_tool_calls_writes_redacted_structured_diagnostic(self, hermetic):
+        secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+        executor = ToolExecutor(
+            tool_classes=[],
+            config=FakeConfig(None),
+            state=_AllowAllState(),
+            logger=None,
+            security_available=False,
+            agent=None,
+        )
+        collected = []
+        executor.execute_tool_calls(
+            [{"id": "call_1", "function": {"name": "ReadFile", "arguments": '{"path": "%s"}' % secret}}],
+            add_to_conversation_func=collected.append,
+            session_id="sess-1",
+        )
+        path = os.path.join(str(hermetic), "logs", "tool_calls_raw_debug.log")
+        assert os.path.isfile(path)
+        raw = open(path, encoding="utf-8").read()
+        assert secret not in raw
+        assert "sk-<REDACTED>" in raw
+        records = [json.loads(ln) for ln in raw.splitlines() if ln.strip()]
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["event"] == "tool_call_raw"
+        assert rec["tool_name"] == "ReadFile"
+        assert rec["tool_call_id"] == "call_1"
+        assert rec["json_repair_needed"] is False
+        assert rec["session_id"] == "sess-1"
+        assert "sk-<REDACTED>" in rec["arguments_preview"]

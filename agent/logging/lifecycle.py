@@ -11,6 +11,7 @@ never bound at import time:
 - ``worker_<name>.log``    — per-worker lifecycle (spawned / stopped)
 - ``container.log``        — container lifecycle (started / stopped / ...)
 - ``provider_raw.jsonl``   — raw provider responses (whole-line redacted)
+- ``tool_calls_raw_debug.log`` — raw tool-call argument diagnostics (whole-line redacted)
 
 Every function is best-effort and NEVER raises: lifecycle logging must never
 break the caller's control flow.  A concise, secret-free summary line is
@@ -228,6 +229,48 @@ def log_provider_event(
             request_id or "-",
             int(tool_call_count or 0),
             content_empty,
+        )
+    except Exception:
+        pass
+
+
+def log_tool_call_raw(
+    *,
+    tool_name: str = "",
+    tool_call_id: str = "",
+    arguments_raw: str = "",
+    json_repair_needed: bool = False,
+    session_id: str = "",
+) -> None:
+    """Append a raw tool-call argument diagnostic to ``tool_calls_raw_debug.log`` (never raises).
+
+    Diagnostic aid for malformed tool-call argument JSON: only the first
+    500 chars of the raw pre-parse argument string are stored
+    (``arguments_preview``), and the whole serialized line is redacted
+    before writing, so secrets embedded in the arguments never reach disk.
+    """
+    try:
+        raw = (
+            arguments_raw
+            if isinstance(arguments_raw, str)
+            else ("" if arguments_raw is None else str(arguments_raw))
+        )
+        record = {
+            "event": "tool_call_raw",
+            "stream": "tool_call",
+            "tool_name": tool_name or "",
+            "tool_call_id": tool_call_id or "",
+            "arguments_preview": raw[:500],
+            "arguments_truncated": len(raw) > 500,
+            "json_repair_needed": bool(json_repair_needed),
+            "session_id": session_id or "",
+        }
+        _writer("tool_calls_raw_debug.log").write(record, redact_line=True)
+        _console_logger.info(
+            "tool call raw name=%s tool_call_id=%s repaired=%s",
+            tool_name or "-",
+            tool_call_id or "-",
+            bool(json_repair_needed),
         )
     except Exception:
         pass
