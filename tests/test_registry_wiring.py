@@ -93,7 +93,7 @@ def test_get_active_registry_is_singleton_per_state(no_daemon):
     assert enabled_a is not disabled_a
 
 
-def test_enabled_singleton_shared_across_configs(fake_registry_cls):
+def test_enabled_singleton_shared_across_configs(fake_registry_cls, no_daemon):
     a = get_active_registry({"use_container_registry": True})
     b = get_active_registry({"use_container_registry": True, "other": 1})
     assert a is b
@@ -125,7 +125,7 @@ def test_is_registry_active_false_when_daemon_unavailable(no_daemon):
     assert is_registry_active({"use_container_registry": True}) is False
 
 
-def test_get_active_registry_constructs_enabled_instance_with_flag(fake_registry_cls):
+def test_get_active_registry_constructs_enabled_instance_with_flag(fake_registry_cls, no_daemon):
     enabled = get_active_registry({"use_container_registry": True})
     assert enabled.is_enabled()
     # feature_flag_check=None -> is_enabled() True, docker_client None.

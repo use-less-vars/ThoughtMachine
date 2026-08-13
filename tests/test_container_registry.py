@@ -416,9 +416,13 @@ class TestRequestContainer:
             reg.request_container("w", "s", {})
 
     def test_request_without_docker_client_raises(self):
-        reg = ContainerRegistry(docker_client=None, feature_flag_check=lambda: True)
-        with pytest.raises(RuntimeError, match="Docker client unavailable"):
-            reg.request_container("w", "s", {})
+        with mock.patch(
+            "docker.from_env",
+            side_effect=docker.errors.DockerException("no daemon"),
+        ):
+            reg = ContainerRegistry(docker_client=None, feature_flag_check=lambda: True)
+            with pytest.raises(RuntimeError, match="Docker client unavailable"):
+                reg.request_container("w", "s", {})
 
 
 # ---------------------------------------------------------------------------
