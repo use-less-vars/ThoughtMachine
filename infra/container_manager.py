@@ -79,6 +79,7 @@ except ImportError:
     Mount = None
 
 from agent.logging import log
+from agent.logging.lifecycle import log_container_event
 from thoughtmachine.audit_logger import audit_event
 
 _audit = lambda event, data: audit_event(event, data)
@@ -431,6 +432,9 @@ class ContainerManager:
                 _audit("CONTAINER_REUSE_OK",
                        f"source=workspace-label name={name} id={entry['container_id']} "
                        f"session={self.session_id}")
+                log_container_event("started", container_id=entry["container_id"],
+                                    session_id=self.session_id or "",
+                                    data={"image": image, "name": name, "status": "reused"})
                 return {**entry, "status": "reused", "id": entry["container_id"],
                         "note": note_value}
         limit = self._get_max_containers()
@@ -479,6 +483,9 @@ class ContainerManager:
                     ).get("note", "")
                     _audit("CONTAINER_REUSE_OK",
                            f"source=registry name={name} id={container.id} session={self.session_id}")
+                    log_container_event("started", container_id=container.id,
+                                        session_id=self.session_id or "",
+                                        data={"image": image, "name": name, "status": "reused"})
                     return {"id": container.id, "name": name, "status": "reused",
                             "note": note_value}
                 log("WARNING", "docker.container_manager",
@@ -513,6 +520,9 @@ class ContainerManager:
                 ).get("note", "")
                 _audit("CONTAINER_REUSE_OK",
                        f"source=label name={name} id={container.id} session={self.session_id}")
+                log_container_event("started", container_id=container.id,
+                                    session_id=self.session_id or "",
+                                    data={"image": image, "name": name, "status": "reused"})
                 return {"id": container.id, "name": name, "status": "reused",
                         "note": note_value}
 
@@ -585,6 +595,9 @@ class ContainerManager:
             _audit("CONTAINER_CREATE",
                    f"source=registry image={image} name={container_name} "
                    f"session={self.session_id} workspace_id={self.workspace_id}")
+            log_container_event("started", container_id=container_id,
+                                session_id=self.session_id or "",
+                                data={"image": image, "name": name, "status": "created"})
             return {"id": container_id, "name": name, "status": "created",
                     "note": note or ""}
 
@@ -617,6 +630,9 @@ class ContainerManager:
         if note is not None:
             self.container_notes[name] = {"note": note}
             self._save_container_notes()
+        log_container_event("started", container_id=container.id,
+                            session_id=self.session_id or "",
+                            data={"image": image, "name": name, "status": "created"})
         return {"id": container.id, "name": name, "status": "created",
                 "note": note or ""}
 
@@ -718,6 +734,8 @@ class ContainerManager:
                     return {"status": "error", "container_id": container_id,
                             "error": str(e)}
                 self._drop_container(container_id)
+                log_container_event("stopped", container_id=container_id,
+                                    session_id=self.session_id or "")
                 return {"status": "stopped", "container_id": container_id,
                         "name": name}
         try:
@@ -740,6 +758,8 @@ class ContainerManager:
                 if container.status == "running":
                     container.kill()
             self._drop_container(container_id)
+            log_container_event("stopped", container_id=container_id,
+                                session_id=self.session_id or "")
             return {"status": "stopped", "container_id": container_id, "name": container.name}
         except Exception as e:
             return {"status": "error", "container_id": container_id, "error": str(e),
@@ -762,6 +782,8 @@ class ContainerManager:
                     return {"status": "error", "container_id": container_id,
                             "error": str(e)}
                 self._drop_container(container_id)
+                log_container_event("removed", container_id=container_id,
+                                    session_id=self.session_id or "")
                 return {"status": "removed", "container_id": container_id,
                         "name": name}
         stopped = self.stop(container_id)
@@ -776,6 +798,8 @@ class ContainerManager:
         try:
             container.remove(force=True)
             self._drop_container(container_id)
+            log_container_event("removed", container_id=container_id,
+                                session_id=self.session_id or "")
             return {"status": "removed", "container_id": container_id}
         except Exception as e:
             return {"status": "error", "container_id": container_id, "error": str(e)}

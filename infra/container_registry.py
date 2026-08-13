@@ -51,6 +51,7 @@ __all__ = [
 ]
 
 log = logging.getLogger("infra.container_registry")
+from agent.logging.lifecycle import log_container_event
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -243,6 +244,12 @@ class ContainerRegistry:
                 "container_id": "",
             }
             self._session_map.setdefault(session_id, set()).add(container_name)
+        log_container_event(
+            "registered",
+            container_id=container_name,
+            session_id=session_id or "",
+            data={"container_type": container_type},
+        )
 
     def unregister(self, container_name) -> bool:
         """Drop a container from the registry.  Graceful: returns False (and
@@ -502,6 +509,7 @@ class ContainerRegistry:
         if container_name not in self._containers:
             log.warning("destroy_container: %s is not registered; nothing to do", container_name)
             return
+        session_id = (self._containers.get(container_name) or {}).get("session_id") or ""
         container = None
         try:
             container = self._docker_client.containers.get(container_name)
@@ -519,6 +527,7 @@ class ContainerRegistry:
                         container_name, exc2,
                     )
         finally:
+            log_container_event("destroyed", container_id=container_name, session_id=session_id)
             self.unregister(container_name)
 
     # -- live permission sync -------------------------------------------

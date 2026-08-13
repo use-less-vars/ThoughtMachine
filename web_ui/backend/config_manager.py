@@ -55,7 +55,7 @@ FALLBACK_FRONTEND_CONFIG: Dict[str, Any] = {
     "token_monitor_critical_threshold": 80000,
     "turn_monitor_enabled": True,
     "enable_logging": True,
-    "log_dir": "./logs",
+    "log_dir": os.path.join(os.path.expanduser("~"), ".thoughtmachine", "logs"),
     "log_level": "INFO",
     "enable_file_logging": True,
     "jsonl_format": True,

@@ -14,6 +14,7 @@ import threading
 from typing import Any, Dict, Tuple
 
 logger = logging.getLogger(__name__)
+from agent.logging.lifecycle import log_worker_event
 
 
 class WorkerRegistry:
@@ -59,6 +60,7 @@ class WorkerRegistry:
         key = (session_id or "", worker_name)
         with self._registry_lock:
             self._worker_registry[key] = thread
+        log_worker_event(worker_name, 'spawned', session_id=session_id or '')
 
     def get_worker(self, session_id: str, worker_name: str) -> Any:
         """Get a registered worker thread, or None if not found."""
@@ -70,7 +72,11 @@ class WorkerRegistry:
         """Unregister and return a worker thread, or *default* if not found."""
         key = (session_id or "", worker_name)
         with self._registry_lock:
-            return self._worker_registry.pop(key, default)
+            existed = key in self._worker_registry
+            popped = self._worker_registry.pop(key, default)
+        if existed:
+            log_worker_event(worker_name, 'stopped', session_id=session_id or '')
+        return popped
 
     def get_all_workers(self) -> dict[tuple[str, str], Any]:
         """Return a snapshot of all registered worker threads."""

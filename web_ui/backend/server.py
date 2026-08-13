@@ -272,6 +272,13 @@ async def lifespan(app: FastAPI):
     """Lifespan handler — registers signal handlers for graceful shutdown."""
     log('INFO', 'server', 'ThoughtMachine Web UI server starting ...')
     log('INFO', 'server', f'Starting ThoughtMachine server — revision {_SERVER_REVISION}')
+
+    # Stdlib logging console layer (human-readable lifecycle lines)
+    try:
+        from agent.logging.console import configure_console_logging
+        configure_console_logging()
+    except Exception as exc:
+        log('WARNING', 'server', f'Console logging setup skipped: {exc}')
     # Start EventLogger to persist all events to disk
     try:
         from agent.logging.event_logger import EventLogger
