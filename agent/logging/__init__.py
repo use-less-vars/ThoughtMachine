@@ -720,7 +720,7 @@ def create_logger(config: 'AgentConfig') -> Optional[_AgentLogger]:
         
         logger = _AgentLogger(
             config=config,
-            log_dir=getattr(config, 'log_dir', './logs'),
+            log_dir=getattr(config, 'log_dir', None),
             log_level=getattr(config, 'log_level', LogLevel.INFO),
             file_log_level=file_log_level,
             enable_file_logging=getattr(config, 'enable_file_logging', True),

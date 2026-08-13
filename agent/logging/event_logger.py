@@ -2,7 +2,7 @@
 
 Supports:
 - Workspace isolation via workspace_path
-- Rotating file handler (10 MB, 3 backups)
+- Rotating file handler (5 MB, 1 backup)
 - Multiple bus subscriptions (subscribe_all + attach_worker_bus)
 - Singleton access via instance()
 """
@@ -14,6 +14,7 @@ import threading
 from datetime import datetime
 from typing import Optional
 from agent.events import EventBus, BaseEvent, EventType, global_event_bus
+from agent.logging.redaction import redact
 
 
 class EventLogger:
@@ -21,7 +22,7 @@ class EventLogger:
 
     Supports:
     - Workspace isolation via workspace_path
-    - Rotating file handler (10 MB max per file, 3 backups)
+    - Rotating file handler (5 MB max per file, 1 backup)
     - Multiple bus subscriptions (subscribe_all + attach_worker_bus)
     - Singleton access via instance()
     """
@@ -73,16 +74,15 @@ class EventLogger:
             self._file = open(self._file_path, "a", encoding="utf-8")
 
     def _maybe_rotate(self):
-        """Rotate the log file if it exceeds 10 MB."""
+        """Rotate the log file if it exceeds 5 MB."""
         if not os.path.exists(self._file_path):
             return
-        if os.path.getsize(self._file_path) > 10 * 1024 * 1024:
-            # Rotate: shift .2 -> .3, .1 -> .2, current -> .1
-            for i in range(3, 0, -1):
-                older = os.path.join(self.log_dir, f"event_log.jsonl.{i}")
-                newer = os.path.join(self.log_dir, f"event_log.jsonl.{i - 1}") if i > 1 else self._file_path
-                if os.path.exists(newer):
-                    os.rename(newer, older)
+        if os.path.getsize(self._file_path) > 5 * 1024 * 1024:
+            # Rotate: current -> .1 (keep exactly one backup)
+            backup = os.path.join(self.log_dir, "event_log.jsonl.1")
+            if os.path.exists(backup):
+                os.remove(backup)
+            os.replace(self._file_path, backup)
             # Close old file handle so next write re-opens (and creates fresh file)
             if self._file:
                 self._file.close()
@@ -174,7 +174,7 @@ class EventLogger:
             try:
                 self._ensure_file_open()
                 self._maybe_rotate()
-                line = json.dumps(record, default=str) + "\n"
+                line = redact(json.dumps(record, default=str)) + "\n"
                 with self._lock:
                     self._file.write(line)
                     self._file.flush()
@@ -186,7 +186,7 @@ class EventLogger:
             try:
                 record = self._event_queue.get_nowait()
                 self._ensure_file_open()
-                line = json.dumps(record, default=str) + "\n"
+                line = redact(json.dumps(record, default=str)) + "\n"
                 with self._lock:
                     self._file.write(line)
                     self._file.flush()

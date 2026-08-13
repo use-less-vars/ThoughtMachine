@@ -535,6 +535,17 @@ class AgentController:
         except Exception:
             pass  # Best-effort: don't crash the agent thread if event bus publish fails
 
+        # Lifecycle stream: session.log (best-effort, never raises)
+        try:
+            from agent.logging.lifecycle import log_session_event
+            log_session_event(
+                event.get('type', 'event'),
+                session_id=event.get('session_id') or self.current_session_id or '',
+                data={k: v for k, v in event.items() if k not in ('session_id', 'type')},
+            )
+        except Exception:
+            pass
+
     def _run(self):
         """Internal method that runs in the background thread."""
         log('INFO', 'core.controller', f'_run thread STARTED (threading.get_ident={threading.get_ident()})')

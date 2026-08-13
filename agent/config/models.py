@@ -88,7 +88,7 @@ class AgentConfig(BaseModel):
     turn_monitor_enabled: bool = Field(default=True, description='Enable automatic turn limit warnings')
 
     enable_logging: bool = Field(default=True, description='Enable agent logging')
-    log_dir: str = Field(default='./logs', description='Directory for log files')
+    log_dir: Optional[str] = Field(default=None, description='Directory for log files (None = canonical vault ~/.thoughtmachine/logs)')
     log_level: str = Field(default='INFO', description='Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)')
     enable_file_logging: bool = Field(default=True, description='Write logs to files')
     jsonl_format: bool = Field(default=True, description='Use JSONL format for log files')

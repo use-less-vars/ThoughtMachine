@@ -13,6 +13,9 @@ authors = [
 ]
 requires-python = ">=3.11"
 
+[project.scripts]
+tm-logs = "agent.cli.logs:main"
+
 [tool.setuptools]
 packages = { find = { include = ["thoughtmachine*", "agent*", "tools*", "security*", "web_ui*", "llm_providers*", "infra*"] } }
 

@@ -4,6 +4,7 @@ LLM client for handling LLM provider interactions.
 Extracted from agent.py to separate LLM communication concerns.
 """
 import os
+import time
 from typing import Optional, List, Dict, Any
 from agent.logging import log
 from llm_providers.factory import ProviderFactory
@@ -24,7 +25,7 @@ class LLMClient:
     def __init__(self, config, session=None, logger=None):
         """
         Initialize LLM client.
-        
+
         Args:
             config: AgentConfig instance.
             session: Optional Session object.
@@ -106,21 +107,23 @@ class LLMClient:
     def chat_completion(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]]=None, **kwargs):
         """
         Make LLM chat completion request.
-        
+
         Args:
             messages: List of message dictionaries.
             tools: Optional tool definitions.
             **kwargs: Additional chat completion parameters.
-            
+
         Returns:
             LLM response object.
-            
+
         Raises:
             RateLimitExceeded: If rate limit is hit.
             LLMError: For provider-independent errors (authentication, timeout, etc.).
         """
         try:
+            start_time = time.time()
             response = self.provider.chat_completion(messages=messages, tools=tools, **kwargs)
+            self._log_provider_response(response, start_time=start_time, kwargs=kwargs)
             return response
         except RateLimitExceeded as e:
             raise
@@ -132,6 +135,99 @@ class LLMClient:
                     error_type = generic_type
                     break
             raise LLMError(error_type=error_type, message=str(e), original_exception=e)
+
+    def _provider_meta(self, response) -> Dict[str, Any]:
+        """Best-effort extraction of provider-specific metadata from a response.
+
+        ``request_id`` / ``finish_reason`` (OpenAI-style ``raw.id`` /
+        ``raw.choices[0].finish_reason``) and ``stop_reason`` (Anthropic-style
+        ``raw.stop_reason``) live only inside ``raw_response``; everything
+        here is defensive and never raises.
+        """
+        meta: Dict[str, Any] = {}
+        try:
+            model = getattr(response, "model", "") or ""
+            if not model or model == "unknown":
+                model = getattr(self.config, "model", "") or ""
+            if model:
+                meta["model_name"] = model
+        except Exception:
+            pass
+        try:
+            raw = getattr(response, "raw_response", None)
+            if raw is None:
+                return meta
+            if isinstance(raw, dict):
+                rid = raw.get("id") or raw.get("request_id")
+                if rid:
+                    meta["request_id"] = str(rid)
+                sr = raw.get("stop_reason")
+                if sr:
+                    meta["stop_reason"] = str(sr)
+                choices = raw.get("choices") or []
+            else:
+                rid = getattr(raw, "id", None) or getattr(raw, "request_id", None)
+                if rid:
+                    meta["request_id"] = str(rid)
+                sr = getattr(raw, "stop_reason", None)
+                if sr:
+                    meta["stop_reason"] = str(sr)
+                choices = getattr(raw, "choices", None) or []
+            if choices:
+                first = choices[0]
+                if isinstance(first, dict):
+                    fr = first.get("finish_reason")
+                else:
+                    fr = getattr(first, "finish_reason", None)
+                if fr:
+                    meta["finish_reason"] = str(fr)
+        except Exception:
+            pass
+        return meta
+
+    def _log_provider_response(self, response, *, start_time: float, kwargs: Dict[str, Any]) -> None:
+        """Best-effort ``provider_raw.jsonl`` record for a successful completion.
+
+        Never raises - provider raw logging must never affect the call path.
+        """
+        try:
+            from agent.logging.lifecycle import log_provider_event
+
+            content = getattr(response, "content", "") or ""
+            tool_calls = getattr(response, "tool_calls", None) or []
+            meta = self._provider_meta(response)
+            usage = getattr(response, "usage", None)
+            token_usage = None
+            if usage:
+                try:
+                    if hasattr(usage, "model_dump"):
+                        token_usage = usage.model_dump()
+                    elif hasattr(usage, "__dict__"):
+                        token_usage = vars(usage)
+                    else:
+                        token_usage = usage
+                except Exception:
+                    token_usage = usage
+            temperature = kwargs.get("temperature")
+            if temperature is None:
+                temperature = getattr(self.config, "temperature", None)
+            session_id = ""
+            if self.session is not None:
+                session_id = getattr(self.session, "session_id", "") or ""
+            log_provider_event(
+                content=content,
+                model_name=meta.get("model_name", ""),
+                request_id=meta.get("request_id", ""),
+                token_usage=token_usage,
+                latency=time.time() - start_time,
+                finish_reason=meta.get("finish_reason", ""),
+                stop_reason=meta.get("stop_reason", ""),
+                tool_call_count=len(tool_calls),
+                temperature=temperature,
+                session_id=session_id,
+            )
+        except Exception:
+            pass
 
     def close(self):
         """Close and release provider resources."""
@@ -162,10 +258,10 @@ class LLMClient:
     def format_tools(self, tool_definitions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Format tool definitions for the provider.
-        
+
         Args:
             tool_definitions: Raw tool definitions.
-            
+
         Returns:
             Formatted tool definitions for the provider.
         """
