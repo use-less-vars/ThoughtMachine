@@ -126,6 +126,7 @@ docs/*
 !docs/logging.md
 !docs/decisions/
 !docs/decisions/logging-architecture.md
+!docs/audit_resource_container_isolation_2026_08_13.md
 docs/container_registry_design.md
 
 # Root-only Dockerfile pattern: ignores the repo-root Dockerfile (a stray
