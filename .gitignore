@@ -134,3 +134,5 @@ docs/container_registry_design.md
 # for the vault-managed git sandbox image Dockerfile
 # (~/.thoughtmachine/docker/resource/Dockerfile).
 /Dockerfile
+!docs/architecture-map.md
+!docs/architecture-map.html
