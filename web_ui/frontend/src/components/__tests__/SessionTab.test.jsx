@@ -9,11 +9,10 @@
  * config_changed, session_loaded, security_prompt, worker:* forwarding),
  * and auto-reconnect after an unexpected close.
  *
- * NOTE: These tests were written from static analysis of SessionTab.jsx
- * (and its children) and have NOT yet been executed in this environment
- * (DockerCodeRunner broken this session; node_modules not installed).
- * Outcomes are PREDICTED — run `cd web_ui/frontend && npm install && npm test`
- * to verify.
+ * STATUS: EXECUTED AND PASSING — 25/25 tests green via
+ * `npx vitest run src/components/__tests__/SessionTab.test.jsx`
+ * (R6b header truthfulness fix; the earlier "predicted / not yet
+ * executed" note was stale).
  */
 
 import React from 'react';

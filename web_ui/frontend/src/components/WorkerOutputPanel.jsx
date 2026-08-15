@@ -135,7 +135,12 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
 
   // Worker info is updated via WebSocket incomingEvents (no polling)
 
-  // Reset when workerName changes
+  // Reset when the worker identity OR the owning session changes.
+  // App does not key this panel by sessionId, so switching sessions while the
+  // same worker is selected changes props without remounting — without
+  // sessionId in the deps the previous session's workerInfo (ctx counter,
+  // current_task, runtime_status) and event stream would leak into the new
+  // session's panel (stale header / stale stream).
   useEffect(() => {
     setWorkerInfo(null);
     setWorkerError('');
@@ -143,7 +148,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
     setEvents([]);
     eventsRef.current = [];
     seenEventKeysRef.current = new Set();
-  }, [workspaceId, workerName]);
+  }, [workspaceId, workerName, sessionId]);
 
   // ── Shared dedup key computation ──────────────────────────────────────
   // Events are received via WebSocket incomingEvents prop (no polling).

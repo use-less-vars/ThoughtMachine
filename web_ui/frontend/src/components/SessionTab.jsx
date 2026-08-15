@@ -70,7 +70,7 @@ function messagesEqual(a, b) {
 // ────────────────────────────────────────────────────────────────────────────
 // Component
 // ────────────────────────────────────────────────────────────────────────────
-function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onSessionRenamed, onSessionAdopted, selectedWorker, onSelectWorker, onWorkerEvent, onLoggingConfigChanged }) {
+function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect = true, isActive = false, onClose, onNewSession, onOpenNewTab, onSessionSaved, onRegister, onSessionRenamed, onSessionAdopted, selectedWorker, onSelectWorker, onWorkerEvent, onWorkspaceKnown, onLoggingConfigChanged }) {
   const [currentSessionId, setCurrentSessionId] = useState(sessionId)
   const [isRenaming, setIsRenaming] = useState(false)
   const renameInputRef = useRef(null)
@@ -162,21 +162,27 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
 
   // ── Config panel resize state (persisted per tab) ──────────────────
   const [configPanelWidth, setConfigPanelWidth] = useState(() => {
-    if (tabId) {
-      const saved = localStorage.getItem(`config-panel-width:${tabId}`)
+    // R7: key the persisted width by sessionId (stable across reloads); the
+    // tabId is ephemeral (regenerated on every page load). Fall back to tabId
+    // when sessionId is not known yet (fresh tab).
+    const widthKey = sessionId || tabId
+    if (widthKey) {
+      const saved = localStorage.getItem(`config-panel-width:${widthKey}`)
       if (saved) return Math.max(CONFIG_PANEL_MIN_WIDTH, Math.min(CONFIG_PANEL_MAX_WIDTH, Number(saved)))
     }
     return CONFIG_PANEL_DEFAULT_WIDTH
   })
   const dragRef = useRef(null) // { startX, startWidth }
 
-  // Persist width changes
+  // Persist width changes (R7: keyed by sessionId so widths survive reloads;
+  // fall back to tabId while sessionId is unknown).
   const handleWidthChange = useCallback((newWidth) => {
     setConfigPanelWidth(newWidth)
-    if (tabId) {
-      localStorage.setItem(`config-panel-width:${tabId}`, String(newWidth))
+    const widthKey = sessionId || tabId
+    if (widthKey) {
+      localStorage.setItem(`config-panel-width:${widthKey}`, String(newWidth))
     }
-  }, [tabId])
+  }, [sessionId, tabId])
 
   const handleResizeStart = useCallback((e) => {
     e.preventDefault()
@@ -281,6 +287,8 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
   onWorkerEventRef.current = onWorkerEvent
   const onLoggingConfigChangedRef = useRef(onLoggingConfigChanged)
   onLoggingConfigChangedRef.current = onLoggingConfigChanged
+  const onWorkspaceKnownRef = useRef(onWorkspaceKnown)
+  onWorkspaceKnownRef.current = onWorkspaceKnown
 
   const connectSessionWs = useCallback(() => {
     // Guard: prevent duplicate connections from StrictMode double-mount
@@ -670,6 +678,8 @@ function SessionTab({ sessionId, tabId, hubReady, staggerMs = 0, loadOnConnect =
         if (msg.workspace_id) {
           // Session metadata — no dedicated store slice yet (kept local).
           setWorkspaceId(msg.workspace_id)
+          // Tell App which workspace this session belongs to (R7 restore).
+          onWorkspaceKnownRef.current?.(msg.session_id, msg.workspace_id)
         }
         if (msg.session_id) {
           const expectedSessionId = currentSessionIdRef.current
