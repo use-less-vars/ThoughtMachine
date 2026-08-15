@@ -5,24 +5,36 @@ R3 (T1-T4): concurrent sessions must be fully isolated from each other.
 These tests drive TWO simultaneous WebSocket connections against one hermetic
 server instance and verify:
 
-1. ``test_concurrent_sessions_respond_independently``
-   - Each connection's ``new_session`` yields a distinct ``session_id``.
+1. ``test_two_sessions_same_workspace_run_concurrently``
+   - Two concurrent ``new_session`` handshakes yield distinct ``session_id``s
+     that resolve to the SAME ``workspace_id``, both sessions appear in the
+     open-session registry, and both sockets answer queries.
+
+2. ``test_two_sessions_respond_independently``
    - A query on session A produces events ONLY on A's socket; session B's
      socket stays silent while A is running (and vice versa).
    - No event, ``session_id``, or message content ever crosses the boundary.
 
-2. ``test_worker_events_delivered_to_owning_session_only``
-   - A worker event whose ``data`` carries a ``session_id`` is delivered only
-     to the WebSocket owning that session.
-   - A worker event WITHOUT a ``session_id`` in its ``data`` passes the bridge
-     filter (``if data.get('session_id') and data['session_id'] != self._session_id``)
-     and is therefore broadcast to EVERY connected bridge/socket.  This is
-     documented behaviour of ``web_ui/backend/bridge.py``; the test asserts
-     both directions of the filter.
+3. ``test_worker_in_session_a_not_visible_to_session_b``
+   - The WorkerRegistry (``tools/workspace/worker_registry.py``) keys workers
+     by ``(session_id, worker_name)``: a worker registered for session A is
+     invisible to session B's lookups (``get_all_workers`` / ``get_worker`` /
+     ``get_event_buses_for_session`` / ``get_event_bus``).
 
-3. ``test_closing_one_session_leaves_other_running``
-   - Closing one client's WebSocket does not tear down the other session:
-     the surviving connection still completes a follow-up query.
+4. ``test_worker_in_session_b_not_visible_to_session_a``
+   - Mirror of test 3: a worker registered for session B is invisible to
+     session A's lookups.
+
+5. ``test_closing_session_a_leaves_session_b_running``
+   - Closing session A's WebSocket does not tear down session B: the
+     surviving connection still completes a follow-up query.
+
+6. ``test_worker_events_delivered_only_to_owning_session``
+   - A WORKER_SPAWNED event whose ``data`` carries ``session_id`` reaches only
+     the owning session's socket, and events published on the worker's
+     per-worker EventBus (e.g. ``worker:worker_message``) are forwarded only
+     to the owning session's socket — the other socket never sees
+     ``worker:*`` events about that worker.
 
 Hermetic harness: temp HOME + patched ``Path.home()`` + purged/re-imported
 server modules with a registered MockProvider, exactly like
@@ -60,26 +72,34 @@ from starlette.testclient import TestClient
 from llm_providers.base import LLMProvider, ProviderConfig, LLMResponse
 from llm_providers.factory import ProviderFactory
 
-# Same singleton instance the bridges subscribe to (agent.events is NOT purged
-# by the fixture, so the re-imported server shares this object).
-from agent.events import global_event_bus, WorkerStatusEvent
+# Same singleton instances the bridges use (agent.events and
+# tools.workspace.worker_registry are NOT purged by the fixture, so the
+# re-imported server shares these objects).
+from agent.events import (
+    EventBus,
+    WorkerMessageEvent,
+    WorkerSpawnedEvent,
+    WorkerStatusEvent,
+    global_event_bus,
+)
+from tools.workspace.worker_registry import WorkerRegistry
 
 pytestmark = pytest.mark.integration
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 # Module-level single-threaded executor for WebSocket reads.
 # NOT wrapped in a ``with`` block — the executor lives for the full process
 # lifetime so that a timed-out ``ws.receive_text()`` thread doesn't block
 # cleanup.
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 _receive_pool = ThreadPoolExecutor(max_workers=1)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 # MockProvider — a fake LLM provider for testing (mirrored verbatim from
 # tests/web_ui/backend/test_ws_mock_provider.py)
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
 class MockProvider(LLMProvider):
     """A mock LLM provider that returns canned responses."""
@@ -139,7 +159,11 @@ def mock_server():
     patcher = patch.object(pathlib.Path, "home", return_value=fake_home)
     patcher.start()
 
-    # Register MockProvider BEFORE importing server
+    # Register MockProvider BEFORE importing server. Remember the registry
+    # state so teardown can restore it: registering our MockProvider under the
+    # global "mock" key would otherwise shadow the class that
+    # tests/web_ui/backend/test_ws_mock_provider.py registers later.
+    prev_mock_cls = ProviderFactory._get_providers().get("mock")
     _register_mock_provider()
 
     # Clear cached modules so re-import picks up the mock
@@ -165,6 +189,13 @@ def mock_server():
         if val is not None:
             os.environ[key] = val
     shutil.rmtree(tmp_home, ignore_errors=True)
+    # Leave the global ProviderFactory registry as we found it (run after
+    # yield, so it also restores when a test in this module fails).
+    providers = ProviderFactory._get_providers()
+    if prev_mock_cls is None:
+        providers.pop("mock", None)
+    else:
+        providers["mock"] = prev_mock_cls
 
 
 @pytest.fixture(autouse=True)
@@ -201,9 +232,9 @@ def reset_all(cls):
 MockProvider.reset_all = reset_all
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 # Helpers
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
 def recv_n(ws, n: int, timeout: float = 5.0) -> list:
     """Receive exactly *n* text messages from the WebSocket.
@@ -280,14 +311,15 @@ def _assert_no_reference(messages, needle: str, label: str):
         )
 
 
-def _assert_worker_event(messages, session_id, worker: str, label: str):
-    """Assert the polled messages contain a worker:worker_status event.
+def _assert_worker_typed_event(messages, event_type: str, session_id, worker: str,
+                               label: str):
+    """Assert the polled messages contain a ``worker:*`` event of *event_type*.
 
     ``session_id`` is the expected ``data.session_id``; pass ``None`` to
     assert the event carries NO session_id (tagless broadcast).
     """
-    worker_msgs = [m for m in messages if m.get("type") == "worker:worker_status"]
-    assert worker_msgs, f"{label}: no worker:worker_status received; got {_types(messages)}"
+    worker_msgs = [m for m in messages if m.get("type") == event_type]
+    assert worker_msgs, f"{label}: no {event_type} received; got {_types(messages)}"
     event = worker_msgs[-1]
     assert event.get("worker_name") == worker, (
         f"{label}: unexpected worker_name {event.get('worker_name')!r}: {event}"
@@ -302,196 +334,396 @@ def _assert_worker_event(messages, session_id, worker: str, label: str):
         )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+def _assert_worker_event(messages, session_id, worker: str, label: str):
+    """Assert the polled messages contain a worker:worker_status event.
+
+    ``session_id`` is the expected ``data.session_id``; pass ``None`` to
+    assert the event carries NO session_id (tagless broadcast).
+    """
+    _assert_worker_typed_event(
+        messages, "worker:worker_status", session_id, worker, label
+    )
+
+
+def _assert_worker_spawned_event(messages, session_id, worker: str, label: str):
+    """Assert the polled messages contain a worker:worker_spawned event."""
+    _assert_worker_typed_event(
+        messages, "worker:worker_spawned", session_id, worker, label
+    )
+
+
+def _assert_worker_message_event(messages, session_id, worker: str, label: str):
+    """Assert the polled messages contain a worker:worker_message event."""
+    _assert_worker_typed_event(
+        messages, "worker:worker_message", session_id, worker, label
+    )
+
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Tests
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
-class TestConcurrentSessions:
+def test_two_sessions_respond_independently(mock_server):
+    """Two concurrent sessions answer only on their own socket."""
+    app, _tmp_home = mock_server
+    query_a = "hello from session A"
+    query_b = "hello from session B"
 
-    def test_concurrent_sessions_respond_independently(self, mock_server):
-        """Two concurrent sessions answer only on their own socket."""
-        app, _tmp_home = mock_server
-        query_a = "hello from session A"
-        query_b = "hello from session B"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws_a:
+            with client.websocket_connect("/ws") as ws_b:
+                # Both sessions start independently with distinct ids.
+                msgs_a = new_session(ws_a)
+                sid_a = _session_id_from(msgs_a)
+                _assert_new_session_events(msgs_a, "session A")
 
-        with TestClient(app) as client:
-            with client.websocket_connect("/ws") as ws_a:
-                with client.websocket_connect("/ws") as ws_b:
-                    # Both sessions start independently with distinct ids.
-                    msgs_a = new_session(ws_a)
-                    sid_a = _session_id_from(msgs_a)
-                    _assert_new_session_events(msgs_a, "session A")
+                msgs_b = new_session(ws_b)
+                sid_b = _session_id_from(msgs_b)
+                _assert_new_session_events(msgs_b, "session B")
 
-                    msgs_b = new_session(ws_b)
-                    sid_b = _session_id_from(msgs_b)
-                    _assert_new_session_events(msgs_b, "session B")
+                assert sid_a and sid_b, "new_session must yield session_ids"
+                assert sid_a != sid_b, "Each connection must get its own session_id"
 
-                    assert sid_a and sid_b, "new_session must yield session_ids"
-                    assert sid_a != sid_b, "Each connection must get its own session_id"
-
-                    # A query on A produces events ONLY on A's socket.
-                    ws_a.send_json({"command": "continue_session", "query": query_a})
-                    a_query_msgs = poll_for_type(ws_a, "status_message", timeout=8.0)
-                    assert any(
-                        m.get("type") == "conversation_changed" for m in a_query_msgs
-                    ), f"No conversation_changed on A's socket: {_types(a_query_msgs)}"
-                    assert any(
-                        m.get("type") == "status_message" for m in a_query_msgs
-                    ), f"No status_message on A's socket: {_types(a_query_msgs)}"
-                    _assert_no_reference(
-                        a_query_msgs, sid_b, "A's query events must not reference session B"
-                    )
-
-                    # B's socket stays silent while A runs (isolation check).
-                    b_silence = recv_n(ws_b, 1, timeout=1.0)
-                    assert b_silence == [], (
-                        f"Session B received events while session A was running: "
-                        f"{_types(b_silence)}"
-                    )
-
-                    # B answers its own query independently.
-                    ws_b.send_json({"command": "continue_session", "query": query_b})
-                    b_query_msgs = poll_for_type(ws_b, "status_message", timeout=8.0)
-                    assert any(
-                        m.get("type") == "status_message" for m in b_query_msgs
-                    ), f"No status_message on B's socket after its own query: {_types(b_query_msgs)}"
-                    _assert_no_reference(
-                        b_query_msgs, sid_a, "B's query events must not reference session A"
-                    )
-
-                    # Drain leftover lifecycle events — these are the LAST reads
-                    # on each socket (a timeout here poisons the pool worker).
-                    a_leftover = recv_n(ws_a, 3, timeout=1.2)
-                    b_leftover = recv_n(ws_b, 2, timeout=1.0)
-
-        # Final invariants over every message each socket received.
-        all_a = msgs_a + a_query_msgs + a_leftover
-        all_b = msgs_b + b_silence + b_query_msgs + b_leftover
-
-        for msg in all_a:
-            if msg.get("session_id"):
-                assert msg["session_id"] == sid_a, (
-                    f"Session A received an event for another session: {msg}"
+                # A query on A produces events ONLY on A's socket.
+                ws_a.send_json({"command": "continue_session", "query": query_a})
+                a_query_msgs = poll_for_type(ws_a, "status_message", timeout=8.0)
+                assert any(
+                    m.get("type") == "conversation_changed" for m in a_query_msgs
+                ), f"No conversation_changed on A's socket: {_types(a_query_msgs)}"
+                assert any(
+                    m.get("type") == "status_message" for m in a_query_msgs
+                ), f"No status_message on A's socket: {_types(a_query_msgs)}"
+                _assert_no_reference(
+                    a_query_msgs, sid_b, "A's query events must not reference session B"
                 )
-            _assert_no_reference(
-                [msg], query_b, f"Session A received content from session B"
-            )
-        for msg in all_b:
-            if msg.get("session_id"):
-                assert msg["session_id"] == sid_b, (
-                    f"Session B received an event for another session: {msg}"
+
+                # B's socket stays silent while A runs (isolation check).
+                b_silence = recv_n(ws_b, 1, timeout=1.0)
+                assert b_silence == [], (
+                    f"Session B received events while session A was running: "
+                    f"{_types(b_silence)}"
                 )
-            _assert_no_reference(
-                [msg], query_a, f"Session B received content from session A"
+
+                # B answers its own query independently.
+                ws_b.send_json({"command": "continue_session", "query": query_b})
+                b_query_msgs = poll_for_type(ws_b, "status_message", timeout=8.0)
+                assert any(
+                    m.get("type") == "status_message" for m in b_query_msgs
+                ), f"No status_message on B's socket after its own query: {_types(b_query_msgs)}"
+                _assert_no_reference(
+                    b_query_msgs, sid_a, "B's query events must not reference session A"
+                )
+
+                # Drain leftover lifecycle events — these are the LAST reads
+                # on each socket (a timeout here poisons the pool worker).
+                a_leftover = recv_n(ws_a, 3, timeout=1.2)
+                b_leftover = recv_n(ws_b, 2, timeout=1.0)
+
+    # Final invariants over every message each socket received.
+    all_a = msgs_a + a_query_msgs + a_leftover
+    all_b = msgs_b + b_silence + b_query_msgs + b_leftover
+
+    for msg in all_a:
+        if msg.get("session_id"):
+            assert msg["session_id"] == sid_a, (
+                f"Session A received an event for another session: {msg}"
             )
-
-    def test_worker_events_delivered_to_owning_session_only(self, mock_server):
-        """
-        Worker events tagged with a session_id reach only that session's socket;
-        tagless worker events are broadcast to every bridge.
-
-        Documented bridge filter (web_ui/backend/bridge.py): an event is dropped
-        only when ``data['session_id']`` is present AND mismatched, so events
-        without a session_id pass the filter on ALL bridges.
-        """
-        app, _tmp_home = mock_server
-
-        with TestClient(app) as client:
-            with client.websocket_connect("/ws") as ws_a:
-                with client.websocket_connect("/ws") as ws_b:
-                    msgs_a = new_session(ws_a)
-                    sid_a = _session_id_from(msgs_a)
-                    msgs_b = new_session(ws_b)
-                    sid_b = _session_id_from(msgs_b)
-                    assert sid_a and sid_b and sid_a != sid_b
-
-                    # Run one query per session so each bridge's _session_id is
-                    # captured (create_session alone does NOT set it; the bridge
-                    # learns its session_id from controller events during a query).
-                    ws_a.send_json({"command": "continue_session", "query": "prime A"})
-                    poll_for_type(ws_a, "status_message", timeout=8.0)
-                    ws_b.send_json({"command": "continue_session", "query": "prime B"})
-                    poll_for_type(ws_b, "status_message", timeout=8.0)
-
-                    # Tagged for A → only A's socket receives it.
-                    global_event_bus.publish(WorkerStatusEvent(data={
-                        "worker_name": "w1", "status": "running", "session_id": sid_a,
-                    }))
-                    a_msgs = poll_for_type(ws_a, "worker:worker_status", timeout=3.0)
-                    _assert_worker_event(a_msgs, session_id=sid_a, worker="w1",
-                                         label="tagged-A on A")
-                    _assert_no_reference(
-                        a_msgs, sid_b, "A's worker messages must not reference session B"
-                    )
-
-                    # Tagged for B → only B's socket receives it.
-                    global_event_bus.publish(WorkerStatusEvent(data={
-                        "worker_name": "w1", "status": "running", "session_id": sid_b,
-                    }))
-                    b_msgs = poll_for_type(ws_b, "worker:worker_status", timeout=3.0)
-                    _assert_worker_event(b_msgs, session_id=sid_b, worker="w1",
-                                         label="tagged-B on B")
-                    _assert_no_reference(
-                        b_msgs, sid_a, "B's worker messages must not reference session A"
-                    )
-
-                    # Tagless → passes the filter on every bridge (documented).
-                    global_event_bus.publish(WorkerStatusEvent(data={
-                        "worker_name": "w1", "status": "running",
-                    }))
-                    a_tagless = poll_for_type(ws_a, "worker:worker_status", timeout=3.0)
-                    _assert_worker_event(a_tagless, session_id=None, worker="w1",
-                                         label="tagless on A")
-                    b_tagless = poll_for_type(ws_b, "worker:worker_status", timeout=3.0)
-                    _assert_worker_event(b_tagless, session_id=None, worker="w1",
-                                         label="tagless on B")
-
-                    # Cross-checks LAST (these may time out and poison the pool
-                    # worker, so nothing may be read afterwards).
-                    b_cross = recv_n(ws_b, 5, timeout=1.0)
-                    a_cross = recv_n(ws_a, 5, timeout=1.0)
-
-        assert not [m for m in b_cross if m.get("type") == "worker:worker_status"], (
-            f"Session B received a worker event it should not have: {b_cross}"
+        _assert_no_reference(
+            [msg], query_b, f"Session A received content from session B"
         )
-        assert not [m for m in a_cross if m.get("type") == "worker:worker_status"], (
-            f"Session A received a worker event it should not have: {a_cross}"
+    for msg in all_b:
+        if msg.get("session_id"):
+            assert msg["session_id"] == sid_b, (
+                f"Session B received an event for another session: {msg}"
+            )
+        _assert_no_reference(
+            [msg], query_a, f"Session B received content from session A"
         )
-        for msg in b_cross:
-            _assert_no_reference([msg], sid_a, "Session B got an event tagged for A")
-        for msg in a_cross:
-            _assert_no_reference([msg], sid_b, "Session A got an event tagged for B")
 
-    def test_closing_one_session_leaves_other_running(self, mock_server):
-        """Closing one session's WebSocket does not affect the other session."""
-        app, _tmp_home = mock_server
 
-        with TestClient(app) as client:
-            with client.websocket_connect("/ws") as ws_a:
-                with client.websocket_connect("/ws") as ws_b:
-                    new_session(ws_a)
-                    new_session(ws_b)
+def test_closing_session_a_leaves_session_b_running(mock_server):
+    """Closing session A's WebSocket leaves session B running."""
+    app, _tmp_home = mock_server
 
-                    # B runs a query successfully.
-                    ws_b.send_json({
-                        "command": "continue_session", "query": "first query on B",
-                    })
-                    b_first = poll_for_type(ws_b, "status_message", timeout=8.0)
-                    assert any(
-                        m.get("type") == "status_message" for m in b_first
-                    ), f"B's first query produced no status_message: {_types(b_first)}"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws_a:
+            with client.websocket_connect("/ws") as ws_b:
+                new_session(ws_a)
+                new_session(ws_b)
 
-                    # A closes its connection (client-side close).
-                    ws_a.close()
+                # B runs a query successfully.
+                ws_b.send_json({
+                    "command": "continue_session", "query": "first query on B",
+                })
+                b_first = poll_for_type(ws_b, "status_message", timeout=8.0)
+                assert any(
+                    m.get("type") == "status_message" for m in b_first
+                ), f"B's first query produced no status_message: {_types(b_first)}"
 
-                    # B must still respond to a follow-up query.
-                    ws_b.send_json({
-                        "command": "continue_session", "query": "second query on B",
-                    })
-                    b_second = poll_for_type(ws_b, "status_message", timeout=8.0)
-                    assert any(
-                        m.get("type") == "status_message" for m in b_second
-                    ), (
-                        "Session B stopped responding after session A was closed: "
-                        f"got {_types(b_second)}"
+                # A closes its connection (client-side close).
+                ws_a.close()
+
+                # B must still respond to a follow-up query.
+                ws_b.send_json({
+                    "command": "continue_session", "query": "second query on B",
+                })
+                b_second = poll_for_type(ws_b, "status_message", timeout=8.0)
+                assert any(
+                    m.get("type") == "status_message" for m in b_second
+                ), (
+                    "Session B stopped responding after session A was closed: "
+                    f"got {_types(b_second)}"
+                )
+
+
+
+def _prime_session(ws, query: str, label: str):
+    """Run one query so the bridge captures its session_id (sets _session_id)."""
+    ws.send_json({"command": "continue_session", "query": query})
+    msgs = poll_for_type(ws, "status_message", timeout=8.0)
+    assert any(m.get("type") == "status_message" for m in msgs), (
+        f"{label}: priming query produced no status_message: {_types(msgs)}"
+    )
+
+
+def _register_worker_for_session(registry, session_id: str, worker_name: str) -> EventBus:
+    """Register a fake worker + a real per-worker EventBus; return the bus."""
+    registry.register_worker(session_id, worker_name, object())
+    worker_bus = EventBus()
+    registry.register_event_bus(session_id, worker_name, worker_bus)
+    return worker_bus
+
+
+def test_worker_in_session_a_not_visible_to_session_b(mock_server):
+    """
+    The WorkerRegistry keys workers by (session_id, worker_name): a worker
+    registered under session A is invisible to session B — absent from
+    get_all_workers() under (sid_b, name), get_worker(sid_b, name) is None,
+    and the per-worker event bus never appears in B's session buses.
+    """
+    app, _tmp_home = mock_server
+    registry = WorkerRegistry.get_instance()
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws_a:
+            with client.websocket_connect("/ws") as ws_b:
+                msgs_a = new_session(ws_a)
+                sid_a = _session_id_from(msgs_a)
+                msgs_b = new_session(ws_b)
+                sid_b = _session_id_from(msgs_b)
+                assert sid_a and sid_b and sid_a != sid_b
+
+                _prime_session(ws_a, "prime A", "session A")
+                _prime_session(ws_b, "prime B", "session B")
+
+                try:
+                    worker_bus = _register_worker_for_session(registry, sid_a, "worker_a")
+
+                    # Registry visibility: present under A, absent under B.
+                    all_workers = registry.get_all_workers()
+                    assert (sid_a, "worker_a") in all_workers, (
+                        f"worker_a missing for {sid_a}: {list(all_workers.keys())}"
                     )
+                    assert (sid_b, "worker_a") not in all_workers, (
+                        f"worker_a visible under {sid_b}: {list(all_workers.keys())}"
+                    )
+                    assert registry.get_worker(sid_a, "worker_a") is not None
+                    assert registry.get_worker(sid_b, "worker_a") is None
+
+                    # Per-worker EventBus visibility is likewise scoped.
+                    buses_a = registry.get_event_buses_for_session(sid_a)
+                    assert "worker_a" in buses_a and buses_a["worker_a"] is worker_bus
+                    buses_b = registry.get_event_buses_for_session(sid_b)
+                    assert "worker_a" not in buses_b, (
+                        f"Session B can see A's worker bus: {list(buses_b.keys())}"
+                    )
+                    assert registry.get_event_bus(sid_b, "worker_a") is None
+
+                    # A spawned event for A's worker must not surface on B.
+                    global_event_bus.publish(WorkerSpawnedEvent(data={
+                        "worker_name": "worker_a", "session_id": sid_a,
+                    }))
+                    a_msgs = poll_for_type(ws_a, "worker:worker_spawned", timeout=3.0)
+                    _assert_worker_spawned_event(
+                        a_msgs, session_id=sid_a, worker="worker_a",
+                        label="spawned on A",
+                    )
+
+                    # B never sees worker:* about worker_a (LAST read on B).
+                    b_drain = recv_n(ws_b, 5, timeout=1.0)
+                finally:
+                    registry.unregister_worker(sid_a, "worker_a")
+                    registry.unregister_event_bus(sid_a, "worker_a")
+
+    assert not [m for m in b_drain if m.get("type", "").startswith("worker:")], (
+        f"Session B received worker events about A's worker: {b_drain}"
+    )
+
+
+
+def test_two_sessions_same_workspace_run_concurrently(mock_server):
+    """
+    Two concurrent ``new_session`` handshakes from the same project root
+    resolve to the SAME ``workspace_id``, both sessions are tracked in the
+    open-session registry, and both sockets answer queries while the other
+    session is alive.
+    """
+    app, _tmp_home = mock_server
+    # The fixture purged and re-imported web_ui.backend.server; importing it
+    # here (inside the test) yields that same module instance, so its
+    # _session_store singleton is the one shared by the live bridges.
+    import web_ui.backend.server as server_mod
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws_a:
+            with client.websocket_connect("/ws") as ws_b:
+                msgs_a = new_session(ws_a)
+                sid_a = _session_id_from(msgs_a)
+                _assert_new_session_events(msgs_a, "session A")
+                # msgs_a[0] is session_loaded (exact 5-event sequence above).
+                ws_a_id = msgs_a[0].get("workspace_id")
+
+                msgs_b = new_session(ws_b)
+                sid_b = _session_id_from(msgs_b)
+                _assert_new_session_events(msgs_b, "session B")
+                ws_b_id = msgs_b[0].get("workspace_id")
+
+                assert sid_a and sid_b and sid_a != sid_b
+                assert ws_a_id, (
+                    f"session A's session_loaded carried no workspace_id: {msgs_a[0]}"
+                )
+                assert ws_a_id == ws_b_id, (
+                    "Sessions must share the same workspace_id: A=%r B=%r"
+                    % (ws_a_id, ws_b_id)
+                )
+
+                # Both sessions are listed in the shared open-session store.
+                store = server_mod._get_session_store()
+                open_ids = store.get_open_sessions()
+                assert sid_a in open_ids, (
+                    f"session A missing from the open-session registry: {open_ids}"
+                )
+                assert sid_b in open_ids, (
+                    f"session B missing from the open-session registry: {open_ids}"
+                )
+
+                # Both sockets answer a query while the other session is alive.
+                _prime_session(ws_a, "query on A", "session A")
+                _prime_session(ws_b, "query on B", "session B")
+
+
+def test_worker_in_session_b_not_visible_to_session_a(mock_server):
+    """
+    Mirror of the session-A test: a worker registered for session B is
+    invisible to session A — absent from ``get_all_workers()`` under
+    (sid_a, name), ``get_worker(sid_a, name)`` is None, and the per-worker
+    event bus never appears in A's session buses.
+    """
+    app, _tmp_home = mock_server
+    registry = WorkerRegistry.get_instance()
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws_a:
+            with client.websocket_connect("/ws") as ws_b:
+                msgs_a = new_session(ws_a)
+                sid_a = _session_id_from(msgs_a)
+                msgs_b = new_session(ws_b)
+                sid_b = _session_id_from(msgs_b)
+                assert sid_a and sid_b and sid_a != sid_b
+
+                try:
+                    worker_bus = _register_worker_for_session(registry, sid_b, "worker_b")
+
+                    # Registry visibility: present under B, absent under A.
+                    all_workers = registry.get_all_workers()
+                    assert (sid_b, "worker_b") in all_workers, (
+                        f"worker_b missing for {sid_b}: {list(all_workers.keys())}"
+                    )
+                    assert (sid_a, "worker_b") not in all_workers, (
+                        f"worker_b visible under {sid_a}: {list(all_workers.keys())}"
+                    )
+                    assert registry.get_worker(sid_b, "worker_b") is not None
+                    assert registry.get_worker(sid_a, "worker_b") is None
+
+                    # Per-worker EventBus visibility is likewise scoped.
+                    buses_b = registry.get_event_buses_for_session(sid_b)
+                    assert "worker_b" in buses_b and buses_b["worker_b"] is worker_bus
+                    buses_a = registry.get_event_buses_for_session(sid_a)
+                    assert "worker_b" not in buses_a, (
+                        f"Session A can see B's worker bus: {list(buses_a.keys())}"
+                    )
+                    assert registry.get_event_bus(sid_a, "worker_b") is None
+                finally:
+                    registry.unregister_worker(sid_b, "worker_b")
+                    registry.unregister_event_bus(sid_b, "worker_b")
+
+
+def test_worker_events_delivered_only_to_owning_session(mock_server):
+    """
+    A WORKER_SPAWNED event tagged with a session_id is forwarded only to that
+    session's socket, and events published on the worker's per-worker EventBus
+    (``worker:worker_message``) are likewise delivered only to the owning
+    session's socket.  The other socket never sees ``worker:*`` events about
+    the worker.
+    """
+    app, _tmp_home = mock_server
+    registry = WorkerRegistry.get_instance()
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws_a:
+            with client.websocket_connect("/ws") as ws_b:
+                msgs_a = new_session(ws_a)
+                sid_a = _session_id_from(msgs_a)
+                msgs_b = new_session(ws_b)
+                sid_b = _session_id_from(msgs_b)
+                assert sid_a and sid_b and sid_a != sid_b
+
+                # Prime both bridges so _session_id is captured.
+                _prime_session(ws_a, "prime A", "session A")
+                _prime_session(ws_b, "prime B", "session B")
+
+                try:
+                    worker_bus = _register_worker_for_session(registry, sid_a, "worker_a")
+
+                    # Spawned event tagged for A → only A's socket sees it.
+                    global_event_bus.publish(WorkerSpawnedEvent(data={
+                        "worker_name": "worker_a", "session_id": sid_a,
+                    }))
+                    spawned = poll_for_type(ws_a, "worker:worker_spawned", timeout=3.0)
+                    _assert_worker_spawned_event(
+                        spawned, session_id=sid_a, worker="worker_a",
+                        label="spawned on A",
+                    )
+                    _assert_no_reference(
+                        spawned, sid_b, "A's spawned event must not reference session B"
+                    )
+
+                    # Events on A's per-worker bus reach only A's socket.
+                    worker_bus.publish(WorkerMessageEvent(data={
+                        "worker_name": "worker_a", "session_id": sid_a,
+                        "message": "hello from worker_a",
+                    }))
+                    a_msgs = poll_for_type(ws_a, "worker:worker_message", timeout=3.0)
+                    _assert_worker_message_event(
+                        a_msgs, session_id=sid_a, worker="worker_a",
+                        label="bus message on A",
+                    )
+                    assert "hello from worker_a" in json.dumps(a_msgs), (
+                        f"A's bus message payload missing: {a_msgs}"
+                    )
+                    _assert_no_reference(
+                        a_msgs, sid_b, "A's bus messages must not reference session B"
+                    )
+
+                    # B never sees worker:* about worker_a (LAST read on B).
+                    b_drain = recv_n(ws_b, 5, timeout=1.0)
+                finally:
+                    registry.unregister_worker(sid_a, "worker_a")
+                    registry.unregister_event_bus(sid_a, "worker_a")
+
+    assert not [m for m in b_drain if m.get("type", "").startswith("worker:")], (
+        f"Session B received worker events about A's worker: {b_drain}"
+    )
+
+

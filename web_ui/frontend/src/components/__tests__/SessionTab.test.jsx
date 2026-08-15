@@ -50,6 +50,7 @@ class MockWebSocket {
     this.url = url;
     this.readyState = MockWebSocket.CONNECTING;
     this.sent = [];
+    this.closed = false; // set true by close() — lets tests assert lifecycle cleanup
     this.onopen = null;
     this.onmessage = null;
     this.onclose = null;
@@ -62,6 +63,7 @@ class MockWebSocket {
   }
 
   close(code = 1001) {
+    this.closed = true;
     this.readyState = MockWebSocket.CLOSED;
     this.onclose?.({ code });
   }
@@ -314,6 +316,16 @@ describe('SessionTab — WebSocket lifecycle', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('closes its WebSocket on unmount (hubReady effect cleanup)', async () => {
+    renderTab();
+    const ws = await connectWs();
+    expect(ws.closed).toBe(false);
+    // Unmounting the component must run the hubReady effect cleanup, which
+    // closes the socket the tab opened (SessionTab.jsx cleanup: wsRef.current?.close()).
+    cleanup();
+    expect(ws.closed).toBe(true);
   });
 });
 

@@ -274,3 +274,85 @@ drain/silence checks must be the last reads on a socket.
   App uses `components/workspace/WorkspacePanel.jsx`)
 - Test fixtures: `tests/conftest.py` (hermetic_vault), `tests/integration/test_server_health.py`
   (contract_server), `SessionTab.test.jsx` (MockWebSocket L30-66)
+
+
+## Backend file:line evidence (verified)
+
+Verified against the working tree during R3 concurrency-isolation test authoring
+(`tests/integration/test_concurrent_sessions.py`, 6 tests, all passing).
+
+### web_ui/backend/server.py
+- `close_session` command L1749-1768: resolves `session_id` from `msg.get("session_id","")`; calls `bridge.close_session(session_id if session_id else None)`; records the resolved id in `_explicitly_closed_sessions`; removes the cached bridge from `_session_bridges` and calls `cached_bridge.stop()`.
+- `new_session` command L1802-1934: saves + stops the previous bridge (L1804-1808); constructs a fresh `WebAgentBridge` (L1816); `workspace_id = msg.get("workspace_id") or None` → `bridge._workspace_id` (L1822-1824); fallback `_resolve_workspace_id(_project_path)` (L1829-1840); auto-registers `WorkspaceRegistry.get_default().register_by_root(str(_project_path))` → entry.id (L1846-1857); `session_id, frontend_config = bridge.create_session(mode=mode)` (L1870); persists `new_session.workspace_id` (L1873); resolves `workspace_path` from the registry → `bridge._workspace_path` + persisted in metadata `agent_config` (L1877-1895); `_session_bridges[session_id] = bridge` (L1902); `session_loaded` payload L1904-1912 carries `workspace_id` (`bridge._workspace_id`), `workspace_path`, `session_id`, `session_name`, `is_running`, `config`; followed by tokens_updated/context_updated/config_changed/status_message (5 events total).
+- `websocket_endpoint` (L524+): disconnect handling — `except WebSocketDisconnect` L2189-2191 marks `ws._closed`; `finally` L2196-2224 removes the event callback for `id(ws)`, and unless the sid is in `_explicitly_closed_sessions` calls `bridge.save_open_session()`; then `bridge.unregister()` — the bridge is NOT stopped (kept cached for reconnect).
+- No WS command exists for `spawn_worker` / `list_workers` (command docstring L52-56 lists all supported commands; worker visibility is only via `WorkerRegistry` + `worker:*` events).
+
+### web_ui/backend/bridge.py
+- `close_session` L1811-1860: session-id resolution L1821-1823; `self.stop()` L1827; `save_session` + `_session_manager.close_session(sid)` L1834-1835; `shutdown_workers(timeout=5.0)` L1841-1845; `_persisted_workers.clear()` L1848; resets `_session`/`_loaded_session`/`_session_id` to None L1851-1853; broadcasts `session_cleared` + `state_changed` IDLE L1854-1858; sets `_cleanly_closed = True`.
+- `_on_worker_spawned` L524-600: session filter L546-549 (`if data.get('session_id') and data['session_id'] != self._session_id: return`); duplicate-subscription guard L553; if `worker_name` and `WORKER_BUS_AVAILABLE` and `get_worker_event_bus` → `worker_bus = get_worker_event_bus(session_id, worker_name)` L562; `_subscribe_to_worker_bus(worker_name, worker_bus)` L567; builds `event_dict = {'type': f'worker:{event.type.value}', 'worker_name', 'timestamp', 'data'}` L582-587; buffers L588; forwards to callbacks L595-600.
+- `_subscribe_to_worker_bus` L602-765: subscribed types = tool_call, tool_result, worker_message, assistant_message, context_updated, context_cleared, context_summarized, token_recovery, token_warning, turn_warning, time_warning, user_message, system_notification (L614-619); `worker_bus.subscribe(evt_enum, handler_fn)` L746 (EventType enum); subs stored in `self._worker_bus_subs[worker_name]` L754. `_make_bus_handler` L626-729: tokens_updated → flattened `worker:tokens_updated` (L637-644); context_updated → `worker:context_updated` with dedup via `self._last_context_updated` (L645-675); context_summarized special-cased (L676-687); otherwise generic `{'type': f'worker:{original_type}', 'worker_name': data.get('worker_name', worker_name), 'timestamp', 'data': data}` (L688-698); buffers non-heartbeat L704-705; forwards L722-728. NOTE: per-worker bus handlers do NOT re-check session_id — the subscription itself is the scoping.
+
+### tools/workspace/worker_registry.py
+- `WorkerRegistry` singleton (`get_instance()`); `_worker_registry: dict[(session_id, worker_name), Any]` + `_registry_lock`; `_worker_event_bus_registry: Dict[(session_id, worker_name), Any]` + `_bus_registry_lock`; atexit `shutdown_workers`.
+- `register_worker(session_id, worker_name, thread)` L58-63 (no type validation; key uses `session_id or ""`); `unregister_worker` L71-79; `get_all_workers` L81-84 (snapshot dict); `find_workers_by_name` L86-98; `register_event_bus` L102-106; `unregister_event_bus` L108-112; `get_event_bus` L114-118; `get_event_buses_for_session(session_id)` L120-133 (filters `sid == session_id`).
+
+### tools/workspace/worker.py
+- `shutdown_workers` L445-447, `register_worker_event_bus` L449-451, `get_worker_event_bus` L457-459, `get_worker_event_buses_for_session` L462-464 — all delegate to `WorkerRegistry`. The `WorkerRegistry` module is NOT purged by the mock_server fixture (which purges only `web_ui.backend`, `agent.config.provider_profile`, `thoughtmachine.bootstrap`).
+
+### agent/events.py
+- `WorkerSpawnedEvent` L277-285 (WORKER_SPAWNED; validator requires `worker_name` in data); `WorkerStatusEvent` L287-297 (requires `worker_name` + `status`); `WorkerCompletedEvent` L299-307; `WorkerMessageEvent` L309-317 (requires `worker_name`).
+- `EventBus` L373+: `subscribe(event_type=None, callback=None)` L381-395; `publish(event: BaseEvent)` L397-412 → typed + wildcard callbacks. `global_event_bus` singleton. EventType enum: WORKER_SPAWNED='worker_spawned', WORKER_STATUS='worker_status', TOOL_CALL, TOOL_RESULT, WORKER_MESSAGE, ASSISTANT_MESSAGE, TOKENS_UPDATED, CONTEXT_UPDATED, TOKEN_RECOVERY, CONTEXT_CLEARED, CONTEXT_SUMMARIZED, TURN_WARNING, TIME_WARNING, USER_MESSAGE, SYSTEM_NOTIFICATION.
+
+### agent/session_manager.py
+- `create_session` L78-123: `new_session = Session()`; `metadata["source"] = "web_ui"`; `save_session(new_session, workspace_id=new_session.workspace_id)` L110; `add_open_session` L112; returns `(session_id, frontend_config)`.
+
+### Test-implied behavior (asserted by the 6 tests)
+- `new_session` without a `workspace_id` in the message → both connections auto-register the SAME project root workspace (same `_project_path`), so both sessions share a `workspace_id` (per-session isolation is via `session_id`, not `workspace_id`).
+- The bridge's `_session_id` is set only after a query produces controller events (`create_session` alone does not set it) — worker-event tests must prime each session with one query first.
+
+
+---
+
+## Frontend file:line evidence (verified)
+
+Verified against the working tree (post-b282130 multi-session upgrade; full frontend
+suite green: 15 files / 335 tests, incl. sessionTabsStore 16, SessionTabsIntegration 5,
+SessionWorkerIsolation 3, SessionTab 26).
+
+### web_ui/frontend/src/App.jsx
+- `loadTab` L377-400: resolves the owning workspace (hint → learned mapping → last known → current, L380); dedups when the tab already exists L387-394; otherwise `st.openTab(ws, { sessionId, title })` L395 and, only for the preferred session, `st.setActiveTab(ws, sessionId)` L397 + `navigate('/session/<id>')` L398.
+- Hub `session_loaded` case L333-337: `loadTab(msg.session_id, undefined, msg.workspace_id)` L336 — a new session created via the hub WS opens a tab, using the backend-provided `workspace_id` as the workspace hint.
+- `handleNewSessionCreated` L500-516: dedup guard L506, `st.openTab(ws, ...)` L507, `st.setActiveTab(ws, sessionId)` L509, `navigate('/session/<id>')` L515 — a session created inside a tab lands in the strip and becomes active.
+- Route-driven activation L615-641: on `#/session/<id>` — hydrate the owning workspace L632, `st.openTab(ws, ...)` if the tab is missing L633-635, then unconditional `st.setActiveTab(ws, route.id)` L636 — the route wins.
+- TabBar strip render L711-724: every tab becomes a strip entry (`tabs.map(t => ({ id: t.sessionId, name: t.title }))` L713); click handler `onSelectTab` L715-718 = `setActiveTab(currentWs, id)` + `navigate('/session/<id>')`.
+- Active-only mount L726-753: `{activeTab && (<div className="tab-wrapper" key={activeTab.sessionId}>…<SessionTab …/>)}` — ONLY the active session's SessionTab is mounted (its own WS opens via the hubReady effect, SessionTab.jsx L440-458); inactive tabs are strip entries only — no mount, no WS.
+- activeTab derivation L106: `tabs.find(t => t.sessionId === activeSessionId) || null`, fed by the per-workspace store selectors L103-105 — activation is eager when a tab is selected, loading is lazy (strip-only until active).
+
+### web_ui/frontend/src/sessionTabsStore.js
+- Storage key L18: `const STORAGE_PREFIX = 'tm.sessionTabs.'` → per-workspace key `tm.sessionTabs.<workspaceId>` (read in `loadEntry` L20-30 @ L22; written in `saveEntry` L32-37 @ L34 as `{ v: 1, tabs, activeSessionId }` on every mutation).
+- `openTab` L63-72: dedup on existing tab L66; `const activeSessionId = entry.activeSessionId || sessionId` L68 — a workspace's FIRST tab becomes active automatically; persist via `saveEntry` L71.
+- `hydrate` L116-123: `const existing = get().byWorkspace[ws]; if (existing) return existing` L118-119 — idempotent restore; otherwise validates and loads `sanitize(loadEntry(ws))` (sanitize L40-51).
+
+### Why only one session was usable before the fix (pre-upgrade, commit 580d9cb)
+Old App.jsx tracked a SINGLE active session app-wide: one `tabs` array + one `activeTabId`,
+one derived `activeSessionId`, and one GLOBAL localStorage key (`activeSessionId` — not
+per-workspace). Verbatim from `git show 580d9cb:web_ui/frontend/src/App.jsx` (removed by
+commit b282130; neither 580d9cb nor 7ffd751 touched App.jsx, so these line numbers are
+exact for 580d9cb):
+
+```js
+// L47  const [tabs, setTabs] = useState([])           // { tabId, sessionId }
+// L48  const [activeTabId, setActiveTabId] = useState(null)
+// L80  const activeTab = tabs.find((t) => t.tabId === activeTabId)
+// L81  const activeSessionId = activeTab?.sessionId
+// L86  const startupActiveSessionId = useMemo(() => {
+// L87    return localStorage.getItem('activeSessionId')
+// L88  }, [])
+// L262 const savedSessionId = localStorage.getItem('activeSessionId')  // open_sessions case
+```
+
+The app could restore/activate only one session at a time — with two sessions open the
+single `activeTabId` could point at only one of them, so the other was unreachable (a UI
+gap, not a backend limit; see §2.1). b282130 replaced this with the per-workspace strip +
+`tm.sessionTabs.<wsId>` persistence.
+

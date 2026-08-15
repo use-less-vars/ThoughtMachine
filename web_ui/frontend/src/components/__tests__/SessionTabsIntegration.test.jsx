@@ -307,4 +307,81 @@ describe('App session tab strip — open_sessions restore', () => {
       expect(load.session_id).toBe('sess-1')
     })
   })
+
+  it('page reload restores the persisted strip and remounts the previously active session', async () => {
+    // Simulate a prior page load: strip persisted with sess-2 active.
+    localStorage.setItem(
+      `tm.sessionTabs.${ENTRY.id}`,
+      JSON.stringify({
+        v: 1,
+        tabs: [
+          { sessionId: 'sess-1', title: 'Tab 1' },
+          { sessionId: 'sess-2', title: 'Tab 2' },
+        ],
+        activeSessionId: 'sess-2',
+      })
+    )
+    // Fresh mount = simulated reload; landing on the workspace route.
+    window.location.hash = `#/workspace/${ENTRY.id}`
+    render(<App />)
+    const hub = await connectHub()
+    await act(async () =>
+      hub.receive({ type: 'sessions_list', sessions: TWO_SESSIONS })
+    )
+    await act(async () =>
+      hub.receive({
+        type: 'open_sessions',
+        sessions: TWO_SESSIONS.map(({ session_id, name }) => ({ session_id, name })),
+      })
+    )
+
+    // Strip restored from localStorage with BOTH tabs; the previously active
+    // sess-2 is active (open_sessions must not override it).
+    await waitFor(() => {
+      const bar = tabBar()
+      expect(bar).toBeTruthy()
+      expect(within(bar).getByText('Tab 1')).toBeInTheDocument()
+      expect(within(bar).getByText('Tab 2')).toBeInTheDocument()
+      expect(activeTabLabel()).toBe('Tab 2')
+    })
+    // Exactly one SessionTab WS (hub + 1) and it loads the previously active
+    // session; sess-1 is strip-only (no mount, no WS).
+    await waitFor(() => {
+      expect(MockWebSocket.instances.length).toBe(2)
+    })
+    const ws = lastWs()
+    expect(ws).not.toBe(hub)
+    await act(async () => ws.open())
+    await waitFor(() => {
+      const load = sentCommands(ws).find((c) => c.command === 'load_session')
+      expect(load).toBeTruthy()
+      expect(load.session_id).toBe('sess-2')
+    })
+    expect(MockWebSocket.instances.length).toBe(2)
+
+    // Second fresh mount (another reload) is idempotent — no duplicate tabs.
+    cleanup()
+    MockWebSocket.instances = []
+    render(<App />)
+    const hub2 = await connectHub()
+    await act(async () =>
+      hub2.receive({ type: 'sessions_list', sessions: TWO_SESSIONS })
+    )
+    await act(async () =>
+      hub2.receive({
+        type: 'open_sessions',
+        sessions: TWO_SESSIONS.map(({ session_id, name }) => ({ session_id, name })),
+      })
+    )
+    await waitFor(() => {
+      const bar = tabBar()
+      expect(bar).toBeTruthy()
+      expect(within(bar).getAllByText('Tab 1')).toHaveLength(1)
+      expect(within(bar).getAllByText('Tab 2')).toHaveLength(1)
+      expect(activeTabLabel()).toBe('Tab 2')
+    })
+    // Persisted entry still holds exactly two tabs.
+    const persisted = JSON.parse(localStorage.getItem(`tm.sessionTabs.${ENTRY.id}`))
+    expect(persisted.tabs).toHaveLength(2)
+  })
 })
