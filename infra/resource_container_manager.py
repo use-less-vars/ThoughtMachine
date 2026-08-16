@@ -82,21 +82,20 @@ except ImportError:  # pragma: no cover - environment without docker SDK
 
 _LOG = logging.getLogger(__name__)
 
-# Resource image identity. The image is auto-built from THIS repo's unified
-# runtime Dockerfile — <repo>/resources/default_dockerfile.txt plus the
-# pinned <repo>/requirements.txt (the trusted code base; agent workspaces
-# are separate directories, so the image definition cannot be tampered with
-# from a workspace). The SAME file is the single source for both the
-# executor image and the tm-resource-git resource image; the vault copy
-# (~/.thoughtmachine/docker/resource/Dockerfile, seeded from
-# resources/default_dockerfile.txt) is kept only as the manual-build
-# fallback. Every auto-built image carries a thoughtmachine.build_hash label
+# Resource image identity. The tm-resource-git resource image is layered on
+# top of the workspace runtime image (tm-workspace-runtime:latest) via the
+# git resource overlay. Both are auto-built from the VAULT's docker/resource/
+# directory — ~/.thoughtmachine/docker/resource/ — which bootstrap seeds from
+# the repo's pinned sources (ensure_resource_build_files, MANIFEST.json) and
+# which is agent-write-blocked, so the image definitions cannot be tampered
+# with from a workspace. The vault is the SINGLE authoritative source: the
+# runtime image from default_runtime.Dockerfile + requirements.txt, and the
+# overlay from git_overlay.Dockerfile on top of the freshly-ensured runtime
+# image. Every auto-built image carries a thoughtmachine.build_hash label
 # (sha256 of the exact bytes built) so a stale image — built from older
 # sources — is detected and rebuilt on drift.
+RUNTIME_IMAGE_TAG = "tm-workspace-runtime:latest"
 RESOURCE_IMAGE_TAG = "tm-resource-git"
-RESOURCE_IMAGE_BUILD_CMD = (
-    f"docker build -t {RESOURCE_IMAGE_TAG} -f resources/default_dockerfile.txt ."
-)
 
 # Known hidden resources. Every entry runs inside the same hardened
 # ``RESOURCE_IMAGE_TAG`` image, so the build-hash drift check applies to all.
@@ -104,14 +103,56 @@ RESOURCE_REGISTRY = {
     "git": {"kind": "git"},
 }
 
-# Build-hash label + repo-sourced build inputs. The repo root is derived from
-# this file's location (infra/ -> repo root).
+# Build-hash label + build inputs. The repo root is derived from this file's
+# location (infra/ -> repo root); the repo-side files below are SEEDS only —
+# the vault's docker/resource/ copy is the single authoritative build source
+# (tests monkeypatch the module-level VAULT_* constants to a tmp vault).
 RESOURCE_BUILD_HASH_LABEL = "thoughtmachine.build_hash"
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO_REQUIREMENTS = os.path.join(_REPO_ROOT, "requirements.txt")
 REPO_RUNTIME_DOCKERFILE = os.path.join(
     _REPO_ROOT, "resources", "default_dockerfile.txt"
 )
+GIT_OVERLAY_DOCKERFILE = os.path.join(
+    _REPO_ROOT, "resources", "git_resource_overlay_dockerfile.txt"
+)
+
+
+def _resolve_vault_root() -> str:
+    """Return the vault root: THOUGHTMACHINE_VAULT_ROOT env or ~/.thoughtmachine.
+
+    Mirrors ``thoughtmachine.vault.vault_root()`` without importing that
+    module, so this module stays importable in stripped-down environments.
+    """
+    override = os.environ.get("THOUGHTMACHINE_VAULT_ROOT")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    return os.path.join(os.path.expanduser("~"), ".thoughtmachine")
+
+
+# VAULT-authoritative build inputs. The vault's docker/resource/ directory is
+# the SINGLE source for resource-image builds: bootstrap seeds it
+# (ensure_resource_build_files, MANIFEST.json) and the agent cannot write it.
+VAULT_RESOURCE_DIR = os.path.join(_resolve_vault_root(), "docker", "resource")
+VAULT_REQUIREMENTS = os.path.join(VAULT_RESOURCE_DIR, "requirements.txt")
+VAULT_RUNTIME_DOCKERFILE = os.path.join(
+    VAULT_RESOURCE_DIR, "default_runtime.Dockerfile"
+)
+VAULT_OVERLAY_DOCKERFILE = os.path.join(
+    VAULT_RESOURCE_DIR, "git_overlay.Dockerfile"
+)
+
+# Manual build fallback (two steps): first the runtime base image, then the
+# git resource overlay on top of it — both from the VAULT build directory
+# (the context must contain requirements.txt for the runtime stage's COPY).
+GIT_OVERLAY_BUILD_CMD = (
+    f"docker build -t {RUNTIME_IMAGE_TAG} -f {VAULT_RUNTIME_DOCKERFILE} "
+    f"{VAULT_RESOURCE_DIR}\n"
+    f"docker build -t {RESOURCE_IMAGE_TAG} "
+    f"-f {VAULT_OVERLAY_DOCKERFILE} "
+    f"--build-arg BASE_IMAGE={RUNTIME_IMAGE_TAG} {VAULT_RESOURCE_DIR}"
+)
+RESOURCE_IMAGE_BUILD_CMD = GIT_OVERLAY_BUILD_CMD
 
 # Phase 3: optional ContainerRegistry delegation behind the session-config
 # `use_container_registry` flag. Defensive import — the registry must never
@@ -141,14 +182,16 @@ def _hash_resource_bytes(requirements_bytes, dockerfile_bytes) -> str:
 def compute_resource_build_hash(requirements_path, dockerfile_path) -> str:
     """sha256 (hex) over ``requirements bytes + b'\\n' + dockerfile bytes``.
 
-    Deterministic and pure (no docker): used both to tag auto-built images
-    (``thoughtmachine.build_hash`` label) and to detect drift between an
-    existing local image and the current repo sources.
+    Deterministic and pure (no docker): this is the build hash of the
+    WORKSPACE RUNTIME image (``tm-workspace-runtime:latest``), used both to
+    tag it with the ``thoughtmachine.build_hash`` label and to detect drift
+    between an existing local image and the current vault build sources.
 
     Args:
-        requirements_path: Path to the repo ``requirements.txt``.
+        requirements_path: Path to the pinned ``requirements.txt``
+            (vault copy).
         dockerfile_path: Path to the runtime Dockerfile source
-            (``resources/default_dockerfile.txt``).
+            (``default_runtime.Dockerfile``).
 
     Returns:
         str: 64-char hex digest.
@@ -160,28 +203,89 @@ def compute_resource_build_hash(requirements_path, dockerfile_path) -> str:
     return _hash_resource_bytes(requirements_bytes, dockerfile_bytes)
 
 
-def _prepare_resource_build_context():
-    """Stage the repo build sources into a fresh temp directory.
+def _hash_overlay_bytes(
+    requirements_bytes,
+    runtime_dockerfile_bytes,
+    overlay_dockerfile_bytes,
+    runtime_image_id_bytes,
+) -> str:
+    """Deterministic sha256 (hex) over the exact bytes the overlay is built from."""
+    digest = hashlib.sha256()
+    digest.update(requirements_bytes)
+    digest.update(b"\n")
+    digest.update(runtime_dockerfile_bytes)
+    digest.update(b"\n")
+    digest.update(overlay_dockerfile_bytes)
+    digest.update(b"\n")
+    digest.update(runtime_image_id_bytes)
+    return digest.hexdigest()
 
-    Copies ``<repo>/requirements.txt`` -> ``<tmp>/requirements.txt`` and
-    ``<repo>/resources/default_dockerfile.txt`` -> ``<tmp>/Dockerfile`` so the
-    docker build context contains ONLY the pinned sources (never the whole
-    repo). The build hash is computed from the same bytes that are copied.
+
+def compute_git_overlay_build_hash(
+    requirements_path, runtime_dockerfile_path, overlay_dockerfile_path, runtime_image_id
+) -> str:
+    """sha256 (hex) over requirements + runtime dockerfile + overlay dockerfile
+    + runtime image id bytes.
+
+    Deterministic and pure (no docker): the build hash of the git resource
+    overlay image (``tm-resource-git``). It covers BOTH the runtime base
+    (``requirements.txt`` + ``default_runtime.Dockerfile``) AND the
+    overlay dockerfile AND the exact id of the runtime image the overlay is
+    built on, so any change to the base sources — or a rebuilt runtime image
+    — forces the overlay to rebuild.
+
+    Args:
+        requirements_path: Path to the pinned ``requirements.txt`` (vault copy).
+        runtime_dockerfile_path: Path to the runtime Dockerfile source
+            (``default_runtime.Dockerfile``).
+        overlay_dockerfile_path: Path to the git overlay Dockerfile source
+            (``git_overlay.Dockerfile``).
+        runtime_image_id: Full image id (e.g. ``sha256:...``) of the
+            freshly-ensured ``tm-workspace-runtime:latest`` image.
+
+    Returns:
+        str: 64-char hex digest.
+    """
+    with open(requirements_path, "rb") as fh:
+        requirements_bytes = fh.read()
+    with open(runtime_dockerfile_path, "rb") as fh:
+        runtime_dockerfile_bytes = fh.read()
+    with open(overlay_dockerfile_path, "rb") as fh:
+        overlay_dockerfile_bytes = fh.read()
+    return _hash_overlay_bytes(
+        requirements_bytes,
+        runtime_dockerfile_bytes,
+        overlay_dockerfile_bytes,
+        runtime_image_id.encode("utf-8"),
+    )
+
+
+def _prepare_resource_build_context():
+    """Stage the RUNTIME image build sources into a fresh temp directory.
+
+    Copies ``<vault>/docker/resource/requirements.txt`` -> ``<tmp>/requirements.txt``
+    and ``<vault>/docker/resource/default_runtime.Dockerfile`` ->
+    ``<tmp>/Dockerfile`` so the docker build context contains ONLY the pinned
+    sources (never the whole vault or repo). The runtime build hash is
+    computed from the same bytes that are copied. (The git overlay is staged
+    separately by ``_prepare_git_overlay_build_context``.)
 
     Returns:
         (context_dir: str, build_hash: str) on success, or None when the
-        repo sources are missing/unreadable (already logged).
+        vault sources are missing/unreadable (already logged).
     """
     try:
-        with open(REPO_REQUIREMENTS, "rb") as fh:
+        with open(VAULT_REQUIREMENTS, "rb") as fh:
             requirements_bytes = fh.read()
-        with open(REPO_RUNTIME_DOCKERFILE, "rb") as fh:
+        with open(VAULT_RUNTIME_DOCKERFILE, "rb") as fh:
             dockerfile_bytes = fh.read()
     except OSError as exc:
         _LOG.warning(
-            "Cannot read resource image build sources (%s, %s): %s",
-            REPO_REQUIREMENTS,
-            REPO_RUNTIME_DOCKERFILE,
+            "Cannot read resource image build sources (%s, %s): %s. "
+            "Seed the vault by running 'python -m thoughtmachine.bootstrap' "
+            "(or ensure_user_defaults()).",
+            VAULT_REQUIREMENTS,
+            VAULT_RUNTIME_DOCKERFILE,
             exc,
         )
         return None
@@ -202,8 +306,46 @@ def _prepare_resource_build_context():
     return context_dir, build_hash
 
 
-def _check_resource_image(client, build_hash) -> bool:
-    """True when the local image exists AND its build-hash label matches.
+def _prepare_git_overlay_build_context():
+    """Stage ONLY the git overlay Dockerfile into a fresh temp directory.
+
+    The overlay build context contains a single ``Dockerfile`` (a copy of
+    ``<vault>/docker/resource/git_overlay.Dockerfile``); the runtime base
+    image is passed via ``--build-arg BASE_IMAGE=...`` at build time, so no
+    other files are needed.
+
+    Returns:
+        str: context dir on success, or None when the overlay dockerfile is
+        missing/unreadable (already logged).
+    """
+    try:
+        with open(VAULT_OVERLAY_DOCKERFILE, "rb") as fh:
+            overlay_bytes = fh.read()
+    except OSError as exc:
+        _LOG.warning(
+            "Cannot read git overlay dockerfile %s: %s. "
+            "Seed the vault by running 'python -m thoughtmachine.bootstrap' "
+            "(or ensure_user_defaults()).",
+            VAULT_OVERLAY_DOCKERFILE,
+            exc,
+        )
+        return None
+    context_dir = tempfile.mkdtemp(prefix="tm-resource-build-")
+    try:
+        with open(os.path.join(context_dir, "Dockerfile"), "wb") as fh:
+            fh.write(overlay_bytes)
+    except OSError as exc:
+        shutil.rmtree(context_dir, ignore_errors=True)
+        _LOG.warning(
+            "Failed to stage git overlay build context: %s",
+            exc,
+        )
+        return None
+    return context_dir
+
+
+def _check_resource_image(client, build_hash, image_tag=RESOURCE_IMAGE_TAG) -> bool:
+    """True when the local image ``image_tag`` exists AND its hash label matches.
 
     A missing image, or an image with a missing/mismatched
     ``thoughtmachine.build_hash`` label (drift), returns False so the caller
@@ -211,45 +353,139 @@ def _check_resource_image(client, build_hash) -> bool:
 
     Args:
         client: docker client with ``images.get``.
-        build_hash: expected hash of the current repo build sources.
+        build_hash: expected hash of the current vault build sources.
+        image_tag: image tag to check (runtime base or git resource overlay).
 
     Returns:
         bool
     """
     try:
-        image = client.images.get(RESOURCE_IMAGE_TAG)
+        image = client.images.get(image_tag)
     except ImageNotFound:
         return False
     labels = getattr(image, "labels", None) or {}
     return labels.get(RESOURCE_BUILD_HASH_LABEL) == build_hash
 
 
-def _ensure_resource_image() -> bool:
-    """Ensure ``tm-resource-git`` exists and matches the repo build sources.
+def _runtime_and_overlay_ready(client, runtime_hash) -> bool:
+    """Read-only fast check that BOTH resource images are present and current.
 
-    The image is auto-built from THIS repo's pinned sources (``requirements.txt``
-    + ``resources/default_dockerfile.txt``, staged into a temp build context)
-    and tagged with a ``thoughtmachine.build_hash`` label (sha256 of the exact
-    bytes built). Drift detection: an existing image whose label is missing or
-    does not match the current repo sources is rebuilt, so a stale image is
-    never silently reused.
-
-    Single-flight: concurrent callers serialize on ``_RESOURCE_IMAGE_LOCK``
-    (double-checked — the image is re-checked inside the lock before the
-    build). Success is cached in ``_RESOURCE_IMAGE_READY``; failures are never
-    cached so the next call retries. NEVER raises — failures are logged (with
-    the manual ``docker build`` command) and reported as ``False``.
+    The git resource overlay's expected build hash depends on the id of the
+    runtime image it is built on, so the runtime image is inspected first and
+    the overlay hash is derived from its (full) image id.
 
     Returns:
-        bool: True when a matching image is available, False otherwise.
+        bool: True when both images exist with matching build-hash labels.
+            Real daemon errors propagate (callers log and bail).
+    """
+    if not _check_resource_image(client, runtime_hash, RUNTIME_IMAGE_TAG):
+        return False
+    runtime_image_id = client.images.get(RUNTIME_IMAGE_TAG).id
+    overlay_hash = compute_git_overlay_build_hash(
+        VAULT_REQUIREMENTS,
+        VAULT_RUNTIME_DOCKERFILE,
+        VAULT_OVERLAY_DOCKERFILE,
+        runtime_image_id,
+    )
+    return _check_resource_image(client, overlay_hash, RESOURCE_IMAGE_TAG)
+
+
+def report_vault_seed_divergence() -> list[str]:
+    """Report whether the vault's resource build files differ from the repo seeds.
+
+    The vault (``~/.thoughtmachine/docker/resource/``) is AUTHORITATIVE for
+    resource-image builds; the repo ``resources/`` files are only seeds. This
+    helper compares the vault copies against the repo seeds and returns a list
+    of divergence labels (empty when they match). It only REPORTS — it never
+    copies or rebuilds, so a stale vault is left intact and images are built
+    from whatever the vault currently contains. Refreshing the vault is the
+    operator's job: ``python -m thoughtmachine.bootstrap`` (or
+    ``ensure_user_defaults()``) — note the vault files are ``never_overwrite``
+    trust anchors, so a refresh requires removing them first.
+
+    Returns:
+        list[str]: labels of diverged/missing vault files (e.g.
+            ``["requirements.txt"]``), or ``[]`` when the vault matches the
+            repo seeds. Missing vault files are reported as ``"<name> (missing)"``.
+    """
+    pairs = (
+        ("requirements.txt", VAULT_REQUIREMENTS, REPO_REQUIREMENTS),
+        (
+            "default_runtime.Dockerfile",
+            VAULT_RUNTIME_DOCKERFILE,
+            REPO_RUNTIME_DOCKERFILE,
+        ),
+        ("git_overlay.Dockerfile", VAULT_OVERLAY_DOCKERFILE, GIT_OVERLAY_DOCKERFILE),
+    )
+    diverged = []
+    for label, vault_path, repo_path in pairs:
+        try:
+            with open(vault_path, "rb") as fh:
+                vault_bytes = fh.read()
+        except OSError:
+            diverged.append(f"{label} (missing)")
+            continue
+        try:
+            with open(repo_path, "rb") as fh:
+                repo_bytes = fh.read()
+        except OSError:
+            continue
+        if vault_bytes != repo_bytes:
+            diverged.append(label)
+    if diverged:
+        _LOG.warning(
+            "vault-vs-repo-seed divergence: %s; vault is authoritative — "
+            "NOT rebuilding from repo sources; to refresh the vault copy run "
+            "'python -m thoughtmachine.bootstrap' (or ensure_user_defaults())",
+            ", ".join(diverged),
+        )
+    return diverged
+
+
+def _ensure_resource_image() -> bool:
+    """Ensure the git resource overlay image exists and matches vault sources.
+
+    Two-stage architecture:
+      Stage 1 — ``tm-workspace-runtime:latest``: the dependency-only runtime
+        base image, built from the VAULT's pinned sources
+        (``~/.thoughtmachine/docker/resource/requirements.txt`` +
+        ``default_runtime.Dockerfile``, staged into a temp build context) and
+        tagged with a ``thoughtmachine.build_hash`` label (sha256 of the exact
+        bytes built).
+      Stage 2 — ``tm-resource-git``: the git resource overlay, built from
+        ``~/.thoughtmachine/docker/resource/git_overlay.Dockerfile`` on top of
+        the freshly-ensured runtime image (``--build-arg BASE_IMAGE=...``).
+        Its build-hash label covers requirements + runtime dockerfile + overlay
+        dockerfile + the runtime image id, so a rebuilt runtime image forces
+        the overlay to rebuild.
+
+    The vault is the SINGLE authoritative source: builds NEVER read the repo
+    directly. A vault-vs-repo seed divergence is reported (see
+    ``report_vault_seed_divergence``) but never acted upon — a stale vault
+    simply means the images are built from the vault's current bytes.
+
+    Drift detection is STRICT: the overlay is ready only when its
+    ``thoughtmachine.build_hash`` label equals the freshly-computed overlay
+    hash. A legacy unified ``tm-resource-git`` (labeled with only the runtime
+    hash) is treated as stale and rebuilt from the overlay.
+
+    Single-flight: concurrent callers serialize on ``_RESOURCE_IMAGE_LOCK``
+    (double-checked — both images are re-checked inside the lock before any
+    build). Success is cached in ``_RESOURCE_IMAGE_READY``; failures are never
+    cached so the next call retries. NEVER raises — failures are logged (with
+    the manual ``docker build`` commands) and reported as ``False``.
+
+    Returns:
+        bool: True when both images are available and current, False otherwise.
     """
     global _RESOURCE_IMAGE_READY
     if _RESOURCE_IMAGE_READY:
         return True
     if docker is None:
         _LOG.warning(
-            "Docker SDK unavailable — cannot ensure resource image %s. "
-            "Build it manually: %s",
+            "Docker SDK unavailable — cannot ensure resource images %s / %s. "
+            "Build them manually:\n%s",
+            RUNTIME_IMAGE_TAG,
             RESOURCE_IMAGE_TAG,
             RESOURCE_IMAGE_BUILD_CMD,
         )
@@ -258,79 +494,123 @@ def _ensure_resource_image() -> bool:
         client = docker.from_env()
     except Exception as exc:
         _LOG.warning(
-            "Cannot reach the Docker daemon to ensure resource image %s: %s. "
-            "Build it manually: %s",
+            "Cannot reach the Docker daemon to ensure resource images %s / %s: %s. "
+            "Build them manually:\n%s",
+            RUNTIME_IMAGE_TAG,
             RESOURCE_IMAGE_TAG,
             exc,
             RESOURCE_IMAGE_BUILD_CMD,
         )
         return False
-    prepared = _prepare_resource_build_context()
-    if prepared is None:
+    runtime_prepared = _prepare_resource_build_context()
+    if runtime_prepared is None:
         return False
-    context_dir, build_hash = prepared
+    runtime_context_dir, runtime_hash = runtime_prepared
     try:
-        # Fast existence + drift check (no lock): a matching image is ready.
+        # Fast existence + drift check (no lock): both images ready.
         try:
-            if _check_resource_image(client, build_hash):
+            if _runtime_and_overlay_ready(client, runtime_hash):
                 _RESOURCE_IMAGE_READY = True
                 return True
         except Exception as exc:
             _LOG.warning(
-                "Failed to check for resource image %s: %s. Build it manually: %s",
+                "Failed to check for resource images %s / %s: %s. "
+                "Build them manually:\n%s",
+                RUNTIME_IMAGE_TAG,
                 RESOURCE_IMAGE_TAG,
                 exc,
                 RESOURCE_IMAGE_BUILD_CMD,
             )
             return False
-        # Image missing or stale — build from the repo sources, single-flight.
+        # Something missing or stale — build from the vault sources,
+        # single-flight. Report (but never act on) any vault-vs-repo seed
+        # divergence first: the vault is authoritative.
+        report_vault_seed_divergence()
         with _RESOURCE_IMAGE_LOCK:
             if _RESOURCE_IMAGE_READY:
                 return True
             try:
-                if _check_resource_image(client, build_hash):
+                if _runtime_and_overlay_ready(client, runtime_hash):
                     _RESOURCE_IMAGE_READY = True
                     return True
             except Exception as exc:
                 _LOG.warning(
-                    "Failed to re-check for resource image %s: %s. "
-                    "Build it manually: %s",
+                    "Failed to re-check for resource images %s / %s: %s. "
+                    "Build them manually:\n%s",
+                    RUNTIME_IMAGE_TAG,
                     RESOURCE_IMAGE_TAG,
                     exc,
                     RESOURCE_IMAGE_BUILD_CMD,
                 )
                 return False
             try:
-                _LOG.info(
-                    "Resource image %s missing or stale (expected build hash %s) "
-                    "— building from repo sources",
-                    RESOURCE_IMAGE_TAG,
-                    build_hash,
+                # Stage 1 — the workspace runtime base image.
+                if not _check_resource_image(client, runtime_hash, RUNTIME_IMAGE_TAG):
+                    _LOG.info(
+                        "Runtime image %s missing or stale (expected build hash %s) "
+                        "— building from vault sources",
+                        RUNTIME_IMAGE_TAG,
+                        runtime_hash,
+                    )
+                    _, runtime_build_log = client.images.build(
+                        path=runtime_context_dir,
+                        dockerfile="Dockerfile",
+                        tag=RUNTIME_IMAGE_TAG,
+                        rm=True,
+                        labels={RESOURCE_BUILD_HASH_LABEL: runtime_hash},
+                    )
+                    try:
+                        for entry in runtime_build_log:
+                            _LOG.debug("runtime image build: %s", entry)
+                    except Exception:
+                        pass  # noisy build-log stream must never fail the build path
+                runtime_image_id = client.images.get(RUNTIME_IMAGE_TAG).id
+                overlay_hash = compute_git_overlay_build_hash(
+                    VAULT_REQUIREMENTS,
+                    VAULT_RUNTIME_DOCKERFILE,
+                    VAULT_OVERLAY_DOCKERFILE,
+                    runtime_image_id,
                 )
-                _, build_log = client.images.build(
-                    path=context_dir,
-                    dockerfile="Dockerfile",
-                    tag=RESOURCE_IMAGE_TAG,
-                    rm=True,
-                    labels={RESOURCE_BUILD_HASH_LABEL: build_hash},
-                )
+                overlay_context_dir = _prepare_git_overlay_build_context()
+                if overlay_context_dir is None:
+                    return False
                 try:
-                    for entry in build_log:
-                        _LOG.debug("resource image build: %s", entry)
-                except Exception:
-                    pass  # noisy build-log stream must never fail the build path
-                _LOG.info(
-                    "Resource image %s built successfully from repo sources "
-                    "(build hash %s)",
-                    RESOURCE_IMAGE_TAG,
-                    build_hash,
-                )
-                _RESOURCE_IMAGE_READY = True
-                return True
+                    # Stage 2 — the git resource overlay on top of the runtime.
+                    if not _check_resource_image(client, overlay_hash, RESOURCE_IMAGE_TAG):
+                        _LOG.info(
+                            "Resource image %s missing or stale "
+                            "(expected build hash %s) — building overlay on %s",
+                            RESOURCE_IMAGE_TAG,
+                            overlay_hash,
+                            RUNTIME_IMAGE_TAG,
+                        )
+                        _, overlay_build_log = client.images.build(
+                            path=overlay_context_dir,
+                            dockerfile="Dockerfile",
+                            tag=RESOURCE_IMAGE_TAG,
+                            rm=True,
+                            buildargs={"BASE_IMAGE": RUNTIME_IMAGE_TAG},
+                            labels={RESOURCE_BUILD_HASH_LABEL: overlay_hash},
+                        )
+                        try:
+                            for entry in overlay_build_log:
+                                _LOG.debug("resource overlay build: %s", entry)
+                        except Exception:
+                            pass  # noisy build-log stream must never fail the build path
+                    _LOG.info(
+                        "Resource image %s ready (overlay of %s, build hash %s)",
+                        RESOURCE_IMAGE_TAG,
+                        RUNTIME_IMAGE_TAG,
+                        overlay_hash,
+                    )
+                    _RESOURCE_IMAGE_READY = True
+                    return True
+                finally:
+                    shutil.rmtree(overlay_context_dir, ignore_errors=True)
             except Exception as exc:
                 _LOG.warning(
-                    "Failed to build resource image %s from repo sources: %s. "
-                    "Build it manually: %s",
+                    "Failed to build resource image %s from vault sources: %s. "
+                    "Build them manually:\n%s",
                     RESOURCE_IMAGE_TAG,
                     exc,
                     RESOURCE_IMAGE_BUILD_CMD,
@@ -339,14 +619,14 @@ def _ensure_resource_image() -> bool:
     finally:
         # The staged context is consumed by the build (or unneeded on the
         # fast paths); always clean it up.
-        shutil.rmtree(context_dir, ignore_errors=True)
+        shutil.rmtree(runtime_context_dir, ignore_errors=True)
 
 
 def is_resource_image_available() -> bool:
     """True when the ``tm-resource-git`` image exists locally.
 
     Existence-only by design: this is a cheap check for tooling and must not
-    trigger a build. Content correctness (build-hash drift vs the repo
+    trigger a build. Content correctness (build-hash drift vs the current vault
     sources) is ``_ensure_resource_image``'s job — call that when the image
     must actually be used. Shares the cached success state with
     ``_ensure_resource_image``; never raises — returns False when Docker is
@@ -390,7 +670,7 @@ def _resolve_worktree_main_repo(workspace_path, vault_root=None):
         str or None: absolute host path of the main repository, or None.
     """
     if vault_root is None:
-        vault_root = os.path.join(os.path.expanduser("~"), ".thoughtmachine")
+        vault_root = _resolve_vault_root()
 
     dot_git = os.path.join(str(workspace_path), ".git")
     if not os.path.isfile(dot_git):
@@ -489,14 +769,20 @@ class ResourceContainerManager:
             The caller should resolve this from
             ``security_gate.get_expected_container_config``; anything other
             than an explicit grant must stay 'none'.
-        image: Image to run. Default 'tm-resource-git' — auto-built from
-            the repo's pinned sources (``<repo>/requirements.txt`` +
-            ``resources/default_dockerfile.txt``; the trusted code base, not
-            the agent workspace, so the image definition cannot be tampered
-            with). Every auto-built image carries a ``thoughtmachine.build_hash``
-            label so a stale image is rebuilt on drift. Manual fallback::
+        image: Image to run. Default 'tm-resource-git' — the git resource
+            overlay image, auto-built in two stages from the VAULT's pinned
+            sources (``~/.thoughtmachine/docker/resource/``, seeded by
+            bootstrap and agent-write-blocked, so the image definition cannot
+            be tampered with from a workspace): first the workspace runtime
+            base ``tm-workspace-runtime:latest`` from ``requirements.txt`` +
+            ``default_runtime.Dockerfile``, then the overlay from
+            ``git_overlay.Dockerfile`` via
+            ``--build-arg BASE_IMAGE=tm-workspace-runtime:latest``. Every
+            auto-built image carries a ``thoughtmachine.build_hash`` label so
+            a stale image is rebuilt on drift. Manual fallback::
 
-                docker build -t tm-resource-git -f resources/default_dockerfile.txt .
+                docker build -t tm-workspace-runtime:latest -f ~/.thoughtmachine/docker/resource/default_runtime.Dockerfile ~/.thoughtmachine/docker/resource
+                docker build -t tm-resource-git -f ~/.thoughtmachine/docker/resource/git_overlay.Dockerfile --build-arg BASE_IMAGE=tm-workspace-runtime:latest ~/.thoughtmachine/docker/resource
         vault_root: Reserved for future audit/config use; NEVER mounted into
             the container.
         session_config: Optional session config dict; the registry feature
@@ -608,7 +894,7 @@ class ResourceContainerManager:
             str: the container id (full id).
         """
         # The image is required even for the reuse path; auto-build it (from
-        # the repo's unified runtime Dockerfile) when it is missing.
+        # the vault's docker/resource sources) when it is missing.
         if not _ensure_resource_image():
             raise RuntimeError(
                 f"Resource image '{RESOURCE_IMAGE_TAG}' is not available "
@@ -1186,9 +1472,45 @@ def resource_status(name, workspace_id=None, session_permissions=None):
                 "host_fallback",
                 detail="docker unavailable: from_env() returned None",
             )
-        build_hash = compute_resource_build_hash(
-            REPO_REQUIREMENTS, REPO_RUNTIME_DOCKERFILE
+        runtime_hash = compute_resource_build_hash(
+            VAULT_REQUIREMENTS, VAULT_RUNTIME_DOCKERFILE
         )
+        # Probe 1 — the workspace runtime base image.
+        try:
+            runtime_image = client.images.get(RUNTIME_IMAGE_TAG)
+        except ImageNotFound:
+            return ResourceContainerManager._resource_result(
+                "containerized",
+                image=RESOURCE_IMAGE_TAG,
+                detail="runtime image missing/stale — will auto-build on first use",
+            )
+        except Exception as exc:
+            return ResourceContainerManager._resource_result(
+                "host_fallback", detail=f"docker unavailable: {exc}"
+            )
+        runtime_labels = getattr(runtime_image, "labels", None) or {}
+        if runtime_labels.get(RESOURCE_BUILD_HASH_LABEL) != runtime_hash:
+            return ResourceContainerManager._resource_result(
+                "containerized",
+                image=RESOURCE_IMAGE_TAG,
+                detail="runtime image missing/stale — will auto-build on first use",
+            )
+        # Probe 2 — the git resource overlay built on the runtime image.
+        # STRICT: ready only when the overlay's label equals the freshly
+        # computed overlay hash (a legacy unified tm-resource-git labeled with
+        # only the runtime hash is treated as stale).
+        try:
+            overlay_hash = compute_git_overlay_build_hash(
+                VAULT_REQUIREMENTS,
+                VAULT_RUNTIME_DOCKERFILE,
+                VAULT_OVERLAY_DOCKERFILE,
+                getattr(runtime_image, "id", ""),
+            )
+        except OSError as exc:
+            _LOG.warning("Cannot read git overlay build sources: %s", exc)
+            return ResourceContainerManager._resource_result(
+                "host_fallback", detail=f"resource status check failed: {exc}"
+            )
         try:
             image = client.images.get(RESOURCE_IMAGE_TAG)
         except ImageNotFound:
@@ -1202,7 +1524,7 @@ def resource_status(name, workspace_id=None, session_permissions=None):
                 "host_fallback", detail=f"docker unavailable: {exc}"
             )
         labels = getattr(image, "labels", None) or {}
-        if labels.get(RESOURCE_BUILD_HASH_LABEL) != build_hash:
+        if labels.get(RESOURCE_BUILD_HASH_LABEL) != overlay_hash:
             return ResourceContainerManager._resource_result(
                 "containerized",
                 image=RESOURCE_IMAGE_TAG,
@@ -1555,4 +1877,3 @@ def prune_unreferenced_resource_images():
         "remaining_containers": remaining,
         "detail": detail,
     }
-

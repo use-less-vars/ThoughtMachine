@@ -43,8 +43,17 @@ def get_manifest() -> dict:
     return _load_manifest()
 
 
-def _resolve_source(source_name: str) -> Path:
-    """Resolve a manifest source name to an absolute path."""
+def _resolve_source(source_name: str, base: str = "resources") -> Path:
+    """Resolve a manifest source name to an absolute path.
+
+    Args:
+        source_name: File or directory name from the manifest.
+        base: ``"resources"`` (default) resolves under ``resources/``;
+            ``"repo_root"`` resolves under the project root (parent of
+            ``resources/``) — used for files like ``requirements.txt``.
+    """
+    if base == "repo_root":
+        return _resources_dir().parent / source_name
     return _resources_dir() / source_name
 
 
@@ -98,9 +107,11 @@ def ensure_user_defaults(overwrite_existing: bool = False) -> list[str]:
     1. Create the vault compartment structure via ``ensure_vault_structure()``.
     2. Deploy all spec files via ``ensure_vault_defaults()`` (factory defaults,
        provider config, system prompts, registry stubs, etc).
-    2b. Seed the vault-managed unified runtime Dockerfile (single source for
-       both the executor image and the tm-resource-git resource image) via
-       ``ensure_resource_dockerfile()`` (never overwritten).
+    2b. Seed the vault-managed resource-image build files — the authoritative
+       runtime Dockerfile, git overlay Dockerfile, and pinned requirements
+       (single source for both the executor image and the tm-resource-git
+       resource image) via ``ensure_resource_build_files()`` (never
+       overwritten).
     3. Deploy individual resource files from the manifest.
     4. Deploy directories from the manifest (e.g., worker_templates).
     5. Ensure the global knowledge base.
@@ -117,7 +128,7 @@ def ensure_user_defaults(overwrite_existing: bool = False) -> list[str]:
     from thoughtmachine.vault import (
         ensure_vault_structure,
         ensure_vault_defaults,
-        ensure_resource_dockerfile,
+        ensure_resource_build_files,
         vault_root,
     )
     created = ensure_vault_structure()
@@ -125,11 +136,19 @@ def ensure_user_defaults(overwrite_existing: bool = False) -> list[str]:
     # Step 2: Deploy all spec files via vault defaults
     created.extend(ensure_vault_defaults(_resources_dir(), overwrite_existing))
 
-    # Step 2b: Seed the vault-managed unified runtime Dockerfile (single
-    # source for both the executor image and the tm-resource-git resource
-    # image). Hard-coded overwrite_existing=False: an existing vault copy is
-    # a trust anchor and must never be replaced by bootstrap.
-    created.extend(ensure_resource_dockerfile(_resources_dir(), overwrite_existing=False))
+    # Step 2b: Seed the vault-managed resource-image build files — the
+    # authoritative runtime Dockerfile, git overlay Dockerfile, and pinned
+    # requirements.txt (single source for both the executor image and the
+    # tm-resource-git resource image). Hard-coded overwrite_existing=False:
+    # existing vault copies are trust anchors and must never be replaced by
+    # bootstrap.
+    created.extend(
+        ensure_resource_build_files(
+            _resources_dir(),
+            _resources_dir().parent,
+            overwrite_existing=False,
+        )
+    )
 
     # Step 3: Deploy individual files from manifest
     manifest = _load_manifest()
@@ -142,14 +161,14 @@ def ensure_user_defaults(overwrite_existing: bool = False) -> list[str]:
         may_overwrite = overwrite_existing and not entry.get("never_overwrite")
         if dst.exists() and not may_overwrite:
             continue
-        src = _resolve_source(entry["source"])
+        src = _resolve_source(entry["source"], entry.get("base", "resources"))
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(str(src), str(dst))
         created.append(str(dst))
 
     # Step 4: Deploy directories from manifest
     for entry in manifest.get("directories", []):
-        src_dir = _resolve_source(entry["source"])
+        src_dir = _resolve_source(entry["source"], entry.get("base", "resources"))
         dst_dir = _resolve_dest(entry["dest"])
         condition = entry.get("condition", "")
 

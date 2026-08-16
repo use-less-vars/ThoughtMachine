@@ -22,9 +22,16 @@ These tests are marked ``@pytest.mark.docker``. The marker IS registered in
 They are COLLECTED but not run in CI/this audit environment: the module-level
 ``require_docker`` fixture skips the whole module when the daemon is
 unreachable. A real daemon is required for these tests to exercise the actual
-container. The image must be built first::
+container. The image must be built first (two stages, from the VAULT-managed
+build directory)::
 
-    docker build -t tm-resource-git -f resources/default_dockerfile.txt .
+    docker build -t tm-workspace-runtime:latest \
+        -f ~/.thoughtmachine/docker/resource/default_runtime.Dockerfile \
+        ~/.thoughtmachine/docker/resource
+    docker build -t tm-resource-git \
+        -f ~/.thoughtmachine/docker/resource/git_overlay.Dockerfile \
+        --build-arg BASE_IMAGE=tm-workspace-runtime:latest \
+        ~/.thoughtmachine/docker/resource
 
 Conftest note: ``tests/docker_integration/conftest.py`` provides mock-docker
 fixtures for unit tests; this module deliberately does NOT use them — these

@@ -480,8 +480,14 @@ class ContainerRegistry:
         raise RuntimeError(
             f"Resource image '{RESOURCE_IMAGE_TAG}' is not available "
             f"(auto-build failed or Docker unreachable). "
-            f"Build it manually: docker build -t {RESOURCE_IMAGE_TAG} "
-            f"-f resources/default_dockerfile.txt ."
+            f"Build it manually (two stages, vault build sources): "
+            f"docker build -t tm-workspace-runtime:latest -f "
+            f"~/.thoughtmachine/docker/resource/default_runtime.Dockerfile "
+            f"~/.thoughtmachine/docker/resource; then docker build -t "
+            f"tm-resource-git -f "
+            f"~/.thoughtmachine/docker/resource/git_overlay.Dockerfile "
+            f"--build-arg BASE_IMAGE=tm-workspace-runtime:latest "
+            f"~/.thoughtmachine/docker/resource"
         )
 
     def get_containers_for_session(self, session_id) -> list:

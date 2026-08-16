@@ -13,10 +13,15 @@ independent.
 """
 
 import os
+import shutil
+from pathlib import Path
 
 import pytest
 
 import infra.resource_container_manager as rcm
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 try:
     from docker.errors import ImageNotFound
@@ -50,12 +55,14 @@ class _FakeImages:
         present=True,
         image_id="sha256:img-current",
         labels=None,
+        runtime_labels=None,
         get_error=None,
         remove_error=None,
     ):
         self.present = present
         self.image_id = image_id
         self.labels = labels
+        self.runtime_labels = runtime_labels
         self.get_error = get_error
         self.remove_error = remove_error
         self.get_calls = []
@@ -68,6 +75,8 @@ class _FakeImages:
             raise self.get_error
         if not self.present:
             raise ImageNotFound(tag)
+        if tag == rcm.RUNTIME_IMAGE_TAG:
+            return _FakeImage(self.image_id, self.runtime_labels)
         return _FakeImage(self.image_id, self.labels)
 
     def build(self, **kwargs):
@@ -218,9 +227,26 @@ def _reset_image_ready():
     rcm._RESOURCE_IMAGE_READY = False
 
 
+@pytest.fixture(autouse=True)
+def _vault_resource_files(tmp_path, monkeypatch):
+    """Point rcm's VAULT_* build inputs at a tmp vault seeded from the repo
+    seeds (resources/ + requirements.txt). Production reads VAULT_* only —
+    the repo files are seeds. Identical bytes -> identical build hashes."""
+    vault_dir = tmp_path / "docker" / "resource"
+    vault_dir.mkdir(parents=True)
+    shutil.copy2(_REPO_ROOT / "resources" / "default_dockerfile.txt", vault_dir / "default_runtime.Dockerfile")
+    shutil.copy2(_REPO_ROOT / "resources" / "git_resource_overlay_dockerfile.txt", vault_dir / "git_overlay.Dockerfile")
+    shutil.copy2(_REPO_ROOT / "requirements.txt", vault_dir / "requirements.txt")
+    monkeypatch.setattr(rcm, "VAULT_RESOURCE_DIR", str(vault_dir))
+    monkeypatch.setattr(rcm, "VAULT_REQUIREMENTS", str(vault_dir / "requirements.txt"))
+    monkeypatch.setattr(rcm, "VAULT_RUNTIME_DOCKERFILE", str(vault_dir / "default_runtime.Dockerfile"))
+    monkeypatch.setattr(rcm, "VAULT_OVERLAY_DOCKERFILE", str(vault_dir / "git_overlay.Dockerfile"))
+    yield vault_dir
+
+
 def _repo_build_hash():
     return rcm.compute_resource_build_hash(
-        rcm.REPO_REQUIREMENTS, rcm.REPO_RUNTIME_DOCKERFILE
+        rcm.VAULT_REQUIREMENTS, rcm.VAULT_RUNTIME_DOCKERFILE
     )
 
 
@@ -232,11 +258,23 @@ def _labels_for(workspace_id, kind="git", name="tm-res-abc-git"):
     }
 
 
+def _overlay_build_hash(runtime_image_id="sha256:img-current"):
+    return rcm.compute_git_overlay_build_hash(
+        rcm.VAULT_REQUIREMENTS,
+        rcm.VAULT_RUNTIME_DOCKERFILE,
+        rcm.VAULT_OVERLAY_DOCKERFILE,
+        runtime_image_id,
+    )
+
+
 def _fresh_images(image_id="sha256:img-current", get_error=None):
     return _FakeImages(
         present=True,
         image_id=image_id,
-        labels={rcm.RESOURCE_BUILD_HASH_LABEL: _repo_build_hash()},
+        # tm-resource-git (the overlay) is labeled with the overlay build hash…
+        labels={rcm.RESOURCE_BUILD_HASH_LABEL: _overlay_build_hash(image_id)},
+        # …while tm-workspace-runtime:latest carries the runtime build hash.
+        runtime_labels={rcm.RESOURCE_BUILD_HASH_LABEL: _repo_build_hash()},
         get_error=get_error,
     )
 
@@ -668,4 +706,3 @@ def test_resource_container_run_command_is_tail_dev_null(monkeypatch, tmp_path):
     assert len(containers.run_calls) == 1
     kwargs = containers.run_calls[0]
     assert kwargs["command"] == ["tail", "-f", "/dev/null"]
-

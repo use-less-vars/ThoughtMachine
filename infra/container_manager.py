@@ -1142,14 +1142,17 @@ class ContainerManager:
 
         # Build-drift gate: reuse an existing image whose
         # thoughtmachine.build_hash label still matches the current build
-        # sources (repo requirements.txt + resources/default_dockerfile.txt);
-        # otherwise rebuild with the fresh hash recorded as the label.
+        # sources — the vault-managed workspace Dockerfile (build context) plus
+        # the executor build sources resolved via docker_executor; otherwise
+        # rebuild with the fresh hash recorded as the label.
         try:
             build_hash = dex.compute_executor_build_hash()
         except OSError as e:
             raise RuntimeError(
-                f"Cannot read executor build sources ({e}); "
-                "requirements.txt and resources/default_dockerfile.txt must exist."
+                f"Cannot read executor build sources ({e}); the vault-managed "
+                "workspace Dockerfile and the executor build sources "
+                "(requirements.txt + default Dockerfile, via docker_executor) "
+                "must exist."
             ) from e
         try:
             existing = self.client.images.get(tag)

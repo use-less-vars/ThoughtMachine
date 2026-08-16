@@ -1,6 +1,6 @@
 {
   "version": "1",
-  "description": "Resource deployment manifest for ThoughtMachine — documents every file that bootstrap.py deploys from resources/ to the user's ~/.thoughtmachine/ directory.",
+  "description": "Resource deployment manifest for ThoughtMachine — documents every file that bootstrap.py deploys from resources/ (and the repo root) to the user's ~/.thoughtmachine/ directory. The vault's docker/resource/ build files are AUTHORITATIVE for resource-image auto-builds (see infra/resource_container_manager.py).",
   "files": [
     {
       "source": "default_system_prompt.txt",
@@ -40,8 +40,21 @@
     },
     {
       "source": "default_dockerfile.txt",
-      "dest": "docker/resource/Dockerfile",
-      "description": "Unified runtime Dockerfile — single source for both the executor image and the tm-resource-git resource image — deployed to the vault (~/.thoughtmachine/docker/resource/) as a manual-build fallback so the image definition is NOT agent-writable; never overwritten once present",
+      "dest": "docker/resource/default_runtime.Dockerfile",
+      "description": "Unified runtime Dockerfile — single source for both the executor image and the tm-resource-git resource image — deployed to the vault (~/.thoughtmachine/docker/resource/) where it is AUTHORITATIVE for auto-builds; agent-write-blocked; never overwritten once present",
+      "never_overwrite": true
+    },
+    {
+      "source": "git_resource_overlay_dockerfile.txt",
+      "dest": "docker/resource/git_overlay.Dockerfile",
+      "description": "Git overlay Dockerfile (ARG BASE_IMAGE + FROM ${BASE_IMAGE} + apt git/ca-certificates/curl) — stage 2 of the resource-image build; vault copy is authoritative; never overwritten once present",
+      "never_overwrite": true
+    },
+    {
+      "source": "requirements.txt",
+      "dest": "docker/resource/requirements.txt",
+      "description": "Pinned Python requirements for the resource runtime image — sourced from the repository root; vault copy is authoritative; never overwritten once present",
+      "base": "repo_root",
       "never_overwrite": true
     }
   ],
@@ -56,6 +69,7 @@
   "notes": [
     "Global knowledge base (resources/global_kb/*.md → ~/.thoughtmachine/knowledge/system/) is handled separately by agent/knowledge/global_kb.py::ensure_global_kb()",
     "User subdirectory structure (~/.thoughtmachine/sessions/, state/, knowledge/) is created by bootstrap.py::ensure_user_defaults()",
-    "This manifest is the single source of truth for resource deployment. The RESOURCE_MAP dict in bootstrap.py is derived from this file."
+    "This manifest is the single source of truth for resource deployment. The RESOURCE_MAP dict in bootstrap.py is derived from this file.",
+    "The vault's docker/resource/ directory holds 3 authoritative build files (default_runtime.Dockerfile, git_overlay.Dockerfile, requirements.txt), all never_overwrite. A legacy vault copy at docker/resource/Dockerfile (pre-provenance layout) is promoted into default_runtime.Dockerfile on bootstrap."
   ]
 }
