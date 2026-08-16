@@ -135,6 +135,22 @@ async def resolve_workspace_path(body: ResolvePathBody) -> Dict[str, Any]:
 
         entry = registry.register_by_root(confined)
         if entry:
+            # Best-effort provisioning of the hidden git resource container.
+            # NEVER fatal: a missing docker daemon or a failed provision must
+            # not break the resolve endpoint.
+            try:
+                from infra.resource_container_manager import (
+                    provision_workspace_resource,
+                )
+
+                provision_workspace_resource(entry.id, entry.root_path)
+            except Exception as exc:
+                logger.warning(
+                    "resolve_workspace_path: resource provisioning failed for "
+                    "workspace %s: %s",
+                    entry.id,
+                    exc,
+                )
             return {"workspace_id": entry.id, "root": entry.root_path}
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

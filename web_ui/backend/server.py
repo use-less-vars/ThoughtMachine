@@ -267,6 +267,48 @@ def _migrate_old_workspaces() -> int:
 # We import bridge lazily inside the lifespan / endpoint to avoid
 # circular / early import issues.
 
+
+def _sweep_orphan_resource_containers():
+    """Startup sweep: remove resource containers of unregistered workspaces.
+
+    Best-effort and unit-testable; NEVER raises — a broken docker daemon or a
+    failing sweep must not prevent the server from starting.  Removes hidden
+    git resource containers (``thoughtmachine.resource`` label) whose
+    ``thoughtmachine.workspace_id`` is no longer registered, then prunes the
+    shared resource image once no resource container remains anywhere.
+    """
+    try:
+        from infra.resource_container_manager import (
+            prune_unreferenced_resource_images,
+            sweep_stale_resource_containers,
+        )
+
+        try:
+            registry = WorkspaceRegistry.get_default()
+            ids = [e.id for e in registry.list_workspaces()]
+        except Exception as exc:
+            log('WARNING', 'server',
+                f'Startup sweep: could not list registered workspaces: {exc}')
+            ids = []
+
+        result = sweep_stale_resource_containers(ids)
+        detail = result.get("detail") or ""
+        log('INFO', 'server',
+            f'Startup sweep: removed {result.get("removed", 0)} orphan '
+            f'resource container(s), kept {result.get("skipped_in_use", 0)} '
+            f'in use' + (f' — {detail}' if detail else ''))
+
+        prune_result = prune_unreferenced_resource_images()
+        prune_detail = prune_result.get("detail") or ""
+        log('INFO', 'server',
+            f'Startup sweep: pruned images '
+            f'{prune_result.get("removed_images", [])}, '
+            f'{prune_result.get("remaining_containers", 0)} resource '
+            f'container(s) remaining' + (f' — {prune_detail}' if prune_detail else ''))
+    except Exception as exc:
+        log('WARNING', 'server', f'Startup resource sweep skipped: {exc}')
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan handler — registers signal handlers for graceful shutdown."""
@@ -352,12 +394,12 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log('DEBUG', 'server', f'Startup container scan skipped: {exc}')
 
-    # ── Startup stale-session container prune: REMOVED (Phase 3) ─────────
-    # Containers are now WORKSPACE-scoped (thoughtmachine.workspace_id label)
-    # and survive session close, so there is nothing to prune on startup.
-    # Workspace-scoped containers are swept by cleanup_workspace() when a
-    # workspace is decommissioned; no startup pass runs here.
-    pass
+    # ── Startup orphan resource-container sweep ──────────────────────────
+    # Remove hidden git resource containers (thoughtmachine.resource label)
+    # whose workspace is no longer registered, then prune the shared resource
+    # image once no resource container remains anywhere. Best-effort: a
+    # failing sweep must never break startup.
+    _sweep_orphan_resource_containers()
 
     yield
     log('INFO', 'server', 'Server shutting down.')

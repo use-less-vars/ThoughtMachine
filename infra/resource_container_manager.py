@@ -1472,3 +1472,138 @@ def sweep_stale_resource_containers(registered_workspace_ids):
             skipped += 1
     return {"removed": removed, "skipped_in_use": skipped, "detail": detail}
 
+
+def provision_workspace_resource(workspace_id, workspace_path, session_permissions=None):
+    """Provision the hidden git resource container for a workspace (best-effort).
+
+    Thin lifecycle wrapper used by registration call-sites (the resolve-path
+    endpoint, setup_workspace, ...): resolves the graded network mode via
+    ``security_gate.get_expected_container_config`` (anything other than an
+    explicit ``bridge`` grant stays ``'none'``), builds a
+    :class:`ResourceContainerManager` for the workspace and calls
+    ``ensure_resource('git')``.
+
+    NEVER raises: any failure (docker SDK absent, daemon unreachable, policy
+    deny, ...) is logged via ``_LOG`` and reported as a structured
+    ``{"mode": "unavailable", "detail": ...}`` result so callers can keep
+    serving without the resource.
+
+    Args:
+        workspace_id: The workspace id the resource container is scoped to.
+        workspace_path: Host path of the workspace root.
+        session_permissions: Optional session/workspace permissions dict used
+            to resolve the network mode; ``None`` yields ``'none'``.
+
+    Returns:
+        dict: ``ensure_resource('git')`` result (normally with ``mode``
+        ``'containerized'``), or ``{"mode": "unavailable", "detail": str}``
+        on any failure.
+    """
+    network_mode = "none"
+    try:
+        from security.security_gate import get_expected_container_config
+
+        config = get_expected_container_config(session_permissions or {})
+        resolved = config.get("network_mode")
+        if resolved in ("bridge", "none"):
+            network_mode = resolved
+    except Exception as exc:
+        _LOG.warning(
+            "provision_workspace_resource: could not resolve network mode for "
+            "workspace %s (defaulting to 'none'): %s",
+            workspace_id,
+            exc,
+        )
+    try:
+        manager = ResourceContainerManager(
+            workspace_id,
+            workspace_path,
+            network_mode=network_mode,
+            image=RESOURCE_IMAGE_TAG,
+            vault_root=os.path.join(os.path.expanduser("~"), ".thoughtmachine"),
+            session_config={},
+            session_id=None,
+            session_permissions=session_permissions,
+        )
+        return manager.ensure_resource("git")
+    except Exception as exc:
+        _LOG.warning(
+            "provision_workspace_resource: failed to provision git resource "
+            "for workspace %s: %s",
+            workspace_id,
+            exc,
+        )
+        return {"mode": "unavailable", "detail": str(exc)}
+
+
+def prune_unreferenced_resource_images():
+    """Prune the shared resource image once no resource container remains.
+
+    Lists every container carrying the ``thoughtmachine.resource`` label.  When
+    NONE remain anywhere (i.e. every workspace was decommissioned or swept),
+    the shared ``RESOURCE_IMAGE_TAG`` image is removed if it exists and the
+    module-level ``_RESOURCE_IMAGE_READY`` cache is reset so the image is
+    re-built on demand.  When resource containers still exist the image is
+    deliberately KEPT (it is shared, not per-workspace).
+
+    NEVER raises — failures are collected into ``detail``.
+
+    Returns:
+        dict: ``{"removed_images": list, "remaining_containers": int,
+        "detail": str}``.  When the docker SDK is unavailable or the daemon
+        cannot be reached, ``{"removed_images": [], "remaining_containers": 0,
+        "detail": "docker unavailable"}``.
+    """
+    global _RESOURCE_IMAGE_READY
+    removed_images = []
+    detail = ""
+    if docker is None:
+        return {
+            "removed_images": [],
+            "remaining_containers": 0,
+            "detail": "docker unavailable",
+        }
+    try:
+        client = docker.from_env()
+    except Exception as exc:
+        return {
+            "removed_images": [],
+            "remaining_containers": 0,
+            "detail": "docker unavailable",
+        }
+    try:
+        containers = client.containers.list(
+            all=True,
+            filters={"label": ResourceContainerManager.RESOURCE_LABEL},
+        )
+    except Exception as exc:
+        return {
+            "removed_images": [],
+            "remaining_containers": 0,
+            "detail": f"failed to list resource containers: {exc}",
+        }
+    remaining = len(containers)
+    if remaining == 0:
+        try:
+            client.images.get(RESOURCE_IMAGE_TAG)
+            try:
+                client.images.remove(RESOURCE_IMAGE_TAG, force=True)
+                removed_images.append(RESOURCE_IMAGE_TAG)
+                _RESOURCE_IMAGE_READY = False
+            except Exception as exc:
+                detail = _join_detail(
+                    detail, f"failed to remove resource image: {exc}"
+                )
+        except Exception as exc:
+            # Image missing (or probe failed) — nothing to remove.
+            detail = _join_detail(detail, f"resource image not present: {exc}")
+    else:
+        detail = _join_detail(
+            detail, f"{remaining} resource container(s) still in use — image kept"
+        )
+    return {
+        "removed_images": removed_images,
+        "remaining_containers": remaining,
+        "detail": detail,
+    }
+

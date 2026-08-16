@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # Add project root to sys.path so thoughtmachine modules are importable
 _PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
@@ -63,6 +66,22 @@ def main() -> None:
     human_id = entry.id
     print(f"Workspace ID: {human_id}")
     print(f"  Root path:  {root_path}")
+
+    # Best-effort provisioning of the hidden git resource container.  NEVER
+    # fatal: a missing docker daemon or a failed provision must not break
+    # workspace setup.
+    try:
+        from infra.resource_container_manager import (
+            provision_workspace_resource,
+        )
+
+        provision_workspace_resource(entry.id, entry.root_path)
+    except Exception as exc:
+        logger.warning(
+            "setup_workspace: resource provisioning failed for workspace %s: %s",
+            entry.id,
+            exc,
+        )
 
     # 2. Create workspace directory
     ws_dir = Path.home() / ".thoughtmachine" / "workspaces" / human_id
