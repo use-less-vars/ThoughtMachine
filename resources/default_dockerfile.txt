@@ -1,7 +1,12 @@
 FROM python:3.11-slim
 RUN useradd -m -s /bin/bash agent
-USER agent
 WORKDIR /workspace
-COPY . .
-RUN pip install --no-cache-dir -r requirements.txt || true
+# requirements.txt is copied into the build context by ContainerManager.build_image
+# (and DockerExecutor._build_image); install as root so deps land in system
+# site-packages (a runtime volume mounted at /home/agent/.local would shadow
+# any --user install). No `|| true`: a failed install must fail the build.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+RUN python -c "import fastapi, pytest, starlette, uvicorn; print('web deps OK')"
+USER agent
 CMD ["python", "main.py"]

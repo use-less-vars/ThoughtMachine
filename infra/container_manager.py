@@ -1097,10 +1097,12 @@ class ContainerManager:
         Vault-gated: always builds from the vault-managed ``<workspace>/Dockerfile``
         (resolved from ``<vault_root>/workspaces/<workspace_id>/Dockerfile``,
         falling back to ``<workspace_path>/Dockerfile`` — no ``dockerfile_path``
-        override). The build context contains ONLY that Dockerfile: it is copied
-        into a temporary build directory, so the workspace tree is NOT part of
-        the build context and ``COPY .`` cannot read workspace files. The build
-        runs synchronously and its output is returned (not just a bool).
+        override). The build context contains the Dockerfile plus
+        ``requirements.txt`` when one is present (vault workspace dir first,
+        then workspace root): both are copied into a temporary build directory,
+        so the rest of the workspace tree is NOT part of the build context and
+        ``COPY .`` cannot read workspace files. The build runs synchronously
+        and its output is returned (not just a bool).
 
         Args:
             tag: Image tag; auto-generated from the workspace path (the same
@@ -1139,11 +1141,20 @@ class ContainerManager:
             tag = dex._compute_image_tag(ws)
 
         try:
-            # SECURITY: the build context contains ONLY the vault Dockerfile.
-            # It is copied into a temporary build directory so the workspace
-            # tree is never part of the build context (no COPY . exfiltration).
+            # SECURITY: the build context contains ONLY the vault Dockerfile
+            # (plus requirements.txt when present — needed by the image defs
+            # that `COPY requirements.txt` before pip install). It is copied
+            # into a temporary build directory so the workspace tree is never
+            # part of the build context (no COPY . exfiltration).
             with tempfile.TemporaryDirectory(prefix="tm_build_") as tmpdir:
                 shutil.copy2(str(vault_dockerfile), os.path.join(tmpdir, "Dockerfile"))
+                req_vault = (
+                    Path(self.vault_root) / "workspaces" / str(self.workspace_id) / "requirements.txt"
+                )
+                req_ws = Path(ws) / "requirements.txt"
+                req_src = req_vault if req_vault.exists() else (req_ws if req_ws.exists() else None)
+                if req_src is not None:
+                    shutil.copy2(str(req_src), os.path.join(tmpdir, "requirements.txt"))
                 _, log_lines = dex._run_image_build(
                     self.client, tmpdir, "Dockerfile", tag
                 )
