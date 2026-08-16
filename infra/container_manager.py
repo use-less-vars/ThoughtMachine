@@ -1140,6 +1140,32 @@ class ContainerManager:
         if not tag:
             tag = dex._compute_image_tag(ws)
 
+        # Build-drift gate: reuse an existing image whose
+        # thoughtmachine.build_hash label still matches the current build
+        # sources (repo requirements.txt + resources/default_dockerfile.txt);
+        # otherwise rebuild with the fresh hash recorded as the label.
+        try:
+            build_hash = dex.compute_executor_build_hash()
+        except OSError as e:
+            raise RuntimeError(
+                f"Cannot read executor build sources ({e}); "
+                "requirements.txt and resources/default_dockerfile.txt must exist."
+            ) from e
+        try:
+            existing = self.client.images.get(tag)
+        except ImageNotFound:
+            existing = None
+        if existing is not None and (
+            (getattr(existing, "labels", None) or {}).get(dex.EXECUTOR_BUILD_HASH_LABEL)
+            == build_hash
+        ):
+            log("INFO", "docker.container_manager",
+                f"Image {tag} already matches build sources \u2014 skipping build")
+            return {"image_tag": tag, "build_log": ""}
+        if existing is not None:
+            log("INFO", "docker.container_manager",
+                f"Image {tag} build sources drifted (label mismatch) \u2014 rebuilding")
+
         try:
             # SECURITY: the build context contains ONLY the vault Dockerfile
             # (plus requirements.txt when present — needed by the image defs
@@ -1155,8 +1181,14 @@ class ContainerManager:
                 req_src = req_vault if req_vault.exists() else (req_ws if req_ws.exists() else None)
                 if req_src is not None:
                     shutil.copy2(str(req_src), os.path.join(tmpdir, "requirements.txt"))
+                staged = set(os.listdir(tmpdir))
+                if not staged <= {"Dockerfile", "requirements.txt"}:
+                    raise RuntimeError(
+                        f"Unexpected files staged in build context: {sorted(staged)}"
+                    )
                 _, log_lines = dex._run_image_build(
-                    self.client, tmpdir, "Dockerfile", tag
+                    self.client, tmpdir, "Dockerfile", tag,
+                    labels={dex.EXECUTOR_BUILD_HASH_LABEL: build_hash},
                 )
         except RuntimeError:
             raise

@@ -46,6 +46,45 @@ _build_log_cache: dict[str, str] = {}
 _build_log_cache_lock = threading.Lock()
 _build_in_progress: bool = False
 
+# ── Executor build-drift tracking ─────────────────────────────────────
+# Every executor image is labeled with a content hash of its build
+# sources (repo requirements.txt + resources/default_dockerfile.txt) so an
+# existing image is reused unless those sources actually changed. The
+# algorithm is identical to infra/resource_container_manager.py so the two
+# systems' hashes are comparable.
+EXECUTOR_BUILD_HASH_LABEL = "thoughtmachine.build_hash"
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+EXECUTOR_REQUIREMENTS = os.path.join(_REPO_ROOT, "requirements.txt")
+EXECUTOR_RUNTIME_DOCKERFILE = os.path.join(_REPO_ROOT, "resources", "default_dockerfile.txt")
+
+
+def _hash_executor_build_bytes(req_b: bytes, df_b: bytes) -> str:
+    """Hash executor build sources (same algorithm as resource_container_manager)."""
+    return hashlib.sha256(req_b + b"\n" + df_b).hexdigest()
+
+
+def compute_executor_build_hash(requirements_path=None, dockerfile_path=None) -> str:
+    """Compute the content hash of the executor image build sources.
+
+    Args:
+        requirements_path: path to requirements.txt (defaults to the repo one).
+        dockerfile_path: path to the runtime Dockerfile (defaults to the repo one).
+
+    Returns:
+        sha256 hex digest of ``requirements_bytes + b"\n" + dockerfile_bytes``.
+
+    Raises:
+        OSError: If either source file is missing or unreadable.
+    """
+    req_path = requirements_path or EXECUTOR_REQUIREMENTS
+    df_path = dockerfile_path or EXECUTOR_RUNTIME_DOCKERFILE
+    with open(req_path, "rb") as f:
+        req_b = f.read()
+    with open(df_path, "rb") as f:
+        df_b = f.read()
+    return _hash_executor_build_bytes(req_b, df_b)
+
+
 def _compute_image_tag(workspace_path: str) -> str:
     """Derive a deterministic Docker image tag from the workspace path.
 
@@ -56,7 +95,7 @@ def _compute_image_tag(workspace_path: str) -> str:
     return f"agent-executor-{path_hash}"
 
 
-def _run_image_build(client, build_path, dockerfile, tag, nocache=False, on_line=None):
+def _run_image_build(client, build_path, dockerfile, tag, nocache=False, on_line=None, labels=None):
     """Run ``client.api.build`` over a host directory, streaming log lines.
 
     Shared by :meth:`DockerExecutor._build_image` and
@@ -70,6 +109,9 @@ def _run_image_build(client, build_path, dockerfile, tag, nocache=False, on_line
         tag: image tag for the built image.
         nocache: if True, bypass the Docker layer cache.
         on_line: optional callback invoked with each non-empty log line.
+        labels: optional dict of labels applied to the built image (e.g.
+            ``{EXECUTOR_BUILD_HASH_LABEL: hash}``); only passed to the
+            daemon when not None.
 
     Returns:
         (image_id, log_lines) where log_lines is the list of non-empty
@@ -82,7 +124,7 @@ def _run_image_build(client, build_path, dockerfile, tag, nocache=False, on_line
     log_lines: list[str] = []
     image_id = None
     try:
-        build_logs = client.api.build(
+        build_kwargs = dict(
             path=build_path,
             dockerfile=dockerfile,
             tag=tag,
@@ -91,6 +133,9 @@ def _run_image_build(client, build_path, dockerfile, tag, nocache=False, on_line
             nocache=nocache,
             decode=True,
         )
+        if labels is not None:
+            build_kwargs["labels"] = labels
+        build_logs = client.api.build(**build_kwargs)
         for chunk in build_logs:
             if "stream" in chunk:
                 line = chunk["stream"].strip()
@@ -726,11 +771,15 @@ class DockerExecutor:
         
         return exit_code, output
     def _ensure_image(self, verbose_build=False):
-        """Build Docker image if it doesn't exist locally or force_rebuild is True.
-        
+        """Build Docker image if it doesn't exist locally, is stale, or force_rebuild is True.
+
+        An existing image is reused only when its ``EXECUTOR_BUILD_HASH_LABEL``
+        label matches the current build-source hash; a missing or mismatched
+        label means the build sources drifted and the image is rebuilt.
+
         Args:
             verbose_build: If True, log build output summary on success.
-        
+
         Returns:
             The Docker image object.
         """
@@ -740,9 +789,22 @@ class DockerExecutor:
             return image
         try:
             image = self.client.images.get(self.image)
-            return image
         except docker.errors.ImageNotFound:
-            pass
+            image = None
+        if image is not None:
+            try:
+                build_hash = compute_executor_build_hash()
+            except OSError as e:
+                log("WARNING", "tools.docker_executor.image",
+                    f"Cannot read executor build sources ({e}) \u2014 reusing existing image")
+                return image
+            labels = getattr(image, "labels", None) or {}
+            if labels.get(EXECUTOR_BUILD_HASH_LABEL) == build_hash:
+                return image
+            log("INFO", "tools.docker_executor.image",
+                f"Image {self.image} build sources drifted (label mismatch) \u2014 rebuilding")
+            image, _ = self._build_image(verbose_build=verbose_build)
+            return image
         image, _ = self._build_image(verbose_build=verbose_build)
         return image
 
@@ -770,6 +832,14 @@ class DockerExecutor:
 
         global _build_in_progress
         _build_in_progress = True
+
+        try:
+            build_hash = compute_executor_build_hash()
+        except OSError as e:
+            raise RuntimeError(
+                f"Cannot read executor build sources ({e}); "
+                "requirements.txt and resources/default_dockerfile.txt must exist."
+            ) from e
 
         # Compute container_name for cache key alignment with get_container_status
         normalised = self.workspace_path.replace("\\", "/")
@@ -809,6 +879,13 @@ class DockerExecutor:
             with open(req_path, "w") as f:
                 f.write(result.stdout)
 
+            # 2b. Guard: the build context must contain only the staged files
+            staged = set(os.listdir(tmpdir))
+            if not staged <= {"Dockerfile", "requirements.txt"}:
+                raise RuntimeError(
+                    f"Unexpected files staged in build context: {sorted(staged)}"
+                )
+
             # 3. Build Docker image from temp context
             log('DEBUG', 'tools.docker_executor.build',
                 f"Building Docker image {self.image} from temp context {tmpdir}")
@@ -829,6 +906,7 @@ class DockerExecutor:
             image_id, _ = _run_image_build(
                 self.client, tmpdir, "Dockerfile", self.image,
                 nocache=nocache, on_line=_stream_line,
+                labels={EXECUTOR_BUILD_HASH_LABEL: build_hash},
             )
 
         except RuntimeError:

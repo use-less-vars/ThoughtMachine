@@ -49,11 +49,21 @@ def mock_container() -> MagicMock:
 
 @pytest.fixture
 def mock_docker(mock_container: MagicMock) -> MagicMock:
-    """Mock ``docker.from_env()`` returning a client that yields ``mock_container``."""
+    """Mock ``docker.from_env()`` returning a client that yields ``mock_container``.
+
+    ``images.get`` returns an image whose ``thoughtmachine.build_hash`` label
+    matches the CURRENT executor build sources, so ``_ensure_image`` reuses it
+    instead of triggering a drift rebuild (which would need a real vault
+    Dockerfile).
+    """
+    from docker_executor import EXECUTOR_BUILD_HASH_LABEL, compute_executor_build_hash
+
     client = MagicMock()
     client.containers.get.return_value = mock_container
     client.containers.run.return_value = mock_container
-    client.images.get.return_value = MagicMock()
+    img = MagicMock()
+    img.labels = {EXECUTOR_BUILD_HASH_LABEL: compute_executor_build_hash()}
+    client.images.get.return_value = img
     client.api.build.return_value = []
     return client
 
