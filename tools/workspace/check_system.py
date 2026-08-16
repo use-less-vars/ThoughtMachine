@@ -652,8 +652,17 @@ class CheckSystem(ToolBase):
 
         # Surface the effective git execution mode (containerized vs
         # host_fallback) using the same resolution as GitInfoTool.
-        if GIT_MODE_RESOLVER_AVAILABLE and resolve_git_execution_mode:
-            result["git"]["mode"] = resolve_git_execution_mode(
+        # The module-level import can fail during a circular-import window
+        # (e.g. when security_gate is imported before check_system), so retry
+        # the import lazily here at call time.
+        resolver = resolve_git_execution_mode if GIT_MODE_RESOLVER_AVAILABLE else None
+        if resolver is None:
+            try:
+                from tools.git_info_tool import resolve_git_execution_mode as resolver
+            except Exception:
+                resolver = None
+        if resolver is not None:
+            result["git"]["mode"] = resolver(
                 dict(self.agent_config) if self.agent_config else {},
                 self._workspace_metadata(),
                 ws_path or getattr(self, "workspace_path", None),
