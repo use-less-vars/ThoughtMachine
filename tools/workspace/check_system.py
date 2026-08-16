@@ -647,6 +647,7 @@ class CheckSystem(ToolBase):
             "os": None,
             "token_limits": {},
             "git": {"mode": "unavailable"},
+            "resources": {},
         }
 
         # Surface the effective git execution mode (containerized vs
@@ -658,6 +659,40 @@ class CheckSystem(ToolBase):
                 ws_path or getattr(self, "workspace_path", None),
                 ws_id,
             )
+
+        # Probe the ACTUAL hidden-resource state (read-only; never builds or
+        # creates containers). The live probe overrides the static resolver
+        # default so the surfaced mode matches what git execution would do.
+        try:
+            from infra.resource_container_manager import resource_status
+        except Exception:
+            resource_status = None
+        if callable(resource_status):
+            try:
+                probe = resource_status(
+                    "git",
+                    workspace_id=ws_id,
+                    session_permissions=getattr(self, "session_permissions", None),
+                )
+            except Exception:
+                probe = None
+            if isinstance(probe, dict) and probe.get("mode") in ("containerized", "host_fallback"):
+                result["git"]["mode"] = probe.get("mode")
+                result["resources"]["git"] = probe
+            elif isinstance(probe, dict):
+                # 'unavailable' (unknown resource / policy-denied): keep the
+                # resolver value; still surface the raw probe payload.
+                result["resources"]["git"] = probe
+            else:
+                result["resources"]["git"] = {
+                    "mode": result["git"]["mode"],
+                    "detail": "probe unavailable",
+                }
+        else:
+            result["resources"]["git"] = {
+                "mode": result["git"]["mode"],
+                "detail": "probe unavailable",
+            }
 
         # Try to get from agent_config first
         if self.agent_config:

@@ -349,18 +349,132 @@ class TestCheckSystemGitMode:
             object.__setattr__(tool, "workspace_path", workspace_path)
         return tool
 
-    def test_container_mode_surfaced(self, tmp_path):
+    @staticmethod
+    def _probe(monkeypatch, result):
+        """Replace the module-level resource_status with a fixed return value.
+
+        The capabilities query imports ``resource_status`` lazily at call
+        time, so patching the ``infra.resource_container_manager`` module
+        attribute is sufficient. Returns the list of (resource, kwargs) calls
+        for assertion.
+        """
+        calls = []
+
+        def _fake_resource_status(resource, **kwargs):
+            calls.append((resource, kwargs))
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        monkeypatch.setattr(
+            "infra.resource_container_manager.resource_status",
+            _fake_resource_status,
+        )
+        return calls
+
+    def test_container_mode_surfaced(self, tmp_path, monkeypatch):
+        self._probe(
+            monkeypatch,
+            {
+                "mode": "containerized",
+                "container_id": "c1",
+                "status": "running",
+                "image": "tm-resource-git",
+                "detail": "",
+            },
+        )
         result = self._make(
             {"git_execution_mode": "container"}, str(tmp_path)
         )._query_capabilities("ws-1", str(tmp_path))
         assert result["git"]["mode"] == "containerized"
+        assert result["resources"]["git"]["container_id"] == "c1"
+        assert result["resources"]["git"]["image"] == "tm-resource-git"
 
-    def test_host_mode_surfaced(self, tmp_path):
+    def test_host_mode_surfaced(self, tmp_path, monkeypatch):
+        self._probe(
+            monkeypatch,
+            {
+                "mode": "host_fallback",
+                "container_id": None,
+                "status": None,
+                "image": None,
+                "detail": "resource image unavailable",
+            },
+        )
         result = self._make(
             {"git_execution_mode": "host"}, str(tmp_path)
         )._query_capabilities("ws-1", str(tmp_path))
         assert result["git"]["mode"] == "host_fallback"
+        assert result["resources"]["git"]["detail"] == "resource image unavailable"
 
-    def test_unavailable_without_workspace(self, tmp_path):
+    def test_unavailable_without_workspace(self, tmp_path, monkeypatch):
+        self._probe(
+            monkeypatch,
+            {"mode": "unavailable", "detail": "unknown resource 'git'"},
+        )
         result = self._make({}, None)._query_capabilities(None, None)
         assert result["git"]["mode"] == "unavailable"
+        assert result["resources"]["git"]["mode"] == "unavailable"
+
+    def test_probe_exception_keeps_resolver_value(self, tmp_path, monkeypatch):
+        self._probe(monkeypatch, RuntimeError("probe exploded"))
+        result = self._make(
+            {"git_execution_mode": "host"}, str(tmp_path)
+        )._query_capabilities("ws-1", str(tmp_path))
+        assert result["git"]["mode"] == "host_fallback"
+        assert result["resources"]["git"] == {
+            "mode": "host_fallback",
+            "detail": "probe unavailable",
+        }
+
+    def test_probe_unavailable_keeps_resolver_containerized(self, tmp_path, monkeypatch):
+        self._probe(
+            monkeypatch,
+            {"mode": "unavailable", "detail": "resource policy denied"},
+        )
+        result = self._make(
+            {"git_execution_mode": "container"}, str(tmp_path)
+        )._query_capabilities("ws-1", str(tmp_path))
+        assert result["git"]["mode"] == "containerized"
+        assert result["resources"]["git"] == {
+            "mode": "unavailable",
+            "detail": "resource policy denied",
+        }
+
+    def test_no_workspace_id_probe_containerized(self, monkeypatch):
+        calls = self._probe(
+            monkeypatch,
+            {
+                "mode": "containerized",
+                "container_id": None,
+                "status": None,
+                "image": "tm-resource-git",
+                "detail": "container state unknown (no workspace_id)",
+            },
+        )
+        result = self._make({}, None)._query_capabilities(None, None)
+        assert result["git"]["mode"] == "containerized"
+        assert (
+            result["resources"]["git"]["detail"]
+            == "container state unknown (no workspace_id)"
+        )
+        assert calls and calls[0][1].get("workspace_id") is None
+
+    def test_probe_receives_workspace_id_and_session_permissions(self, tmp_path, monkeypatch):
+        calls = self._probe(
+            monkeypatch,
+            {
+                "mode": "containerized",
+                "container_id": "c1",
+                "status": "running",
+                "image": "tm-resource-git",
+                "detail": "",
+            },
+        )
+        tool = self._make({"git_execution_mode": "container"}, str(tmp_path))
+        object.__setattr__(tool, "session_permissions", {"container": True})
+        tool._query_capabilities("ws-9", str(tmp_path))
+        resource, kwargs = calls[0]
+        assert resource == "git"
+        assert kwargs.get("workspace_id") == "ws-9"
+        assert kwargs.get("session_permissions") == {"container": True}
