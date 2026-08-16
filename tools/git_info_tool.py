@@ -439,9 +439,47 @@ class GitInfoTool(ToolBase):
         ``_use_container_mode()``. No path validation is performed here --
         that lives in ``_run_git`` so internal callers (e.g.
         ``_git_repo_root``) do not re-validate.
+
+        The container path is self-healing: ``_resolve_resource_execution()``
+        consults ``ensure_resource("git")`` at execution time and honors the
+        ACTUAL resource mode. A docker/image outage degrades to the hardened
+        host path (host_fallback, logged); a policy denial or unknown
+        resource surfaces as a clear RuntimeError (unavailable) instead of a
+        generic failure.
         """
-        if self._use_container_mode():
-            return self._exec_container_raw(repo_root, args, timeout=timeout)
+        if not self._use_container_mode():
+            return self._exec_host_raw(repo_root, args, timeout=timeout)
+
+        mode, manager = self._resolve_resource_execution()
+        effective = mode.get("mode")
+        detail = mode.get("detail", "")
+        if effective == "containerized" and manager is not None:
+            logger.info(
+                "GitInfoTool effective git execution mode: containerized "
+                "(operation=%s, workspace_id=%s)",
+                self.operation,
+                self._resolved_workspace_id or "none",
+            )
+            return self._exec_container_raw(
+                repo_root, args, timeout=timeout, manager=manager
+            )
+        if effective == "unavailable":
+            logger.error(
+                "GitInfoTool containerized git execution unavailable: %s "
+                "(operation=%s)",
+                detail,
+                self.operation,
+            )
+            raise RuntimeError(
+                f"GitInfoTool: containerized git execution unavailable: {detail}"
+            )
+        # host_fallback: graceful degradation to the hardened host path.
+        logger.warning(
+            "GitInfoTool degraded containerized git execution to hardened "
+            "host git: %s (operation=%s)",
+            detail,
+            self.operation,
+        )
         return self._exec_host_raw(repo_root, args, timeout=timeout)
 
     def _exec_host_raw(
@@ -499,7 +537,11 @@ class GitInfoTool(ToolBase):
         return (result.returncode, result.stdout, result.stderr)
 
     def _exec_container_raw(
-        self, repo_root: Path, args: List[str], timeout: int = 30
+        self,
+        repo_root: Path,
+        args: List[str],
+        timeout: int = 30,
+        manager: Any = None,
     ) -> tuple:
         """Run git inside the workspace resource container.
 
@@ -507,6 +549,10 @@ class GitInfoTool(ToolBase):
         (``_use_container_mode()``), so host paths are mapped to
         ``/workspace/...`` before dispatch. The same git:read/git:write
         permission gate as the host path is enforced here (fail closed).
+        ``manager`` may be supplied by the caller when it was already
+        resolved via ``ensure_resource("git")``; otherwise it is obtained
+        through ``_ensure_resource_container()`` (which raises a clear
+        RuntimeError when the resource is unavailable).
         """
         # Containerized commits run workspace-local hooks from the policy-owned
         # .githooks directory (mounted at /workspace/.githooks). The explicit
@@ -525,7 +571,8 @@ class GitInfoTool(ToolBase):
                 hooks_path = ".githooks"
             args = ["-c", f"core.hooksPath={hooks_path}"] + args
 
-        manager = self._ensure_resource_container()
+        if manager is None:
+            manager = self._ensure_resource_container()
 
         # Permission gate: enforce git:read/git:write ONLY when session
         # permissions are present (mirrors the host path). The gate hard-denies
@@ -647,34 +694,91 @@ class GitInfoTool(ToolBase):
             and bool(self._resolved_workspace_id)
         )
 
-    def _ensure_resource_container(self) -> Any:
-        """Return (creating if needed) the workspace git resource container."""
-        if self._resource_manager is not None:
-            return self._resource_manager
-        if not self._resolved_workspace_path:
-            raise RuntimeError(
-                "GitInfoTool: no registry workspace available for container-backed git execution"
+    def _resolve_resource_execution(self) -> tuple:
+        """Resolve the ACTUAL git resource execution mode at runtime.
+
+        Returns ``(mode_dict, manager_or_None)``. ``mode_dict`` carries
+        ``mode`` ("containerized" | "host_fallback" | "unavailable") and
+        ``detail`` (human-readable reason). ``manager_or_None`` is the live
+        ``ResourceContainerManager`` when ``mode == "containerized"``, else
+        ``None``.
+
+        Config-level ``_use_container_mode()`` decides whether the container
+        path is *desired*; ``ensure_resource("git")`` then self-heals
+        (auto-build image, recreate stale containers) and reports the mode
+        that is actually achievable: a docker/image outage degrades to
+        ``host_fallback``, while a policy denial or unknown resource
+        surfaces as ``unavailable``. Never raises.
+        """
+        if not self._use_container_mode():
+            return (
+                {
+                    "mode": "host_fallback",
+                    "detail": "config selects host mode or no registry workspace",
+                },
+                None,
+            )
+
+        if self._resource_manager is None:
+            if not self._resolved_workspace_path:
+                return (
+                    {
+                        "mode": "unavailable",
+                        "detail": (
+                            "no registry workspace available for "
+                            "container-backed git execution"
+                        ),
+                    },
+                    None,
+                )
+            try:
+                from security.security_gate import get_expected_container_config
+
+                expected = get_expected_container_config(
+                    self.session_permissions or {}, None
+                )
+                network_mode = expected.get("network_mode", "none")
+            except Exception:
+                network_mode = "none"
+
+            from infra.resource_container_manager import ResourceContainerManager
+
+            self._resource_manager = ResourceContainerManager(
+                workspace_id=self._resolved_workspace_id
+                or self.workspace_id
+                or "default",
+                workspace_path=self._resolved_workspace_path,
+                network_mode=network_mode,
+                session_permissions=self.session_permissions,
             )
 
         try:
-            from security.security_gate import get_expected_container_config
+            result = self._resource_manager.ensure_resource("git")
+        except Exception as e:
+            # ensure_resource never raises by contract, but stay defensive:
+            # an unexpected exception is an unavailable resource.
+            return ({"mode": "unavailable", "detail": str(e)}, None)
 
-            expected = get_expected_container_config(
-                self.session_permissions or {}, None
+        result = result or {}
+        if result.get("mode") == "containerized":
+            return (result, self._resource_manager)
+        # host_fallback or unavailable (or unknown) -> no container to use.
+        return (result, None)
+
+    def _ensure_resource_container(self) -> Any:
+        """Return the workspace git resource container.
+
+        Thin wrapper over ``_resolve_resource_execution()`` for callers that
+        need a live manager; raises ``RuntimeError`` with the detail when the
+        resource is not containerized (policy denial, unknown resource,
+        docker outage).
+        """
+        mode, manager = self._resolve_resource_execution()
+        if mode.get("mode") != "containerized" or manager is None:
+            raise RuntimeError(
+                "GitInfoTool: git resource container unavailable: "
+                f"{mode.get('detail', 'unknown reason')}"
             )
-            network_mode = expected.get("network_mode", "none")
-        except Exception:
-            network_mode = "none"
-
-        from infra.resource_container_manager import ResourceContainerManager
-
-        manager = ResourceContainerManager(
-            workspace_id=self._resolved_workspace_id or self.workspace_id or "default",
-            workspace_path=self._resolved_workspace_path,
-            network_mode=network_mode,
-        )
-        manager.ensure_container()
-        self._resource_manager = manager
         return manager
 
     def _to_container_path(self, host_path) -> str:

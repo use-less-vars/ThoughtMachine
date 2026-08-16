@@ -163,6 +163,180 @@ class TestHostCommitArgs:
 
 
 # ---------------------------------------------------------------------------
+# Execution-time self-healing: ensure_resource("git") drives the ACTUAL mode
+# ---------------------------------------------------------------------------
+class _FakeEnsureManager:
+    """Manager fake exposing ensure_resource + exec for mode routing."""
+
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def ensure_resource(self, name):
+        self.calls.append(("ensure_resource", name))
+        return self.result
+
+    def exec(self, command, **kwargs):
+        self.calls.append(("exec", command, kwargs))
+        return {"exit_code": 0, "stdout": "ok", "stderr": ""}
+
+
+class TestSelfHealingModeRouting:
+    """ensure_resource outcome decides container vs hardened-host routing."""
+
+    HOST_FALLBACK_DETAIL = (
+        "resource image unavailable (auto-build failed or Docker unreachable); "
+        "manual build: docker build ..."
+    )
+    POLICY_DENIAL_DETAIL = (
+        "container resources disabled/denied: session/workspace policy "
+        "denies container usage (effective container=False)"
+    )
+
+    def _container_tool(self, tmp_path, operation="commit"):
+        """Tool configured for container mode with a registry workspace."""
+        tool = GitInfoTool(operation=operation, message="x")
+        object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
+        object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
+        return tool
+
+    def _host_sandbox(self, monkeypatch):
+        _FakeSandbox.instances.clear()
+        monkeypatch.setattr("tools.git_info_tool.SandboxedExecution", _FakeSandbox)
+        return _FakeSandbox
+
+    def test_containerized_uses_container_exec_path(self, tmp_path):
+        manager = _FakeEnsureManager(
+            {
+                "mode": "containerized",
+                "container_id": "c1",
+                "status": "running",
+                "image": "tm-resource-git",
+                "detail": "",
+            }
+        )
+        tool = self._container_tool(tmp_path)
+        object.__setattr__(tool, "_resource_manager", manager)
+
+        tool._run_git_raw(tmp_path, ["commit", "-m", "x"])
+
+        execs = [c for c in manager.calls if c[0] == "exec"]
+        assert len(execs) == 1
+        command = execs[0][1]
+        assert command == [
+            "git", "-c", "core.hooksPath=/workspace/.githooks",
+            "commit", "-m", "x",
+        ]
+        assert "--no-verify" not in command
+
+    def test_host_fallback_commit_uses_hardened_host_path(self, tmp_path, monkeypatch):
+        _FakeSandbox = self._host_sandbox(monkeypatch)
+        manager = _FakeEnsureManager(
+            {
+                "mode": "host_fallback",
+                "container_id": None,
+                "status": None,
+                "image": None,
+                "detail": self.HOST_FALLBACK_DETAIL,
+            }
+        )
+        tool = self._container_tool(tmp_path)
+        object.__setattr__(tool, "_resource_manager", manager)
+
+        tool._run_git_raw(tmp_path, ["commit", "-m", "x"])
+
+        # Degradation must NOT reach the container exec path.
+        assert not [c for c in manager.calls if c[0] == "exec"]
+        assert len(_FakeSandbox.instances) == 1
+        command, _kwargs = _FakeSandbox.instances[0].calls[0]
+        assert command[0] == "git"
+        assert command.index("core.hooksPath=/dev/null") < command.index("commit")
+        assert "--no-verify" in command
+        assert "core.hooksPath=.githooks" not in command
+
+    def test_unavailable_policy_denial_raises_clear_error(self, tmp_path):
+        manager = _FakeEnsureManager(
+            {
+                "mode": "unavailable",
+                "container_id": None,
+                "status": None,
+                "image": None,
+                "detail": self.POLICY_DENIAL_DETAIL,
+            }
+        )
+        tool = self._container_tool(tmp_path, operation="status")
+        object.__setattr__(tool, "_resource_manager", manager)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            tool._run_git_raw(tmp_path, ["status"])
+        assert "containerized git execution unavailable" in str(excinfo.value)
+        assert "container resources disabled/denied" in str(excinfo.value)
+        assert not [c for c in manager.calls if c[0] == "exec"]
+
+    def test_host_fallback_status_runs_without_no_verify(self, tmp_path, monkeypatch):
+        _FakeSandbox = self._host_sandbox(monkeypatch)
+        manager = _FakeEnsureManager(
+            {
+                "mode": "host_fallback",
+                "container_id": None,
+                "status": None,
+                "image": None,
+                "detail": self.HOST_FALLBACK_DETAIL,
+            }
+        )
+        tool = self._container_tool(tmp_path, operation="status")
+        object.__setattr__(tool, "_resource_manager", manager)
+
+        tool._run_git_raw(tmp_path, ["status"])
+
+        assert not [c for c in manager.calls if c[0] == "exec"]
+        assert len(_FakeSandbox.instances) == 1
+        command, _kwargs = _FakeSandbox.instances[0].calls[0]
+        assert "--no-verify" not in command
+        assert command.index("core.hooksPath=/dev/null") < command.index("status")
+
+    def test_manager_ctor_receives_session_permissions(self, tmp_path, monkeypatch):
+        captured = {}
+
+        class _CtorCapture:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self._inner = _FakeEnsureManager(
+                    {
+                        "mode": "containerized",
+                        "container_id": "c1",
+                        "status": "running",
+                        "image": "tm-resource-git",
+                        "detail": "",
+                    }
+                )
+
+            def ensure_resource(self, name):
+                return self._inner.ensure_resource(name)
+
+            def exec(self, command, **kwargs):
+                return self._inner.exec(command, **kwargs)
+
+        monkeypatch.setattr(
+            "infra.resource_container_manager.ResourceContainerManager", _CtorCapture
+        )
+        tool = GitInfoTool(
+            operation="status",
+            message="x",
+            session_permissions={"git": "read"},
+            effective_permissions={"git": "read"},
+        )
+        object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
+        object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
+
+        tool._run_git_raw(tmp_path, ["status"])
+
+        assert captured.get("session_permissions") == {"git": "read"}
+        assert captured.get("workspace_path") == str(tmp_path)
+        assert captured.get("workspace_id") == "test-ws"
+
+
+# ---------------------------------------------------------------------------
 # CheckSystem capabilities: git execution mode surfaced
 # ---------------------------------------------------------------------------
 class TestCheckSystemGitMode:
