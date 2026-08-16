@@ -35,9 +35,21 @@ import os
 
 import pytest
 
+
+def _docker_security_tests_enabled():
+    if os.environ.get("TM_RUN_DOCKER_SECURITY_TESTS") != "1":
+        return False
+    try:
+        from docker import from_env
+        from_env().ping()
+        return True
+    except Exception:
+        return False
+
+
 # Marker registration note: @pytest.mark.docker is defined in pyproject.toml
 # [tool.pytest.ini_options].markers. No pytest.ini exists in this repo.
-pytestmark = pytest.mark.docker
+pytestmark = pytest.mark.skipif(not _docker_security_tests_enabled(), reason="Docker-gated security test; set TM_RUN_DOCKER_SECURITY_TESTS=1 and ensure Docker is available")
 
 
 @pytest.fixture(scope="module", autouse=True)
