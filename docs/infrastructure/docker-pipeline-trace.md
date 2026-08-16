@@ -48,7 +48,7 @@ CMD ["tail", "-f", "/dev/null"]
 
 ### Template for User-Customizable Dockerfile
 
-**`resources/default_dockerfile.txt`** (180 bytes) — fallback template for `EditDockerfile` tool:
+**`resources/default_dockerfile.txt`** (978 bytes) — fallback template for the unified runtime image (`infra/resource_container_manager.py`):
 
 ```dockerfile
 FROM python:3.11-slim
@@ -199,14 +199,6 @@ Located at project **root** (not inside `agent/` or `tools/`).
 - Uses `docker.from_env()` client
 - Container pooling via image tag derived from workspace path hash
 
-### Agent Tool: `tools/workspace/edit_dockerfile.py`
-
-- `EditDockerfile` class (extends `ToolBase`)
-- Appends instructions to a **workspace-scoped** Dockerfile
-- Creates from `resources/default_dockerfile.txt` template if missing
-- Falls back to `FROM python:3.11-slim` if template missing
-- This is separate from `docker/executor.Dockerfile`
-
 ### Architecture Diagram
 
 ```
@@ -235,7 +227,6 @@ Located at project **root** (not inside `agent/` or `tools/`).
      Agent Tool Layer:
      ┌──────────────────────────────────────┐
      │ DockerCodeRunner  (tools/)           │ ← agent's tool to run code in container
-     │ EditDockerfile     (tools/)          │ ← agent's tool to modify Dockerfile
      │ CheckSystem        (tools/)          │ ← agent's tool to inspect Dockerfile
      └──────────────────────────────────────┘
 ```

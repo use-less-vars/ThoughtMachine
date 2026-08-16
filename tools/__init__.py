@@ -234,12 +234,6 @@ except ImportError as e:
     logger.warning(f"Failed to import Worker: {e}")
 
 try:
-    from .workspace.edit_dockerfile import EditDockerfile
-    TOOL_CLASSES.append(EditDockerfile)
-except ImportError as e:
-    logger.warning(f"Failed to import EditDockerfile: {e}")
-
-try:
     from .workspace.working_document import WorkingDocument
     TOOL_CLASSES.append(WorkingDocument)
 except ImportError as e:

@@ -38,10 +38,10 @@ sections are implemented and verified against the tree at `b23c26b`.
 - Scope note: this guarantee covers git execution mediated by ThoughtMachine's git
   tooling. Git invoked directly on the host by a human operator is outside the
   tool's control.
-- Host-side extension point (operator-owned, not agent-owned): the vault hook
-  `~/.thoughtmachine/hooks/<workspace_id>/pre-commit` runs on the host before
-  commits (`tools/git_info_tool.py` `_run_vault_hooks` L675-731, `_git_commit`
-  L904-907). Only `pre-commit` is honored.
+- Host-side extension point: **removed** — the vault hook mechanism
+  (`~/.thoughtmachine/hooks/<workspace_id>/pre-commit`, formerly
+  `tools/git_info_tool.py` `_run_vault_hooks`) was deleted; no vault-managed
+  hooks run on the host.
 
 ## 4. Host fallback git
 
@@ -81,7 +81,7 @@ sections are implemented and verified against the tree at `b23c26b`.
   the preflight script (how they run).
 - **Current status:** no `pytest-list` / `test-list` mechanism exists (0 matches).
   Today's pre-commit gating is the repo-owned `.githooks/pre-commit` (operator-wired,
-  runs via `core.hooksPath` host-side) and the vault pre-commit hook — neither is
+  runs via `core.hooksPath` host-side) — it is not
   agent-configurable beyond the repo's own hook contents.
 
 ## 7. Resource execution modes
@@ -118,8 +118,7 @@ sections are implemented and verified against the tree at `b23c26b`.
 
 - **Agent-editable:** everything inside the workspace, including workspace hooks (§2);
   the pytest-list file once implemented (§6).
-- **Operator-editable only (never the agent):** vault hooks
-  (`~/.thoughtmachine/hooks/<workspace_id>/`), the host preflight script (§5),
+- **Operator-editable only (never the agent):** the host preflight script (§5),
   resource-container configuration, and host git hardening parameters.
 - Host-side execution is hermetic (`SandboxedExecution`), so the agent cannot reach
   host code even indirectly.

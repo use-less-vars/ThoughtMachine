@@ -60,7 +60,7 @@ Errors: 0
 | 38 | test_worker_agent_transplant.py | unit | 32 | ScriptedProvider, TestSmokeMultiTurnTask, TestResumeWorkerContinuesConversation | Y | N |
 | 39 | test_worker_definition.py | unit | 11 | TestTemplates, TestValidInstantiation, TestJsonSchema | N | N |
 | 40 | test_worker_loop_spike.py | unit | 29 | EchoToolProvider, TestWorkerContextAttributes, TestAgentWithWorkerContext | N | N |
-| 41 | tools/test_workspace_tools.py | workspace | 51 | TestCheckSystem, TestWorker, TestEditDockerfile | Y | N |
+| 41 | tools/test_workspace_tools.py | workspace | 51 | TestCheckSystem, TestWorker, TestEditDockerfileRemoved | Y | N |
 | 42 | trust/test_gate_contract.py | unit | 24 | TestEffectivePermissionsEdgeValues, TestContainerConfigEdgeValues, TestGetExpectedContainerConfig | N | N |
 | 43 | trust/test_toggle_live.py | unit | 8 | TestNoRecreation, TestAskPermissionRestrictive | Y | N |
 | 44 | web_ui/backend/test_websocket_integration.py | integration | 4 | TestWebSocketLifecycle | Y | N |
