@@ -100,6 +100,15 @@ except ImportError:
     get_checksystem_allowlist = None
     VAULT_AVAILABLE = False
 
+# Git execution-mode resolver (shared with GitInfoTool; used to surface
+# whether git runs containerized or on the host).
+try:
+    from tools.git_info_tool import resolve_git_execution_mode
+    GIT_MODE_RESOLVER_AVAILABLE = True
+except ImportError:
+    resolve_git_execution_mode = None
+    GIT_MODE_RESOLVER_AVAILABLE = False
+
 
 logger = logging.getLogger(__name__)
 
@@ -232,7 +241,7 @@ class CheckSystem(ToolBase):
                 "network_diagnostics": lambda: self._query_network_diagnostics(ws_id, workspace_path),
                 "workers": lambda: self._query_workers(ws_id),
                 "running_workers": lambda: self._query_running_workers(),
-                "capabilities": lambda: self._query_capabilities(ws_id),
+                "capabilities": lambda: self._query_capabilities(ws_id, workspace_path),
                 "dockerfile": lambda: self._query_dockerfile(ws_id),
                 "mcp_servers": lambda: self._query_mcp_servers(ws_id),
                 "event_bus_status": lambda: self._query_event_bus_status(),
@@ -600,7 +609,34 @@ class CheckSystem(ToolBase):
                     running.append(entry)
         return {"running_workers": running, "count": len(running)}
 
-    def _query_capabilities(self, ws_id: Optional[str]) -> dict:
+    def _workspace_metadata(self) -> dict:
+        """Resolve metadata of the session's registered workspace.
+
+        Best-effort mirror of ``GitInfoTool._workspace_metadata`` so the git
+        execution mode surfaced in capabilities uses the same precedence
+        (agent config → workspace metadata → default). Any registry failure
+        or missing session/entry yields ``{}``.
+        """
+        session_id = getattr(self, "session_id", None)
+        if not session_id:
+            return {}
+        try:
+            from session.session_registry import SessionRegistry
+            from thoughtmachine.workspace_registry import WorkspaceRegistry
+
+            session_info = SessionRegistry.get_default().get(session_id)
+            if not session_info:
+                return {}
+            ws_id = session_info.get("workspace_id")
+            if not ws_id:
+                return {}
+            entry = WorkspaceRegistry.get_default().get_workspace(ws_id)
+            metadata = getattr(entry, "metadata", None)
+            return dict(metadata) if metadata else {}
+        except Exception:
+            return {}
+
+    def _query_capabilities(self, ws_id: Optional[str], ws_path: Optional[str] = None) -> dict:
         """Return workspace capabilities: provider, model, tools, docker, git, OS, token limits."""
         result = {
             "provider": None,
@@ -610,7 +646,18 @@ class CheckSystem(ToolBase):
             "has_git": False,
             "os": None,
             "token_limits": {},
+            "git": {"mode": "unavailable"},
         }
+
+        # Surface the effective git execution mode (containerized vs
+        # host_fallback) using the same resolution as GitInfoTool.
+        if GIT_MODE_RESOLVER_AVAILABLE and resolve_git_execution_mode:
+            result["git"]["mode"] = resolve_git_execution_mode(
+                dict(self.agent_config) if self.agent_config else {},
+                self._workspace_metadata(),
+                ws_path or getattr(self, "workspace_path", None),
+                ws_id,
+            )
 
         # Try to get from agent_config first
         if self.agent_config:

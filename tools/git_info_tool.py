@@ -4,7 +4,6 @@ from typing import Any, ClassVar, Literal, Optional, List, Union
 from pydantic import Field
 import logging
 import subprocess
-import os
 from pathlib import Path
 from .base import ToolBase
 from security.sandboxed_execution import SandboxedExecution
@@ -14,6 +13,38 @@ from security.sandboxed_execution import SandboxedExecution
 # (including ``ext::`` shell executors and ``file://`` local access), so clone
 # URLs are restricted to these schemes plus scp-like ``user@host:path`` syntax.
 ALLOWED_GIT_PROTOCOLS = ["https://", "http://", "git://", "ssh://"]
+
+logger = logging.getLogger(__name__)
+
+
+def resolve_git_execution_mode(
+    agent_config: Optional[dict],
+    workspace_metadata: Optional[dict],
+    resolved_workspace_path: Optional[str],
+    resolved_workspace_id: Optional[str],
+) -> str:
+    """Resolve the effective git execution mode for diagnostics.
+
+    Mirrors ``GitInfoTool._git_execution_mode`` / ``_use_container_mode`` so
+    the decision is observable outside the tool (e.g. CheckSystem).
+
+    Returns:
+        "containerized": git runs inside the workspace resource container.
+        "host_fallback": git runs on the host inside the hermetic sandbox.
+        "unavailable": no resolvable workspace to run against.
+    """
+    config = agent_config or {}
+    mode = config.get("git_execution_mode")
+    if mode not in ("host", "container"):
+        metadata = workspace_metadata or {}
+        mode = metadata.get("git_execution_mode")
+    effective_mode = mode if mode in ("host", "container") else "container"
+
+    if not resolved_workspace_path:
+        return "unavailable"
+    if effective_mode == "host" or not resolved_workspace_id:
+        return "host_fallback"
+    return "containerized"
 
 
 class GitInfoTool(ToolBase):
@@ -31,6 +62,7 @@ class GitInfoTool(ToolBase):
     _resource_manager: Optional[Any] = None
     _resolved_workspace_path: Optional[str] = None
     _resolved_workspace_id: Optional[str] = None
+    _last_mode: Optional[str] = None
 
     @classmethod
     def get_required_categories(cls, params: dict | None = None) -> list[str]:
@@ -63,8 +95,8 @@ class GitInfoTool(ToolBase):
 
     workspace_id: Optional[str] = Field(
         default=None,
-        description="Workspace identifier used to locate vault-backed hooks "
-        "(~/.thoughtmachine/hooks/<workspace_id>/<hook_name>)"
+        description="Workspace identifier resolved by the ToolExecutor "
+        "(used for container-backed git execution)"
     )
     
     # Operation-specific parameters
@@ -321,7 +353,25 @@ class GitInfoTool(ToolBase):
                 repo_root = self._validate_repo_root(repo_root)
             except ValueError as e:
                 return self._truncate_output(f"Error: {e}")
-            
+
+            # Surface the effective git execution mode (containerized vs
+            # host fallback) for diagnostics; log it when determined and
+            # again whenever it changes across calls on a reused instance.
+            mode = resolve_git_execution_mode(
+                getattr(self, "agent_config", None),
+                self._workspace_metadata(),
+                self._resolved_workspace_path,
+                self._resolved_workspace_id,
+            )
+            if mode != getattr(self, "_last_mode", None):
+                logger.info(
+                    "GitInfoTool git execution mode: %s (operation=%s, workspace_id=%s)",
+                    mode,
+                    self.operation,
+                    self._resolved_workspace_id or "none",
+                )
+                self._last_mode = mode
+
             # Execute operation
             if self.operation == "status":
                 return self._git_status(repo_root)
@@ -346,8 +396,8 @@ class GitInfoTool(ToolBase):
         
         except Exception as e:
             if isinstance(e, (RuntimeError, PermissionError)):
-                # Vault hook failures and permission denials are hard errors:
-                # surface them instead of swallowing into a generic string.
+                # Hard security errors (permission denials) are re-raised
+                # instead of swallowing into a generic string.
                 raise
             return self._truncate_output(f"Error executing git operation: {e}")
     
@@ -458,6 +508,23 @@ class GitInfoTool(ToolBase):
         ``/workspace/...`` before dispatch. The same git:read/git:write
         permission gate as the host path is enforced here (fail closed).
         """
+        # Containerized commits run workspace-local hooks from the policy-owned
+        # .githooks directory (mounted at /workspace/.githooks). The explicit
+        # core.hooksPath override uses the container-mapped ABSOLUTE path so a
+        # nested repository (whose root is not the workspace root) cannot
+        # resolve the relative ".githooks" to some other directory; repo-local
+        # .git/hooks is never consulted. No --no-verify here: the resource
+        # container IS the security boundary, but hooks may only originate
+        # from .githooks.
+        if args and args[0] == "commit":
+            hooks_dir = Path(self._resolved_workspace_path) / ".githooks"
+            try:
+                hooks_path = self._to_container_path(hooks_dir)
+            except ValueError:
+                # Defensive fallback: workspace path unresolvable → relative.
+                hooks_path = ".githooks"
+            args = ["-c", f"core.hooksPath={hooks_path}"] + args
+
         manager = self._ensure_resource_container()
 
         # Permission gate: enforce git:read/git:write ONLY when session
@@ -484,8 +551,9 @@ class GitInfoTool(ToolBase):
                     )
 
         # NOTE: no --no-verify here. The resource container IS the security
-        # boundary, so repo-local .git/hooks scripts are allowed to run
-        # (unlike the host path, which neutralizes them).
+        # boundary; hooks are restricted to the workspace .githooks dir via
+        # the core.hooksPath override above (unlike the host path, which
+        # neutralizes hooks entirely).
         environment = {
             "GIT_PAGER": "cat",
             "GIT_CONFIG_SYSTEM": "/dev/null",
@@ -672,64 +740,6 @@ class GitInfoTool(ToolBase):
             return "write"
         return "read"
 
-    def _run_vault_hooks(self, repo_root: Path, hook_name: str) -> None:
-        """Run a vault-managed hook script before a git operation.
-
-        Vault hooks live in ``~/.thoughtmachine/hooks/<workspace_id>/<hook_name>``
-        and are the ONLY sanctioned extension point for policy injection:
-        repository-local ``.git/hooks/`` scripts are never executed (the
-        hardened runner neutralizes them via ``core.hooksPath=/dev/null`` and
-        ``--no-verify``).
-
-        Raises:
-            RuntimeError: if the hook exists but exits non-zero.
-            PermissionError: if session permissions deny ``git:write``
-                (fail closed -- hooks are write-side policy).
-        """
-        workspace_id = getattr(self, "workspace_id", None)
-        if not workspace_id:
-            if getattr(self, "_logger", None):
-                self._logger.debug(
-                    "GitInfoTool: no workspace_id, skipping vault %s hook", hook_name
-                )
-            return
-
-        hook_path = (
-            Path.home() / ".thoughtmachine" / "hooks" / str(workspace_id) / hook_name
-        )
-        if not hook_path.is_file():
-            if getattr(self, "_logger", None):
-                self._logger.debug("GitInfoTool: vault hook not found: %s", hook_path)
-            return
-
-        executor = SandboxedExecution(
-            session_permissions=self.session_permissions,
-            workspace_id=str(workspace_id),
-            logger=getattr(self, "_logger", None) or logging.getLogger(__name__),
-        )
-        # Enforce git:write only when session permissions are present (the
-        # ToolExecutor always injects them; legacy/direct callers without
-        # permissions keep the sandbox's hermetic-environment guarantees).
-        # An 'ask' level defers outward: the outer gate already prompted and
-        # approved, and SandboxedExecution would treat 'ASK' as denied, so
-        # the category is left unset (the hook script still executes).
-        required_category = (
-            "git:write"
-            if self.session_permissions is not None
-            and (self.effective_permissions or {}).get("git") != "ask"
-            else None
-        )
-        result = executor.run(
-            [str(hook_path)],
-            cwd=str(repo_root),
-            required_category=required_category,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Vault {hook_name} hook failed (exit {result.returncode}): "
-                f"{result.stderr.strip()}"
-            )
-
     def _git_status(self, repo_root: Path) -> str:
         """Run git status."""
         output = self._run_git(repo_root, ["status", "--porcelain=v1"])
@@ -901,11 +911,10 @@ class GitInfoTool(ToolBase):
         if not self.message:
             return "Error: message is required for commit operation"
 
-        # Vault-backed pre-commit hook (write-side policy). Runs after staging
-        # (mirroring git semantics) and BEFORE the commit; a non-zero exit
-        # aborts the commit. Repository-local .git/hooks are never consulted.
-        self._run_vault_hooks(repo_root, "pre-commit")
-
+        # Commit hook policy lives in the execution backends: container mode
+        # runs the workspace-local .githooks dir (core.hooksPath override);
+        # host mode neutralizes hooks entirely (core.hooksPath=/dev/null plus
+        # --no-verify). No vault-backed hooks are consulted.
         args = ["commit", "-m", self.message]
         output = self._run_git(repo_root, args)
         return self._truncate_output(output)

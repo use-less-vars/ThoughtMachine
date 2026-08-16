@@ -8,8 +8,11 @@ Verifies that:
 2. Git hooks never execute on the HOST fallback path: core.hooksPath is
    pointed at /dev/null for every invocation and commit additionally passes
    --no-verify. The container path (resource container = security boundary)
-   deliberately does NOT neutralize hooks -- repo-local hook scripts run
-   inside the sandbox (see test_container_path_commit_has_no_no_verify).
+   runs hooks ONLY from the workspace-local .githooks directory via a
+   core.hooksPath=/workspace/.githooks override (the container-mapped
+   absolute workspace path); repo-local .git/hooks is never consulted and
+   no --no-verify is injected (see
+   test_container_path_commit_runs_githooks_only).
 3. External diff drivers / textconv filters and the fsmonitor helper are
    disabled on every invocation.
 4. A repository root that resolves OUTSIDE the workspace is rejected before
@@ -110,11 +113,14 @@ class _FakeManager:
         return {"exit_code": 0, "stdout": "ok", "stderr": ""}
 
 
-def test_container_path_commit_has_no_no_verify(tmp_path):
-    """Container mode lets repo-local hooks run: no --no-verify injected.
+def test_container_path_commit_runs_githooks_only(tmp_path):
+    """Container mode runs workspace .githooks, never repo .git/hooks.
 
-    The resource container IS the security boundary, so the container git
-    path must NOT neutralize .git/hooks scripts the way the host path does.
+    The resource container IS the security boundary, but hooks may only
+    originate from the policy-owned .githooks directory: the container git
+    path injects ``-c core.hooksPath=/workspace/.githooks`` (the
+    container-mapped absolute workspace path) and does NOT inject
+    --no-verify.
     """
     manager = _FakeManager()
     tool = GitInfoTool(operation="commit", message="x")
@@ -126,8 +132,13 @@ def test_container_path_commit_has_no_no_verify(tmp_path):
 
     assert len(manager.calls) == 1
     command, _kwargs = manager.calls[0]
-    assert command == ["git", "commit", "-m", "x"]
+    assert command == ["git", "-c", "core.hooksPath=/workspace/.githooks", "commit", "-m", "x"]
     assert "--no-verify" not in command
+
+    # Non-commit operations are unaffected by the hook-path override.
+    tool._exec_container_raw(tmp_path, ["status"])
+    command2, _kwargs2 = manager.calls[1]
+    assert command2 == ["git", "status"]
 
 
 def test_commit_still_succeeds(hardened_repo):
@@ -262,8 +273,14 @@ def test_fsmonitor_config_not_executed(hardened_repo):
     assert not fsmon_marker.exists()
 
 
-def test_vault_pre_commit_hook_runs(tmp_path, monkeypatch):
-    """A vault-managed pre-commit hook runs before the commit and passes."""
+def test_vault_pre_commit_hook_never_runs(tmp_path, monkeypatch):
+    """A vault-managed pre-commit hook must NEVER execute anymore.
+
+    The vault hook mechanism was removed: hooks are now either the
+    workspace-local .githooks dir (container) or fully neutralized (host).
+    A marker hook planted at ~/.thoughtmachine/hooks/<ws>/pre-commit must
+    leave no trace.
+    """
     workspace = tmp_path / "workspace"
     repo = workspace / "repo"
     repo.mkdir(parents=True)
@@ -286,15 +303,19 @@ def test_vault_pre_commit_hook_runs(tmp_path, monkeypatch):
     result = _vault_commit_tool(workspace, repo, ws_id).execute()
     assert "Git command failed" not in result
     assert "Error executing git operation" not in result
-    assert vault_marker.exists()  # the vault hook actually ran
+    assert not vault_marker.exists()  # the vault hook never ran
 
     log = _run_git_clean(repo, "log", "--oneline")
     assert log.returncode == 0
     assert "vault hook commit" in log.stdout
 
 
-def test_vault_pre_commit_hook_failure_aborts_commit(tmp_path, monkeypatch):
-    """A vault pre-commit hook exiting non-zero aborts the commit."""
+def test_failing_vault_pre_commit_hook_does_not_abort(tmp_path, monkeypatch):
+    """A failing vault pre-commit hook must NOT abort the commit anymore.
+
+    Vault hooks are no longer consulted at all, so even an exit-1 vault
+    hook cannot block the commit.
+    """
     workspace = tmp_path / "workspace"
     repo = workspace / "repo"
     repo.mkdir(parents=True)
@@ -313,11 +334,12 @@ def test_vault_pre_commit_hook_failure_aborts_commit(tmp_path, monkeypatch):
 
     (repo / "hello.txt").write_text("hi\n")
     _run_git_clean(repo, "add", "hello.txt")
-    with pytest.raises(RuntimeError):
-        _vault_commit_tool(workspace, repo, ws_id).execute()
+    # Must NOT raise RuntimeError: vault hooks are no longer consulted.
+    result = _vault_commit_tool(workspace, repo, ws_id).execute()
+    assert "Git command failed" not in result
 
     log = _run_git_clean(repo, "log", "--oneline")
-    assert log.returncode != 0  # no commit was created
+    assert log.returncode == 0  # the commit was created
 
 
 def test_commit_denied_without_git_write_permission(hardened_repo):

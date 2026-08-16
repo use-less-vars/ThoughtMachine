@@ -284,7 +284,9 @@ def test_container_commit_does_not_skip_hooks(tmp_path):
 
     The resource container is the security boundary, so repo-local hooks
     (e.g. the pre-commit above) are allowed to run inside it. This pins the
-    command contract: no --no-verify is injected in container mode.
+    command contract: no --no-verify is injected in container mode, and the
+    container-mapped absolute hooks path core.hooksPath=/workspace/.githooks
+    is injected instead.
     """
     manager = _FakeManager()
     tool = GitInfoTool(operation="commit", message="x")
@@ -296,7 +298,7 @@ def test_container_commit_does_not_skip_hooks(tmp_path):
 
     assert len(manager.calls) == 1
     command, _kwargs = manager.calls[0]
-    assert command == ["git", "commit", "-m", "x"]
+    assert command == ["git", "-c", "core.hooksPath=/workspace/.githooks", "commit", "-m", "x"]
     assert "--no-verify" not in command
 
 

@@ -71,9 +71,11 @@ VAULT_ROOT = os.path.join(os.path.expanduser("~"), ".thoughtmachine")
 # rather than all of .git. Normal tooling legitimately reads the repo's own
 # refs/objects (e.g. .git/refs/heads/main) and must keep working; the blocked
 # entries are precisely the ones that can leak credentials (config/HEAD).
-# .git/hooks is deliberately NOT blocked: the resource container is the
-# security boundary, so repo-local hook scripts are allowed to run inside it
-# (the host fallback still neutralizes them via core.hooksPath=/dev/null).
+# .git/hooks itself is NOT blocked because git never consults it anymore:
+# commits run ONLY the policy-owned workspace .githooks directory (container
+# path injects -c core.hooksPath=/workspace/.githooks — the container-mapped
+# absolute workspace path) and the host fallback neutralizes
+# hooks entirely via core.hooksPath=/dev/null + --no-verify.
 WORKSPACE_BLOCKED_PATH_PREFIXES = [
     ".git/config",
     ".git/HEAD",
