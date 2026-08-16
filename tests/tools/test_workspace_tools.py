@@ -7,8 +7,6 @@ Covers
   workspace_info, my_config, network_diagnostics) plus unknown query.
 - Worker:     list, spawn, check, query, missing worker_name, unknown action,
               missing workers.json.
-- EditDockerfile: append instructions, creation from template, empty
-                  instructions error, timestamp comment.
 """
 
 from __future__ import annotations
@@ -16,15 +14,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
+import time
 from pathlib import Path
-from unittest.mock import patch, MagicMock, mock_open
+from unittest.mock import patch, MagicMock
 
 import pytest
 
 from tools.workspace.check_system import CheckSystem
 from tools.workspace.worker import Worker, WorkerThread, _restrictive_merge
 from agent.core.worker_context import WorkerContext
-from tools.workspace.edit_dockerfile import EditDockerfile
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Helpers
@@ -772,6 +771,146 @@ class TestWorker:
         with pytest.raises(TimeoutError):
             thread.send_query("hello", timeout=0.01)
 
+    def test_worker_send_query_stale_reply_discarded(self, tmp_path: Path):
+        """Stale envelopes pre-seeded in _output_queue must not satisfy a
+        send_query call — with the per-caller reply channel the fresh reply
+        arrives on the caller's private queue (and stale items are drained)."""
+        thread = WorkerThread(
+            name="stale_test",
+            definition={},
+            agent_config={},
+            workspace_dir=tmp_path,
+        )
+        # Stale replies left over from a previous (timed-out / superseded)
+        # query — exactly what the per-caller reply channel must bypass.
+        thread._output_queue.put(json.dumps(
+            {"content": "STALE-OLD", "status": "completed", "query_id": "old-id"}))
+        thread._output_queue.put(json.dumps(
+            {"content": "STALE-NOID", "status": "completed"}))
+
+        captured = {}
+
+        def fake_put(item):
+            captured["item"] = item
+            qid, q = item[0], item[1]
+            payload = json.dumps(
+                {"content": f"FRESH-{q}", "status": "completed", "query_id": qid})
+            if len(item) == 3:
+                # Retrofit: send_query carries a private reply_q — deliver there.
+                item[2].put(payload)
+            else:
+                thread._output_queue.put(payload)
+
+        with patch.object(thread._input_queue, "put", side_effect=fake_put):
+            response = thread.send_query("hi", timeout=2.0)
+
+        payload = json.loads(response)
+        assert payload["content"] == "FRESH-hi"
+        assert payload["query_id"] == captured["item"][0]
+
+    def test_worker_legacy_output_queue_drains_after_timeout(self, tmp_path: Path):
+        """A reply landing after send_query timed out must never satisfy the
+        next send_query call: the timeout path drains the shared output queue
+        and each call owns a private reply queue."""
+        thread = WorkerThread(
+            name="legacy_drain_test",
+            definition={},
+            agent_config={},
+            workspace_dir=tmp_path,
+        )
+
+        def fake_put_slow(item):
+            qid = item[0]
+
+            def deliver():
+                payload = json.dumps({"content": "LATE", "query_id": qid})
+                if len(item) == 3:
+                    item[2].put(payload)
+                else:
+                    thread._output_queue.put(payload)
+
+            threading.Timer(0.3, deliver).start()
+
+        with patch.object(thread._input_queue, "put", side_effect=fake_put_slow):
+            with pytest.raises(TimeoutError):
+                thread.send_query("slow", timeout=0.05)
+
+        # Nothing pending immediately after the timeout...
+        assert thread._output_queue.empty()
+        # ... and even after the late reply would have landed (0.3s timer),
+        # it must have been drained / routed to the orphaned private queue.
+        time.sleep(0.5)
+        assert thread._output_queue.empty()
+
+        def fake_put_fast(item):
+            qid, q = item[0], item[1]
+            payload = json.dumps(
+                {"content": f"FRESH-{q}", "status": "completed", "query_id": qid})
+            if len(item) == 3:
+                item[2].put(payload)
+            else:
+                thread._output_queue.put(payload)
+
+        with patch.object(thread._input_queue, "put", side_effect=fake_put_fast):
+            response = thread.send_query("next", timeout=2.0)
+
+        payload = json.loads(response)
+        assert payload["content"] == "FRESH-next"
+        assert payload["content"] != "LATE"
+
+    def test_worker_overlapping_send_query_no_crosstalk(self, tmp_path: Path):
+        """Two concurrent send_query callers each get their own reply: the
+        per-caller reply queue carried in the (query_id, query, reply_q)
+        input item prevents reply stealing via the shared output queue."""
+        thread = WorkerThread(
+            name="overlap_test",
+            definition={},
+            agent_config={},
+            workspace_dir=tmp_path,
+        )
+        results = {}
+        errors = {}
+
+        def caller(name):
+            try:
+                results[name] = thread.send_query(name, timeout=5.0)
+            except Exception as exc:  # pragma: no cover - surfaced below
+                errors[name] = exc
+
+        ta = threading.Thread(target=caller, args=("q-A",))
+        tb = threading.Thread(target=caller, args=("q-B",))
+        ta.daemon = True
+        tb.daemon = True
+
+        def fake_worker():
+            # Consume both (query_id, query, reply_q) items, then answer each
+            # on ITS private reply queue.
+            items = []
+            for _ in range(2):
+                items.append(thread._input_queue.get(timeout=6.0))
+            for item in items:
+                qid, q = item[0], item[1]
+                time.sleep(0.2)
+                payload = json.dumps(
+                    {"content": f"reply-{q}", "status": "completed", "query_id": qid})
+                item[2].put(payload)
+
+        fake = threading.Thread(target=fake_worker)
+        fake.daemon = True
+        fake.start()
+        ta.start()
+        tb.start()
+        fake.join(timeout=6.0)
+        ta.join(timeout=6.0)
+        tb.join(timeout=6.0)
+
+        assert not fake.is_alive()
+        assert not ta.is_alive()
+        assert not tb.is_alive()
+        assert errors == {}
+        for x in ("q-A", "q-B"):
+            assert json.loads(results[x])["content"] == f"reply-{x}"
+
     # ═══════════════════════════════════════════════════════════════════
     #  Worker tool — list
     # ═══════════════════════════════════════════════════════════════════
@@ -1152,123 +1291,23 @@ class TestWorker:
         assert merged2.get("filesystem") == "read"
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  EditDockerfile
+#  EditDockerfile removal guard
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestEditDockerfile:
-    """Tests for EditDockerfile."""
+class TestEditDockerfileRemoved:
+    """EditDockerfile was removed: no registered tool class, no module, and no
+    worker blocklist entry — the vestigial container-config tool is gone."""
 
-    @patch("tools.workspace.edit_dockerfile.resolve_workspace_id", return_value="ws_test")
-    @patch("tools.workspace.edit_dockerfile._workspace_dir")
-    def test_append_instructions(self, mock_ws_dir, mock_resolve, tmp_path: Path):
-        """Append adds instructions to an existing Dockerfile."""
-        dockerfile_path = tmp_path / "Dockerfile"
-        dockerfile_path.write_text("FROM python:3.11-slim\n")
+    def test_not_in_registered_tool_classes(self):
+        import tools
+        names = {getattr(t, "tool", t.__name__) for t in tools.TOOL_CLASSES}
+        assert "EditDockerfile" not in names
 
-        mock_dir = MagicMock()
-        mock_dockerfile = MagicMock()
-        mock_dockerfile.exists.return_value = True
-        mock_dockerfile.read_text.return_value = "FROM python:3.11-slim\n"
-        mock_dir.__truediv__.return_value = mock_dockerfile
-        mock_ws_dir.return_value = mock_dir
+    def test_module_absent(self):
+        import importlib.util
+        assert importlib.util.find_spec("tools.workspace.edit_dockerfile") is None
 
-        # Patch write_text to actually write to our tmp_path
-        def _write_text(content, encoding="utf-8"):
-            dockerfile_path.write_text(content, encoding=encoding)
+    def test_not_in_worker_blocklist(self):
+        from tools.workspace.worker import _WORKER_BLOCKLIST
+        assert "EditDockerfile" not in _WORKER_BLOCKLIST
 
-        mock_dockerfile.write_text.side_effect = _write_text
-
-        tool = EditDockerfile(
-            instructions="RUN apt-get install -y curl",
-            workspace_path=str(tmp_path),
-        )
-        result = tool.execute()  # Returns plain string, not JSON
-
-        # Result should be the full new content
-        assert "FROM python:3.11-slim" in result
-        assert "RUN apt-get install -y curl" in result
-        assert "edit_dockerfile" in result  # timestamp comment
-
-    @patch("tools.workspace.edit_dockerfile.resolve_workspace_id", return_value="ws_test")
-    @patch("tools.workspace.edit_dockerfile._workspace_dir")
-    def test_creates_from_template(self, mock_ws_dir, mock_resolve, tmp_path: Path):
-        """Creates Dockerfile from template when it doesn't exist."""
-        dockerfile_path = tmp_path / "Dockerfile"
-
-        mock_dir = MagicMock()
-        mock_dockerfile = MagicMock()
-        mock_dockerfile.exists.return_value = False  # File doesn't exist yet
-
-        def _make_exist():
-            mock_dockerfile.exists.return_value = True
-
-        def _write_text(content, encoding="utf-8"):
-            dockerfile_path.write_text(content, encoding=encoding)
-            _make_exist()
-
-        def _read_text(encoding="utf-8"):
-            if dockerfile_path.exists():
-                return dockerfile_path.read_text(encoding=encoding)
-            return ""
-
-        mock_dockerfile.write_text.side_effect = _write_text
-        mock_dockerfile.read_text.side_effect = _read_text
-        mock_dir.__truediv__.return_value = mock_dockerfile
-        mock_ws_dir.return_value = mock_dir
-
-        # Patch the template path to point to our temp template
-        template_path = tmp_path / "resources" / "default_dockerfile.txt"
-        template_path.parent.mkdir(parents=True)
-        template_path.write_text("FROM test:latest\n")
-
-        with patch.object(
-            Path, "resolve",
-            return_value=Path(__file__).resolve().parent.parent.parent / "resources" / "default_dockerfile.txt",
-        ):
-            with patch.object(Path, "exists", return_value=True):
-                with patch.object(Path, "read_text", return_value="FROM test:latest\n"):
-                    tool = EditDockerfile(
-                        instructions="RUN echo hello",
-                        workspace_path=str(tmp_path),
-                    )
-                    result = tool.execute()
-
-        # Result should contain the template content + instructions
-        assert "FROM test:latest" in result
-        assert "RUN echo hello" in result
-        assert "edit_dockerfile" in result  # timestamp comment
-
-    def test_empty_instructions(self):
-        """Empty instructions returns error."""
-        tool = EditDockerfile(
-            instructions="   ",
-            workspace_path="/tmp/test_ws",
-        )
-        result = tool.execute()
-        parsed = json.loads(result)
-        assert "error" in parsed
-
-    @patch("tools.workspace.edit_dockerfile.resolve_workspace_id")
-    def test_no_workspace(self, mock_resolve):
-        """Returns error when no workspace ID can be resolved."""
-        mock_resolve.return_value = None
-        tool = EditDockerfile(
-            instructions="RUN echo hello",
-            workspace_path="/tmp/nonexistent",
-        )
-        result = tool.execute()
-        parsed = json.loads(result)
-        assert "error" in parsed
-        assert "No active workspace" in parsed["error"]
-
-    def test_timestamp_in_output(self):
-        """Timestamp comment includes ISO datetime."""
-        # This test validates the implementation creates a timestamp
-        from datetime import datetime
-        now = datetime.now()
-        timestamp_str = now.isoformat()
-        assert "T" in timestamp_str  # ISO format has T separator
-
-    def test_required_categories(self):
-        """EditDockerfile declares container:write."""
-        assert "container:write" in EditDockerfile.required_categories

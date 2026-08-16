@@ -806,5 +806,61 @@ class TestWlmWorkerDelegation(_RunSafetyPatches):
             self.assertEqual(len(thread._worker_ctx.user_history), 3)
 
 
+class TestTimeoutDoesNotPoisonNextQuery(_RunSafetyPatches):
+    """A soft timeout on one query must not poison the next query:
+    _timeout_triggered is reset per query, the next reply is delivered with
+    status None / telemetry.timeout_triggered False, and the next query is
+    recorded as last_completed_query."""
+
+    def test_timeout_then_successful_query(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            thread = make_thread(tmp, name="w-no-poison")
+            thread._agent = make_fake_agent("CRITICAL", "timeout")
+            thread._input_queue.put("query-1")
+            thread._input_queue.put("query-2")
+            thread._input_queue.put(None)
+
+            def fake_run_tool_loop(self, query):
+                if query == "query-1":
+                    # run()'s per-query reset cleared restriction_reason to
+                    # None; simulate the agent's own timeout-restriction being
+                    # applied before the timeout-detection snippet runs.
+                    self._agent.state.restriction_reason = "timeout"
+                    agent_state = self._agent.state
+                    if (
+                        hasattr(agent_state, "time_state")
+                        and hasattr(agent_state.time_state, "value")
+                        and agent_state.time_state.value == "CRITICAL"
+                        and getattr(agent_state, "restriction_reason", None) == "timeout"
+                    ):
+                        self._timeout_triggered = True
+                    self._last_elapsed_val = 12.3
+                    self._final_token_usage = self.get_current_context_tokens()
+                    return None
+                self._last_elapsed_val = 1.0
+                self._final_token_usage = self.get_current_context_tokens()
+                return "reply-2"
+
+            with mock.patch.object(
+                thread, "_run_tool_loop",
+                new=fake_run_tool_loop.__get__(thread, WorkerThread),
+            ):
+                thread.run()
+
+            raw1 = thread._output_queue.get_nowait()
+            env1 = json.loads(raw1)
+            self.assertEqual(env1["status"], "timeout")
+            self.assertIs(env1["telemetry"]["timeout_triggered"], True)
+            self.assertEqual(env1["content"], "Worker finished with no output.")
+
+            raw2 = thread._output_queue.get_nowait()
+            env2 = json.loads(raw2)
+            self.assertEqual(env2["content"], "reply-2")
+            self.assertIsNone(env2["status"])
+            self.assertIs(env2["telemetry"]["timeout_triggered"], False)
+            self.assertEqual(thread._last_completed_query, "query-2")
+
+
+
 if __name__ == "__main__":
     unittest.main()

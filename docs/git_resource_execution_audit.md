@@ -35,7 +35,7 @@ Verdicts: **PASS** (implemented as specified), **PARTIAL** (implemented with gap
 
 - Container path allows repo-local hooks: `tools/git_info_tool.py` L486-488 comment; `thoughtmachine/security.py` design note L70-76 (".git/hooks is deliberately NOT blocked: the resource container is the security boundary … the host fallback still neutralizes them via core.hooksPath=/dev/null").
 - Host path disables them: `tools/git_info_tool.py` L406-415 (`core.hooksPath=/dev/null`) + L416-419 (`--no-verify` on commit).
-- Commit flow: stage L896-898 → vault pre-commit hook L904-907 → `git commit` L909-910; repo-local hooks never consulted on the host path.
+- Commit flow: stage L896-898 → `git commit` L909-910; repo-local hooks never consulted on the host path.
 
 ## (d) Shared `.git/hooks/pre-commit` — NOT READABLE from this environment (gitfile indirection); repo `.githooks/pre-commit` inspected
 
@@ -43,10 +43,13 @@ Verdicts: **PASS** (implemented as specified), **PARTIAL** (implemented with gap
 - Repo-owned hook **`.githooks/pre-commit`** (tracked in workspace, readable): executable, 11,677 B, 279 lines. Content = "fast gate": (1) import `web_ui.backend.server`; (2) live health check on `127.0.0.1:<random-high-port>` via urllib, asserting `{"status":"ok"}` and `revision == git rev-parse HEAD`; (3) hermetic websocket smoke (starlette `TestClient`, temp HOME, patched `Path.home`, purged modules, `new_session(custom)` → `session_loaded`); (4) conditional pytest run of `tests/integration/test_session_creation_contract.py` only if steps 1-3 finish < 3 s, with `--ignore` for the RED test (exit 5 treated as SKIP). Python resolution `$PYTHON` → `.venv/bin/python` → `python3`; EXIT trap cleanup; `mktemp -d ${TMPDIR:-/tmp}/tm_precommit.XXXXXX`; `setsid` process-group kill. No `mcp_servers.json` creation anywhere.
 - `.pre-commit-config.yaml` is **absent** from the repo (verified via glob). Whether `.githooks` actually fires on commit depends on the operator's host `core.hooksPath` wiring — unverifiable from the sandbox.
 
-## (e) Vault hooks (`~/.thoughtmachine/hooks/<workspace_id>/`) — PASS but LATENT
+## (e) Vault hooks (`~/.thoughtmachine/hooks/<workspace_id>/`) — REMOVED
 
-- Implemented: `tools/git_info_tool.py` `_run_vault_hooks` L675-731 — docstring L676-688 (vault hooks are "the ONLY sanctioned extension point for policy injection"; repo-local `.git/hooks` never executed on the host); skip when no workspace_id L689-695; hook path `Path.home()/".thoughtmachine"/"hooks"/<workspace_id>/<hook_name>` L697-699; silent return if not a file L700-703; `SandboxedExecution` with `required_category="git:write"` L705-726 (L716-721) when `session_permissions is not None and git != 'ask'`; `RuntimeError` on non-zero exit L727-731. Only `pre-commit` is honored, in `_git_commit` L904-907.
-- **LATENT:** nothing creates `~/.thoughtmachine/hooks/`. `thoughtmachine/vault.py` `ensure_vault_structure` L51-72 creates only `VAULT_SUBDIRS` L40-48 (`system,user,credentials,workspaces,global,state,logs`); `vault.py` contains zero occurrences of `hooks`. The hook directory is never created and no sample hook is installed → the mechanism is dormant until an operator creates the directory + hooks.
+- `_run_vault_hooks` was deleted from `tools/git_info_tool.py`: vault-managed
+  hooks no longer exist and never run. Regression guards: `TestVaultHooksRemoved`
+  (tests/test_permission_routing_fix.py) and `test_vault_pre_commit_hook_never_runs`
+  (tests/security/test_git_hardening.py). Host commits use `--no-verify`; the
+  `~/.thoughtmachine/hooks/` directory is never created by any code path.
 
 ## (f) Linked-worktree / common git-dir resolution — PASS (empirical + code)
 
@@ -68,7 +71,7 @@ Verdicts: **PASS** (implemented as specified), **PARTIAL** (implemented with gap
 
 - Tool executor: `agent/core/tool_executor.py` L241-280 — `session_perms_obj` L242-244; gate path: `resolve_workspace_id` L249 → `get_workspace_capabilities` L250 → `get_effective_permissions` L251 → `check_required_categories` L253-263 (deny → error L264-265); injects `session_permissions` L269-272 and `effective_permissions` + `workspace_id` L274-279.
 - Security gate: `security/security_gate.py` `get_effective_permissions` L109-151 (filesystem write→read downgrade L127-128; `container = session.container AND workspace.allow_docker` L135; `git = min(session.git, workspace.git_available)` L138); `check_atomic_operation` L286-321 (ASK → DENIED L315-320); `check_required_categories` L329+; `get_expected_container_config` L159+.
-- GitInfoTool consumption: host `required_category` L434-437; container `check_atomic_operation` L470-484; vault hooks `git:write` L716-721.
+- GitInfoTool consumption: host `required_category` L434-437; container `check_atomic_operation` L470-484. (The former vault-hook `git:write` path L716-721 no longer exists — see (e).)
 - Capabilities storage: `thoughtmachine/workspace_capabilities.py` — defaults fully permissive L92-104; path `~/.thoughtmachine/workspaces/<id>/capabilities.json` L159-161; `load_workspace_capabilities` L164+.
 
 ## (i) Agent can edit workspace hooks — PASS (by design)
@@ -81,7 +84,7 @@ Verdicts: **PASS** (implemented as specified), **PARTIAL** (implemented with gap
 
 - No preflight exists: `'preflight'` → 0 matches in `tools/`, `infra/`, `agent/`, `thoughtmachine/` (NOT IMPLEMENTED — aspirational, see contract §5).
 - No pytest-list mechanism: `'pytest-list'` / `'test-list'` → 0 matches (NOT IMPLEMENTED — contract §6).
-- Vault hooks are the only sanctioned host-side extension point and are operator-owned: `tools/git_info_tool.py` L676-688 docstring.
+- Vault hooks (the former operator-owned host-side extension point, `tools/git_info_tool.py` L676-688 docstring) are REMOVED — see (e); no vault-managed hook runs on the host.
 - Host execution is hermetic: git runs inside `SandboxedExecution` (`_exec_host_raw` L421-448), so the agent cannot reach host code or the host filesystem outside the sandbox; `required_category` gates every host invocation (L434-437).
 
 ---
@@ -94,9 +97,9 @@ Verdicts: **PASS** (implemented as specified), **PARTIAL** (implemented with gap
 | (b) Host fallback git (hooks disabled, no Docker) | PASS |
 | (c) Hook execution boundary (container allows / host disables) | PASS (by design) |
 | (d) Shared `.git/hooks/pre-commit` | NOT READABLE from sandbox (gitfile); `.githooks/pre-commit` inspected (279 lines); `.pre-commit-config.yaml` absent |
-| (e) Vault hooks | PASS but LATENT (no creator of `~/.thoughtmachine/hooks/`) |
+| (e) Vault hooks | REMOVED (`_run_vault_hooks` deleted; `~/.thoughtmachine/hooks/` never created by any code path) |
 | (f) Linked-worktree / common git-dir resolution | PASS |
 | (g) ResourceContainerManager mounts/hardening | PASS |
 | (h) Permission propagation | PASS |
 | (i) Agent can edit workspace hooks | PASS (by design) |
-| (j) Agent cannot affect host preflight / host code | PASS (no preflight exists → NOT IMPLEMENTED; vault hooks only sanctioned extension point; host runs hermetic) |
+| (j) Agent cannot affect host preflight / host code | PASS (no preflight exists → NOT IMPLEMENTED; vault hooks REMOVED → no sanctioned host-side extension point; host runs hermetic) |

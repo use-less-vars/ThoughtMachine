@@ -29,6 +29,7 @@ import queue
 import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
@@ -395,7 +396,6 @@ logger = logging.getLogger(__name__)
 # (enabled_tools filtering and tool class resolution).
 _WORKER_BLOCKLIST: frozenset[str] = frozenset({
     "Worker",           # recursion: worker spawning workers
-    "EditDockerfile",    # container configuration
     "MCPValidator",      # MCP server management
     "CheckSystem",       # system/network/worker/infrastructure discovery
     "KnowledgeBaseTool", # persistent cross-session knowledge store
@@ -611,6 +611,18 @@ class WorkerThread(threading.Thread):
         self._wlm_soft_warning_received: bool = False
         self._final_token_usage: Optional[int] = None
         self._respond_metadata: Dict[str, Any] = {}  # captures status/confidence/meta from last Respond call
+        # Legacy query id of the in-flight attempt (set by run() when it
+        # dequeues a (query_id, query) tuple; None for plain-string producers
+        # such as the WLM handler). Stamped into the envelope so send_query
+        # can correlate replies even when multiple callers overlap.
+        self._current_query_id: Optional[str] = None
+        # Per-caller reply channel (set by run() when it dequeues a
+        # (query_id, query, reply_q) triple from send_query). Envelopes are
+        # routed to this private queue when set, so concurrent send_query
+        # callers can never steal each other's replies; the shared
+        # _output_queue remains the fallback for plain-string producers
+        # (WLM handler, spawn auto-query). None between queries.
+        self._current_reply_queue: Optional[queue.Queue] = None
 
         # Cached authoritative token count from agent's token_update events
         self._cached_context_tokens: Optional[int] = None
@@ -706,40 +718,114 @@ class WorkerThread(threading.Thread):
             return self._worker_ctx.estimated_context_tokens()
         return 0
 
+    @staticmethod
+    def _drain_queue(q: queue.Queue) -> None:
+        """Discard everything currently queued on ``q`` (get_nowait to empty)."""
+        while True:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break
+
+    def _drain_output_queue(self) -> None:
+        """Discard any stale replies currently sitting in the output queue.
+
+        A reply produced for a previous (timed-out or superseded) query must
+        never satisfy a later send_query call — drain before enqueueing and
+        again on timeout so late replies cannot leak into the next call.
+        """
+        self._drain_queue(self._output_queue)
+
+    def _emit_reply(self, payload: str, nowait: bool = False) -> None:
+        """Route a reply to the current caller's private reply queue when one
+        is set (legacy send_query correlation), else to the shared output
+        queue (plain-string producers: WLM handler, spawn auto-query).
+        """
+        target = (
+            self._current_reply_queue
+            if self._current_reply_queue is not None
+            else self._output_queue
+        )
+        if nowait:
+            target.put_nowait(payload)
+        else:
+            target.put(payload)
+
+    def _reply_matches_query(self, response: str, query_id: str) -> bool:
+        """Return True when a queue item is the envelope for ``query_id``.
+
+        Envelopes produced by the run() loop carry a ``query_id`` key; plain
+        strings (error payloads, legacy replies) and envelopes without a
+        matching id cannot satisfy a correlated send_query call.
+        """
+        try:
+            payload = json.loads(response)
+        except (json.JSONDecodeError, TypeError):
+            return False
+        if not isinstance(payload, dict) or "query_id" not in payload:
+            return False
+        return payload["query_id"] == query_id
+
     def send_query(self, query: str, timeout: float = 120.0) -> str:
         """Send a query to this worker and block for a response."""
         # Workspace Lifecycle Manager fast path (feature-flagged, default off)
         used, reply = self._process_query_via_wlm(query, timeout=timeout)
         if used:
             return reply
-        # Push query before checking heartbeat (query clears the queue)
-        self._input_queue.put(query)
-        try:
-            response = self._output_queue.get(timeout=timeout)
-            return response
-        except queue.Empty:
-            # Fallback: read heartbeat from status.json if in-memory is None
-            hb = self.last_heartbeat
-            if hb is None:
-                try:
-                    status_path = self._worker_dir / "status.json"
-                    if status_path.exists():
-                        data = json.loads(status_path.read_text(encoding="utf-8"))
-                        hb = data.get("last_heartbeat")
-                except (OSError, json.JSONDecodeError):
-                    pass
-            if hb:
-                try:
-                    hb_dt = datetime.fromisoformat(hb)
-                    age = (datetime.now(timezone.utc) - hb_dt).total_seconds()
-                    detail = f" (last heartbeat {age:.0f}s ago)"
-                except (ValueError, TypeError):
-                    detail = f" (last heartbeat: {hb})"
-            else:
-                detail = ""
-            raise TimeoutError(
-                f"Worker '{self.worker_name}' did not respond within {timeout}s{detail}"
-            )
+        # Correlate this call with a fresh query id and drain any stale
+        # replies left over from a previous timed-out query, so a late reply
+        # can never satisfy this (or the next) call. The worker run() loop
+        # dequeues the (query_id, query) tuple and echoes the id back in the
+        # envelope it produces.
+        self._drain_output_queue()
+        query_id = uuid.uuid4().hex
+        # Each call gets its own private reply queue, carried to the run()
+        # loop inside the input item. The worker routes its envelope to this
+        # queue, so two concurrent send_query callers can never steal each
+        # other's replies (the shared _output_queue is only a fallback for
+        # plain-string producers). The correlation check below is kept as
+        # defense in depth.
+        reply_q: queue.Queue = queue.Queue()
+        self._input_queue.put((query_id, query, reply_q))
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            try:
+                response = reply_q.get(timeout=remaining if remaining > 0 else 0)
+            except queue.Empty:
+                # Drain our private queue AND the shared fallback queue so a
+                # late reply (on either channel) cannot leak into the next
+                # call. Our queue is dropped anyway (local to this call), but
+                # the drain keeps the invariant explicit.
+                self._drain_queue(reply_q)
+                self._drain_output_queue()
+                # Fallback: read heartbeat from status.json if in-memory is None
+                hb = self.last_heartbeat
+                if hb is None:
+                    try:
+                        status_path = self._worker_dir / "status.json"
+                        if status_path.exists():
+                            data = json.loads(status_path.read_text(encoding="utf-8"))
+                            hb = data.get("last_heartbeat")
+                    except (OSError, json.JSONDecodeError):
+                        pass
+                if hb:
+                    try:
+                        hb_dt = datetime.fromisoformat(hb)
+                        age = (datetime.now(timezone.utc) - hb_dt).total_seconds()
+                        detail = f" (last heartbeat {age:.0f}s ago)"
+                    except (ValueError, TypeError):
+                        detail = f" (last heartbeat: {hb})"
+                else:
+                    detail = ""
+                raise TimeoutError(
+                    f"Worker '{self.worker_name}' did not respond within {timeout}s{detail}"
+                )
+            if self._reply_matches_query(response, query_id):
+                return response
+            # Non-matching item: a stale envelope or another caller's reply.
+            # Discard it and keep waiting for our own envelope.
+            continue
 
     # ------------------------------------------------------------------
     # Workspace Lifecycle Manager wiring (feature-flagged, default off).
@@ -1373,11 +1459,25 @@ class WorkerThread(threading.Thread):
                 # Wait for the next query with a 2-second timeout
                 # so we can also poll for command.json periodically
                 try:
-                    query = self._input_queue.get(timeout=2.0)
+                    raw = self._input_queue.get(timeout=2.0)
                 except queue.Empty:
                     continue
-                if query is None or self._stop_event.is_set():
+                if raw is None or self._stop_event.is_set():
                     break
+                # send_query enqueues (query_id, query[, reply_q]) tuples so
+                # replies can be correlated and routed to the caller's private
+                # queue; plain-string producers (WLM handler, initial
+                # auto-query, stop/pause markers) carry no id and keep the
+                # shared _output_queue fallback.
+                if isinstance(raw, tuple) and len(raw) == 3:
+                    query_id, query, reply_q = raw
+                elif isinstance(raw, tuple) and len(raw) == 2:
+                    query_id, query = raw
+                    reply_q = None
+                else:
+                    query_id, query, reply_q = None, raw, None
+                self._current_query_id = query_id
+                self._current_reply_queue = reply_q
 
                 # F1: record the most recent query dequeued (even if it times
                 # out mid-attempt) so a later force-respawn can tell whether
@@ -1389,18 +1489,22 @@ class WorkerThread(threading.Thread):
                     agent_cfg = self._build_agent_config()
                     if agent_cfg is None:
                         reply = json.dumps({
-                            "error": "Cannot create Agent: invalid agent_config"
+                            "error": "Cannot create Agent: invalid agent_config",
+                            **({"query_id": self._current_query_id}
+                               if self._current_query_id is not None else {}),
                         })
-                        self._output_queue.put(reply)
+                        self._emit_reply(reply)
                         break
                     # Lazy import to avoid circular dep: agent.core.agent ↔ tools
                     try:
                         from agent.core.agent import Agent
                     except ImportError:
                         reply = json.dumps({
-                            "error": "Cannot create Agent: module not importable"
+                            "error": "Cannot create Agent: module not importable",
+                            **({"query_id": self._current_query_id}
+                               if self._current_query_id is not None else {}),
                         })
-                        self._output_queue.put(reply)
+                        self._emit_reply(reply)
                         break
 
                     # Publish WORKER_SPAWNED is now handled earlier in run() —
@@ -1449,6 +1553,10 @@ class WorkerThread(threading.Thread):
                     self._agent.state.time_start = time.time()
                     if TimeState is not None:
                         self._agent.state.last_time_warning_state = TimeState.LOW
+                # A soft timeout is per-query: clear the sticky flag so the
+                # next query starts fresh (same per-query reset semantics as
+                # the turn/time state above, but independent of the agent).
+                self._timeout_triggered = False
 
                 reply = self._run_tool_loop(query)
 
@@ -1485,8 +1593,18 @@ class WorkerThread(threading.Thread):
                         self._worker_ctx.compact_after_summary()
                     self._save_context()
 
-                    # Send the pause response back to the waiting tool call
-                    self._output_queue.put(reply)
+                    # Send the pause response back to the waiting tool call.
+                    # A correlated (legacy send_query) caller needs the query id
+                    # echoed so it can accept the reply; plain-string producers
+                    # (WLM handler, spawn auto-query) keep the raw reply.
+                    if self._current_query_id is not None:
+                        self._emit_reply(json.dumps({
+                            "content": reply,
+                            "status": "paused",
+                            "query_id": self._current_query_id,
+                        }))
+                    else:
+                        self._emit_reply(reply)
 
                     # Block until resumed (or stopped)
                     while self._pause_event.is_set() and not self._stop_event.is_set():
@@ -1605,6 +1723,14 @@ class WorkerThread(threading.Thread):
                     "telemetry": telemetry,
                 }
 
+                # Legacy path: expose this attempt's query id in the envelope
+                # so send_query can correlate replies even when multiple
+                # callers overlap. The WLM block below keeps precedence when
+                # the supervisor is active (plain-string producer, so this
+                # legacy stamp stays None in that case anyway).
+                if self._current_query_id is not None:
+                    envelope["query_id"] = self._current_query_id
+
                 # WLM: expose the supervisor's query id in the envelope so the
                 # caller can correlate the reply with the lifecycle manager.
                 if self._wlm_flag_enabled() and getattr(self, "_wlm", None) is not None:
@@ -1626,7 +1752,7 @@ class WorkerThread(threading.Thread):
                     except (json.JSONDecodeError, TypeError):
                         envelope["content"] = reply
 
-                self._output_queue.put(json.dumps(envelope, default=str))
+                self._emit_reply(json.dumps(envelope, default=str))
 
         except Exception as exc:
             logger.exception("Worker thread %s failed", self.worker_name)
@@ -1634,9 +1760,13 @@ class WorkerThread(threading.Thread):
             self.error = str(exc)
             self._write_status_file()
             # Put the error into the output queue so any waiting query call gets it
-            error_json = json.dumps({"error": str(exc)})
+            error_json = json.dumps({
+                "error": str(exc),
+                **({"query_id": self._current_query_id}
+                   if self._current_query_id is not None else {}),
+            })
             try:
-                self._output_queue.put_nowait(error_json)
+                self._emit_reply(error_json, nowait=True)
             except queue.Full:
                 pass
             self._publish_event('worker_error', {'error': str(exc)})
