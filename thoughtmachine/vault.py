@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import shutil
 from pathlib import Path
 
@@ -28,9 +29,13 @@ logger = logging.getLogger(__name__)
 def vault_root() -> Path:
     """Return the absolute path to the user's ThoughtMachine vault directory.
 
-    Typically ``~/.thoughtmachine/`` on Linux/macOS or the equivalent
-    on Windows.
+    Honors the ``THOUGHTMACHINE_VAULT_ROOT`` environment variable when set
+    (useful for tests and multi-profile setups); otherwise returns
+    ``~/.thoughtmachine/`` on Linux/macOS or the equivalent on Windows.
     """
+    override = os.environ.get("THOUGHTMACHINE_VAULT_ROOT")
+    if override:
+        return Path(override).expanduser().resolve()
     return Path.home() / ".thoughtmachine"
 
 
@@ -190,44 +195,92 @@ def ensure_vault_defaults(
     return created
 
 
+# Legacy single-file path (pre-provenance layout) — read only for promotion.
 _RESOURCE_DOCKERFILE_RELPATH = "docker/resource/Dockerfile"
+# Authoritative build-file directory: the vault's resource-image build seeds.
+_RESOURCE_BUILD_DIR_RELPATH = "docker/resource"
 
 
-def ensure_resource_dockerfile(
+def ensure_resource_build_files(
     resources_dir: Path,
+    repo_root: Path,
     overwrite_existing: bool = False,
 ) -> list[str]:
-    """Seed the vault-managed runtime Dockerfile.
+    """Seed the vault-managed resource-image build files (authoritative).
 
-    Copies ``resources/default_dockerfile.txt`` — the repo's UNIFIED runtime
-    Dockerfile, the single source for BOTH the executor image and the
-    ``tm-resource-git`` resource image — to
-    ``~/.thoughtmachine/docker/resource/Dockerfile``. The vault copy is the
-    manual-build fallback only: auto-builds read the repo file directly, and
-    the manual command is ``docker build -t tm-resource-git -f
-    resources/default_dockerfile.txt .``. Seeding a copy into the vault —
-    which is agent-write-blocked — keeps a fallback image definition out of
-    agent reach.
+    The vault directory ``~/.thoughtmachine/docker/resource/`` is the
+    AUTHORITATIVE source for resource-image builds (see
+    ``infra/resource_container_manager.py``): auto-builds read these vault
+    files only, never the repo directly, so the image definition cannot be
+    tampered with from the agent workspace.  Deploys:
 
-    Callers MUST pass ``overwrite_existing=False`` (the default): an existing
-    vault copy is a trust anchor and must never be replaced by bootstrap.
+    * ``default_runtime.Dockerfile``  — from ``resources/default_dockerfile.txt``
+    * ``git_overlay.Dockerfile``      — from ``resources/git_resource_overlay_dockerfile.txt``
+    * ``requirements.txt``            — from ``<repo_root>/requirements.txt``
+
+    If a legacy vault copy at ``docker/resource/Dockerfile`` exists (from a
+    pre-provenance release), it is PROMOTED into the authoritative
+    ``default_runtime.Dockerfile`` slot: an existing vault copy is a trust
+    anchor and wins over the repo seed.
+
+    Callers MUST pass ``overwrite_existing=False`` (the default): existing
+    vault copies are trust anchors and must never be replaced by bootstrap.
 
     Args:
         resources_dir: Absolute path to the project-level ``resources/``
             directory.
-        overwrite_existing: If ``True``, overwrite an existing vault copy.
+        repo_root: Absolute path to the repository root (parent of
+            ``resources/``) — source of ``requirements.txt``.
+        overwrite_existing: If ``True``, overwrite existing vault copies.
             Keep ``False`` (the default) — see docstring above.
 
     Returns:
         A list of absolute paths to files that were written.
     """
     created: list[str] = []
+    build_dir = vault_root() / _RESOURCE_BUILD_DIR_RELPATH
+    # Promote a legacy vault Dockerfile (pre-provenance layout) into the
+    # authoritative runtime slot when present.
+    legacy_dockerfile = vault_root() / _RESOURCE_DOCKERFILE_RELPATH
+    runtime_source = (
+        legacy_dockerfile if legacy_dockerfile.exists()
+        else resources_dir / "default_dockerfile.txt"
+    )
     _copy_resource(
-        resources_dir / "default_dockerfile.txt",
-        vault_root() / _RESOURCE_DOCKERFILE_RELPATH,
+        runtime_source,
+        build_dir / "default_runtime.Dockerfile",
+        overwrite_existing, created,
+    )
+    _copy_resource(
+        resources_dir / "git_resource_overlay_dockerfile.txt",
+        build_dir / "git_overlay.Dockerfile",
+        overwrite_existing, created,
+    )
+    _copy_resource(
+        repo_root / "requirements.txt",
+        build_dir / "requirements.txt",
         overwrite_existing, created,
     )
     return created
+
+
+def ensure_resource_dockerfile(
+    resources_dir: Path,
+    overwrite_existing: bool = False,
+) -> list[str]:
+    """DEPRECATED — legacy single-file seeder, kept for backward compatibility.
+
+    Prefer :func:`ensure_resource_build_files`, which seeds the three
+    authoritative build files (runtime Dockerfile, git overlay, pinned
+    requirements).  This wrapper delegates to it; the legacy
+    ``docker/resource/Dockerfile`` path is no longer written here (an existing
+    legacy copy is promoted by :func:`ensure_resource_build_files`).
+    """
+    return ensure_resource_build_files(
+        resources_dir,
+        resources_dir.parent,
+        overwrite_existing=overwrite_existing,
+    )
 
 
 def load_factory_defaults() -> dict:
