@@ -12,6 +12,8 @@ These tests deliberately use their OWN fakes (no imports from
 independent.
 """
 
+import os
+
 import pytest
 
 import infra.resource_container_manager as rcm
@@ -56,10 +58,12 @@ class _FakeImages:
         self.labels = labels
         self.get_error = get_error
         self.remove_error = remove_error
+        self.get_calls = []
         self.build_calls = []
         self.remove_calls = []
 
     def get(self, tag):
+        self.get_calls.append(tag)
         if self.get_error is not None:
             raise self.get_error
         if not self.present:
@@ -216,7 +220,7 @@ def _reset_image_ready():
 
 def _repo_build_hash():
     return rcm.compute_resource_build_hash(
-        rcm.REPO_REQUIREMENTS, rcm.REPO_RESOURCE_DOCKERFILE
+        rcm.REPO_REQUIREMENTS, rcm.REPO_RUNTIME_DOCKERFILE
     )
 
 
@@ -240,6 +244,20 @@ def _fresh_images(image_id="sha256:img-current", get_error=None):
 def _monkeypatch_docker(monkeypatch, docker_mod):
     monkeypatch.setattr(rcm, "docker", docker_mod)
     return docker_mod
+
+
+def _mount_source(mount):
+    """Read the source path from a docker Mount (dict in docker-py 7.x)."""
+    if isinstance(mount, dict):
+        return mount.get("Source") or mount.get("source")
+    return getattr(mount, "source", None)
+
+
+def _mount_target(mount):
+    """Read the target path from a docker Mount (dict in docker-py 7.x)."""
+    if isinstance(mount, dict):
+        return mount.get("Target") or mount.get("target")
+    return getattr(mount, "target", None)
 
 
 # ------------------------------------------------- resource_status tests
@@ -602,3 +620,52 @@ def test_sweep_remove_error_collected(monkeypatch):
     result = rcm.sweep_stale_resource_containers(["ws-1"])
     assert result["removed"] == 0
     assert "remove boom" in result["detail"]
+
+
+# ------------------------------------- ensure_resource container mounts tests
+
+
+def test_resource_container_has_no_venv_bind_mount(monkeypatch, tmp_path):
+    """The resource container mounts the workspace ONLY (no .venv bind)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    images = _fresh_images()
+    containers = _FakeContainers()
+    _monkeypatch_docker(
+        monkeypatch, _FakeDockerModule(images=images, containers=containers)
+    )
+    mgr = rcm.ResourceContainerManager(workspace_id="ws-1", workspace_path=str(ws))
+    mgr.ensure_resource("git")
+    assert len(containers.run_calls) == 1
+    kwargs = containers.run_calls[0]
+    mounts = kwargs["mounts"]
+    assert len(mounts) == 1
+    for mount in mounts:
+        source = _mount_source(mount)
+        target = _mount_target(mount)
+        assert source is not None
+        assert target is not None
+        assert os.path.basename(str(source)) != ".venv"
+        assert os.path.basename(str(target)) != ".venv"
+        assert not str(source).endswith(".venv")
+        assert not str(target).endswith(".venv")
+    # the single mount is the workspace bind at /workspace
+    assert _mount_target(mounts[0]) == "/workspace"
+    assert _mount_source(mounts[0]) == str(ws)
+
+
+def test_resource_container_run_command_is_tail_dev_null(monkeypatch, tmp_path):
+    """The resource container must stay alive via tail -f /dev/null."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    images = _fresh_images()
+    containers = _FakeContainers()
+    _monkeypatch_docker(
+        monkeypatch, _FakeDockerModule(images=images, containers=containers)
+    )
+    mgr = rcm.ResourceContainerManager(workspace_id="ws-1", workspace_path=str(ws))
+    mgr.ensure_resource("git")
+    assert len(containers.run_calls) == 1
+    kwargs = containers.run_calls[0]
+    assert kwargs["command"] == ["tail", "-f", "/dev/null"]
+

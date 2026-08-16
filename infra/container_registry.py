@@ -381,7 +381,7 @@ class ContainerRegistry:
           mem/cpu    "512m" / 50000; oom_score_adj 500 (resource default)
           mounts     /workspace bind ALWAYS rw (added from workspace_path)
                      + caller-supplied extras (linked-worktree main repo rw,
-                     .venv ro) — resolved by the caller
+                     resolved by the caller)
           no package volume / no PYTHONUSERBASE (absent by design, §6.2)
         ``network_mode`` defaults to "none" when falsy (fail closed, §6.3).
 
@@ -424,6 +424,7 @@ class ContainerRegistry:
 
         profile = ContainerProfile(
             image=RESOURCE_IMAGE_TAG,
+            command=list(DEFAULT_COMMAND),
             container_type="resource",
             network_mode=network_mode or "none",
             mem_limit=RESOURCE_MEM_LIMIT,
@@ -480,7 +481,7 @@ class ContainerRegistry:
             f"Resource image '{RESOURCE_IMAGE_TAG}' is not available "
             f"(auto-build failed or Docker unreachable). "
             f"Build it manually: docker build -t {RESOURCE_IMAGE_TAG} "
-            f"<vault_root>/docker/resource"
+            f"-f resources/default_dockerfile.txt ."
         )
 
     def get_containers_for_session(self, session_id) -> list:

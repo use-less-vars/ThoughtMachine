@@ -42,14 +42,11 @@ Security model
   index, so ``read_only=False``. This intentionally DIVERGES from the
   executor's tmpfs-shadowing of ``/workspace/.git``: the resource container's
   purpose is to operate on the REAL git metadata. Blast radius is bounded by
-  no network / no socket / no vault / read-only rootfs. Two documented extra
-  mounts: (1) for a git linked worktree (``.git`` is a ``gitdir:`` pointer
-  file) the MAIN repository is additionally bind-mounted at its original
-  host path so the pointer resolves inside the container (see
-  ``_resolve_worktree_main_repo``); (2) the project's ``.venv`` is
-  bind-mounted READ-ONLY at its original host path so the pre-commit hook
-  can run pytest with the workspace's exact dependencies (see
-  ``_resolve_venv``).
+  no network / no socket / no vault / read-only rootfs. One documented extra
+  mount: for a git linked worktree (``.git`` is a ``gitdir:`` pointer file)
+  the MAIN repository is additionally bind-mounted at its original host path
+  so the pointer resolves inside the container (see
+  ``_resolve_worktree_main_repo``).
 
 Exec semantics
 --------------
@@ -83,27 +80,22 @@ except ImportError:  # pragma: no cover - environment without docker SDK
     Mount = None
 
 
-# The resource image Dockerfile is defined in the VAULT (agent-write-blocked)
-# at <vault>/docker/resource/Dockerfile; resolve it via the shared resolver
-# (thoughtmachine.vault.vault_root, i.e. ~/.thoughtmachine).
-from thoughtmachine.vault import vault_root
-
-
 _LOG = logging.getLogger(__name__)
 
-# Resource image identity. The image is auto-built from THIS repo's pinned
-# sources — <repo>/requirements.txt and <repo>/resources/resource_dockerfile.txt
-# (the trusted code base; agent workspaces are separate directories, so the
-# image definition cannot be tampered with from a workspace). The vault copy
+# Resource image identity. The image is auto-built from THIS repo's unified
+# runtime Dockerfile — <repo>/resources/default_dockerfile.txt plus the
+# pinned <repo>/requirements.txt (the trusted code base; agent workspaces
+# are separate directories, so the image definition cannot be tampered with
+# from a workspace). The SAME file is the single source for both the
+# executor image and the tm-resource-git resource image; the vault copy
 # (~/.thoughtmachine/docker/resource/Dockerfile, seeded from
-# resources/resource_dockerfile.txt) is kept only as the manual-build
+# resources/default_dockerfile.txt) is kept only as the manual-build
 # fallback. Every auto-built image carries a thoughtmachine.build_hash label
 # (sha256 of the exact bytes built) so a stale image — built from older
 # sources — is detected and rebuilt on drift.
 RESOURCE_IMAGE_TAG = "tm-resource-git"
-RESOURCE_IMAGE_DOCKERFILE_DIR = vault_root() / "docker" / "resource"
 RESOURCE_IMAGE_BUILD_CMD = (
-    f"docker build -t {RESOURCE_IMAGE_TAG} {RESOURCE_IMAGE_DOCKERFILE_DIR}"
+    f"docker build -t {RESOURCE_IMAGE_TAG} -f resources/default_dockerfile.txt ."
 )
 
 # Known hidden resources. Every entry runs inside the same hardened
@@ -117,8 +109,8 @@ RESOURCE_REGISTRY = {
 RESOURCE_BUILD_HASH_LABEL = "thoughtmachine.build_hash"
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO_REQUIREMENTS = os.path.join(_REPO_ROOT, "requirements.txt")
-REPO_RESOURCE_DOCKERFILE = os.path.join(
-    _REPO_ROOT, "resources", "resource_dockerfile.txt"
+REPO_RUNTIME_DOCKERFILE = os.path.join(
+    _REPO_ROOT, "resources", "default_dockerfile.txt"
 )
 
 # Phase 3: optional ContainerRegistry delegation behind the session-config
@@ -155,8 +147,8 @@ def compute_resource_build_hash(requirements_path, dockerfile_path) -> str:
 
     Args:
         requirements_path: Path to the repo ``requirements.txt``.
-        dockerfile_path: Path to the resource Dockerfile source
-            (``resources/resource_dockerfile.txt``).
+        dockerfile_path: Path to the runtime Dockerfile source
+            (``resources/default_dockerfile.txt``).
 
     Returns:
         str: 64-char hex digest.
@@ -172,7 +164,7 @@ def _prepare_resource_build_context():
     """Stage the repo build sources into a fresh temp directory.
 
     Copies ``<repo>/requirements.txt`` -> ``<tmp>/requirements.txt`` and
-    ``<repo>/resources/resource_dockerfile.txt`` -> ``<tmp>/Dockerfile`` so the
+    ``<repo>/resources/default_dockerfile.txt`` -> ``<tmp>/Dockerfile`` so the
     docker build context contains ONLY the pinned sources (never the whole
     repo). The build hash is computed from the same bytes that are copied.
 
@@ -183,13 +175,13 @@ def _prepare_resource_build_context():
     try:
         with open(REPO_REQUIREMENTS, "rb") as fh:
             requirements_bytes = fh.read()
-        with open(REPO_RESOURCE_DOCKERFILE, "rb") as fh:
+        with open(REPO_RUNTIME_DOCKERFILE, "rb") as fh:
             dockerfile_bytes = fh.read()
     except OSError as exc:
         _LOG.warning(
             "Cannot read resource image build sources (%s, %s): %s",
             REPO_REQUIREMENTS,
-            REPO_RESOURCE_DOCKERFILE,
+            REPO_RUNTIME_DOCKERFILE,
             exc,
         )
         return None
@@ -236,7 +228,7 @@ def _ensure_resource_image() -> bool:
     """Ensure ``tm-resource-git`` exists and matches the repo build sources.
 
     The image is auto-built from THIS repo's pinned sources (``requirements.txt``
-    + ``resources/resource_dockerfile.txt``, staged into a temp build context)
+    + ``resources/default_dockerfile.txt``, staged into a temp build context)
     and tagged with a ``thoughtmachine.build_hash`` label (sha256 of the exact
     bytes built). Drift detection: an existing image whose label is missing or
     does not match the current repo sources is rebuilt, so a stale image is
@@ -371,27 +363,6 @@ def is_resource_image_available() -> bool:
         return False
 
 
-def _resolve_venv(workspace_path):
-    """Find the project's ``.venv`` directory, or None.
-
-    Walks up from ``workspace_path`` looking for a ``.venv`` directory (the
-    conventional virtualenv location) and returns the first one found, or
-    None if none exists. Mirrors the host-path discovery pattern used for
-    the linked-worktree main-repo mount (``_resolve_worktree_main_repo``).
-    """
-    if not workspace_path:
-        return None
-    path = os.path.abspath(str(workspace_path))
-    while True:
-        candidate = os.path.join(path, ".venv")
-        if os.path.isdir(candidate):
-            return candidate
-        parent = os.path.dirname(path)
-        if parent == path:
-            return None
-        path = parent
-
-
 def _resolve_worktree_main_repo(workspace_path, vault_root=None):
     """Resolve the MAIN repository of a git linked worktree, or None.
 
@@ -520,12 +491,12 @@ class ResourceContainerManager:
             than an explicit grant must stay 'none'.
         image: Image to run. Default 'tm-resource-git' — auto-built from
             the repo's pinned sources (``<repo>/requirements.txt`` +
-            ``resources/resource_dockerfile.txt``; the trusted code base, not
+            ``resources/default_dockerfile.txt``; the trusted code base, not
             the agent workspace, so the image definition cannot be tampered
             with). Every auto-built image carries a ``thoughtmachine.build_hash``
             label so a stale image is rebuilt on drift. Manual fallback::
 
-                docker build -t tm-resource-git ~/.thoughtmachine/docker/resource/
+                docker build -t tm-resource-git -f resources/default_dockerfile.txt .
         vault_root: Reserved for future audit/config use; NEVER mounted into
             the container.
         session_config: Optional session config dict; the registry feature
@@ -637,7 +608,7 @@ class ResourceContainerManager:
             str: the container id (full id).
         """
         # The image is required even for the reuse path; auto-build it (from
-        # the vault-managed Dockerfile) when it is missing.
+        # the repo's unified runtime Dockerfile) when it is missing.
         if not _ensure_resource_image():
             raise RuntimeError(
                 f"Resource image '{RESOURCE_IMAGE_TAG}' is not available "
@@ -691,7 +662,7 @@ class ResourceContainerManager:
         """Create a fresh hardened resource container (no reuse logic).
 
         Builds the workspace bind mount (rw) plus the optional
-        linked-worktree main-repo and read-only .venv mounts, then creates
+        linked-worktree main-repo mount, then creates
         the container via the registry facade (when active) or
         ``client.containers.run`` with the full hardening set.
 
@@ -708,9 +679,8 @@ class ResourceContainerManager:
         # Workspace bind mount, READ-WRITE: git writes .git + index on the
         # REAL workspace. Documented divergence from the executor's ro/.git-
         # tmpfs scheme — this container's whole purpose is operating on git
-        # metadata; isolation comes from it being the ONLY mount (two
-        # documented exceptions: the linked-worktree main repo and the
-        # read-only .venv below).
+        # metadata; isolation comes from it being the ONLY mount (one
+        # documented exception: the linked-worktree main repo).
         mounts = [
             Mount(
                 target="/workspace",
@@ -738,27 +708,6 @@ class ResourceContainerManager:
                     read_only=False,
                 )
             )
-        # .venv bind mount, READ-ONLY: expose the project's virtualenv at its
-        # ORIGINAL host path so the pre-commit hook can run pytest with the
-        # workspace's exact dependencies. Read-only keeps the sandbox safe —
-        # the container never mutates the venv. Skipped (with a warning) when
-        # no .venv exists; the hook then just won't run.
-        venv_path = _resolve_venv(self.workspace_path)
-        if venv_path:
-            mounts.append(
-                Mount(
-                    target=venv_path,
-                    source=venv_path,
-                    type="bind",
-                    read_only=True,
-                )
-            )
-        else:
-            _LOG.warning(
-                "No .venv found for workspace %s — pre-commit hook pytest "
-                "run unavailable (skipping .venv mount)",
-                self.workspace_path,
-            )
         # tmpfs (same entries as ContainerManager.start / docker_executor,
         # minus the /workspace/.git shadow — we need the real .git).
         tmpfs = {
@@ -770,8 +719,8 @@ class ResourceContainerManager:
                 # Phase 3: the registry facade owns the hardened create
                 # (design doc §6.2). The /workspace bind is always added by
                 # the registry from workspace_path (rw); the linked-worktree
-                # main-repo and .venv mounts computed above are passed as
-                # extras. The registry returns the same shape of handle; its
+                # main-repo mount computed above is passed as an extra. The
+                # registry returns the same shape of handle; its
                 # create failure is wrapped identically below.
                 handle = self._registry.create_resource_container(
                     session_id=self.session_id or "resource",
@@ -1238,7 +1187,7 @@ def resource_status(name, workspace_id=None, session_permissions=None):
                 detail="docker unavailable: from_env() returned None",
             )
         build_hash = compute_resource_build_hash(
-            REPO_REQUIREMENTS, REPO_RESOURCE_DOCKERFILE
+            REPO_REQUIREMENTS, REPO_RUNTIME_DOCKERFILE
         )
         try:
             image = client.images.get(RESOURCE_IMAGE_TAG)

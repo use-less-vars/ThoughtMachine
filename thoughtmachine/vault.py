@@ -197,14 +197,17 @@ def ensure_resource_dockerfile(
     resources_dir: Path,
     overwrite_existing: bool = False,
 ) -> list[str]:
-    """Seed the vault-managed git sandbox image Dockerfile.
+    """Seed the vault-managed runtime Dockerfile.
 
-    Copies ``resources/resource_dockerfile.txt`` to
-    ``~/.thoughtmachine/docker/resource/Dockerfile`` (the build context used
-    by ``infra.resource_container_manager`` to auto-build the
-    ``tm-resource-git`` image). Seeding the Dockerfile into the vault — which
-    is agent-write-blocked — keeps the image definition out of agent reach:
-    the image can never be built from a tampered file.
+    Copies ``resources/default_dockerfile.txt`` — the repo's UNIFIED runtime
+    Dockerfile, the single source for BOTH the executor image and the
+    ``tm-resource-git`` resource image — to
+    ``~/.thoughtmachine/docker/resource/Dockerfile``. The vault copy is the
+    manual-build fallback only: auto-builds read the repo file directly, and
+    the manual command is ``docker build -t tm-resource-git -f
+    resources/default_dockerfile.txt .``. Seeding a copy into the vault —
+    which is agent-write-blocked — keeps a fallback image definition out of
+    agent reach.
 
     Callers MUST pass ``overwrite_existing=False`` (the default): an existing
     vault copy is a trust anchor and must never be replaced by bootstrap.
@@ -220,7 +223,7 @@ def ensure_resource_dockerfile(
     """
     created: list[str] = []
     _copy_resource(
-        resources_dir / "resource_dockerfile.txt",
+        resources_dir / "default_dockerfile.txt",
         vault_root() / _RESOURCE_DOCKERFILE_RELPATH,
         overwrite_existing, created,
     )

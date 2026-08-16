@@ -98,7 +98,8 @@ def ensure_user_defaults(overwrite_existing: bool = False) -> list[str]:
     1. Create the vault compartment structure via ``ensure_vault_structure()``.
     2. Deploy all spec files via ``ensure_vault_defaults()`` (factory defaults,
        provider config, system prompts, registry stubs, etc).
-    2b. Seed the vault-managed resource image Dockerfile via
+    2b. Seed the vault-managed unified runtime Dockerfile (single source for
+       both the executor image and the tm-resource-git resource image) via
        ``ensure_resource_dockerfile()`` (never overwritten).
     3. Deploy individual resource files from the manifest.
     4. Deploy directories from the manifest (e.g., worker_templates).
@@ -124,9 +125,10 @@ def ensure_user_defaults(overwrite_existing: bool = False) -> list[str]:
     # Step 2: Deploy all spec files via vault defaults
     created.extend(ensure_vault_defaults(_resources_dir(), overwrite_existing))
 
-    # Step 2b: Seed the vault-managed resource image Dockerfile. Hard-coded
-    # overwrite_existing=False: an existing vault copy is a trust anchor and
-    # must never be replaced by bootstrap.
+    # Step 2b: Seed the vault-managed unified runtime Dockerfile (single
+    # source for both the executor image and the tm-resource-git resource
+    # image). Hard-coded overwrite_existing=False: an existing vault copy is
+    # a trust anchor and must never be replaced by bootstrap.
     created.extend(ensure_resource_dockerfile(_resources_dir(), overwrite_existing=False))
 
     # Step 3: Deploy individual files from manifest

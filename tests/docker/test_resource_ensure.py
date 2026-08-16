@@ -178,7 +178,7 @@ def _reset_image_ready():
 
 def _repo_build_hash():
     return rcm.compute_resource_build_hash(
-        rcm.REPO_REQUIREMENTS, rcm.REPO_RESOURCE_DOCKERFILE
+        rcm.REPO_REQUIREMENTS, rcm.REPO_RUNTIME_DOCKERFILE
     )
 
 

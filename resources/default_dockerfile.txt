@@ -1,12 +1,18 @@
-FROM python:3.11-slim
-RUN useradd -m -s /bin/bash agent
-WORKDIR /workspace
-# requirements.txt is copied into the build context by ContainerManager.build_image
-# (and DockerExecutor._build_image); install as root so deps land in system
-# site-packages (a runtime volume mounted at /home/agent/.local would shadow
-# any --user install). No `|| true`: a failed install must fail the build.
+# Unified runtime Dockerfile — single source for BOTH the executor image and
+# the tm-resource-git resource image (build context = this file + requirements.txt only).
+FROM python:3.12-slim
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN python -c "import fastapi, pytest, starlette, uvicorn; print('web deps OK')"
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates curl nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
+RUN groupadd -g 1000 agent \
+    && useradd -m -u 1000 -g 1000 -s /bin/bash agent \
+    && mkdir -p /home/agent/.local \
+    && chown 1000:1000 /home/agent/.local
+ENV HOME=/home/agent
+RUN mkdir -p /workspace
 USER agent
+WORKDIR /workspace
+RUN python -c "import importlib.metadata as m, re; reqs=[re.sub(r'[<>=!~;\[].*','',l.strip()) for l in open('/requirements.txt') if l.strip() and not l.startswith('#')]; missing=[n for n in reqs if not m.version(n)]; assert not missing, f'missing deps: {missing}'; print('all resource requirements OK')"
 CMD ["python", "main.py"]

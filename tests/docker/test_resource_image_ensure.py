@@ -4,7 +4,7 @@ Unit tests for the auto image-build logic in ``infra.resource_container_manager`
 ``is_resource_image_available`` and the ``ensure_container`` guard).
 
 The resource image is auto-built from THIS repo's pinned sources
-(``requirements.txt`` + ``resources/resource_dockerfile.txt``) staged into a
+(``requirements.txt`` + ``resources/default_dockerfile.txt``) staged into a
 temp build context; every auto-built image carries a
 ``thoughtmachine.build_hash`` label (sha256 of the exact bytes built), and
 ``_ensure_resource_image`` rebuilds when the label is missing or stale
@@ -62,6 +62,10 @@ class _FakeImages:
         # record the attempt even when the build fails (simulates a real
         # docker build that is attempted and errors).
         self.build_calls.append(kwargs)
+        # snapshot the staged build context while it still exists (the
+        # caller removes the temp dir right after build returns).
+        if "path" in kwargs:
+            self.build_context_listing = sorted(os.listdir(kwargs["path"]))
         if self.build_error is not None:
             raise self.build_error
         # simulate docker: the image exists after a successful build,
@@ -103,7 +107,7 @@ def _reset_image_ready():
 def _repo_build_hash():
     """The hash ``_ensure_resource_image`` expects for the real repo sources."""
     return rcm.compute_resource_build_hash(
-        rcm.REPO_REQUIREMENTS, rcm.REPO_RESOURCE_DOCKERFILE
+        rcm.REPO_REQUIREMENTS, rcm.REPO_RUNTIME_DOCKERFILE
     )
 
 
@@ -189,7 +193,15 @@ class TestEnsureResourceImage:
         # vault-managed directory (removed after the build, so only the
         # prefix is checkable).
         assert os.path.basename(kwargs["path"]).startswith("tm-resource-build-")
-        assert kwargs["path"] != str(rcm.RESOURCE_IMAGE_DOCKERFILE_DIR)
+        # the context stages exactly the two repo sources and is never the
+        # repo root itself nor the vault-managed directory.
+        assert kwargs["path"] != rcm._REPO_ROOT
+        assert kwargs["path"] != os.path.join(
+            os.path.expanduser("~"), ".thoughtmachine", "docker", "resource"
+        )
+        # staged context contains exactly the two repo sources (snapshot
+        # taken by the fake at build time, before the temp dir is removed)
+        assert images.build_context_listing == ["Dockerfile", "requirements.txt"]
         assert kwargs["dockerfile"] == "Dockerfile"
         assert kwargs["tag"] == rcm.RESOURCE_IMAGE_TAG
         assert kwargs["rm"] is True
