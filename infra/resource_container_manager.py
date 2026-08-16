@@ -864,27 +864,7 @@ class ResourceContainerManager:
             str or None: the denial reason, or None when containers are
                 allowed or the gate is unavailable.
         """
-        if not self.session_permissions:
-            return None
-        try:
-            from security.security_gate import get_expected_container_config
-        except Exception as exc:
-            _LOG.warning(
-                "Security gate unavailable; skipping container policy check: %s",
-                exc,
-            )
-            return None
-        try:
-            effective = get_expected_container_config(self.session_permissions)
-        except Exception as exc:
-            _LOG.warning("Security gate container policy check failed: %s", exc)
-            return None
-        if (effective.get("effective") or {}).get("container") is False:
-            return (
-                "session/workspace policy denies container usage "
-                "(effective container=False)"
-            )
-        return None
+        return _container_policy_denied(self.session_permissions)
 
     @staticmethod
     def _resource_result(
@@ -1147,3 +1127,348 @@ class ResourceContainerManager:
             return {"status": "removed", "container_id": container_id}
         except Exception as e:
             return {"status": "error", "container_id": container_id, "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Module-level orchestration: workspace resource lifecycle
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Read-only status probe + workspace teardown / startup sweep for web_ui
+# orchestration (server lifespan + unregister paths). These operate on the
+# docker client directly (no ResourceContainerManager instance) and NEVER
+# build or create containers — building/creating stays exclusive to
+# ``_ensure_resource_image`` / ``ResourceContainerManager``.
+
+
+def _container_policy_denied(session_permissions=None):
+    """Reason string when session/workspace policy denies containers.
+
+    Module-level twin of ``ResourceContainerManager._container_policy_denied``
+    (the instance method delegates here) so orchestration helpers like
+    ``resource_status`` can consult the same policy without a manager
+    instance.
+
+    Opt-in: only consulted when ``session_permissions`` is supplied (the
+    caller gates container usage itself, mirroring ``network_mode`` gating).
+    Uses the shared security gate via a LAZY import — a module-level import
+    would create a circular import through the tool registry.
+
+    Returns:
+        str or None: the denial reason, or None when containers are allowed
+            or the gate is unavailable.
+    """
+    if not session_permissions:
+        return None
+    try:
+        from security.security_gate import get_expected_container_config
+    except Exception as exc:
+        _LOG.warning(
+            "Security gate unavailable; skipping container policy check: %s",
+            exc,
+        )
+        return None
+    try:
+        effective = get_expected_container_config(session_permissions)
+    except Exception as exc:
+        _LOG.warning("Security gate container policy check failed: %s", exc)
+        return None
+    if (effective.get("effective") or {}).get("container") is False:
+        return (
+            "session/workspace policy denies container usage "
+            "(effective container=False)"
+        )
+    return None
+
+
+def _join_detail(detail, part):
+    """Join a detail string with a new part ('; ' separated), or the part alone."""
+    return f"{detail}; {part}" if detail else part
+
+
+def resource_status(name, workspace_id=None, session_permissions=None):
+    """Read-only status of a named hidden resource for a workspace.
+
+    Purely a state probe: NEVER builds the image, NEVER creates, starts or
+    removes containers. Returns the same result shape as
+    ``ResourceContainerManager.ensure_resource`` so callers can branch on
+    ``mode`` uniformly — 'containerized' here means "will be containerized on
+    the next ensure_resource call" (possibly after an auto-build /
+    auto-provision / restart), 'host_fallback' means Docker itself is
+    unavailable, 'unavailable' means the name is unknown or policy-denied.
+
+    Args:
+        name: Resource name from ``RESOURCE_REGISTRY`` (e.g. 'git').
+        workspace_id: Workspace id whose resource container to inspect.
+            Required for the container-state part of the probe; when omitted
+            the container state is reported as unknown (no lookup attempted).
+        session_permissions: Optional session/workspace permissions dict.
+            When supplied, a hard container deny reports 'unavailable'
+            (mirrors ``ResourceContainerManager.ensure_resource``).
+
+    Returns:
+        dict: ``{"mode", "container_id", "status", "image", "detail"}``.
+            Never raises.
+    """
+    try:
+        entry = RESOURCE_REGISTRY.get(name)
+        if entry is None:
+            return ResourceContainerManager._resource_result(
+                "unavailable", detail=f"unknown resource '{name}'"
+            )
+        denied = _container_policy_denied(session_permissions)
+        if denied:
+            return ResourceContainerManager._resource_result(
+                "unavailable",
+                detail=f"container resources disabled/denied: {denied}",
+            )
+        if docker is None:
+            return ResourceContainerManager._resource_result(
+                "host_fallback",
+                detail="docker unavailable: docker SDK not installed",
+            )
+        try:
+            client = docker.from_env()
+        except Exception as exc:
+            return ResourceContainerManager._resource_result(
+                "host_fallback", detail=f"docker unavailable: {exc}"
+            )
+        if client is None:
+            return ResourceContainerManager._resource_result(
+                "host_fallback",
+                detail="docker unavailable: from_env() returned None",
+            )
+        build_hash = compute_resource_build_hash(
+            REPO_REQUIREMENTS, REPO_RESOURCE_DOCKERFILE
+        )
+        try:
+            image = client.images.get(RESOURCE_IMAGE_TAG)
+        except ImageNotFound:
+            return ResourceContainerManager._resource_result(
+                "containerized",
+                image=RESOURCE_IMAGE_TAG,
+                detail="image missing/stale — will auto-build on first use",
+            )
+        except Exception as exc:
+            return ResourceContainerManager._resource_result(
+                "host_fallback", detail=f"docker unavailable: {exc}"
+            )
+        labels = getattr(image, "labels", None) or {}
+        if labels.get(RESOURCE_BUILD_HASH_LABEL) != build_hash:
+            return ResourceContainerManager._resource_result(
+                "containerized",
+                image=RESOURCE_IMAGE_TAG,
+                detail="image missing/stale — will auto-build on first use",
+            )
+        if not workspace_id:
+            return ResourceContainerManager._resource_result(
+                "containerized",
+                image=RESOURCE_IMAGE_TAG,
+                detail="container state unknown (no workspace_id)",
+            )
+        kind = (entry.get("kind") or ResourceContainerManager.RESOURCE_KIND).lower()
+        try:
+            candidates = client.containers.list(
+                all=True,
+                filters={
+                    "label": [
+                        f"{ResourceContainerManager.WORKSPACE_LABEL}={workspace_id}",
+                        ResourceContainerManager.RESOURCE_LABEL,
+                    ]
+                },
+            )
+        except Exception as exc:
+            return ResourceContainerManager._resource_result(
+                "host_fallback", detail=f"docker unavailable: {exc}"
+            )
+        container = None
+        for candidate in candidates:
+            candidate_kind = (candidate.labels or {}).get(
+                ResourceContainerManager.RESOURCE_LABEL
+            )
+            if (candidate_kind or "").lower() == kind:
+                container = candidate
+                break
+        if container is None:
+            return ResourceContainerManager._resource_result(
+                "containerized",
+                image=RESOURCE_IMAGE_TAG,
+                detail="container missing — will auto-provision on first use",
+            )
+        if container.status != "running":
+            return ResourceContainerManager._resource_result(
+                "containerized",
+                container_id=container.id,
+                status=container.status,
+                image=RESOURCE_IMAGE_TAG,
+                detail="container stopped — will restart on first use",
+            )
+        return ResourceContainerManager._resource_result(
+            "containerized",
+            container_id=container.id,
+            status="running",
+            image=RESOURCE_IMAGE_TAG,
+        )
+    except Exception as exc:
+        return ResourceContainerManager._resource_result(
+            "host_fallback", detail=f"resource status check failed: {exc}"
+        )
+
+
+def cleanup_workspace_resources(workspace_id):
+    """Remove ALL hidden resource containers of a workspace, then the image.
+
+    Workspace teardown: force-removes every container carrying both the
+    ``thoughtmachine.resource`` marker and the workspace's
+    ``thoughtmachine.workspace_id`` label, then removes the
+    ``tm-resource-git`` image when NO remaining resource container (across
+    ALL workspaces) still references it. The module-level image-readiness
+    cache is invalidated so the next ``ensure_resource`` re-checks.
+
+    Never raises — per-container and per-image failures are collected into
+    ``detail`` and the counts returned.
+
+    Returns:
+        dict: ``{"removed_containers": int, "removed_image": bool,
+        "detail": str}``.
+    """
+    global _RESOURCE_IMAGE_READY
+    # The image may be removed below — never trust the cached readiness.
+    _RESOURCE_IMAGE_READY = False
+    workspace_id = str(workspace_id)
+    removed_containers = 0
+    removed_image = False
+    detail = ""
+    if docker is None:
+        return {
+            "removed_containers": 0,
+            "removed_image": False,
+            "detail": "docker SDK not installed",
+        }
+    try:
+        client = docker.from_env()
+    except Exception as exc:
+        return {
+            "removed_containers": 0,
+            "removed_image": False,
+            "detail": f"docker unavailable: {exc}",
+        }
+    try:
+        containers = client.containers.list(
+            all=True,
+            filters={
+                "label": [
+                    ResourceContainerManager.RESOURCE_LABEL,
+                    f"{ResourceContainerManager.WORKSPACE_LABEL}={workspace_id}",
+                ]
+            },
+        )
+        for container in containers:
+            try:
+                container.remove(force=True)
+                removed_containers += 1
+            except Exception as exc:
+                detail = _join_detail(
+                    detail,
+                    f"failed to remove container "
+                    f"{getattr(container, 'id', '?')}: {exc}",
+                )
+        try:
+            image = client.images.get(RESOURCE_IMAGE_TAG)
+        except ImageNotFound:
+            image = None
+        except Exception as exc:
+            image = None
+            detail = _join_detail(detail, f"failed to inspect resource image: {exc}")
+        if image is not None:
+            try:
+                remaining = client.containers.list(
+                    all=True,
+                    filters={"label": ResourceContainerManager.RESOURCE_LABEL},
+                )
+            except Exception as exc:
+                remaining = []
+                detail = _join_detail(
+                    detail, f"failed to list remaining resource containers: {exc}"
+                )
+            referenced = False
+            for container in remaining:
+                if ResourceContainerManager._container_image_id(container) == image.id:
+                    referenced = True
+                    break
+            if not referenced:
+                try:
+                    client.images.remove(RESOURCE_IMAGE_TAG, force=True)
+                    removed_image = True
+                except Exception as exc:
+                    detail = _join_detail(
+                        detail, f"failed to remove resource image: {exc}"
+                    )
+    except Exception as exc:
+        detail = _join_detail(detail, f"cleanup failed: {exc}")
+    return {
+        "removed_containers": removed_containers,
+        "removed_image": removed_image,
+        "detail": detail,
+    }
+
+
+def sweep_stale_resource_containers(registered_workspace_ids):
+    """Sweep resource containers whose workspace is no longer registered.
+
+    Startup/orphan sweep: force-removes every ``thoughtmachine.resource``
+    container whose ``thoughtmachine.workspace_id`` label is missing or not
+    in ``registered_workspace_ids`` (i.e. the workspace was unregistered or
+    the label is corrupt). Containers of registered workspaces are NEVER
+    touched — even stopped ones (their workspace may just be idle).
+
+    Never raises — per-container failures are collected into ``detail``.
+
+    Args:
+        registered_workspace_ids: iterable of workspace ids considered
+            in-use (their resource containers must be kept).
+
+    Returns:
+        dict: ``{"removed": int, "skipped_in_use": int, "detail": str}``.
+    """
+    registered = {str(ws) for ws in (registered_workspace_ids or [])}
+    removed = 0
+    skipped = 0
+    detail = ""
+    if docker is None:
+        return {"removed": 0, "skipped_in_use": 0, "detail": "docker SDK not installed"}
+    try:
+        client = docker.from_env()
+    except Exception as exc:
+        return {
+            "removed": 0,
+            "skipped_in_use": 0,
+            "detail": f"docker unavailable: {exc}",
+        }
+    try:
+        containers = client.containers.list(
+            all=True,
+            filters={"label": ResourceContainerManager.RESOURCE_LABEL},
+        )
+    except Exception as exc:
+        return {
+            "removed": 0,
+            "skipped_in_use": 0,
+            "detail": f"failed to list resource containers: {exc}",
+        }
+    for container in containers:
+        ws_id = (container.labels or {}).get(
+            ResourceContainerManager.WORKSPACE_LABEL
+        )
+        if ws_id is None or str(ws_id) not in registered:
+            try:
+                container.remove(force=True)
+                removed += 1
+            except Exception as exc:
+                detail = _join_detail(
+                    detail,
+                    f"failed to remove {getattr(container, 'id', '?')}: {exc}",
+                )
+        else:
+            skipped += 1
+    return {"removed": removed, "skipped_in_use": skipped, "detail": detail}
+
