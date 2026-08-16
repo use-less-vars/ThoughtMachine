@@ -102,7 +102,9 @@ class DockerCodeRunner(ToolBase):
     - This reduces Docker container overhead while maintaining security isolation.
 
     Dockerfile:
-    The Docker image is built from the project's Dockerfile at `docker/executor.Dockerfile`.
+    The executor image is built from the vault-managed workspace Dockerfile
+    via `ContainerManager`/`docker_executor` (no repo `docker/` directory is
+    involved).
     Set `build=True` to force a rebuild before execution (useful when adding packages).
 
     Security policy:
@@ -373,10 +375,12 @@ chmod +x "{script_path}"
                 cpu_quota=self.cpu_quota,
             )
             if self.build:
-                # Preserve build=True semantics: explicitly rebuild the image
-                # before starting (mirrors DockerExecutor._ensure_image).
-                import docker as _docker
-                self._build_image(_docker.from_env(), self.image)
+                # Preserve build=True semantics: explicitly run the image
+                # build-drift gate before starting. The executor image is built
+                # from the vault-managed workspace Dockerfile (vault-gated
+                # ContainerManager.build_image -> docker_executor machinery);
+                # the legacy docker/executor.Dockerfile no longer exists.
+                manager.build_image(tag=self.image)
             with open("/tmp/container_audit.log", "a") as _f:
                 _f.write(f"{time.time()} | CODERUNNER_EXECUTE | workspace={workspace} via_security={SECURITY_AVAILABLE}\n")
             info = manager.start(image=self.image)
@@ -445,27 +449,16 @@ chmod +x "{script_path}"
             ))
 
     def _build_image(self, client, image_name):
-        """Build Docker image from docker/executor.Dockerfile"""
-        dockerfile_path = os.path.join(os.path.dirname(__file__), "..", "docker", "executor.Dockerfile")
-        if not os.path.exists(dockerfile_path):
-            dockerfile_path = "docker/executor.Dockerfile"
+        """Legacy build helper — no longer supported.
 
-        try:
-            # Build the image
-            image, build_logs = client.images.build(
-                path=os.path.dirname(dockerfile_path),
-                dockerfile=os.path.basename(dockerfile_path),
-                tag=image_name,
-                rm=True,
-                pull=True
-            )
-            # Log build output (optional)
-            for chunk in build_logs:
-                if "stream" in chunk:
-                    line = chunk["stream"].strip()
-                    if line:
-                        self._log_debug(f"Build: {line}")
-            return image
-        except DockerException as e:
-            raise RuntimeError(f"Failed to build Docker image: {e}")
+        The old ``docker/executor.Dockerfile`` does not exist; the executor
+        image is built by ``ContainerManager.build_image`` / ``docker_executor``
+        from the vault-managed workspace Dockerfile (vault-authoritative).
+        """
+        raise RuntimeError(
+            "Direct image builds from docker/executor.Dockerfile are no longer "
+            "supported: the executor image is built from the vault-managed "
+            "workspace Dockerfile via ContainerManager/docker_executor "
+            "(use build_image(tag=...) or DockerCodeRunner(build=True))."
+        )
 

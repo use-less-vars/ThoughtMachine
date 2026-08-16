@@ -105,7 +105,8 @@ RESOURCE_REGISTRY = {
 
 # Build-hash label + build inputs. The repo root is derived from this file's
 # location (infra/ -> repo root); the repo-side files below are SEEDS only —
-# the vault copy is what actually gets built (and what tests monkeypatch).
+# the vault's docker/resource/ copy is the single authoritative build source
+# (tests monkeypatch the module-level VAULT_* constants to a tmp vault).
 RESOURCE_BUILD_HASH_LABEL = "thoughtmachine.build_hash"
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO_REQUIREMENTS = os.path.join(_REPO_ROOT, "requirements.txt")
