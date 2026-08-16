@@ -3,12 +3,13 @@ Unit tests for the auto image-build logic in ``infra.resource_container_manager`
 (``compute_resource_build_hash``, ``_ensure_resource_image`` /
 ``is_resource_image_available`` and the ``ensure_container`` guard).
 
-The resource images are auto-built in TWO stages from THIS repo's pinned
-sources: the workspace runtime base (``tm-workspace-runtime:latest``) from
-``requirements.txt`` + ``resources/default_dockerfile.txt``, then the git
-resource overlay (``tm-resource-git``) from
-``resources/git_resource_overlay_dockerfile.txt`` built on top of it (via
-``--build-arg BASE_IMAGE=...``). Every auto-built image carries a
+The resource images are auto-built in TWO stages from the VAULT-MANAGED
+build sources (``~/.thoughtmachine/docker/resource/``, seeded once from the
+repo's pinned sources): the workspace runtime base
+(``tm-workspace-runtime:latest``) from ``requirements.txt`` +
+``default_runtime.Dockerfile``, then the git resource overlay
+(``tm-resource-git``) from ``git_overlay.Dockerfile`` built on top of it
+(via ``--build-arg BASE_IMAGE=...``). Every auto-built image carries a
 ``thoughtmachine.build_hash`` label (sha256 of the exact bytes built), and
 ``_ensure_resource_image`` rebuilds a stage when its label is missing or
 stale (drift detection).
@@ -19,8 +20,10 @@ module imports docker defensively via try/except, and every test replaces
 """
 
 import os
+import shutil
 import sys
 import threading
+from pathlib import Path
 
 # Make the repository root importable when running `pytest tests/docker/` or
 # this file directly (tests/docker has no conftest.py of its own).
@@ -147,24 +150,50 @@ def _reset_image_ready():
     rcm._RESOURCE_IMAGE_READY = False
 
 
+@pytest.fixture(autouse=True)
+def _vault_resource_files(tmp_path, monkeypatch):
+    """Point rcm's VAULT_* build inputs at a tmp vault seeded from the repo
+    seeds (resources/ + requirements.txt). Production reads VAULT_* only —
+    the repo files are seeds. Identical bytes -> identical build hashes."""
+    vault_dir = tmp_path / "docker" / "resource"
+    vault_dir.mkdir(parents=True)
+    shutil.copy2(
+        os.path.join(_SRC_ROOT, "resources", "default_dockerfile.txt"),
+        vault_dir / "default_runtime.Dockerfile",
+    )
+    shutil.copy2(
+        os.path.join(_SRC_ROOT, "resources", "git_resource_overlay_dockerfile.txt"),
+        vault_dir / "git_overlay.Dockerfile",
+    )
+    shutil.copy2(
+        os.path.join(_SRC_ROOT, "requirements.txt"),
+        vault_dir / "requirements.txt",
+    )
+    monkeypatch.setattr(rcm, "VAULT_RESOURCE_DIR", str(vault_dir))
+    monkeypatch.setattr(rcm, "VAULT_REQUIREMENTS", str(vault_dir / "requirements.txt"))
+    monkeypatch.setattr(rcm, "VAULT_RUNTIME_DOCKERFILE", str(vault_dir / "default_runtime.Dockerfile"))
+    monkeypatch.setattr(rcm, "VAULT_OVERLAY_DOCKERFILE", str(vault_dir / "git_overlay.Dockerfile"))
+    yield vault_dir
+
+
 def _repo_build_hash():
-    """The hash ``_ensure_resource_image`` expects for the real repo sources."""
+    """The hash ``_ensure_resource_image`` expects for the vault build sources."""
     return rcm.compute_resource_build_hash(
-        rcm.REPO_REQUIREMENTS, rcm.REPO_RUNTIME_DOCKERFILE
+        rcm.VAULT_REQUIREMENTS, rcm.VAULT_RUNTIME_DOCKERFILE
     )
 
 
 def _overlay_build_hash(runtime_image_id="sha256:img-runtime"):
-    """The overlay hash for the real repo sources built on ``runtime_image_id``.
+    """The overlay hash for the vault build sources on ``runtime_image_id``.
 
     Mirrors production: the git resource overlay's build hash covers
     requirements + runtime dockerfile + overlay dockerfile + the runtime
     image id the overlay is built on.
     """
     return rcm.compute_git_overlay_build_hash(
-        rcm.REPO_REQUIREMENTS,
-        rcm.REPO_RUNTIME_DOCKERFILE,
-        rcm.GIT_OVERLAY_DOCKERFILE,
+        rcm.VAULT_REQUIREMENTS,
+        rcm.VAULT_RUNTIME_DOCKERFILE,
+        rcm.VAULT_OVERLAY_DOCKERFILE,
         runtime_image_id,
     )
 
@@ -303,26 +332,26 @@ class TestEnsureResourceImage:
         assert len(images.build_calls) == 1
         assert images.build_calls[0]["tag"] == expected_tag
 
-    def test_images_missing_build_both_stages_from_repo_sources(self, monkeypatch):
+    def test_images_missing_build_both_stages_from_vault_sources(self, monkeypatch):
         images = _FakeImages(present=False, runtime_present=False)
         monkeypatch.setattr(rcm, "docker", _FakeDockerModule(images))
         assert rcm._ensure_resource_image() is True
         assert len(images.build_calls) == 2
         # Stage 1 - the workspace runtime base image (tm-workspace-runtime:latest).
         runtime_kwargs = images.build_calls[0]
-        # build context is a fresh temp dir staging the repo sources, NOT the
-        # vault-managed directory (removed after the build, so only the
-        # prefix is checkable).
+        # build context is a fresh temp dir staging the vault sources, NOT
+        # the vault-managed directory itself (removed after the build, so
+        # only the prefix is checkable).
         assert os.path.basename(runtime_kwargs["path"]).startswith(
             "tm-resource-build-"
         )
-        # the context stages exactly the two repo sources and is never the
+        # the context stages exactly the two vault sources and is never the
         # repo root itself nor the vault-managed directory.
         assert runtime_kwargs["path"] != rcm._REPO_ROOT
         assert runtime_kwargs["path"] != os.path.join(
             os.path.expanduser("~"), ".thoughtmachine", "docker", "resource"
         )
-        # staged context contains exactly the two repo sources (snapshot
+        # staged context contains exactly the two vault sources (snapshot
         # taken by the fake at build time, before the temp dir is removed)
         assert images.build_context_listings[0] == [
             "Dockerfile",

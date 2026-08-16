@@ -4,11 +4,13 @@ Covers the two-stage resource image architecture in
 ``infra.resource_container_manager``:
 
 - Stage 1 — ``tm-workspace-runtime:latest``: the dependency-only runtime base
-  image (``requirements.txt`` + ``resources/default_dockerfile.txt``), built
-  from the repo's pinned sources and labeled with a ``thoughtmachine.build_hash``.
+  image (``requirements.txt`` + ``default_runtime.Dockerfile`` from the
+  VAULT-MANAGED ``~/.thoughtmachine/docker/resource/`` directory, seeded once
+  from the repo's pinned sources), labeled with a ``thoughtmachine.build_hash``.
 - Stage 2 — ``tm-resource-git``: the git resource overlay
-  (``resources/git_resource_overlay_dockerfile.txt``), built on top of the
-  freshly-ensured runtime image via ``--build-arg BASE_IMAGE=...``. Its build
+  (``git_overlay.Dockerfile`` in the same vault directory), built on top of
+  the freshly-ensured runtime image via ``--build-arg BASE_IMAGE=...``. Its
+  build
   hash covers requirements + runtime dockerfile + overlay dockerfile + the
   runtime image id, so any base drift forces the overlay to rebuild.
 
@@ -21,11 +23,15 @@ unit tests always run).
 """
 
 import os
+import shutil
 from pathlib import Path
 
 import pytest
 
 import infra.resource_container_manager as rcm
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 try:
     from docker.errors import ImageNotFound
@@ -236,6 +242,29 @@ def _reset_image_ready():
     rcm._RESOURCE_IMAGE_READY = False
 
 
+@pytest.fixture(autouse=True)
+def _vault_resource_files(tmp_path, monkeypatch):
+    """Point rcm's VAULT_* build inputs at a tmp vault seeded from the repo
+    seeds (resources/ + requirements.txt). Production reads VAULT_* only —
+    the repo files are seeds. Identical bytes -> identical build hashes."""
+    vault_dir = tmp_path / "docker" / "resource"
+    vault_dir.mkdir(parents=True)
+    shutil.copy2(
+        _REPO_ROOT / "resources" / "default_dockerfile.txt",
+        vault_dir / "default_runtime.Dockerfile",
+    )
+    shutil.copy2(
+        _REPO_ROOT / "resources" / "git_resource_overlay_dockerfile.txt",
+        vault_dir / "git_overlay.Dockerfile",
+    )
+    shutil.copy2(_REPO_ROOT / "requirements.txt", vault_dir / "requirements.txt")
+    monkeypatch.setattr(rcm, "VAULT_RESOURCE_DIR", str(vault_dir))
+    monkeypatch.setattr(rcm, "VAULT_REQUIREMENTS", str(vault_dir / "requirements.txt"))
+    monkeypatch.setattr(rcm, "VAULT_RUNTIME_DOCKERFILE", str(vault_dir / "default_runtime.Dockerfile"))
+    monkeypatch.setattr(rcm, "VAULT_OVERLAY_DOCKERFILE", str(vault_dir / "git_overlay.Dockerfile"))
+    yield vault_dir
+
+
 @pytest.fixture(scope="module")
 def overlay_images():
     """Build BOTH resource images ONCE via rcm internals (real Docker).
@@ -256,15 +285,15 @@ def overlay_images():
 
 def _repo_build_hash():
     return rcm.compute_resource_build_hash(
-        rcm.REPO_REQUIREMENTS, rcm.REPO_RUNTIME_DOCKERFILE
+        rcm.VAULT_REQUIREMENTS, rcm.VAULT_RUNTIME_DOCKERFILE
     )
 
 
 def _overlay_build_hash(runtime_image_id="sha256:img-current"):
     return rcm.compute_git_overlay_build_hash(
-        rcm.REPO_REQUIREMENTS,
-        rcm.REPO_RUNTIME_DOCKERFILE,
-        rcm.GIT_OVERLAY_DOCKERFILE,
+        rcm.VAULT_REQUIREMENTS,
+        rcm.VAULT_RUNTIME_DOCKERFILE,
+        rcm.VAULT_OVERLAY_DOCKERFILE,
         runtime_image_id,
     )
 
@@ -289,47 +318,47 @@ def _fresh_images(image_id="sha256:img-current"):
 def test_hash_inputs_cover_all_drift_sources(monkeypatch, tmp_path):
     """Every input the overlay is built from feeds its build hash."""
     runtime_hash = rcm.compute_resource_build_hash(
-        rcm.REPO_REQUIREMENTS, rcm.REPO_RUNTIME_DOCKERFILE
+        rcm.VAULT_REQUIREMENTS, rcm.VAULT_RUNTIME_DOCKERFILE
     )
     overlay_hash_a = rcm.compute_git_overlay_build_hash(
-        rcm.REPO_REQUIREMENTS,
-        rcm.REPO_RUNTIME_DOCKERFILE,
-        rcm.GIT_OVERLAY_DOCKERFILE,
+        rcm.VAULT_REQUIREMENTS,
+        rcm.VAULT_RUNTIME_DOCKERFILE,
+        rcm.VAULT_OVERLAY_DOCKERFILE,
         "sha256:aaa",
     )
     # (a) the runtime hash and the overlay hash differ for the same repo files
     assert runtime_hash != overlay_hash_a
     # (b) the overlay hash changes when the runtime image id changes
     overlay_hash_b = rcm.compute_git_overlay_build_hash(
-        rcm.REPO_REQUIREMENTS,
-        rcm.REPO_RUNTIME_DOCKERFILE,
-        rcm.GIT_OVERLAY_DOCKERFILE,
+        rcm.VAULT_REQUIREMENTS,
+        rcm.VAULT_RUNTIME_DOCKERFILE,
+        rcm.VAULT_OVERLAY_DOCKERFILE,
         "sha256:bbb",
     )
     assert overlay_hash_a != overlay_hash_b
     # (c) the overlay hash changes when the overlay dockerfile content changes
     tmp_overlay = tmp_path / "git_resource_overlay_dockerfile.txt"
     tmp_overlay.write_bytes(
-        Path(rcm.GIT_OVERLAY_DOCKERFILE).read_bytes() + b"\n# drift\n"
+        Path(rcm.VAULT_OVERLAY_DOCKERFILE).read_bytes() + b"\n# drift\n"
     )
-    monkeypatch.setattr(rcm, "GIT_OVERLAY_DOCKERFILE", str(tmp_overlay))
+    monkeypatch.setattr(rcm, "VAULT_OVERLAY_DOCKERFILE", str(tmp_overlay))
     overlay_hash_c = rcm.compute_git_overlay_build_hash(
-        rcm.REPO_REQUIREMENTS,
-        rcm.REPO_RUNTIME_DOCKERFILE,
-        rcm.GIT_OVERLAY_DOCKERFILE,
+        rcm.VAULT_REQUIREMENTS,
+        rcm.VAULT_RUNTIME_DOCKERFILE,
+        rcm.VAULT_OVERLAY_DOCKERFILE,
         "sha256:aaa",
     )
     assert overlay_hash_c != overlay_hash_a
     # (d) the overlay hash changes when the runtime dockerfile content changes
     tmp_runtime = tmp_path / "default_dockerfile.txt"
     tmp_runtime.write_bytes(
-        Path(rcm.REPO_RUNTIME_DOCKERFILE).read_bytes() + b"\n# drift\n"
+        Path(rcm.VAULT_RUNTIME_DOCKERFILE).read_bytes() + b"\n# drift\n"
     )
-    monkeypatch.setattr(rcm, "REPO_RUNTIME_DOCKERFILE", str(tmp_runtime))
+    monkeypatch.setattr(rcm, "VAULT_RUNTIME_DOCKERFILE", str(tmp_runtime))
     overlay_hash_d = rcm.compute_git_overlay_build_hash(
-        rcm.REPO_REQUIREMENTS,
-        rcm.REPO_RUNTIME_DOCKERFILE,
-        rcm.GIT_OVERLAY_DOCKERFILE,
+        rcm.VAULT_REQUIREMENTS,
+        rcm.VAULT_RUNTIME_DOCKERFILE,
+        rcm.VAULT_OVERLAY_DOCKERFILE,
         "sha256:aaa",
     )
     assert overlay_hash_d != overlay_hash_a
@@ -338,7 +367,7 @@ def test_hash_inputs_cover_all_drift_sources(monkeypatch, tmp_path):
 def test_static_runtime_dockerfile_excludes_git_tooling():
     """The runtime base image must NOT carry git/curl tooling — that is the
     overlay's job."""
-    lines = Path(rcm.REPO_RUNTIME_DOCKERFILE).read_text().splitlines()
+    lines = Path(rcm.VAULT_RUNTIME_DOCKERFILE).read_text().splitlines()
     # header advertises the git resource overlay layered on top
     assert any("git resource overlay" in line for line in lines[:8])
     # apt-get install token set (RUN block incl. `&&` continuations)
@@ -357,7 +386,7 @@ def test_static_runtime_dockerfile_excludes_git_tooling():
 def test_static_overlay_dockerfile_spec():
     """The git overlay dockerfile layers ONLY the OS git tooling on the
     runtime image (no python/node package installs)."""
-    text = Path(rcm.GIT_OVERLAY_DOCKERFILE).read_text()
+    text = Path(rcm.VAULT_OVERLAY_DOCKERFILE).read_text()
     assert "ARG BASE_IMAGE" in text
     assert "FROM ${BASE_IMAGE}" in text
     run_line = next(
@@ -588,17 +617,17 @@ def test_stale_overlay_rebuilds_on_overlay_change(overlay_images, tmp_path, monk
 
     tmp_overlay = tmp_path / "git_resource_overlay_dockerfile.txt"
     tmp_overlay.write_bytes(
-        Path(rcm.GIT_OVERLAY_DOCKERFILE).read_bytes() + b"\n# drift\n"
+        Path(rcm.VAULT_OVERLAY_DOCKERFILE).read_bytes() + b"\n# drift\n"
     )
-    monkeypatch.setattr(rcm, "GIT_OVERLAY_DOCKERFILE", str(tmp_overlay))
+    monkeypatch.setattr(rcm, "VAULT_OVERLAY_DOCKERFILE", str(tmp_overlay))
 
     assert rcm._ensure_resource_image() is True
 
     client = docker.from_env()
     runtime_id = client.images.get(rcm.RUNTIME_IMAGE_TAG).id
     expected = rcm.compute_git_overlay_build_hash(
-        rcm.REPO_REQUIREMENTS,
-        rcm.REPO_RUNTIME_DOCKERFILE,
+        rcm.VAULT_REQUIREMENTS,
+        rcm.VAULT_RUNTIME_DOCKERFILE,
         str(tmp_overlay),
         runtime_id,
     )

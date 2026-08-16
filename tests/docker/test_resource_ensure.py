@@ -8,9 +8,16 @@ These tests deliberately use their OWN fakes (no imports from
 ``test_resource_image_ensure``) so the suites stay independent.
 """
 
+import os
+import shutil
+from pathlib import Path
+
 import pytest
 
 import infra.resource_container_manager as rcm
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 try:
     from docker.errors import ImageNotFound
@@ -61,6 +68,7 @@ class _FakeImages:
         self.build_error = build_error
         self.get_error = get_error
         self.build_calls = []
+        self.build_context_listings = []
 
     def get(self, tag):
         if self.get_error is not None:
@@ -73,6 +81,10 @@ class _FakeImages:
 
     def build(self, **kwargs):
         self.build_calls.append(kwargs)
+        if "path" in kwargs:
+            self.build_context_listings.append(
+                sorted(os.listdir(kwargs["path"]))
+            )
         if self.build_error is not None:
             raise self.build_error
         # simulate docker: the built image exists after a successful build,
@@ -192,17 +204,34 @@ def _reset_image_ready():
     rcm._RESOURCE_IMAGE_READY = False
 
 
+@pytest.fixture(autouse=True)
+def _vault_resource_files(tmp_path, monkeypatch):
+    """Point rcm's VAULT_* build inputs at a tmp vault seeded from the repo
+    seeds (resources/ + requirements.txt). Production reads VAULT_* only —
+    the repo files are seeds. Identical bytes -> identical build hashes."""
+    vault_dir = tmp_path / "docker" / "resource"
+    vault_dir.mkdir(parents=True)
+    shutil.copy2(_REPO_ROOT / "resources" / "default_dockerfile.txt", vault_dir / "default_runtime.Dockerfile")
+    shutil.copy2(_REPO_ROOT / "resources" / "git_resource_overlay_dockerfile.txt", vault_dir / "git_overlay.Dockerfile")
+    shutil.copy2(_REPO_ROOT / "requirements.txt", vault_dir / "requirements.txt")
+    monkeypatch.setattr(rcm, "VAULT_RESOURCE_DIR", str(vault_dir))
+    monkeypatch.setattr(rcm, "VAULT_REQUIREMENTS", str(vault_dir / "requirements.txt"))
+    monkeypatch.setattr(rcm, "VAULT_RUNTIME_DOCKERFILE", str(vault_dir / "default_runtime.Dockerfile"))
+    monkeypatch.setattr(rcm, "VAULT_OVERLAY_DOCKERFILE", str(vault_dir / "git_overlay.Dockerfile"))
+    yield vault_dir
+
+
 def _repo_build_hash():
     return rcm.compute_resource_build_hash(
-        rcm.REPO_REQUIREMENTS, rcm.REPO_RUNTIME_DOCKERFILE
+        rcm.VAULT_REQUIREMENTS, rcm.VAULT_RUNTIME_DOCKERFILE
     )
 
 
 def _overlay_build_hash(image_id="sha256:img-current"):
     return rcm.compute_git_overlay_build_hash(
-        rcm.REPO_REQUIREMENTS,
-        rcm.REPO_RUNTIME_DOCKERFILE,
-        rcm.GIT_OVERLAY_DOCKERFILE,
+        rcm.VAULT_REQUIREMENTS,
+        rcm.VAULT_RUNTIME_DOCKERFILE,
+        rcm.VAULT_OVERLAY_DOCKERFILE,
         image_id,
     )
 
@@ -455,3 +484,65 @@ def test_images_get_error_guarded(monkeypatch):
     assert result["mode"] == "containerized"
     assert result["container_id"] == "c-ok"
     assert len(containers.run_calls) == 0
+
+
+def test_vault_authoritative_build_context_only(monkeypatch):
+    """Both build stages stage their context from the VAULT_* source files —
+    a fresh temp dir (never the vault dir itself, never the repo seeds)."""
+    images = _FakeImages(present=False)
+    containers = _FakeContainers()
+    mgr = _make_manager(monkeypatch, images=images, containers=containers)
+    result = mgr.ensure_resource("git")
+    assert result["mode"] == "containerized"
+    assert len(images.build_calls) == 2
+    runtime_kwargs, overlay_kwargs = images.build_calls
+    repo_resources_dir = os.path.dirname(rcm.REPO_RUNTIME_DOCKERFILE)
+    for kwargs in (runtime_kwargs, overlay_kwargs):
+        assert kwargs["path"] != rcm.VAULT_RESOURCE_DIR
+        assert kwargs["path"] != rcm._REPO_ROOT
+        assert repo_resources_dir not in kwargs["path"]
+    # stage 1 context: requirements.txt + Dockerfile (runtime base)
+    assert images.build_context_listings[0] == ["Dockerfile", "requirements.txt"]
+    # stage 2 context: Dockerfile only (git tooling overlay)
+    assert images.build_context_listings[1] == ["Dockerfile"]
+
+
+def test_vault_missing_fail_closed_no_build(monkeypatch, tmp_path):
+    """Missing vault sources fail CLOSED: _ensure_resource_image returns False
+    and NOTHING is built — there is no fallback to the repo seeds."""
+    missing = tmp_path / "empty-vault"
+    monkeypatch.setattr(rcm, "VAULT_REQUIREMENTS", str(missing / "requirements.txt"))
+    monkeypatch.setattr(rcm, "VAULT_RUNTIME_DOCKERFILE", str(missing / "default_runtime.Dockerfile"))
+    monkeypatch.setattr(rcm, "VAULT_OVERLAY_DOCKERFILE", str(missing / "git_overlay.Dockerfile"))
+    images = _FakeImages(present=False)
+    containers = _FakeContainers()
+    monkeypatch.setattr(rcm, "docker", _FakeDockerModule(images=images, containers=containers))
+    assert rcm._ensure_resource_image() is False
+    assert images.build_calls == []
+    assert containers.run_calls == []
+
+
+def test_vault_seed_divergence_reported_never_raises(monkeypatch, tmp_path):
+    """Divergence is REPORT-only: report_vault_seed_divergence() lists the
+    drifted vault file (never raises) and the vault copy stays authoritative
+    for builds."""
+    (Path(rcm.VAULT_REQUIREMENTS).parent / "requirements.txt").write_bytes(
+        b"# drifted seed\n"
+    )
+    diverged = rcm.report_vault_seed_divergence()
+    assert "requirements.txt" in diverged  # byte mismatch -> plain label
+    assert "default_runtime.Dockerfile" not in diverged
+    assert "git_overlay.Dockerfile" not in diverged
+    # divergence never blocks or redirects the build — the vault copy is used
+    images = _FakeImages(present=False)
+    containers = _FakeContainers()
+    mgr = _make_manager(monkeypatch, images=images, containers=containers)
+    result = mgr.ensure_resource("git")
+    assert result["mode"] == "containerized"
+    assert len(images.build_calls) == 2
+
+
+def test_vault_seed_divergence_empty_when_matching(monkeypatch):
+    """With the vault seeded byte-identical to the repo seeds (the autouse
+    fixture's baseline), divergence reporting returns []."""
+    assert rcm.report_vault_seed_divergence() == []
