@@ -37,19 +37,27 @@ class _FakeImage:
 
 
 class _FakeImages:
-    """``client.images`` fake with ``get(tag)`` and ``build(**kwargs)``."""
+    """``client.images`` fake with ``get(tag)`` and ``build(**kwargs)``.
+
+    Tag-aware for the two-stage resource image build:
+    ``tm-workspace-runtime:latest`` is modelled by ``runtime_labels`` and
+    ``tm-resource-git`` by ``labels`` (both share ``image_id``; this suite
+    never distinguishes their ids).
+    """
 
     def __init__(
         self,
         present=True,
         image_id="sha256:img-current",
         labels=None,
+        runtime_labels=None,
         build_error=None,
         get_error=None,
     ):
         self.present = present
         self.image_id = image_id
         self.labels = labels
+        self.runtime_labels = runtime_labels
         self.build_error = build_error
         self.get_error = get_error
         self.build_calls = []
@@ -59,14 +67,22 @@ class _FakeImages:
             raise self.get_error
         if not self.present:
             raise ImageNotFound(tag)
+        if tag == rcm.RUNTIME_IMAGE_TAG:
+            return _FakeImage(self.image_id, self.runtime_labels)
         return _FakeImage(self.image_id, self.labels)
 
     def build(self, **kwargs):
         self.build_calls.append(kwargs)
         if self.build_error is not None:
             raise self.build_error
+        # simulate docker: the built image exists after a successful build,
+        # labelled with the labels that were passed to build().
         self.present = True
-        return None, []
+        if kwargs.get("tag") == rcm.RUNTIME_IMAGE_TAG:
+            self.runtime_labels = kwargs.get("labels") or {}
+        else:
+            self.labels = kwargs.get("labels") or {}
+        return _FakeImage(self.image_id, kwargs.get("labels") or {}), []
 
 
 class _FakeContainer:
@@ -182,6 +198,15 @@ def _repo_build_hash():
     )
 
 
+def _overlay_build_hash(image_id="sha256:img-current"):
+    return rcm.compute_git_overlay_build_hash(
+        rcm.REPO_REQUIREMENTS,
+        rcm.REPO_RUNTIME_DOCKERFILE,
+        rcm.GIT_OVERLAY_DOCKERFILE,
+        image_id,
+    )
+
+
 def _labels_for(mgr, kind="git"):
     return {
         mgr.WORKSPACE_LABEL: mgr.workspace_id,
@@ -203,10 +228,14 @@ def _make_manager(monkeypatch, images=None, containers=None, docker_mod=None,
 
 
 def _images_present(image_id="sha256:img-current", get_error=None):
+    # Both resource images are present and current: the runtime base carries
+    # the runtime build hash, the overlay the overlay build hash (which also
+    # covers the runtime image id).
     return _FakeImages(
         present=True,
         image_id=image_id,
-        labels={rcm.RESOURCE_BUILD_HASH_LABEL: _repo_build_hash()},
+        labels={rcm.RESOURCE_BUILD_HASH_LABEL: _overlay_build_hash(image_id)},
+        runtime_labels={rcm.RESOURCE_BUILD_HASH_LABEL: _repo_build_hash()},
         get_error=get_error,
     )
 
@@ -249,7 +278,20 @@ def test_image_missing_builds_and_creates(monkeypatch):
     containers = _FakeContainers()
     mgr = _make_manager(monkeypatch, images=images, containers=containers)
     result = mgr.ensure_resource("git")
-    assert len(images.build_calls) == 1
+    # Two-stage build: the runtime base first, then the git overlay on top.
+    assert len(images.build_calls) == 2
+    runtime_call, overlay_call = images.build_calls
+    assert runtime_call["tag"] == rcm.RUNTIME_IMAGE_TAG
+    assert runtime_call["dockerfile"] == "Dockerfile"
+    assert runtime_call["labels"] == {
+        rcm.RESOURCE_BUILD_HASH_LABEL: _repo_build_hash()
+    }
+    assert overlay_call["tag"] == rcm.RESOURCE_IMAGE_TAG
+    assert overlay_call["dockerfile"] == "Dockerfile"
+    assert overlay_call["buildargs"] == {"BASE_IMAGE": rcm.RUNTIME_IMAGE_TAG}
+    assert overlay_call["labels"] == {
+        rcm.RESOURCE_BUILD_HASH_LABEL: _overlay_build_hash("sha256:img-current")
+    }
     assert len(containers.run_calls) == 1
     assert result == {
         "mode": "containerized",

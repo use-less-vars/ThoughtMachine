@@ -50,12 +50,14 @@ class _FakeImages:
         present=True,
         image_id="sha256:img-current",
         labels=None,
+        runtime_labels=None,
         get_error=None,
         remove_error=None,
     ):
         self.present = present
         self.image_id = image_id
         self.labels = labels
+        self.runtime_labels = runtime_labels
         self.get_error = get_error
         self.remove_error = remove_error
         self.get_calls = []
@@ -68,6 +70,8 @@ class _FakeImages:
             raise self.get_error
         if not self.present:
             raise ImageNotFound(tag)
+        if tag == rcm.RUNTIME_IMAGE_TAG:
+            return _FakeImage(self.image_id, self.runtime_labels)
         return _FakeImage(self.image_id, self.labels)
 
     def build(self, **kwargs):
@@ -232,11 +236,23 @@ def _labels_for(workspace_id, kind="git", name="tm-res-abc-git"):
     }
 
 
+def _overlay_build_hash(runtime_image_id="sha256:img-current"):
+    return rcm.compute_git_overlay_build_hash(
+        rcm.REPO_REQUIREMENTS,
+        rcm.REPO_RUNTIME_DOCKERFILE,
+        rcm.GIT_OVERLAY_DOCKERFILE,
+        runtime_image_id,
+    )
+
+
 def _fresh_images(image_id="sha256:img-current", get_error=None):
     return _FakeImages(
         present=True,
         image_id=image_id,
-        labels={rcm.RESOURCE_BUILD_HASH_LABEL: _repo_build_hash()},
+        # tm-resource-git (the overlay) is labeled with the overlay build hash…
+        labels={rcm.RESOURCE_BUILD_HASH_LABEL: _overlay_build_hash(image_id)},
+        # …while tm-workspace-runtime:latest carries the runtime build hash.
+        runtime_labels={rcm.RESOURCE_BUILD_HASH_LABEL: _repo_build_hash()},
         get_error=get_error,
     )
 
@@ -668,4 +684,3 @@ def test_resource_container_run_command_is_tail_dev_null(monkeypatch, tmp_path):
     assert len(containers.run_calls) == 1
     kwargs = containers.run_calls[0]
     assert kwargs["command"] == ["tail", "-f", "/dev/null"]
-
