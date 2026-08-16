@@ -1,14 +1,14 @@
 """
 Unit tests for the auto image-build logic in ``infra.resource_container_manager``
-(``_ensure_resource_image`` / ``is_resource_image_available`` and the
-``ensure_container`` guard).
+(``compute_resource_build_hash``, ``_ensure_resource_image`` /
+``is_resource_image_available`` and the ``ensure_container`` guard).
 
-The resource image Dockerfile lives in the VAULT
-(``~/.thoughtmachine/docker/resource/Dockerfile``, seeded from
-``resources/resource_dockerfile.txt``) so the image definition is NOT
-agent-writable; ``_ensure_resource_image`` builds the ``tm-resource-git``
-image from that vault directory on demand (single-flight, success-cached,
-never raising).
+The resource image is auto-built from THIS repo's pinned sources
+(``requirements.txt`` + ``resources/resource_dockerfile.txt``) staged into a
+temp build context; every auto-built image carries a
+``thoughtmachine.build_hash`` label (sha256 of the exact bytes built), and
+``_ensure_resource_image`` rebuilds when the label is missing or stale
+(drift detection).
 
 These are PURE unit tests: no Docker daemon and no docker SDK required (the
 module imports docker defensively via try/except, and every test replaces
@@ -37,12 +37,16 @@ import infra.resource_container_manager as rcm
 
 
 class _FakeImage:
-    """Stand-in for a docker image object; intentionally has no attributes."""
+    """Stand-in for a docker image object; carries only its labels."""
+
+    def __init__(self, labels=None):
+        self.labels = labels or {}
 
 
 class _FakeImages:
-    def __init__(self, present, build_error=None, get_error=None):
+    def __init__(self, present, labels=None, build_error=None, get_error=None):
         self.present = present
+        self.labels = labels or {}
         self.build_error = build_error
         self.get_error = get_error
         self.build_calls = []
@@ -52,14 +56,19 @@ class _FakeImages:
             raise self.get_error
         if not self.present:
             raise ImageNotFound(tag)
-        return _FakeImage()
+        return _FakeImage(self.labels)
 
     def build(self, **kwargs):
+        # record the attempt even when the build fails (simulates a real
+        # docker build that is attempted and errors).
+        self.build_calls.append(kwargs)
         if self.build_error is not None:
             raise self.build_error
-        self.build_calls.append(kwargs)
-        self.present = True  # simulate docker: the image exists after a build
-        return _FakeImage(), iter([])
+        # simulate docker: the image exists after a successful build,
+        # labelled with the labels that were passed to build().
+        self.present = True
+        self.labels = kwargs.get("labels") or {}
+        return _FakeImage(self.labels), iter([])
 
 
 class _FakeClient:
@@ -91,25 +100,110 @@ def _reset_image_ready():
     rcm._RESOURCE_IMAGE_READY = False
 
 
+def _repo_build_hash():
+    """The hash ``_ensure_resource_image`` expects for the real repo sources."""
+    return rcm.compute_resource_build_hash(
+        rcm.REPO_REQUIREMENTS, rcm.REPO_RESOURCE_DOCKERFILE
+    )
+
+
+class TestComputeResourceBuildHash:
+    def test_deterministic_same_content_same_hash(self, tmp_path):
+        req = tmp_path / "requirements.txt"
+        df = tmp_path / "Dockerfile"
+        req.write_text("fastapi\npytest\n")
+        df.write_text("FROM python:3.12-slim\n")
+        first = rcm.compute_resource_build_hash(str(req), str(df))
+        second = rcm.compute_resource_build_hash(str(req), str(df))
+        assert first == second
+
+    def test_different_requirements_different_hash(self, tmp_path):
+        req = tmp_path / "requirements.txt"
+        df = tmp_path / "Dockerfile"
+        df.write_text("FROM python:3.12-slim\n")
+        req.write_text("fastapi\n")
+        h1 = rcm.compute_resource_build_hash(str(req), str(df))
+        req.write_text("fastapi==0.100.0\n")
+        h2 = rcm.compute_resource_build_hash(str(req), str(df))
+        assert h1 != h2
+
+    def test_different_dockerfile_different_hash(self, tmp_path):
+        req = tmp_path / "requirements.txt"
+        df = tmp_path / "Dockerfile"
+        req.write_text("fastapi\n")
+        df.write_text("FROM python:3.12-slim\n")
+        h1 = rcm.compute_resource_build_hash(str(req), str(df))
+        df.write_text("FROM python:3.13-slim\n")
+        h2 = rcm.compute_resource_build_hash(str(req), str(df))
+        assert h1 != h2
+
+    def test_returns_hex_digest(self, tmp_path):
+        req = tmp_path / "requirements.txt"
+        df = tmp_path / "Dockerfile"
+        req.write_text("fastapi\n")
+        df.write_text("FROM python:3.12-slim\n")
+        digest = rcm.compute_resource_build_hash(str(req), str(df))
+        assert len(digest) == 64
+        int(digest, 16)  # is valid hex
+
+
 class TestEnsureResourceImage:
-    def test_image_present_no_build(self, monkeypatch):
-        images = _FakeImages(present=True)
+    def test_image_present_with_matching_hash_no_build(self, monkeypatch):
+        images = _FakeImages(
+            present=True,
+            labels={rcm.RESOURCE_BUILD_HASH_LABEL: _repo_build_hash()},
+        )
         monkeypatch.setattr(rcm, "docker", _FakeDockerModule(images))
         assert rcm._ensure_resource_image() is True
         assert images.build_calls == []
         assert rcm._RESOURCE_IMAGE_READY is True
 
-    def test_image_missing_builds_from_vault_dockerfile(self, monkeypatch):
+    def test_image_present_without_hash_label_rebuilds(self, monkeypatch):
+        images = _FakeImages(present=True, labels={})
+        monkeypatch.setattr(rcm, "docker", _FakeDockerModule(images))
+        assert rcm._ensure_resource_image() is True
+        assert len(images.build_calls) == 1
+        assert images.build_calls[0]["labels"] == {
+            rcm.RESOURCE_BUILD_HASH_LABEL: _repo_build_hash()
+        }
+
+    def test_image_present_with_stale_hash_rebuilds(self, monkeypatch):
+        images = _FakeImages(
+            present=True,
+            labels={rcm.RESOURCE_BUILD_HASH_LABEL: "0" * 64},
+        )
+        monkeypatch.setattr(rcm, "docker", _FakeDockerModule(images))
+        assert rcm._ensure_resource_image() is True
+        assert len(images.build_calls) == 1
+        assert images.build_calls[0]["labels"] == {
+            rcm.RESOURCE_BUILD_HASH_LABEL: _repo_build_hash()
+        }
+
+    def test_image_missing_builds_from_repo_sources(self, monkeypatch):
         images = _FakeImages(present=False)
         monkeypatch.setattr(rcm, "docker", _FakeDockerModule(images))
         assert rcm._ensure_resource_image() is True
         assert len(images.build_calls) == 1
         kwargs = images.build_calls[0]
-        assert kwargs["path"] == str(rcm.RESOURCE_IMAGE_DOCKERFILE_DIR)
+        # build context is a fresh temp dir staging the repo sources, NOT the
+        # vault-managed directory (removed after the build, so only the
+        # prefix is checkable).
+        assert os.path.basename(kwargs["path"]).startswith("tm-resource-build-")
+        assert kwargs["path"] != str(rcm.RESOURCE_IMAGE_DOCKERFILE_DIR)
         assert kwargs["dockerfile"] == "Dockerfile"
         assert kwargs["tag"] == rcm.RESOURCE_IMAGE_TAG
         assert kwargs["rm"] is True
+        assert kwargs["labels"] == {
+            rcm.RESOURCE_BUILD_HASH_LABEL: _repo_build_hash()
+        }
         assert rcm._RESOURCE_IMAGE_READY is True
+
+    def test_build_failure_returns_false_no_raise(self, monkeypatch):
+        images = _FakeImages(present=False, build_error=RuntimeError("build failed"))
+        monkeypatch.setattr(rcm, "docker", _FakeDockerModule(images))
+        assert rcm._ensure_resource_image() is False
+        assert len(images.build_calls) == 1
+        assert rcm._RESOURCE_IMAGE_READY is False
 
     def test_from_env_raises_returns_false_no_build(self, monkeypatch):
         images = _FakeImages(present=False)

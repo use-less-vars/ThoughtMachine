@@ -65,6 +65,8 @@ import hashlib
 import logging
 import os
 import queue
+import shutil
+import tempfile
 import threading
 
 try:
@@ -89,14 +91,28 @@ from thoughtmachine.vault import vault_root
 
 _LOG = logging.getLogger(__name__)
 
-# Resource image identity. The Dockerfile lives in the vault
+# Resource image identity. The image is auto-built from THIS repo's pinned
+# sources — <repo>/requirements.txt and <repo>/resources/resource_dockerfile.txt
+# (the trusted code base; agent workspaces are separate directories, so the
+# image definition cannot be tampered with from a workspace). The vault copy
 # (~/.thoughtmachine/docker/resource/Dockerfile, seeded from
-# resources/resource_dockerfile.txt) so the image definition is NOT
-# agent-writable — the image can never be built from a tampered file.
+# resources/resource_dockerfile.txt) is kept only as the manual-build
+# fallback. Every auto-built image carries a thoughtmachine.build_hash label
+# (sha256 of the exact bytes built) so a stale image — built from older
+# sources — is detected and rebuilt on drift.
 RESOURCE_IMAGE_TAG = "tm-resource-git"
 RESOURCE_IMAGE_DOCKERFILE_DIR = vault_root() / "docker" / "resource"
 RESOURCE_IMAGE_BUILD_CMD = (
     f"docker build -t {RESOURCE_IMAGE_TAG} {RESOURCE_IMAGE_DOCKERFILE_DIR}"
+)
+
+# Build-hash label + repo-sourced build inputs. The repo root is derived from
+# this file's location (infra/ -> repo root).
+RESOURCE_BUILD_HASH_LABEL = "thoughtmachine.build_hash"
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_REQUIREMENTS = os.path.join(_REPO_ROOT, "requirements.txt")
+REPO_RESOURCE_DOCKERFILE = os.path.join(
+    _REPO_ROOT, "resources", "resource_dockerfile.txt"
 )
 
 # Phase 3: optional ContainerRegistry delegation behind the session-config
@@ -115,8 +131,110 @@ _RESOURCE_IMAGE_READY = False
 _RESOURCE_IMAGE_LOCK = threading.Lock()
 
 
+def _hash_resource_bytes(requirements_bytes, dockerfile_bytes) -> str:
+    """Deterministic sha256 (hex) over the exact bytes that get built."""
+    digest = hashlib.sha256()
+    digest.update(requirements_bytes)
+    digest.update(b"\n")
+    digest.update(dockerfile_bytes)
+    return digest.hexdigest()
+
+
+def compute_resource_build_hash(requirements_path, dockerfile_path) -> str:
+    """sha256 (hex) over ``requirements bytes + b'\\n' + dockerfile bytes``.
+
+    Deterministic and pure (no docker): used both to tag auto-built images
+    (``thoughtmachine.build_hash`` label) and to detect drift between an
+    existing local image and the current repo sources.
+
+    Args:
+        requirements_path: Path to the repo ``requirements.txt``.
+        dockerfile_path: Path to the resource Dockerfile source
+            (``resources/resource_dockerfile.txt``).
+
+    Returns:
+        str: 64-char hex digest.
+    """
+    with open(requirements_path, "rb") as fh:
+        requirements_bytes = fh.read()
+    with open(dockerfile_path, "rb") as fh:
+        dockerfile_bytes = fh.read()
+    return _hash_resource_bytes(requirements_bytes, dockerfile_bytes)
+
+
+def _prepare_resource_build_context():
+    """Stage the repo build sources into a fresh temp directory.
+
+    Copies ``<repo>/requirements.txt`` -> ``<tmp>/requirements.txt`` and
+    ``<repo>/resources/resource_dockerfile.txt`` -> ``<tmp>/Dockerfile`` so the
+    docker build context contains ONLY the pinned sources (never the whole
+    repo). The build hash is computed from the same bytes that are copied.
+
+    Returns:
+        (context_dir: str, build_hash: str) on success, or None when the
+        repo sources are missing/unreadable (already logged).
+    """
+    try:
+        with open(REPO_REQUIREMENTS, "rb") as fh:
+            requirements_bytes = fh.read()
+        with open(REPO_RESOURCE_DOCKERFILE, "rb") as fh:
+            dockerfile_bytes = fh.read()
+    except OSError as exc:
+        _LOG.warning(
+            "Cannot read resource image build sources (%s, %s): %s",
+            REPO_REQUIREMENTS,
+            REPO_RESOURCE_DOCKERFILE,
+            exc,
+        )
+        return None
+    build_hash = _hash_resource_bytes(requirements_bytes, dockerfile_bytes)
+    context_dir = tempfile.mkdtemp(prefix="tm-resource-build-")
+    try:
+        with open(os.path.join(context_dir, "requirements.txt"), "wb") as fh:
+            fh.write(requirements_bytes)
+        with open(os.path.join(context_dir, "Dockerfile"), "wb") as fh:
+            fh.write(dockerfile_bytes)
+    except OSError as exc:
+        shutil.rmtree(context_dir, ignore_errors=True)
+        _LOG.warning(
+            "Failed to stage resource image build context: %s",
+            exc,
+        )
+        return None
+    return context_dir, build_hash
+
+
+def _check_resource_image(client, build_hash) -> bool:
+    """True when the local image exists AND its build-hash label matches.
+
+    A missing image, or an image with a missing/mismatched
+    ``thoughtmachine.build_hash`` label (drift), returns False so the caller
+    rebuilds. Real daemon errors propagate (callers log and bail).
+
+    Args:
+        client: docker client with ``images.get``.
+        build_hash: expected hash of the current repo build sources.
+
+    Returns:
+        bool
+    """
+    try:
+        image = client.images.get(RESOURCE_IMAGE_TAG)
+    except ImageNotFound:
+        return False
+    labels = getattr(image, "labels", None) or {}
+    return labels.get(RESOURCE_BUILD_HASH_LABEL) == build_hash
+
+
 def _ensure_resource_image() -> bool:
-    """Ensure the ``tm-resource-git`` image exists locally, building it if needed.
+    """Ensure ``tm-resource-git`` exists and matches the repo build sources.
+
+    The image is auto-built from THIS repo's pinned sources (``requirements.txt``
+    + ``resources/resource_dockerfile.txt``, staged into a temp build context)
+    and tagged with a ``thoughtmachine.build_hash`` label (sha256 of the exact
+    bytes built). Drift detection: an existing image whose label is missing or
+    does not match the current repo sources is rebuilt, so a stale image is
+    never silently reused.
 
     Single-flight: concurrent callers serialize on ``_RESOURCE_IMAGE_LOCK``
     (double-checked — the image is re-checked inside the lock before the
@@ -125,7 +243,7 @@ def _ensure_resource_image() -> bool:
     the manual ``docker build`` command) and reported as ``False``.
 
     Returns:
-        bool: True when the image is available, False otherwise.
+        bool: True when a matching image is available, False otherwise.
     """
     global _RESOURCE_IMAGE_READY
     if _RESOURCE_IMAGE_READY:
@@ -149,79 +267,92 @@ def _ensure_resource_image() -> bool:
             RESOURCE_IMAGE_BUILD_CMD,
         )
         return False
-    try:
-        client.images.get(RESOURCE_IMAGE_TAG)
-        _RESOURCE_IMAGE_READY = True
-        return True
-    except ImageNotFound:
-        pass
-    except Exception as exc:
-        _LOG.warning(
-            "Failed to check for resource image %s: %s. Build it manually: %s",
-            RESOURCE_IMAGE_TAG,
-            exc,
-            RESOURCE_IMAGE_BUILD_CMD,
-        )
+    prepared = _prepare_resource_build_context()
+    if prepared is None:
         return False
-    # Image missing — build it from the vault-managed Dockerfile, single-flight.
-    with _RESOURCE_IMAGE_LOCK:
-        if _RESOURCE_IMAGE_READY:
-            return True
+    context_dir, build_hash = prepared
+    try:
+        # Fast existence + drift check (no lock): a matching image is ready.
         try:
-            client.images.get(RESOURCE_IMAGE_TAG)
-            _RESOURCE_IMAGE_READY = True
-            return True
-        except ImageNotFound:
-            pass
+            if _check_resource_image(client, build_hash):
+                _RESOURCE_IMAGE_READY = True
+                return True
         except Exception as exc:
             _LOG.warning(
-                "Failed to re-check for resource image %s: %s. Build it manually: %s",
+                "Failed to check for resource image %s: %s. Build it manually: %s",
                 RESOURCE_IMAGE_TAG,
                 exc,
                 RESOURCE_IMAGE_BUILD_CMD,
             )
             return False
-        try:
-            _LOG.info(
-                "Resource image %s missing — building from %s",
-                RESOURCE_IMAGE_TAG,
-                RESOURCE_IMAGE_DOCKERFILE_DIR,
-            )
-            _, build_log = client.images.build(
-                path=str(RESOURCE_IMAGE_DOCKERFILE_DIR),
-                dockerfile="Dockerfile",
-                tag=RESOURCE_IMAGE_TAG,
-                rm=True,
-            )
+        # Image missing or stale — build from the repo sources, single-flight.
+        with _RESOURCE_IMAGE_LOCK:
+            if _RESOURCE_IMAGE_READY:
+                return True
             try:
-                for entry in build_log:
-                    _LOG.debug("resource image build: %s", entry)
-            except Exception:
-                pass  # noisy build-log stream must never fail the build path
-            _LOG.info(
-                "Resource image %s built successfully from %s",
-                RESOURCE_IMAGE_TAG,
-                RESOURCE_IMAGE_DOCKERFILE_DIR,
-            )
-            _RESOURCE_IMAGE_READY = True
-            return True
-        except Exception as exc:
-            _LOG.warning(
-                "Failed to build resource image %s from %s: %s. "
-                "Build it manually: %s",
-                RESOURCE_IMAGE_TAG,
-                RESOURCE_IMAGE_DOCKERFILE_DIR,
-                exc,
-                RESOURCE_IMAGE_BUILD_CMD,
-            )
-            return False
+                if _check_resource_image(client, build_hash):
+                    _RESOURCE_IMAGE_READY = True
+                    return True
+            except Exception as exc:
+                _LOG.warning(
+                    "Failed to re-check for resource image %s: %s. "
+                    "Build it manually: %s",
+                    RESOURCE_IMAGE_TAG,
+                    exc,
+                    RESOURCE_IMAGE_BUILD_CMD,
+                )
+                return False
+            try:
+                _LOG.info(
+                    "Resource image %s missing or stale (expected build hash %s) "
+                    "— building from repo sources",
+                    RESOURCE_IMAGE_TAG,
+                    build_hash,
+                )
+                _, build_log = client.images.build(
+                    path=context_dir,
+                    dockerfile="Dockerfile",
+                    tag=RESOURCE_IMAGE_TAG,
+                    rm=True,
+                    labels={RESOURCE_BUILD_HASH_LABEL: build_hash},
+                )
+                try:
+                    for entry in build_log:
+                        _LOG.debug("resource image build: %s", entry)
+                except Exception:
+                    pass  # noisy build-log stream must never fail the build path
+                _LOG.info(
+                    "Resource image %s built successfully from repo sources "
+                    "(build hash %s)",
+                    RESOURCE_IMAGE_TAG,
+                    build_hash,
+                )
+                _RESOURCE_IMAGE_READY = True
+                return True
+            except Exception as exc:
+                _LOG.warning(
+                    "Failed to build resource image %s from repo sources: %s. "
+                    "Build it manually: %s",
+                    RESOURCE_IMAGE_TAG,
+                    exc,
+                    RESOURCE_IMAGE_BUILD_CMD,
+                )
+                return False
+    finally:
+        # The staged context is consumed by the build (or unneeded on the
+        # fast paths); always clean it up.
+        shutil.rmtree(context_dir, ignore_errors=True)
 
 
 def is_resource_image_available() -> bool:
     """True when the ``tm-resource-git`` image exists locally.
 
-    Shares the cached success state with ``_ensure_resource_image``; never
-    raises — returns False when Docker is unreachable or the image is missing.
+    Existence-only by design: this is a cheap check for tooling and must not
+    trigger a build. Content correctness (build-hash drift vs the repo
+    sources) is ``_ensure_resource_image``'s job — call that when the image
+    must actually be used. Shares the cached success state with
+    ``_ensure_resource_image``; never raises — returns False when Docker is
+    unreachable or the image is missing.
     """
     if _RESOURCE_IMAGE_READY:
         return True
@@ -368,10 +499,11 @@ class ResourceContainerManager:
             ``security_gate.get_expected_container_config``; anything other
             than an explicit grant must stay 'none'.
         image: Image to run. Default 'tm-resource-git' — auto-built from
-            the vault-managed Dockerfile ``~/.thoughtmachine/docker/resource/Dockerfile``
-            (seeded from ``resources/resource_dockerfile.txt``; the vault is
-            agent-write-blocked, so the image definition cannot be tampered
-            with)::
+            the repo's pinned sources (``<repo>/requirements.txt`` +
+            ``resources/resource_dockerfile.txt``; the trusted code base, not
+            the agent workspace, so the image definition cannot be tampered
+            with). Every auto-built image carries a ``thoughtmachine.build_hash``
+            label so a stale image is rebuilt on drift. Manual fallback::
 
                 docker build -t tm-resource-git ~/.thoughtmachine/docker/resource/
         vault_root: Reserved for future audit/config use; NEVER mounted into

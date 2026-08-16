@@ -1,12 +1,18 @@
 # ~/.thoughtmachine/docker/resource/Dockerfile — minimal git sandbox for the hidden resource container.
 #
-# Build: docker build -t tm-resource-git ~/.thoughtmachine/docker/resource/
-# NOTE: operator must ALSO copy the repo's requirements.txt to ~/.thoughtmachine/docker/resource/requirements.txt before building (Layer 2 COPYs it).
+# LIVE build sources: THIS file (resources/resource_dockerfile.txt) + the repo's
+# requirements.txt. infra/resource_container_manager._ensure_resource_image stages
+# both into a temp build context, builds tm-resource-git, and labels the image with
+# the sources' build hash (thoughtmachine.build_hash) for drift detection. The
+# seeded vault copy (~/.thoughtmachine/docker/resource/Dockerfile) remains only as
+# the manual fallback:
+#   docker build -t tm-resource-git ~/.thoughtmachine/docker/resource/
 #
 # Security intent: the SMALLEST image that can run git and Node.js against the real
-# workspace. No docker CLI, no docker socket, no vault. Web deps (fastapi,
-# pytest, starlette, uvicorn) are installed so the .githooks/pre-commit gate
-# (`import web_ui.backend.server`) works even with an empty tm-packages volume.
+# workspace. No docker CLI, no docker socket, no vault. ALL repo requirements
+# (requirements.txt — including fastapi, pytest, starlette, uvicorn for the web UI)
+# are installed so the .githooks/pre-commit gate (`import web_ui.backend.server`)
+# works even with an empty tm-packages volume.
 # The container is launched by ResourceContainerManager with a read-only
 # rootfs, all capabilities dropped, no-new-privileges, no network, and only
 # the workspace bind mount (rw, since git writes .git metadata).
@@ -31,7 +37,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates curl nodejs npm \
     && rm -rf /var/lib/apt/lists/*
 
-# Layer 3: non-root user 'agent' with UID 1000 (must match the
+# Layer 4: non-root user 'agent' with UID 1000 (must match the
 # user="1000:1000" the manager passes to containers.run — Docker resolves
 # "1000:1000" numerically, so the uid/gid, not the name, is what matters).
 # -m creates /home/agent (the manager mounts tmpfs there, writable).
@@ -43,29 +49,29 @@ RUN groupadd -g 1000 agent \
     && mkdir -p /home/agent/.local \
     && chown 1000:1000 /home/agent/.local
 
-# Layer 4: HOME for git's global config (~/.gitconfig lives on the /home/agent
+# Layer 5: HOME for git's global config (~/.gitconfig lives on the /home/agent
 # tmpfs, so `git config --global safe.directory ...` works and persists only
 # for the container's lifetime).
 ENV HOME=/home/agent
 
-# Layer 5: pre-create /workspace owned by root. It is shadowed at runtime by
+# Layer 6: pre-create /workspace owned by root. It is shadowed at runtime by
 # the host workspace bind mount, but docker needs the image path to exist when
 # the bind target is empty/absent on the host. Must run BEFORE `USER agent`:
 # / is only writable by root in the image, so a filesystem-root mkdir needs
 # root privileges (as the agent user it would fail with EACCES).
 RUN mkdir -p /workspace
 
-# Layer 6: run as the non-root agent. WORKDIR below stays valid after this
+# Layer 7: run as the non-root agent. WORKDIR below stays valid after this
 # switch because /workspace already exists in the image (and the runtime bind
 # mount shadows it anyway).
 USER agent
 
 WORKDIR /workspace
 
-# Layer 7: verify the web deps the pre-commit gate needs are importable.
+# Layer 8: verify the web deps the pre-commit gate needs are importable.
 RUN python -c "import importlib.metadata as m, re; reqs=[re.sub(r'[<>=!~;\[].*','',l.strip()) for l in open('/requirements.txt') if l.strip() and not l.startswith('#')]; missing=[n for n in reqs if not m.version(n)]; assert not missing, f'missing deps: {missing}'; print('all resource requirements OK')"
 
-# Layer 8: keep the container alive after `containers.run(detach=True)` so
+# Layer 9: keep the container alive after `containers.run(detach=True)` so
 # subsequent exec_run calls have a running target (same pattern as the
 # executor's `tail -f /dev/null`).
 CMD ["tail", "-f", "/dev/null"]
