@@ -1,8 +1,8 @@
 # Roadmap
-
-Project milestones, planned features, and long-term goals.
-
-## Current Status
+Milestones and future plans. **Restructured 2026-08-16**: completed phases (Phase 2, Phase 2.5, Tasks 1-4) moved to `archive_arch_b.md`; future-ideas retained.
+> **LOST (2026-08-16, S2 incident):** the `V3 ORDER` section (operator priority list) was uncommitted in the working tree at restore time and is not recoverable from git/workspace. The authoritative 1–14 status list survives in `personal/task_tracker.md` → OPERATOR HANDOFF. Please re-supply the section from host-side if available.
+## Current Status (2026-08-16)
+- V3 ORDER section: LOST (see note above); 1–14 status list preserved in task_tracker.md OPERATOR HANDOFF.
 
 **All previously planned phases 1–5 are ✅ COMPLETE.** See `task_tracker.md` for full completion details.
 
@@ -17,6 +17,7 @@ Project milestones, planned features, and long-term goals.
 - **Performance I/O audit:** Session store caching added, full audit pending
 
 ## Upcoming Milestones (Ordered by Priority)
+> **Superseded (2026-08-16).** Kept for context.
 
 ### Phase 3 — GUI Adaptation & Grace-Turn Preservation 🟢 NOW
 | Item | Description | Status |
@@ -58,6 +59,7 @@ Project milestones, planned features, and long-term goals.
 | 7.3 | Provide backward‑compatible wrapper so the current GUI still works. | Planned |
 
 ## Future Ideas
+
 ## Future Ideas (Foggy — No Timeline Yet)
 
 | Item | Description |
@@ -100,39 +102,7 @@ Project milestones, planned features, and long-term goals.
 | F14 | **Config change awareness messages** — inject system notifications when the agent's configuration changes mid-session (workspace switched, context window expanded, tools changed). The agent should receive a message like "Your workspace has been changed to X" so it can adapt its behavior accordingly. |
 
 
-## 2026-05-11 — ## Phase 2.5 — Multi‑Session Tab Support & Full Session Rest...
-
-## Phase 2.5 — Multi‑Session Tab Support & Full Session Restore 🟢 NOW
-
-| Item | Description | Status |
-|------|-------------|--------|
-| 2.5.1a | **Backend: load_session also loads agent_config** — extract `session.metadata['agent_config']` and store as overrides so next `start_session` uses saved config (system prompt, tools, etc.) | Planned |
-| 2.5.1b | **Backend: new `get_open_sessions` command** — returns session IDs from `open_sessions.json` | Planned |
-| 2.5.1c | **Backend: new `close_session` command** — save session, remove from open list, stop bridge | Planned |
-| 2.5.1d | **Backend: WebSocket disconnect handler** — treat unexpected close as tab close (save + remove from open list) | Planned |
-| 2.5.2a | **Frontend: Tab bar component** — replace single-session view with tab manager; each tab has `tabId`, `sessionId`, `ws`, local chat state | Planned |
-| 2.5.2b | **Frontend: Each tab is independent** — refactor `App.jsx` into `SessionTab` component with own WebSocket lifecycle; per-tab Zustand context or local state | Planned |
-| 2.5.2c | **Frontend: Initialisation flow** — on load, send `get_open_sessions`, open tabs for each returned session_id via `load_session` | Planned |
-| 2.5.2d | **Frontend: "+" button** — creates blank tab; on first query sends `start_session` with default config | Planned |
-| 2.5.2e | **Frontend: Tab close** — send `close_session`, close WebSocket, remove tab | Planned |
-| 2.5.2f | **Frontend: Config per session** (deferred to Phase 3) | Deferred |
-
-### Architectural Mapping
-| Old PyQt6 GUI | New Web GUI |
-|---------------|-------------|
-| Each `SessionTab` has its own Presenter + Controller | Each browser tab gets its own WebSocket → backend spawns `WebAgentBridge` + `AgentController` |
-| `QTabWidget` with "+" button | React tab bar component, "+" creates new WebSocket connection |
-| On start, restore open sessions from `open_sessions.json` | Frontend sends `get_open_sessions`, opens tabs for each session_id with `load_session` |
-| Close tab → save session | Frontend sends `close_session`, backend saves + updates open list, client closes WebSocket |
-| Load session from file → `presenter.load_session(filepath)` | WebSocket command `load_session { session_id }` → bridge loads session with full agent_config from metadata |
-
-### Design Notes
-- No agent logic changes — this is a thin-shell reproduction of the old PyQt6 tab system
-- `load_session` must extract `session.metadata['agent_config']` so that system prompt, tools, and settings are restored exactly as saved
-- `close_session` passes through to existing `SessionLifecycle`/`FileSystemSessionStore` methods — no new logic
-- Per-tab WebSocket isolation ensures each tab is an independent "mini-app"
-
-## 2026-05-14 — ## Future Idea: GUI Logging Toggle (Dynamic `TM_LOG_TAGS`)
+## 2026-05-14 — Future Idea: GUI Logging Toggle (Dynamic `TM_LOG_TAGS`)
 
 ...
 
@@ -147,7 +117,7 @@ Project milestones, planned features, and long-term goals.
 
 **Why it wasn't done yet**: This is a cross-cutting change to the logging facade itself. The import-time env var approach is simple and works for restart-driven development. A proper GUI toggle needs careful design to avoid perf overhead from polling or callback registration.
 
-## 2026-05-25 — ## 2026-05-25 — Non-Urgent Items (Parked by Engineering Team...
+## 2026-05-25 — 2026-05-25 — Non-Urgent Items (Parked by Engineering Team...
 
 ## 2026-05-25 — Non-Urgent Items (Parked by Engineering Team)
 
@@ -198,7 +168,7 @@ Items with one-line dispositions so they don't clutter active thinking:
 4. **UX:**
    - Dashed border / highlight appears when a file is dragged over the agent area.
 
-## 2026-05-28 — ## Feature Ideas (Rough — added 2026-05-28)
+## 2026-05-28 — Feature Ideas (Rough — added 2026-05-28)
 
 ### 1. GUI-swit...
 
@@ -225,7 +195,7 @@ A new agent tool (e.g. `ShowFileToUser`) that:
 - The panel could be a dedicated "viewer" tab separate from the chat
 - Useful for the agent to show results without blowing up the context with file content
 
-## 2026-06-03 — ## Session Gossip Protocol (Idea)
+## 2026-06-03 — Session Gossip Protocol (Idea)
 
 **Origin**: Config audit ...
 
@@ -249,19 +219,7 @@ A new agent tool (e.g. `ShowFileToUser`) that:
 
 **Status**: Idea only — no implementation planned yet. Requires careful security design before any prototyping.
 
-## 2026-06-04 — ## Future: Logging flags available in GUI with hot-switch to...
-
-## Future: Logging flags available in GUI with hot-switch toggling (2026-06-04)
-
-**Priority**: Medium (enhancement)
-
-**Description**: Currently logging configuration (verbosity levels, enabled loggers, etc.) is configured statically. We need to:
-1. Expose logging flags (debug levels, component-specific logging toggles, etc.) in the GUI
-2. Allow hot-switching — changes take effect immediately without restarting the server or agent
-
-**Use case**: Users often need to toggle debug logging for specific components (bridge, agent, websocket, etc.) during troubleshooting without restarting. Also useful for development and diagnostics.
-
-**Status**: FUTURE — not started.
+## 2026-06-04 — Future: Logging flags available in GUI with hot-switch to...
 
 ## 2026-06-04 — **Hot-swappable system prompts** (feature idea):
 - ConfigPan...
@@ -273,7 +231,7 @@ A new agent tool (e.g. `ShowFileToUser`) that:
 - Don't implement yet, just record the idea
 - See also: DirectoryBrowser component in ConfigPanel.jsx (the file browsing pattern already exists)
 
-## 2026-06-04 — ## 2026-06-05 — Ask-prompts need more expressiveness
+## 2026-06-04 — 2026-06-05 — Ask-prompts need more expressiveness
 
 The pe...
 
@@ -286,7 +244,7 @@ The permission/security ask-prompts (shown when a tool requires user approval) a
 **Status:** TODO — planned for near-term work.
 
 
-## 2026-06-05 — ## 2026-06-05 — **ThoughtHub — The ThoughtMachine Network** ...
+## 2026-06-05 — 2026-06-05 — **ThoughtHub — The ThoughtMachine Network** ...
 
 ## 2026-06-05 — **ThoughtHub — The ThoughtMachine Network** (Major New Direction — design phase)
 
@@ -347,7 +305,7 @@ A web server ("ThoughtHub") that allows multiple ThoughtMachine instances to com
 
 
 
-## 2026-06-05 — ## 2026-06-06 — Workspace Panel (Feature Idea)
+## 2026-06-05 — 2026-06-06 — Workspace Panel (Feature Idea)
 
 A slide-in p...
 
@@ -361,21 +319,7 @@ A slide-in panel (similar to VS Code's sidebar) that gives the user full visibil
 - **Session context** — current session metadata, token usage, attached files, active config
 - **Environment info** — OS, runtime versions, environment variables
 
-## Phase 2
-
-## 2026-06-12 — 🎉 **Phase 2 Complete** (2025-04-11): Workspace config files ...
-
-🎉 **Phase 2 Complete** (2025-04-11): Workspace config files REST API is fully implemented.
-- `GET/PUT /api/workspace/{ws_id}/domain_allowlist` (with atomic write)
-- `GET /api/workspace/{ws_id}/dockerfile` (from workspace dir)
-- `GET /api/workspace/{ws_id}/workers` (empty JSON)
-- `GET /api/workspace/{ws_id}/mcp_servers` (empty JSON)
-- `GET /api/workspace/{ws_id}/effective_permissions` (with session permission merging & fallback)
-- `ensure_workspace_dirs()` creates all config files idempotently
-- 18 tests covering bootstrap + API endpoints all passing
-
-
-## 2026-07-01 — ## 2026-07-02 — Master Vault: Future Plans
+## 2026-07-01 — 2026-07-02 — Master Vault: Future Plans
 
 ### 1. Workspace...
 
@@ -429,26 +373,5 @@ A slide-in panel (similar to VS Code's sidebar) that gives the user full visibil
 - First-run wizard: provider key setup, workspace init, guided tour
 - Auto-update mechanism
 
-## 2026-07-22 — ## Task 1 — De-emojify GUI + remove Save button ✅
-- **Config...
-
-## Task 1 — De-emojify GUI + remove Save button ✅
-- **ConfigPanel.jsx**: Mode badges (🤖→Agent, ⚙️→Engineer, 🎨→Custom), lock icons (🔒→(locked)), factory prompt emoji removed
-- **SessionTab.jsx**: Save button removed entirely, Rename (✏️→Rename), Delete (🗑️ Delete→Delete), Yes/No confirm buttons de-emojified
-- **SessionList.jsx**: Rename (✏️→Rename), Delete (🗑️→Delete)
-
-## Task 2 — System prompt audit ✅
-- Traced system_prompt save/load path: apply_config→update_prompt→model_dump→SessionConfig(**raw_dict)
-- No bug found in Custom mode persistence — save/load pipeline is clean
-- Mode-locked prompting in Agent/Engineer is intentional (validator re-reads factory file)
-
-## Task 3 — Tool audit ✅
-- **3a CodeModifier**: Syntax test PASS — py_compile exit code 0. Minor cosmetic formatting quirk (no blank line before decorator) but syntactically valid.
-- **3b Tool call log**: Temporary tool_calls.log added to bridge.py at two dispatch points, then removed in final sweep.
-- **3c Bash equivalence**: Table of 5 tools. Key finding: silent truncation across FileEditor, GlobTool, DirectoryTreeTool — LLMs get incomplete results without notification.
-
-## Task 4 — Chat scroll anchoring ✅
-- **R1 Auto-scroll at bottom**: Already worked (20px threshold in handleScroll + useLayoutEffect)
-- **R2 No yank when reading history**: Already worked (isAtBottomRef guard)
-- **R3 Force scroll after summary**: NEW — SessionTab.jsx detects compaction keywords (context now free, summar, compact, messages removed) and increments scrollToBottomKey prop; ChatPanel.jsx watches it and force-scrolls via double-rAF
-- **R4 Jump buttons always visible**: Fixed — removed conditional `!isAtBottomRef.current` wrapper, buttons render unconditionally
+## Archived
+Completed phases → `archive_arch_b.md` (`## SOURCE: roadmap.md — completed phases`).
