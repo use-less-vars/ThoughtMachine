@@ -106,6 +106,12 @@ RESOURCE_IMAGE_BUILD_CMD = (
     f"docker build -t {RESOURCE_IMAGE_TAG} {RESOURCE_IMAGE_DOCKERFILE_DIR}"
 )
 
+# Known hidden resources. Every entry runs inside the same hardened
+# ``RESOURCE_IMAGE_TAG`` image, so the build-hash drift check applies to all.
+RESOURCE_REGISTRY = {
+    "git": {"kind": "git"},
+}
+
 # Build-hash label + repo-sourced build inputs. The repo root is derived from
 # this file's location (infra/ -> repo root).
 RESOURCE_BUILD_HASH_LABEL = "thoughtmachine.build_hash"
@@ -486,6 +492,20 @@ def _path_is_within(path, parent):
         return False
 
 
+class _ResourceContainerHandle:
+    """Minimal container handle for the registry create path.
+
+    The registry facade returns ``{"id": ...}`` dicts; this shim gives them
+    the same ``.id`` surface as docker container objects so callers are
+    uniform. ``__slots__`` keeps it lightweight.
+    """
+
+    __slots__ = ("id",)
+
+    def __init__(self, container_id):
+        self.id = container_id
+
+
 class ResourceContainerManager:
     """Owns the hidden git resource container for ONE workspace.
 
@@ -515,6 +535,12 @@ class ResourceContainerManager:
             (design doc docs/container_registry_design.md §6).
         session_id: Optional session id the resource container is registered
             under (registry bookkeeping only).
+        session_permissions: Optional session/workspace permissions dict.
+            When supplied, ``ensure_resource`` consults
+            ``security_gate.get_expected_container_config`` and reports the
+            resource as 'unavailable' when the effective container grant is
+            False (hard deny). When None, the caller gates container usage
+            itself (mirror of ``network_mode`` gating).
     """
 
     # Resource marker label: any value of ``thoughtmachine.resource`` marks a
@@ -533,6 +559,7 @@ class ResourceContainerManager:
         vault_root=None,
         session_config=None,
         session_id=None,
+        session_permissions=None,
     ):
         if docker is None:
             raise RuntimeError(
@@ -545,6 +572,7 @@ class ResourceContainerManager:
         self.vault_root = vault_root
         self.session_config = session_config
         self.session_id = session_id
+        self.session_permissions = session_permissions or {}
         # Fixed quotas (mirror the agent-tool defaults; not constructor params
         # by design — the git sandbox is a fixed-shape resource).
         self.mem_limit = "512m"
@@ -618,24 +646,65 @@ class ResourceContainerManager:
             )
 
         name = self.container_name
+        container = self._find_resource_container(name)
+        if container is not None and (
+            (container.labels or {}).get(self.RESOURCE_LABEL)
+            == self.RESOURCE_KIND
+        ):
+            if container.status != "running":
+                container.start()
+            return container.id
+
+        return self._create_resource_container(name).id
+
+    def _find_resource_container(self, name=None):
+        """Find the container matching ``name`` (label or docker name).
+
+        Lists containers by the ``thoughtmachine.workspace_id`` label and
+        returns the FIRST one whose ``thoughtmachine.container_name`` label
+        (or docker name) equals ``name`` (defaults to ``self.container_name``).
+        NO kind filter — callers decide: ``ensure_container`` reuses only
+        ``RESOURCE_KIND`` matches; ``ensure_resource`` treats a wrong-kind
+        container as stale (removes and recreates it).
+
+        Returns:
+            object or None: the container, or None when absent.
+        """
+        name = name or self.container_name
         try:
             candidates = self.client.containers.list(
                 all=True,
                 filters={"label": f"{self.WORKSPACE_LABEL}={self.workspace_id}"},
             )
         except Exception:
-            candidates = []
+            return None
         for container in candidates:
             labels = container.labels or {}
-            is_ours = (
+            if (
                 labels.get(self.CONTAINER_NAME_LABEL) == name
                 or container.name == name
-            )
-            if is_ours and labels.get(self.RESOURCE_LABEL) == self.RESOURCE_KIND:
-                if container.status != "running":
-                    container.start()
-                return container.id
+            ):
+                return container
+        return None
 
+    def _create_resource_container(self, name=None):
+        """Create a fresh hardened resource container (no reuse logic).
+
+        Builds the workspace bind mount (rw) plus the optional
+        linked-worktree main-repo and read-only .venv mounts, then creates
+        the container via the registry facade (when active) or
+        ``client.containers.run`` with the full hardening set.
+
+        Raises:
+            RuntimeError: when creation fails (with the manual build command
+                for actionable image-missing diagnostics).
+
+        Returns:
+            object: the created container (``.id`` usable) — a
+                ``_ResourceContainerHandle`` on the registry path, or the
+                docker container object on the legacy path.
+        """
+        name = name or self.container_name
         # Workspace bind mount, READ-WRITE: git writes .git + index on the
         # REAL workspace. Documented divergence from the executor's ro/.git-
         # tmpfs scheme — this container's whole purpose is operating on git
@@ -719,7 +788,7 @@ class ResourceContainerManager:
                         for m in mounts[1:]
                     ],
                 )
-                return handle["id"]
+                return _ResourceContainerHandle(handle["id"])
             container = self.client.containers.run(
                 image=self.image,
                 name=name,
@@ -745,7 +814,197 @@ class ResourceContainerManager:
                 f"Failed to create git resource container: {e}. "
                 f"Build the image first: {RESOURCE_IMAGE_BUILD_CMD}"
             ) from e
-        return container.id
+        return container
+
+    @staticmethod
+    def _container_image_id(container):
+        """The image id a container was created from, or None.
+
+        Tries ``container.image.id`` first (docker SDK), then falls back to
+        ``container.attrs['Image']`` (the raw daemon field). Never raises.
+        """
+        try:
+            image = getattr(container, "image", None)
+            image_id = getattr(image, "id", None)
+            if image_id:
+                return image_id
+        except Exception:
+            pass
+        try:
+            attrs = container.attrs or {}
+            return attrs.get("Image") or None
+        except Exception:
+            return None
+
+    def _current_image_id(self):
+        """The id of the local ``tm-resource-git`` image, or None.
+
+        Used for drift detection: a container created from an older image
+        build (different image id) is stale and gets recreated. Never raises
+        — failures are logged and reported as None (stale check skipped).
+        """
+        try:
+            image = self.client.images.get(RESOURCE_IMAGE_TAG)
+            image_id = getattr(image, "id", None)
+            return image_id or None
+        except Exception as exc:
+            _LOG.warning("Failed to resolve current resource image id: %s", exc)
+            return None
+
+    def _container_policy_denied(self):
+        """Reason string when session/workspace policy denies containers.
+
+        Opt-in: only consulted when ``session_permissions`` was supplied to
+        the constructor (the caller gates container usage itself, mirroring
+        ``network_mode`` gating). Uses the shared security gate via a LAZY
+        import — a module-level import would create a circular import through
+        the tool registry.
+
+        Returns:
+            str or None: the denial reason, or None when containers are
+                allowed or the gate is unavailable.
+        """
+        if not self.session_permissions:
+            return None
+        try:
+            from security.security_gate import get_expected_container_config
+        except Exception as exc:
+            _LOG.warning(
+                "Security gate unavailable; skipping container policy check: %s",
+                exc,
+            )
+            return None
+        try:
+            effective = get_expected_container_config(self.session_permissions)
+        except Exception as exc:
+            _LOG.warning("Security gate container policy check failed: %s", exc)
+            return None
+        if (effective.get("effective") or {}).get("container") is False:
+            return (
+                "session/workspace policy denies container usage "
+                "(effective container=False)"
+            )
+        return None
+
+    @staticmethod
+    def _resource_result(
+        mode, container_id=None, status=None, image=None, detail=""
+    ):
+        """Structured ``ensure_resource`` result dict."""
+        return {
+            "mode": mode,
+            "container_id": container_id,
+            "status": status,
+            "image": image,
+            "detail": detail,
+        }
+
+    def ensure_resource(self, name):
+        """Ensure the named hidden resource is available (state machine).
+
+        Modes returned:
+            'containerized': the resource container is running
+                (``container_id`` set, ``status`` 'running', ``image``
+                ``RESOURCE_IMAGE_TAG``).
+            'host_fallback': the container could not be ensured (image
+                unavailable, Docker unreachable, or create/start/remove
+                failed) — the caller should fall back to a host-side
+                operation.
+            'unavailable': the resource name is unknown, or container
+                resources are denied by session/workspace policy.
+
+        Never raises: every failure is reported as a structured result.
+
+        Returns:
+            dict: ``{"mode", "container_id", "status", "image", "detail"}``.
+        """
+        entry = RESOURCE_REGISTRY.get(name)
+        if entry is None:
+            return self._resource_result(
+                "unavailable", detail=f"unknown resource '{name}'"
+            )
+
+        denied = self._container_policy_denied()
+        if denied:
+            return self._resource_result(
+                "unavailable",
+                detail=f"container resources disabled/denied: {denied}",
+            )
+
+        if not _ensure_resource_image():
+            return self._resource_result(
+                "host_fallback",
+                detail=(
+                    "resource image unavailable (auto-build failed or Docker "
+                    f"unreachable); manual build: {RESOURCE_IMAGE_BUILD_CMD}"
+                ),
+            )
+
+        kind = (entry.get("kind") or self.RESOURCE_KIND).lower()
+        container = self._find_resource_container()
+        if container is None:
+            try:
+                created = self._create_resource_container()
+            except Exception as exc:
+                return self._resource_result(
+                    "host_fallback",
+                    detail=f"failed to create resource container: {exc}",
+                )
+            return self._resource_result(
+                "containerized",
+                container_id=created.id,
+                status="running",
+                image=RESOURCE_IMAGE_TAG,
+            )
+
+        labels = container.labels or {}
+        current_image_id = self._current_image_id()
+        container_image_id = self._container_image_id(container)
+        stale = bool(current_image_id) and bool(container_image_id) and (
+            current_image_id != container_image_id
+        )
+        if (
+            labels.get(self.WORKSPACE_LABEL) != self.workspace_id
+            or labels.get(self.RESOURCE_LABEL) != kind
+        ):
+            stale = True
+
+        if stale:
+            try:
+                container.remove(force=True)
+            except Exception as exc:
+                return self._resource_result(
+                    "host_fallback",
+                    detail=f"failed to remove stale resource container: {exc}",
+                )
+            try:
+                created = self._create_resource_container()
+            except Exception as exc:
+                return self._resource_result(
+                    "host_fallback",
+                    detail=f"failed to recreate resource container: {exc}",
+                )
+            return self._resource_result(
+                "containerized",
+                container_id=created.id,
+                status="running",
+                image=RESOURCE_IMAGE_TAG,
+            )
+
+        if container.status != "running":
+            try:
+                container.start()
+            except Exception as exc:
+                return self._resource_result(
+                    "host_fallback",
+                    detail=f"failed to start resource container: {exc}",
+                )
+        return self._resource_result(
+            "containerized",
+            container_id=container.id,
+            status="running",
+            image=RESOURCE_IMAGE_TAG,
+        )
 
     def _container_id(self):
         """Find the current container id by labels; None when absent.
