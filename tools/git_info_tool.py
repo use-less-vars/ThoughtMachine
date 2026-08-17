@@ -1,5 +1,6 @@
 # tools/git_info_tool.py
 import json
+import re
 from typing import Any, ClassVar, Literal, Optional, List, Union
 from pydantic import Field
 import logging
@@ -13,6 +14,11 @@ from security.sandboxed_execution import SandboxedExecution
 # (including ``ext::`` shell executors and ``file://`` local access), so clone
 # URLs are restricted to these schemes plus scp-like ``user@host:path`` syntax.
 ALLOWED_GIT_PROTOCOLS = ["https://", "http://", "git://", "ssh://"]
+
+# Branch-name validation for branch_create/checkout. Explicit allowlist so
+# names can never smuggle option-like arguments ('-'), path traversal
+# ('..'), or revision syntax ('@{') into git argv.
+_BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9._/\-]+$")
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +55,29 @@ def resolve_git_execution_mode(
 
 class GitInfoTool(ToolBase):
     """
-    Git repository tool with read-only operations (status, diff, log, branch, show,
-    remote, blame, config) and write operations (commit, init, clone).
-    Write operations are subject to the agent's ask policy.
+    Git repository tool. Read operations: status, diff, diff_cached, log,
+    branch, branch_list, show, remote, blame, config. Write operations:
+    commit, init, clone, branch_create, checkout, stage, unstage. Write
+    operations are subject to the agent's ask policy.
+
+    Parameters:
+        working_dir: repository root (defaults to workspace root).
+        file_path: single path or list of paths, used by diff, diff_cached,
+            log, blame, stage, unstage and commit (selective commit).
+        message: commit message (required for commit).
+        branch: branch name for branch_create and checkout operations.
+        all_branches: include remote branches for branch / branch_list.
+
+    Explicit surface: no raw git flags are accepted from the agent. Every
+    invocation is assembled from fixed argv lists and hardened internally;
+    --no-verify, -c/--config/core.hooksPath, credential/filter/textconv
+    configuration and hooks are never taken from agent input (the execution
+    backends inject their own hardening flags). Commits in a source repo
+    checked out as an operator-managed worktree (a ``.git`` FILE pointing at
+    a gitdir) are blocked: they are performed host-side by the operator.
+    Execution mode is reported per call for the new operations (diff_cached,
+    branch_list, branch_create, checkout, stage, unstage) via a trailing
+    ``execution_mode: <mode>`` line.
     """
 
     # ------------------------------------------------------------------
@@ -63,6 +89,7 @@ class GitInfoTool(ToolBase):
     _resolved_workspace_path: Optional[str] = None
     _resolved_workspace_id: Optional[str] = None
     _last_mode: Optional[str] = None
+    _last_execution_mode: Optional[str] = None
 
     @classmethod
     def get_required_categories(cls, params: dict | None = None) -> list[str]:
@@ -71,20 +98,27 @@ class GitInfoTool(ToolBase):
             op = params.get("operation", "")
             if op in ("remote",):
                 return ["git:read", "network:outbound"]
-            if op in ("commit", "init"):
+            if op in ("commit", "init", "branch_create", "checkout", "stage", "unstage"):
                 return ["git:write"]
             if op in ("clone",):
                 return ["git:write", "network:outbound"]
             if op in ("push", "pull", "fetch", "merge", "rebase"):
                 return ["git:write", "network:outbound"]
-        # All other operations (status, diff, log, branch, show, blame, config) are read-only
+        # All other operations (status, diff, diff_cached, log, branch,
+        # branch_list, show, blame, config) are read-only
         return ["git:read"]
 
     tool: Literal["GitInfoTool"] = "GitInfoTool"
 
     
-    operation: Literal["status", "diff", "log", "branch", "show", "remote", "blame", "config", "commit", "init", "clone"] = Field(
-        description="Git operation to perform: status, diff, log, branch, show, remote, blame, config, commit, init, clone"
+    operation: Literal[
+        "status", "diff", "log", "branch", "show", "remote", "blame", "config",
+        "commit", "init", "clone", "diff_cached", "branch_list", "branch_create",
+        "checkout", "stage", "unstage",
+    ] = Field(
+        description="Git operation to perform: status, diff, diff_cached, log, branch, "
+        "branch_list, branch_create, checkout, show, remote, blame, config, stage, "
+        "unstage, commit, init, clone"
     )
     
     # Common parameters
@@ -110,7 +144,9 @@ class GitInfoTool(ToolBase):
     )
     file_path: Optional[Union[str, List[str]]] = Field(
         default=None,
-        description="File path(s) for diff, log, blame, or commit operations. Accepts a single path (string) or multiple paths (list of strings)."
+        description="File path(s) for diff, diff_cached, log, blame, stage, unstage, or "
+        "commit (selective commit) operations. Accepts a single path (string) or "
+        "multiple paths (list of strings)."
     )
     
     # Log parameters
@@ -139,6 +175,10 @@ class GitInfoTool(ToolBase):
     all_branches: bool = Field(
         default=False,
         description="Include remote branches for branch operation"
+    )
+    branch: Optional[str] = Field(
+        default=None,
+        description="Branch name for branch_create and checkout operations"
     )
     
     # Show parameters
@@ -254,6 +294,7 @@ class GitInfoTool(ToolBase):
         self._resource_manager = None
         self._resolved_workspace_path = None
         self._resolved_workspace_id = None
+        self._last_execution_mode = None
 
         # Atomic permission re-check for network operations. An 'ask' level
         # is NOT re-checked here: it defers to the ToolExecutor's outer gate,
@@ -371,6 +412,9 @@ class GitInfoTool(ToolBase):
                     self._resolved_workspace_id or "none",
                 )
                 self._last_mode = mode
+            # Record the effective execution mode for per-call reporting
+            # (surfaced via _with_mode() on the new operation outputs).
+            self._last_execution_mode = mode
 
             # Execute operation
             if self.operation == "status":
@@ -381,6 +425,18 @@ class GitInfoTool(ToolBase):
                 return self._git_log(repo_root)
             elif self.operation == "branch":
                 return self._git_branch(repo_root)
+            elif self.operation == "diff_cached":
+                return self._git_diff_cached(repo_root)
+            elif self.operation == "branch_list":
+                return self._git_branch_list(repo_root)
+            elif self.operation == "branch_create":
+                return self._git_branch_create(repo_root)
+            elif self.operation == "checkout":
+                return self._git_checkout(repo_root)
+            elif self.operation == "stage":
+                return self._git_stage(repo_root)
+            elif self.operation == "unstage":
+                return self._git_unstage(repo_root)
             elif self.operation == "show":
                 return self._git_show(repo_root)
             elif self.operation == "remote":
@@ -448,6 +504,7 @@ class GitInfoTool(ToolBase):
         generic failure.
         """
         if not self._use_container_mode():
+            self._last_execution_mode = "host_fallback"
             return self._exec_host_raw(repo_root, args, timeout=timeout)
 
         mode, manager = self._resolve_resource_execution()
@@ -460,6 +517,7 @@ class GitInfoTool(ToolBase):
                 self.operation,
                 self._resolved_workspace_id or "none",
             )
+            self._last_execution_mode = "containerized"
             return self._exec_container_raw(
                 repo_root, args, timeout=timeout, manager=manager
             )
@@ -470,6 +528,7 @@ class GitInfoTool(ToolBase):
                 detail,
                 self.operation,
             )
+            self._last_execution_mode = "unavailable"
             raise RuntimeError(
                 f"GitInfoTool: containerized git execution unavailable: {detail}"
             )
@@ -480,6 +539,7 @@ class GitInfoTool(ToolBase):
             detail,
             self.operation,
         )
+        self._last_execution_mode = "host_fallback"
         return self._exec_host_raw(repo_root, args, timeout=timeout)
 
     def _exec_host_raw(
@@ -836,11 +896,14 @@ class GitInfoTool(ToolBase):
         """Return the permission level ('read'/'write') for a git invocation.
 
         Derived from the declared operation: anything that mutates repository
-        state (commit/init/clone) requires ``git:write``; everything else is
-        ``git:read``. ``args`` is accepted for future operation-level
-        granularity (e.g. write detection for internal helper invocations).
+        state (commit/init/clone/branch_create/checkout/stage/unstage) requires
+        ``git:write``; everything else is ``git:read``. ``args`` is accepted for
+        future operation-level granularity (e.g. write detection for internal
+        helper invocations).
         """
-        if self.operation in ("commit", "init", "clone"):
+        if self.operation in (
+            "commit", "init", "clone", "branch_create", "checkout", "stage", "unstage",
+        ):
             return "write"
         return "read"
 
@@ -931,7 +994,157 @@ class GitInfoTool(ToolBase):
             args.append("-a")
         output = self._run_git(repo_root, args)
         return self._truncate_output(output)
-    
+
+    def _is_operator_managed_worktree(self, repo_root: Path) -> bool:
+        """True when ``repo_root`` is an operator-managed git worktree.
+
+        Git worktrees represent ``.git`` as a regular file whose contents
+        start with ``gitdir: <path>`` (instead of a directory). Such
+        workspaces are checked out by operator/host tooling and commits are
+        performed host-side, so in-workspace commits are blocked.
+        """
+        dot_git = repo_root / ".git"
+        if not dot_git.exists() or not dot_git.is_file():
+            return False
+        try:
+            content = dot_git.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            # Unreadable gitfile: treat as not operator-managed so read ops
+            # and staging keep working; a broken worktree surfaces the
+            # underlying git error at commit time instead.
+            return False
+        return content.startswith("gitdir:")
+
+    @staticmethod
+    def _validate_branch_name(name: str) -> str:
+        """Validate a branch name against the tool's safe-name allowlist.
+
+        Only letters, digits, dots, slashes, underscores and hyphens are
+        allowed; names must not start with '-' or '.', must not contain
+        '..', '@{', whitespace or control characters. Returns the name
+        unchanged on success; raises ``ValueError`` otherwise.
+        """
+        if (
+            not isinstance(name, str)
+            or not name
+            or name != name.strip()
+            or not _BRANCH_NAME_RE.match(name)
+            or name.startswith(("-", "."))
+            or ".." in name
+            or "@{" in name
+            or "--" in name
+        ):
+            raise ValueError(
+                f"Invalid branch name: {name!r} - branch names may only contain "
+                "letters, digits, dots, slashes, underscores and hyphens; must "
+                "not start with '-' or '.', and must not contain '..', '@{', "
+                "whitespace or control characters"
+            )
+        return name
+
+    def _validated_rel_paths(self, repo_root: Path, paths) -> List[str]:
+        """Normalize and workspace-validate file path(s) into repo-relative paths.
+
+        Accepts a single path (str) or multiple paths (list of str). Each
+        path must be a string and must resolve inside the workspace; returns
+        paths relative to ``repo_root`` for use as git path arguments. Raises
+        ``ValueError`` for invalid path types, empty paths, or paths outside
+        the workspace.
+        """
+        path_list = paths if isinstance(paths, list) else [paths]
+        rels = []
+        for p in path_list:
+            if not isinstance(p, str):
+                raise ValueError(
+                    f"Invalid file path type: {type(p).__name__} (expected str)"
+                )
+            if not p:
+                raise ValueError("Invalid empty file path")
+            file_abs = (repo_root / p).resolve()
+            validated_abs = self._validate_path(str(file_abs))
+            rels.append(str(Path(validated_abs).relative_to(repo_root)))
+        return rels
+
+    def _with_mode(self, output: str) -> str:
+        """Append the effective execution mode for per-call reporting."""
+        return f"{output}\nexecution_mode: {self._last_execution_mode or 'unavailable'}"
+
+    def _git_diff_cached(self, repo_root: Path) -> str:
+        """Run git diff --cached (staged changes)."""
+        # Same belt-and-suspenders as _git_diff: --no-ext-diff guarantees
+        # external diff drivers can never render diffs.
+        args = ["diff", "--cached", "--no-ext-diff", "--no-textconv"]
+        if self.file_path:
+            try:
+                rels = self._validated_rel_paths(repo_root, self.file_path)
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+            if rels:
+                args.append("--")
+                args.extend(rels)
+        output = self._run_git(repo_root, args)
+        return self._with_mode(self._truncate_output(output))
+
+    def _git_branch_list(self, repo_root: Path) -> str:
+        """Run git branch --list (explicit list operation)."""
+        args = ["branch", "--list"]
+        if self.all_branches:
+            args.append("--all")
+        output = self._run_git(repo_root, args)
+        return self._with_mode(self._truncate_output(output))
+
+    def _git_branch_create(self, repo_root: Path) -> str:
+        """Create a new branch (git branch <name>)."""
+        if not self.branch:
+            return "Error: branch is required for branch_create operation"
+        try:
+            name = self._validate_branch_name(self.branch)
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        output = self._run_git(repo_root, ["branch", name])
+        return self._with_mode(self._truncate_output(output))
+
+    def _git_checkout(self, repo_root: Path) -> str:
+        """Check out an existing branch (git checkout <name>)."""
+        if not self.branch:
+            return "Error: branch is required for checkout operation"
+        try:
+            name = self._validate_branch_name(self.branch)
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        # No -b: only existing branches may be checked out (creating branches
+        # is the branch_create operation). No '--' separator: the validated
+        # name can never look like an option.
+        output = self._run_git(repo_root, ["checkout", name])
+        return self._with_mode(self._truncate_output(output))
+
+    def _git_stage(self, repo_root: Path) -> str:
+        """Stage file path(s) (git add -- <paths>)."""
+        if not self.file_path:
+            return "Error: file_path is required for stage operation (at least one path)"
+        try:
+            rels = self._validated_rel_paths(repo_root, self.file_path)
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        if not rels:
+            return "Error: file_path is required for stage operation (at least one path)"
+        output = self._run_git(repo_root, ["add", "--"] + rels)
+        return self._with_mode(self._truncate_output(output))
+
+    def _git_unstage(self, repo_root: Path) -> str:
+        """Unstage file path(s) (git reset HEAD -- <paths>)."""
+        if not self.file_path:
+            return "Error: file_path is required for unstage operation (at least one path)"
+        try:
+            rels = self._validated_rel_paths(repo_root, self.file_path)
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        if not rels:
+            return "Error: file_path is required for unstage operation (at least one path)"
+        # Path-scoped reset only; a bare `git reset` is never issued.
+        output = self._run_git(repo_root, ["reset", "HEAD", "--"] + rels)
+        return self._with_mode(self._truncate_output(output))
+
     def _git_show(self, repo_root: Path) -> str:
         """Run git show."""
         args = ["show", "--no-ext-diff", "--no-textconv"]
@@ -998,29 +1211,54 @@ class GitInfoTool(ToolBase):
         return self._truncate_output(output)
 
     def _git_commit(self, repo_root: Path) -> str:
-        """Run git commit."""
-        # If specific file_paths are given, unstage everything first so that
-        # only the explicitly-listed files are included in the commit.
-        if self.file_path:
-            reset_result = self._run_git(repo_root, ["reset", "HEAD", "--", "."])
-            if reset_result.startswith("Git command failed"):
-                return reset_result
+        """Run git commit.
 
-        # First, stage changes
-        add_result = self._git_add(repo_root)
-        if add_result.startswith("Git command failed") or add_result.startswith("Error"):
-            return add_result
+        Two modes:
 
-        # Then commit
-        if not self.message:
+        - Full commit (no ``file_path``): the worktree is auto-staged via
+          ``git add -A`` (tracked modifications, deletions and untracked
+          files) and ``git commit -m <msg>`` captures the whole worktree
+          state. A failure in the add step propagates
+          (``Git command failed ...``).
+        - Selective commit (``file_path`` given): the commit is limited to
+          the listed paths (``git commit -m <msg> -- <paths>``) without
+          touching the index -- only the named files are committed.
+
+        Commit hook policy lives in the execution backends: container mode
+        runs the workspace-local .githooks dir (core.hooksPath override);
+        host mode neutralizes hooks entirely (core.hooksPath=/dev/null plus
+        --no-verify). No vault-backed hooks are consulted. No agent-visible
+        flags are added here.
+        """
+        # Operator-managed worktrees (a .git FILE pointing at a gitdir) are
+        # committed host-side by the operator; block in-workspace commits
+        # before any git subprocess can run.
+        if self._is_operator_managed_worktree(repo_root):
+            return self._truncate_output(
+                "Error: commits in this workspace are performed host-side by "
+                "the operator (workspace is an operator-managed git worktree)"
+            )
+
+        if not self.message or not self.message.strip():
             return "Error: message is required for commit operation"
 
-        # Commit hook policy lives in the execution backends: container mode
-        # runs the workspace-local .githooks dir (core.hooksPath override);
-        # host mode neutralizes hooks entirely (core.hooksPath=/dev/null plus
-        # --no-verify). No vault-backed hooks are consulted.
-        args = ["commit", "-m", self.message]
-        output = self._run_git(repo_root, args)
+        if self.file_path:
+            try:
+                rels = self._validated_rel_paths(repo_root, self.file_path)
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+            if not rels:
+                return "Error: file_path is required for commit operation (at least one path)"
+            args = ["commit", "-m", self.message, "--"] + rels
+            output = self._run_git(repo_root, args)
+            return self._truncate_output(output)
+
+        # Full commit: auto-stage the whole worktree, then commit. A failure
+        # in the add step propagates exactly as the historical flow did.
+        add_output = self._git_add(repo_root)
+        if "Git command failed" in add_output:
+            return self._truncate_output(add_output)
+        output = self._run_git(repo_root, ["commit", "-m", self.message])
         return self._truncate_output(output)
 
     def _git_init(self, repo_root: Path) -> str:
