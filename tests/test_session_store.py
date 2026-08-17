@@ -72,14 +72,20 @@ class TestInit:
                                         enable_session_history_pruning=False)
         assert store.state_dir == state
 
-    def test_directories_created_on_init(self, tmp_path):
-        """Verify directories are created automatically."""
+    def test_directories_created_lazily_on_first_write(self, tmp_path):
+        """Verify directories are created on first write, not on init."""
         sessions = tmp_path / "new_sessions"
         state = tmp_path / "new_state"
         assert not sessions.exists()
         assert not state.exists()
         store = FileSystemSessionStore(sessions_dir=str(sessions), state_dir=str(state),
                                         enable_session_history_pruning=False)
+        # Construction performs no filesystem I/O
+        assert not sessions.exists()
+        assert not state.exists()
+        # The first write creates the directories
+        from session.models import Session
+        store.save_session(Session())
         assert sessions.exists()
         assert state.exists()
 
@@ -92,9 +98,11 @@ class TestOpenSessionsPath:
         path = store.get_open_sessions_path()
         assert path == store.state_dir / 'open_sessions.json'
 
-    def test_path_parent_created(self, store):
-        """Verify the state directory exists for the path."""
+    def test_path_parent_created_on_write(self, store):
+        """Verify the state directory is created lazily on first write."""
         path = store.get_open_sessions_path()
+        assert not path.parent.exists()
+        store.save_open_sessions([])
         assert path.parent.exists()
 
 
@@ -280,35 +288,48 @@ class TestGetSessionPath:
 # --- Migration Tests ---
 
 class TestCurrentSessionMigration:
-    """Test migration of .current_session from sessions_dir to state_dir."""
+    """Test read-only fallback to legacy .current_session in sessions_dir."""
 
-    def test_migrates_from_old_location_on_read(self, store):
-        """Verify .current_session is migrated from sessions_dir to state_dir on first read."""
+    def test_falls_back_to_old_location_read_only(self, store):
+        """Verify the legacy marker is read without migrating.
+
+        The legacy fallback is read-only: the old marker stays in place and no
+        new marker is written to state_dir.  set_current_session_id still writes
+        the new-location marker.
+        """
+        # sessions_dir is created lazily on first write; create it manually
+        store.sessions_dir.mkdir(parents=True, exist_ok=True)
         # Write .current_session in old location (sessions_dir)
         old_marker = store.sessions_dir / ".current_session"
         old_marker.write_text("migrated-session-id")
         assert old_marker.exists()
         assert not (store.state_dir / ".current_session").exists()
 
-        # Read should trigger migration
+        # Read falls back to the old location without migrating
         session_id = store.get_current_session_id()
         assert session_id == "migrated-session-id"
 
-        # Old marker should be removed
-        assert not old_marker.exists(), "Old marker should be deleted after migration"
+        # Old marker should be left in place (read-only fallback)
+        assert old_marker.exists(), "Old marker should NOT be deleted by a read"
 
-        # New marker should exist
+        # No new marker should be created by the read
         new_marker = store.state_dir / ".current_session"
+        assert not new_marker.exists(), "Read should not write a new marker"
+
+        # A subsequent set still writes the new-location marker
+        store.set_current_session_id("migrated-session-id")
         assert new_marker.exists()
         assert new_marker.read_text().strip() == "migrated-session-id"
 
     def test_prefers_new_location_over_old(self, store):
         """Verify the new location takes precedence when both exist."""
         # Write in new location
+        store.state_dir.mkdir(parents=True, exist_ok=True)
         new_marker = store.state_dir / ".current_session"
         new_marker.write_text("new-session-id")
 
         # Write in old location (should be ignored)
+        store.sessions_dir.mkdir(parents=True, exist_ok=True)
         old_marker = store.sessions_dir / ".current_session"
         old_marker.write_text("old-session-id")
 
@@ -321,6 +342,7 @@ class TestCurrentSessionMigration:
 
     def test_empty_old_marker_does_not_migrate(self, store):
         """Verify an empty old marker does not create a new marker."""
+        store.sessions_dir.mkdir(parents=True, exist_ok=True)
         old_marker = store.sessions_dir / ".current_session"
         old_marker.write_text("")
         assert store.get_current_session_id() is None
@@ -335,10 +357,12 @@ class TestOpenSessionsMigration:
     def test_reads_from_new_location_first(self, store):
         """Verify new location is tried first."""
         # Write in new location
+        store.state_dir.mkdir(parents=True, exist_ok=True)
         new_path = store.state_dir / 'open_sessions.json'
         new_path.write_text('["session-1"]')
 
         # Write in old location (should be ignored)
+        store.sessions_dir.mkdir(parents=True, exist_ok=True)
         old_path = store.sessions_dir / 'open_sessions.json'
         old_path.write_text('["session-2"]')
 
@@ -348,6 +372,7 @@ class TestOpenSessionsMigration:
     def test_fallback_to_old_location(self, store):
         """Verify old location is a fallback concept in main_window (tested via store path)."""
         # Old location exists, new does not
+        store.sessions_dir.mkdir(parents=True, exist_ok=True)
         old_path = store.sessions_dir / 'open_sessions.json'
         old_path.write_text('["session-a"]')
 

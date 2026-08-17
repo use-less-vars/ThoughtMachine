@@ -244,9 +244,17 @@ class KnowledgeBaseTool(ToolBase):
         """
         self._log_debug(f"KnowledgeBaseTool.execute called with mode='{self.mode}', domain='{self.domain}'")
 
+        write_modes = ("append", "update", "create_domain")
+
         # Resolve the knowledge base root directory
         if self.scope == "global":
-            kb_root = _get_global_kb_root()
+            if self.mode in write_modes:
+                kb_root = _get_global_kb_root()
+            else:
+                # Read modes: resolve the root WITHOUT initializing, so no
+                # directories or files are created on a read-only operation.
+                from agent.knowledge.global_kb import GLOBAL_KB_DIR
+                kb_root = GLOBAL_KB_DIR
             init_result = None  # global KB is self-initialising
         else:
             # === Resolve workspace path from registries (primary) ===
@@ -274,13 +282,16 @@ class KnowledgeBaseTool(ToolBase):
                 kb_root = Path(ws_path) / ".thoughtmachine" / "knowledge"
             else:
                 kb_root = Path.cwd() / ".thoughtmachine" / "knowledge"
-            init_result = self._initialize_kb(kb_root)
-            if init_result:
-                self._log_debug(f"Knowledge base initialized: {init_result}")
+            if self.mode in write_modes:
+                init_result = self._initialize_kb(kb_root)
+                if init_result:
+                    self._log_debug(f"Knowledge base initialized: {init_result}")
+            else:
+                init_result = None
 
         # Atomic permission re-check for write modes
         mode = self.mode
-        if mode in ("append", "update", "create_domain"):
+        if mode in write_modes:
             from security.security_gate import check_atomic_operation
             effective = self.effective_permissions or {}
             if not check_atomic_operation(

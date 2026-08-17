@@ -88,7 +88,6 @@ class WorkingDocument(ToolBase):
             ws_path = "."
         base = Path(ws_path)
         docs_dir = base / ".thoughtmachine" / "working_docs"
-        docs_dir.mkdir(parents=True, exist_ok=True)
 
         # Dispatch
         handler = {
@@ -127,6 +126,7 @@ class WorkingDocument(ToolBase):
         }
 
         filepath = docs_dir / f"{doc_id}.json"
+        docs_dir.mkdir(parents=True, exist_ok=True)
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(document, f, indent=2, ensure_ascii=False)
 
@@ -166,6 +166,7 @@ class WorkingDocument(ToolBase):
 
         document["updated_at"] = datetime.now().isoformat()
 
+        docs_dir.mkdir(parents=True, exist_ok=True)
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(document, f, indent=2, ensure_ascii=False)
 
