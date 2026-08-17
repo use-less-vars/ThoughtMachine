@@ -126,6 +126,7 @@ from session.store import FileSystemSessionStore
 from session.session_registry import SessionRegistry
 from agent.config.presets import get_tools_for_mode
 from agent.config.session_config import SessionConfig
+from agent.config.config_manager import save_config_defaults
 from thoughtmachine.workspace_registry import WorkspaceRegistry
 
 # ── Shared session store singleton ────────────────────────────────────────────
@@ -151,10 +152,36 @@ from web_ui.backend.session_routes import router as session_router
 from web_ui.backend.prompt_routes import router as prompt_router
 
 # ── ConfigManager (facade for all config operations) ────────────────────────
-from web_ui.backend.config_manager import ConfigManager
+from web_ui.backend.config_manager import (
+    ConfigManager,
+    GLOBAL_DEFAULT_KEYS,
+    load_global_defaults,
+)
 
 # Singleton instance used throughout the WebSocket handlers.
 config_manager = ConfigManager()
+
+
+def save_global_defaults(cfg_dict: Dict[str, Any]) -> Path:
+    """Persist a config payload as the global default (Path A of config ownership).
+
+    Extracts only the six session-level keys allowed in the global-default
+    layer (``GLOBAL_DEFAULT_KEYS``: provider_id, model, base_url, temperature,
+    max_turns, system_prompt), merges them into the existing
+    ``~/.thoughtmachine/user/defaults.json`` (preserving unrelated keys), and
+    writes the merged dict back through the canonical writer
+    ``agent.config.config_manager.save_config_defaults(..., global_scope=True)``.
+
+    Returns the path of the file written.  This replaces the legacy write to
+    ``~/.thoughtmachine/agent_config.json``, which is now read-compat only and
+    never written by the server.  See ``docs/architecture/config_ownership.md``.
+    """
+    subset = {k: v for k, v in cfg_dict.items() if k in GLOBAL_DEFAULT_KEYS}
+    existing = load_global_defaults()
+    merged = dict(existing)
+    merged.update(subset)
+    workspace_id = str(cfg_dict.get("workspace_id") or "")
+    return save_config_defaults(merged, workspace_id, global_scope=True)
 
 
 # Ensure project root is on sys.path
@@ -1156,6 +1183,12 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     Accepts an optional ``config`` payload (frontend format) so the
                     frontend can send the user's draft directly.  Falls back to
                     ``bridge.get_config()`` when no payload is provided.
+
+                    Persists ONLY the ``GLOBAL_DEFAULT_KEYS`` subset into
+                    ``~/.thoughtmachine/user/defaults.json`` (see
+                    ``docs/architecture/config_ownership.md``) — the legacy
+                    ``~/.thoughtmachine/agent_config.json`` write was removed;
+                    that file is now read-compat only.
                     """
                     try:
                         config_dict = msg.get("config")
@@ -1173,18 +1206,10 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             })
                             continue
 
-                        config_dir = Path.home() / '.thoughtmachine'
-                        config_dir.mkdir(parents=True, exist_ok=True)
-                        config_path = config_dir / 'agent_config.json'
+                        saved_path = save_global_defaults(cfg_dict)
 
-                        # Windows-safe atomic write with retry
-                        config_manager.atomic_replace(
-                            data=cfg_dict,
-                            dst=str(config_path),
-                            work_dir=str(config_dir),
-                        )
-
-                        log('INFO', 'server.config', f"Default config saved to {config_path}")
+                        log('INFO', 'server.config',
+                            f"Default config saved to {saved_path} (global defaults)")
                         await ws.send_json({
                             "type": "default_config_saved",
                             "status": "ok",
