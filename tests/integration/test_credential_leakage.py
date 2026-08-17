@@ -214,16 +214,25 @@ class TestSecretUnwrappedBeforeProvider:
     receive the Secret which works because Secret is a valid str subclass.
     """
 
-    def test_agent_config_api_key_is_secret_with_redaction(self):
+    def test_agent_config_api_key_is_secret_with_redaction(
+        self, tmp_path, monkeypatch
+    ):
         """After credential resolution, config.api_key is a Secret with redaction."""
         mock_session = MagicMock()
         mock_session.workspace_id = "test-workspace"
 
         import os
+        import shutil
+
+        # Hermetic: redirect HOME to tmp_path so Path.home()-based vault
+        # resolution (CredentialInjector) and the write path agree on tmp_path.
+        monkeypatch.setenv("HOME", str(tmp_path))
         cred_dir = os.path.join(
-            os.path.expanduser("~"), ".thoughtmachine", "credentials", "test-workspace"
+            str(tmp_path), ".thoughtmachine", "credentials", "test-workspace"
         )
-        os.makedirs(cred_dir, exist_ok=True)
+        os.makedirs(cred_dir, mode=0o700, exist_ok=True)
+        # Credentials dir must be owner-only (umask can only remove bits).
+        assert os.stat(cred_dir).st_mode & 0o077 == 0
         cred_file = os.path.join(cred_dir, "test_key")
         try:
             with open(cred_file, "w") as f:
@@ -245,8 +254,7 @@ class TestSecretUnwrappedBeforeProvider:
             assert repr(agent.config.api_key) == "***"
             assert f"{agent.config.api_key}" == "***"
         finally:
-            if os.path.exists(cred_file):
-                os.remove(cred_file)
+            shutil.rmtree(str(tmp_path / ".thoughtmachine"), ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
