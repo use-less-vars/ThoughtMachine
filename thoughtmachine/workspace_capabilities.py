@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from thoughtmachine.vault import vault_root
 from thoughtmachine.workspace_registry import _normalize_path
 
 # Minimal validation for template workers (avoids circular import via agent.__init__)
@@ -37,8 +38,13 @@ def _validate_worker_dict(data: dict) -> dict | None:
 # ── Default user data directory ───────────────────────────────────────────────
 
 def _user_dir() -> Path:
-    """Return the user data directory (lazily, so tests can patch ``Path.home``)."""
-    return Path.home() / ".thoughtmachine"
+    """Return the user data directory (lazily resolved, env-aware).
+
+    Uses ``vault_root()`` so ``THOUGHTMACHINE_VAULT_ROOT`` is honoured; falls
+    back to ``Path.home() / ".thoughtmachine"`` when the env var is unset
+    (tests patching ``Path.home`` continue to work).
+    """
+    return vault_root()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

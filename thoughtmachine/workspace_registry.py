@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from thoughtmachine.vault import vault_root
+
 logger = logging.getLogger(__name__)
 
 def generate_human_id() -> str:
@@ -57,8 +59,13 @@ def generate_human_id() -> str:
 
 
 def _user_dir() -> Path:
-    """Return the user data directory (lazily, so tests can patch ``Path.home``)."""
-    return Path.home() / ".thoughtmachine"
+    """Return the user data directory (lazily resolved, env-aware).
+
+    Uses ``vault_root()`` so ``THOUGHTMACHINE_VAULT_ROOT`` is honoured; falls
+    back to ``Path.home() / ".thoughtmachine"`` when the env var is unset
+    (tests patching ``Path.home`` continue to work).
+    """
+    return vault_root()
 
 
 def _registry_path() -> Path:

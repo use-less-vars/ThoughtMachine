@@ -248,8 +248,8 @@ class ContainerManager:
         """Load per-workspace config; returns a dict and NEVER raises.
 
         Reads ``<vault_root>/workspaces/<workspace_id>/config.json``.
-        Missing file -> defaults written to disk. Corrupt file -> defaults in
-        memory (file left untouched).
+        Missing file -> defaults in memory (nothing written to disk — construction
+        performs no I/O). Corrupt file -> defaults in memory (file untouched).
         """
         defaults = {"max_containers": 4, "disk_quota_mb": 4096}
         config_dir = Path(self.vault_root) / "workspaces" / str(self.workspace_id)
@@ -268,18 +268,34 @@ class ContainerManager:
                     log("WARNING", "docker.container_manager",
                         f"Failed to read workspace config {config_path}: {e}; using defaults")
                 return dict(defaults)
-            try:
-                config_dir.mkdir(parents=True, exist_ok=True)
-                with open(config_path, "w", encoding="utf-8") as f:
-                    json.dump(defaults, f, indent=2)
-            except OSError as e:
-                log("WARNING", "docker.container_manager",
-                    f"Failed to write default workspace config {config_path}: {e}")
             return dict(defaults)
         except Exception as e:
             log("WARNING", "docker.container_manager",
                 f"Unexpected error loading workspace config {config_path}: {e}")
             return dict(defaults)
+
+    def _save_workspace_config(self):
+        """Atomically persist the workspace config; NEVER raises.
+
+        Writes ``self.workspace_config`` to ``self.workspace_config_path``
+        (parent directory created on demand).  Failures are logged, never
+        raised, mirroring ``_save_container_notes``.
+        """
+        config_path = getattr(self, "workspace_config_path", None)
+        if config_path is None:
+            return
+        try:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = config_path.with_suffix(".json.tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(getattr(self, "workspace_config", {}) or {}, f, indent=2)
+            os.replace(tmp_path, config_path)
+        except (OSError, ValueError) as e:
+            log("WARNING", "docker.container_manager",
+                f"Failed to write workspace config {config_path}: {e}")
+        except Exception as e:
+            log("WARNING", "docker.container_manager",
+                f"Unexpected error writing workspace config {config_path}: {e}")
 
     def _get_max_containers(self) -> int:
         """Effective per-workspace container limit.

@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 from .models import Session
 from .lock import FileLock
+from thoughtmachine.vault import vault_root
 
 
 def _sanitize_filename(name: str, max_length: int = 100) -> str:
@@ -107,7 +108,6 @@ class FileSystemSessionStore(SessionStore):
         logger.debug(f"[SessionStore] Initializing with sessions_dir={sessions_dir}")
         self._enable_session_history_pruning = enable_session_history_pruning
         logger.debug(f"[SessionStore] Session history pruning enabled: {self._enable_session_history_pruning}")
-        self._original_sessions_dir = sessions_dir  # Store original parameter
 
         # In-memory caches to reduce disk I/O
         self._cached_list: Optional[Tuple[float, List[Dict[str, Any]]]] = None  # (timestamp, list)
@@ -120,10 +120,6 @@ class FileSystemSessionStore(SessionStore):
             home = os.path.expanduser("~")
             state_dir = os.path.join(home, ".thoughtmachine", "state")
         self.state_dir = Path(state_dir)
-        try:
-            self.state_dir.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            logger.warning(f"[SessionStore] Could not create state directory at {self.state_dir}")
 
         if sessions_dir is None:
             home = os.path.expanduser("~")
@@ -131,37 +127,30 @@ class FileSystemSessionStore(SessionStore):
             logger.debug(f"[SessionStore] Using default directory: {sessions_dir}")
         self.sessions_dir = Path(sessions_dir)
         logger.debug(f"[SessionStore] Final sessions_dir: {self.sessions_dir}")
-        # Try to create directory, with fallbacks if needed
+        # NOTE: construction performs no filesystem I/O; the state and sessions
+        # directories are created lazily on the first write via _ensure_dirs().
+
+    def _ensure_dirs(self) -> None:
+        """Create the state and sessions directories if missing (write paths only).
+
+        Called lazily by every method that persists anything, so constructing
+        a store never touches the filesystem.  Failures are logged and the
+        underlying write operation surfaces the error.
+        """
         try:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
             self.sessions_dir.mkdir(parents=True, exist_ok=True)
-            logger.debug(f"[SessionStore] Directory created/exists: {self.sessions_dir}")
         except OSError as e:
-            # Only attempt fallbacks if using default directory (not user-provided)
-            if self._original_sessions_dir is None:
-                logger.warning(f"[SessionStore] Warning: Could not create default sessions directory at {self.sessions_dir}: {e}")
-                # Try fallback in current working directory
-                try:
-                    import sys
-                    fallback = Path.cwd() / ".thoughtmachine" / "sessions"
-                    fallback.mkdir(parents=True, exist_ok=True)
-                    self.sessions_dir = fallback
-                    logger.info(f"[SessionStore] Using fallback directory: {self.sessions_dir}")
-                except OSError as e2:
-                    logger.warning(f"[SessionStore] Warning: Could not create fallback directory at {fallback}: {e2}")
-                    # Try system temp directory as last resort
-                    import tempfile
-                    temp_fallback = Path(tempfile.gettempdir()) / "thoughtmachine_sessions"
-                    temp_fallback.mkdir(parents=True, exist_ok=True)
-                    self.sessions_dir = temp_fallback
-                    logger.info(f"[SessionStore] Using temp directory: {self.sessions_dir}")
-            else:
-                # User-provided directory, re-raise the error
-                raise
+            logger.warning(
+                f"[SessionStore] Could not create directories "
+                f"(state={self.state_dir}, sessions={self.sessions_dir}): {e}"
+            )
+            raise
 
     @property
     def _base_dir(self) -> Path:
         """Root directory for workspace-scoped session storage."""
-        return Path(os.path.expanduser("~")) / ".thoughtmachine"
+        return vault_root()
 
     def _resolve_session_path(self, session_id: str, workspace_id: Optional[str] = None) -> Path:
         """Resolve the filesystem path for a session file.
@@ -275,6 +264,8 @@ class FileSystemSessionStore(SessionStore):
 
         Acquires an exclusive file lock to prevent concurrent writes.
         """
+        self._ensure_dirs()
+
         # Resolve workspace_id from session if not explicitly passed
         if workspace_id is None and session.workspace_id:
             workspace_id = session.workspace_id
@@ -571,7 +562,6 @@ class FileSystemSessionStore(SessionStore):
                 sid = session_info['session_id']
                 seen_ids.add(sid)
                 sessions.append(session_info)
-                self._write_meta_file(session_info)
                 continue
             # Fallback: full file read (should be rare after migration)
             try:
@@ -592,7 +582,6 @@ class FileSystemSessionStore(SessionStore):
                 }
                 seen_ids.add(sid)
                 sessions.append(session_info)
-                self._write_meta_file(session_info)
             except json.JSONDecodeError as e:
                 logger.warning(f"[SessionStore] Corrupt session file {file_path.name}: {e}")
                 continue
@@ -707,23 +696,6 @@ class FileSystemSessionStore(SessionStore):
             'preview': '',
         }
 
-    def _write_meta_file(self, session_info: Dict[str, Any]) -> None:
-        """Write a lightweight _meta_ file so the fast path can use it next time."""
-        sid = session_info.get('session_id')
-        if not sid:
-            return
-        meta_path = self._get_meta_path(sid)
-        try:
-            temp_path = meta_path.with_suffix('.tmp')
-            os.makedirs(os.path.dirname(temp_path), exist_ok=True)
-            with open(temp_path, 'w') as f:
-                json.dump(session_info, f)
-            temp_path.replace(meta_path)
-        except Exception:
-            # Non-critical — will retry on next list_sessions() call
-            if temp_path.exists():
-                temp_path.unlink()
-
     # ── Singleton access ─────────────────────────────────────────────────────
 
     _instance: Optional['FileSystemSessionStore'] = None
@@ -750,6 +722,8 @@ class FileSystemSessionStore(SessionStore):
 
         Returns True if at least one file was deleted.
         """
+        self._ensure_dirs()
+
         # Invalidate caches
         self._cached_paths.pop(session_id, None)
         self._cached_paths_ts.pop(session_id, None)
@@ -839,7 +813,7 @@ class FileSystemSessionStore(SessionStore):
         try:
             # Atomic write via temp file
             temp_path = path.with_suffix('.tmp')
-            os.makedirs(os.path.dirname(temp_path), exist_ok=True)
+            self._ensure_dirs()
             with open(temp_path, 'w') as f:
                 json.dump(session_ids, f)
             temp_path.replace(path)
@@ -870,8 +844,9 @@ class FileSystemSessionStore(SessionStore):
         Get the ID of the current session from the marker file.
         Returns None if no marker exists.
 
-        Migrates the marker from the old sessions_dir location to the
-        new state_dir location on first access if needed.
+        Falls back (read-only) to the legacy marker in the old sessions_dir
+        location when the state_dir marker does not exist.  No migration is
+        performed: this method never writes to disk.
         """
         marker = self.state_dir / ".current_session"
         logger.debug(f"[SessionStore] get_current_session_id: marker={marker}, exists={marker.exists()}")
@@ -885,23 +860,16 @@ class FileSystemSessionStore(SessionStore):
                 logger.error(f"[SessionStore] Error reading current session marker: {e}")
                 return None
 
-        # Migration: check old location in sessions_dir
+        # Read-only fallback: check old location in sessions_dir (no migration)
         old_marker = self.sessions_dir / ".current_session"
         if old_marker.exists():
             try:
                 content = old_marker.read_text().strip()
                 if content:
-                    logger.info(f"[SessionStore] Migrating .current_session from {old_marker} to {marker}")
-                    # Atomic write to new location
-                    temp_path = marker.with_suffix('.tmp')
-                    os.makedirs(os.path.dirname(temp_path), exist_ok=True)
-                    temp_path.write_text(content)
-                    temp_path.replace(marker)
-                    # Remove old marker
-                    old_marker.unlink()
+                    logger.debug(f"[SessionStore] Using legacy .current_session from {old_marker}")
                     return content
             except Exception as e:
-                logger.error(f"[SessionStore] Error migrating .current_session: {e}")
+                logger.error(f"[SessionStore] Error reading legacy .current_session: {e}")
 
         return None
 
@@ -924,7 +892,7 @@ class FileSystemSessionStore(SessionStore):
             # Atomic write via temp file
             temp_path = marker.with_suffix('.tmp')
             try:
-                os.makedirs(os.path.dirname(temp_path), exist_ok=True)
+                self._ensure_dirs()
                 temp_path.write_text(session_id)
                 temp_path.replace(marker)
                 logger.info(f"[SessionStore] Wrote marker file with session_id: {session_id}")

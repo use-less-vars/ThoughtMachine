@@ -24,6 +24,7 @@ import json
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
+from agent._log_root import get_log_root
 from agent.logging import log
 from agent.config.loader import (
     load_config,
@@ -31,6 +32,7 @@ from agent.config.loader import (
     migrate_config,
     get_config_paths,
 )
+from thoughtmachine.vault import vault_root
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -195,9 +197,14 @@ def _check_api_key(report: HealthReport) -> None:
 def _check_directories(report: HealthReport) -> None:
     """Verify required directories exist or can be created."""
     dirs_to_check = {
-        'Log directory': '~/.thoughtmachine/logs',
+        # Canonical log root (agent._log_root.get_log_root): honors
+        # THOUGHTMACHINE_VAULT_ROOT, else ~/.thoughtmachine/logs.
+        'Log directory': str(get_log_root()),
         'Config backups': '~/.thoughtmachine/config_backups',
-        'Knowledge base': '.thoughtmachine/global',
+        # Global knowledge base lives in the vault "global" compartment
+        # (agent.knowledge.global_kb.GLOBAL_KB_DIR).  Resolve against the
+        # vault root so nothing is ever created relative to the CWD.
+        'Knowledge base': str(vault_root() / 'global'),
     }
 
     # Also check workspace_path from config if available
