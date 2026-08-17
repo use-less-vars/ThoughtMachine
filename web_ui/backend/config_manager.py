@@ -7,6 +7,7 @@ from a single location.
 
 Exported names (all public — no leading underscore):
     FALLBACK_FRONTEND_CONFIG
+    GLOBAL_DEFAULT_KEYS
     load_global_defaults
     translate_frontend_config
     frontend_config_from_bridge
@@ -86,6 +87,26 @@ FALLBACK_FRONTEND_CONFIG: Dict[str, Any] = {
     "enabled_tools": get_tools_for_mode("agent"),
     "tools": [],
 }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  GLOBAL_DEFAULT_KEYS
+# ═══════════════════════════════════════════════════════════════════════════
+# The only keys the Web UI may persist into the global-default layer
+# (``~/.thoughtmachine/user/defaults.json``) when the user saves a config as
+# the global default (``set_default_config``).  Every other key in a
+# frontend/backend config payload is session-local or workspace-scoped and
+# must NOT be written into the global defaults file.  See
+# ``docs/architecture/config_ownership.md`` for the full ownership model.
+
+GLOBAL_DEFAULT_KEYS = frozenset({
+    "provider_id",
+    "model",
+    "base_url",
+    "temperature",
+    "max_turns",
+    "system_prompt",
+})
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 from pathlib import Path
 
 from agent.config.deep_merge import deep_merge
@@ -108,9 +110,38 @@ def save_config_defaults(
         dst = _workspace_defaults_path(workspace_id)
 
     dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_text(
-        json.dumps(config_dict, indent=2, ensure_ascii=False, default=str),
-        encoding="utf-8",
-    )
+
+    # Atomic write: serialize to a temp file in the same directory as the
+    # destination, fsync it, lock it down to 0o600 before the rename (the
+    # mode survives os.replace), then atomically replace the destination.
+    # On failure the temp file is unlinked and the previous destination
+    # content is left intact.  No retry loop (mirrors atomic_replace in
+    # web_ui/backend/config_manager.py, without the retries/shutil.move
+    # fallback).
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            delete=False,
+            dir=dst.parent,
+            prefix=f".{dst.name}.",
+            suffix=".tmp",
+        ) as tmp:
+            tmp.write(
+                json.dumps(config_dict, indent=2, ensure_ascii=False, default=str)
+            )
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+        tmp_path.chmod(0o600)
+        os.replace(tmp_path, dst)
+    except OSError:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
     logger.info("Saved config defaults to %s", dst)
     return dst

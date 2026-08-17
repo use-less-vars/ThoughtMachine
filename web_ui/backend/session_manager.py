@@ -94,10 +94,14 @@ class SessionManager:
         )
 
         # Merge global defaults so saved provider/model appear in new sessions
-        from web_ui.backend.config_manager import load_global_defaults, translate_frontend_config
+        from web_ui.backend.config_manager import (
+            GLOBAL_DEFAULT_KEYS,
+            load_global_defaults,
+            translate_frontend_config,
+        )
         defaults_be = translate_frontend_config(load_global_defaults())
-        # Only copy keys that SessionConfig actually supports
-        session_config_keys = {"provider_id", "model", "base_url", "temperature"}
+        # Only copy the global-default allowlist (see docs/architecture/config_ownership.md)
+        session_config_keys = GLOBAL_DEFAULT_KEYS
         for key in session_config_keys:
             if key in defaults_be and defaults_be[key]:
                 setattr(session_config, key, defaults_be[key])
