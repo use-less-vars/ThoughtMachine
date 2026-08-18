@@ -60,6 +60,7 @@ class SessionListItem(BaseModel):
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     preview: str = ""
+    session_size_bytes: Optional[int] = None
 
 
 class SessionDetailResponse(BaseModel):
@@ -70,6 +71,7 @@ class SessionDetailResponse(BaseModel):
     message_count: int = 0
     workspace_id: str = ""
     mode: str = "agent"
+    session_size_bytes: Optional[int] = None
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -191,7 +193,7 @@ async def list_sessions(
         # Try to get previews from session store for all sessions
         store = _get_store()
         session_ids = [s.get("session_id", "") for s in sessions if s.get("session_id")]
-        metadata_batch = store.load_sessions_metadata_batch(session_ids, workspace_id=workspace_id) if workspace_id else {}
+        metadata_batch = store.load_sessions_metadata_batch(session_ids, workspace_id=workspace_id)
 
         # Map registry fields to the expected SessionListItem format
         result = []
@@ -206,6 +208,7 @@ async def list_sessions(
                 "created_at": s.get("created_at"),
                 "updated_at": meta.get("updated_at") if meta else s.get("updated_at"),
                 "preview": meta.get("preview", "") if meta else "",
+                "session_size_bytes": meta.get("session_size_bytes") if meta else None,
             })
 
         return result
@@ -241,6 +244,7 @@ async def get_session(session_id: str) -> Dict[str, Any]:
             "message_count": message_count,
             "workspace_id": session.workspace_id or "",
             "mode": session.mode,
+            "session_size_bytes": store.get_session_size_bytes(session_id),
         }
     except HTTPException:
         raise

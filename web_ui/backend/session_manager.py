@@ -78,6 +78,9 @@ class SessionManager:
         new_session = Session()
         new_session.mode = mode
         new_session.metadata["source"] = "web_ui"
+        # Main-agent sessions only: this flag gates session history bounding
+        # (session/size_bounding.py) and session_size_bytes exposure.
+        new_session.metadata["agent_type"] = "main"
         new_session.ensure_name()
 
         # Build a minimal SessionConfig for the requested mode

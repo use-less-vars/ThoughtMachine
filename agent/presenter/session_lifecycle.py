@@ -110,6 +110,9 @@ class SessionLifecycle:
                 ws_path = self.state_bridge.current_config.workspace_path
                 workspace_id = None
                 metadata = {}
+                # Main-agent sessions only: this flag gates session history bounding
+                # (session/size_bounding.py) and session_size_bytes exposure.
+                metadata['agent_type'] = 'main'
                 if ws_path:
                     from thoughtmachine.workspace_capabilities import resolve_workspace_id
                     try:
@@ -148,6 +151,9 @@ class SessionLifecycle:
         ws_path = self.state_bridge.current_config.workspace_path
         workspace_id = None
         metadata = {}
+        # Main-agent sessions only: this flag gates session history bounding
+        # (session/size_bounding.py) and session_size_bytes exposure.
+        metadata['agent_type'] = 'main'
         if name:
             metadata['name'] = name
         if ws_path:
