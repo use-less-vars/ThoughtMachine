@@ -446,12 +446,12 @@ def test_policy_denied_unavailable(monkeypatch):
     mgr = _make_manager(
         monkeypatch,
         images=images,
-        session_permissions={"container": False, "network": "banned"},
+        session_permissions={"git": "banned"},
     )
     result = mgr.ensure_resource("git")
     assert result["mode"] == "unavailable"
     assert "disabled/denied" in result["detail"]
-    assert "container" in result["detail"].lower()
+    assert "git" in result["detail"].lower()
 
 
 def test_policy_allows_container(monkeypatch):
@@ -461,7 +461,7 @@ def test_policy_allows_container(monkeypatch):
         monkeypatch,
         images=images,
         containers=containers,
-        session_permissions={"container": True, "network": "none"},
+        session_permissions={"container": True, "network": "none", "git": True},
     )
     result = mgr.ensure_resource("git")
     assert result["mode"] == "containerized"

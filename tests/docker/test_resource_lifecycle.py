@@ -421,11 +421,11 @@ def test_resource_status_policy_denied(monkeypatch):
     result = rcm.resource_status(
         "git",
         workspace_id="ws-1",
-        session_permissions={"container": False, "network": "banned"},
+        session_permissions={"git": "banned"},
     )
     assert result["mode"] == "unavailable"
     assert "disabled/denied" in result["detail"]
-    assert "container" in result["detail"].lower()
+    assert "git" in result["detail"].lower()
 
 
 def test_resource_status_no_workspace_id(monkeypatch):
