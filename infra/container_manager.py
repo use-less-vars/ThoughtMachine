@@ -35,6 +35,12 @@ Every container created by this module carries:
 - ``thoughtmachine.workspace_id=<workspace_id>``
 Used for label-based reuse lookups and ``cleanup_workspace()`` sweeps.
 
+Containers created on behalf of a worker sub-agent (``start(worker_name=...)``)
+additionally carry ``thoughtmachine.worker=<worker_name>`` on FRESH creates.
+Workers stop/remove their labelled containers at teardown and never touch
+resource containers (see tools/workspace/worker.py). Reuse paths never
+re-label an existing container: the worker label is only stamped at create.
+
 Sticky notes (vault bulletin board)
 -----------------------------------
 Container notes are NOT stored in Docker labels (labels are immutable after
@@ -411,10 +417,17 @@ class ContainerManager:
                 return handle
         return None
 
-    def start(self, image=None, name=None, note=None):
+    def start(self, image=None, name=None, note=None, worker_name=None):
         """Ensure a running container exists and return {"id", "name", "status", "note"}.
 
         Reuse order: in-memory registry -> label lookup -> fresh create.
+
+        ``worker_name`` (optional) stamps the container with the
+        ``thoughtmachine.worker`` ownership label - but only on a FRESH
+        create: reuse paths return before the label dict is built, so an
+        existing container keeps whatever labels it was created with. Workers
+        use this label to reclaim their containers at teardown (see
+        tools/workspace/worker.py).
 
         ``note`` is an optional sticky note: it is written to the per-workspace
         bulletin board (``<vault_root>/workspaces/<workspace_id>/container_notes.json``)
@@ -577,6 +590,10 @@ class ContainerManager:
             "thoughtmachine.container_name": name,
             "thoughtmachine.workspace_id": self.workspace_id,
         }
+        if worker_name:
+            # Ownership label: lets a worker reclaim the containers it created
+            # at teardown (presence-based; the value is informational).
+            labels["thoughtmachine.worker"] = worker_name
         _audit("CONTAINER_CREATE",
                f"image={image} network={network_mode} name={name} session={self.session_id}")
 

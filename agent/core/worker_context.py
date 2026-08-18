@@ -28,11 +28,28 @@ The WorkerContext exposes these Session-equivalent attributes:
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+
+# ── Worker-name context var ──────────────────────────────────────────────────────────────
+# Carries the name of the worker sub-agent whose query is currently executing
+# on THIS thread. WorkerThread._run_tool_loop stamps it for the duration of
+# each process_query() turn; tools read it via current_worker_name() to stamp
+# ownership labels (e.g. the ``thoughtmachine.worker`` docker label on
+# containers they create, which worker teardown uses to reclaim them).
+WORKER_NAME_CONTEXTVAR: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "thoughtmachine_worker_name", default=None
+)
+
+
+def current_worker_name() -> Optional[str]:
+    """Return the worker name executing on this thread, or None outside a worker turn."""
+    return WORKER_NAME_CONTEXTVAR.get()
 
 
 class WorkerContext:

@@ -38,6 +38,15 @@ from pydantic import Field
 
 from .base import ToolBase
 
+# Worker-name context var (stdlib-only leaf module — no circular import).
+# Falls back to None so the container tools keep working outside a worker turn.
+try:
+    from agent.core.worker_context import current_worker_name
+except ImportError:
+
+    def current_worker_name():  # type: ignore
+        return None
+
 # Guarded Docker SDK import (mirrors container_manager): keeps this module
 # importable when the docker package is missing so the rest of the agent loads.
 try:
@@ -189,12 +198,26 @@ class ContainerStartTool(_ContainerControlBase):
         default=50000,
         description="CPU quota in microseconds (default 50000 = 50ms per 100ms period)"
     )
+    worker_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "[internal] Name of the worker sub-agent that created this container "
+            "(injected by ToolExecutor from the worker context var; stamped as the "
+            "``thoughtmachine.worker`` docker label on fresh creates so worker "
+            "teardown can reclaim it)."
+        ),
+    )
 
     def execute(self) -> str:
         start_time = time.time()
         try:
             manager = self._make_manager()
-            info = manager.start(image=self.image, name=self.name, note=self.note)
+            info = manager.start(
+                image=self.image,
+                name=self.name,
+                note=self.note,
+                worker_name=getattr(self, "worker_name", None) or current_worker_name(),
+            )
             if "error" in info:
                 return self._respond(
                     False,

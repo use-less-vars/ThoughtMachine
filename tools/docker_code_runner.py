@@ -8,6 +8,15 @@ from typing import ClassVar, List, Literal, Optional, Dict, Any
 from pydantic import Field, field_validator, model_validator
 from .base import ToolBase
 
+# Worker-name context var (stdlib-only leaf module — no circular import).
+# Falls back to None so the runner keeps working outside a worker turn.
+try:
+    from agent.core.worker_context import current_worker_name
+except ImportError:
+
+    def current_worker_name():  # type: ignore
+        return None
+
 # Import centralized security
 try:
     from thoughtmachine.security import (
@@ -171,6 +180,15 @@ class DockerCodeRunner(ToolBase):
     idle_timeout: int = Field(
         default=600,
         description="Idle timeout in seconds for container pooling. Container will be closed after this period of inactivity. Default: 600 seconds (10 minutes)."
+    )
+    worker_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "[internal] Name of the worker sub-agent that created this container "
+            "(injected by ToolExecutor from the worker context var; stamped as the "
+            "``thoughtmachine.worker`` docker label on fresh creates so worker "
+            "teardown can reclaim it)."
+        ),
     )
 
     @model_validator(mode='after')
@@ -383,7 +401,10 @@ chmod +x "{script_path}"
                 manager.build_image(tag=self.image)
             with open("/tmp/container_audit.log", "a") as _f:
                 _f.write(f"{time.time()} | CODERUNNER_EXECUTE | workspace={workspace} via_security={SECURITY_AVAILABLE}\n")
-            info = manager.start(image=self.image)
+            info = manager.start(
+                image=self.image,
+                worker_name=getattr(self, "worker_name", None) or current_worker_name(),
+            )
             # start() returns {"error": ...} (no "id") when the per-workspace
             # container limit is reached or any pre-create check fails -
             # surface that as a clear RuntimeError instead of a KeyError('id').
