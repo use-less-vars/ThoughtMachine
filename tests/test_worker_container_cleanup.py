@@ -2,16 +2,23 @@
 TESTS-FIRST — worker container cleanup on timeout/error (RED on
 feat/wlm-phase1-safe-foundation).
 
-Contracts under test (the prod implementation does NOT satisfy them yet):
+Contracts under test (B1–B3 are now satisfied by prod; contract C is RED
+on the current branch):
 
   B1. A worker that hits a soft timeout (state CRITICAL + restriction_reason
       "timeout") stops+removes its worker-owned containers via the container
-      manager (label thoughtmachine.worker=<worker_name>).
+      manager (label thoughtmachine.worker=<session_id>:<worker_name>).
   B2. A worker that errors out of run() (exception propagating out of
       _run_tool_loop) stops+removes its worker-owned containers.
   B3. Cleanup actually runs AND never touches resource containers
       (thoughtmachine.resource label / tm-res-* name / tm-resource-git image)
       — the exclusion contract.
+  C.  Ownership is EXACT-VALUE: a container belongs to a worker only when
+      thoughtmachine.worker == "<session_id>:<worker_name>". Teardown must
+      never touch sibling workers' containers in the same session (RED
+      today: label PRESENCE decides ownership, so worker A's teardown also
+      stops+removes worker B's containers) and never reclaims stale
+      bare-name labels from the old format.
 
 Mocks only — no real Docker, no sleeps, no production code changes. run() is
 executed inline with a patched _run_tool_loop (same pattern as
@@ -94,12 +101,14 @@ class _RunSafetyPatches(unittest.TestCase):
 
 # Container fakes — the mocked container manager only records calls; prod
 # does the discovery. Labels encode the NEW contract: worker-owned containers
-# carry thoughtmachine.worker=<worker_name>; resource containers carry
-# thoughtmachine.resource and/or tm-res-* / tm-resource-git names.
+# carry thoughtmachine.worker=<session_id>:<worker_name> (the owning worker's
+# identity — "s1:w-test" matches make_thread's session_id="s1" + name
+# "w-test"); resource containers carry thoughtmachine.resource and/or
+# tm-res-* / tm-resource-git names.
 WORKER_CONTAINER = SimpleNamespace(
     id="c-w1",
     name="tm-worker-w-test",
-    labels={"thoughtmachine.worker": "w-test"},
+    labels={"thoughtmachine.worker": "s1:w-test"},
 )
 RESOURCE_CONTAINER = SimpleNamespace(
     id="c-res",
@@ -123,7 +132,9 @@ class TestWorkerContainerCleanup(_RunSafetyPatches):
 
     def _run_timeout(self, tmp, cm):
         """Drive run() inline through a soft-timeout _run_tool_loop."""
-        thread = make_thread(tmp, name="w-clean-timeout")
+        # Identity "s1:w-test" (session_id="s1" + name "w-test") must equal
+        # the WORKER_CONTAINER label under the exact-value ownership contract.
+        thread = make_thread(tmp, name="w-test")
         thread._agent = make_fake_agent("CRITICAL", "timeout")
         thread._state_bridge = SimpleNamespace(context_length=0)
         # NEW prod contract: WorkerThread gains a container_manager
@@ -158,7 +169,9 @@ class TestWorkerContainerCleanup(_RunSafetyPatches):
 
     def _run_error(self, tmp, cm):
         """Drive run() inline through an exploding _run_tool_loop."""
-        thread = make_thread(tmp, name="w-clean-error")
+        # Identity "s1:w-test" (session_id="s1" + name "w-test") must equal
+        # the WORKER_CONTAINER label under the exact-value ownership contract.
+        thread = make_thread(tmp, name="w-test")
         thread._agent = make_fake_agent()
         thread._state_bridge = SimpleNamespace(context_length=0)
         thread._container_manager = cm
@@ -244,6 +257,99 @@ class TestWorkerContainerCleanup(_RunSafetyPatches):
                 msg="worker cleanup never invoked container_manager.remove",
             )
             # ...and must exclude resource containers by contract.
+            self.assertFalse(_called_with(cm.stop, RESOURCE_CONTAINER))
+            self.assertFalse(_called_with(cm.remove, RESOURCE_CONTAINER))
+
+
+class TestCrossWorkerIsolation(_RunSafetyPatches):
+    """C — cross-worker container isolation (exact-value ownership).
+
+    Two workers in the SAME session share one container manager. Worker A's
+    teardown must stop+remove ONLY containers whose
+    ``thoughtmachine.worker`` label equals A's identity
+    (``"<session_id>:<worker_name>"``). RED today: ownership is decided by
+    label PRESENCE, so A's teardown also stops+removes sibling worker B's
+    containers.
+    """
+
+    def _drive_cleanup(self, tmp, cm, name, listed):
+        """Build a worker thread (identity s1:<name>), attach the manager and
+        run worker-scoped cleanup directly (the same method run()'s finally
+        and _action_stop invoke)."""
+        thread = make_thread(tmp, name=name)
+        thread._container_manager = cm
+        cm.list_containers.return_value = listed
+        thread._cleanup_worker_containers()
+        return thread
+
+    def test_worker_teardown_leaves_sibling_containers_untouched(self):
+        cm = mock.Mock()
+        worker_a = SimpleNamespace(
+            id="c-wa",
+            name="tm-worker-w-a",
+            labels={"thoughtmachine.worker": "s1:w-a"},
+        )
+        worker_b = SimpleNamespace(
+            id="c-wb",
+            name="tm-worker-w-b",
+            labels={"thoughtmachine.worker": "s1:w-b"},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self._drive_cleanup(
+                tmp, cm, name="w-a",
+                listed=[worker_a, worker_b, RESOURCE_CONTAINER],
+            )
+            # A's own container is stopped and removed.
+            self.assertTrue(
+                _called_with(cm.stop, worker_a),
+                msg=f"A's own container never stopped; "
+                    f"stop calls={cm.stop.call_args_list}",
+            )
+            self.assertTrue(
+                _called_with(cm.remove, worker_a),
+                msg=f"A's own container never removed; "
+                    f"remove calls={cm.remove.call_args_list}",
+            )
+            # Sibling worker B's container must survive A's teardown. RED
+            # today: presence-based matching treats B's label as owned by A.
+            self.assertFalse(
+                _called_with(cm.stop, worker_b),
+                msg=f"sibling worker container was stopped; "
+                    f"stop calls={cm.stop.call_args_list}",
+            )
+            self.assertFalse(
+                _called_with(cm.remove, worker_b),
+                msg=f"sibling worker container was removed; "
+                    f"remove calls={cm.remove.call_args_list}",
+            )
+            # Resource containers remain excluded.
+            self.assertFalse(_called_with(cm.stop, RESOURCE_CONTAINER))
+            self.assertFalse(_called_with(cm.remove, RESOURCE_CONTAINER))
+
+    def test_worker_teardown_ignores_stale_bare_name_labels(self):
+        cm = mock.Mock()
+        # A container labelled with the OLD bare-name format (no session
+        # prefix) must NOT be reclaimed by an identity-scoped teardown.
+        stale = SimpleNamespace(
+            id="c-stale",
+            name="tm-worker-w-a",
+            labels={"thoughtmachine.worker": "w-a"},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self._drive_cleanup(
+                tmp, cm, name="w-a",
+                listed=[stale, RESOURCE_CONTAINER],
+            )
+            self.assertFalse(
+                _called_with(cm.stop, stale),
+                msg=f"stale bare-name label was stopped; "
+                    f"stop calls={cm.stop.call_args_list}",
+            )
+            self.assertFalse(
+                _called_with(cm.remove, stale),
+                msg=f"stale bare-name label was removed; "
+                    f"remove calls={cm.remove.call_args_list}",
+            )
             self.assertFalse(_called_with(cm.stop, RESOURCE_CONTAINER))
             self.assertFalse(_called_with(cm.remove, RESOURCE_CONTAINER))
 

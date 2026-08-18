@@ -10,10 +10,12 @@ Container cleanup
 -----------------
 When a worker exits (completed, stopped, errored, or timed out) it stops
 and removes any containers it created while running. Ownership is
-established by the ``thoughtmachine.worker`` label: a container whose
-label is present with a truthy value belongs to the worker that ran the
-tool call which created it (the label value carries the worker name for
-diagnostics but is deliberately not compared). Resource containers
+established by the EXACT VALUE of the ``thoughtmachine.worker`` label: a
+container belongs to a worker only when the label value EQUALS the
+worker's owner identity ``<session_id or 'unknown'>:<worker_name>`` (the
+identity the worker container bridge stamped when the tool call created
+it). Containers with a stale or mismatched value are ignored - they may
+belong to a sibling worker or a previous session. Resource containers
 (``thoughtmachine.resource`` label, ``tm-res-*`` names, or the
 ``tm-resource-git`` image) are shared workspace infrastructure managed by
 the workspace lifecycle manager and are never touched during worker
@@ -100,6 +102,14 @@ try:
 except ImportError:
     WorkerContext = None  # type: ignore
     WORKER_NAME_CONTEXTVAR = None  # type: ignore
+
+# Optional: ContainerManager — used at spawn time to build a per-worker
+# manager for worker-scoped container teardown. Imported lazily so worker.py
+# stays importable when the docker stack is unavailable (cleanup then no-ops).
+try:
+    from infra.container_manager import ContainerManager as _CM
+except Exception:
+    _CM = None  # type: ignore
 
 # NOTE: Agent and AgentConfig are imported *lazily* inside
 # WorkerThread._build_agent_config() to avoid a circular import with
@@ -561,11 +571,12 @@ def _restrictive_merge(
 # ---------------------------------------------------------------------------
 
 # Ownership label stamped on containers created inside worker tool calls by
-# the worker container bridge. Ownership is established by the PRESENCE of
-# a truthy value — the value carries the creating worker's name for
-# diagnostics only and is deliberately not compared (a container spawned
-# in a tool call belongs to the worker thread that executed it, so a name
-# mismatch must never prevent cleanup).
+# the worker container bridge. Ownership is established by the EXACT VALUE:
+# the label must equal the owning worker's owner identity
+# ("<session_id or 'unknown'>:<worker_name>") for teardown to reclaim the
+# container. Stale values (a sibling worker's identity, a bare worker name,
+# a previous session's identity) are deliberately ignored so a worker never
+# stops a container it does not own.
 _WORKER_CONTAINER_LABEL = "thoughtmachine.worker"
 # Label marking shared resource containers (git checkouts, tooling images)
 # managed by the workspace lifecycle manager — always excluded from
@@ -744,6 +755,18 @@ class WorkerThread(threading.Thread):
     def event_bus(self):
         """Return the per-worker EventBus instance."""
         return self._event_bus
+
+    @property
+    def owner_identity(self) -> str:
+        """Owner identity stamped on containers this worker creates.
+
+        Format: ``<session_id or 'unknown'>:<worker_name>`` — the single
+        source of truth used BOTH when stamping the ``thoughtmachine.worker``
+        docker label (via the worker-name context var in ``_run_tool_loop``)
+        and when comparing labels at teardown
+        (``_is_worker_owned_container``).
+        """
+        return f"{self.session_id or 'unknown'}:{self.worker_name}"
 
     @property
     def max_context_tokens(self) -> int:
@@ -1243,11 +1266,14 @@ class WorkerThread(threading.Thread):
         # tool calls executed by the agent read it via
         # agent.core.worker_context.current_worker_name() and stamp the
         # ``thoughtmachine.worker`` docker label on containers they create,
-        # so teardown can reclaim them (see module docstring). Reset in the
-        # finally block below so the var never leaks across queries.
+        # so teardown can reclaim them (see module docstring). The stamp
+        # carries the worker's OWNER IDENTITY (``<session_id or
+        # 'unknown'>:<worker_name>``), not the bare name, so teardown can
+        # match labels exactly. Reset in the finally block below so the var
+        # never leaks across queries.
         _worker_ctx_token = None
         if WORKER_NAME_CONTEXTVAR is not None:
-            _worker_ctx_token = WORKER_NAME_CONTEXTVAR.set(self.worker_name)
+            _worker_ctx_token = WORKER_NAME_CONTEXTVAR.set(self.owner_identity)
 
         try:
             for event in self._agent.process_query(query):
@@ -1422,15 +1448,18 @@ class WorkerThread(threading.Thread):
     def _is_worker_owned_container(self, container: Any) -> bool:
         """Return True when ``container`` belongs to this worker.
 
-        Ownership is established by the PRESENCE of a truthy
-        ``thoughtmachine.worker`` label (any value — see module docstring).
+        Ownership is established by an EXACT match: the
+        ``thoughtmachine.worker`` label value must equal this worker's owner
+        identity (``<session_id or 'unknown'>:<worker_name>`` — see module
+        docstring). Stale/mismatched values (sibling workers, bare names,
+        previous sessions) are ignored.
         """
         labels = getattr(container, "labels", None)
         if labels is None and isinstance(container, dict):
             labels = container.get("labels")
         if not labels:
             return False
-        return bool(labels.get(_WORKER_CONTAINER_LABEL))
+        return labels.get(_WORKER_CONTAINER_LABEL) == self.owner_identity
 
     def _cleanup_worker_containers(self) -> None:
         """Stop and remove containers owned by this worker.
@@ -2881,6 +2910,29 @@ class Worker(ToolBase):
             else definition.get("timeout_seconds", 600)
         )
 
+        # Build a ContainerManager bound to this session/workspace so the
+        # worker can stop/remove the containers it owns at teardown. Falls
+        # back to None when Docker/ContainerManager is unavailable — worker
+        # teardown then skips container cleanup instead of crashing (mirrors
+        # tools/container_control._make_manager).
+        container_manager = None
+        if _CM is not None:
+            try:
+                workspace_id = None
+                try:
+                    from thoughtmachine.workspace_capabilities import resolve_workspace_id
+                    workspace_id = resolve_workspace_id(ws_dir)
+                except Exception:
+                    pass
+                container_manager = _CM(
+                    workspace_path=ws_dir,
+                    session_id=self.session_id,
+                    workspace_id=workspace_id or ws_id or "default",
+                    session_permissions=self.session_permissions,
+                )
+            except Exception:
+                container_manager = None
+
         # Create and start the worker thread
         thread = WorkerThread(
             name=self.worker_name,
@@ -2892,6 +2944,7 @@ class Worker(ToolBase):
             project_root=project_root,
             timeout_seconds=effective_timeout,
             session_id=self.session_id,
+            container_manager=container_manager,
         )
 
         # Store initial context for the thread to pick up in run()

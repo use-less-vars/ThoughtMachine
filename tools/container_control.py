@@ -201,10 +201,11 @@ class ContainerStartTool(_ContainerControlBase):
     worker_name: Optional[str] = Field(
         default=None,
         description=(
-            "[internal] Name of the worker sub-agent that created this container "
-            "(injected by ToolExecutor from the worker context var; stamped as the "
+            "[internal] Owner identity of the worker sub-agent that created this "
+            "container (injected by ToolExecutor from the worker context var as "
+            "'<session_id or unknown>:<worker_name>'; stamped VERBATIM as the "
             "``thoughtmachine.worker`` docker label on fresh creates so worker "
-            "teardown can reclaim it)."
+            "teardown can reclaim it by exact label match)."
         ),
     )
 

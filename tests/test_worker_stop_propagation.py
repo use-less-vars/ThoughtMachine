@@ -11,7 +11,7 @@ Contracts under test (the prod implementation does NOT satisfy them yet):
       _run_tool_loop already abandons the generator, so the tool-boundary
       asserts pass today; the terminal-status assert is what makes it RED.)
   A3. Stopping a worker stops+removes its worker-owned containers (label
-      thoughtmachine.worker=<worker_name>) via the container manager, and
+      thoughtmachine.worker=<session_id>:<worker_name>) via the container manager, and
       never touches resource containers (thoughtmachine.resource label /
       tm-res-* name / tm-resource-git image).
 
@@ -169,12 +169,14 @@ class _StopAwareFakeAgent:
 
 # Container fakes — the mocked container manager only records calls; prod
 # does the discovery. Labels encode the NEW contract: worker-owned containers
-# carry thoughtmachine.worker=<worker_name>; resource containers carry
-# thoughtmachine.resource and/or tm-res-* / tm-resource-git names.
+# carry thoughtmachine.worker=<session_id>:<worker_name> (the owning worker's
+# identity — "s1:w-stop-clean" matches the A3 thread w-stop-clean in
+# session s1); resource containers carry thoughtmachine.resource and/or
+# tm-res-* / tm-resource-git names.
 WORKER_CONTAINER = SimpleNamespace(
     id="c-w1",
-    name="tm-worker-w-test",
-    labels={"thoughtmachine.worker": "w-test"},
+    name="tm-worker-w-stop-clean",
+    labels={"thoughtmachine.worker": "s1:w-stop-clean"},
 )
 RESOURCE_CONTAINER = SimpleNamespace(
     id="c-res",

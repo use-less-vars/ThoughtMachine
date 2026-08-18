@@ -36,10 +36,14 @@ Every container created by this module carries:
 Used for label-based reuse lookups and ``cleanup_workspace()`` sweeps.
 
 Containers created on behalf of a worker sub-agent (``start(worker_name=...)``)
-additionally carry ``thoughtmachine.worker=<worker_name>`` on FRESH creates.
-Workers stop/remove their labelled containers at teardown and never touch
-resource containers (see tools/workspace/worker.py). Reuse paths never
-re-label an existing container: the worker label is only stamped at create.
+additionally carry ``thoughtmachine.worker=<worker owner identity>`` on
+FRESH creates. The identity format (``<session_id or 'unknown'>:<worker_name>``)
+is decided by tools/workspace/worker.py and stamped VERBATIM. Workers stop/
+remove their labelled containers at teardown by comparing the label value
+EXACTLY to their own identity (stale/mismatched values are ignored) and
+never touch resource containers (see tools/workspace/worker.py). Reuse
+paths never re-label an existing container: the worker label is only
+stamped at create.
 
 Sticky notes (vault bulletin board)
 -----------------------------------
@@ -592,7 +596,10 @@ class ContainerManager:
         }
         if worker_name:
             # Ownership label: lets a worker reclaim the containers it created
-            # at teardown (presence-based; the value is informational).
+            # at teardown. The value is the worker's owner identity
+            # ("<session_id or 'unknown'>:<worker_name>") stamped VERBATIM;
+            # teardown compares the label value EXACTLY (mismatched/stale
+            # values are ignored).
             labels["thoughtmachine.worker"] = worker_name
         _audit("CONTAINER_CREATE",
                f"image={image} network={network_mode} name={name} session={self.session_id}")

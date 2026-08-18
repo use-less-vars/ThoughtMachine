@@ -4,7 +4,8 @@ Worker -> container ownership bridge (label + context-var + injection).
 Contracts under test:
 
   A. The worker context var (agent.core.worker_context.WORKER_NAME_CONTEXTVAR)
-     defaults to None, is stamped with the worker's name for the duration of
+     defaults to None, is stamped with the worker's identity
+     ("<session_id>:<worker_name>") for the duration of
      WorkerThread._run_tool_loop, and is reset afterwards.
   B. ToolExecutor injects ``worker_name`` into tools that declare the field
      whenever the context var is set, and leaves it unset otherwise.
@@ -114,7 +115,9 @@ class TestWorkerContextVar(_RunSafetyPatches):
             result = thread._run_tool_loop("query-1")
 
             self.assertEqual(result, "done")
-            self.assertEqual(seen["inside"], "w-ctx-bridge")
+            # The stamp carries the worker's identity (session_id + name),
+            # not the bare name — RED today: prod stamps only self.worker_name.
+            self.assertEqual(seen["inside"], "s1:w-ctx-bridge")
             # The stamp must not leak past the turn.
             self.assertIsNone(current_worker_name())
             self.assertIsNone(WORKER_NAME_CONTEXTVAR.get())
@@ -149,7 +152,7 @@ class TestToolExecutorInjection(unittest.TestCase):
 
     def test_executor_injects_worker_name(self):
         executor = self._make_executor()
-        token = WORKER_NAME_CONTEXTVAR.set("w-exec-inject")
+        token = WORKER_NAME_CONTEXTVAR.set("s1:w-exec-inject")
         try:
             result = executor._execute_single_tool(
                 _WorkerAwareTool, {}, "_WorkerAwareTool", 0,
@@ -159,7 +162,7 @@ class TestToolExecutorInjection(unittest.TestCase):
             WORKER_NAME_CONTEXTVAR.reset(token)
         self.assertEqual(result["tool_type"], "normal")
         self.assertEqual(
-            json.loads(result["result"])["worker_name"], "w-exec-inject"
+            json.loads(result["result"])["worker_name"], "s1:w-exec-inject"
         )
 
     def test_executor_leaves_worker_name_unset_without_context(self):
@@ -188,20 +191,20 @@ class TestContainerStartToolWorkerName(unittest.TestCase):
 
     def test_container_start_tool_passes_worker_name(self):
         fake_manager = self._execute_with_fake_manager(
-            ContainerStartTool(worker_name="w-explicit")
+            ContainerStartTool(worker_name="s1:w-explicit")
         )
         self.assertEqual(
-            fake_manager.start.call_args.kwargs["worker_name"], "w-explicit"
+            fake_manager.start.call_args.kwargs["worker_name"], "s1:w-explicit"
         )
 
     def test_container_start_tool_falls_back_to_context_var(self):
-        token = WORKER_NAME_CONTEXTVAR.set("w-ctx-fallback")
+        token = WORKER_NAME_CONTEXTVAR.set("s1:w-ctx-fallback")
         try:
             fake_manager = self._execute_with_fake_manager(ContainerStartTool())
         finally:
             WORKER_NAME_CONTEXTVAR.reset(token)
         self.assertEqual(
-            fake_manager.start.call_args.kwargs["worker_name"], "w-ctx-fallback"
+            fake_manager.start.call_args.kwargs["worker_name"], "s1:w-ctx-fallback"
         )
 
     def test_container_start_tool_no_worker_name_no_context(self):
@@ -214,8 +217,8 @@ class TestDockerCodeRunnerWorkerName(unittest.TestCase):
     """DockerCodeRunner accepts (and defaults) the worker_name field."""
 
     def test_docker_code_runner_accepts_worker_name(self):
-        runner = DockerCodeRunner(command="echo hi", worker_name="w-runner")
-        self.assertEqual(runner.worker_name, "w-runner")
+        runner = DockerCodeRunner(command="echo hi", worker_name="s1:w-runner")
+        self.assertEqual(runner.worker_name, "s1:w-runner")
 
     def test_docker_code_runner_defaults_to_none(self):
         runner = DockerCodeRunner(command="echo hi")
