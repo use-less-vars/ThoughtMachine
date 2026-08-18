@@ -103,6 +103,24 @@ RESOURCE_REGISTRY = {
     "git": {"kind": "git"},
 }
 
+# Global resource images are lifecycle-protected shared infrastructure:
+# conservative cleanup/prune NEVER removes them — only an explicit global
+# lifecycle operation may remove or rebuild such an image.
+GLOBAL_RESOURCE_IMAGES = frozenset({RESOURCE_IMAGE_TAG})
+
+
+def is_global_resource_image(image_tag):
+    """True when ``image_tag`` is a protected global resource image.
+
+    Global resource images (``GLOBAL_RESOURCE_IMAGES``) are shared
+    infrastructure: ``cleanup_workspace_resources`` and
+    ``prune_unreferenced_resource_images`` remove resource containers only
+    and deliberately KEEP these images, because a later workspace would
+    otherwise have to rebuild (or run without) the shared resource image.
+    Only an explicit global lifecycle operation may remove/rebuild them.
+    """
+    return image_tag in GLOBAL_RESOURCE_IMAGES
+
 # Build-hash label + build inputs. The repo root is derived from this file's
 # location (infra/ -> repo root); the repo-side files below are SEEDS only —
 # the vault's docker/resource/ copy is the single authoritative build source
@@ -1103,15 +1121,30 @@ class ResourceContainerManager:
 
     @staticmethod
     def _resource_result(
-        mode, container_id=None, status=None, image=None, detail=""
+        mode,
+        container_id=None,
+        status=None,
+        image=None,
+        detail="",
+        failure_reason=None,
+        fallback_used=False,
     ):
-        """Structured ``ensure_resource`` result dict."""
+        """Structured ``ensure_resource`` result dict.
+
+        ``failure_reason`` classifies WHY the resource could not be
+        containerized (one of ``"unknown_resource"``, ``"policy_denied"``,
+        ``"build_failed"``, ``"container_create_failed"``, ``"fallback_used"``
+        or ``None`` when containerized). ``fallback_used`` is True whenever
+        the caller must degrade to a host-side operation.
+        """
         return {
             "mode": mode,
             "container_id": container_id,
             "status": status,
             "image": image,
             "detail": detail,
+            "failure_reason": failure_reason,
+            "fallback_used": fallback_used,
         }
 
     def ensure_resource(self, name):
@@ -1131,12 +1164,21 @@ class ResourceContainerManager:
         Never raises: every failure is reported as a structured result.
 
         Returns:
-            dict: ``{"mode", "container_id", "status", "image", "detail"}``.
+            dict: ``{"mode", "container_id", "status", "image", "detail",
+            "failure_reason", "fallback_used"}``. ``failure_reason``
+            classifies why containerization failed (``"unknown_resource"``,
+            ``"policy_denied"``, ``"build_failed"``,
+            ``"container_create_failed"``, ``"fallback_used"``, or ``None``
+            when containerized) and ``fallback_used`` is True whenever the
+            caller must degrade to a host-side operation. Unknown resources
+            and policy denials are fail-closed (no fallback).
         """
         entry = RESOURCE_REGISTRY.get(name)
         if entry is None:
             return self._resource_result(
-                "unavailable", detail=f"unknown resource '{name}'"
+                "unavailable",
+                detail=f"unknown resource '{name}'",
+                failure_reason="unknown_resource",
             )
 
         denied = self._container_policy_denied()
@@ -1144,6 +1186,7 @@ class ResourceContainerManager:
             return self._resource_result(
                 "unavailable",
                 detail=f"container resources disabled/denied: {denied}",
+                failure_reason="policy_denied",
             )
 
         if not _ensure_resource_image():
@@ -1153,6 +1196,8 @@ class ResourceContainerManager:
                     "resource image unavailable (auto-build failed or Docker "
                     f"unreachable); manual build: {RESOURCE_IMAGE_BUILD_CMD}"
                 ),
+                failure_reason="build_failed",
+                fallback_used=True,
             )
 
         kind = (entry.get("kind") or self.RESOURCE_KIND).lower()
@@ -1164,6 +1209,8 @@ class ResourceContainerManager:
                 return self._resource_result(
                     "host_fallback",
                     detail=f"failed to create resource container: {exc}",
+                    failure_reason="container_create_failed",
+                    fallback_used=True,
                 )
             return self._resource_result(
                 "containerized",
@@ -1191,6 +1238,8 @@ class ResourceContainerManager:
                 return self._resource_result(
                     "host_fallback",
                     detail=f"failed to remove stale resource container: {exc}",
+                    failure_reason="fallback_used",
+                    fallback_used=True,
                 )
             try:
                 created = self._create_resource_container()
@@ -1198,6 +1247,8 @@ class ResourceContainerManager:
                 return self._resource_result(
                     "host_fallback",
                     detail=f"failed to recreate resource container: {exc}",
+                    failure_reason="fallback_used",
+                    fallback_used=True,
                 )
             return self._resource_result(
                 "containerized",
@@ -1213,6 +1264,8 @@ class ResourceContainerManager:
                 return self._resource_result(
                     "host_fallback",
                     detail=f"failed to start resource container: {exc}",
+                    failure_reason="fallback_used",
+                    fallback_used=True,
                 )
         return self._resource_result(
             "containerized",
@@ -1586,24 +1639,27 @@ def resource_status(name, workspace_id=None, session_permissions=None):
 
 
 def cleanup_workspace_resources(workspace_id):
-    """Remove ALL hidden resource containers of a workspace, then the image.
+    """Remove ALL hidden resource containers of a workspace; keep the image.
 
     Workspace teardown: force-removes every container carrying both the
     ``thoughtmachine.resource`` marker and the workspace's
-    ``thoughtmachine.workspace_id`` label, then removes the
-    ``tm-resource-git`` image when NO remaining resource container (across
-    ALL workspaces) still references it. The module-level image-readiness
-    cache is invalidated so the next ``ensure_resource`` re-checks.
+    ``thoughtmachine.workspace_id`` label. The shared ``tm-resource-git``
+    image is NEVER removed here: it is a protected global resource image
+    (``GLOBAL_RESOURCE_IMAGES``), so cleanup removes containers only — only
+    an explicit global lifecycle operation may remove or rebuild it. The
+    module-level image-readiness cache is invalidated so the next
+    ``ensure_resource`` re-checks.
 
-    Never raises — per-container and per-image failures are collected into
-    ``detail`` and the counts returned.
+    Never raises — per-container failures are collected into ``detail`` and
+    the counts returned.
 
     Returns:
         dict: ``{"removed_containers": int, "removed_image": bool,
         "detail": str}``.
     """
     global _RESOURCE_IMAGE_READY
-    # The image may be removed below — never trust the cached readiness.
+    # Containers were removed below; the shared image is kept (protected),
+    # but never trust the cached readiness after a teardown pass.
     _RESOURCE_IMAGE_READY = False
     workspace_id = str(workspace_id)
     removed_containers = 0
@@ -1667,13 +1723,20 @@ def cleanup_workspace_resources(workspace_id):
                     referenced = True
                     break
             if not referenced:
-                try:
-                    client.images.remove(RESOURCE_IMAGE_TAG, force=True)
-                    removed_image = True
-                except Exception as exc:
+                if is_global_resource_image(RESOURCE_IMAGE_TAG):
                     detail = _join_detail(
-                        detail, f"failed to remove resource image: {exc}"
+                        detail,
+                        f"global resource image {RESOURCE_IMAGE_TAG} is "
+                        "protected — kept",
                     )
+                else:
+                    try:
+                        client.images.remove(RESOURCE_IMAGE_TAG, force=True)
+                        removed_image = True
+                    except Exception as exc:
+                        detail = _join_detail(
+                            detail, f"failed to remove resource image: {exc}"
+                        )
     except Exception as exc:
         detail = _join_detail(detail, f"cleanup failed: {exc}")
     return {
@@ -1812,10 +1875,13 @@ def prune_unreferenced_resource_images():
 
     Lists every container carrying the ``thoughtmachine.resource`` label.  When
     NONE remain anywhere (i.e. every workspace was decommissioned or swept),
-    the shared ``RESOURCE_IMAGE_TAG`` image is removed if it exists and the
-    module-level ``_RESOURCE_IMAGE_READY`` cache is reset so the image is
-    re-built on demand.  When resource containers still exist the image is
-    deliberately KEPT (it is shared, not per-workspace).
+    the shared ``RESOURCE_IMAGE_TAG`` image is KEPT: it is a protected global
+    resource image (``GLOBAL_RESOURCE_IMAGES``), so this conservative prune
+    NEVER removes it — only an explicit global lifecycle operation may remove
+    or rebuild it.  (A non-protected image would be removed if present and the
+    ``_RESOURCE_IMAGE_READY`` cache reset so it is re-built on demand.)  When
+    resource containers still exist the image is deliberately KEPT (it is
+    shared, not per-workspace).
 
     NEVER raises — failures are collected into ``detail``.
 
@@ -1855,19 +1921,25 @@ def prune_unreferenced_resource_images():
         }
     remaining = len(containers)
     if remaining == 0:
-        try:
-            client.images.get(RESOURCE_IMAGE_TAG)
+        if is_global_resource_image(RESOURCE_IMAGE_TAG):
+            detail = _join_detail(
+                detail,
+                f"global resource image {RESOURCE_IMAGE_TAG} is protected — kept",
+            )
+        else:
             try:
-                client.images.remove(RESOURCE_IMAGE_TAG, force=True)
-                removed_images.append(RESOURCE_IMAGE_TAG)
-                _RESOURCE_IMAGE_READY = False
+                client.images.get(RESOURCE_IMAGE_TAG)
+                try:
+                    client.images.remove(RESOURCE_IMAGE_TAG, force=True)
+                    removed_images.append(RESOURCE_IMAGE_TAG)
+                    _RESOURCE_IMAGE_READY = False
+                except Exception as exc:
+                    detail = _join_detail(
+                        detail, f"failed to remove resource image: {exc}"
+                    )
             except Exception as exc:
-                detail = _join_detail(
-                    detail, f"failed to remove resource image: {exc}"
-                )
-        except Exception as exc:
-            # Image missing (or probe failed) — nothing to remove.
-            detail = _join_detail(detail, f"resource image not present: {exc}")
+                # Image missing (or probe failed) — nothing to remove.
+                detail = _join_detail(detail, f"resource image not present: {exc}")
     else:
         detail = _join_detail(
             detail, f"{remaining} resource container(s) still in use — image kept"

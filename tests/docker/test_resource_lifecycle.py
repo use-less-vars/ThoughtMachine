@@ -310,6 +310,8 @@ def test_resource_status_unknown_unavailable(monkeypatch):
         "status": None,
         "image": None,
         "detail": "unknown resource 'nope'",
+        "failure_reason": None,
+        "fallback_used": False,
     }
 
 
@@ -409,6 +411,8 @@ def test_resource_status_ok_running(monkeypatch):
         "status": "running",
         "image": rcm.RESOURCE_IMAGE_TAG,
         "detail": "",
+        "failure_reason": None,
+        "fallback_used": False,
     }
 
 
@@ -469,9 +473,13 @@ def test_cleanup_removes_workspace_containers_and_image(monkeypatch):
     result = rcm.cleanup_workspace_resources("ws-1")
     assert c_ws1.remove_calls == 1
     assert result["removed_containers"] == 1
-    assert result["removed_image"] is True
-    assert images.remove_calls == [{"tag": rcm.RESOURCE_IMAGE_TAG, "force": True}]
-    assert result["detail"] == ""
+    assert result["removed_image"] is False
+    assert images.remove_calls == []
+    assert "protected" in result["detail"]
+    assert (
+        f"global resource image {rcm.RESOURCE_IMAGE_TAG} is protected"
+        in result["detail"]
+    )
 
 
 def test_cleanup_keeps_image_when_other_workspace_uses_it(monkeypatch):
@@ -506,7 +514,7 @@ def test_cleanup_leaves_non_resource_containers(monkeypatch):
     assert c_res.remove_calls == 1
     assert c_agent.remove_calls == 0
     assert result["removed_containers"] == 1
-    assert result["removed_image"] is True
+    assert result["removed_image"] is False
 
 
 def test_cleanup_docker_none(monkeypatch):
@@ -558,8 +566,16 @@ def test_cleanup_resets_image_ready_cache(monkeypatch):
     )
     rcm._RESOURCE_IMAGE_READY = True
     result = rcm.cleanup_workspace_resources("ws-1")
-    assert result["removed_image"] is True
+    assert result["removed_image"] is False
+    assert "protected" in result["detail"]
     assert rcm._RESOURCE_IMAGE_READY is False
+
+
+def test_global_resource_image_classification():
+    """The resource image is protected shared infra (kept by cleanup/prune)."""
+    assert rcm.RESOURCE_IMAGE_TAG in rcm.GLOBAL_RESOURCE_IMAGES
+    assert rcm.is_global_resource_image(rcm.RESOURCE_IMAGE_TAG) is True
+    assert rcm.is_global_resource_image("other:latest") is False
 
 
 # -------------------------------------- sweep_stale_resource_containers tests

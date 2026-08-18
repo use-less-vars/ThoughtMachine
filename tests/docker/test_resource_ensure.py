@@ -281,6 +281,8 @@ def test_unknown_resource_unavailable(monkeypatch):
         "status": None,
         "image": None,
         "detail": "unknown resource 'nope'",
+        "failure_reason": "unknown_resource",
+        "fallback_used": False,
     }
 
 
@@ -328,6 +330,8 @@ def test_image_missing_builds_and_creates(monkeypatch):
         "status": "running",
         "image": rcm.RESOURCE_IMAGE_TAG,
         "detail": "",
+        "failure_reason": None,
+        "fallback_used": False,
     }
 
 

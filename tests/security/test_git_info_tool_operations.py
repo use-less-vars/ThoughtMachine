@@ -14,8 +14,10 @@ Security properties asserted per operation:
 - the agent-visible param surface exposes no raw git flags (``--no-verify``,
   ``-c``/``--config``, ``core.hooksPath``).
 - commit messages travel as a single argv element, never re-parsed.
-- the new operations report a trailing ``execution_mode: <mode>`` line while
-  legacy operations (status/diff/log/branch) stay byte-identical (no trailer).
+- every operation reports three trailing lines ``execution_mode: <mode>``,
+  ``failure_reason: <reason-or-none>`` and ``fallback_used: <bool>`` (legacy
+  operations included); argument-validation errors keep their byte-exact form
+  (no trailer).
 """
 
 from types import SimpleNamespace
@@ -359,7 +361,9 @@ class TestCommit:
             "commit", "-m", "msg", "--", "a.txt",
         ]
         assert "--no-verify" not in command
-        assert "execution_mode:" not in result  # commit stays byte-identical
+        assert "execution_mode: containerized" in result
+        assert "failure_reason: none" in result
+        assert "fallback_used: false" in result
 
     def test_containerized_full_commit_argv(self, tmp_path, fake_manager):
         (tmp_path / ".git").mkdir()
@@ -588,13 +592,15 @@ class TestNoRawFlagsExposed:
 
 
 # ---------------------------------------------------------------------------
-# regression: legacy operations stay byte-identical (no trailer)
+# legacy operations report the execution-mode trailer too
 # ---------------------------------------------------------------------------
-class TestLegacyOperationsUnchanged:
+class TestLegacyOperationsTrailer:
     @pytest.mark.parametrize("op", ["status", "diff", "log", "branch"])
-    def test_no_execution_mode_trailer(self, tmp_path, fake_sandbox, op):
+    def test_legacy_operations_report_trailer(self, tmp_path, fake_sandbox, op):
         tool = _host_tool(tmp_path, operation=op)
         result = getattr(tool, f"_git_{op}")(tmp_path)
 
-        assert result == "ok"
-        assert "execution_mode:" not in result
+        assert result.startswith("ok")
+        assert "execution_mode: host_fallback" in result
+        assert "failure_reason: none" in result
+        assert "fallback_used: false" in result

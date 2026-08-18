@@ -356,7 +356,8 @@ def test_sweep_failure_never_breaks_startup(monkeypatch):
 
 
 def test_prune_unreferenced_resource_images(monkeypatch):
-    # Scenario A: no resource containers remain -> image is removed.
+    # Scenario A: no resource containers remain -> image is KEPT (protected
+    # global resource image).
     images = _FakeImages(present=True)
     containers = _FakeContainers([])
     monkeypatch.setattr(
@@ -365,11 +366,12 @@ def test_prune_unreferenced_resource_images(monkeypatch):
     rcm._RESOURCE_IMAGE_READY = True
 
     result = rcm.prune_unreferenced_resource_images()
-    assert result["removed_images"] == [rcm.RESOURCE_IMAGE_TAG]
+    assert result["removed_images"] == []
     assert result["remaining_containers"] == 0
-    assert images.get_calls == [rcm.RESOURCE_IMAGE_TAG]
-    assert images.remove_calls == [{"tag": rcm.RESOURCE_IMAGE_TAG, "force": True}]
-    assert rcm._RESOURCE_IMAGE_READY is False
+    assert images.get_calls == []
+    assert images.remove_calls == []
+    assert rcm._RESOURCE_IMAGE_READY is True
+    assert "protected" in result["detail"]
 
     # Scenario B: a resource container still exists -> image is KEPT.
     images_b = _FakeImages(present=True)

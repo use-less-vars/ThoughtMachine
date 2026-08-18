@@ -406,7 +406,7 @@ def test_static_overlay_dockerfile_spec():
 
 def test_ensure_resource_returns_required_schema(monkeypatch, tmp_path):
     """With both images ready, ensure_resource('git') returns the exact
-    five-key containerized result dict."""
+    seven-key containerized result dict."""
     ws = tmp_path / "ws"
     ws.mkdir()
     images = _fresh_images()
@@ -416,7 +416,12 @@ def test_ensure_resource_returns_required_schema(monkeypatch, tmp_path):
     )
     mgr = rcm.ResourceContainerManager(workspace_id="ws-1", workspace_path=str(ws))
     result = mgr.ensure_resource("git")
-    assert set(result.keys()) == {"mode", "container_id", "status", "image", "detail"}
+    assert set(result.keys()) == {
+        "mode", "container_id", "status", "image", "detail",
+        "failure_reason", "fallback_used",
+    }
+    assert result["failure_reason"] is None
+    assert result["fallback_used"] is False
     assert result["mode"] == "containerized"
     assert result["image"] == rcm.RESOURCE_IMAGE_TAG
     assert result["container_id"] is not None
