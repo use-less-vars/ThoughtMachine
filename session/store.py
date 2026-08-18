@@ -291,6 +291,17 @@ class FileSystemSessionStore(SessionStore):
         if 'metadata' in data and 'external_file_path' in data['metadata']:
             del data['metadata']['external_file_path']
 
+        # Session history bounding: only main-agent sessions (metadata['agent_type']
+        # == 'main') whose serialized payload exceeds the cap are bounded, right
+        # before the atomic write. session_size_bytes is then written for those
+        # sessions via fixpoint so the stored value equals the real file size.
+        # Sessions without the flag are skipped entirely (defensive: worker
+        # sessions and legacy files must never be touched).
+        if isinstance(data.get('metadata'), dict) and data['metadata'].get('agent_type') == 'main':
+            from session.size_bounding import apply_session_size_bounding, set_session_size_bytes
+            apply_session_size_bounding(data)
+            set_session_size_bytes(data)
+
         # Determine the target directory and friendly filename
         if workspace_id:
             target_dir = self._base_dir / "workspaces" / workspace_id / "sessions"
@@ -437,6 +448,7 @@ class FileSystemSessionStore(SessionStore):
                             'updated_at': updated_at,
                             'message_count': message_count,
                             'preview': self._extract_preview(user_history),
+                            'session_size_bytes': data.get('session_size_bytes'),
                         }
                 except Exception:
                     continue
@@ -503,6 +515,7 @@ class FileSystemSessionStore(SessionStore):
                                 'updated_at': updated_at,
                                 'message_count': message_count,
                                 'preview': self._extract_preview(user_history),
+                                'session_size_bytes': data.get('session_size_bytes'),
                             }
                     except Exception:
                         continue
@@ -513,6 +526,28 @@ class FileSystemSessionStore(SessionStore):
                 logger.warning(f"[SessionStore] Error scanning {target_dir} in batch metadata load: {e}")
                 continue
         return results
+
+    def get_session_size_bytes(self, session_id: str, workspace_id: Optional[str] = None) -> Optional[int]:
+        """Return the stored top-level ``session_size_bytes`` for a session.
+
+        Reads the raw session JSON directly (no ``Session`` deserialization)
+        and returns the int field, or None when the session file is not found
+        or the field is absent (e.g. sessions saved before this feature).
+        The file is located via ``_find_session_path``, which scans the
+        legacy sessions dir and every workspace-scoped sessions dir.
+        """
+        path = self._find_session_path(session_id)
+        if path is None or not path.exists():
+            return None
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return None
+            value = data.get('session_size_bytes')
+            return value if isinstance(value, int) else None
+        except Exception:
+            return None
 
     def list_sessions(self, workspace_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
