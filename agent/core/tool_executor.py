@@ -26,6 +26,17 @@ except ImportError:
 # Try to import security module
 from thoughtmachine.security import SessionPermissions
 
+# Worker-name context var (stdlib-only leaf module — no circular import):
+# carries the name of the worker sub-agent whose query is executing on this
+# thread, so tools can stamp ownership labels (e.g. ``thoughtmachine.worker``
+# on containers they create).
+try:
+    from agent.core.worker_context import current_worker_name
+except ImportError:
+
+    def current_worker_name():  # type: ignore
+        return None
+
 # Import unified security gate (always available)
 try:
     from security.security_gate import (
@@ -122,7 +133,31 @@ class ToolExecutor:
                 turn_transaction.add_tool_result(message)
             else:
                 add_to_conversation_func(message)
-        for tool_call in tool_calls:
+        for _tc_index, tool_call in enumerate(tool_calls):
+            # Cooperative cancellation: if a stop was requested between tool
+            # calls, skip execution and record a clean 'stopped' tool result
+            # for every pending call. The agent's turn_start stop_check
+            # checkpoint then terminates the turn with a 'stopped' event.
+            # stop_check is only consulted when callable (None by default,
+            # so main-agent paths are unaffected).
+            stop_check = getattr(self.config, "stop_check", None)
+            if callable(stop_check) and stop_check():
+                stopped_content = json.dumps({
+                    "status": "stopped",
+                    "message": "Worker stopped before tool execution",
+                })
+                for tc in tool_calls[_tc_index:]:
+                    add_tool_result({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": stopped_content,
+                    })
+                    executed_tools.append({
+                        "name": tc["function"]["name"],
+                        "arguments": {},
+                        "result": stopped_content,
+                    })
+                return (executed_tools, False, None, None, None)
             tool_name = tool_call['function']['name']
             if not self.state.is_tool_allowed(tool_name):
                 tool_result = self._create_tool_rejection_message(tool_name)
@@ -299,6 +334,15 @@ class ToolExecutor:
             # Inject session_id only for tools that support it (e.g. Worker)
             if 'session_id' in valid_field_names:
                 tool_args['session_id'] = session_id
+
+            # Inject the calling worker's name (if any) for tools that declare
+            # the field (e.g. ContainerStartTool / DockerCodeRunner), so
+            # containers they create carry the ``thoughtmachine.worker``
+            # ownership label and worker teardown can reclaim them.
+            if 'worker_name' in valid_field_names:
+                _worker_name = current_worker_name()
+                if _worker_name:
+                    tool_args['worker_name'] = _worker_name
 
             # Credential injection: resolve {{credential:...}} placeholders in tool args
             if tool_args:

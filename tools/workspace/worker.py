@@ -6,6 +6,21 @@ Workers run as threads on the host, reusing the agent's LLM provider
 configuration.  Each worker has its own persisted conversation context
 stored in ``<workspace_dir>/workers/<name>/context.json``.
 
+Container cleanup
+-----------------
+When a worker exits (completed, stopped, errored, or timed out) it stops
+and removes any containers it created while running. Ownership is
+established by the EXACT VALUE of the ``thoughtmachine.worker`` label: a
+container belongs to a worker only when the label value EQUALS the
+worker's owner identity ``<session_id or 'unknown'>:<worker_name>`` (the
+identity the worker container bridge stamped when the tool call created
+it). Containers with a stale or mismatched value are ignored - they may
+belong to a sibling worker or a previous session. Resource containers
+(``thoughtmachine.resource`` label, ``tm-res-*`` names, or the
+``tm-resource-git`` image) are shared workspace infrastructure managed by
+the workspace lifecycle manager and are never touched during worker
+teardown.
+
 Actions
 -------
 list:
@@ -55,6 +70,14 @@ except ImportError:
 # value so it never preempts the agent's own timeout logic.
 SPAWN_QUEUE_TIMEOUT = 600
 
+# ── Session-level worker spawn cap (safe default) ──
+# Limits how many LIVE worker threads a single session may have running at
+# once. Configurable per session via the ``max_workers`` config key (top-level
+# agent_config, or nested under ``session_config``). Force-replacements
+# (force=True) do NOT count toward the cap — the stale instance is stopped
+# and removed from the registry before the cap check runs.
+MAX_WORKERS_PER_SESSION = 5
+
 # ---------------------------------------------------------------------------
 # Optional dependencies
 # ---------------------------------------------------------------------------
@@ -72,9 +95,21 @@ except ImportError:
 
 # Optional: WorkerContext (imported eagerly — no circular dep)
 try:
-    from agent.core.worker_context import WorkerContext
+    from agent.core.worker_context import (
+        WorkerContext,
+        WORKER_NAME_CONTEXTVAR,
+    )
 except ImportError:
     WorkerContext = None  # type: ignore
+    WORKER_NAME_CONTEXTVAR = None  # type: ignore
+
+# Optional: ContainerManager — used at spawn time to build a per-worker
+# manager for worker-scoped container teardown. Imported lazily so worker.py
+# stays importable when the docker stack is unavailable (cleanup then no-ops).
+try:
+    from infra.container_manager import ContainerManager as _CM
+except Exception:
+    _CM = None  # type: ignore
 
 # NOTE: Agent and AgentConfig are imported *lazily* inside
 # WorkerThread._build_agent_config() to avoid a circular import with
@@ -389,11 +424,12 @@ class WorkerSessionLifecycle:
 logger = logging.getLogger(__name__)
 
 # Hard blocklist: tools that workers must NEVER use, regardless of permissions.
-# Workers can spawn other workers (recursion), manage containers, modify
-# workspace infrastructure, inspect system state, or access the persistent
-# knowledge base — all operations reserved for the main agent / human user.
-# This is defense-in-depth: the blocklist is enforced at two separate points
-# (enabled_tools filtering and tool class resolution).
+# NOTE: container tools (DockerCodeRunner, ContainerStartTool, ContainerExecTool,
+# etc.) ARE allowed for workers — they are gated by session permissions/footprint
+# like any other tool, not hard-blocked. Only the tools below are hard-blocked
+# (recursion, MCP server management, system/infrastructure discovery, persistent
+# knowledge store). This is defense-in-depth: the blocklist is enforced at two
+# separate points (enabled_tools filtering and tool class resolution).
 _WORKER_BLOCKLIST: frozenset[str] = frozenset({
     "Worker",           # recursion: worker spawning workers
     "MCPValidator",      # MCP server management
@@ -531,6 +567,52 @@ def _restrictive_merge(
     return result
 
 # ---------------------------------------------------------------------------
+# Worker-scoped container cleanup helpers
+# ---------------------------------------------------------------------------
+
+# Ownership label stamped on containers created inside worker tool calls by
+# the worker container bridge. Ownership is established by the EXACT VALUE:
+# the label must equal the owning worker's owner identity
+# ("<session_id or 'unknown'>:<worker_name>") for teardown to reclaim the
+# container. Stale values (a sibling worker's identity, a bare worker name,
+# a previous session's identity) are deliberately ignored so a worker never
+# stops a container it does not own.
+_WORKER_CONTAINER_LABEL = "thoughtmachine.worker"
+# Label marking shared resource containers (git checkouts, tooling images)
+# managed by the workspace lifecycle manager — always excluded from
+# worker teardown.
+_RESOURCE_CONTAINER_LABEL = "thoughtmachine.resource"
+
+
+def is_resource_container(container: Any) -> bool:
+    """Return True when ``container`` is shared workspace infrastructure.
+
+    Resource containers are managed by the workspace lifecycle manager and
+    must never be stopped or removed during worker teardown. Handles both
+    the object shape (docker container objects / ``SimpleNamespace`` with
+    ``labels``, ``name``, ``image`` attributes) and the dict shape returned
+    by ``ContainerManager.list_containers()`` (``container_id``, ``name``,
+    ``image`` keys).
+    """
+    labels = getattr(container, "labels", None)
+    if labels is None and isinstance(container, dict):
+        labels = container.get("labels")
+    if labels and labels.get(_RESOURCE_CONTAINER_LABEL):
+        return True
+    name = getattr(container, "name", None)
+    if name is None and isinstance(container, dict):
+        name = container.get("name")
+    if name and str(name).startswith("tm-res-"):
+        return True
+    image = getattr(container, "image", None)
+    if image is None and isinstance(container, dict):
+        image = container.get("image")
+    if image == "tm-resource-git":
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Worker thread
 # ---------------------------------------------------------------------------
 
@@ -544,7 +626,7 @@ class WorkerThread(threading.Thread):
     ---------
     ready  ──spawn──▶  ready  ──query──▶  busy  ──done──▶  ready
       ▲                    │            │                   │
-      │                    ├──stop──▶  completed            │
+      │                    ├──stop──▶  stopping ──▶ stopped │
       │                    ├──pause──▶ paused ──resume──▶  ready
       │                    └──error──▶  error               │
       └───────────────────────────  spawn again  ◄──────────┘
@@ -561,12 +643,16 @@ class WorkerThread(threading.Thread):
         project_root: Optional[str] = None,
         timeout_seconds: Optional[int] = None,
         session_id: Optional[str] = None,
+        container_manager: Optional[Any] = None,
     ) -> None:
         super().__init__(daemon=True, name=f"worker-{name}")
         self.worker_name = name
         self.definition = definition
         self._agent_config_dict = agent_config
         self.session_id = session_id
+        # Container manager used to stop/remove containers owned by this
+        # worker at teardown (see _cleanup_worker_containers).
+        self._container_manager: Optional[Any] = container_manager
         self._worker_dir = workspace_dir / "workers" / name
         self._worker_dir.mkdir(parents=True, exist_ok=True)
 
@@ -599,7 +685,7 @@ class WorkerThread(threading.Thread):
         )
 
         # Runtime state
-        self.status: str = "ready"      # ready | busy | paused | completed | error
+        self.status: str = "ready"      # ready | busy | paused | completed | error | stopping | stopped
         self.current_task: Optional[str] = None
         self.error: Optional[str] = None
         self.last_heartbeat: Optional[str] = None
@@ -608,6 +694,10 @@ class WorkerThread(threading.Thread):
         # Telemetry tracking
         self._tool_call_count: int = 0
         self._timeout_triggered: bool = False
+        # Idempotency guard for worker-scoped container cleanup: cleanup
+        # runs at most once per thread, so it is safe to call from both
+        # run() teardown and _action_stop finally paths.
+        self._containers_cleaned: bool = False
         self._wlm_soft_warning_received: bool = False
         self._final_token_usage: Optional[int] = None
         self._respond_metadata: Dict[str, Any] = {}  # captures status/confidence/meta from last Respond call
@@ -665,6 +755,18 @@ class WorkerThread(threading.Thread):
     def event_bus(self):
         """Return the per-worker EventBus instance."""
         return self._event_bus
+
+    @property
+    def owner_identity(self) -> str:
+        """Owner identity stamped on containers this worker creates.
+
+        Format: ``<session_id or 'unknown'>:<worker_name>`` — the single
+        source of truth used BOTH when stamping the ``thoughtmachine.worker``
+        docker label (via the worker-name context var in ``_run_tool_loop``)
+        and when comparing labels at teardown
+        (``_is_worker_owned_container``).
+        """
+        return f"{self.session_id or 'unknown'}:{self.worker_name}"
 
     @property
     def max_context_tokens(self) -> int:
@@ -845,7 +947,7 @@ class WorkerThread(threading.Thread):
 
         supervisor = WorkerSupervisor(
             worker_id=self.worker_name,
-            container_manager=None,
+            container_manager=getattr(self, "_container_manager", None),
             resource_container_manager=None,
             feature_flag_check=lambda: True,
             session_id=self.session_id,
@@ -898,6 +1000,10 @@ class WorkerThread(threading.Thread):
 
     def stop(self) -> None:
         """Signal the worker to stop after completing its current task."""
+        # Synchronous lifecycle transition: 'stopping' must be observable
+        # before the run loop acknowledges the stop event.
+        self.status = "stopping"
+        self._write_status_file()
         wlm = getattr(self, "_wlm", None)
         if self._wlm_flag_enabled() and wlm is not None:
             try:
@@ -1156,6 +1262,19 @@ class WorkerThread(threading.Thread):
                 "message": "Worker stopped before processing query",
             })
 
+        # Stamp the worker-name context var for the duration of this turn:
+        # tool calls executed by the agent read it via
+        # agent.core.worker_context.current_worker_name() and stamp the
+        # ``thoughtmachine.worker`` docker label on containers they create,
+        # so teardown can reclaim them (see module docstring). The stamp
+        # carries the worker's OWNER IDENTITY (``<session_id or
+        # 'unknown'>:<worker_name>``), not the bare name, so teardown can
+        # match labels exactly. Reset in the finally block below so the var
+        # never leaks across queries.
+        _worker_ctx_token = None
+        if WORKER_NAME_CONTEXTVAR is not None:
+            _worker_ctx_token = WORKER_NAME_CONTEXTVAR.set(self.owner_identity)
+
         try:
             for event in self._agent.process_query(query):
                                 # Fix 1.1B: Poll for stop command on every event
@@ -1297,6 +1416,9 @@ class WorkerThread(threading.Thread):
         except Exception as exc:
             logger.exception("Worker _run_tool_loop failed")
             final_content = json.dumps({"error": f"Worker execution failed: {exc}"})
+        finally:
+            if _worker_ctx_token is not None and WORKER_NAME_CONTEXTVAR is not None:
+                WORKER_NAME_CONTEXTVAR.reset(_worker_ctx_token)
 
         self.current_task = None
         # Store elapsed time for inclusion in query result
@@ -1320,6 +1442,75 @@ class WorkerThread(threading.Thread):
         self._final_token_usage = self.get_current_context_tokens()
 
         return final_content
+
+    # ── worker-scoped container cleanup ───────────────────────────────────────────────
+
+    def _is_worker_owned_container(self, container: Any) -> bool:
+        """Return True when ``container`` belongs to this worker.
+
+        Ownership is established by an EXACT match: the
+        ``thoughtmachine.worker`` label value must equal this worker's owner
+        identity (``<session_id or 'unknown'>:<worker_name>`` — see module
+        docstring). Stale/mismatched values (sibling workers, bare names,
+        previous sessions) are ignored.
+        """
+        labels = getattr(container, "labels", None)
+        if labels is None and isinstance(container, dict):
+            labels = container.get("labels")
+        if not labels:
+            return False
+        return labels.get(_WORKER_CONTAINER_LABEL) == self.owner_identity
+
+    def _cleanup_worker_containers(self) -> None:
+        """Stop and remove containers owned by this worker.
+
+        Idempotent (runs at most once per thread, guarded by
+        ``_containers_cleaned``) and never raises, so it is safe to call
+        from every teardown path — ``run()``'s finally block and
+        ``_action_stop``'s finally paths — without masking the worker's
+        own terminal status. Only containers carrying the
+        worker-ownership label are touched; resource containers are always
+        excluded (see ``is_resource_container``).
+        """
+        if getattr(self, "_containers_cleaned", False):
+            return
+        self._containers_cleaned = True
+        cm = getattr(self, "_container_manager", None)
+        if cm is None:
+            return
+        try:
+            listed = cm.list_containers()
+        except Exception:
+            return
+        if listed is None:
+            return
+        if not isinstance(listed, (list, tuple)):
+            try:
+                listed = list(listed)
+            except TypeError:
+                return
+        for container in listed:
+            try:
+                if is_resource_container(container):
+                    continue
+                if not self._is_worker_owned_container(container):
+                    continue
+                if isinstance(container, dict):
+                    target = container.get("container_id") or container.get("name")
+                else:
+                    target = container
+                if target is None:
+                    continue
+                try:
+                    cm.stop(target)
+                except Exception:
+                    pass
+                try:
+                    cm.remove(target)
+                except Exception:
+                    pass
+            except Exception:
+                continue
 
     # ── thread run loop ────────────────────────────────────────────
 
@@ -1789,9 +1980,12 @@ class WorkerThread(threading.Thread):
                 except Exception:
                     pass
         else:
-            self.status = "completed"
+            # Terminal status on the stop path is 'stopped' (not 'completed');
+            # a clean drain with no stop request ends as 'completed'.
+            final_status = "stopped" if self._stop_event.is_set() else "completed"
+            self.status = final_status
             self._write_status_file()
-            self._publish_event('worker_completed', {'status': 'completed', 'worker_name': self.worker_name})
+            self._publish_event('worker_completed', {'status': final_status, 'worker_name': self.worker_name})
             # Also publish to global_event_bus so the bridge receives it
             if global_event_bus is not None and EventType is not None and create_event is not None:
                 try:
@@ -1800,7 +1994,7 @@ class WorkerThread(threading.Thread):
                         data={
                             "session_id": self.session_id or "",
                             "worker_name": self.worker_name,
-                            "status": "completed",
+                            "status": final_status,
                             "current_context_tokens": self.get_current_context_tokens(),
                             "max_context_tokens": self.max_context_tokens,
                         },
@@ -1817,6 +2011,8 @@ class WorkerThread(threading.Thread):
                 pass
             if self._worker_ctx is not None:
                 self._save_context()
+            # Stop/remove containers this worker created (idempotent).
+            self._cleanup_worker_containers()
 
     # ── persistence ────────────────────────────────────────────────
 
@@ -2448,6 +2644,45 @@ class Worker(ToolBase):
         """
         return _WorkerRegistry.get_instance().find_workers_by_name(worker_name)
 
+    def _effective_max_workers(self) -> int:
+        """
+        Return this session's worker spawn cap.
+
+        Reads the ``max_workers`` key from the injected ``agent_config``
+        (top level first, then nested under ``session_config`` for the legacy
+        shape). Invalid values (non-int, unparseable, or <= 0) fall back to
+        the safe default ``MAX_WORKERS_PER_SESSION``.
+        """
+        cfg = self.agent_config or {}
+        raw = cfg.get("max_workers")
+        if raw is None:
+            nested_cfg = cfg.get("session_config")
+            if isinstance(nested_cfg, dict):
+                raw = nested_cfg.get("max_workers")
+        if raw is None:
+            return MAX_WORKERS_PER_SESSION
+        try:
+            cap = int(raw)
+        except (TypeError, ValueError):
+            return MAX_WORKERS_PER_SESSION
+        if cap <= 0:
+            return MAX_WORKERS_PER_SESSION
+        return cap
+
+    def _live_workers_in_session(self, session_key: str) -> int:
+        """
+        Count LIVE worker threads currently registered for ``session_key``.
+
+        Only threads whose ``is_alive()`` is True count toward the spawn cap;
+        dead (completed/stopped/errored) registry entries do not.
+        """
+        count = 0
+        with _registry_lock:
+            for (sid, _name), thread in _worker_registry.items():
+                if sid == session_key and thread.is_alive():
+                    count += 1
+        return count
+
     # -- action implementations --------------------------------------
 
     def _action_list(self, workers: list) -> dict:
@@ -2583,6 +2818,23 @@ class Worker(ToolBase):
                 parsed["elapsed_seconds"] = round(elapsed, 1)
             return parsed
 
+        # ── Session-level spawn cap ──
+        # Count LIVE workers already running for this session and refuse the
+        # spawn at/above the cap. Force-replacements never reach this point:
+        # the force block above already stopped and popped the stale entry.
+        max_workers = self._effective_max_workers()
+        live_workers = self._live_workers_in_session(session_key)
+        if live_workers >= max_workers:
+            return {
+                "error": (
+                    f"Worker spawn limit reached: {live_workers}/{max_workers} "
+                    f"workers already running for this session. Stop an existing "
+                    f"worker before spawning '{self.worker_name}'."
+                ),
+                "max_workers": max_workers,
+                "live_workers": live_workers,
+            }
+
         # Build agent config for this worker
         agent_config = self._build_agent_config()
         if agent_config is None:
@@ -2658,6 +2910,29 @@ class Worker(ToolBase):
             else definition.get("timeout_seconds", 600)
         )
 
+        # Build a ContainerManager bound to this session/workspace so the
+        # worker can stop/remove the containers it owns at teardown. Falls
+        # back to None when Docker/ContainerManager is unavailable — worker
+        # teardown then skips container cleanup instead of crashing (mirrors
+        # tools/container_control._make_manager).
+        container_manager = None
+        if _CM is not None:
+            try:
+                workspace_id = None
+                try:
+                    from thoughtmachine.workspace_capabilities import resolve_workspace_id
+                    workspace_id = resolve_workspace_id(ws_dir)
+                except Exception:
+                    pass
+                container_manager = _CM(
+                    workspace_path=ws_dir,
+                    session_id=self.session_id,
+                    workspace_id=workspace_id or ws_id or "default",
+                    session_permissions=self.session_permissions,
+                )
+            except Exception:
+                container_manager = None
+
         # Create and start the worker thread
         thread = WorkerThread(
             name=self.worker_name,
@@ -2669,6 +2944,7 @@ class Worker(ToolBase):
             project_root=project_root,
             timeout_seconds=effective_timeout,
             session_id=self.session_id,
+            container_manager=container_manager,
         )
 
         # Store initial context for the thread to pick up in run()
@@ -2707,6 +2983,23 @@ class Worker(ToolBase):
                 return {
                     "error": f"Worker '{self.worker_name}' is already running",
                     "status": existing.status,
+                }
+            # Re-check the spawn cap under the lock (TOCTOU guard): another
+            # spawn may have registered between the early cap check and here.
+            live_now = sum(
+                1
+                for (sid, _name), t in _worker_registry.items()
+                if sid == session_key and t.is_alive()
+            )
+            if live_now >= max_workers:
+                return {
+                    "error": (
+                        f"Worker spawn limit reached: {live_now}/{max_workers} "
+                        f"workers already running for this session. Stop an existing "
+                        f"worker before spawning '{self.worker_name}'."
+                    ),
+                    "max_workers": max_workers,
+                    "live_workers": live_now,
                 }
             _worker_registry[(session_key, self.worker_name)] = thread
 
@@ -2944,6 +3237,7 @@ class Worker(ToolBase):
                     if t._worker_ctx is not None:
                         t._worker_ctx.compact_after_summary()
                     t._save_context()
+                    t._cleanup_worker_containers()
                     with _registry_lock:
                         _worker_registry.pop((sid, self.worker_name), None)
                     if t.status not in [s.get("status") for s in stopped_info]:
@@ -2966,6 +3260,7 @@ class Worker(ToolBase):
             if thread._worker_ctx is not None:
                 thread._worker_ctx.compact_after_summary()
             thread._save_context()
+            thread._cleanup_worker_containers()
             return {
                 "worker_name": self.worker_name,
                 "status": thread.status,
@@ -3007,6 +3302,13 @@ class Worker(ToolBase):
             if thread._worker_ctx is not None:
                 thread._worker_ctx.compact_after_summary()
             thread._save_context()
+            thread._cleanup_worker_containers()
+            # Terminal status: a stopped worker ends as 'stopped' (not
+            # 'completed'). Write the status file before removing from the
+            # registry so the terminal state remains observable.
+            if thread.status != "error":
+                thread.status = "stopped"
+                thread._write_status_file()
             with _registry_lock:
                 _worker_registry.pop((session_key, self.worker_name), None)
 

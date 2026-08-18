@@ -688,3 +688,81 @@ class TestContainerNoteFileStore:
         finally:
             shutil.rmtree(vault_root, ignore_errors=True)
 
+
+
+class TestContainerWorkerLabel:
+    """Mock-based tests for the worker->container label bridge (no daemon needed).
+
+    Fresh creates stamp ``thoughtmachine.worker`` onto the container labels so
+    worker teardown can reclaim them; containers created without a worker carry
+    no such label; and the label is immutable after create, so a reuse never
+    overwrites it with a different worker's name.
+    """
+
+    def _make_manager(self, fake_containers, workspace_id, vault_root):
+        # Lazy import: top-level import of infra.container_manager triggers the
+        # thoughtmachine.security circular-import cascade (see module docstring).
+        from infra.container_manager import ContainerManager
+
+        manager = ContainerManager.__new__(ContainerManager)
+        manager.workspace_path = "/tmp/tm-worker-label-test-ws"
+        manager.session_id = "worker-label-test-session"
+        manager.workspace_id = workspace_id
+        manager.vault_root = str(vault_root)
+        manager.session_permissions = None
+        manager.image = "agent-executor"
+        manager.mem_limit = "512m"
+        manager.cpu_quota = 50000
+        manager._containers = {}
+        manager.workspace_config = {}
+        manager.max_containers = 4
+        manager.client = SimpleNamespace(containers=fake_containers)
+        manager.container_notes = manager._load_container_notes()
+        manager._compute_config = lambda ws, wid, sp: ("none", "ro")
+        return manager
+
+    def test_worker_label_stamped_on_fresh_create(self):
+        vault_root = tempfile.mkdtemp(prefix="tm-worker-label-")
+        try:
+            workspace_id = str(uuid.uuid4())
+            fake = FakeContainers()
+            manager = self._make_manager(fake, workspace_id, vault_root)
+            r = manager.start(name="worker-owned", worker_name="w1")
+            assert r["status"] == "created"
+            container = fake.get(r["id"])
+            assert container.labels["thoughtmachine.worker"] == "w1"
+            assert container.labels["thoughtmachine.workspace_id"] == workspace_id
+            assert container.labels["thoughtmachine.container_name"] == "worker-owned"
+        finally:
+            shutil.rmtree(vault_root, ignore_errors=True)
+
+    def test_no_worker_label_without_worker_name(self):
+        vault_root = tempfile.mkdtemp(prefix="tm-worker-label-")
+        try:
+            workspace_id = str(uuid.uuid4())
+            fake = FakeContainers()
+            manager = self._make_manager(fake, workspace_id, vault_root)
+            r = manager.start(name="worker-owned")
+            assert r["status"] == "created"
+            container = fake.get(r["id"])
+            assert "thoughtmachine.worker" not in container.labels
+            assert container.labels["thoughtmachine.workspace_id"] == workspace_id
+        finally:
+            shutil.rmtree(vault_root, ignore_errors=True)
+
+    def test_worker_label_not_added_on_reuse(self):
+        vault_root = tempfile.mkdtemp(prefix="tm-worker-label-")
+        try:
+            workspace_id = str(uuid.uuid4())
+            fake = FakeContainers()
+            manager = self._make_manager(fake, workspace_id, vault_root)
+            r1 = manager.start(name="shared", worker_name="w1")
+            assert r1["status"] == "created"
+            r2 = manager.start(name="shared", worker_name="w2")
+            assert r2["status"] == "reused"
+            assert r2["id"] == r1["id"]
+            container = fake.get(r2["id"])
+            assert container.labels["thoughtmachine.worker"] == "w1"
+        finally:
+            shutil.rmtree(vault_root, ignore_errors=True)
+
