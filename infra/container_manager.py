@@ -392,12 +392,15 @@ class ContainerManager:
         """Lazily-resolved ContainerRegistry facade (wired per session config)."""
         return get_active_registry(getattr(self, "_session_config", None))
 
-    def _resolve_registry_name(self, container_id):
-        """Map a container id (or name) to the registry's registered name.
+    def _resolve_registry_handle(self, container_id):
+        """Map a container id (or name) to the registry's tracked handle.
 
         Returns None when the container is not tracked by the registry (e.g.
         a legacy container created before the flag was enabled) — callers
-        then fall back to the legacy docker path.
+        then fall back to the legacy docker path.  The handle carries the
+        registry's ``container_type`` bookkeeping ("resource" for hidden
+        resource containers), which the stop/remove registry branches use to
+        refuse destroying them.
         """
         try:
             handles = self._registry.list_all()
@@ -405,7 +408,7 @@ class ContainerManager:
             return None
         for handle in handles or []:
             if handle.get("id") == container_id or handle.get("name") == container_id:
-                return handle.get("name")
+                return handle
         return None
 
     def start(self, image=None, name=None, note=None):
@@ -428,6 +431,12 @@ class ContainerManager:
         if name is None:
             ws_hash = hashlib.sha256(self.workspace_path.encode()).hexdigest()[:12]
             name = f"agent-exec-{ws_hash}-{_safe_session_tag(self.session_id)}"
+
+        # Hidden resource containers (tm-res-*) are never addressable through
+        # the generic container manager — they are owned by the resource
+        # container manager and must stay invisible here.
+        if str(name).startswith("tm-res-"):
+            return {"error": "Resource container access denied"}
 
         # Phase 3: workspace-scoped reuse + container-limit enforcement BEFORE
         # any create. An existing container with the same name is reused as-is
@@ -655,6 +664,8 @@ class ContainerManager:
     def exec(self, container_id, command, timeout=30, workdir="/workspace", environment=None):
         """Run ``command`` in the container; returns {"stdout","stderr","exit_code"}."""
         container = self.client.containers.get(container_id)
+        if self._is_resource_container(container):
+            raise PermissionError("Resource container access denied")
 
         # Phase 2: disk quota guard for the persistent package cache.
         quota_mb = (getattr(self, "workspace_config", None) or {}).get("disk_quota_mb", 4096)
@@ -742,8 +753,15 @@ class ContainerManager:
     def stop(self, container_id):
         """Stop the container. Idempotent; NEVER raises."""
         if is_registry_active(getattr(self, "_session_config", None)):
-            name = self._resolve_registry_name(container_id)
-            if name is not None:
+            handle = self._resolve_registry_handle(container_id)
+            if handle is not None:
+                # Resource containers are tracked by the registry too (their
+                # factory registers them with container_type="resource");
+                # refuse to destroy them here just like the legacy path does.
+                if handle.get("container_type") == "resource":
+                    return {"status": "error", "container_id": container_id,
+                            "error": "Resource container access denied"}
+                name = handle.get("name")
                 try:
                     self._registry.destroy_container(name)
                 except Exception as e:
@@ -761,6 +779,9 @@ class ContainerManager:
                     "error": "container not found"}
         except Exception as e:
             return {"status": "error", "container_id": container_id, "error": str(e)}
+        if self._is_resource_container(container):
+            return {"status": "error", "container_id": container_id,
+                    "error": "Resource container access denied"}
         try:
             container.reload()
         except Exception:
@@ -790,8 +811,15 @@ class ContainerManager:
             {"status": "error", "container_id": ..., "error": ...}
         """
         if is_registry_active(getattr(self, "_session_config", None)):
-            name = self._resolve_registry_name(container_id)
-            if name is not None:
+            handle = self._resolve_registry_handle(container_id)
+            if handle is not None:
+                # Resource containers are tracked by the registry too (their
+                # factory registers them with container_type="resource");
+                # refuse to destroy them here just like the legacy path does.
+                if handle.get("container_type") == "resource":
+                    return {"status": "error", "container_id": container_id,
+                            "error": "Resource container access denied"}
+                name = handle.get("name")
                 try:
                     self._registry.destroy_container(name)
                 except Exception as e:
@@ -829,6 +857,9 @@ class ContainerManager:
                     "error": "container not found"}
         except Exception as e:
             return {"status": "error", "container_id": container_id, "error": str(e)}
+        if self._is_resource_container(container):
+            return {"status": "error", "container_id": container_id,
+                    "error": "Resource container access denied"}
         try:
             container.reload()
         except Exception:
@@ -1249,6 +1280,9 @@ class ContainerManager:
                 f"Failed to access container {container_id}: {e}"
             ) from e
 
+        if self._is_resource_container(container):
+            raise RuntimeError("Resource container access denied")
+
         try:
             raw = container.logs(
                 stdout=True, stderr=True, tail=tail, since=since
@@ -1278,6 +1312,44 @@ class ContainerManager:
         )
         return {"stdout": stdout, "stderr": stderr}
 
+    @staticmethod
+    def _is_resource_container(obj):
+        """True when ``obj`` is a hidden resource container (tm-res-*).
+
+        Hidden resource containers (managed exclusively by the resource
+        container manager) must never be addressable through the generic
+        container manager. They are recognized by their
+        ``thoughtmachine.resource`` label, their ``tm-res-`` name prefix, or
+        their ``tm-resource-git`` image. Any probe failure is treated as
+        False (a non-resource container).
+        """
+        try:
+            labels = getattr(obj, "labels", None) or {}
+            label_val = labels.get("thoughtmachine.resource")
+            if isinstance(label_val, str) and label_val:
+                return True
+        except Exception:
+            pass
+        try:
+            name = str(getattr(obj, "name", "") or "")
+            if name.startswith("tm-res-"):
+                return True
+        except Exception:
+            pass
+        try:
+            image = getattr(obj, "image", None)
+            if image is None:
+                return False
+            if isinstance(image, str):
+                return image == "tm-resource-git"
+            tags = getattr(image, "tags", None) or []
+            return any(
+                tag == "tm-resource-git" or tag.startswith("tm-resource-git:")
+                for tag in tags
+            )
+        except Exception:
+            return False
+
     # ── Internals ──────────────────────────────────────────────────────────
 
     def _reuse_container(self, container_id):
@@ -1303,7 +1375,12 @@ class ContainerManager:
                     ]
                 },
             )
-            return containers[0] if containers else None
+            if not containers:
+                return None
+            first = containers[0]
+            if self._is_resource_container(first):
+                return None
+            return first
         except Exception:
             return None
 

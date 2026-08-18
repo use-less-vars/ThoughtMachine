@@ -100,7 +100,7 @@ RESOURCE_IMAGE_TAG = "tm-resource-git"
 # Known hidden resources. Every entry runs inside the same hardened
 # ``RESOURCE_IMAGE_TAG`` image, so the build-hash drift check applies to all.
 RESOURCE_REGISTRY = {
-    "git": {"kind": "git"},
+    "git": {"kind": "git", "permission": "git"},
 }
 
 # Global resource images are lifecycle-protected shared infrastructure:
@@ -1181,11 +1181,15 @@ class ResourceContainerManager:
                 failure_reason="unknown_resource",
             )
 
-        denied = self._container_policy_denied()
+        denied = _resource_policy_denied(self.session_permissions, name)
         if denied:
+            if name == "git":
+                detail = f"git resources disabled/denied: {denied}"
+            else:
+                detail = f"resource '{name}' disabled/denied: {denied}"
             return self._resource_result(
                 "unavailable",
-                detail=f"container resources disabled/denied: {denied}",
+                detail=detail,
                 failure_reason="policy_denied",
             )
 
@@ -1468,6 +1472,67 @@ def _container_policy_denied(session_permissions=None):
     return None
 
 
+def _resource_policy_denied(session_permissions=None, resource_name=None):
+    """Reason string when session/workspace policy denies a hidden resource.
+
+    Per-resource twin of ``_container_policy_denied``: instead of gating on
+    the shared ``container`` permission, each registered resource declares
+    its own permission key in ``RESOURCE_REGISTRY`` (e.g. ``git`` ->
+    ``"permission": "git"``), so container access can be granted while a
+    specific resource stays denied (and vice versa).
+
+    Fail-closed: when ``session_permissions`` is supplied and the gate
+    cannot be consulted (import or call failure), the resource is DENIED
+    with a reason string. When ``session_permissions`` is falsy the check
+    is opt-in and returns None (mirrors ``_container_policy_denied``).
+
+    Args:
+        session_permissions: Optional session/workspace permissions dict.
+        resource_name: Resource name from ``RESOURCE_REGISTRY``.
+
+    Returns:
+        str or None: the denial reason, or None when the resource is
+            allowed (or no session permissions were supplied).
+    """
+    entry = RESOURCE_REGISTRY.get(resource_name)
+    if entry is None:
+        return f"unknown resource permission '{resource_name}'"
+    permission = entry.get("permission")
+    if not permission:
+        return f"resource '{resource_name}' policy missing permission key"
+    if not session_permissions:
+        return None
+    try:
+        from security.security_gate import check_atomic_operation
+    except Exception as exc:
+        _LOG.warning(
+            "Security gate unavailable; denying resource '%s' access: %s",
+            resource_name,
+            exc,
+        )
+        return f"security gate unavailable: {exc}"
+    try:
+        allowed = check_atomic_operation(
+            f"{permission}:read",
+            session_permissions,
+            "ResourceContainerManager",
+            f"resource '{resource_name}' ({permission}:read)",
+        )
+    except Exception as exc:
+        _LOG.warning(
+            "Security gate resource policy check failed for '%s': %s",
+            resource_name,
+            exc,
+        )
+        return f"security gate check failed: {exc}"
+    if not allowed:
+        return (
+            f"session/workspace policy denies resource '{resource_name}' "
+            f"(effective {permission}=denied)"
+        )
+    return None
+
+
 def _join_detail(detail, part):
     """Join a detail string with a new part ('; ' separated), or the part alone."""
     return f"{detail}; {part}" if detail else part
@@ -1503,11 +1568,16 @@ def resource_status(name, workspace_id=None, session_permissions=None):
             return ResourceContainerManager._resource_result(
                 "unavailable", detail=f"unknown resource '{name}'"
             )
-        denied = _container_policy_denied(session_permissions)
+        denied = _resource_policy_denied(session_permissions, name)
         if denied:
+            if name == "git":
+                detail = f"git resources disabled/denied: {denied}"
+            else:
+                detail = f"resource '{name}' disabled/denied: {denied}"
             return ResourceContainerManager._resource_result(
                 "unavailable",
-                detail=f"container resources disabled/denied: {denied}",
+                detail=detail,
+                failure_reason="policy_denied",
             )
         if docker is None:
             return ResourceContainerManager._resource_result(
