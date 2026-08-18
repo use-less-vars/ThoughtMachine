@@ -336,6 +336,71 @@ class TestSelfHealingModeRouting:
         assert captured.get("workspace_id") == "test-ws"
 
 
+    def test_host_fallback_failure_reason_plumbing(self, tmp_path, monkeypatch):
+        """failure_reason/fallback_used from ensure_resource reach the trailer."""
+        _FakeSandbox = self._host_sandbox(monkeypatch)
+        manager = _FakeEnsureManager(
+            {
+                "mode": "host_fallback",
+                "container_id": None,
+                "status": None,
+                "image": None,
+                "detail": self.HOST_FALLBACK_DETAIL,
+                "failure_reason": "build_failed",
+                "fallback_used": True,
+            }
+        )
+        tool = self._container_tool(tmp_path)
+        object.__setattr__(tool, "_resource_manager", manager)
+
+        tool._run_git_raw(tmp_path, ["status"])
+
+        assert tool._last_failure_reason == "build_failed"
+        assert tool._last_fallback_used is True
+        trailer = tool._with_mode("out")
+        assert "execution_mode: host_fallback" in trailer
+        assert "failure_reason: build_failed" in trailer
+        assert "fallback_used: true" in trailer
+
+    def test_containerized_no_failure_keys_defaults(self, tmp_path):
+        """Missing failure_reason/fallback_used keys default to None/False."""
+        manager = _FakeEnsureManager(
+            {
+                "mode": "containerized",
+                "container_id": "c1",
+                "status": "running",
+                "image": "tm-resource-git",
+                "detail": "",
+            }
+        )
+        tool = self._container_tool(tmp_path, operation="status")
+        object.__setattr__(tool, "_resource_manager", manager)
+
+        tool._run_git_raw(tmp_path, ["status"])
+
+        assert tool._last_failure_reason is None
+        assert tool._last_fallback_used is False
+
+    def test_unavailable_with_failure_reason_suffix(self, tmp_path):
+        """unavailable with a failure_reason includes it in the raise message."""
+        manager = _FakeEnsureManager(
+            {
+                "mode": "unavailable",
+                "container_id": None,
+                "status": None,
+                "image": None,
+                "detail": self.POLICY_DENIAL_DETAIL,
+                "failure_reason": "policy_denied",
+            }
+        )
+        tool = self._container_tool(tmp_path, operation="status")
+        object.__setattr__(tool, "_resource_manager", manager)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            tool._run_git_raw(tmp_path, ["status"])
+        assert "(failure_reason: policy_denied)" in str(excinfo.value)
+
+
 # ---------------------------------------------------------------------------
 # CheckSystem capabilities: git execution mode surfaced
 # ---------------------------------------------------------------------------

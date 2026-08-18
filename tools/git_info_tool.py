@@ -75,9 +75,13 @@ class GitInfoTool(ToolBase):
     backends inject their own hardening flags). Commits in a source repo
     checked out as an operator-managed worktree (a ``.git`` FILE pointing at
     a gitdir) are blocked: they are performed host-side by the operator.
-    Execution mode is reported per call for the new operations (diff_cached,
-    branch_list, branch_create, checkout, stage, unstage) via a trailing
-    ``execution_mode: <mode>`` line.
+    Execution mode and failure diagnostics are reported per call for EVERY
+    operation via three trailing lines: ``execution_mode: <mode>``
+    (containerized | host_fallback | unavailable), ``failure_reason: <reason>``
+    (why a containerized resource could not be used, or ``none``) and
+    ``fallback_used: <bool>`` (True when the call degraded to a host-side
+    operation). Argument-validation errors keep their historical byte-exact
+    form (no trailer).
     """
 
     # ------------------------------------------------------------------
@@ -90,6 +94,8 @@ class GitInfoTool(ToolBase):
     _resolved_workspace_id: Optional[str] = None
     _last_mode: Optional[str] = None
     _last_execution_mode: Optional[str] = None
+    _last_failure_reason: Optional[str] = None
+    _last_fallback_used: bool = False
 
     @classmethod
     def get_required_categories(cls, params: dict | None = None) -> list[str]:
@@ -295,6 +301,8 @@ class GitInfoTool(ToolBase):
         self._resolved_workspace_path = None
         self._resolved_workspace_id = None
         self._last_execution_mode = None
+        self._last_failure_reason = None
+        self._last_fallback_used = False
 
         # Atomic permission re-check for network operations. An 'ask' level
         # is NOT re-checked here: it defers to the ToolExecutor's outer gate,
@@ -505,11 +513,15 @@ class GitInfoTool(ToolBase):
         """
         if not self._use_container_mode():
             self._last_execution_mode = "host_fallback"
+            self._last_failure_reason = None
+            self._last_fallback_used = False
             return self._exec_host_raw(repo_root, args, timeout=timeout)
 
         mode, manager = self._resolve_resource_execution()
         effective = mode.get("mode")
         detail = mode.get("detail", "")
+        failure_reason = mode.get("failure_reason")
+        fallback_used = bool(mode.get("fallback_used", False))
         if effective == "containerized" and manager is not None:
             logger.info(
                 "GitInfoTool effective git execution mode: containerized "
@@ -518,6 +530,8 @@ class GitInfoTool(ToolBase):
                 self._resolved_workspace_id or "none",
             )
             self._last_execution_mode = "containerized"
+            self._last_failure_reason = failure_reason
+            self._last_fallback_used = fallback_used
             return self._exec_container_raw(
                 repo_root, args, timeout=timeout, manager=manager
             )
@@ -529,6 +543,13 @@ class GitInfoTool(ToolBase):
                 self.operation,
             )
             self._last_execution_mode = "unavailable"
+            self._last_failure_reason = failure_reason
+            self._last_fallback_used = fallback_used
+            if failure_reason:
+                raise RuntimeError(
+                    f"GitInfoTool: containerized git execution unavailable: "
+                    f"{detail} (failure_reason: {failure_reason})"
+                )
             raise RuntimeError(
                 f"GitInfoTool: containerized git execution unavailable: {detail}"
             )
@@ -540,6 +561,8 @@ class GitInfoTool(ToolBase):
             self.operation,
         )
         self._last_execution_mode = "host_fallback"
+        self._last_failure_reason = failure_reason
+        self._last_fallback_used = fallback_used
         return self._exec_host_raw(repo_root, args, timeout=timeout)
 
     def _exec_host_raw(
@@ -913,7 +936,7 @@ class GitInfoTool(ToolBase):
         if output.startswith("Git command failed"):
             # Try human-readable status
             output = self._run_git(repo_root, ["status"])
-        return self._truncate_output(output)
+        return self._with_mode(self._truncate_output(output))
     
     def _git_diff(self, repo_root: Path) -> str:
         """Run git diff."""
@@ -950,7 +973,7 @@ class GitInfoTool(ToolBase):
             except ValueError as e:
                 return self._truncate_output(f"Error: {e}")
         output = self._run_git(repo_root, args)
-        return self._truncate_output(output)
+        return self._with_mode(self._truncate_output(output))
     
     def _git_log(self, repo_root: Path) -> str:
         """Run git log."""
@@ -985,7 +1008,7 @@ class GitInfoTool(ToolBase):
             except ValueError as e:
                 return self._truncate_output(f"Error: {e}")
         output = self._run_git(repo_root, args)
-        return self._truncate_output(output)
+        return self._with_mode(self._truncate_output(output))
     
     def _git_branch(self, repo_root: Path) -> str:
         """Run git branch."""
@@ -993,7 +1016,7 @@ class GitInfoTool(ToolBase):
         if self.all_branches:
             args.append("-a")
         output = self._run_git(repo_root, args)
-        return self._truncate_output(output)
+        return self._with_mode(self._truncate_output(output))
 
     def _is_operator_managed_worktree(self, repo_root: Path) -> bool:
         """True when ``repo_root`` is an operator-managed git worktree.
@@ -1066,8 +1089,19 @@ class GitInfoTool(ToolBase):
         return rels
 
     def _with_mode(self, output: str) -> str:
-        """Append the effective execution mode for per-call reporting."""
-        return f"{output}\nexecution_mode: {self._last_execution_mode or 'unavailable'}"
+        """Append effective execution mode + failure diagnostics.
+
+        Appends three trailing lines — ``execution_mode`` (containerized |
+        host_fallback | unavailable), ``failure_reason`` (why a
+        containerized resource could not be used, or ``none``) and
+        ``fallback_used`` (True when the call degraded to a host-side
+        operation) — so every operation reports how it actually executed.
+        """
+        return (
+            f"{output}\nexecution_mode: {self._last_execution_mode or 'unavailable'}"
+            f"\nfailure_reason: {self._last_failure_reason or 'none'}"
+            f"\nfallback_used: {str(bool(self._last_fallback_used)).lower()}"
+        )
 
     def _git_diff_cached(self, repo_root: Path) -> str:
         """Run git diff --cached (staged changes)."""
@@ -1152,12 +1186,12 @@ class GitInfoTool(ToolBase):
             args.append(f"--format={self.format}")
         args.append(self.commit)
         output = self._run_git(repo_root, args)
-        return self._truncate_output(output)
+        return self._with_mode(self._truncate_output(output))
     
     def _git_remote(self, repo_root: Path) -> str:
         """Run git remote."""
         output = self._run_git(repo_root, ["remote", "-v"])
-        return self._truncate_output(output)
+        return self._with_mode(self._truncate_output(output))
     
     def _git_blame(self, repo_root: Path) -> str:
         """Run git blame."""
@@ -1181,7 +1215,7 @@ class GitInfoTool(ToolBase):
         args.append("--")
         args.append(str(file_rel))
         output = self._run_git(repo_root, args)
-        return self._truncate_output(output)
+        return self._with_mode(self._truncate_output(output))
     
     def _git_config(self, repo_root: Path) -> str:
         """Run git config."""
@@ -1189,7 +1223,7 @@ class GitInfoTool(ToolBase):
         if self.config_name:
             args = ["config", "--get", self.config_name]
         output = self._run_git(repo_root, args)
-        return self._truncate_output(output)
+        return self._with_mode(self._truncate_output(output))
 
     def _git_add(self, repo_root: Path) -> str:
         """Run git add. Accepts single file path (str) or multiple (list)."""
@@ -1251,7 +1285,7 @@ class GitInfoTool(ToolBase):
                 return "Error: file_path is required for commit operation (at least one path)"
             args = ["commit", "-m", self.message, "--"] + rels
             output = self._run_git(repo_root, args)
-            return self._truncate_output(output)
+            return self._with_mode(self._truncate_output(output))
 
         # Full commit: auto-stage the whole worktree, then commit. A failure
         # in the add step propagates exactly as the historical flow did.
@@ -1259,7 +1293,7 @@ class GitInfoTool(ToolBase):
         if "Git command failed" in add_output:
             return self._truncate_output(add_output)
         output = self._run_git(repo_root, ["commit", "-m", self.message])
-        return self._truncate_output(output)
+        return self._with_mode(self._truncate_output(output))
 
     def _git_init(self, repo_root: Path) -> str:
         """Initialize a new git repository in the target directory."""
@@ -1267,7 +1301,7 @@ class GitInfoTool(ToolBase):
         repo_root.mkdir(parents=True, exist_ok=True)
         args = ["init"]
         output = self._run_git(repo_root, args)
-        return self._truncate_output(output)
+        return self._with_mode(self._truncate_output(output))
 
     def _git_clone(self, repo_root: Path) -> str:
         """Clone a remote git repository into the workspace."""
@@ -1294,4 +1328,4 @@ class GitInfoTool(ToolBase):
                 return self._truncate_output(f"Error: {e}")
 
         output = self._run_git(repo_root, args)
-        return self._truncate_output(output)
+        return self._with_mode(self._truncate_output(output))
