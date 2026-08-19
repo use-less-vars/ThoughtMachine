@@ -35,6 +35,7 @@ import logging
 import os
 import queue
 import signal
+import subprocess
 import threading
 import time
 import uuid
@@ -59,9 +60,23 @@ except ImportError:  # pragma: no cover - defensive
     def is_registry_active(session_config=None) -> bool:  # type: ignore[misc]
         return False
 
+try:
+    from infra.container_registry import DEFAULT_MAX_CONTAINERS
+except ImportError:  # pragma: no cover - defensive
+    DEFAULT_MAX_CONTAINERS = 4
+
 # Resource container name convention (see ResourceContainerManager.container_name).
 _RESOURCE_NAME_PREFIX = "tm-res-"
 _RESOURCE_NAME_SUFFIX = "-git"
+
+# Container ownership labels (same conventions as tools.workspace.worker):
+# the ``thoughtmachine.worker`` label carries the owning worker's identity
+# ("<session_id or 'unknown'>:<worker_name>") and the
+# ``thoughtmachine.resource`` label marks shared workspace infrastructure
+# (git checkouts / tooling images) that must NEVER be touched by worker
+# teardown.
+_WORKER_CONTAINER_LABEL = "thoughtmachine.worker"
+_RESOURCE_CONTAINER_LABEL = "thoughtmachine.resource"
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +119,76 @@ def _get_session_config(container_manager: Any) -> dict:
     return {}
 
 
+def _container_info(container_manager: Any, container_id: Optional[str]):
+    """Best-effort container lookup (labels/name/image dict or object).
+
+    Tries ``inspect(container_id)`` first (duck-typed; the real
+    ContainerManager has no public inspect, fakes may), then matches
+    ``list_containers()`` entries by id or name. Returns None when the
+    container cannot be found.
+    """
+    if container_manager is None or not container_id:
+        return None
+    try:
+        inspect = getattr(container_manager, "inspect", None)
+        if inspect is not None:
+            result = inspect(container_id)
+            if result is not None:
+                return result
+    except Exception:
+        pass
+    try:
+        for entry in container_manager.list_containers() or []:
+            if not isinstance(entry, dict):
+                continue
+            cid = entry.get("id") or entry.get("container_id") or entry.get("name")
+            if cid and str(cid) == str(container_id):
+                return entry
+    except Exception:
+        pass
+    return None
+
+
+def _is_worker_owned_container(container: Any, worker_id: str, session_id: Optional[str]) -> bool:
+    """True when ``container`` belongs to ``worker_id`` (label ownership).
+
+    Ownership is established by the EXACT value of the
+    ``thoughtmachine.worker`` label: it must equal the bare worker id or the
+    worker's owner identity ``<session_id>:<worker_id>``. Resource containers
+    (``thoughtmachine.resource`` label, ``tm-res-*`` names, the
+    ``tm-resource-git`` image) are shared workspace infrastructure and are
+    NEVER worker-owned.
+    """
+    if container is None:
+        return False
+    labels = getattr(container, "labels", None)
+    if labels is None and isinstance(container, dict):
+        labels = container.get("labels")
+    labels = labels or {}
+    # Shared resource containers are never owned by any worker.
+    if labels.get(_RESOURCE_CONTAINER_LABEL):
+        return False
+    owner = labels.get(_WORKER_CONTAINER_LABEL)
+    if not owner:
+        return False
+    if str(owner) == str(worker_id):
+        return True
+    if session_id and str(owner) == f"{session_id}:{worker_id}":
+        return True
+    # Belt-and-braces resource-convention checks (dict/object shape).
+    name = getattr(container, "name", None)
+    if name is None and isinstance(container, dict):
+        name = container.get("name")
+    if name and str(name).startswith(_RESOURCE_NAME_PREFIX):
+        return False
+    image = getattr(container, "image", None)
+    if image is None and isinstance(container, dict):
+        image = container.get("image")
+    if image == RESOURCE_IMAGE_TAG:
+        return False
+    return False
+
+
 def is_wlm_enabled(container_manager: Any) -> bool:
     """True when ``use_workspace_lifecycle_manager`` is set in session config."""
     return bool(
@@ -116,7 +201,9 @@ class ExecutionTracker:
 
     Execution details dict: ``{query_id, tool_call_id, container_id, exec_id,
     start_time, type}`` where ``type`` is one of ``docker_exec``,
-    ``subprocess`` (may also carry ``pid``) or ``scoped_container``.
+    ``subprocess`` (may also carry ``pid``), ``scoped_container`` or
+    ``container_exec`` (a process running inside a container — carries
+    ``container_id`` and ``pid``).
     """
 
     def __init__(self) -> None:
@@ -178,6 +265,7 @@ class ExecutionTracker:
         worker_id: str,
         container_manager: Any,
         resource_container_manager: Any,
+        session_id: Optional[str] = None,
     ) -> None:
         """Terminate every tracked execution; then clear the tracker.
 
@@ -188,6 +276,11 @@ class ExecutionTracker:
         - ``scoped_container``: ``stop(container_id)``.
         - ``subprocess``: ``os.killpg`` when the pid is a process group, else
           ``os.kill(pid, SIGTERM)``.
+        - ``container_exec``: minimal ``docker exec <container> kill <pid>``
+          (``exec_run`` when the manager exposes it, else the docker CLI).
+          Without a pid, the container is stopped ONLY when it is
+          worker-owned (label check) — resource/shared containers are never
+          touched.
 
         Every step is guarded: a failure in one execution never prevents the
         others from being terminated. Idempotent — an empty tracker is a safe
@@ -205,6 +298,10 @@ class ExecutionTracker:
             try:
                 if ex_type == "docker_exec":
                     self._terminate_docker_exec(worker_id, execution_id, details, container_manager)
+                elif ex_type == "container_exec":
+                    self._terminate_container_exec(
+                        worker_id, execution_id, details, container_manager, session_id
+                    )
                 elif ex_type == "scoped_container":
                     self._terminate_scoped_container(worker_id, execution_id, details, container_manager)
                 elif ex_type == "subprocess":
@@ -252,6 +349,78 @@ class ExecutionTracker:
             except Exception as remove_exc:
                 _log("WARNING", "workspace.lifecycle",
                      f"terminate_all: force-remove of {container_id} failed: {remove_exc}")
+
+    def _terminate_container_exec(
+        self,
+        worker_id: str,
+        execution_id: str,
+        details: dict,
+        container_manager: Any,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Terminate a process running inside a container (minimal touch).
+
+        With ``container_id`` + ``pid`` the minimal action is a
+        ``docker exec <container> kill <pid>`` — the container itself keeps
+        running and is never stopped. Without a pid the container is stopped
+        ONLY when it is worker-owned (``thoughtmachine.worker`` label matches
+        the worker); resource/shared containers are never touched.
+        """
+        container_id = details.get("container_id")
+        pid = details.get("pid")
+        if container_id and pid:
+            self._docker_exec_kill(execution_id, container_id, int(pid), container_manager)
+            return
+        if not container_id:
+            _log("WARNING", "workspace.lifecycle",
+                 f"terminate_all: container_exec {execution_id} has neither "
+                 f"container_id nor pid — skipping")
+            return
+        if container_manager is None:
+            _log("WARNING", "workspace.lifecycle",
+                 f"terminate_all: container_exec {execution_id} has no pid and "
+                 f"no container_manager — skipping (cannot verify ownership)")
+            return
+        info = _container_info(container_manager, container_id)
+        if _is_worker_owned_container(info, worker_id, session_id):
+            _log("INFO", "workspace.lifecycle",
+                 f"terminate_all: container_exec {execution_id} — no pid, "
+                 f"worker-owned container {container_id} — stop({container_id})")
+            container_manager.stop(container_id)
+        else:
+            _log("WARNING", "workspace.lifecycle",
+                 f"terminate_all: container_exec {execution_id} has no pid and "
+                 f"container {container_id} is not worker-owned — skipping "
+                 f"(never touch resource/shared containers)")
+
+    def _docker_exec_kill(self, execution_id, container_id, pid, container_manager) -> None:
+        """Minimal in-container kill: ``docker exec <container> kill <pid>``.
+
+        Prefers ``container_manager.exec_run`` when the manager exposes it,
+        else shells out to the docker CLI. On failure only a warning is
+        logged — the container is deliberately NOT stopped (minimal
+        termination semantics).
+        """
+        exec_run = getattr(container_manager, "exec_run", None)
+        try:
+            if callable(exec_run):
+                _log("INFO", "workspace.lifecycle",
+                     f"terminate_all: container_exec {execution_id} — "
+                     f"exec_run({container_id}, kill {pid})")
+                exec_run(container_id, ["kill", str(pid)])
+            else:
+                _log("INFO", "workspace.lifecycle",
+                     f"terminate_all: container_exec {execution_id} — "
+                     f"docker exec {container_id} kill {pid}")
+                subprocess.run(
+                    ["docker", "exec", str(container_id), "kill", str(pid)],
+                    capture_output=True,
+                    timeout=EXEC_KILL_GRACE,
+                )
+        except Exception as exc:
+            _log("WARNING", "workspace.lifecycle",
+                 f"terminate_all: container_exec {execution_id} docker exec "
+                 f"kill failed ({exc}) — container left running (minimal touch)")
 
     def _terminate_scoped_container(self, worker_id, execution_id, details, container_manager) -> None:
         container_id = details.get("container_id")
@@ -339,6 +508,7 @@ class WorkerSupervisor:
         feature_flag_check: Optional[Callable[[], bool]] = None,
         session_id: Optional[str] = None,
         permissions_provider: Optional[Callable[[], Any]] = None,
+        max_container_count: Optional[int] = None,
     ) -> None:
         self.worker_id = worker_id
         self._container_manager = container_manager
@@ -352,6 +522,16 @@ class WorkerSupervisor:
                 cfg.get("use_workspace_lifecycle_manager", False)
             )
         self._feature_flag_check = feature_flag_check
+
+        # Per-worker container budget (Phase 3, item 6): the maximum number of
+        # containers this worker may keep active simultaneously.  Defaults to
+        # DEFAULT_MAX_CONTAINERS (4) — the same default the registry and the
+        # legacy container manager apply per session.
+        self._max_container_count: int = (
+            max_container_count if max_container_count is not None else DEFAULT_MAX_CONTAINERS
+        )
+        # Ids of containers created via request_container() and not yet released.
+        self._active_container_ids: set = set()
 
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
@@ -721,21 +901,42 @@ class WorkerSupervisor:
             note = permissions.get("note")
         else:
             image, name, note = permissions, None, None
+        # Per-worker container budget (Phase 3, item 6): fail closed BEFORE
+        # delegating, so the registry/manager is never called over budget.
+        with self._lock:
+            if len(self._active_container_ids) >= self._max_container_count:
+                raise RuntimeError(
+                    f"Worker container limit reached ({self._max_container_count})"
+                )
         # Phase 3: with the registry active the registry owns creation and the
         # container limit; the legacy ContainerManager.start() path runs only
         # when the registry is inactive.
         if is_registry_active(_get_session_config(cm)):
             registry = get_active_registry(_get_session_config(cm))
-            return registry.request_container(
+            result = registry.request_container(
                 worker_id or self.worker_id,
                 session_id or self.worker_id,
                 permissions if isinstance(permissions, dict) else {},
                 image=image,
             )
-        return cm.start(image=image, name=name, note=note)
+        else:
+            result = cm.start(image=image, name=name, note=note)
+        # Track the created container (by id, else by name) so release can
+        # account for it. Handles exposing no id/name are not tracked — the
+        # limit still applies to subsequent requests.
+        if isinstance(result, dict):
+            _cid = result.get("id") or result.get("container_id") or result.get("name")
+            if _cid is not None:
+                with self._lock:
+                    self._active_container_ids.add(_cid)
+        return result
 
     def release_container(self, container_id: str) -> dict:
         """Release a container via the real ``container_manager.stop()`` API."""
+        # Phase 3 item 6: drop the container from the worker's active set so
+        # its budget slot is freed (idempotent for unknown ids).
+        with self._lock:
+            self._active_container_ids.discard(container_id)
         cm = self._container_manager
         if cm is None:
             raise RuntimeError(
@@ -795,10 +996,21 @@ class WorkerSupervisor:
                  f"[WLM-DRAIN] query_id={stale_qid} state={self._state.value} "
                  f"dropping stale reply")
 
+    def terminate_executions(self) -> None:
+        """Terminate all tracked executions for this worker (no state change).
+
+        Used by hung-worker recovery (Phase 3, item 7): a worker whose
+        heartbeats went stale gets its in-flight executions terminated so a
+        stuck tool call (e.g. a docker exec) can unblock, without stopping
+        the worker state machine itself.
+        """
+        self._terminate_all()
+
     def _terminate_all(self) -> None:
         """Run the execution tracker's terminate_all (no lock held)."""
         self.execution_tracker.terminate_all(
             self.worker_id,
             self._container_manager,
             self._resource_container_manager,
+            session_id=self.session_id,
         )

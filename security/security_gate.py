@@ -28,7 +28,7 @@ from thoughtmachine.workspace_capabilities import (
     WorkspaceCapabilities,
     load_workspace_capabilities,
 )
-from thoughtmachine.security import SessionPermissions, _pending_security_requests, _pending_requests_lock, resolve_security_prompt
+from thoughtmachine.security import SessionPermissions, PERMISSION_SCHEMA, _pending_security_requests, _pending_requests_lock, resolve_security_prompt
 from agent.events import SecurityPromptEvent, EventType, NullEventBus
 
 logger = logging.getLogger(__name__)
@@ -45,16 +45,30 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════════════
 
 
+# ── Fail-closed capabilities constant ──
+# When a workspace has no capabilities file (or it cannot be parsed), the
+# loader returns None. Instead of falling back to a fully-permissive
+# default, we return RESTRICTIVE capabilities: filesystem read-only, no
+# docker, no network, no git. Session permissions can still be more
+# restrictive; this constant only lowers the ceiling, never raises it.
+_FAIL_CLOSED_CAPABILITIES = WorkspaceCapabilities(
+    filesystem_write=False,
+    allow_docker=False,
+    allow_network=False,
+    git_available=False,
+)
+
+
 def get_workspace_capabilities(workspace_id: str) -> WorkspaceCapabilities:
     """
     Load workspace capabilities via the canonical loader.
 
-    Returns a default (fully-permissive) ``WorkspaceCapabilities`` when the
+    Returns a fail-closed (restrictive) ``WorkspaceCapabilities`` when the
     file does not exist or cannot be parsed.
     """
     caps = load_workspace_capabilities(workspace_id)
     if caps is None:
-        return WorkspaceCapabilities()
+        return _FAIL_CLOSED_CAPABILITIES
     return caps
 
 
@@ -368,7 +382,10 @@ def check_required_categories(
             ``"write"``, ``"full"``).  Applied via ``_min_permission``
             which returns the more restrictive of the effective and
             worker value.  If a key exists in *permission_footprint* but
-            not in *effective*, the worker value is used as-is.
+            not in *effective* — or its value is not a known level for
+            that category — the category resolves to a hard deny
+            (fail-closed): a worker never gains access to a category the
+            session does not explicitly expose.
         is_worker_context:
             If True, the call originates from a worker where no interactive
             user is available — deny immediately without prompting.
@@ -382,12 +399,19 @@ def check_required_categories(
     # ── Apply worker-level restrictions ─────────────────────────────────
     if permission_footprint is not None:
         for category, worker_val in permission_footprint.items():
-            if category in effective:
+            valid_levels = PERMISSION_SCHEMA.get(category)
+            if valid_levels is None or worker_val not in valid_levels:
+                # Unknown category or unknown level — fail closed: deny.
+                effective[category] = False
+            elif category in effective:
                 effective[category] = _min_permission(
                     effective[category], worker_val
                 )
             else:
-                effective[category] = worker_val
+                # Category absent from the session's effective dict: the
+                # worker may NOT grant itself a category the session does
+                # not expose — resolve to a hard deny (fail-closed).
+                effective[category] = False
 
     ask_categories: List[str] = []
     prompts_needed = False

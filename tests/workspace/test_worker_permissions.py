@@ -124,12 +124,16 @@ class TestRestrictiveMerge:
         assert result == {"container": True}
 
     def test_session_missing_key(self):
-        """Key only in worker is used as-is."""
+        """Key only in worker falls back to the category's safe default."""
+        # NOTE: a category absent from the session never takes the worker
+        # value directly — it falls back to the fail-closed safe default
+        # ("execution" -> "banned"), so a worker cannot grant itself a
+        # category the session does not expose.
         result = _restrictive_merge(
             {"filesystem": "read"},
             {"execution": "deny"},
         )
-        assert result == {"filesystem": "read", "execution": "deny"}
+        assert result == {"filesystem": "read", "execution": "banned"}
 
     def test_worker_missing_key(self):
         """Key only in session is used as-is."""
@@ -216,7 +220,9 @@ class TestWorkerPermissionsMergeIntegration:
         assert merged == {
             "container": False,
             "filesystem": "read",
-            "execution": "full",
+            # NOTE: "execution" is absent from the session, so the worker's
+            # "full" is replaced by the fail-closed safe default ("banned").
+            "execution": "banned",
         }, f"Expected container=False (ceiling), got {merged}"
 
     def test_worker_can_strengthen(self, _mock_agent_config):
@@ -236,7 +242,9 @@ class TestWorkerPermissionsMergeIntegration:
         assert merged == {
             "container": True,
             "filesystem": "read",
-            "execution": "deny",
+            # NOTE: "execution" is absent from the session, so the worker's
+            # "deny" is replaced by the fail-closed safe default ("banned").
+            "execution": "banned",
         }, f"Expected filesystem=read (worker stricter), got {merged}"
 
     def test_backward_compat_worker_permissions_key(self, _mock_agent_config):
@@ -256,7 +264,9 @@ class TestWorkerPermissionsMergeIntegration:
         assert merged == {
             "container": False,
             "filesystem": "none",
-            "execution": "deny",
+            # NOTE: "execution" is absent from the session, so the worker's
+            # "deny" is replaced by the fail-closed safe default ("banned").
+            "execution": "banned",
         }, f"Expected filesystem=none (worker stricter), got {merged}"
 
     def test_no_permission_footprint(self, _mock_agent_config):
@@ -291,7 +301,9 @@ class TestWorkerPermissionsMergeIntegration:
         merged = call_kwargs.get("session_permissions", {})
         assert merged == {
             "filesystem": "read",
-            "execution": "allow",
+            # NOTE: "execution" is absent from the session, so the worker's
+            # "allow" is replaced by the fail-closed safe default ("banned").
+            "execution": "banned",
         }, f"Expected worker to fill gap, got {merged}"
 
     def test_default_tool_set(self, _mock_agent_config):

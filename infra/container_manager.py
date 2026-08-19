@@ -1112,7 +1112,7 @@ class ContainerManager:
         from the per-workspace bulletin board (container_notes.json), not from
         Docker labels. Returns a list of dicts with EXACTLY: ``container_id``,
         ``name``, ``image``, ``status``, ``uptime_seconds``, ``workspace_id``,
-        ``note``.
+        ``note``, ``labels``.
         """
         try:
             containers = self.client.containers.list(
@@ -1157,6 +1157,7 @@ class ContainerManager:
                 "uptime_seconds": uptime_seconds,
                 "workspace_id": (container.labels.get("thoughtmachine.workspace_id")
                                  or self.workspace_id),
+                "labels": dict(container.labels or {}),
                 "note": ((getattr(self, "container_notes", {}) or {}).get(container.name)
                          or {}).get("note", ""),
             })
@@ -1546,3 +1547,163 @@ def cleanup_workspace(workspace_id, docker_client):
             pass
     _audit("CONTAINER_CLEANUP", f"workspace={wid} count={removed}")
     return {"removed": removed}
+
+
+# ── Idle/TTL + orphan sweep for EXITED workspace containers ─────────────────
+_WORKSPACE_LABEL = "thoughtmachine.workspace_id"
+_RESOURCE_LABEL = "thoughtmachine.resource"
+_SWEEP_SKIP_DETAIL_CAP = 8  # keep startup log lines bounded
+
+
+def _container_name(container):
+    """Best-effort human-readable name for a container object."""
+    for attr in ("name", "id"):
+        try:
+            value = getattr(container, attr, None)
+        except Exception:
+            value = None
+        if value:
+            return value
+    return repr(container)
+
+
+def sweep_exited_workspace_containers(registered_workspace_ids=None,
+                                      max_age_s=3600, dry_run=False):
+    """Sweep EXITED ``thoughtmachine.workspace_id``-labelled containers that
+    have been idle for at least ``max_age_s`` seconds.
+
+    Two branches share the same predicate (``status == 'exited'`` AND idle
+    age ``>= max_age_s``):
+    - registered workspaces -> idle/TTL branch (``removed_registered``)
+    - unregistered workspaces -> orphan branch (``removed_orphan``)
+    Resource containers (``thoughtmachine.resource`` label) are ALWAYS
+    skipped, as are running/created containers and any container whose
+    ``State.FinishedAt`` is missing, unparseable or in the future (clock
+    skew safety).
+
+    ``registered_workspace_ids=None`` -> TTL-only sweep: every workspace
+    container is treated as registered (orphan classification disabled).
+    ``registered_workspace_ids=[]``  -> conservative NO-OP: with an empty
+    registry every container would look like an orphan, so nothing is
+    removed ("safe when the registry is empty").
+
+    ``dry_run=True`` counts would-be removals but never calls ``remove()``.
+    Never raises — a missing/broken docker daemon soft-fails into a result.
+    Returns::
+
+        {"removed": int, "skipped": int, "detail": str, "dry_run": bool,
+         "removed_registered": int, "removed_orphan": int,
+         "removed_containers": [container name or id, ...]}
+    """
+    result = {
+        "removed": 0,
+        "skipped": 0,
+        "detail": "",
+        "dry_run": bool(dry_run),
+        "removed_registered": 0,
+        "removed_orphan": 0,
+        "removed_containers": [],
+    }
+
+    if registered_workspace_ids is not None and len(registered_workspace_ids) == 0:
+        # Empty registry -> nothing can be classified as "registered"; wiping
+        # every exited container on startup would be a data-loss surprise.
+        result["detail"] = "registry empty; sweep skipped"
+        return result
+
+    if not DOCKER_AVAILABLE:
+        result["detail"] = "docker SDK not installed"
+        return result
+
+    try:
+        client = docker.from_env()
+        containers = client.containers.list(all=True, filters={"label": _WORKSPACE_LABEL})
+    except Exception as exc:
+        result["detail"] = f"docker unavailable: {exc}"
+        return result
+
+    registered = (
+        None
+        if registered_workspace_ids is None
+        else {str(ws) for ws in registered_workspace_ids}
+    )
+
+    skip_counts = {}
+    now = time.time()
+
+    def _note_skip(category):
+        skip_counts[category] = skip_counts.get(category, 0) + 1
+        result["skipped"] += 1
+
+    for container in containers:
+        name = _container_name(container)
+
+        try:
+            labels = container.labels or {}
+        except Exception:
+            labels = {}
+        if labels.get(_RESOURCE_LABEL):
+            # Resource containers (hidden git images etc.) are owned by
+            # infra/resource_container_manager — never touched here.
+            _note_skip("resource")
+            continue
+
+        wid = labels.get(_WORKSPACE_LABEL)
+        if not wid:
+            _note_skip("no_workspace_label")
+            continue
+
+        try:
+            status = container.status
+        except Exception:
+            status = None
+        if status != "exited":
+            _note_skip(f"status={status!r}")
+            continue
+
+        try:
+            finished_at = ((container.attrs or {}).get("State") or {}).get("FinishedAt") or ""
+            ts = datetime.fromisoformat(finished_at.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            _note_skip("FinishedAt unparseable")
+            continue
+        if ts > now:
+            _note_skip("FinishedAt in future")
+            continue
+        if now - ts < max_age_s:
+            _note_skip("too young")
+            continue
+
+        is_registered = registered is None or wid in registered
+
+        if dry_run:
+            result["removed"] += 1
+            if is_registered:
+                result["removed_registered"] += 1
+            else:
+                result["removed_orphan"] += 1
+            result["removed_containers"].append(name)
+            continue
+
+        try:
+            container.remove(force=True)
+        except Exception as exc:
+            _note_skip(f"remove failed: {exc}")
+            continue
+        result["removed"] += 1
+        if is_registered:
+            result["removed_registered"] += 1
+        else:
+            result["removed_orphan"] += 1
+        result["removed_containers"].append(name)
+
+    if skip_counts:
+        parts = ", ".join(f"{cat}: {cnt}" for cat, cnt in sorted(skip_counts.items()))
+        if len(parts) > _SWEEP_SKIP_DETAIL_CAP * 40:
+            parts = parts[:_SWEEP_SKIP_DETAIL_CAP * 40] + "…"
+        result["detail"] = f"skipped ({parts})"
+
+    _audit("CONTAINER_SWEEP",
+           f"removed={result['removed']} skipped={result['skipped']} "
+           f"dry_run={dry_run}")
+    return result

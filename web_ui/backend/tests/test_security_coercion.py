@@ -31,6 +31,9 @@ class TestCoerceSessionPermissions:
 
     def test_valid_permissions_pass_through(self):
         """All valid values should pass through unchanged."""
+        # NOTE: "mcp" is part of PERMISSION_SCHEMA (banned/connect/full) and
+        # missing keys are filled with SAFE_DEFAULTS, so it must be present
+        # in the pass-through fixture.
         raw = {
             "network": "write",
             "filesystem": "read",
@@ -38,6 +41,7 @@ class TestCoerceSessionPermissions:
             "execution": "banned",
             "git": "read",
             "system": "ask",
+            "mcp": "connect",
         }
         result = coerce_session_permissions(raw)
         assert result == raw, f"Expected pass-through, got {result}"

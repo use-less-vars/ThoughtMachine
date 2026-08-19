@@ -385,6 +385,24 @@ async def put_domain_allowlist(ws_id: str, body: DomainAllowlistBody):
 
 # ── GET /api/workspace/{ws_id}/workers ───────────────────────────────────────
 
+
+def _seconds_since_heartbeat(iso_ts: Optional[str]) -> Optional[float]:
+    """Seconds elapsed since an ISO-8601 heartbeat timestamp.
+
+    Returns None when the timestamp is absent or unparseable. Naive
+    timestamps are treated as UTC; negative deltas (clock skew) clamp to 0.
+    """
+    if not iso_ts:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(iso_ts).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+
+
 @router.get("/{ws_id}/workers")
 async def get_workers(
     ws_id: str,
@@ -465,8 +483,11 @@ async def get_workers(
                         pass
 
     # 3. Check for persisted contexts on disk
-    #    Supports both legacy and session-scoped structures.
+    #    Supports both legacy and session-scoped structures. Also collects the
+    #    worker's ``pruned_since_last_query`` counter from context.json (the
+    #    stale/abandoned-attempt prune tally persisted by the worker thread).
     persisted_names = set()
+    pruned_since_last_query: Dict[str, int] = {}
     if workers_dir.is_dir():
         for subdir in workers_dir.iterdir():
             if not subdir.is_dir():
@@ -477,10 +498,30 @@ async def get_workers(
                 for worker_subdir in subdir.iterdir():
                     if worker_subdir.is_dir() and (worker_subdir / "context.json").exists():
                         persisted_names.add(worker_subdir.name)
+                        try:
+                            ctx = json.loads(
+                                (worker_subdir / "context.json").read_text(encoding="utf-8")
+                            )
+                            count = int(ctx.get("pruned_since_last_query") or 0)
+                            pruned_since_last_query[worker_subdir.name] = max(
+                                pruned_since_last_query.get(worker_subdir.name, 0), count
+                            )
+                        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+                            pass
             else:
                 # Legacy: workers/<name>/context.json
                 if (subdir / "context.json").exists():
                     persisted_names.add(subdir.name)
+                    try:
+                        ctx = json.loads(
+                            (subdir / "context.json").read_text(encoding="utf-8")
+                        )
+                        count = int(ctx.get("pruned_since_last_query") or 0)
+                        pruned_since_last_query[subdir.name] = max(
+                            pruned_since_last_query.get(subdir.name, 0), count
+                        )
+                    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+                        pass
 
     # 4. Merge everything
     result = []
@@ -509,6 +550,10 @@ async def get_workers(
             entry["current_context_tokens"] = None
             entry["max_context_tokens"] = None
         entry["has_persisted_context"] = worker_name in persisted_names
+        entry["pruned_since_last_query"] = pruned_since_last_query.get(worker_name, 0)
+        entry["time_since_last_query"] = _seconds_since_heartbeat(
+            entry.get("last_heartbeat")
+        )
         result.append(entry)
 
     # 5. Optional ?name= filter — return single worker entry or 404

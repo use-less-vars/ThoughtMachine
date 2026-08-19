@@ -118,13 +118,17 @@ class TestAutoRegisterCreatesConfigAndDirs:
         missing = expected_files - actual_files
         assert not missing, f"Missing bootstrap files: {missing}"
 
-    def test_workers_json_contains_coder_reviewer_researcher(self, fake_home, project_root):
-        """workers.json should include coder, reviewer, and researcher workers."""
+    def test_workers_json_contains_default_worker(self, fake_home, project_root):
+        """workers.json should include the default template worker.
+
+        NOTE: the worker template set was consolidated to a single
+        general-purpose "default" worker (resources/worker_templates/default.json);
+        the older coder/reviewer/researcher template trio no longer exists.
+        """
         ws_id = _simulate_auto_register(project_root)
         worker_names = _worker_names_in(ws_id)
-        for expected in ("coder", "reviewer", "researcher"):
-            assert expected in worker_names, \
-                f"Expected worker '{expected}' not found in workers.json; got {worker_names}"
+        assert "default" in worker_names, \
+            f"Expected worker 'default' not found in workers.json; got {worker_names}"
 
     def test_capabilities_json_is_valid(self, fake_home, project_root):
         """capabilities.json should parse into a valid WorkspaceCapabilities dict."""
@@ -270,7 +274,11 @@ class TestMultipleWorkspaces:
                 f"Workspace {ws_id}: expected {expected}, got {actual}"
 
     def test_worker_templates_in_both(self, fake_home, tmp_path):
-        """Both workspaces should have coder/reviewer/researcher in their workers.json."""
+        """Both workspaces should have the default worker in their workers.json.
+
+        NOTE: worker templates were consolidated to a single "default" worker;
+        the older coder/reviewer/researcher trio no longer exists.
+        """
         root_a = tmp_path / "project_alpha"
         root_b = tmp_path / "project_beta"
         root_a.mkdir(parents=True, exist_ok=True)
@@ -279,7 +287,7 @@ class TestMultipleWorkspaces:
         ws_id_a = _simulate_auto_register(root_a)
         ws_id_b = _simulate_auto_register(root_b)
 
-        expected_workers = {"coder", "reviewer", "researcher"}
+        expected_workers = {"default"}
         assert _worker_names_in(ws_id_a) == expected_workers
         assert _worker_names_in(ws_id_b) == expected_workers
 

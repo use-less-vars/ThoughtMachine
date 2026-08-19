@@ -1194,13 +1194,20 @@ class TestWorkerConfigForwarding:
     def test_config_forwards_parent_fields(
         self, worker_thread: Any
     ) -> None:
-        """Parent config fields (api_key, base_url, temperature,
-        tool_output_token_limit) should flow through to the worker's AgentConfig."""
+        """Parent config fields (api_key, base_url, tool_output_token_limit)
+        flow through to the worker's AgentConfig; temperature NEVER inherits
+        from the parent — the worker uses the definition's temperature when
+        set, otherwise WORKER_DEFAULT_TEMPERATURE (0.7).
+        """
         agent_cfg = worker_thread._build_agent_config()
         assert agent_cfg is not None
         assert agent_cfg.api_key == "sk-parent-key"
         assert agent_cfg.base_url == "https://parent.example.com"
-        assert agent_cfg.temperature == 0.3
+        # New contract: definition sets no temperature → worker default (0.7),
+        # never the parent's 0.3.
+        from tools.workspace.worker import WORKER_DEFAULT_TEMPERATURE
+
+        assert agent_cfg.temperature == WORKER_DEFAULT_TEMPERATURE
         assert agent_cfg.tool_output_token_limit == 4096
         assert agent_cfg.provider_type == "scripted"
         assert agent_cfg.model == "mock-model"

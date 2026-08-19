@@ -218,9 +218,12 @@ class TestQueryActionTimeout(unittest.TestCase):
 
         self.assertIn("error", result)
         self.assertIn("Worker 'w-query' did not respond within 300.0s", result["error"])
-        self.assertIn("still alive", result["note"])
+        self.assertIn("stopped cooperatively", result["note"])
+        self.assertIn("Re-spawn", result["note"])
         self.assertEqual(result["worker_name"], "w-query")
         fake.send_query.assert_called_once_with("hello", timeout=300.0)
+        fake.stop.assert_called_once()
+        fake._cleanup_worker_containers.assert_called_once()
 
 
 class TestForceRespawnReload(_RunSafetyPatches):
