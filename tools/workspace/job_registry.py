@@ -118,7 +118,8 @@ class WorkerJobRegistry:
 
     # -- mutations -----------------------------------------------------
 
-    def register(self, job_id: str, worker_name: str, session_id=None) -> Optional[dict]:
+    def register(self, job_id: str, worker_name: str, session_id=None,
+                 instance_id=None) -> Optional[dict]:
         """Register a submitted job. Returns the stored record (deep copy)."""
         if not job_id:
             return None
@@ -129,6 +130,7 @@ class WorkerJobRegistry:
                 "job_id": job_id,
                 "worker_name": worker_name,
                 "session_id": session_id or "",
+                "instance_id": instance_id,
                 "status": "submitted",
                 "created_at": now,
                 "updated_at": now,
@@ -146,7 +148,7 @@ class WorkerJobRegistry:
             if job is None:
                 return None
             for key, value in fields.items():
-                if key in ("worker_name", "session_id", "status", "completed_at", "preview"):
+                if key in ("worker_name", "session_id", "instance_id", "status", "completed_at", "preview"):
                     job[key] = value
             job["updated_at"] = _now_iso()
             return copy.deepcopy(job)
@@ -167,6 +169,7 @@ class WorkerJobRegistry:
                     "job_id": job_id,
                     "worker_name": None,
                     "session_id": "",
+                    "instance_id": None,
                     "status": "submitted",
                     "created_at": now,
                     "updated_at": now,
@@ -194,7 +197,7 @@ class WorkerJobRegistry:
             job = self._jobs.get(job_id)
             return copy.deepcopy(job) if job is not None else None
 
-    def jobs(self, worker_name=None, status=None) -> list:
+    def jobs(self, worker_name=None, status=None, instance_id=None) -> list:
         """Deep copies of all job records, optionally filtered."""
         with self._lock:
             out = []
@@ -202,6 +205,8 @@ class WorkerJobRegistry:
                 if worker_name is not None and job.get("worker_name") != worker_name:
                     continue
                 if status is not None and job.get("status") != status:
+                    continue
+                if instance_id is not None and job.get("instance_id") != instance_id:
                     continue
                 out.append(copy.deepcopy(job))
             return out

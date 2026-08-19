@@ -81,6 +81,14 @@ MAX_WORKERS_PER_SESSION = 5
 # Registry key fallback used when a worker is spawned without a session_id.
 _NO_SESSION_KEY = "<no-session>"
 
+# Session-level main-agent pause set (UNIT C, pause/resume v2). A session id
+# present here means the session's MAIN agent is paused ("Pause Main"); its
+# async workers keep running unless they were paused too ("Pause All"). While
+# the main agent is paused, join/wait_for_job return {"status": "paused"}
+# promptly instead of blocking. Pausing is cooperative only: workers pause at
+# their next safe loop boundary via WorkerThread.pause(); no thread is killed.
+_SESSION_MAIN_PAUSED: set[str] = set()
+
 # ── Worker heartbeat / liveness (Phase 2A) ──
 # Workers publish WORKER_HEARTBEAT events to the global bus while idle,
 # paused, and busy. HEARTBEAT_INTERVAL_S throttles publication; a worker is
@@ -227,10 +235,30 @@ def _on_worker_stale(worker_name: str, info: dict) -> None:
     """
     try:
         session_id = info.get("session_id") or ""
-        with _registry_lock:
-            thread = _worker_registry.get((session_id, worker_name))
-            if thread is None:
-                thread = _worker_registry.get((_NO_SESSION_KEY, worker_name))
+        instance_id = info.get("instance_id")
+        thread = None
+        try:
+            thread, _sid, _iid = _resolve_worker_thread(
+                worker_name,
+                instance_id=instance_id,
+                session_id=session_id or None,
+            )
+        except _WorkerAmbiguityError:
+            thread = None
+        if thread is None:
+            with _registry_lock:
+                thread = _worker_registry.get((session_id, worker_name, instance_id or 1))
+                if thread is None:
+                    thread = _worker_registry.get((session_id, worker_name))
+                if thread is None:
+                    thread = _worker_registry.get((_NO_SESSION_KEY, worker_name))
+        if thread is None:
+            # Name-only fallback: first matching entry across sessions.
+            with _registry_lock:
+                for key, cand in _worker_registry.items():
+                    if key[1] == worker_name:
+                        thread = cand
+                        break
         if thread is None:
             return
         wlm = getattr(thread, "_wlm", None)
@@ -653,22 +681,82 @@ def shutdown_workers(timeout: float = 5.0) -> None:
     """Delegate to WorkerRegistry singleton (backward compat)."""
     _WorkerRegistry.get_instance().shutdown_workers(timeout=timeout)
 
-def register_worker_event_bus(session_id: str, worker_name: str, event_bus: Any) -> None:
+def register_worker_event_bus(session_id: str, worker_name: str, event_bus: Any, instance_id: int = 1) -> None:
     """Delegate to WorkerRegistry singleton (backward compat)."""
-    _WorkerRegistry.get_instance().register_event_bus(session_id, worker_name, event_bus)
+    _WorkerRegistry.get_instance().register_event_bus(session_id, worker_name, event_bus, instance_id=instance_id)
 
-def unregister_worker_event_bus(session_id: str, worker_name: str) -> None:
+def unregister_worker_event_bus(session_id: str, worker_name: str, instance_id: int = 1) -> None:
     """Delegate to WorkerRegistry singleton (backward compat)."""
-    _WorkerRegistry.get_instance().unregister_event_bus(session_id, worker_name)
+    _WorkerRegistry.get_instance().unregister_event_bus(session_id, worker_name, instance_id=instance_id)
 
-def get_worker_event_bus(session_id: str, worker_name: str) -> Any:
+def get_worker_event_bus(session_id: str, worker_name: str, instance_id: int = 1) -> Any:
     """Delegate to WorkerRegistry singleton (backward compat)."""
-    return _WorkerRegistry.get_instance().get_event_bus(session_id, worker_name)
+    return _WorkerRegistry.get_instance().get_event_bus(session_id, worker_name, instance_id=instance_id)
 
 
 def get_worker_event_buses_for_session(session_id: str) -> Dict[str, Any]:
     """Delegate to WorkerRegistry singleton (backward compat)."""
     return _WorkerRegistry.get_instance().get_event_buses_for_session(session_id)
+
+
+class _WorkerAmbiguityError(Exception):
+    """Raised when a worker name maps to multiple live instances and no
+    ``instance_id`` was given to disambiguate."""
+
+
+def _resolve_worker_thread(
+    worker_name: str,
+    instance_id: Optional[int] = None,
+    session_id: Optional[str] = None,
+):
+    """Resolve a worker name (+ optional instance/session) to a live thread.
+
+    Returns ``(thread, session_key, iid)``. With no explicit ``instance_id``,
+    exactly one live candidate must exist; multiple live candidates raise
+    ``_WorkerAmbiguityError`` (callers must pass ``instance_id``). No live
+    candidate raises ``_WorkerAmbiguityError`` with a 'not running' message.
+    """
+    with _registry_lock:
+        if instance_id is not None:
+            # Exact 3-tuple lookup first, then a name+instance scan (session
+            # filter applies only when given).
+            if session_id is not None:
+                thread = _worker_registry.get((session_id, worker_name, instance_id))
+                if thread is not None:
+                    return (thread, session_id, instance_id)
+            for key, thread in list(_worker_registry.items()):
+                wname = key[1]
+                iid = key[2] if len(key) >= 3 else 1
+                if wname == worker_name and iid == instance_id:
+                    if session_id is None or key[0] == session_id:
+                        return (thread, key[0], iid)
+            raise _WorkerAmbiguityError(
+                f"Worker '{worker_name}' instance {instance_id} is not running"
+            )
+        candidates = []
+        for key, thread in list(_worker_registry.items()):
+            wname = key[1]
+            iid = key[2] if len(key) >= 3 else 1
+            if wname != worker_name:
+                continue
+            if session_id is not None and key[0] != session_id:
+                continue
+            alive = bool(getattr(thread, "is_alive", lambda: True)())
+            if not alive:
+                continue
+            candidates.append((key[0], iid, thread))
+    if not candidates:
+        raise _WorkerAmbiguityError(f"Worker '{worker_name}' is not running")
+    if len(candidates) == 1:
+        sid, iid, thread = candidates[0]
+        return (thread, sid, iid)
+    labels = sorted(
+        _WorkerRegistry.instance_label(worker_name, iid) for _sid, iid, _t in candidates
+    )
+    raise _WorkerAmbiguityError(
+        f"Worker '{worker_name}' is ambiguous: {len(candidates)} live "
+        f"instances ({', '.join(labels)}). Specify instance_id."
+    )
 
 # ---------------------------------------------------------------------------
 # Restrictive merge for permission ceiling enforcement
@@ -817,13 +905,16 @@ class WorkerThread(threading.Thread):
         project_root: Optional[str] = None,
         timeout_seconds: Optional[int] = None,
         session_id: Optional[str] = None,
+        instance_id: int = 1,
         container_manager: Optional[Any] = None,
         *,
         max_container_count: Optional[int] = None,
         max_token_usage: Optional[int] = None,
         max_runtime_s: Optional[float] = None,
     ) -> None:
-        super().__init__(daemon=True, name=f"worker-{name}")
+        self.instance_id = instance_id
+        instance_label = _WorkerRegistry.instance_label(name, instance_id)
+        super().__init__(daemon=True, name=f"worker-{instance_label}")
         self.worker_name = name
         self.definition = definition
         self._agent_config_dict = agent_config
@@ -831,7 +922,7 @@ class WorkerThread(threading.Thread):
         # Container manager used to stop/remove containers owned by this
         # worker at teardown (see _cleanup_worker_containers).
         self._container_manager: Optional[Any] = container_manager
-        self._worker_dir = workspace_dir / "workers" / name
+        self._worker_dir = workspace_dir / "workers" / instance_label
         self._worker_dir.mkdir(parents=True, exist_ok=True)
 
         # F2: generation token — a monotonic per-worker counter that guards
@@ -973,6 +1064,11 @@ class WorkerThread(threading.Thread):
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._resume_event = threading.Event()
+        # UNIT C: True when this worker was paused with the manual-only flag.
+        # A later query must NOT auto-resume such a worker (see _action_spawn's
+        # sole-paused path); it has to be resumed explicitly via the 'resume'
+        # action (which clears the marker).
+        self._manual_only_pause: bool = False
 
     # ── public API called from the tool thread ─────────────────────
 
@@ -992,6 +1088,11 @@ class WorkerThread(threading.Thread):
         (``_is_worker_owned_container``).
         """
         return f"{self.session_id or 'unknown'}:{self.worker_name}"
+
+    @property
+    def instance_label(self) -> str:
+        """Return this instance's display label (``name`` or ``name#iid``)."""
+        return _WorkerRegistry.instance_label(self.worker_name, self.instance_id)
 
     @property
     def max_context_tokens(self) -> int:
@@ -1672,6 +1773,8 @@ class WorkerThread(threading.Thread):
                         _publish_global_worker_event(EventType.WORKER_PARTIAL_RESULT, {
                             "worker_name": self.worker_name,
                             "session_id": self.session_id or "",
+                            "instance_id": self.instance_id,
+                            "instance_label": self.instance_label,
                             "query_id": self._current_query_id,
                             "status": "running",
                             "reason": "partial",
@@ -1880,7 +1983,7 @@ class WorkerThread(threading.Thread):
             self._write_status_file()
             # Create per-worker EventBus early so _publish_event below works
             self._event_bus = EventBus()
-            register_worker_event_bus(self.session_id or "", self.worker_name, self._event_bus)
+            register_worker_event_bus(self.session_id or "", self.worker_name, self._event_bus, instance_id=self.instance_id)
             # Attach EventLogger to this worker's per-worker bus
             try:
                 from agent.logging.event_logger import EventLogger
@@ -1899,6 +2002,8 @@ class WorkerThread(threading.Thread):
                         data={
                             "session_id": self.session_id or "",
                             "worker_name": self.worker_name,
+                            "instance_id": self.instance_id,
+                            "instance_label": self.instance_label,
                             "current_context_tokens": self.get_current_context_tokens(),
                             "max_context_tokens": self.max_context_tokens,
                             "status": "ready",
@@ -2067,6 +2172,8 @@ class WorkerThread(threading.Thread):
                             data={
                                 "session_id": self.session_id or "",
                                 "worker_name": self.worker_name,
+                                "instance_id": self.instance_id,
+                                "instance_label": self.instance_label,
                                 "status": "busy",
                                 "current_task": self.current_task,
                                 "current_context_tokens": self.get_current_context_tokens(),
@@ -2122,6 +2229,8 @@ class WorkerThread(threading.Thread):
                                 data={
                                     "session_id": self.session_id or "",
                                     "worker_name": self.worker_name,
+                                    "instance_id": self.instance_id,
+                                    "instance_label": self.instance_label,
                                     "status": "paused",
                                     "current_context_tokens": self.get_current_context_tokens(),
                                     "max_context_tokens": self.max_context_tokens,
@@ -2174,6 +2283,8 @@ class WorkerThread(threading.Thread):
                                 data={
                                     "session_id": self.session_id or "",
                                     "worker_name": self.worker_name,
+                                    "instance_id": self.instance_id,
+                                    "instance_label": self.instance_label,
                                     "status": "ready",
                                     "current_context_tokens": self.get_current_context_tokens(),
                                     "max_context_tokens": self.max_context_tokens,
@@ -2215,6 +2326,8 @@ class WorkerThread(threading.Thread):
                             data={
                                 "session_id": self.session_id or "",
                                 "worker_name": self.worker_name,
+                                "instance_id": self.instance_id,
+                                "instance_label": self.instance_label,
                                 "status": "ready",
                                 "current_context_tokens": self.get_current_context_tokens(),
                                 "max_context_tokens": self.max_context_tokens,
@@ -2350,6 +2463,8 @@ class WorkerThread(threading.Thread):
                         data={
                             "session_id": self.session_id or "",
                             "worker_name": self.worker_name,
+                            "instance_id": self.instance_id,
+                            "instance_label": self.instance_label,
                             "error": str(exc),
                             "current_context_tokens": self.get_current_context_tokens(),
                             "max_context_tokens": self.max_context_tokens,
@@ -2377,6 +2492,8 @@ class WorkerThread(threading.Thread):
                         data={
                             "session_id": self.session_id or "",
                             "worker_name": self.worker_name,
+                            "instance_id": self.instance_id,
+                            "instance_label": self.instance_label,
                             "status": final_status,
                             "current_context_tokens": self.get_current_context_tokens(),
                             "max_context_tokens": self.max_context_tokens,
@@ -2391,7 +2508,7 @@ class WorkerThread(threading.Thread):
                     pass
         finally:
             try:
-                unregister_worker_event_bus(self.session_id or "", self.worker_name)
+                unregister_worker_event_bus(self.session_id or "", self.worker_name, instance_id=self.instance_id)
             except Exception:
                 pass
             if self._worker_ctx is not None:
@@ -2720,6 +2837,8 @@ class WorkerThread(threading.Thread):
         _publish_global_worker_event(event_type, {
             "session_id": self.session_id or "",
             "worker_name": self.worker_name,
+            "instance_id": self.instance_id,
+            "instance_label": self.instance_label,
             **data,
         })
 
@@ -2805,6 +2924,15 @@ class Worker(ToolBase):
         description="Session ID that spawned this worker (injected by ToolExecutor)",
     )
 
+    instance_id: Optional[int] = Field(
+        default=None,
+        description="Worker instance ID to address. When omitted, actions that "
+        "target a worker by name operate on the single live instance and error "
+        "with an ambiguity message if the name maps to multiple live instances. "
+        "Spawn with an explicit instance_id to create/replace that instance; "
+        "without it a fresh instance id is allocated (1, 2, ...).",
+    )
+
     force: bool = Field(
         default=False,
         description="If True, stop any existing worker instance (across all sessions) before spawning a fresh one.",
@@ -2825,7 +2953,7 @@ class Worker(ToolBase):
 
     skip_output_truncation: ClassVar[bool] = True
 
-    VALID_ACTIONS: ClassVar[list[str]] = ["list", "spawn", "check", "query", "stop", "submit_query", "job_status"]
+    VALID_ACTIONS: ClassVar[list[str]] = ["list", "spawn", "check", "query", "stop", "submit_query", "job_status", "join", "wait_for_job", "pause", "resume"]
 
     # ── Pydantic v2 validator: coerce plain string context to {"query": ...} ──
     @field_validator('context', mode='before')
@@ -2845,7 +2973,7 @@ class Worker(ToolBase):
                     "available_actions": self.VALID_ACTIONS,
                 })
 
-            if self.action in ("spawn", "check", "query", "submit_query") and not self.worker_name:
+            if self.action in ("spawn", "check", "query", "submit_query", "join", "wait_for_job") and not self.worker_name:
                 return json.dumps({
                     "error": f"worker_name is required for action '{self.action}'",
                 })
@@ -2884,6 +3012,10 @@ class Worker(ToolBase):
                 "stop": lambda: self._action_stop(workers),
                 "submit_query": lambda: self._action_submit_query(workers),
                 "job_status": lambda: self._action_job_status(workers),
+                "join": lambda: self._action_join(workers),
+                "wait_for_job": lambda: self._action_join(workers),
+                "pause": lambda: self._action_pause(workers),
+                "resume": lambda: self._action_resume(workers),
             }[self.action]
 
             result = handler()
@@ -3110,7 +3242,8 @@ class Worker(ToolBase):
         """
         count = 0
         with _registry_lock:
-            for (sid, _name), thread in _worker_registry.items():
+            for key, thread in _worker_registry.items():
+                sid = key[0]
                 if sid == session_key and thread.is_alive():
                     count += 1
         return count
@@ -3123,18 +3256,34 @@ class Worker(ToolBase):
         augmented = []
         for w in workers:
             name = w.get("name", "")
-            entry = dict(w)
-            # Merge runtime status from registry (session-scoped key)
+            base = dict(w)
+            # Merge runtime status from registry — one entry per live instance.
             with _registry_lock:
-                thread = _worker_registry.get((session_key, name))
-            if thread is not None:
-                entry["runtime_status"] = thread.status
-                entry["current_task"] = thread.current_task
-                entry["last_heartbeat"] = thread.last_heartbeat
-                entry["error"] = thread.error
+                instances = [
+                    (key[2] if len(key) >= 3 else 1, thread)
+                    for key, thread in _worker_registry.items()
+                    if key[0] == session_key and key[1] == name
+                ]
+            if instances:
+                for iid, thread in sorted(instances, key=lambda item: item[0]):
+                    entry = dict(base)
+                    entry["instance_id"] = iid
+                    entry["instance_label"] = (
+                        thread.instance_label
+                        if hasattr(thread, "instance_label")
+                        else _WorkerRegistry.instance_label(name, iid)
+                    )
+                    entry["runtime_status"] = thread.status
+                    entry["current_task"] = thread.current_task
+                    entry["last_heartbeat"] = thread.last_heartbeat
+                    entry["error"] = thread.error
+                    augmented.append(entry)
             else:
+                entry = dict(base)
+                entry["instance_id"] = None
+                entry["instance_label"] = name
                 entry["runtime_status"] = "stopped"
-            augmented.append(entry)
+                augmented.append(entry)
 
         return {"workers": augmented, "count": len(augmented)}
 
@@ -3177,7 +3326,13 @@ class Worker(ToolBase):
                         thread._worker_ctx.compact_after_summary()
                     thread._save_context()
                     with _registry_lock:
-                        _worker_registry.pop((sid, self.worker_name), None)
+                        for key, t in list(_worker_registry.items()):
+                            if (
+                                key[0] == sid
+                                and key[1] == self.worker_name
+                                and t is thread
+                            ):
+                                _worker_registry.pop(key, None)
                 stopped_info.append({"session_id": sid, "status": thread.status})
             if stopped_info:
                 logger.info(
@@ -3185,22 +3340,63 @@ class Worker(ToolBase):
                     len(stopped_info), self.worker_name,
                 )
 
-        # Prevent duplicate spawns (session-scoped key)
+        # Prevent duplicate spawns (session-scoped key, instance-aware).
+        # Name-only spawns allocate a fresh instance id (1, 2, ...); the sole
+        # exception is a single PAUSED instance, which is resumed so the main
+        # agent can seamlessly re-query it without manual stop/resume steps.
         session_key = self.session_id or _NO_SESSION_KEY
         resume_paused_worker = None
+        spawn_iid = None
+        explicit_iid = self.instance_id
         with _registry_lock:
-            existing = _worker_registry.get((session_key, self.worker_name))
-            if existing is not None and existing.is_alive():
-                if existing.status == "paused":
-                    # Paused worker — auto-resume and re-route the new query.
-                    # This allows the main agent to seamlessly re-query a
-                    # paused worker without manual stop/resume steps.
-                    resume_paused_worker = existing
+            live_same = []
+            for key, t in list(_worker_registry.items()):
+                if key[0] == session_key and key[1] == self.worker_name:
+                    iid = key[2] if len(key) >= 3 else 1
+                    if bool(getattr(t, "is_alive", lambda: True)()):
+                        live_same.append((iid, t))
+            if explicit_iid is not None:
+                match = [t for iid, t in live_same if iid == explicit_iid]
+                if match:
+                    existing = match[0]
+                    if existing.status == "paused":
+                        if getattr(existing, "_manual_only_pause", False):
+                            return {
+                                "error": (
+                                    f"Worker '{self.worker_name}' instance "
+                                    f"{explicit_iid} is paused (manual-only) "
+                                    "and will not be auto-resumed by a query; "
+                                    "resume it explicitly with the 'resume' action."
+                                ),
+                                "status": "paused",
+                            }
+                        # Paused worker — auto-resume and re-route the new query.
+                        resume_paused_worker = existing
+                    else:
+                        return {
+                            "error": (
+                                f"Worker '{self.worker_name}' instance "
+                                f"{explicit_iid} is already running"
+                            ),
+                            "status": existing.status,
+                        }
                 else:
-                    return {
-                        "error": f"Worker '{self.worker_name}' is already running",
-                        "status": existing.status,
-                    }
+                    spawn_iid = explicit_iid
+            else:
+                if len(live_same) == 1 and live_same[0][1].status == "paused":
+                    if getattr(live_same[0][1], "_manual_only_pause", False):
+                        return {
+                            "error": (
+                                f"Worker '{self.worker_name}' is paused "
+                                "(manual-only) and will not be auto-resumed by "
+                                "a query; resume it explicitly with the "
+                                "'resume' action."
+                            ),
+                            "status": "paused",
+                        }
+                    resume_paused_worker = live_same[0][1]
+                else:
+                    spawn_iid = max([iid for iid, _ in live_same], default=0) + 1
 
         if resume_paused_worker is not None:
             # Resume the paused worker and send the new query.
@@ -3245,6 +3441,8 @@ class Worker(ToolBase):
                 parsed = {"response": str(parsed)}
             parsed.setdefault("worker_name", self.worker_name)
             parsed.setdefault("spawned", True)
+            parsed.setdefault("instance_id", resume_paused_worker.instance_id)
+            parsed.setdefault("instance_label", resume_paused_worker.instance_label)
             elapsed = resume_paused_worker._last_elapsed()
             if elapsed is not None:
                 parsed["elapsed_seconds"] = round(elapsed, 1)
@@ -3399,6 +3597,7 @@ class Worker(ToolBase):
             project_root=project_root,
             timeout_seconds=effective_timeout,
             session_id=self.session_id,
+            instance_id=spawn_iid,
             container_manager=container_manager,
         )
 
@@ -3432,19 +3631,22 @@ class Worker(ToolBase):
         # another thread may have spawned the same worker between the early
         # check (above) and this registration point.
         with _registry_lock:
-            existing = _worker_registry.get((session_key, self.worker_name))
+            existing = _worker_registry.get((session_key, self.worker_name, spawn_iid))
             if existing is not None and existing.is_alive():
                 # Another thread won the race — don't overwrite.
                 return {
-                    "error": f"Worker '{self.worker_name}' is already running",
+                    "error": (
+                        f"Worker '{self.worker_name}' instance {spawn_iid} "
+                        f"is already running"
+                    ),
                     "status": existing.status,
                 }
             # Re-check the spawn cap under the lock (TOCTOU guard): another
             # spawn may have registered between the early cap check and here.
             live_now = sum(
                 1
-                for (sid, _name), t in _worker_registry.items()
-                if sid == session_key and t.is_alive()
+                for key, t in _worker_registry.items()
+                if key[0] == session_key and t.is_alive()
             )
             if live_now >= max_workers:
                 return {
@@ -3456,7 +3658,7 @@ class Worker(ToolBase):
                     "max_workers": max_workers,
                     "live_workers": live_now,
                 }
-            _worker_registry[(session_key, self.worker_name)] = thread
+            _worker_registry[(session_key, self.worker_name, spawn_iid)] = thread
 
         thread.start()
 
@@ -3496,6 +3698,8 @@ class Worker(ToolBase):
                 parsed = {"response": str(parsed)}
             parsed.setdefault("worker_name", self.worker_name)
             parsed.setdefault("spawned", True)
+            parsed.setdefault("instance_id", thread.instance_id)
+            parsed.setdefault("instance_label", thread.instance_label)
             elapsed = thread._last_elapsed()
             if elapsed is not None:
                 parsed["elapsed_seconds"] = round(elapsed, 1)
@@ -3504,6 +3708,8 @@ class Worker(ToolBase):
             # No auto-query — return immediately; worker stays alive
             return {
                 "worker_name": self.worker_name,
+                "instance_id": thread.instance_id,
+                "instance_label": thread.instance_label,
                 "spawned": True,
                 "status": "ready",
             }
@@ -3527,19 +3733,28 @@ class Worker(ToolBase):
             return (None, False)
 
     def _action_check(self, workers: list) -> dict:
-        """Check on a specific worker by name.
+        """Check on a specific worker by name (+ optional instance_id).
 
-        First tries the current session; if not found, searches across all
-        sessions and reports any foreign-session instances found.
+        Resolves live instances for the current session first; when no
+        instance_id is given and none are live here, falls back to searching
+        across all sessions and reports any foreign-session instances found.
+        Name-only lookups against multiple live instances require an explicit
+        instance_id.
         """
         session_key = self.session_id or _NO_SESSION_KEY
         _get_worker_lifecycle_observer()  # best-effort: ensure observer subscription
-        with _registry_lock:
-            thread = _worker_registry.get((session_key, self.worker_name))
-
-        if thread is None:
-            # Not found in current session → search across all sessions
-            all_instances = self._find_all_worker_threads(self.worker_name)
+        try:
+            thread, sid, iid = _resolve_worker_thread(
+                self.worker_name,
+                instance_id=self.instance_id,
+                session_id=session_key,
+            )
+        except _WorkerAmbiguityError as exc:
+            msg = str(exc)
+            all_instances = []
+            if self.instance_id is None and "is not running" in msg:
+                # Not found in current session → search across all sessions
+                all_instances = self._find_all_worker_threads(self.worker_name)
             if all_instances:
                 # Found in another session — report with note
                 if len(all_instances) == 1:
@@ -3572,6 +3787,14 @@ class Worker(ToolBase):
                     "count": len(instances),
                 }
 
+            if "ambiguous" in msg:
+                # Name maps to multiple live instances in this session — the
+                # caller must pass an explicit instance_id.
+                return {
+                    "error": msg,
+                    "worker_name": self.worker_name,
+                }
+
             # No instances found anywhere — report as stopped
             entry = self._find_worker(workers, self.worker_name)
             if entry:
@@ -3589,11 +3812,13 @@ class Worker(ToolBase):
         age, stale = self._heartbeat_summary(thread.last_heartbeat)
         return {
             "worker_name": self.worker_name,
+            "instance_id": iid,
+            "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
             "status": thread.status,
             "current_task": thread.current_task,
             "last_heartbeat": thread.last_heartbeat,
             "error": thread.error,
-            "session_id": thread.session_id,
+            "session_id": sid,
             "current_context_tokens": thread.get_current_context_tokens(),
             "max_context_tokens": thread.max_context_tokens,
             "alive": thread.is_alive(),
@@ -3604,14 +3829,16 @@ class Worker(ToolBase):
 
     def _action_query(self, workers: list) -> dict:
         """Query a worker and wait for a response (synchronous, blocking)."""
-        session_key = self.session_id or _NO_SESSION_KEY
-        with _registry_lock:
-            thread = _worker_registry.get((session_key, self.worker_name))
-
-        if thread is None:
+        try:
+            thread, _sid, iid = _resolve_worker_thread(
+                self.worker_name,
+                instance_id=self.instance_id,
+                session_id=self.session_id or _NO_SESSION_KEY,
+            )
+        except _WorkerAmbiguityError as exc:
             return {
-                "error": f"Worker '{self.worker_name}' is not running. "
-                          f"Use 'spawn' first.",
+                "error": str(exc),
+                "worker_name": self.worker_name,
             }
 
         if not thread.is_alive():
@@ -3633,6 +3860,8 @@ class Worker(ToolBase):
             elapsed = thread._last_elapsed()
             result = {
                 "worker_name": self.worker_name,
+                "instance_id": iid,
+                "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
                 "response": response,
                 "elapsed_seconds": round(elapsed, 1) if elapsed is not None else None,
             }
@@ -3706,10 +3935,14 @@ class Worker(ToolBase):
         the job registry.
         """
         session_key = self.session_id or _NO_SESSION_KEY
-        with _registry_lock:
-            thread = _worker_registry.get((session_key, self.worker_name))
-        if thread is None:
-            return {"error": f"Worker '{self.worker_name}' is not running. Use 'spawn' first."}
+        try:
+            thread, _sid, iid = _resolve_worker_thread(
+                self.worker_name,
+                instance_id=self.instance_id,
+                session_id=session_key,
+            )
+        except _WorkerAmbiguityError as exc:
+            return {"error": str(exc), "worker_name": self.worker_name}
         if not thread.is_alive():
             return {
                 "error": f"Worker '{self.worker_name}' is no longer alive (status: {thread.status}).",
@@ -3726,11 +3959,18 @@ class Worker(ToolBase):
         registry = _get_worker_job_registry()
         if registry is not None:
             try:
-                registry.register(job_id, self.worker_name, self.session_id or "")
+                registry.register(
+                    job_id,
+                    self.worker_name,
+                    self.session_id or "",
+                    instance_id=iid,
+                )
             except Exception:
                 pass
         return {
             "worker_name": self.worker_name,
+            "instance_id": iid,
+            "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
             "job_id": job_id,
             "status": "submitted",
             "note": "Query submitted (non-blocking). Progress/completion arrive via "
@@ -3768,9 +4008,254 @@ class Worker(ToolBase):
                 "has_result": r.get("result") is not None,
                 "preview": r.get("preview", ""),
             }
-            for r in registry.jobs(worker_name=self.worker_name or None)
+            for r in registry.jobs(
+                worker_name=self.worker_name or None,
+                instance_id=self.instance_id,
+            )
         ]
         return {"worker_name": self.worker_name, "jobs": jobs, "count": len(jobs)}
+
+    def _action_join(self, workers: list) -> dict:
+        """Block until a submitted job reaches a terminal state (Phase 2B).
+
+        Shared handler for both the ``join`` and ``wait_for_job`` actions.
+        ``worker_query`` carries the job_id (same convention as ``job_status``).
+        Polls the job registry in 0.25s slices for a total of ``timeout_seconds``
+        (default 60, hard cap 300). Returns early on: job terminal state
+        (completed / timeout / error), a partial result (status ``partial_result``
+        + preview), the worker thread pausing (``status == 'paused'``), a stop
+        signal (stop_event set / status stopping / stopped), or thread death.
+        """
+        _JOB_TERMINAL = ("completed", "timeout", "error")
+        job_id = (self.worker_query or "").strip()
+        if not job_id:
+            return {
+                "error": "worker_query is required for action 'join' (pass the job_id)",
+                "worker_name": self.worker_name,
+            }
+        try:
+            thread, _sid, iid = _resolve_worker_thread(
+                self.worker_name,
+                instance_id=self.instance_id,
+                session_id=self.session_id or _NO_SESSION_KEY,
+            )
+        except _WorkerAmbiguityError as exc:
+            return {"error": str(exc), "worker_name": self.worker_name}
+        registry = _get_worker_job_registry()
+        if registry is None:
+            return {"error": "Worker job registry unavailable", "worker_name": self.worker_name}
+        rec = registry.job(job_id)
+        if rec is None:
+            return {
+                "error": "Job not found",
+                "job_id": job_id,
+                "worker_name": self.worker_name,
+            }
+        total = min(int(self.timeout_seconds or 60), 300)
+        deadline = time.monotonic() + total
+        last_status = rec.get("status")
+        while True:
+            rec = registry.job(job_id)
+            status = rec.get("status") if rec is not None else None
+            if status is not None:
+                last_status = status
+            if rec is not None and status in _JOB_TERMINAL:
+                out = {
+                    "worker_name": self.worker_name,
+                    "instance_id": iid,
+                    "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
+                    "job_id": job_id,
+                    "status": status,
+                    "preview": rec.get("preview", ""),
+                    "has_result": rec.get("result") is not None,
+                    "completed_at": rec.get("completed_at"),
+                }
+                if rec.get("result") is not None:
+                    out["result"] = rec.get("result")
+                return out
+            if rec is not None and status == "partial" and rec.get("preview"):
+                return {
+                    "worker_name": self.worker_name,
+                    "instance_id": iid,
+                    "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
+                    "job_id": job_id,
+                    "status": "partial_result",
+                    "preview": rec.get("preview"),
+                }
+            # Session main-pause (UNIT C): the main agent is paused, so a
+            # blocking wait is pointless — return paused promptly. Pause
+            # propagates INTO join waits this way.
+            if self.session_id and self.session_id in _SESSION_MAIN_PAUSED:
+                return {
+                    "worker_name": self.worker_name,
+                    "instance_id": iid,
+                    "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
+                    "job_id": job_id,
+                    "status": "paused",
+                    "note": "Session main agent is paused; job remains pending.",
+                }
+            # Worker-side wake conditions.
+            if getattr(thread, "status", None) == "paused":
+                return {
+                    "worker_name": self.worker_name,
+                    "instance_id": iid,
+                    "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
+                    "job_id": job_id,
+                    "status": "paused",
+                    "note": "Worker is paused; job remains pending.",
+                }
+            stop_event = getattr(thread, "_stop_event", None)
+            if (stop_event is not None and stop_event.is_set()) or \
+                    getattr(thread, "status", None) in ("stopping", "stopped"):
+                return {
+                    "worker_name": self.worker_name,
+                    "instance_id": iid,
+                    "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
+                    "job_id": job_id,
+                    "status": "stopped",
+                    "note": "Worker is stopping/stopped; job did not reach a terminal state.",
+                }
+            if not thread.is_alive():
+                return {
+                    "worker_name": self.worker_name,
+                    "instance_id": iid,
+                    "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
+                    "job_id": job_id,
+                    "status": "stopped",
+                    "note": "Worker thread is no longer alive; job did not reach a terminal state.",
+                }
+            if time.monotonic() >= deadline:
+                return {
+                    "worker_name": self.worker_name,
+                    "instance_id": iid,
+                    "instance_label": _WorkerRegistry.instance_label(self.worker_name, iid),
+                    "job_id": job_id,
+                    "status": "timeout",
+                    "note": f"Timed out after {total}s waiting for job; last known status: {last_status}.",
+                }
+            time.sleep(0.25)
+
+    def _action_pause(self, workers: list) -> dict:
+        """Pause the session's main agent and/or its workers (UNIT C, v2).
+
+        Cooperative only: workers pause at their next safe loop boundary
+        (``WorkerThread.pause()`` sets the pause event; the thread flips its own
+        ``status`` to ``'paused'``). No thread is killed; a paused idle worker
+        stays alive until explicitly stopped or resumed.
+
+        ``worker_query`` is a comma/space-separated mode string:
+          - (empty) or ``main`` \u2192 pause the main agent only. Async workers
+            keep running; ``join``/``wait_for_job`` return
+            ``{"status": "paused"}`` while the main agent is paused.
+          - ``all`` \u2192 also cooperatively pause every live worker of this
+            session (Pause All).
+          - ``manual_only`` \u2192 the workers paused by this call are marked
+            manual-only: a later query will NOT auto-resume them; they must be
+            resumed explicitly with the ``resume`` action.
+        When ``worker_name`` is set, only that worker is paused (the session
+        main agent is not paused unless ``main`` is also present).
+        """
+        session_key = self.session_id or _NO_SESSION_KEY
+        spec = (self.worker_query or "").strip().lower()
+        tokens = {t for t in spec.replace(",", " ").split() if t}
+        want_all = "all" in tokens
+        want_main = (not tokens) or ("main" in tokens)
+        manual_only = "manual_only" in tokens
+        if self.worker_name:
+            want_all = True
+            want_main = False
+        if want_main:
+            _SESSION_MAIN_PAUSED.add(session_key)
+        paused_workers = []
+        with _registry_lock:
+            for key, thread in list(_worker_registry.items()):
+                if key[0] != session_key:
+                    continue
+                if self.worker_name is not None and key[1] != self.worker_name:
+                    continue
+                alive = bool(getattr(thread, "is_alive", lambda: True)())
+                if not alive:
+                    continue
+                if not want_all:
+                    continue
+                try:
+                    thread.pause()
+                except Exception:
+                    pass
+                if manual_only:
+                    try:
+                        thread._manual_only_pause = True
+                    except Exception:
+                        pass
+                paused_workers.append({
+                    "worker_name": key[1],
+                    "instance_id": key[2] if len(key) >= 3 else 1,
+                })
+        if want_main and not want_all:
+            note = "Main agent paused; async workers continue."
+        elif want_all:
+            note = "Main agent and session workers paused (cooperative)."
+        else:
+            note = "Requested worker(s) paused."
+        return {
+            "status": "paused",
+            "session_id": self.session_id,
+            "scope": "all" if want_all else "main",
+            "main_agent_paused": want_main,
+            "manual_only": manual_only,
+            "workers_paused": paused_workers,
+            "note": note,
+        }
+
+    def _action_resume(self, workers: list) -> dict:
+        """Resume a session main-agent and/or worker pause (UNIT C, v2).
+
+        Mirrors ``_action_pause``: clears the session from the main-pause set
+        and (with ``all`` in ``worker_query`` or a ``worker_name``) resumes the
+        matching paused workers cooperatively via ``WorkerThread.resume()``,
+        clearing their manual-only marker.
+        """
+        session_key = self.session_id or _NO_SESSION_KEY
+        spec = (self.worker_query or "").strip().lower()
+        tokens = {t for t in spec.replace(",", " ").split() if t}
+        want_all = "all" in tokens
+        want_main = (not tokens) or ("main" in tokens)
+        if self.worker_name:
+            want_all = True
+            want_main = False
+        if want_main:
+            _SESSION_MAIN_PAUSED.discard(session_key)
+        resumed_workers = []
+        with _registry_lock:
+            for key, thread in list(_worker_registry.items()):
+                if key[0] != session_key:
+                    continue
+                if self.worker_name is not None and key[1] != self.worker_name:
+                    continue
+                if getattr(thread, "status", None) != "paused":
+                    continue
+                if not want_all:
+                    continue
+                try:
+                    thread.resume()
+                except Exception:
+                    pass
+                try:
+                    thread._manual_only_pause = False
+                except Exception:
+                    pass
+                resumed_workers.append({
+                    "worker_name": key[1],
+                    "instance_id": key[2] if len(key) >= 3 else 1,
+                })
+        return {
+            "status": "resumed",
+            "session_id": self.session_id,
+            "scope": "all" if want_all else "main",
+            "main_agent_paused": want_main and session_key in _SESSION_MAIN_PAUSED,
+            "workers_resumed": resumed_workers,
+            "note": "Main agent resumed." if want_main else "Requested worker(s) resumed.",
+        }
 
     def _action_stop(self, workers: list) -> dict:
         """Stop a running worker and persist its context.
@@ -3779,12 +4264,25 @@ class Worker(ToolBase):
         sessions and stops any matching instances.
         """
         session_key = self.session_id or _NO_SESSION_KEY
-        with _registry_lock:
-            thread = _worker_registry.get((session_key, self.worker_name))
-
-        # ── Not found in current session → search across all sessions ──
-        if thread is None:
-            all_instances = self._find_all_worker_threads(self.worker_name)
+        try:
+            thread, sid, iid = _resolve_worker_thread(
+                self.worker_name,
+                instance_id=self.instance_id,
+                session_id=session_key,
+            )
+        except _WorkerAmbiguityError as exc:
+            msg = str(exc)
+            all_instances = []
+            if self.instance_id is None and "is not running" in msg:
+                # ── Not found in current session → search across all sessions ──
+                all_instances = self._find_all_worker_threads(self.worker_name)
+            if "ambiguous" in msg:
+                # Name maps to multiple live instances — the caller must pass
+                # an explicit instance_id to disambiguate.
+                return {
+                    "error": msg,
+                    "worker_name": self.worker_name,
+                }
             if not all_instances:
                 # No instances anywhere — report as not running
                 entry = self._find_worker(workers, self.worker_name)
@@ -3827,7 +4325,13 @@ class Worker(ToolBase):
                     t._save_context()
                     t._cleanup_worker_containers()
                     with _registry_lock:
-                        _worker_registry.pop((sid, self.worker_name), None)
+                        for key, existing_t in list(_worker_registry.items()):
+                            if (
+                                key[0] == sid
+                                and key[1] == self.worker_name
+                                and existing_t is t
+                            ):
+                                _worker_registry.pop(key, None)
                     if t.status not in [s.get("status") for s in stopped_info]:
                         stopped_info.append({"session_id": sid, "status": t.status})
 
@@ -3844,7 +4348,7 @@ class Worker(ToolBase):
         # ── Found in current session ──
         if not thread.is_alive():
             with _registry_lock:
-                _worker_registry.pop((session_key, self.worker_name), None)
+                _worker_registry.pop((sid, self.worker_name, iid), None)
             if thread._worker_ctx is not None:
                 thread._worker_ctx.compact_after_summary()
             thread._save_context()
@@ -3898,7 +4402,7 @@ class Worker(ToolBase):
                 thread.status = "stopped"
                 thread._write_status_file()
             with _registry_lock:
-                _worker_registry.pop((session_key, self.worker_name), None)
+                _worker_registry.pop((sid, self.worker_name, iid), None)
 
         return {
             "worker_name": self.worker_name,
