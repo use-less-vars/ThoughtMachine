@@ -78,6 +78,9 @@ SPAWN_QUEUE_TIMEOUT = 600
 # and removed from the registry before the cap check runs.
 MAX_WORKERS_PER_SESSION = 5
 
+# Registry key fallback used when a worker is spawned without a session_id.
+_NO_SESSION_KEY = "<no-session>"
+
 # ── Worker heartbeat / liveness (Phase 2A) ──
 # Workers publish WORKER_HEARTBEAT events to the global bus while idle,
 # paused, and busy. HEARTBEAT_INTERVAL_S throttles publication; a worker is
@@ -85,6 +88,16 @@ MAX_WORKERS_PER_SESSION = 5
 # HEARTBEAT_STALE_AFTER_S.
 HEARTBEAT_INTERVAL_S = 30
 HEARTBEAT_STALE_AFTER_S = 600
+
+# ── Per-worker resource budgets (Phase 3, item 6) ───────────────────────────
+# Containers: a worker may keep at most this many containers active at once.
+# The default (4) aligns with infra.container_registry.DEFAULT_MAX_CONTAINERS
+# and the container_manager default.  Token and runtime budgets default to
+# None (unlimited) so existing behaviour is unchanged unless a session config
+# sets ``max_token_usage`` / ``max_runtime_s``.
+WORKER_DEFAULT_MAX_CONTAINERS = 4
+WORKER_DEFAULT_MAX_TOKENS: Optional[int] = None
+WORKER_DEFAULT_MAX_RUNTIME_S: Optional[float] = None
 
 # ---------------------------------------------------------------------------
 # Optional dependencies
@@ -143,6 +156,40 @@ except ImportError:
     GATE_AVAILABLE = False
     check_required_categories = None  # type: ignore
 
+# Fail-closed default levels for permission categories a session profile does
+# not explicitly expose.  Used by _restrictive_merge() so a worker can never
+# fill in a missing category with its own (potentially permissive) footprint
+# value.  Imported LAZILY (not at module import time): a module-level
+# ``from thoughtmachine.security import SAFE_DEFAULTS`` triggered
+# thoughtmachine/security.py's try/except ImportError during pytest
+# collection — while agent.events was mid-load — permanently pinning its
+# EventType to None and breaking security-prompt tests later in the session.
+_SAFE_DEFAULTS_CACHE: Optional[Dict[str, Any]] = None
+
+
+def _load_safe_defaults() -> Dict[str, Any]:
+    """Return the fail-closed SAFE_DEFAULTS map, importing it lazily.
+
+    Cached after the first successful import so the cost is paid once.
+    Falls back to an empty dict (with a warning) if thoughtmachine.security
+    is unavailable; callers then resolve missing categories to ``None``.
+    """
+    global _SAFE_DEFAULTS_CACHE
+    if _SAFE_DEFAULTS_CACHE is None:
+        try:
+            from thoughtmachine.security import SAFE_DEFAULTS
+
+            _SAFE_DEFAULTS_CACHE = SAFE_DEFAULTS
+        except ImportError:
+            log(
+                "WARN",
+                "worker.permissions",
+                "thoughtmachine.security unavailable; "
+                "worker safe-defaults fall back to an empty dict",
+            )
+            _SAFE_DEFAULTS_CACHE = {}
+    return _SAFE_DEFAULTS_CACHE
+
 # NullEventBus — used for worker security prompts where no interactive
 # user is available to respond (returns "deny" instantly).
 try:
@@ -168,6 +215,32 @@ try:
 except ImportError:
     WorkerLifecycleObserver = None  # type: ignore
 
+
+def _on_worker_stale(worker_name: str, info: dict) -> None:
+    """Best-effort callback invoked when the observer flags a hung worker.
+
+    Looks up the worker thread in the module-level registry and terminates its
+    in-flight executions so the supervisor can reclaim the worker. Deliberately
+    never raises: this is invoked from the lifecycle observer's event path and
+    must not break it. Registry globals (``_registry_lock`` / ``_worker_registry``)
+    are assigned later in this module, so they are resolved at call time.
+    """
+    try:
+        session_id = info.get("session_id") or ""
+        with _registry_lock:
+            thread = _worker_registry.get((session_id, worker_name))
+            if thread is None:
+                thread = _worker_registry.get((_NO_SESSION_KEY, worker_name))
+        if thread is None:
+            return
+        wlm = getattr(thread, "_wlm", None)
+        if wlm is None:
+            return
+        wlm.terminate_executions()
+    except Exception:
+        pass
+
+
 _WORKER_LIFECYCLE_OBSERVER = None
 
 
@@ -182,12 +255,43 @@ def _get_worker_lifecycle_observer():
     if WorkerLifecycleObserver is None:
         return None
     if _WORKER_LIFECYCLE_OBSERVER is None:
-        _WORKER_LIFECYCLE_OBSERVER = WorkerLifecycleObserver()
+        _WORKER_LIFECYCLE_OBSERVER = WorkerLifecycleObserver(
+            stale_callback=_on_worker_stale
+        )
         try:
             _WORKER_LIFECYCLE_OBSERVER.ensure_subscribed()
         except Exception:
             pass
     return _WORKER_LIFECYCLE_OBSERVER
+
+
+# Optional: WorkerJobRegistry (Phase 2B) — imported lazily so worker.py stays
+# importable without tools.workspace.job_registry (stdlib + agent.events only).
+try:
+    from tools.workspace.job_registry import WorkerJobRegistry
+except ImportError:
+    WorkerJobRegistry = None  # type: ignore
+
+_WORKER_JOB_REGISTRY = None
+
+
+def _get_worker_job_registry():
+    """Return the module-level WorkerJobRegistry singleton (best-effort).
+
+    Creates and subscribes it on first use. Returns None when the registry
+    module or the event bus is unavailable, so callers can safely ignore the
+    result.
+    """
+    global _WORKER_JOB_REGISTRY
+    if WorkerJobRegistry is None:
+        return None
+    if _WORKER_JOB_REGISTRY is None:
+        _WORKER_JOB_REGISTRY = WorkerJobRegistry()
+        try:
+            _WORKER_JOB_REGISTRY.ensure_subscribed()
+        except Exception:
+            pass
+    return _WORKER_JOB_REGISTRY
 
 
 def _publish_global_worker_event(event_type, data: dict) -> None:
@@ -482,8 +586,11 @@ logger = logging.getLogger(__name__)
 
 # Hard blocklist: tools that workers must NEVER use, regardless of permissions.
 # NOTE: container tools (DockerCodeRunner, ContainerStartTool, ContainerExecTool,
-# etc.) ARE allowed for workers — they are gated by session permissions/footprint
-# like any other tool, not hard-blocked. Only the tools below are hard-blocked
+# etc.) ARE allowed for workers — they are permission-gated like any other tool,
+# NOT hard-blocked: DockerCodeRunner requires filesystem:write + container:true
+# (docker_code_runner.py:56) and the ToolExecutor enforces those categories via
+# check_required_categories, so a worker can only reach them when its effective
+# (session × footprint) profile allows it. Only the tools below are hard-blocked
 # (recursion, MCP server management, system/infrastructure discovery, persistent
 # knowledge store). This is defense-in-depth: the blocklist is enforced at two
 # separate points (enabled_tools filtering and tool class resolution).
@@ -505,6 +612,13 @@ DEFAULT_WORKER_SYSTEM_PROMPT = (
     "Be concise but complete. "
     "Do not ask the user for clarification — the main agent already understood the request."
 )
+
+# Worker LLM sampling defaults (used when the worker definition does not
+# specify a value).  These are worker-scoped: the main agent's sampling
+# settings are never inherited.
+WORKER_DEFAULT_TEMPERATURE = 0.7
+WORKER_DEFAULT_MAX_TOKENS: Optional[int] = None
+WORKER_DEFAULT_TRUNCATION: Optional[int] = None
 
 # Global tool name → class registry (built lazily to avoid circular import
 # with tools.__init__ — that module imports this file (Worker) before
@@ -608,7 +722,10 @@ def _restrictive_merge(
         w_val = worker_perms.get(key)
 
         if s_val is None:
-            result[key] = w_val  # worker fills in
+            # Fail-closed: the session does not expose this category, so the
+            # worker may NOT fill it in with its own (potentially permissive)
+            # footprint value.  Resolve to the safe-default level instead.
+            result[key] = _load_safe_defaults().get(key)
         elif w_val is None:
             result[key] = s_val  # session provides
         elif isinstance(s_val, bool) or isinstance(w_val, bool):
@@ -701,6 +818,10 @@ class WorkerThread(threading.Thread):
         timeout_seconds: Optional[int] = None,
         session_id: Optional[str] = None,
         container_manager: Optional[Any] = None,
+        *,
+        max_container_count: Optional[int] = None,
+        max_token_usage: Optional[int] = None,
+        max_runtime_s: Optional[float] = None,
     ) -> None:
         super().__init__(daemon=True, name=f"worker-{name}")
         self.worker_name = name
@@ -740,6 +861,47 @@ class WorkerThread(threading.Thread):
             if timeout_seconds is not None
             else _def_timeout
         )
+
+        # Per-worker resource budgets (Phase 3, item 6).  Resolution order:
+        # explicit constructor param → session_config (the nested
+        # ``agent_config["session_config"]`` dict) → module defaults
+        # (containers=4, tokens/runtime=unlimited).
+        _session_cfg = (agent_config or {}).get("session_config") or {}
+        if not isinstance(_session_cfg, dict):
+            _session_cfg = {}
+
+        self._max_container_count: int = WORKER_DEFAULT_MAX_CONTAINERS
+        if max_container_count is not None:
+            self._max_container_count = max_container_count
+        else:
+            _limits = _session_cfg.get("container_limits")
+            if isinstance(_limits, dict) and _limits.get("max_containers") is not None:
+                try:
+                    self._max_container_count = max(1, int(_limits["max_containers"]))
+                except (TypeError, ValueError):
+                    self._max_container_count = WORKER_DEFAULT_MAX_CONTAINERS
+
+        self._max_token_usage: Optional[int] = WORKER_DEFAULT_MAX_TOKENS
+        if max_token_usage is not None:
+            self._max_token_usage = max_token_usage
+        elif _session_cfg.get("max_token_usage") is not None:
+            try:
+                self._max_token_usage = int(_session_cfg["max_token_usage"])
+            except (TypeError, ValueError):
+                self._max_token_usage = WORKER_DEFAULT_MAX_TOKENS
+
+        self._max_runtime_s: Optional[float] = WORKER_DEFAULT_MAX_RUNTIME_S
+        if max_runtime_s is not None:
+            self._max_runtime_s = max_runtime_s
+        elif _session_cfg.get("max_runtime_s") is not None:
+            try:
+                self._max_runtime_s = float(_session_cfg["max_runtime_s"])
+            except (TypeError, ValueError):
+                self._max_runtime_s = WORKER_DEFAULT_MAX_RUNTIME_S
+
+        # Monotonic start of this worker's lifetime; the runtime budget is
+        # measured against it (per-worker lifetime, not per-query).
+        self._budget_started_at: float = time.monotonic()
 
         # Runtime state
         self.status: str = "ready"      # ready | busy | paused | completed | error | stopping | stopped
@@ -786,6 +948,11 @@ class WorkerThread(threading.Thread):
         # WLM query id of the last attempt — persisted alongside the F1 markers
         # so a WLM-enabled force-respawn can prune abandoned attempts exactly.
         self._last_query_id: Optional[str] = None
+        # Cumulative count of stale/abandoned attempt prunes performed by this
+        # worker (F1 + WLM prune paths). Persisted in context.json so it
+        # survives restarts; exposed via GET /api/workspace/{ws_id}/workers
+        # as ``pruned_since_last_query``.
+        self._pruned_since_last_query: int = 0
 
         # Agent instance + WorkerContext (created lazily in run())
         self._agent: Optional[Any] = None
@@ -878,6 +1045,29 @@ class WorkerThread(threading.Thread):
             return self._worker_ctx.estimated_context_tokens()
         return 0
 
+    def _budget_check(self) -> Optional[Dict[str, str]]:
+        """Return a fail-closed error payload when a per-worker budget is exceeded.
+
+        Checks the runtime budget first (monotonic elapsed time vs
+        ``_max_runtime_s``), then the current context-token count vs
+        ``_max_token_usage``. Returns ``None`` while both budgets are within
+        limits (or unset). Never raises.
+        """
+        if self._max_runtime_s is not None:
+            if time.monotonic() - self._budget_started_at > self._max_runtime_s:
+                return {
+                    "error": f"Worker runtime budget exceeded ({self._max_runtime_s}s)",
+                    "reason": "runtime_budget",
+                }
+        if self._max_token_usage is not None:
+            current = self.get_current_context_tokens()
+            if current > self._max_token_usage:
+                return {
+                    "error": f"Worker token budget exceeded ({current} > {self._max_token_usage})",
+                    "reason": "token_budget",
+                }
+        return None
+
     @staticmethod
     def _drain_queue(q: queue.Queue) -> None:
         """Discard everything currently queued on ``q`` (get_nowait to empty)."""
@@ -937,6 +1127,8 @@ class WorkerThread(threading.Thread):
                 "reason": "query_timeout",
                 "timeout_seconds": timeout,
                 "last_heartbeat": self.last_heartbeat,
+                **({"query_id": self._current_query_id}
+                   if self._current_query_id is not None else {}),
             })
             raise
         if used:
@@ -992,6 +1184,8 @@ class WorkerThread(threading.Thread):
                     "reason": "query_timeout",
                     "timeout_seconds": timeout,
                     "last_heartbeat": self.last_heartbeat,
+                    **({"query_id": self._current_query_id}
+                       if self._current_query_id is not None else {}),
                 })
                 raise TimeoutError(
                     f"Worker '{self.worker_name}' did not respond within {timeout}s{detail}"
@@ -1025,6 +1219,9 @@ class WorkerThread(threading.Thread):
             feature_flag_check=lambda: True,
             session_id=self.session_id,
             permissions_provider=lambda: self._session_permissions,
+            max_container_count=getattr(
+                self, "_max_container_count", WORKER_DEFAULT_MAX_CONTAINERS
+            ),
         )
 
         def _wlm_handler(query, query_id):
@@ -1181,7 +1378,8 @@ class WorkerThread(threading.Thread):
 
         The worker inherits all fields from the parent (ToolExecutor-injected)
         config dict, then overrides only worker-specific settings
-        (system_prompt, enabled_tools, max_turns, timeout_seconds, stop_check).
+        (system_prompt, temperature, enabled_tools, max_turns,
+        timeout_seconds, stop_check).
 
         Also injects ``session_permissions`` so that tools running inside
         the worker use the same security policy as the parent agent.
@@ -1212,9 +1410,24 @@ class WorkerThread(threading.Thread):
         worker_cfg["provider_type"] = worker_cfg.pop("provider")
 
         # ── Worker-specific overrides ──────────────────────────────────
+        # The worker NEVER inherits the main agent's system_prompt or sampling
+        # settings: every sampling-relevant field below is resolved from the
+        # worker definition (or its own worker defaults), so spawning cannot
+        # leak main-agent settings into a worker agent.
         worker_cfg["system_prompt"] = self.definition.get(
             "system_prompt",
             DEFAULT_WORKER_SYSTEM_PROMPT,
+        )
+        # Temperature is worker-scoped: the worker definition wins, else the
+        # worker default (0.7) — the main agent's temperature is never
+        # inherited.  max_tokens / truncation_limit live on the worker
+        # definition schema only (None = worker default); AgentConfig has no
+        # such fields, so they are intentionally NOT injected into the cfg
+        # (Pydantic's extra='ignore' would silently drop them anyway).
+        worker_cfg["temperature"] = (
+            self.definition.get("temperature")
+            if self.definition.get("temperature") is not None
+            else WORKER_DEFAULT_TEMPERATURE
         )
         worker_tools = self.definition.get("tools", [])
         parent_enabled_tools = cfg.get("enabled_tools")
@@ -1354,6 +1567,24 @@ class WorkerThread(threading.Thread):
                                 # Fix 1.1B: Poll for stop command on every event
                 self._poll_command()
 
+                # Per-worker resource budgets (Phase 3, item 6): fail closed.
+                budget_payload = self._budget_check()
+                if budget_payload is not None:
+                    self.error = budget_payload["error"]
+                    final_content = json.dumps(budget_payload)
+                    self._publish_event("worker_error", {
+                        "error": budget_payload["error"],
+                        "reason": budget_payload["reason"],
+                    })
+                    self._publish_global_event(
+                        EventType.WORKER_ERROR if EventType is not None else "worker_error",
+                        {
+                            "error": budget_payload["error"],
+                            "reason": budget_payload["reason"],
+                        },
+                    )
+                    break
+
                 # Log heartbeat for liveliness checks and flush to disk
                 self.last_heartbeat = datetime.now(timezone.utc).isoformat()
                 self._write_status_file()
@@ -1425,6 +1656,28 @@ class WorkerThread(threading.Thread):
                         "meta": event.get("meta"),
                     }
 
+                # Phase 2B: emit WORKER_PARTIAL_RESULT while work is running so
+                # non-blocking callers (submit_query) can stream progress. The
+                # terminal PARTIAL_RESULT publish below covers failed/stopped
+                # attempts; this covers the success path mid-flight. Turn-level
+                # only (agent_responded / partial events with content) — no
+                # per-token spam.
+                if (
+                    self._current_query_id is not None
+                    and event_type in ("agent_responded", "partial", "agent_partial",
+                                       "agent_message", "assistant_message")
+                ):
+                    _partial_content = event.get("content", "")
+                    if _partial_content:
+                        _publish_global_worker_event(EventType.WORKER_PARTIAL_RESULT, {
+                            "worker_name": self.worker_name,
+                            "session_id": self.session_id or "",
+                            "query_id": self._current_query_id,
+                            "status": "running",
+                            "reason": "partial",
+                            "content": str(_partial_content)[:2000],
+                        })
+
                 # Track tool call count
                 if event_type == "tool_call":
                     self._tool_call_count += 1
@@ -1433,11 +1686,32 @@ class WorkerThread(threading.Thread):
                     wlm = getattr(self, "_wlm", None)
                     if self._wlm_flag_enabled() and wlm is not None:
                         try:
+                            _container_id = event.get("container_id")
+                            _exec_id = event.get("exec_id")
+                            _pid = event.get("pid")
+                            # Nested tool payloads (arguments/data/result) may
+                            # carry the execution identifiers instead.
+                            for _key in ("arguments", "data", "result"):
+                                _nested = event.get(_key)
+                                if isinstance(_nested, dict):
+                                    if _container_id is None:
+                                        _container_id = _nested.get("container_id")
+                                    if _exec_id is None:
+                                        _exec_id = _nested.get("exec_id")
+                                    if _pid is None:
+                                        _pid = _nested.get("pid")
+                            _exec_type = (
+                                "container_exec" if (_container_id and _pid) else "subprocess"
+                            )
                             wlm.execution_tracker.register(
                                 worker_id=self.worker_name,
                                 query_id=wlm.current_query_id,
                                 tool_call_id=event.get("tool_call_id"),
                                 tool_name=event.get("name") or event.get("tool_name"),
+                                container_id=_container_id,
+                                exec_id=_exec_id,
+                                pid=_pid,
+                                type=_exec_type,
                             )
                         except Exception as exc:
                             log("WARNING", "tools.worker",
@@ -1639,7 +1913,7 @@ class WorkerThread(threading.Thread):
                 # Load system prompt from definition
                 system_prompt = self.definition.get(
                     "system_prompt",
-                    "You are a helpful worker assistant."
+                    DEFAULT_WORKER_SYSTEM_PROMPT,
                 )
                 user_history = [
                     {"role": "system", "content": system_prompt}
@@ -1809,6 +2083,8 @@ class WorkerThread(threading.Thread):
                     "current_task": self.current_task,
                     "current_context_tokens": self.get_current_context_tokens(),
                     "max_context_tokens": self.max_context_tokens,
+                    **({"query_id": self._current_query_id}
+                       if self._current_query_id is not None else {}),
                 })
                 # ── Reset turn/time state per query ────────────────────────
                 # Each query is an isolated unit — reset turn counter and
@@ -2032,7 +2308,21 @@ class WorkerThread(threading.Thread):
                         "content": str(envelope.get("content", ""))[:2000],
                         "current_context_tokens": self.get_current_context_tokens(),
                         "max_context_tokens": self.max_context_tokens,
+                        **({"query_id": self._current_query_id}
+                           if self._current_query_id is not None else {}),
                     })
+
+                # Phase 2B: record the completed job (best-effort — never
+                # breaks the worker). The registry stores the full envelope so
+                # non-blocking callers (submit_query) can retrieve results via
+                # job_status.
+                if self._current_query_id is not None:
+                    try:
+                        _registry = _get_worker_job_registry()
+                        if _registry is not None:
+                            _registry.complete(self._current_query_id, envelope)
+                    except Exception:
+                        pass
 
                 self._emit_reply(json.dumps(envelope, default=str))
 
@@ -2063,6 +2353,8 @@ class WorkerThread(threading.Thread):
                             "error": str(exc),
                             "current_context_tokens": self.get_current_context_tokens(),
                             "max_context_tokens": self.max_context_tokens,
+                            **({"query_id": self._current_query_id}
+                               if self._current_query_id is not None else {}),
                         },
                         source=f"worker:{self.worker_name}",
                         session_id=self.session_id or "",
@@ -2088,6 +2380,8 @@ class WorkerThread(threading.Thread):
                             "status": final_status,
                             "current_context_tokens": self.get_current_context_tokens(),
                             "max_context_tokens": self.max_context_tokens,
+                            **({"query_id": self._current_query_id}
+                               if self._current_query_id is not None else {}),
                         },
                         source=f"worker:{self.worker_name}",
                         session_id=self.session_id or "",
@@ -2171,6 +2465,12 @@ class WorkerThread(threading.Thread):
                 self._last_query = data.get("last_query")
                 self._last_completed_query = data.get("last_completed_query")
                 self._last_query_id = data.get("last_query_id")
+                try:
+                    self._pruned_since_last_query = int(
+                        data.get("pruned_since_last_query") or 0
+                    )
+                except (TypeError, ValueError):
+                    self._pruned_since_last_query = 0
                 # F2: restore generation; keep the max so this thread's saves
                 # are never rejected against a file it just loaded.
                 try:
@@ -2211,6 +2511,7 @@ class WorkerThread(threading.Thread):
             return
         boundary = ic_indices[-1]
         del history[boundary:]
+        self._pruned_since_last_query += 1
         logger.debug(
             "Pruned incomplete attempt for query %r before merging new context (worker '%s')",
             last_query,
@@ -2261,6 +2562,7 @@ class WorkerThread(threading.Thread):
             return
         boundary = ic_indices[-1]
         del history[boundary:]
+        self._pruned_since_last_query += 1
         logger.debug(
             "Pruned WLM-abandoned attempt (query_id=%s) before merging new context (worker '%s')",
             last_qid,
@@ -2348,6 +2650,7 @@ class WorkerThread(threading.Thread):
             "last_query": self._last_query,
             "last_completed_query": self._last_completed_query,
             "last_query_id": getattr(self, "_last_query_id", None),
+            "pruned_since_last_query": getattr(self, "_pruned_since_last_query", 0),
             "generation": self._generation,
         }
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -2459,10 +2762,13 @@ class Worker(ToolBase):
     required_categories: ClassVar[List[str]] = []
 
     action: str = Field(
-        description="Action: list, spawn, check, query, stop. "
+        description="Action: list, spawn, check, query, stop, submit_query, job_status. "
         "When action='spawn' and context has a 'query' key, the spawn call "
         "BLOCKS until the worker finishes the task and returns the full result. "
-        "Without a 'query' key, spawn returns immediately; use action='query' later."
+        "Without a 'query' key, spawn returns immediately; use action='query' later. "
+        "action='submit_query' enqueues a query and returns immediately with a job_id "
+        "(non-blocking); poll progress with action='job_status' (worker_query = job id, "
+        "or empty to list this worker's jobs)."
     )
 
     worker_name: Optional[str] = Field(
@@ -2473,8 +2779,9 @@ class Worker(ToolBase):
     worker_query: Optional[str] = Field(
         default=None,
         description="Query string to send to an already-spawned worker. "
-        "Only valid with action='query'. The worker processes this and the call "
-        "BLOCKS until the worker responds.",
+        "Only valid with action='query' (the call BLOCKS until the worker responds), "
+        "action='submit_query' (non-blocking; returns a job handle immediately), "
+        "or action='job_status' (job id to look up; empty lists jobs for the worker).",
     )
 
     context: Optional[Union[Dict, str]] = Field(
@@ -2518,7 +2825,7 @@ class Worker(ToolBase):
 
     skip_output_truncation: ClassVar[bool] = True
 
-    VALID_ACTIONS: ClassVar[list[str]] = ["list", "spawn", "check", "query", "stop"]
+    VALID_ACTIONS: ClassVar[list[str]] = ["list", "spawn", "check", "query", "stop", "submit_query", "job_status"]
 
     # ── Pydantic v2 validator: coerce plain string context to {"query": ...} ──
     @field_validator('context', mode='before')
@@ -2538,7 +2845,7 @@ class Worker(ToolBase):
                     "available_actions": self.VALID_ACTIONS,
                 })
 
-            if self.action in ("spawn", "check", "query") and not self.worker_name:
+            if self.action in ("spawn", "check", "query", "submit_query") and not self.worker_name:
                 return json.dumps({
                     "error": f"worker_name is required for action '{self.action}'",
                 })
@@ -2575,6 +2882,8 @@ class Worker(ToolBase):
                 "check": lambda: self._action_check(workers),
                 "query": lambda: self._action_query(workers),
                 "stop": lambda: self._action_stop(workers),
+                "submit_query": lambda: self._action_submit_query(workers),
+                "job_status": lambda: self._action_job_status(workers),
             }[self.action]
 
             result = handler()
@@ -2810,7 +3119,7 @@ class Worker(ToolBase):
 
     def _action_list(self, workers: list) -> dict:
         """Return all known worker definitions plus runtime status."""
-        session_key = self.session_id or ""
+        session_key = self.session_id or _NO_SESSION_KEY
         augmented = []
         for w in workers:
             name = w.get("name", "")
@@ -2877,7 +3186,7 @@ class Worker(ToolBase):
                 )
 
         # Prevent duplicate spawns (session-scoped key)
-        session_key = self.session_id or ""
+        session_key = self.session_id or _NO_SESSION_KEY
         resume_paused_worker = None
         with _registry_lock:
             existing = _worker_registry.get((session_key, self.worker_name))
@@ -2982,6 +3291,26 @@ class Worker(ToolBase):
         missing_tools: list[str] = []
         tool_names = definition.get("tools", [])
         worker_perms = definition.get("permission_footprint") or definition.get("worker_permissions", {})
+        # ── Fail-closed spawn guard ────────────────────────────────────
+        # The worker footprint may only RESTRICT categories the session
+        # explicitly exposes.  A footprint that requests a category absent
+        # from the session profile is rejected outright: the worker can never
+        # grant itself access to a category the session does not expose.
+        session_perms = self.session_permissions or {}
+        denied_categories = sorted(set(worker_perms) - set(session_perms))
+        if denied_categories:
+            return {
+                "error": (
+                    "Cannot create worker: permission footprint requests "
+                    "category/categories not exposed by the session: "
+                    f"{', '.join(denied_categories)} (fail-closed \u2014 workers "
+                    "may only use categories the session explicitly exposes)."
+                ),
+                "worker_name": self.worker_name,
+            }
+        # Effective worker profile: session (ceiling) intersected with the
+        # worker footprint.  Used for spawn-time tool validation below.
+        spawn_effective = _restrictive_merge(session_perms, worker_perms)
         if tool_names:
             for tool_name in tool_names:
                 if tool_name in _WORKER_BLOCKLIST:
@@ -2997,14 +3326,17 @@ class Worker(ToolBase):
                 if tool_cats and GATE_AVAILABLE and check_required_categories is not None:
                     ok, _err = check_required_categories(
                         required=tool_cats,
-                        effective=worker_perms,
+                        effective=spawn_effective,
                         tool_name=tool_name,
                         tool_args={},
                         description=(
                             f"Worker '{self.worker_name}' footprint validation"
                             f" for {tool_name}"
                         ),
-                        permission_footprint=worker_perms,
+                        # Footprint already intersected into spawn_effective
+                        # via _restrictive_merge \u2014 pass None so the gate does
+                        # not re-apply the raw footprint on top.
+                        permission_footprint=None,
                         is_worker_context=True,
                     )
                     if not ok:
@@ -3200,7 +3532,7 @@ class Worker(ToolBase):
         First tries the current session; if not found, searches across all
         sessions and reports any foreign-session instances found.
         """
-        session_key = self.session_id or ""
+        session_key = self.session_id or _NO_SESSION_KEY
         _get_worker_lifecycle_observer()  # best-effort: ensure observer subscription
         with _registry_lock:
             thread = _worker_registry.get((session_key, self.worker_name))
@@ -3272,7 +3604,7 @@ class Worker(ToolBase):
 
     def _action_query(self, workers: list) -> dict:
         """Query a worker and wait for a response (synchronous, blocking)."""
-        session_key = self.session_id or ""
+        session_key = self.session_id or _NO_SESSION_KEY
         with _registry_lock:
             thread = _worker_registry.get((session_key, self.worker_name))
 
@@ -3323,6 +3655,8 @@ class Worker(ToolBase):
                             "heartbeat_age_s": round(age_seconds, 1),
                             "current_context_tokens": thread.get_current_context_tokens(),
                             "max_context_tokens": thread.max_context_tokens,
+                            **({"query_id": getattr(thread, "_current_query_id", None)}
+                               if getattr(thread, "_current_query_id", None) is not None else {}),
                         })
                         return {
                             "error": f"Worker appears hung (last heartbeat: {thread.last_heartbeat}, {age_seconds:.0f}s ago)",
@@ -3339,13 +3673,89 @@ class Worker(ToolBase):
                 "worker_name": self.worker_name,
             }
 
+    def _action_submit_query(self, workers: list) -> dict:
+        """Submit a query without blocking (Phase 2B).
+
+        Enqueues a (job_id, query, None) tuple: replies are NOT routed to a
+        private queue, so they land on the shared _output_queue and are drained
+        as stale by any later synchronous send_query call. Returns immediately
+        with a job handle; progress/completion arrive via WORKER_* events and
+        the job registry.
+        """
+        session_key = self.session_id or _NO_SESSION_KEY
+        with _registry_lock:
+            thread = _worker_registry.get((session_key, self.worker_name))
+        if thread is None:
+            return {"error": f"Worker '{self.worker_name}' is not running. Use 'spawn' first."}
+        if not thread.is_alive():
+            return {
+                "error": f"Worker '{self.worker_name}' is no longer alive (status: {thread.status}).",
+                "status": thread.status,
+                "error_detail": thread.error,
+            }
+        if not self.worker_query:
+            return {"error": "worker_query is required for action 'submit_query'"}
+        job_id = uuid.uuid4().hex
+        try:
+            thread._input_queue.put((job_id, self.worker_query, None))
+        except Exception as exc:
+            return {"error": f"Failed to enqueue query: {exc}", "worker_name": self.worker_name}
+        registry = _get_worker_job_registry()
+        if registry is not None:
+            try:
+                registry.register(job_id, self.worker_name, self.session_id or "")
+            except Exception:
+                pass
+        return {
+            "worker_name": self.worker_name,
+            "job_id": job_id,
+            "status": "submitted",
+            "note": "Query submitted (non-blocking). Progress/completion arrive via "
+                    "WORKER_PARTIAL_RESULT / WORKER_COMPLETED events; poll with "
+                    "action='job_status'.",
+        }
+
+    def _action_job_status(self, workers: list) -> dict:
+        """Read job records from the registry (non-blocking, Phase 2B)."""
+        registry = _get_worker_job_registry()
+        if registry is None:
+            return {"error": "Worker job registry unavailable", "worker_name": self.worker_name}
+        job_id = (self.worker_query or "").strip() or None
+        if job_id:
+            rec = registry.job(job_id)
+            if rec is None:
+                return {"worker_name": self.worker_name, "job_id": job_id, "error": "Job not found"}
+            return {
+                "worker_name": self.worker_name,
+                "job_id": rec.get("job_id"),
+                "status": rec.get("status"),
+                "created_at": rec.get("created_at"),
+                "updated_at": rec.get("updated_at"),
+                "completed_at": rec.get("completed_at"),
+                "has_result": rec.get("result") is not None,
+                "preview": rec.get("preview", ""),
+            }
+        jobs = [
+            {
+                "job_id": r.get("job_id"),
+                "status": r.get("status"),
+                "created_at": r.get("created_at"),
+                "updated_at": r.get("updated_at"),
+                "completed_at": r.get("completed_at"),
+                "has_result": r.get("result") is not None,
+                "preview": r.get("preview", ""),
+            }
+            for r in registry.jobs(worker_name=self.worker_name or None)
+        ]
+        return {"worker_name": self.worker_name, "jobs": jobs, "count": len(jobs)}
+
     def _action_stop(self, workers: list) -> dict:
         """Stop a running worker and persist its context.
 
         First tries the current session; if not found, searches across all
         sessions and stops any matching instances.
         """
-        session_key = self.session_id or ""
+        session_key = self.session_id or _NO_SESSION_KEY
         with _registry_lock:
             thread = _worker_registry.get((session_key, self.worker_name))
 
