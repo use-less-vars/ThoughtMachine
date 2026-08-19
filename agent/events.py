@@ -82,6 +82,12 @@ class EventType(enum.Enum):
     TOKEN_RECOVERY = 'token_recovery'
     CONTEXT_CLEARED = 'context_cleared'
     CONTEXT_SUMMARIZED = 'context_summarized'
+    # Worker lifecycle events (Phase 2A)
+    WORKER_RUNNING = 'worker_running'
+    WORKER_STOPPING = 'worker_stopping'
+    WORKER_HEARTBEAT = 'worker_heartbeat'
+    WORKER_PARTIAL_RESULT = 'worker_partial_result'
+    WORKER_TIMEOUT = 'worker_timeout'
 
 
 class EventMetadata(BaseModel):
@@ -340,6 +346,67 @@ class WorkerErrorEvent(BaseEvent):
                 raise ValueError(f"WorkerErrorEvent requires '{field}' in data")
         return v
 
+
+class WorkerRunningEvent(BaseEvent):
+    """Worker transitioned into a running (busy) state."""
+    type: EventType = Field(default=EventType.WORKER_RUNNING)
+
+    @validator('data')
+    def validate_data(cls, v):
+        if 'worker_name' not in v:
+            raise ValueError("WorkerRunningEvent requires 'worker_name' in data")
+        return v
+
+
+class WorkerStoppingEvent(BaseEvent):
+    """Worker received a stop request and is stopping."""
+    type: EventType = Field(default=EventType.WORKER_STOPPING)
+
+    @validator('data')
+    def validate_data(cls, v):
+        if 'worker_name' not in v:
+            raise ValueError("WorkerStoppingEvent requires 'worker_name' in data")
+        return v
+
+
+class WorkerHeartbeatEvent(BaseEvent):
+    """Periodic worker liveness heartbeat."""
+    type: EventType = Field(default=EventType.WORKER_HEARTBEAT)
+
+    @validator('data')
+    def validate_data(cls, v):
+        required = ['worker_name', 'status']
+        for field in required:
+            if field not in v:
+                raise ValueError(f"WorkerHeartbeatEvent requires '{field}' in data")
+        return v
+
+
+class WorkerPartialResultEvent(BaseEvent):
+    """Worker ended without a complete final reply (stopped/paused/error/timeout)."""
+    type: EventType = Field(default=EventType.WORKER_PARTIAL_RESULT)
+
+    @validator('data')
+    def validate_data(cls, v):
+        required = ['worker_name', 'reason']
+        for field in required:
+            if field not in v:
+                raise ValueError(f"WorkerPartialResultEvent requires '{field}' in data")
+        return v
+
+
+class WorkerTimeoutEvent(BaseEvent):
+    """Worker query timed out (query expiry or hung heartbeat)."""
+    type: EventType = Field(default=EventType.WORKER_TIMEOUT)
+
+    @validator('data')
+    def validate_data(cls, v):
+        required = ['worker_name', 'reason']
+        for field in required:
+            if field not in v:
+                raise ValueError(f"WorkerTimeoutEvent requires '{field}' in data")
+        return v
+
 def create_event(event_type: Union[EventType, str], data: Dict[str, Any], source: str='unknown', session_id: Optional[str]=None, turn: Optional[int]=None) -> BaseEvent:
     """Create a typed event with proper validation."""
     if isinstance(event_type, str):
@@ -349,6 +416,7 @@ def create_event(event_type: Union[EventType, str], data: Dict[str, Any], source
             event_type = _map_legacy_event_type(event_type)
     metadata = EventMetadata(source=source, session_id=session_id, turn=turn)
     event_class_map = {EventType.AGENT_START: AgentStartEvent, EventType.AGENT_END: AgentEndEvent, EventType.TOOL_CALL: ToolCallEvent, EventType.TOOL_RESULT: ToolResultEvent, EventType.TOKEN_WARNING: TokenWarningEvent, EventType.TURN_WARNING: TurnWarningEvent, EventType.ERROR: ErrorEvent, EventType.TURN: TurnEvent, EventType.CAPABILITY_CHECK: BaseEvent, EventType.SECURITY_PROMPT: SecurityPromptEvent, EventType.SECURITY_RESPONSE: SecurityResponseEvent, EventType.FINAL: BaseEvent, EventType.MAX_TURNS: BaseEvent, EventType.STOPPED: BaseEvent, EventType.PAUSED: BaseEvent, EventType.THREAD_FINISHED: BaseEvent, EventType.USER_INTERACTION_REQUESTED: BaseEvent, EventType.RATE_LIMIT_WARNING: BaseEvent, EventType.TOKEN_UPDATE: BaseEvent, EventType.TOKEN_RECOVERY: BaseEvent, EventType.CONTEXT_CLEARED: BaseEvent, EventType.CONTEXT_SUMMARIZED: BaseEvent, EventType.EXECUTION_STATE_CHANGE: BaseEvent, EventType.SESSION_STATE_CHANGE: BaseEvent, EventType.WORKER_SPAWNED: WorkerSpawnedEvent, EventType.WORKER_STATUS: WorkerStatusEvent, EventType.WORKER_COMPLETED: WorkerCompletedEvent, EventType.WORKER_ERROR: WorkerErrorEvent, EventType.WORKER_MESSAGE: WorkerMessageEvent, EventType.ASSISTANT_MESSAGE: AssistantMessageEvent,
+    EventType.WORKER_RUNNING: WorkerRunningEvent, EventType.WORKER_STOPPING: WorkerStoppingEvent, EventType.WORKER_HEARTBEAT: WorkerHeartbeatEvent, EventType.WORKER_PARTIAL_RESULT: WorkerPartialResultEvent, EventType.WORKER_TIMEOUT: WorkerTimeoutEvent,
     EventType.WEBSOCKET_CONNECT: BaseEvent,
     EventType.WEBSOCKET_DISCONNECT: BaseEvent,
     EventType.CONFIG_LOADED: BaseEvent,}

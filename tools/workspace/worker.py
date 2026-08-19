@@ -78,6 +78,14 @@ SPAWN_QUEUE_TIMEOUT = 600
 # and removed from the registry before the cap check runs.
 MAX_WORKERS_PER_SESSION = 5
 
+# ── Worker heartbeat / liveness (Phase 2A) ──
+# Workers publish WORKER_HEARTBEAT events to the global bus while idle,
+# paused, and busy. HEARTBEAT_INTERVAL_S throttles publication; a worker is
+# considered "stale" (possibly hung) when its last heartbeat is older than
+# HEARTBEAT_STALE_AFTER_S.
+HEARTBEAT_INTERVAL_S = 30
+HEARTBEAT_STALE_AFTER_S = 600
+
 # ---------------------------------------------------------------------------
 # Optional dependencies
 # ---------------------------------------------------------------------------
@@ -151,6 +159,55 @@ except ImportError:
     create_event = None
     EventType = None
     global_event_bus = None
+
+# Optional: WorkerLifecycleObserver (Phase 2A) — imported lazily so worker.py
+# stays importable without tools.workspace.worker_lifecycle (which only
+# depends on agent.events, so there is no import cycle at runtime).
+try:
+    from tools.workspace.worker_lifecycle import WorkerLifecycleObserver
+except ImportError:
+    WorkerLifecycleObserver = None  # type: ignore
+
+_WORKER_LIFECYCLE_OBSERVER = None
+
+
+def _get_worker_lifecycle_observer():
+    """Return the module-level WorkerLifecycleObserver singleton (best-effort).
+
+    Creates and subscribes it on first use. Returns None when the observer
+    module or the event bus is unavailable, so callers can safely ignore the
+    result.
+    """
+    global _WORKER_LIFECYCLE_OBSERVER
+    if WorkerLifecycleObserver is None:
+        return None
+    if _WORKER_LIFECYCLE_OBSERVER is None:
+        _WORKER_LIFECYCLE_OBSERVER = WorkerLifecycleObserver()
+        try:
+            _WORKER_LIFECYCLE_OBSERVER.ensure_subscribed()
+        except Exception:
+            pass
+    return _WORKER_LIFECYCLE_OBSERVER
+
+
+def _publish_global_worker_event(event_type, data: dict) -> None:
+    """Publish a worker lifecycle event to the global event bus (best-effort).
+
+    Never raises: worker lifecycle events are observability aids, not control
+    plane. ``data`` must include ``worker_name`` and may include ``session_id``.
+    """
+    if global_event_bus is None or EventType is None or create_event is None:
+        return
+    try:
+        evt = create_event(
+            event_type,
+            data=data,
+            source=f"worker:{data.get('worker_name', 'unknown')}",
+            session_id=data.get("session_id") or "",
+        )
+        global_event_bus.publish(evt)
+    except Exception:
+        pass
 
 
 class WorkerBusAdapter:
@@ -689,6 +746,7 @@ class WorkerThread(threading.Thread):
         self.current_task: Optional[str] = None
         self.error: Optional[str] = None
         self.last_heartbeat: Optional[str] = None
+        self._last_heartbeat_monotonic: float = 0.0
         self._last_reasoning: Optional[str] = None
 
         # Telemetry tracking
@@ -871,7 +929,16 @@ class WorkerThread(threading.Thread):
     def send_query(self, query: str, timeout: float = 120.0) -> str:
         """Send a query to this worker and block for a response."""
         # Workspace Lifecycle Manager fast path (feature-flagged, default off)
-        used, reply = self._process_query_via_wlm(query, timeout=timeout)
+        try:
+            used, reply = self._process_query_via_wlm(query, timeout=timeout)
+        except TimeoutError:
+            self._publish_global_event(EventType.WORKER_TIMEOUT, {
+                "status": self.status,
+                "reason": "query_timeout",
+                "timeout_seconds": timeout,
+                "last_heartbeat": self.last_heartbeat,
+            })
+            raise
         if used:
             return reply
         # Correlate this call with a fresh query id and drain any stale
@@ -920,6 +987,12 @@ class WorkerThread(threading.Thread):
                         detail = f" (last heartbeat: {hb})"
                 else:
                     detail = ""
+                self._publish_global_event(EventType.WORKER_TIMEOUT, {
+                    "status": self.status,
+                    "reason": "query_timeout",
+                    "timeout_seconds": timeout,
+                    "last_heartbeat": self.last_heartbeat,
+                })
                 raise TimeoutError(
                     f"Worker '{self.worker_name}' did not respond within {timeout}s{detail}"
                 )
@@ -1011,6 +1084,7 @@ class WorkerThread(threading.Thread):
             except Exception as exc:
                 log("WARNING", "tools.worker",
                     f"WLM stop delegation failed for worker '{self.worker_name}': {exc}")
+        self._publish_global_event(EventType.WORKER_STOPPING, {"status": "stopping", "reason": "stop_requested"})
         self._stop_event.set()
         # Write a stop command file for cross-process signalling
         try:
@@ -1652,6 +1726,7 @@ class WorkerThread(threading.Thread):
                 try:
                     raw = self._input_queue.get(timeout=2.0)
                 except queue.Empty:
+                    self._heartbeat_tick()
                     continue
                 if raw is None or self._stop_event.is_set():
                     break
@@ -1729,6 +1804,12 @@ class WorkerThread(threading.Thread):
                         global_event_bus.publish(evt)
                     except Exception:
                         pass
+                self._publish_global_event(EventType.WORKER_RUNNING, {
+                    "status": "busy",
+                    "current_task": self.current_task,
+                    "current_context_tokens": self.get_current_context_tokens(),
+                    "max_context_tokens": self.max_context_tokens,
+                })
                 # ── Reset turn/time state per query ────────────────────────
                 # Each query is an isolated unit — reset turn counter and
                 # time tracking so the restriction pipeline starts fresh.
@@ -1799,6 +1880,7 @@ class WorkerThread(threading.Thread):
 
                     # Block until resumed (or stopped)
                     while self._pause_event.is_set() and not self._stop_event.is_set():
+                        self._heartbeat_tick()
                         self._resume_event.wait(1.0)
 
                     if self._stop_event.is_set():
@@ -1942,6 +2024,15 @@ class WorkerThread(threading.Thread):
                                 envelope["content"] = reply
                     except (json.JSONDecodeError, TypeError):
                         envelope["content"] = reply
+
+                if envelope.get("status") in ("stopped", "paused", "error", "timeout", "max_turns", "max_turns_reached"):
+                    self._publish_global_event(EventType.WORKER_PARTIAL_RESULT, {
+                        "status": envelope.get("status"),
+                        "reason": envelope.get("status"),
+                        "content": str(envelope.get("content", ""))[:2000],
+                        "current_context_tokens": self.get_current_context_tokens(),
+                        "max_context_tokens": self.max_context_tokens,
+                    })
 
                 self._emit_reply(json.dumps(envelope, default=str))
 
@@ -2316,6 +2407,38 @@ class WorkerThread(threading.Thread):
             self._event_bus.publish(event)
         except Exception as e:
             log('ERROR', 'tools.worker', f"Failed to publish event {event_type}: {e}")
+
+    def _publish_global_event(self, event_type, data: dict) -> None:
+        """Publish a lifecycle event to the *global* event bus (best-effort).
+
+        Auto-injects ``session_id`` and ``worker_name`` so call sites can stay
+        minimal. Never raises — failures are swallowed by the module helper.
+        """
+        _publish_global_worker_event(event_type, {
+            "session_id": self.session_id or "",
+            "worker_name": self.worker_name,
+            **data,
+        })
+
+    def _heartbeat_tick(self) -> None:
+        """Publish a WORKER_HEARTBEAT if the interval has elapsed (no-op otherwise).
+
+        Updates ``last_heartbeat`` in memory (status.json writes remain the
+        responsibility of the existing status-file machinery). Called from the
+        idle loop, the pause loop, and the busy query path.
+        """
+        now = time.monotonic()
+        if now - self._last_heartbeat_monotonic < HEARTBEAT_INTERVAL_S:
+            return
+        self._last_heartbeat_monotonic = now
+        self.last_heartbeat = datetime.now(timezone.utc).isoformat()
+        self._publish_global_event(EventType.WORKER_HEARTBEAT, {
+            "status": self.status,
+            "current_task": self.current_task,
+            "last_heartbeat": self.last_heartbeat,
+            "current_context_tokens": self.get_current_context_tokens(),
+            "max_context_tokens": self.max_context_tokens,
+        })
 
 # ---------------------------------------------------------------------------
 # Tool
@@ -3053,6 +3176,24 @@ class Worker(ToolBase):
                 "status": "ready",
             }
 
+    def _heartbeat_summary(self, hb_iso: Optional[str]):
+        """Summarize a worker's heartbeat age for the check payload.
+
+        Returns ``(age_seconds, stale)`` where ``age_seconds`` is rounded to
+        one decimal (None when there is no/invalid heartbeat) and ``stale`` is
+        True when the heartbeat is older than HEARTBEAT_STALE_AFTER_S.
+        """
+        if not hb_iso:
+            return (None, False)
+        try:
+            hb_dt = datetime.fromisoformat(hb_iso)
+            if hb_dt.tzinfo is None:
+                hb_dt = hb_dt.replace(tzinfo=timezone.utc)
+            age = round((datetime.now(timezone.utc) - hb_dt).total_seconds(), 1)
+            return (age, age > HEARTBEAT_STALE_AFTER_S)
+        except (ValueError, TypeError):
+            return (None, False)
+
     def _action_check(self, workers: list) -> dict:
         """Check on a specific worker by name.
 
@@ -3060,6 +3201,7 @@ class Worker(ToolBase):
         sessions and reports any foreign-session instances found.
         """
         session_key = self.session_id or ""
+        _get_worker_lifecycle_observer()  # best-effort: ensure observer subscription
         with _registry_lock:
             thread = _worker_registry.get((session_key, self.worker_name))
 
@@ -3112,6 +3254,7 @@ class Worker(ToolBase):
                 "error": f"Worker '{self.worker_name}' not found",
             }
 
+        age, stale = self._heartbeat_summary(thread.last_heartbeat)
         return {
             "worker_name": self.worker_name,
             "status": thread.status,
@@ -3123,6 +3266,8 @@ class Worker(ToolBase):
             "max_context_tokens": thread.max_context_tokens,
             "alive": thread.is_alive(),
             "conversation_length": len(thread._worker_ctx.user_history) if thread._worker_ctx else 0,
+            "last_heartbeat_age_s": age,
+            "stale": stale,
         }
 
     def _action_query(self, workers: list) -> dict:
@@ -3169,6 +3314,16 @@ class Worker(ToolBase):
                     hb_dt = datetime.fromisoformat(thread.last_heartbeat)
                     age_seconds = (datetime.now(timezone.utc) - hb_dt).total_seconds()
                     if age_seconds > 600.0:  # 2× the 300s query timeout
+                        _publish_global_worker_event(EventType.WORKER_TIMEOUT, {
+                            "session_id": self.session_id or "",
+                            "worker_name": self.worker_name,
+                            "status": thread.status,
+                            "reason": "hung",
+                            "last_heartbeat": thread.last_heartbeat,
+                            "heartbeat_age_s": round(age_seconds, 1),
+                            "current_context_tokens": thread.get_current_context_tokens(),
+                            "max_context_tokens": thread.max_context_tokens,
+                        })
                         return {
                             "error": f"Worker appears hung (last heartbeat: {thread.last_heartbeat}, {age_seconds:.0f}s ago)",
                             "worker_name": self.worker_name,
