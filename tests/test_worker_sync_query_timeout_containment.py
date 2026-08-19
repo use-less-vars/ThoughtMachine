@@ -601,11 +601,24 @@ def test_live_sync_query_timeout_reclaims_runner_container(tmp_path, monkeypatch
     )
 
     def _ps_evidence(tag):
-        print(f"\n[{tag}] docker ps -a:")
+        # Operator evidence, FILTERED to this test's containers only: the
+        # worker-owned runner (thoughtmachine.worker label), the resource
+        # container (thoughtmachine.resource label), and the resource matched
+        # by name (tm-live-res-<stamp>). Everything else on the host is noise.
+        print(f"\n[{tag}] relevant containers:")
         for c in client.containers.list(all=True):
-            print(
-                f"  {c.id[:12]} name={c.name!r} status={c.status} labels={dict(c.labels)}"
-            )
+            labels = dict(c.labels)
+            if (
+                c.name == resource_name
+                or _WORKER_CONTAINER_LABEL in labels
+                or _RESOURCE_CONTAINER_LABEL in labels
+            ):
+                tm_labels = {
+                    k: v for k, v in labels.items() if k.startswith("thoughtmachine.")
+                }
+                print(
+                    f"  {c.id[:12]} name={c.name!r} status={c.status} labels={tm_labels}"
+                )
 
     old_api_key = os.environ.get("MOCK_API_KEY")
     os.environ["MOCK_API_KEY"] = "test-key"  # mock provider requires api_key
@@ -624,7 +637,17 @@ def test_live_sync_query_timeout_reclaims_runner_container(tmp_path, monkeypatch
             cpu_quota=100000,
         )
 
-        monkeypatch.setattr(WorkerThread, "_load_context", lambda self: _FakeContext())
+        # Do NOT patch _load_context here: this live test builds a REAL Agent,
+        # which requires a full WorkerContext. The minimal _FakeContext used by
+        # the docker-free tests would crash with AttributeError: '_FakeContext'
+        # object has no attribute 'session_id' (Agent.__init__ reads
+        # session.session_id at agent/core/agent.py:90, user_history at :91,
+        # and total_input/output_tokens at :126). With a fresh tmp_path the
+        # real loader finds no context.json, returns None, and run() falls
+        # back to a REAL WorkerContext (agent/core/worker_context.py) which
+        # supplies session_id/user_history/total_input_tokens/
+        # total_output_tokens/_on_conversation_changed etc. so Agent
+        # construction succeeds and the thread reaches 'ready'.
         monkeypatch.setattr(WorkerThread, "_save_context", lambda self: None)
         monkeypatch.setattr(WorkerThread, "_heartbeat_tick", lambda self: None)
         thread = _LiveTimeoutWorker(
