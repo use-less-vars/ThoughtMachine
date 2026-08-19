@@ -30,6 +30,9 @@ from tools.workspace.worker import (
     _WORKER_CONTAINER_LABEL,
 )
 
+from llm_providers.base import LLMProvider, ProviderConfig, LLMResponse
+from llm_providers.factory import ProviderFactory
+
 # ── fakes ──────────────────────────────────────────────────────────────────
 
 
@@ -489,3 +492,234 @@ def test_live_timeout_reclaims_worker_owned_container(tmp_path, monkeypatch):
                 c.remove(force=True)
             except Exception:
                 pass
+
+
+# ── live docker variant: REAL ContainerManager + REAL query protocol ────────
+
+
+class _LiveMockProvider(LLMProvider):
+    """Scripted mock LLM for the real-docker test.
+
+    Call 1 returns a DockerCodeRunner tool call so the worker's real Agent
+    actually executes a long-running docker command (sleep 60) in a fresh
+    container stamped with the worker's ownership label; later calls return a
+    plain content response. The mock provider requires an api_key
+    (llm_providers/factory.py resolves it from config or the MOCK_API_KEY env
+    var, else raises InvalidConfigError)."""
+
+    def __init__(self, config: ProviderConfig):
+        self._config = config
+        self._call_count = 0
+
+    def chat_completion(self, messages, tools=None, **kwargs):
+        self._call_count += 1
+        usage = {"prompt_tokens": 10, "completion_tokens": 5}
+        if self._call_count == 1:
+            return LLMResponse(
+                content="",
+                reasoning="mock reasoning",
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "DockerCodeRunner",
+                            "arguments": json.dumps(
+                                {
+                                    "command": "sleep 60",
+                                    "timeout": 120,
+                                    "image": "alpine:3.19",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                usage=usage,
+                provider="mock",
+                model="mock-model",
+            )
+        return LLMResponse(
+            content="done",
+            reasoning="mock reasoning",
+            tool_calls=None,
+            usage=usage,
+            provider="mock",
+            model="mock-model",
+        )
+
+    def count_tokens(self, text: str) -> int:
+        return 42
+
+
+def _register_mock_provider():
+    if "mock" not in ProviderFactory._get_providers():
+        ProviderFactory.register_provider("mock", _LiveMockProvider)
+
+
+class _LiveTimeoutWorker(WorkerThread):
+    """WorkerThread whose send_query shims the hardcoded 300s query timeout
+    down to 5s. Everything else stays real: the wire protocol (enqueue +
+    block on the reply queue, raise TimeoutError) and the docker tool path."""
+
+    def send_query(self, query, timeout=300.0):
+        return super().send_query(query, timeout=5.0)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("WORKER_LIVE_DOCKER"),
+    reason="live docker test: set WORKER_LIVE_DOCKER=1 to enable",
+)
+def test_live_sync_query_timeout_reclaims_runner_container(tmp_path, monkeypatch):
+    """End-to-end against a real docker daemon exercising the REAL worker
+    query protocol and the REAL ContainerManager: the worker's real Agent
+    issues a DockerCodeRunner call (long sleep) whose container is stamped
+    thoughtmachine.worker='sess-live:wlive'; the sync query times out (5s
+    shim), the cooperative-stop branch stops the thread and reclaims the
+    runner's container via the real ContainerManager, while a resource
+    container survives. Operator evidence: docker ps before/after."""
+    docker = pytest.importorskip("docker")
+    try:
+        client = docker.from_env()
+        client.ping()
+    except Exception as exc:  # daemon missing/offline
+        pytest.skip(f"docker daemon unavailable: {exc}")
+
+    # Lazy import: infra.container_manager triggers a circular-import cascade
+    # if imported at module top (same pattern as tests/docker/*).
+    from infra.container_manager import ContainerManager
+
+    client.images.pull("alpine:3.19")
+    stamp = int(time.time())
+    owner = "sess-live:wlive"
+    resource_name = f"tm-live-res-{stamp}"
+    resource = client.containers.run(
+        "alpine:3.19",
+        ["sleep", "300"],
+        detach=True,
+        name=resource_name,
+        labels={_RESOURCE_CONTAINER_LABEL: "live-test"},
+    )
+
+    def _ps_evidence(tag):
+        print(f"\n[{tag}] docker ps -a:")
+        for c in client.containers.list(all=True):
+            print(
+                f"  {c.id[:12]} name={c.name!r} status={c.status} labels={dict(c.labels)}"
+            )
+
+    old_api_key = os.environ.get("MOCK_API_KEY")
+    os.environ["MOCK_API_KEY"] = "test-key"  # mock provider requires api_key
+    _register_mock_provider()
+    thread = None
+    try:
+        _ps_evidence("docker ps BEFORE")
+
+        # Real manager: workspace_id resolves from workspace_path, matching the
+        # manager DockerCodeRunner builds internally for the same workspace.
+        cm = ContainerManager(
+            workspace_path=str(tmp_path),
+            session_id="sess-live",
+            image="alpine:3.19",
+            mem_limit="1g",
+            cpu_quota=100000,
+        )
+
+        monkeypatch.setattr(WorkerThread, "_load_context", lambda self: _FakeContext())
+        monkeypatch.setattr(WorkerThread, "_save_context", lambda self: None)
+        monkeypatch.setattr(WorkerThread, "_heartbeat_tick", lambda self: None)
+        thread = _LiveTimeoutWorker(
+            name="wlive",
+            definition={"name": "wlive", "system_prompt": "You are a test worker."},
+            agent_config={
+                "provider": "mock",
+                "model": "mock-model",
+                "api_key": "test-key",  # forwarded to AgentConfig.api_key
+                "enabled_tools": ["DockerCodeRunner"],
+            },
+            workspace_dir=tmp_path,
+            session_id="sess-live",
+            # Session exposes the categories DockerCodeRunner requires
+            # (filesystem:write + container:true, docker_code_runner.py:56).
+            session_permissions={
+                "filesystem": "write",
+                "container": True,
+                "execution": "allow",
+                "network": "allow",
+            },
+            project_root=str(tmp_path),
+            container_manager=cm,
+            timeout_seconds=120,
+        )
+        with worker_module._registry_lock:
+            worker_module._worker_registry[("sess-live", "wlive")] = thread
+        thread.start()
+        assert _wait_until(lambda: thread.status == "ready", timeout=20.0), (
+            f"worker did not reach ready (status={thread.status}, error={thread.error})"
+        )
+
+        tool = Worker(
+            action="query",
+            worker_name="wlive",
+            worker_query="run the long docker command",
+            session_id="sess-live",
+        )
+        t0 = time.monotonic()
+        envelope = tool._action_query([])
+        elapsed = time.monotonic() - t0
+
+        # (1) cooperative-stop envelope arrives promptly after the 5s shim
+        assert 4.0 <= elapsed <= 25.0, f"elapsed={elapsed:.1f}s"
+        assert envelope.get("error"), envelope
+        note = envelope.get("note", "")
+        assert "stopped cooperatively" in note, note
+        assert "Re-spawn" in note, note
+        assert envelope["status"] in ("stopping", "stopped")
+
+        # (2) terminal state reached via run()'s own teardown
+        assert _wait_until(lambda: not thread.is_alive(), timeout=30.0), (
+            "worker thread still alive"
+        )
+        assert thread.status == "stopped"
+
+        # (3) the runner's real container (owner-labeled) was reclaimed
+        leftovers = [
+            c
+            for c in client.containers.list(all=True)
+            if c.labels.get(_WORKER_CONTAINER_LABEL) == owner
+        ]
+        assert not leftovers, (
+            f"owner-labeled containers still exist: {[c.name for c in leftovers]}"
+        )
+
+        # (4) resource container survives
+        assert any(c.name == resource_name for c in client.containers.list(all=True)), (
+            f"resource container {resource_name} was removed"
+        )
+        _ps_evidence("docker ps AFTER")
+    finally:
+        try:
+            resource.remove(force=True)
+        except Exception:
+            pass
+        try:
+            for c in client.containers.list(all=True):
+                if c.labels.get(_WORKER_CONTAINER_LABEL) == owner:
+                    try:
+                        c.remove(force=True)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        with worker_module._registry_lock:
+            worker_module._worker_registry.pop(("sess-live", "wlive"), None)
+        if thread is not None and thread.is_alive():
+            try:
+                thread.stop()
+            except Exception:
+                pass
+            thread.join(timeout=5)
+        if old_api_key is None:
+            os.environ.pop("MOCK_API_KEY", None)
+        else:
+            os.environ["MOCK_API_KEY"] = old_api_key
+
