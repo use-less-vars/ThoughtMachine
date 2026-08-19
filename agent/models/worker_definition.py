@@ -19,7 +19,9 @@ class WorkerDefinition(BaseModel):
 
     All fields are flat (no nesting).  Optional fields (``timeout_seconds``,
     ``max_turns``, etc.) default to ``None``, meaning the value is inherited
-    from the spawning session at spawn time.
+    from the spawning session at spawn time.  ``system_prompt`` is required
+    and is never inherited from the main agent (workers always get their own
+    prompt).
     """
 
     model_config = ConfigDict(populate_by_name=True)
@@ -54,6 +56,20 @@ class WorkerDefinition(BaseModel):
     temperature: Optional[float] = Field(
         default=None,
         description="LLM temperature override for this worker."
+    )
+    max_tokens: Optional[int] = Field(
+        default=None,
+        description=(
+            'Maximum number of tokens for worker LLM responses. '
+            'None means the worker default (no explicit cap).'
+        )
+    )
+    truncation_limit: Optional[int] = Field(
+        default=None,
+        description=(
+            'Token truncation limit for worker conversations. '
+            'None means the worker default.'
+        )
     )
     warning_threshold_tokens: Optional[int] = Field(
         default=65000,

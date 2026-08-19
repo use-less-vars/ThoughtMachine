@@ -36,8 +36,11 @@ class TestApplyConfig:
         2. Persist the config to a session file on disk
         """
         # ── Setup ──────────────────────────────────────────────────────
-        bridge = WebAgentBridge()
-        bridge._session_store = session_store
+        # NOTE: SessionManager caches the session store at construction time
+        # (bridge.py:251-252), so the store MUST be passed via the constructor.
+        # A post-hoc `bridge._session_store = ...` override is ignored by
+        # save_session() and the config would be persisted to the default store.
+        bridge = WebAgentBridge(session_store=session_store)
 
         # ── Exercise ───────────────────────────────────────────────────
         result = bridge.apply_config({

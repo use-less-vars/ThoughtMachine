@@ -1,5 +1,5 @@
 {
-  "description": "Reusable worker configuration.\n\nAll fields are flat (no nesting).  Optional fields (``timeout_seconds``,\n``max_turns``, etc.) default to ``None``, meaning the value is inherited\nfrom the spawning session at spawn time.",
+  "description": "Reusable worker configuration.\n\nAll fields are flat (no nesting).  Optional fields (``timeout_seconds``,\n``max_turns``, etc.) default to ``None``, meaning the value is inherited\nfrom the spawning session at spawn time.  ``system_prompt`` is required\nand is never inherited from the main agent (workers always get their own\nprompt).",
   "properties": {
     "name": {
       "description": "Unique name for this worker definition.",
@@ -70,6 +70,32 @@
       "default": null,
       "description": "LLM temperature override for this worker.",
       "title": "Temperature"
+    },
+    "max_tokens": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Maximum number of tokens for worker LLM responses. None means the worker default (no explicit cap).",
+      "title": "Max Tokens"
+    },
+    "truncation_limit": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Token truncation limit for worker conversations. None means the worker default.",
+      "title": "Truncation Limit"
     },
     "warning_threshold_tokens": {
       "anyOf": [

@@ -512,51 +512,58 @@ class TestCheckRequiredCategoriesPermissionFootprint:
     Verify that the optional ``permission_footprint`` dict further restricts
     the effective permission dict using string-level permission values.
 
-    ``permission_footprint`` uses the same string hierarchy as session/workspace
-    permissions (``"banned"``, ``"read"``, ``"write"``, ``"full"``).
-    ``_min_permission`` compares levels and returns the more restrictive one.
+    ``permission_footprint`` values are validated per-category against the
+    allowed PERMISSION_SCHEMA levels (network: ``"banned"``/``"ask"``/
+    ``"write"``/``"outbound"``; filesystem: ``"banned"``/``"ask"``/
+    ``"read"``/``"write"``).  An unknown category or level fails closed
+    (hard deny).  Valid footprint levels are merged restrictively with the
+    effective level; a footprint can never grant a category the session does
+    not expose.
     """
 
     def test_worker_read_narrows_write(self):
         """
         Worker has ``"read"`` where session+workspace have ``"write"``.
         Effective ``{network: "write", filesystem: "write"}``,
-        worker ``{network: "read"}``
-        → network narrowed to ``"read"``, filesystem stays ``"write"``.
+        worker ``{filesystem: "read"}``
+        → filesystem narrowed to ``"read"``, network stays ``"write"``.
         """
+        # NOTE: "read" is not a valid network level (network schema is
+        # banned/ask/write/outbound), so the footprint uses filesystem:read
+        # to exercise the narrowing (read < write).
         ok, msg = check_required_categories(
-            ["network:read"],
+            ["filesystem:read"],
             {"network": "write", "filesystem": "write"},
             "ReadTool",
             {},
             "",
             None,
-            permission_footprint={"network": "read"},
+            permission_footprint={"filesystem": "read"},
         )
-        assert ok is True, f"network:read should still be allowed: {msg}"
+        assert ok is True, f"filesystem:read should still be allowed: {msg}"
 
-        # network:write should now be denied (narrowed from write→read)
+        # filesystem:write should now be denied (narrowed from write→read)
         ok2, msg2 = check_required_categories(
-            ["network:write"],
-            {"network": "write", "filesystem": "write"},
-            "WriteTool",
-            {},
-            "",
-            None,
-            permission_footprint={"network": "read"},
-        )
-        assert ok2 is False, msg2
-        assert "denied" in msg2.lower()
-
-        # filesystem:write should still pass (not in permission_footprint)
-        ok3, _ = check_required_categories(
             ["filesystem:write"],
             {"network": "write", "filesystem": "write"},
             "WriteTool",
             {},
             "",
             None,
-            permission_footprint={"network": "read"},
+            permission_footprint={"filesystem": "read"},
+        )
+        assert ok2 is False, msg2
+        assert "denied" in msg2.lower()
+
+        # network:write should still pass (not in permission_footprint)
+        ok3, _ = check_required_categories(
+            ["network:write"],
+            {"network": "write", "filesystem": "write"},
+            "WriteTool",
+            {},
+            "",
+            None,
+            permission_footprint={"filesystem": "read"},
         )
         assert ok3 is True
 
@@ -608,28 +615,31 @@ class TestCheckRequiredCategoriesPermissionFootprint:
         """
         Worker restricts multiple categories at once.
         Effective ``{network: "write", filesystem: "write"}``,
-        worker ``{network: "read", filesystem: "banned"}``
-        → ``network:read`` allowed, ``network:write`` denied,
-          ``filesystem:read`` denied (banned).
+        worker ``{filesystem: "read", network: "banned"}``
+        → ``filesystem:read`` allowed, ``filesystem:write`` denied,
+          ``network:true`` denied (banned).
         """
+        # NOTE: "read" is not a valid network level, so the narrowing is
+        # exercised via filesystem (read < write) and the hard denial via
+        # network:banned.
         eff = {"network": "write", "filesystem": "write"}
-        wp = {"network": "read", "filesystem": "banned"}
+        wp = {"filesystem": "read", "network": "banned"}
 
-        # network:read still allowed
+        # filesystem:read still allowed (narrowed from write to read)
         ok, _ = check_required_categories(
-            ["network:read"], eff, "Tool", {}, "", None, permission_footprint=wp
+            ["filesystem:read"], eff, "Tool", {}, "", None, permission_footprint=wp
         )
         assert ok is True
 
-        # network:write denied (read < write)
+        # filesystem:write denied (read < write)
         ok2, msg2 = check_required_categories(
-            ["network:write"], eff, "Tool", {}, "", None, permission_footprint=wp
+            ["filesystem:write"], eff, "Tool", {}, "", None, permission_footprint=wp
         )
         assert ok2 is False, msg2
 
-        # filesystem:read denied (banned)
+        # network:true denied (banned)
         ok3, msg3 = check_required_categories(
-            ["filesystem:read"], eff, "Tool", {}, "", None, permission_footprint=wp
+            ["network:true"], eff, "Tool", {}, "", None, permission_footprint=wp
         )
         assert ok3 is False, msg3
 

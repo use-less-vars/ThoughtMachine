@@ -13,7 +13,6 @@ from __future__ import annotations
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from agent.logging import log
-from session.models import ObservableList
 
 
 class TurnTransaction:
@@ -110,6 +109,8 @@ class TurnTransaction:
         Returns:
             List of committed messages in order of addition
         """
+        # Local import: session.models <-> agent.core circular import (PASS 1e)
+        from session.models import ObservableList
         if self._committed:
             raise RuntimeError('Transaction already committed')
         if self._assistant_committed:

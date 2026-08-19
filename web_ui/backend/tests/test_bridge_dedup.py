@@ -25,6 +25,7 @@ _agent_mock.config.provider_profile.ProviderManager = MagicMock
 _agent_mock.config.service.create_agent_config_service = MagicMock
 _agent_mock.controller.AgentController = MagicMock
 _agent_mock.logging.log = MagicMock()
+_agent_mock.core.message.SYSTEM_NOTIFICATION_PREFIX = "SYSTEM_NOTIFICATION:"
 
 _session_mock = MagicMock()
 _session_mock.store.FileSystemSessionStore = MagicMock
@@ -39,7 +40,11 @@ _agent_patches = {
     'agent.config': _agent_mock.config,
     'agent.config.provider_profile': _agent_mock.config.provider_profile,
     'agent.config.service': _agent_mock.config.service,
+    'agent.config.session_config': _agent_mock.config.session_config,  # imported by bridge.py / session_manager.py
+    'agent.config.presets': _agent_mock.config.presets,  # imported by config_manager.py (bridge import chain)
     'agent.controller': _agent_mock.controller,
+    'agent.core': _agent_mock.core,  # session_manager.py imports agent.core.message
+    'agent.core.message': _agent_mock.core.message,
     'agent.logging': _agent_mock.logging,
     'session': _session_mock,
     'session.store': _session_mock.store,

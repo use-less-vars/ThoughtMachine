@@ -81,12 +81,15 @@ class TestWorkspaceCapabilitiesModel:
 
 class TestGetWorkspaceCapabilities:
     def test_default_when_file_missing(self):
-        """When the capabilities file does not exist, return fully-permissive defaults."""
+        """When the capabilities file does not exist, fail closed (all denied)."""
+        # NOTE: get_workspace_capabilities is fail-closed — a missing
+        # capabilities file yields all-False capabilities, never permissive
+        # defaults, so an unregistered workspace gets no capabilities.
         caps = get_workspace_capabilities("nonexistent_workspace")
-        assert caps.allow_network is True  # canonical default
-        assert caps.allow_docker is True
-        assert caps.filesystem_write is True
-        assert caps.git_available is True
+        assert caps.allow_network is False
+        assert caps.allow_docker is False
+        assert caps.filesystem_write is False
+        assert caps.git_available is False
 
     def test_loads_real_values(self):
         """Read values from a well-formed capabilities JSON."""

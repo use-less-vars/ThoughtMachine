@@ -1203,6 +1203,11 @@ class TestWorker:
             worker_name="reader",
             workspace_path="/tmp/test_ws",
             agent_config={"provider": "openai", "model": "gpt-4"},
+            # NOTE: spawn is fail-closed without an explicit session
+            # permission scope; the worker's footprint
+            # {"filesystem": "read"} must be within the session's allowed
+            # permissions.
+            session_permissions={"filesystem": "read"},
         )
         result = _parse_result(tool.execute())
         assert result["spawned"] is True
