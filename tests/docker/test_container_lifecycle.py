@@ -145,6 +145,18 @@ class TestContainerLifecycle:
             session_permissions=session_permissions,
             image=self.image_tag,
         )
+        # NOTE: the security gate (security_gate.get_workspace_capabilities)
+        # fail-closes to network=none / workspace=ro when a workspace has NO
+        # registered capabilities record; production bootstraps a permissive
+        # record per workspace. These tests use throwaway workspace ids, so
+        # register a permissive record before start (only needed when
+        # session_permissions are passed — with None the gate is skipped).
+        if workspace_id is not None and session_permissions is not None:
+            from thoughtmachine.workspace_capabilities import (  # lazy, matches file convention
+                WorkspaceCapabilities,
+                save_workspace_capabilities,
+            )
+            save_workspace_capabilities(str(workspace_id), WorkspaceCapabilities())
         result = manager.start()
         # Give the container a moment to settle (mirrors test_persistence).
         time.sleep(1)

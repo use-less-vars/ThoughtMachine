@@ -336,6 +336,65 @@ def _sweep_orphan_resource_containers():
         log('WARNING', 'server', f'Startup resource sweep skipped: {exc}')
 
 
+# Idle TTL (seconds) after which an EXITED generic workspace container is
+# removed at startup. Tune via env override if needed.
+_EXITED_CONTAINER_SWEEP_MAX_AGE_S = int(
+    os.environ.get('THOUGHTMACHINE_EXITED_CONTAINER_MAX_AGE_S', '3600')
+)
+
+
+def _sweep_exited_workspace_containers():
+    """Startup sweep: remove EXITED generic workspace containers.
+
+    Two concerns, both best-effort and NEVER raising:
+    - idle/TTL: exited containers of registered workspaces that have been idle
+      past ``_EXITED_CONTAINER_SWEEP_MAX_AGE_S`` are removed;
+    - orphan GC: exited containers of UNREGISTERED workspaces are removed too.
+    Resource containers (``thoughtmachine.resource`` label) are excluded.
+    If the workspace registry cannot be read the sweep degrades to TTL-only
+    (``ids=None``) so a failing/empty registry can never trigger a wipe.
+    """
+    try:
+        from infra.container_manager import sweep_exited_workspace_containers
+
+        try:
+            registry = WorkspaceRegistry.get_default()
+            ids = [e.id for e in registry.list_workspaces()]
+        except Exception as exc:
+            log('WARNING', 'server',
+                f'Startup sweep: could not list registered workspaces: {exc}')
+            ids = None  # TTL-only; never orphan-wipe on registry failure
+
+        result = sweep_exited_workspace_containers(
+            registered_workspace_ids=ids,
+            max_age_s=_EXITED_CONTAINER_SWEEP_MAX_AGE_S,
+        )
+        detail = result.get("detail") or ""
+        log('INFO', 'server',
+            f'Startup sweep: removed {result.get("removed", 0)} exited '
+            f'workspace container(s), skipped {result.get("skipped", 0)}'
+            + (f' — {detail}' if detail else ''))
+
+        # Registry companion: drop swept names so the in-memory container
+        # registry does not retain entries for removed containers. The
+        # disabled registry no-ops here, so this is safe on every start.
+        removed = result.get("removed_containers") or []
+        if removed:
+            try:
+                from infra.registry_wiring import get_active_registry
+                registry = get_active_registry(None)
+                for name in removed:
+                    try:
+                        registry.unregister(name)
+                    except Exception:
+                        pass
+            except Exception as exc:
+                log('WARNING', 'server',
+                    f'Startup sweep: registry companion unregister failed: {exc}')
+    except Exception as exc:
+        log('WARNING', 'server', f'Startup workspace sweep skipped: {exc}')
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan handler — registers signal handlers for graceful shutdown."""
@@ -427,6 +486,13 @@ async def lifespan(app: FastAPI):
     # image once no resource container remains anywhere. Best-effort: a
     # failing sweep must never break startup.
     _sweep_orphan_resource_containers()
+
+    # ── Startup exited-workspace-container sweep ────────────────────────
+    # Remove EXITED generic workspace containers (thoughtmachine.workspace_id
+    # label) idle past the TTL; containers of unregistered workspaces are
+    # treated as orphans and removed too. Resource containers are excluded.
+    # Best-effort: a failing sweep must never break startup.
+    _sweep_exited_workspace_containers()
 
     yield
     log('INFO', 'server', 'Server shutting down.')
@@ -2643,7 +2709,21 @@ def workspace_containers(workspace_id: str, workspace_path: str = ""):
             f"workspace '{workspace_id}' not found or path unresolvable",
             status_code=404)
     try:
-        return {"containers": manager.list_containers()}
+        containers = manager.list_containers() or []
+        containers_in_use = len(containers)
+        # Session container cap: ContainerManager.max_containers (workspace
+        # config.json, default 4; clamped >= 1, mirroring
+        # ContainerManager._get_max_containers()).
+        raw_cap = getattr(manager, "max_containers", 4)
+        try:
+            cap = max(1, int(raw_cap))
+        except (TypeError, ValueError):
+            cap = 4
+        return {
+            "containers": containers,
+            "containers_in_use": containers_in_use,
+            "containers_available": max(0, cap - containers_in_use),
+        }
     except Exception as exc:
         log("ERROR", "server.workspace_containers", f"List failed: {exc}")
         return _json_error(str(exc), status_code=503)
