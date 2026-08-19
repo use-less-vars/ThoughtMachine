@@ -143,7 +143,7 @@ class TestContainerManagerListContainers:
         for entry in result:
             assert set(entry.keys()) == {
                 "container_id", "name", "image", "status", "uptime_seconds",
-                "workspace_id", "note",
+                "workspace_id", "note", "labels",
             }
         by_id = {e["container_id"]: e for e in result}
         assert set(by_id) == {"abc123", "def456"}
@@ -155,6 +155,7 @@ class TestContainerManagerListContainers:
             "uptime_seconds": by_id["abc123"]["uptime_seconds"],
             "workspace_id": "ws-1",
             "note": "",
+            "labels": {"thoughtmachine.workspace_id": "ws-1"},
         }
         # uptime == now - StartedAt (≈3600s, allowing a little clock drift)
         assert isinstance(by_id["abc123"]["uptime_seconds"], int)

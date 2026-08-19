@@ -84,6 +84,48 @@ class _FakeContainerManager:
             self.containers.remove(container)
 
 
+class _FakeDictContainerManager:
+    """Real-ContainerManager-shaped fake: ``list_containers()`` returns DICTS
+    with exactly the keys the real ``ContainerManager.list_containers()`` emits
+    (including ``labels``), so ``_cleanup_worker_containers`` exercises the
+    worker.py dict branch (``container.get("labels")`` at L1806-1807 and the
+    ``container_id``-target resolution at L1846-1849) — a path the
+    object-shaped ``_FakeContainerManager`` never covers."""
+
+    def __init__(self, containers):
+        self.containers = list(containers)
+        self.stopped = []
+        self.removed = []
+
+    def list_containers(self):
+        return list(self.containers)
+
+    def stop(self, container, **kwargs):
+        self.stopped.append(container)
+
+    def remove(self, container, **kwargs):
+        self.removed.append(container)
+        self.containers = [
+            c for c in self.containers
+            if c.get("container_id") != container and c.get("name") != container
+        ]
+
+
+def _owned_container_dict(cid, name, owner):
+    """Real-CM-style dict entry for a worker-owned container (copy of the
+    exact key set infra/container_manager.py list_containers() emits)."""
+    return {
+        "container_id": cid,
+        "name": name,
+        "image": "agent-executor:latest",
+        "status": "running",
+        "uptime_seconds": 5,
+        "workspace_id": "sess-d",
+        "note": "",
+        "labels": {_WORKER_CONTAINER_LABEL: owner},
+    }
+
+
 # ── helpers ────────────────────────────────────────────────────────────────
 
 
@@ -206,6 +248,46 @@ def test_query_timeout_invokes_cooperative_stop_and_returns_envelope(tmp_path, m
     assert any(c.id == "c-res" for c in cm.containers)
     assert [c.id for c in cm.stopped + cm.removed].count("c-res") == 0
     assert any(c.name.startswith("tm-res-") for c in cm.containers)
+
+
+def test_cleanup_reclaims_owned_containers_from_real_cm_style_dicts(tmp_path, monkeypatch):
+    """Dict-shape list_containers() entries (what the REAL ContainerManager
+    returns — including the ``labels`` key added for worker reclaim) must be
+    reclaimable: the entry whose ``thoughtmachine.worker`` label equals the
+    owner is stopped+removed, while unlabeled and foreign entries are
+    skipped. Locks the worker.py dict branch (L1806-1807 / L1844 /
+    L1846-1849) that object-shaped fakes never exercise."""
+    owner = "sess-d:w-d"
+    cm = _FakeDictContainerManager(
+        [
+            _owned_container_dict("c-owned", "wd-ctr", owner),
+            {
+                "container_id": "c-unlabeled", "name": "plain-ctr",
+                "image": "agent-executor", "status": "running",
+                "uptime_seconds": 5, "workspace_id": "sess-d", "note": "",
+                "labels": {},
+            },
+            {
+                "container_id": "c-foreign", "name": "other-ctr",
+                "image": "agent-executor", "status": "running",
+                "uptime_seconds": 5, "workspace_id": "sess-d", "note": "",
+                "labels": {_WORKER_CONTAINER_LABEL: "sess-9:w9"},
+            },
+        ]
+    )
+    thread = _spawn_worker(
+        tmp_path, monkeypatch, name="w-d", session_id="sess-d", container_manager=cm
+    )
+
+    thread.stop()
+    assert _wait_until(lambda: not thread.is_alive(), timeout=10.0), "worker thread still alive"
+    with worker_module._registry_lock:
+        assert worker_module._worker_registry[("sess-d", "w-d")].status == "stopped"
+
+    # only the exact-owner dict entry is reclaimed (targeted by container_id)
+    assert cm.stopped == ["c-owned"]
+    assert cm.removed == ["c-owned"]
+    assert [c["container_id"] for c in cm.containers] == ["c-unlabeled", "c-foreign"]
 
 
 def test_cooperative_stop_reclaims_worker_containers_only(tmp_path, monkeypatch):

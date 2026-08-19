@@ -1112,7 +1112,7 @@ class ContainerManager:
         from the per-workspace bulletin board (container_notes.json), not from
         Docker labels. Returns a list of dicts with EXACTLY: ``container_id``,
         ``name``, ``image``, ``status``, ``uptime_seconds``, ``workspace_id``,
-        ``note``.
+        ``note``, ``labels``.
         """
         try:
             containers = self.client.containers.list(
@@ -1157,6 +1157,7 @@ class ContainerManager:
                 "uptime_seconds": uptime_seconds,
                 "workspace_id": (container.labels.get("thoughtmachine.workspace_id")
                                  or self.workspace_id),
+                "labels": dict(container.labels or {}),
                 "note": ((getattr(self, "container_notes", {}) or {}).get(container.name)
                          or {}).get("note", ""),
             })
