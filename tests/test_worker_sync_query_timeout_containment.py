@@ -640,11 +640,14 @@ def test_live_sync_query_timeout_reclaims_runner_container(tmp_path, monkeypatch
             session_id="sess-live",
             # Session exposes the categories DockerCodeRunner requires
             # (filesystem:write + container:true, docker_code_runner.py:56).
+            # Values must be valid AgentConfig SessionPermissions literals
+            # (thoughtmachine/security.py): network in {banned, ask, write,
+            # outbound}, execution in {banned, read, write, full, ask}.
             session_permissions={
                 "filesystem": "write",
                 "container": True,
-                "execution": "allow",
-                "network": "allow",
+                "network": "write",
+                "execution": "full",
             },
             project_root=str(tmp_path),
             container_manager=cm,
@@ -722,4 +725,3 @@ def test_live_sync_query_timeout_reclaims_runner_container(tmp_path, monkeypatch
             os.environ.pop("MOCK_API_KEY", None)
         else:
             os.environ["MOCK_API_KEY"] = old_api_key
-
