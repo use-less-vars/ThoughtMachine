@@ -15,6 +15,11 @@ from typing import Optional
 
 from agent.events import EventType, global_event_bus
 
+try:
+    from agent.events import create_event
+except ImportError:  # pragma: no cover - defensive
+    create_event = None  # type: ignore
+
 # Lifecycle event types this observer subscribes to (Phase 2A)
 WORKER_LIFECYCLE_EVENT_TYPES = (
     "worker_spawned",
@@ -35,6 +40,14 @@ GLOBAL_RING_SIZE = 500
 # A worker whose last heartbeat is older than this is considered stale
 HEARTBEAT_STALE_AFTER_S = 600
 
+# Publisher-side heartbeat cadence (worker.py throttles heartbeats to this).
+HEARTBEAT_INTERVAL_S = 30
+# Alias used by consumers of the observer (tests, supervisor).
+STALE_AFTER_S = HEARTBEAT_STALE_AFTER_S
+# Extra time past staleness before a worker is reported as "hung". 0 means a
+# stale worker is immediately hung.
+WORKER_HUNG_GRACE_S = 0
+
 
 class WorkerLifecycleObserver:
     """Subscribes to worker lifecycle events and keeps bounded rings of them.
@@ -43,7 +56,14 @@ class WorkerLifecycleObserver:
     read APIs acquire the lock and return copies.
     """
 
-    def __init__(self, event_bus=None, stale_after_s: int = HEARTBEAT_STALE_AFTER_S):
+    def __init__(
+        self,
+        event_bus=None,
+        stale_after_s: int = HEARTBEAT_STALE_AFTER_S,
+        *,
+        stale_callback=None,
+        hung_grace_s: int = WORKER_HUNG_GRACE_S,
+    ):
         self._event_bus = event_bus if event_bus is not None else global_event_bus
         self._lock = threading.Lock()
         self._global_ring = deque(maxlen=GLOBAL_RING_SIZE)
@@ -52,6 +72,10 @@ class WorkerLifecycleObserver:
         self._stale_flagged = {}  # worker_name -> True once stale reported
         self._terminal = {}  # worker_name -> True after completed/error
         self._stale_after_s = stale_after_s
+        self._stale_callback = stale_callback
+        self._hung_grace_s = max(0, hung_grace_s)
+        self._worker_session = {}  # worker_name -> session_id
+        self._hung_notified = {}  # worker_name -> True once hung emitted
         self._subscribed = False
 
     def ensure_subscribed(self) -> bool:
@@ -86,49 +110,90 @@ class WorkerLifecycleObserver:
         raw_type = getattr(event, "type", "")
         type_str = getattr(raw_type, "value", None) or (raw_type if isinstance(raw_type, str) else "") or ""
 
+        session_id = getattr(metadata, "session_id", None) if metadata else None
+
         record = {
             "type": type_str,
             "worker_name": worker,
             "timestamp": ts_iso,
             "data": data,
             "source": getattr(metadata, "source", None) if metadata else None,
-            "session_id": getattr(metadata, "session_id", None) if metadata else None,
+            "session_id": session_id,
         }
 
+        hung_action = None
         with self._lock:
             if type_str == "worker_heartbeat":
                 hb = data.get("last_heartbeat") or ts_iso
                 if hb:
                     self._last_heartbeat[worker] = hb
                     self._stale_flagged.pop(worker, None)
+                    self._hung_notified.pop(worker, None)
                     self._terminal.pop(worker, None)
             if type_str in ("worker_completed", "worker_error"):
                 self._terminal[worker] = True
+            if worker:
+                self._worker_session[worker] = session_id
             ring = self._per_worker.setdefault(worker, deque(maxlen=PER_WORKER_RING_SIZE))
             ring.append(record)
             self._global_ring.append(record)
-            self._check_stale_for(worker, datetime.now(timezone.utc))
+            hung_action = self._check_stale_for(worker, datetime.now(timezone.utc))
+        if hung_action:
+            self._emit_hung_actions([hung_action])
 
-    def _is_stale(self, worker: str, now: datetime) -> bool:
-        """True when the worker's last heartbeat is older than the threshold."""
+    def _heartbeat_age(self, worker: str, now: datetime) -> Optional[float]:
+        """Age in seconds of the worker's last heartbeat (None when unknown)."""
         hb = self._last_heartbeat.get(worker)
         if not hb:
-            return False
+            return None
         try:
             hb_dt = datetime.fromisoformat(hb)
             if hb_dt.tzinfo is None:
                 hb_dt = hb_dt.replace(tzinfo=timezone.utc)
-            return (now - hb_dt).total_seconds() > self._stale_after_s
+            return (now - hb_dt).total_seconds()
         except (ValueError, TypeError):
-            return False
+            return None
 
-    def _check_stale_for(self, worker: str, now: datetime) -> None:
+    def _is_stale(self, worker: str, now: datetime) -> bool:
+        """True when the worker's last heartbeat is older than the threshold."""
+        age = self._heartbeat_age(worker, now)
+        return age is not None and age > self._stale_after_s
+
+    def _is_hung(self, worker: str, now: datetime) -> bool:
+        """True when the worker is stale AND past the hung grace period."""
+        age = self._heartbeat_age(worker, now)
+        return age is not None and age > self._stale_after_s + self._hung_grace_s
+
+    def _hung_action_for(self, worker: str, now: datetime) -> Optional[tuple]:
+        """Build a one-shot hung notification for an already-stale worker.
+
+        Must be called with ``self._lock`` held — private helper. Emits at
+        most once per worker (tracked in ``_hung_notified``). Returns
+        ``(worker, info)`` when the worker is hung and not yet notified, else
+        None.
+        """
+        if not self._is_hung(worker, now):
+            return None
+        if self._hung_notified.get(worker):
+            return None
+        self._hung_notified[worker] = True
+        info = {
+            "reason": "stale_heartbeat",
+            "last_heartbeat": self._last_heartbeat.get(worker),
+            "heartbeat_age_seconds": self._heartbeat_age(worker, now),
+            "session_id": self._worker_session.get(worker, ""),
+        }
+        return (worker, info)
+
+    def _check_stale_for(self, worker: str, now: datetime) -> Optional[tuple]:
         """Flag a worker as stale (once) if its heartbeat is too old.
 
-        Must be called with ``self._lock`` held — private helper.
+        Must be called with ``self._lock`` held — private helper. Returns a
+        hung action ``(worker, info)`` when the worker is past the hung grace
+        period (so the caller can emit outside the lock), else None.
         """
         if not worker or self._terminal.get(worker) or self._stale_flagged.get(worker):
-            return
+            return None
         if self._is_stale(worker, now):
             self._stale_flagged[worker] = True
             rec = {
@@ -142,30 +207,73 @@ class WorkerLifecycleObserver:
             ring = self._per_worker.setdefault(worker, deque(maxlen=PER_WORKER_RING_SIZE))
             ring.append(rec)
             self._global_ring.append(rec)
+            return self._hung_action_for(worker, now)
+        return None
 
     def check_stale_transitions(self, now: Optional[datetime] = None) -> int:
-        """Scan known workers and flag any newly-stale ones; returns count."""
+        """Scan known workers, flag newly-stale ones and emit hung actions.
+
+        Returns the number of newly-flagged stale workers. Hung notifications
+        (WORKER_TIMEOUT event + ``stale_callback``) are re-evaluated for
+        already-flagged workers on every scan, so a grace period that elapses
+        between scans is still honored; each worker is notified at most once.
+        """
         now = now or datetime.now(timezone.utc)
         count = 0
+        pending = []
         with self._lock:
             for worker in list(self._last_heartbeat.keys()):
-                if self._stale_flagged.get(worker) or self._terminal.get(worker):
+                if self._terminal.get(worker):
                     continue
                 if self._is_stale(worker, now):
-                    self._stale_flagged[worker] = True
-                    rec = {
-                        "type": "worker_stale",
-                        "worker_name": worker,
-                        "timestamp": now.isoformat(),
-                        "data": {"last_heartbeat": self._last_heartbeat.get(worker)},
-                        "source": "worker_lifecycle_observer",
-                        "session_id": None,
-                    }
-                    ring = self._per_worker.setdefault(worker, deque(maxlen=PER_WORKER_RING_SIZE))
-                    ring.append(rec)
-                    self._global_ring.append(rec)
-                    count += 1
+                    if not self._stale_flagged.get(worker):
+                        self._stale_flagged[worker] = True
+                        rec = {
+                            "type": "worker_stale",
+                            "worker_name": worker,
+                            "timestamp": now.isoformat(),
+                            "data": {"last_heartbeat": self._last_heartbeat.get(worker)},
+                            "source": "worker_lifecycle_observer",
+                            "session_id": None,
+                        }
+                        ring = self._per_worker.setdefault(worker, deque(maxlen=PER_WORKER_RING_SIZE))
+                        ring.append(rec)
+                        self._global_ring.append(rec)
+                        count += 1
+                    action = self._hung_action_for(worker, now)
+                    if action:
+                        pending.append(action)
+        self._emit_hung_actions(pending)
         return count
+
+    def _emit_hung_actions(self, pending: list) -> None:
+        """Publish WORKER_TIMEOUT and invoke the stale callback (never raises)."""
+        for worker, info in pending or []:
+            try:
+                if self._event_bus is not None and create_event is not None:
+                    evt = create_event(
+                        EventType.WORKER_TIMEOUT,
+                        data={
+                            "worker_name": worker,
+                            "worker_id": worker,
+                            "reason": "stale_heartbeat",
+                            "last_heartbeat": info.get("last_heartbeat"),
+                            "heartbeat_age_seconds": round(info.get("heartbeat_age_seconds") or 0.0, 1),
+                            "session_id": info.get("session_id") or "",
+                            "source": "worker_lifecycle_observer",
+                        },
+                        source="worker_lifecycle_observer",
+                        session_id=info.get("session_id") or "",
+                    )
+                    if evt is not None:
+                        self._event_bus.publish(evt)
+            except Exception:
+                pass
+            if self._stale_callback is not None:
+                try:
+                    self._stale_callback(worker, info)
+                except Exception:
+                    pass
 
     def recent_events(self, worker_name: Optional[str] = None) -> list:
         """Return recent lifecycle records (per-worker or global ring)."""
