@@ -430,7 +430,7 @@ class TestMaxWorkersCap:
                 t.is_alive.return_value = alive
                 t.status = "ready" if alive else "stopped"
                 t._timeout_seconds = 30
-                harness.registry._worker_registry[(session, name)] = t
+                harness.registry._worker_registry[(session, name, 1)] = t
 
     def test_default_cap_refuses_sixth(self, spawn_harness):
         spawn_harness.set_definitions([
@@ -481,7 +481,7 @@ class TestMaxWorkersCap:
         with spawn_harness.registry._registry_lock:
             live = [
                 (sid, name)
-                for (sid, name), t in spawn_harness.registry._worker_registry.items()
+                for (sid, name, _iid), t in spawn_harness.registry._worker_registry.items()
                 if sid == SESSION_H and t.is_alive()
             ]
         assert len(live) == 5

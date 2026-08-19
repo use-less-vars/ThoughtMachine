@@ -175,7 +175,7 @@ def _spawn_worker(tmp_path, monkeypatch, name, session_id, container_manager=Non
         max_runtime_s=None,
     )
     with worker_module._registry_lock:
-        worker_module._worker_registry[(session_id, name)] = thread
+        worker_module._worker_registry[(session_id, name, 1)] = thread
     thread.start()
     assert _wait_until(lambda: thread.status == "ready"), (
         f"worker {name!r} did not reach ready "
@@ -237,7 +237,7 @@ def test_query_timeout_invokes_cooperative_stop_and_returns_envelope(tmp_path, m
     # 2) terminal state visible in the registry afterwards
     assert _wait_until(lambda: not thread.is_alive(), timeout=10.0), "worker thread still alive"
     with worker_module._registry_lock:
-        assert worker_module._worker_registry[("sess-1", "w1")].status == "stopped"
+        assert worker_module._worker_registry[("sess-1", "w1", 1)].status == "stopped"
 
     # 3) owned container stopped + removed
     assert [c.id for c in cm.stopped] == ["c-owned"]
@@ -282,7 +282,7 @@ def test_cleanup_reclaims_owned_containers_from_real_cm_style_dicts(tmp_path, mo
     thread.stop()
     assert _wait_until(lambda: not thread.is_alive(), timeout=10.0), "worker thread still alive"
     with worker_module._registry_lock:
-        assert worker_module._worker_registry[("sess-d", "w-d")].status == "stopped"
+        assert worker_module._worker_registry[("sess-d", "w-d", 1)].status == "stopped"
 
     # only the exact-owner dict entry is reclaimed (targeted by container_id)
     assert cm.stopped == ["c-owned"]
@@ -310,7 +310,7 @@ def test_cooperative_stop_reclaims_worker_containers_only(tmp_path, monkeypatch)
     thread.stop()
     assert _wait_until(lambda: not thread.is_alive(), timeout=10.0), "worker thread still alive"
     with worker_module._registry_lock:
-        assert worker_module._worker_registry[("sess-2", "w2")].status == "stopped"
+        assert worker_module._worker_registry[("sess-2", "w2", 1)].status == "stopped"
 
     assert [c.id for c in cm.stopped] == ["c-owned"]
     assert [c.id for c in cm.removed] == ["c-owned"]
@@ -376,7 +376,7 @@ def test_stop_during_busy_query_drains_and_cleans_up(tmp_path, monkeypatch):
     assert _wait_until(lambda: not thread.is_alive(), timeout=10.0), "worker thread still alive"
     assert thread.status == "stopped"
     with worker_module._registry_lock:
-        entry = worker_module._worker_registry.get(("sess-3", "w3"))
+        entry = worker_module._worker_registry.get(("sess-3", "w3", 1))
     assert entry is None or entry.status == "stopped"
     assert not reply_q.empty(), "in-flight query never drained to its reply queue"
     envelope = json.loads(reply_q.get_nowait())
@@ -470,7 +470,7 @@ def test_query_timeout_while_busy_reclaims_containers_synchronously(tmp_path, mo
     assert _wait_until(lambda: not thread.is_alive(), timeout=10.0), "worker thread still alive"
     assert thread.status == "stopped"
     with worker_module._registry_lock:
-        entry = worker_module._worker_registry.get(("sess-4", "w4"))
+        entry = worker_module._worker_registry.get(("sess-4", "w4", 1))
     assert entry is None or entry.status == "stopped"
     assert not reply_q.empty(), "in-flight query never drained to its reply queue"
     env2 = json.loads(reply_q.get_nowait())
@@ -759,7 +759,7 @@ def test_live_sync_query_timeout_reclaims_runner_container(tmp_path, monkeypatch
             timeout_seconds=120,
         )
         with worker_module._registry_lock:
-            worker_module._worker_registry[("sess-live", "wlive")] = thread
+            worker_module._worker_registry[("sess-live", "wlive", 1)] = thread
         thread.start()
         assert _wait_until(lambda: thread.status == "ready", timeout=20.0), (
             f"worker did not reach ready (status={thread.status}, error={thread.error})"
@@ -819,7 +819,7 @@ def test_live_sync_query_timeout_reclaims_runner_container(tmp_path, monkeypatch
         except Exception:
             pass
         with worker_module._registry_lock:
-            worker_module._worker_registry.pop(("sess-live", "wlive"), None)
+            worker_module._worker_registry.pop(("sess-live", "wlive", 1), None)
         if thread is not None and thread.is_alive():
             try:
                 thread.stop()

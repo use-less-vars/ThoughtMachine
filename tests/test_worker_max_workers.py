@@ -96,7 +96,7 @@ class TestWorkerMaxWorkers(unittest.TestCase):
     ) -> None:
         with self._registry._registry_lock:
             for name in names:
-                self._registry._worker_registry[(session, name)] = (
+                self._registry._worker_registry[(session, name, 1)] = (
                     _live_thread() if alive else _dead_thread()
                 )
 
@@ -208,7 +208,7 @@ class TestWorkerMaxWorkers(unittest.TestCase):
         with self._registry._registry_lock:
             live = [
                 (sid, name)
-                for (sid, name), t in self._registry._worker_registry.items()
+                for (sid, name, _iid), t in self._registry._worker_registry.items()
                 if sid == SESSION and t.is_alive()
             ]
         self.assertEqual(len(live), 5)

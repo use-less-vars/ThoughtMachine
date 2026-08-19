@@ -17,9 +17,9 @@ server instance and verify:
 
 3. ``test_worker_in_session_a_not_visible_to_session_b``
    - The WorkerRegistry (``tools/workspace/worker_registry.py``) keys workers
-     by ``(session_id, worker_name)``: a worker registered for session A is
-     invisible to session B's lookups (``get_all_workers`` / ``get_worker`` /
-     ``get_event_buses_for_session`` / ``get_event_bus``).
+     by ``(session_id, worker_name, instance_id)``: a worker registered for
+     session A is invisible to session B's lookups (``get_all_workers`` /
+     ``get_worker`` / ``get_event_buses_for_session`` / ``get_event_bus``).
 
 4. ``test_worker_in_session_b_not_visible_to_session_a``
    - Mirror of test 3: a worker registered for session B is invisible to
@@ -497,10 +497,10 @@ def _register_worker_for_session(registry, session_id: str, worker_name: str) ->
 
 def test_worker_in_session_a_not_visible_to_session_b(mock_server):
     """
-    The WorkerRegistry keys workers by (session_id, worker_name): a worker
-    registered under session A is invisible to session B — absent from
-    get_all_workers() under (sid_b, name), get_worker(sid_b, name) is None,
-    and the per-worker event bus never appears in B's session buses.
+    The WorkerRegistry keys workers by (session_id, worker_name, instance_id):
+    a worker registered under session A is invisible to session B — absent
+    from get_all_workers() under (sid_b, name), get_worker(sid_b, name) is
+    None, and the per-worker event bus never appears in B's session buses.
     """
     app, _tmp_home = mock_server
     registry = WorkerRegistry.get_instance()
@@ -522,10 +522,10 @@ def test_worker_in_session_a_not_visible_to_session_b(mock_server):
 
                     # Registry visibility: present under A, absent under B.
                     all_workers = registry.get_all_workers()
-                    assert (sid_a, "worker_a") in all_workers, (
+                    assert (sid_a, "worker_a", 1) in all_workers, (
                         f"worker_a missing for {sid_a}: {list(all_workers.keys())}"
                     )
-                    assert (sid_b, "worker_a") not in all_workers, (
+                    assert (sid_b, "worker_a", 1) not in all_workers, (
                         f"worker_a visible under {sid_b}: {list(all_workers.keys())}"
                     )
                     assert registry.get_worker(sid_a, "worker_a") is not None
@@ -617,8 +617,8 @@ def test_worker_in_session_b_not_visible_to_session_a(mock_server):
     """
     Mirror of the session-A test: a worker registered for session B is
     invisible to session A — absent from ``get_all_workers()`` under
-    (sid_a, name), ``get_worker(sid_a, name)`` is None, and the per-worker
-    event bus never appears in A's session buses.
+    (sid_a, name, instance_id), ``get_worker(sid_a, name)`` is None, and the
+    per-worker event bus never appears in A's session buses.
     """
     app, _tmp_home = mock_server
     registry = WorkerRegistry.get_instance()
@@ -637,10 +637,10 @@ def test_worker_in_session_b_not_visible_to_session_a(mock_server):
 
                     # Registry visibility: present under B, absent under A.
                     all_workers = registry.get_all_workers()
-                    assert (sid_b, "worker_b") in all_workers, (
+                    assert (sid_b, "worker_b", 1) in all_workers, (
                         f"worker_b missing for {sid_b}: {list(all_workers.keys())}"
                     )
-                    assert (sid_a, "worker_b") not in all_workers, (
+                    assert (sid_a, "worker_b", 1) not in all_workers, (
                         f"worker_b visible under {sid_a}: {list(all_workers.keys())}"
                     )
                     assert registry.get_worker(sid_b, "worker_b") is not None
