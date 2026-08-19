@@ -3640,7 +3640,29 @@ class Worker(ToolBase):
                 result["reasoning"] = thread._last_reasoning
             return result
         except TimeoutError as exc:
-            # Check heartbeat to distinguish "worker hung" vs "worker still busy"
+            # Cooperative stop: the query deadline elapsed with no reply. Stop
+            # the worker thread so its run() loop drains, its terminal path
+            # runs, and its containers are reclaimed. Never Thread.kill — the
+            # thread always terminates via its own run() teardown (which calls
+            # _cleanup_worker_containers). The stop is best-effort: if it
+            # raises, run() teardown remains authoritative.
+            try:
+                thread.stop()
+            except Exception:
+                pass
+            # Synchronous reclaim: the worker may be stuck inside a DockerCodeRunner
+            # call, so run()'s finally (the safety net) may not run until that call
+            # returns. Reclaim worker-owned containers NOW from the timeout path.
+            # If the worker is mid-tool-call using the container, the stop/remove
+            # will make that call fail and return — acceptable. No join() here; no
+            # Thread.kill; never touches resource containers.
+            try:
+                thread._cleanup_worker_containers()
+            except Exception:
+                pass
+            # Heartbeat classification now only shapes the message content —
+            # both branches terminate the worker, because a timed-out query is
+            # final (the worker was stopped and its containers reclaimed).
             if thread.last_heartbeat:
                 try:
                     hb_dt = datetime.fromisoformat(thread.last_heartbeat)
@@ -3663,14 +3685,15 @@ class Worker(ToolBase):
                             "worker_name": self.worker_name,
                             "status": thread.status,
                             "current_task": thread.current_task,
+                            "note": "Worker did not respond in time and was stopped cooperatively (its containers were reclaimed). Re-spawn the worker before querying it again.",
                         }
                 except (ValueError, TypeError):
                     pass  # Malformed heartbeat — fall through to generic timeout
             return {
                 "error": str(exc),
-                "note": "Worker did not respond in time. The worker thread is "
-                         "still alive — you can query it again with a shorter task.",
+                "note": "Worker did not respond in time and was stopped cooperatively (its containers were reclaimed). Re-spawn the worker before querying it again.",
                 "worker_name": self.worker_name,
+                "status": thread.status,
             }
 
     def _action_submit_query(self, workers: list) -> dict:
