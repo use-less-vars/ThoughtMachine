@@ -840,10 +840,11 @@ async def stop_worker(ws_id: str, name: str):
     }, worker_dir / "status.json")
 
     # Fast-path: if the thread is in-memory (same process), signal directly.
-    # Registry keys are tuples (session_id, worker_name), so iterate all
-    # entries matching the worker name across all sessions.
+    # Registry keys are tuples (session_id, worker_name[, instance_id]), so
+    # iterate all entries matching the worker name across all sessions.
     with _registry_lock:
-        for (sid, wname), thread in list(_worker_registry.items()):
+        for key, thread in list(_worker_registry.items()):
+            wname = key[1]
             if wname == name:
                 try:
                     thread.stop()
@@ -920,10 +921,11 @@ async def pause_worker(ws_id: str, name: str):
     }, worker_dir / "status.json")
 
     # Fast-path: if the thread is in-memory (same process), signal directly.
-    # Registry keys are tuples (session_id, worker_name), so iterate all
-    # entries matching the worker name across all sessions.
+    # Registry keys are tuples (session_id, worker_name[, instance_id]), so
+    # iterate all entries matching the worker name across all sessions.
     with _registry_lock:
-        for (sid, wname), thread in list(_worker_registry.items()):
+        for key, thread in list(_worker_registry.items()):
+            wname = key[1]
             if wname == name:
                 try:
                     thread.pause()
@@ -989,7 +991,8 @@ async def resume_worker(ws_id: str, name: str):
 
     # Fast-path: if the thread is in-memory (same process), signal directly.
     with _registry_lock:
-        for (sid, wname), thread in list(_worker_registry.items()):
+        for key, thread in list(_worker_registry.items()):
+            wname = key[1]
             if wname == name:
                 try:
                     thread.resume()

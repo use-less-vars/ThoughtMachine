@@ -1180,7 +1180,11 @@ class WebAgentBridge:
         # Pause all workers for this session
         if WORKER_BUS_AVAILABLE and _worker_registry is not None:
             with _registry_lock:
-                for (sid, wname), thread in list(_worker_registry.items()):
+                for key, thread in list(_worker_registry.items()):
+                    if len(key) >= 3:
+                        sid, wname, _iid = key
+                    else:
+                        sid, wname = key
                     if sid == self._session_id:
                         try:
                             thread.pause()
@@ -1199,7 +1203,11 @@ class WebAgentBridge:
         # Resume all workers for this session
         if WORKER_BUS_AVAILABLE and _worker_registry is not None:
             with _registry_lock:
-                for (sid, wname), thread in list(_worker_registry.items()):
+                for key, thread in list(_worker_registry.items()):
+                    if len(key) >= 3:
+                        sid, wname, _iid = key
+                    else:
+                        sid, wname = key
                     if sid == self._session_id:
                         try:
                             thread.resume()
