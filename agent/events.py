@@ -88,6 +88,8 @@ class EventType(enum.Enum):
     WORKER_HEARTBEAT = 'worker_heartbeat'
     WORKER_PARTIAL_RESULT = 'worker_partial_result'
     WORKER_TIMEOUT = 'worker_timeout'
+    WORKER_PAUSED = 'worker_paused'
+    WORKER_RESUMED = 'worker_resumed'
 
 
 class EventMetadata(BaseModel):

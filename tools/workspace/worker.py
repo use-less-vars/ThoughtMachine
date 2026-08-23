@@ -1704,7 +1704,13 @@ class WorkerThread(threading.Thread):
                     self._agent.request_pause()
                     self.status = "paused"
                     self._write_status_file()
-                    self._publish_event('worker_paused', {'status': 'paused', 'worker_name': self.worker_name})
+                    self._publish_event('worker_paused', {
+                        'status': 'paused',
+                        'worker_name': self.worker_name,
+                        'session_id': self.session_id or "",
+                        'current_context_tokens': self.get_current_context_tokens(),
+                        'max_context_tokens': self.max_context_tokens,
+                    })
                     final_content = json.dumps({
                         "status": "paused",
                         "message": "Worker paused by user",
@@ -2106,9 +2112,93 @@ class WorkerThread(threading.Thread):
                     raw = self._input_queue.get(timeout=2.0)
                 except queue.Empty:
                     self._heartbeat_tick()
-                    continue
-                if raw is None or self._stop_event.is_set():
+                    raw = None
+                if self._stop_event.is_set():
                     break
+                if raw is None:
+                    # A bare None normally means stop, but when a pause was
+                    # requested while the worker is idle it must NOT terminate
+                    # the worker: honor the pause here instead of treating the
+                    # sentinel as a stop signal (BUG 1).
+                    if self._pause_event.is_set():
+                        self.status = "paused"
+                        self._write_status_file()
+                        self._publish_event('worker_paused', {
+                            'status': 'paused',
+                            'worker_name': self.worker_name,
+                            'session_id': self.session_id or "",
+                            'current_context_tokens': self.get_current_context_tokens(),
+                            'max_context_tokens': self.max_context_tokens,
+                        })
+                        if global_event_bus is not None and EventType is not None and create_event is not None:
+                            try:
+                                evt = create_event(
+                                    EventType.WORKER_STATUS,
+                                    data={
+                                        "session_id": self.session_id or "",
+                                        "worker_name": self.worker_name,
+                                        "instance_id": self.instance_id,
+                                        "instance_label": self.instance_label,
+                                        "status": "paused",
+                                        "current_context_tokens": self.get_current_context_tokens(),
+                                        "max_context_tokens": self.max_context_tokens,
+                                    },
+                                    source=f"worker:{self.worker_name}",
+                                    session_id=self.session_id or "",
+                                )
+                                global_event_bus.publish(evt)
+                            except Exception:
+                                pass
+                        self.current_task = None
+                        self.last_heartbeat = datetime.now(timezone.utc).isoformat()
+                        # Block until resumed (or stopped)
+                        while self._pause_event.is_set() and not self._stop_event.is_set():
+                            self._heartbeat_tick()
+                            self._resume_event.wait(1.0)
+                        if self._stop_event.is_set():
+                            break
+                        # Resume — transition back to ready
+                        self.status = "ready"
+                        self._resume_event.clear()
+                        self._write_status_file()
+                        self._publish_event('worker_resumed', {
+                            'status': 'ready',
+                            'worker_name': self.worker_name,
+                            'session_id': self.session_id or "",
+                            'current_context_tokens': self.get_current_context_tokens(),
+                            'max_context_tokens': self.max_context_tokens,
+                        })
+                        if global_event_bus is not None and EventType is not None and create_event is not None:
+                            try:
+                                evt = create_event(
+                                    EventType.WORKER_STATUS,
+                                    data={
+                                        "session_id": self.session_id or "",
+                                        "worker_name": self.worker_name,
+                                        "instance_id": self.instance_id,
+                                        "instance_label": self.instance_label,
+                                        "status": "ready",
+                                        "current_context_tokens": self.get_current_context_tokens(),
+                                        "max_context_tokens": self.max_context_tokens,
+                                    },
+                                    source=f"worker:{self.worker_name}",
+                                    session_id=self.session_id or "",
+                                )
+                                global_event_bus.publish(evt)
+                            except Exception:
+                                pass
+                        # Drain stale None/unblock signals left by pause() so
+                        # they are not misinterpreted as stop signals.
+                        try:
+                            while True:
+                                item = self._input_queue.get_nowait()
+                                if item is not None:
+                                    # Real query — put it back in front
+                                    self._input_queue.put(item)
+                                    break
+                        except queue.Empty:
+                            pass
+                    continue
                 # send_query enqueues (query_id, query[, reply_q]) tuples so
                 # replies can be correlated and routed to the caller's private
                 # queue; plain-string producers (WLM handler, initial
@@ -2220,7 +2310,13 @@ class WorkerThread(threading.Thread):
                     # Preserve paused status — don't overwrite with "ready"
                     self.status = "paused"
                     self._write_status_file()
-                    self._publish_event('worker_paused', {'status': 'paused', 'worker_name': self.worker_name})
+                    self._publish_event('worker_paused', {
+                        'status': 'paused',
+                        'worker_name': self.worker_name,
+                        'session_id': self.session_id or "",
+                        'current_context_tokens': self.get_current_context_tokens(),
+                        'max_context_tokens': self.max_context_tokens,
+                    })
                     # Also publish to global_event_bus so the bridge receives it
                     if global_event_bus is not None and EventType is not None and create_event is not None:
                         try:
@@ -2250,6 +2346,21 @@ class WorkerThread(threading.Thread):
                         self._worker_ctx.compact_after_summary()
                     self._save_context()
 
+                    # Terminalize any in-flight job: a Pause All during an
+                    # async job must not strand it as 'running' forever, and a
+                    # later resume must not complete or restart it (BUG 2).
+                    if self._current_query_id is not None:
+                        try:
+                            _registry = _get_worker_job_registry()
+                            if _registry is not None:
+                                _registry.terminalize(
+                                    self._current_query_id,
+                                    status="paused",
+                                    envelope={"content": reply, "status": "paused"},
+                                )
+                        except Exception:
+                            pass
+
                     # Send the pause response back to the waiting tool call.
                     # A correlated (legacy send_query) caller needs the query id
                     # echoed so it can accept the reply; plain-string producers
@@ -2275,7 +2386,13 @@ class WorkerThread(threading.Thread):
                     self.status = "ready"
                     self._resume_event.clear()
                     self._write_status_file()
-                    self._publish_event('worker_resumed', {'status': 'ready', 'worker_name': self.worker_name})
+                    self._publish_event('worker_resumed', {
+                        'status': 'ready',
+                        'worker_name': self.worker_name,
+                        'session_id': self.session_id or "",
+                        'current_context_tokens': self.get_current_context_tokens(),
+                        'max_context_tokens': self.max_context_tokens,
+                    })
                     if global_event_bus is not None and EventType is not None and create_event is not None:
                         try:
                             evt = create_event(
@@ -3853,6 +3970,24 @@ class Worker(ToolBase):
             return {
                 "error": "worker_query is required for action 'query'",
             }
+
+        if thread.status == "paused":
+            # A paused worker must never be queried destructively (BUG 3):
+            # the old behavior blocked up to 300s, then stopped the worker
+            # and reclaimed its containers. Manual-only pauses reject the
+            # query immediately (non-destructively); normal pauses are
+            # auto-resumed and the query proceeds normally below.
+            if getattr(thread, "_manual_only_pause", False):
+                return {
+                    "status": "paused",
+                    "message": "Worker is manually paused",
+                    "worker_name": self.worker_name,
+                    "session_id": self.session_id or "",
+                }
+            try:
+                thread.resume()
+            except Exception:
+                pass
 
         try:
             # Block until the worker responds

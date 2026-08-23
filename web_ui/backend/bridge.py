@@ -616,6 +616,7 @@ class WebAgentBridge:
                             'context_updated', 'context_cleared', 'context_summarized',
                             'token_recovery', 'token_warning', 'turn_warning', 'time_warning',
                             'user_message', 'system_notification',
+                            'worker_paused', 'worker_resumed',
                             ]
         log('DEBUG', 'pipeline.bridge',
             f"_subscribe_to_worker_bus [worker={worker_name}]: "

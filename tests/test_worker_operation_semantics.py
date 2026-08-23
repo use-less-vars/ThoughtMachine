@@ -911,5 +911,200 @@ class TestWorkerPauseResumeSemantics(_OpSemBase):
         WorkerThread._cleanup_worker_containers(no_cm)  # must not raise
 
 
+# ══════════════════════════════════════════════════════════════════════
+# Unit D — pause/resume non-destructiveness + job terminalization (E5)
+#══════════════════════════════════════════════════════════════════════
+
+import pytest
+
+from tests.test_worker_sync_query_timeout_containment import (
+    _FakeContainerManager,
+    _owned_container,
+    _spawn_worker,
+    _wait_until,
+)
+
+from tools.workspace import worker as worker_module
+
+
+@pytest.fixture(autouse=True)
+def _registry_teardown():
+    """run() does not unregister threads — pop added registry keys and
+    stop/join any stragglers so nothing leaks into later tests."""
+    with worker_module._registry_lock:
+        preexisting = set(worker_module._worker_registry.keys())
+    yield
+    with worker_module._registry_lock:
+        added = [k for k in worker_module._worker_registry.keys() if k not in preexisting]
+        threads = [worker_module._worker_registry.pop(k, None) for k in added]
+    for t in threads:
+        if t is None:
+            continue
+        try:
+            t.stop()
+        except Exception:
+            pass
+        t.join(timeout=5)
+
+
+def _fake_tool_loop(self, query):
+    """Scripted _run_tool_loop: sets the telemetry attribute run() reads
+    directly (worker.py L2485) and returns a JSON reply."""
+    self._last_elapsed_val = 0.0
+    return json.dumps({"response": "ok", "query": query})
+
+
+def _capture_events(thread):
+    events = []
+    orig = thread._publish_event
+
+    def capture(etype, data):
+        events.append((etype, dict(data)))
+        orig(etype, data)
+
+    thread._publish_event = capture
+    return events
+
+
+def test_pause_idle_worker_is_non_destructive(tmp_path, monkeypatch):
+    """Idle pause/resume must not stop/remove containers and must not kill
+    the worker; the worker must still answer queries afterwards."""
+    cm = _FakeContainerManager([_owned_container("c-owned", "w1-ctr", "sess-p:w1")])
+    thread = _spawn_worker(tmp_path, monkeypatch, "w1", "sess-p", container_manager=cm)
+    thread._save_context = lambda: None  # instance shadow survives monkeypatch teardown
+    events = _capture_events(thread)
+
+    thread.pause()
+    assert _wait_until(lambda: thread.status == "paused" and thread.is_alive()), (
+        f"worker did not reach paused (status={thread.status})"
+    )
+    paused = [d for e, d in events if e == "worker_paused"]
+    assert paused, f"no worker_paused event: {events}"
+    assert paused[-1]["status"] == "paused"
+    assert paused[-1]["worker_name"] == "w1"
+    assert paused[-1]["session_id"] == "sess-p"
+    assert "current_context_tokens" in paused[-1]
+    assert "max_context_tokens" in paused[-1]
+    # Non-destructive: no container was stopped or removed.
+    assert cm.stopped == [] and cm.removed == []
+
+    thread.resume()
+    # resume() flips status to 'ready' synchronously; wait for the worker
+    # thread to actually publish worker_resumed (race-free signal).
+    assert _wait_until(lambda: any(e == "worker_resumed" for e, _ in events)), (
+        f"no worker_resumed event: {events}"
+    )
+    resumed = [d for e, d in events if e == "worker_resumed"]
+    assert resumed[-1]["status"] == "ready"
+    assert _wait_until(lambda: thread.status == "ready" and thread.is_alive()), (
+        f"worker did not resume (status={thread.status})"
+    )
+
+    # Still fully functional: run a real query through the queue path.
+    monkeypatch.setattr(WorkerThread, "_run_tool_loop", _fake_tool_loop)
+    thread._agent = object()
+    reply_q = queue.Queue()
+    thread._input_queue.put(("q1", "hello", reply_q))
+    envelope = json.loads(reply_q.get(timeout=10))
+    assert envelope["query_id"] == "q1"
+    assert json.loads(envelope["content"])["response"] == "ok"
+    assert cm.stopped == [] and cm.removed == []
+
+
+def test_pause_all_during_async_job_terminalizes_job(tmp_path, monkeypatch):
+    """Pause All while a job is running must terminalize the job as 'paused'
+    in the job registry, and that terminal state must never be overwritten
+    by a later completion of the same job id."""
+    reg = WorkerJobRegistry(event_bus=None)
+    monkeypatch.setattr(worker_module, "_get_worker_job_registry", lambda: reg)
+    thread = _spawn_worker(tmp_path, monkeypatch, "w1", "sess-2")
+    thread._save_context = lambda: None  # instance shadow survives monkeypatch teardown
+
+    busy_started = threading.Event()
+    release = threading.Event()
+
+    def blocking_tool_loop(self, query):
+        busy_started.set()
+        assert release.wait(timeout=15)
+        self._last_elapsed_val = 0.0
+        return json.dumps({"response": "done", "query": query})
+
+    monkeypatch.setattr(WorkerThread, "_run_tool_loop", blocking_tool_loop)
+    thread._agent = object()
+
+    job_id = "job-pause-1"
+    reg.register(job_id, "w1", session_id="sess-2")
+    reply_q = queue.Queue()
+    thread._input_queue.put((job_id, "task", reply_q))
+    assert busy_started.wait(timeout=5.0), "worker never became busy"
+    assert thread.status == "busy"
+
+    thread.pause()  # Pause All while the job is mid-flight
+    release.set()
+    assert _wait_until(lambda: thread.status == "paused"), thread.status
+    assert reg.job(job_id)["status"] == "paused"
+
+    thread.resume()
+    assert _wait_until(lambda: thread.status == "ready"), thread.status
+    assert reg.job(job_id)["status"] == "paused"  # terminal, unchanged
+
+    # A later completion of the SAME job id must not clobber the terminal state.
+    reply_q2 = queue.Queue()
+    thread._input_queue.put((job_id, "again", reply_q2))
+    envelope2 = json.loads(reply_q2.get(timeout=10))
+    assert json.loads(envelope2["content"])["response"] == "done"
+    assert reg.job(job_id)["status"] == "paused"
+
+
+def test_sync_query_to_paused_worker_auto_resumes(tmp_path, monkeypatch):
+    """A synchronous query to a paused worker must auto-resume it (non-manual
+    pause only) and still deliver the reply."""
+    thread = _spawn_worker(tmp_path, monkeypatch, "w1", "sess-3")
+    thread._save_context = lambda: None  # instance shadow survives monkeypatch teardown
+    thread.pause()
+    assert _wait_until(lambda: thread.status == "paused"), thread.status
+    events = _capture_events(thread)
+
+    monkeypatch.setattr(WorkerThread, "_run_tool_loop", _fake_tool_loop)
+    thread._agent = object()
+
+    tool = Worker(action="query", worker_name="w1", worker_query="hello", session_id="sess-3")
+    t0 = time.monotonic()
+    envelope = tool._action_query([])
+    elapsed = time.monotonic() - t0
+    assert elapsed < 10.0, f"auto-resume took {elapsed:.1f}s"
+    assert envelope["worker_name"] == "w1"
+    payload = json.loads(envelope["response"])
+    assert payload["query_id"]
+    assert json.loads(payload["content"])["response"] == "ok"
+    assert thread.status == "ready" and thread.is_alive()
+    resumed = [d for e, d in events if e == "worker_resumed"]
+    assert resumed and resumed[-1]["status"] == "ready", f"no worker_resumed: {events}"
+
+
+def test_sync_query_to_manual_only_paused_worker_is_non_destructive(tmp_path, monkeypatch):
+    """A synchronous query to a MANUALLY paused worker must short-circuit with
+    a 'paused' result and leave the worker paused and alive (no auto-resume,
+    no spawn, no stop)."""
+    thread = _spawn_worker(tmp_path, monkeypatch, "w1", "sess-4")
+    thread._save_context = lambda: None  # instance shadow survives monkeypatch teardown
+    thread._manual_only_pause = True
+    thread.pause()
+    assert _wait_until(lambda: thread.status == "paused"), thread.status
+
+    tool = Worker(action="query", worker_name="w1", worker_query="hello", session_id="sess-4")
+    t0 = time.monotonic()
+    envelope = tool._action_query([])
+    elapsed = time.monotonic() - t0
+    assert elapsed < 5.0, f"manual-pause short-circuit took {elapsed:.1f}s"
+    assert envelope == {
+        "status": "paused",
+        "message": "Worker is manually paused",
+        "worker_name": "w1",
+        "session_id": "sess-4",
+    }
+    assert thread.status == "paused" and thread.is_alive()
+
+
 if __name__ == "__main__":
     unittest.main()

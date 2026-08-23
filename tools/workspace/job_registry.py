@@ -42,6 +42,10 @@ _JOB_EVENT_TYPES = (
     "worker_error",
 )
 
+# Statuses that are final: once a job reaches one of these it must never
+# transition again (no overwriting a paused/timeout/completed job).
+TERMINAL_STATUSES = ("completed", "paused", "timeout", "error", "stopped", "interrupted")
+
 
 def _now_iso() -> str:
     """Current UTC time as an ISO-8601 string."""
@@ -153,15 +157,61 @@ class WorkerJobRegistry:
             job["updated_at"] = _now_iso()
             return copy.deepcopy(job)
 
+    def terminalize(self, job_id: str, status: str = "paused",
+                    envelope=None) -> Optional[dict]:
+        """Terminate a job with a non-completed terminal status (no-op if already terminal).
+
+        Used when a job is interrupted (e.g. Pause All while the worker is
+        mid-query): the in-flight job must not stay 'running' forever and
+        must not later be completed or restarted. Creates the record on
+        demand (like ``complete``) so synchronous query paths that carry a
+        query_id also get a terminal record.
+        """
+        with self._lock:
+            existing = self._jobs.get(job_id)
+            if existing is not None and existing.get("status") in TERMINAL_STATUSES:
+                return copy.deepcopy(existing)
+            job = existing
+            if job is None:
+                self._evict_if_needed_locked()
+                now = _now_iso()
+                job = {
+                    "job_id": job_id,
+                    "worker_name": None,
+                    "session_id": "",
+                    "instance_id": None,
+                    "status": "submitted",
+                    "created_at": now,
+                    "updated_at": now,
+                    "completed_at": None,
+                    "preview": "",
+                    "result": None,
+                }
+                self._jobs[job_id] = job
+            job["status"] = status
+            if envelope is not None:
+                job["result"] = copy.deepcopy(envelope) if isinstance(envelope, dict) else envelope
+                job["preview"] = (
+                    str((envelope or {}).get("content", ""))[:PREVIEW_CAP]
+                    if isinstance(envelope, dict)
+                    else ""
+                )
+            job["completed_at"] = _now_iso()
+            job["updated_at"] = job["completed_at"]
+            return copy.deepcopy(job)
+
     def complete(self, job_id: str, envelope) -> Optional[dict]:
         """Store the final result envelope for a job (status -> completed).
 
         Creates the record on demand so jobs that were never explicitly
         registered (e.g. synchronous query paths that still carry a
-        query_id) still end up with a completed record.
+        query_id) still end up with a completed record. Jobs that already
+        reached a terminal status are left untouched.
         """
         with self._lock:
             job = self._jobs.get(job_id)
+            if job is not None and job.get("status") in TERMINAL_STATUSES:
+                return copy.deepcopy(job)
             if job is None:
                 self._evict_if_needed_locked()
                 now = _now_iso()
