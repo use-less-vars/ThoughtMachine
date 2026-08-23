@@ -1422,6 +1422,16 @@ class WorkerThread(threading.Thread):
             except Exception as exc:
                 log("WARNING", "tools.worker",
                     f"WLM resume delegation failed for worker '{self.worker_name}': {exc}")
+        # Remove any stale pause command file left by pause() while the
+        # worker was busy (it would re-pause the worker on the next poll).
+        # This MUST happen before _pause_event.clear(): the pause park loop
+        # exits as soon as the event is cleared, so the file must already be
+        # gone before the worker can wake and poll it again.  Symmetric with
+        # stop()/pause() command file writes.
+        try:
+            (self._worker_dir / "command.json").unlink(missing_ok=True)
+        except OSError:
+            pass
         self._pause_event.clear()
         self._resume_event.set()
         self.status = "ready"
@@ -2112,7 +2122,7 @@ class WorkerThread(threading.Thread):
                     raw = self._input_queue.get(timeout=2.0)
                 except queue.Empty:
                     self._heartbeat_tick()
-                    raw = None
+                    continue
                 if self._stop_event.is_set():
                     break
                 if raw is None:
@@ -2198,7 +2208,10 @@ class WorkerThread(threading.Thread):
                                     break
                         except queue.Empty:
                             pass
-                    continue
+                        continue
+                    # Bare None with no pause and no stop event is the legacy
+                    # stop sentinel. Preserve that contract.
+                    break
                 # send_query enqueues (query_id, query[, reply_q]) tuples so
                 # replies can be correlated and routed to the caller's private
                 # queue; plain-string producers (WLM handler, initial
