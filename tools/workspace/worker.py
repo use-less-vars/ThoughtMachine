@@ -1434,6 +1434,12 @@ class WorkerThread(threading.Thread):
             pass
         self._pause_event.clear()
         self._resume_event.set()
+        # UNIT C: the worker is now actually running again, so the manual-only
+        # marker is stale.  Clear it so later queries/spawns do not treat this
+        # worker as manually paused (the REST fast-path resume reaches this
+        # method without going through _action_resume, which used to be the
+        # only place that cleared the marker).
+        self._manual_only_pause = False
         self.status = "ready"
         self._write_status_file()
 
@@ -1469,6 +1475,9 @@ class WorkerThread(threading.Thread):
                 cmd_path.unlink(missing_ok=True)
                 self._pause_event.clear()
                 self._resume_event.set()
+                # Mirrors WorkerThread.resume(): the worker keeps running, so
+                # the manual-only marker is stale and must be cleared too.
+                self._manual_only_pause = False
         except (json.JSONDecodeError, OSError):
             # Corrupted file — delete and ignore
             try:

@@ -53,6 +53,9 @@ class _FakeContext:
     def estimated_context_tokens(self):
         return 10
 
+    def to_persistable_dict(self):
+        return {"user_history": self.user_history}
+
 
 class _FakeContainer:
     def __init__(self, cid, name, labels=None, image=""):

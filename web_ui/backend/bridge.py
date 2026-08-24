@@ -86,6 +86,7 @@ try:
     from agent.events import (
         global_event_bus, EventType, SecurityPromptEvent,
         WorkerSpawnedEvent, WorkerStatusEvent, WorkerCompletedEvent, WorkerErrorEvent,
+        WorkerPartialResultEvent,
         TokenWarningEvent, BaseEvent,
         ToolCallEvent, ToolResultEvent, AssistantMessageEvent, WorkerMessageEvent,
     )
@@ -98,6 +99,7 @@ except ImportError:
     WorkerStatusEvent = None
     WorkerCompletedEvent = None
     WorkerErrorEvent = None
+    WorkerPartialResultEvent = None
     TokenWarningEvent = None
     ToolCallEvent = None
     ToolResultEvent = None
@@ -141,6 +143,36 @@ from web_ui.backend.session_manager import SessionManager
 # session load calls within the same bridge instance.
 _workspace_id_cache: Dict[str, str] = {}
 _workspace_cache_lock = threading.Lock()
+
+
+# ── Worker instance label helpers ──────────────────────────────────────────────────
+# Instance labels mirror WorkerRegistry.instance_label semantics: "<name>" for
+# instance 1 and "<name>#<N>" for N>1.  The worker registry keys per-worker
+# EventBuses by these labels (get_event_buses_for_session), so the bridge keys
+# its per-worker subscriptions the same way to keep instances distinct.
+
+
+def _worker_instance_label(worker_name: str, instance_id: Optional[int]) -> str:
+    """Build the instance label for a worker (mirrors WorkerRegistry.instance_label).
+
+    None/1 → bare worker name, N>1 → ``<name>#<N>``.
+    """
+    if not instance_id or instance_id == 1:
+        return worker_name
+    return f"{worker_name}#{instance_id}"
+
+
+def _worker_instance_parts(label: str) -> Tuple[str, int]:
+    """Split an instance label into ``(base_name, instance_id)``.
+
+    Labels are ``<name>`` for instance 1 and ``<name>#<N>`` for N>1.  A trailing
+    ``#<int>`` suffix belongs to that instance; anything else is a bare name
+    (instance 1).
+    """
+    base, sep, suffix = label.rpartition('#')
+    if sep and suffix.isdigit():
+        return base, int(suffix)
+    return label, 1
 
 
 def _build_workspace_id_cache() -> Dict[str, str]:
@@ -193,6 +225,23 @@ def _resolve_workspace_id(workspace_path: str) -> Optional[str]:
         pass
 
     return None
+
+def _worker_is_running_async_job(thread: Any) -> bool:
+    """Return True when *thread* is currently executing a submit_query (async) job.
+
+    Async jobs are enqueued by ``action='submit_query'`` as ``(job_id, query,
+    None)`` tuples; the run loop mirrors them onto ``_current_query_id`` (set)
+    while ``_current_reply_queue`` stays None (a synchronous ``send_query``
+    carries a private reply queue instead).  The ``status == "busy"`` guard
+    excludes idle workers whose ``_current_query_id`` is never reset between
+    queries, so only a worker that is actively running an async job is skipped.
+    """
+    return (
+        getattr(thread, "status", None) == "busy"
+        and getattr(thread, "_current_query_id", None) is not None
+        and getattr(thread, "_current_reply_queue", None) is None
+    )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Bridge class
@@ -261,6 +310,7 @@ class WebAgentBridge:
         self._worker_status_sub = None
         self._worker_completed_sub = None
         self._worker_error_sub = None
+        self._worker_partial_result_sub = None
         self._worker_token_warning_sub = None
         self._worker_message_sub = None
         # Per-worker EventBus subscriptions (worker_name -> {event_type: sub_handle})
@@ -369,6 +419,8 @@ class WebAgentBridge:
                 event_dict = {
                     'type': f'worker:{event.type.value}',
                     'worker_name': data.get('worker_name', ''),
+                    'instance_id': data.get('instance_id'),
+                    'instance_label': data.get('instance_label'),
                     'timestamp': event.metadata.timestamp.isoformat(),
                     'data': data,
                 }
@@ -400,6 +452,9 @@ class WebAgentBridge:
         self._worker_error_sub = global_event_bus.subscribe(
             EventType.WORKER_ERROR, self._on_worker_error
         )
+        self._worker_partial_result_sub = global_event_bus.subscribe(
+            EventType.WORKER_PARTIAL_RESULT, _make_handler(WorkerPartialResultEvent)
+        )
         self._worker_token_warning_sub = global_event_bus.subscribe(
             EventType.TOKEN_WARNING, self._on_worker_token_warning
         )
@@ -427,14 +482,14 @@ class WebAgentBridge:
         try:
             from tools.workspace.worker_registry import WorkerRegistry as _WorkerRegistry
             buses = _WorkerRegistry.get_instance().get_event_buses_for_session(session_id)
-            for worker_name, bus in buses.items():
-                if worker_name in self._worker_bus_subs:
+            for worker_label, bus in buses.items():
+                if worker_label in self._worker_bus_subs:
                     log('DEBUG', 'pipeline.bridge',
-                        f"[DISCOVERY] Already subscribed to {worker_name}, skipping")
+                        f"[DISCOVERY] Already subscribed to {worker_label}, skipping")
                     continue
                 log('INFO', 'server.bridge',
-                    f"[DISCOVERY] Found existing worker: {worker_name} \u2014 subscribing to per-worker bus")
-                self._subscribe_to_worker_bus(worker_name, bus)
+                    f"[DISCOVERY] Found existing worker: {worker_label} \u2014 subscribing to per-worker bus")
+                self._subscribe_to_worker_bus(worker_label, bus)
         except ImportError:
             log('DEBUG', 'server.bridge',
                 "[DISCOVERY] get_worker_event_buses_for_session not available")
@@ -501,6 +556,7 @@ class WebAgentBridge:
             ('_worker_status_sub',),
             ('_worker_completed_sub',),
             ('_worker_error_sub',),
+            ('_worker_partial_result_sub',),
             ('_worker_token_warning_sub',),
             ('_worker_message_sub',),
         ]
@@ -514,9 +570,9 @@ class WebAgentBridge:
                     pass
                 setattr(self, attr_name, None)
 
-        # Clean up all per-worker bus subscriptions
-        for worker_name in list(self._worker_bus_subs.keys()):
-            self._unsubscribe_worker_bus(worker_name)
+        # Clean up all per-worker bus subscriptions (keyed by instance label)
+        for worker_label in list(self._worker_bus_subs.keys()):
+            self._unsubscribe_worker_bus(worker_label)
         self._worker_bus_subs.clear()
 
     # ── Per-worker EventBus subscription management ───────────────────────────
@@ -534,6 +590,8 @@ class WebAgentBridge:
 
         # Only handle events for this bridge's session
         worker_name = data.get('worker_name', '')
+        instance_id = data.get('instance_id') or 1
+        worker_label = _worker_instance_label(worker_name, instance_id)
         session_id = data.get('session_id', self._session_id or '')
         log('DEBUG', 'pipeline.bridge',
             f"[TOKEN_PIPELINE] bridge._on_worker_spawned: worker_name={worker_name!r}, "
@@ -550,21 +608,21 @@ class WebAgentBridge:
 
         # Guard against duplicate subscriptions — if already subscribed for this
         # worker, skip re-subscribing to avoid duplicate events on the frontend.
-        if worker_name in self._worker_bus_subs:
+        if worker_label in self._worker_bus_subs:
             log('DEBUG', 'pipeline.bridge',
-                f"_on_worker_spawned: already subscribed for {worker_name}, "
+                f"_on_worker_spawned: already subscribed for {worker_label}, "
                 f"skipping duplicate subscription")
         else:
             # Subscribe to per-worker EventBus for detailed events
             # This must happen regardless of _event_callbacks to avoid
             # a race where the event arrives before any WebSocket client connects.
             if worker_name and WORKER_BUS_AVAILABLE and get_worker_event_bus is not None:
-                worker_bus = get_worker_event_bus(session_id, worker_name)
+                worker_bus = get_worker_event_bus(session_id, worker_name, instance_id=instance_id)
                 if worker_bus is not None:
                     log('DEBUG', 'pipeline.bridge',
-                        f"_on_worker_spawned: found per-worker bus for {worker_name}, "
+                        f"_on_worker_spawned: found per-worker bus for {worker_label}, "
                         f"subscribing to detailed events")
-                    self._subscribe_to_worker_bus(worker_name, worker_bus)
+                    self._subscribe_to_worker_bus(worker_label, worker_bus)
                 else:
                     log('WARNING', 'server.bridge',
                         f'Per-worker EventBus for {worker_name} (session={session_id}) not found '
@@ -582,6 +640,8 @@ class WebAgentBridge:
         event_dict = {
             'type': f'worker:{event.type.value}',
             'worker_name': worker_name,
+            'instance_id': instance_id,
+            'instance_label': worker_label,
             'timestamp': event.metadata.timestamp.isoformat(),
             'data': data,
         }
@@ -599,14 +659,16 @@ class WebAgentBridge:
                 log('ERROR', 'server.bridge',
                     f'Failed to forward worker event: {exc}')
 
-    def _subscribe_to_worker_bus(self, worker_name: str, worker_bus: Any) -> None:
+    def _subscribe_to_worker_bus(self, worker_label: str, worker_bus: Any) -> None:
         """
-        Subscribe to a worker's per-worker EventBus for detailed real-time
-        events (tool_call, tool_result, token_warning, worker_message, etc.).
+        Subscribe to a worker instance's per-worker EventBus for detailed
+        real-time events (tool_call, tool_result, token_warning, worker_message,
+        etc.).  *worker_label* is the instance label (``<name>`` or ``<name>#<N>``)
+        that this bridge uses to key per-worker subscriptions.
         """
         if not EVENT_SYSTEM_AVAILABLE or EventType is None:
             log('DEBUG', 'pipeline.bridge',
-                f"_subscribe_to_worker_bus: cannot subscribe for {worker_name}, "
+                f"_subscribe_to_worker_bus: cannot subscribe for {worker_label}, "
                 f"EVENT_SYSTEM_AVAILABLE={EVENT_SYSTEM_AVAILABLE}, EventType={'SET' if EventType else 'NONE'}")
             return
 
@@ -619,7 +681,7 @@ class WebAgentBridge:
                             'worker_paused', 'worker_resumed',
                             ]
         log('DEBUG', 'pipeline.bridge',
-            f"_subscribe_to_worker_bus [worker={worker_name}]: "
+            f"_subscribe_to_worker_bus [worker={worker_label}]: "
             f"subscribing to {len(subscribed_types)} event types: {subscribed_types}")
 
         subs = {}
@@ -629,7 +691,7 @@ class WebAgentBridge:
                 data = event.data or {}
                 # [PIPELINE:HOPS] Per-worker bus handler entry
                 log('DEBUG', 'pipeline.hops',
-                    f"[PIPELINE:HOPS] bridge._make_bus_handler entry [worker={worker_name}]: "
+                    f"[PIPELINE:HOPS] bridge._make_bus_handler entry [worker={worker_label}]: "
                     f"original_type={original_type!r}, "
                     f"data_keys={list(data.keys())}, "
                     f"n_callbacks={len(self._forwarder._callbacks)}")
@@ -641,7 +703,9 @@ class WebAgentBridge:
                         'input': data.get('total_input', 0),
                         'output': data.get('total_output', 0),
                         'source': 'worker',
-                        'worker_name': data.get('worker_name', worker_name),
+                        'worker_name': data.get('worker_name', worker_label),
+                        'instance_id': data.get('instance_id', _worker_instance_parts(worker_label)[1]),
+                        'instance_label': data.get('instance_label', worker_label),
                     }
                 elif original_type == 'context_updated':
                     context_length_val = data.get('context_length', 0)
@@ -651,23 +715,25 @@ class WebAgentBridge:
                     else:
                         display_str = str(context_length_val)
                     # Event-level dedup: skip if same formatted display string already forwarded
-                    last_display = self._last_context_updated.get(worker_name)
+                    last_display = self._last_context_updated.get(worker_label)
                     if last_display is not None and display_str == last_display:
                         log('DEBUG', 'pipeline.bridge',
-                            f"Dedup context_updated for {worker_name}: "
+                            f"Dedup context_updated for {worker_label}: "
                             f"skipping duplicate context_length={context_length_val} "
                             f"(display={display_str!r})")
                         return
-                    self._last_context_updated[worker_name] = display_str
+                    self._last_context_updated[worker_label] = display_str
                     log('DEBUG', 'pipeline.hops',
                         f"[PIPELINE:HOPS] bridge forwarding context_updated: "
-                        f"worker={worker_name} "
+                        f"worker={worker_label} "
                         f"context_length={data.get('context_length', '?')}")
                     event_dict = {
                         'type': 'worker:context_updated',
                         'context_length': context_length_val,
                         'source': 'worker',
-                        'worker_name': data.get('worker_name', worker_name),
+                        'worker_name': data.get('worker_name', worker_label),
+                        'instance_id': data.get('instance_id', _worker_instance_parts(worker_label)[1]),
+                        'instance_label': data.get('instance_label', worker_label),
                         'timestamp': (
                             event.metadata.timestamp.isoformat()
                             if hasattr(event, 'metadata') and event.metadata
@@ -677,7 +743,9 @@ class WebAgentBridge:
                 elif original_type == 'context_summarized':
                     event_dict = {
                         'type': 'worker:context_summarized',
-                        'worker_name': data.get('worker_name', worker_name),
+                        'worker_name': data.get('worker_name', worker_label),
+                        'instance_id': data.get('instance_id', _worker_instance_parts(worker_label)[1]),
+                        'instance_label': data.get('instance_label', worker_label),
                         'message': data.get('message', 'Context has been summarized'),
                         'timestamp': (
                             event.metadata.timestamp.isoformat()
@@ -689,7 +757,9 @@ class WebAgentBridge:
                 else:
                     event_dict = {
                         'type': f'worker:{original_type}',
-                        'worker_name': data.get('worker_name', worker_name),
+                        'worker_name': data.get('worker_name', worker_label),
+                        'instance_id': data.get('instance_id', _worker_instance_parts(worker_label)[1]),
+                        'instance_label': data.get('instance_label', worker_label),
                         'timestamp': (
                             event.metadata.timestamp.isoformat()
                             if hasattr(event, 'metadata') and event.metadata
@@ -706,11 +776,11 @@ class WebAgentBridge:
                     self._buffer_worker_event(event_dict)
                 if not self._forwarder._callbacks:
                     log('DEBUG', 'pipeline.bridge',
-                        f"Per-worker bus handler for {worker_name}/{original_type}: "
+                        f"Per-worker bus handler for {worker_label}/{original_type}: "
                         f"NO event_callbacks registered, buffered event (replay on next connect)")
                     return
                 log('DEBUG', 'pipeline.bridge',
-                    f"[TOKEN_PIPELINE] bridge per-worker bus handler [{worker_name}/{original_type}]: "
+                    f"[TOKEN_PIPELINE] bridge per-worker bus handler [{worker_label}/{original_type}]: "
                     f"forwarding type={event_dict.get('type')}, "
                     f"worker={event_dict.get('worker_name', 'N/A')}, "
                     f"data_keys={list(data.keys())}, "
@@ -747,41 +817,48 @@ class WebAgentBridge:
                 worker_bus.subscribe(evt_enum, handler_fn)
                 subs[evt_enum] = (evt_enum, handler_fn)
                 log('DEBUG', 'pipeline.bridge',
-                    f"Subscribed to {evt_type!r} on per-worker bus for {worker_name}")
+                    f"Subscribed to {evt_type!r} on per-worker bus for {worker_label}")
             except (ValueError, Exception) as exc:
                 log('DEBUG', 'server.bridge',
-                    f'Could not subscribe to {evt_type} for {worker_name}: {exc}')
+                    f'Could not subscribe to {evt_type} for {worker_label}: {exc}')
 
-        self._worker_bus_subs[worker_name] = subs
+        self._worker_bus_subs[worker_label] = subs
         log('INFO', 'server.bridge',
-            f'Subscribed to per-worker bus for {worker_name} ({len(subs)} event types)')
+            f'Subscribed to per-worker bus for {worker_label} ({len(subs)} event types)')
         log('DEBUG', 'pipeline.bridge',
-            f"_subscribe_to_worker_bus complete [worker={worker_name}]: "
+            f"_subscribe_to_worker_bus complete [worker={worker_label}]: "
             f"{len(subs)}/{len(subscribed_types)} subscriptions successful")
         if len(subs) < len(subscribed_types):
             missing = [t for t in subscribed_types
                        if EventType(t) not in subs]
             log('WARNING', 'pipeline.bridge',
-                f"_subscribe_to_worker_bus [worker={worker_name}]: "
+                f"_subscribe_to_worker_bus [worker={worker_label}]: "
                 f"FAILED to subscribe to: {missing}")
 
-    def _unsubscribe_worker_bus(self, worker_name: str) -> None:
-        """Unsubscribe all per-worker bus subscriptions for a worker."""
-        subs = self._worker_bus_subs.pop(worker_name, {})
+    def _unsubscribe_worker_bus(self, worker_label: str) -> None:
+        """Unsubscribe all per-worker bus subscriptions for a worker instance.
+
+        *worker_label* is the instance label (``<name>`` or ``<name>#<N>``) that
+        ``_subscribe_to_worker_bus`` keyed the subscriptions under.
+        """
+        subs = self._worker_bus_subs.pop(worker_label, {})
         # Clean up context_updated dedup tracking
-        self._last_context_updated.pop(worker_name, None)
+        self._last_context_updated.pop(worker_label, None)
         if not subs:
             return
+        base_name, instance_id = _worker_instance_parts(worker_label)
         for evt_type_key, (stored_evt_type, callback_fn) in subs.items():
             try:
                 if WORKER_BUS_AVAILABLE and get_worker_event_bus is not None:
-                    worker_bus = get_worker_event_bus(self._session_id or '', worker_name)
+                    worker_bus = get_worker_event_bus(
+                        self._session_id or '', base_name, instance_id=instance_id
+                    )
                     if worker_bus is not None and hasattr(worker_bus, 'unsubscribe'):
                         worker_bus.unsubscribe(stored_evt_type, callback_fn)
             except Exception:
                 pass
         log('INFO', 'server.bridge',
-            f'Unsubscribed from per-worker bus for {worker_name}')
+            f'Unsubscribed from per-worker bus for {worker_label}')
 
     def _on_worker_completed(self, event: WorkerCompletedEvent) -> None:
         """
@@ -789,9 +866,12 @@ class WebAgentBridge:
         the per-worker EventBus.
         """
         self._forward_worker_event(event)
-        worker_name = (event.data or {}).get('worker_name', '')
+        data = event.data or {}
+        worker_name = data.get('worker_name', '')
         if worker_name:
-            self._unsubscribe_worker_bus(worker_name)
+            self._unsubscribe_worker_bus(
+                _worker_instance_label(worker_name, data.get('instance_id') or 1)
+            )
 
     def _on_worker_error(self, event: WorkerErrorEvent) -> None:
         """
@@ -799,9 +879,12 @@ class WebAgentBridge:
         the per-worker EventBus.
         """
         self._forward_worker_event(event)
-        worker_name = (event.data or {}).get('worker_name', '')
+        data = event.data or {}
+        worker_name = data.get('worker_name', '')
         if worker_name:
-            self._unsubscribe_worker_bus(worker_name)
+            self._unsubscribe_worker_bus(
+                _worker_instance_label(worker_name, data.get('instance_id') or 1)
+            )
 
     def _forward_worker_event(self, event: Any) -> None:
         """Forward a worker lifecycle event to frontend (shared handler logic)."""
@@ -821,6 +904,8 @@ class WebAgentBridge:
         event_dict = {
             'type': f'worker:{event.type.value}',
             'worker_name': data.get('worker_name', ''),
+            'instance_id': data.get('instance_id'),
+            'instance_label': data.get('instance_label'),
             'timestamp': event.metadata.timestamp.isoformat(),
             'data': data,
         }
@@ -1187,6 +1272,10 @@ class WebAgentBridge:
                     else:
                         sid, wname = key
                     if sid == self._session_id:
+                        if _worker_is_running_async_job(thread):
+                            log('INFO', 'server.bridge',
+                                f'Skip pause of worker {wname}: async job in progress')
+                            continue
                         try:
                             thread.pause()
                             log('INFO', 'server.bridge', f'Worker paused: {wname}')
@@ -1210,6 +1299,8 @@ class WebAgentBridge:
                     else:
                         sid, wname = key
                     if sid == self._session_id:
+                        if getattr(thread, "status", None) != "paused":
+                            continue
                         try:
                             thread.resume()
                             log('INFO', 'server.bridge', f'Worker resumed: {wname}')
