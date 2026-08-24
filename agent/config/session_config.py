@@ -141,6 +141,10 @@ class SessionConfig(BaseModel):
         default=False,
         description='Enable the ContainerRegistry delegation for container lifecycle in this session (feature flag).',
     )
+    git_allow_worktree_commits: bool = Field(
+        default=False,
+        description='Allow agent commits in operator-managed git worktrees on feat/* or fix/* branches (feature flag).',
+    )
 
     # ── Validators ──────────────────────────────────────────────────────
 
@@ -252,6 +256,7 @@ class SessionConfig(BaseModel):
 
         kwargs['use_workspace_lifecycle_manager'] = bool(self.use_workspace_lifecycle_manager)
         kwargs['use_container_registry'] = bool(self.use_container_registry)
+        kwargs['git_allow_worktree_commits'] = bool(self.git_allow_worktree_commits)
 
         return AgentConfig(**kwargs)
 

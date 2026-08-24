@@ -63,6 +63,7 @@ class AgentConfig(BaseModel):
         'worker_mode': HOT_SWAPPABLE,
         'use_workspace_lifecycle_manager': HOT_SWAPPABLE,
         'use_container_registry': HOT_SWAPPABLE,
+        'git_allow_worktree_commits': HOT_SWAPPABLE,
         'mode': RESTART_REQUIRED,
     }
 
@@ -122,6 +123,10 @@ class AgentConfig(BaseModel):
     use_container_registry: bool = Field(
         default=False,
         description='Enable ContainerRegistry delegation for container lifecycle in worker queries (feature flag).',
+    )
+    git_allow_worktree_commits: bool = Field(
+        default=False,
+        description='Allow agent commits in operator-managed git worktrees on feat/* or fix/* branches (feature flag).',
     )
 
     @field_validator('system_prompt')
