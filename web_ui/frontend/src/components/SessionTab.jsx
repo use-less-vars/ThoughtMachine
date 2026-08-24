@@ -1266,6 +1266,7 @@ export default React.memo(SessionTab, (prevProps, nextProps) => {
     prevProps.isActive === nextProps.isActive &&
     prevProps.selectedWorker?.name === nextProps.selectedWorker?.name &&
     prevProps.selectedWorker?.workspaceId === nextProps.selectedWorker?.workspaceId &&
+    prevProps.selectedWorker?.instance_id === nextProps.selectedWorker?.instance_id &&
     prevProps.onLoggingConfigChanged === nextProps.onLoggingConfigChanged
   )
 })

@@ -104,6 +104,11 @@ function truncate(str, maxLen = 120) {
   return s.slice(0, maxLen) + '…';
 }
 
+// ── Helper: per-instance identity key (name + instance_id) ────────────────
+function workerInstanceKey(w) {
+  return `${w.name}#${w.instance_id ?? '0'}`;
+}
+
 // ── Status dot ─────────────────────────────────────────────────────────────
 function WorkerDot({ status }) {
   const color = STATUS_DOT_COLORS[status] || '#585b70';
@@ -518,31 +523,31 @@ export default function WorkerManagementPanel({
   useEffect(() => {
     const prev = prevSelectedWorkerRef.current;
     if (prev && !selectedWorker) {
-      dismissedWorkersRef.current.add(prev.name);
+      dismissedWorkersRef.current.add(workerInstanceKey(prev));
     }
     prevSelectedWorkerRef.current = selectedWorker;
   }, [selectedWorker]);
 
   useEffect(() => {
-    const currentMap = new Map(workers.map((w) => [w.name, w.runtime_status]));
+    const currentMap = new Map(workers.map((w) => [workerInstanceKey(w), w.runtime_status]));
     const prev = prevStatusMapRef.current;
 
-    for (const [name, status] of currentMap) {
-      if (dismissedWorkersRef.current.has(name)) {
+    for (const [key, status] of currentMap) {
+      if (dismissedWorkersRef.current.has(key)) {
         if (status !== 'busy' && status !== 'ready') {
-          dismissedWorkersRef.current.delete(name);
+          dismissedWorkersRef.current.delete(key);
         }
         continue;
       }
 
-      const prevStatus = prev.get(name);
+      const prevStatus = prev.get(key);
       if (
-        !prev.has(name) ||
+        !prev.has(key) ||
         (prevStatus !== 'ready' && prevStatus !== 'busy' && (status === 'ready' || status === 'busy'))
       ) {
-        const worker = workers.find((w) => w.name === name);
+        const worker = workers.find((w) => workerInstanceKey(w) === key);
         if (worker) {
-          onSelectWorker?.(worker.name, workspaceId);
+          onSelectWorker?.(worker.name, workspaceId, worker.instance_id, worker.instance_label);
         }
         break;
       }
@@ -586,10 +591,12 @@ export default function WorkerManagementPanel({
 
   // ── Stop worker ──────────────────────────────────────────────────────────
   const handleStop = useCallback(
-    async (name) => {
+    async (name, instanceId) => {
+      const key = workerInstanceKey({ name, instance_id: instanceId });
+      const instanceQuery = instanceId != null ? `?instance_id=${instanceId}` : '';
       try {
         const res = await fetch(
-          `/api/workspace/${workspaceId}/workers/${encodeURIComponent(name)}/stop`,
+          `/api/workspace/${workspaceId}/workers/${encodeURIComponent(name)}/stop${instanceQuery}`,
           { method: 'POST' }
         );
         if (!res.ok) {
@@ -597,19 +604,23 @@ export default function WorkerManagementPanel({
           throw new Error(body?.detail?.error || `HTTP ${res.status}`);
         }
         setWorkers((prev) =>
-          prev.map((w) => (w.name === name ? { ...w, runtime_status: 'stopped' } : w))
+          prev.map((w) =>
+            w.name === name && (w.instance_id ?? null) === (instanceId ?? null)
+              ? { ...w, runtime_status: 'stopped' }
+              : w
+          )
         );
         setStopErrors((prev) => {
           const n = { ...prev };
-          delete n[name];
+          delete n[key];
           return n;
         });
       } catch (err) {
-        setStopErrors((prev) => ({ ...prev, [name]: err.message }));
+        setStopErrors((prev) => ({ ...prev, [key]: err.message }));
         setTimeout(() => {
           setStopErrors((prev) => {
             const n = { ...prev };
-            delete n[name];
+            delete n[key];
             return n;
           });
         }, 3000);
@@ -618,10 +629,12 @@ export default function WorkerManagementPanel({
     [workspaceId]
   );
 
-  const handlePause = useCallback(async (name) => {
+  const handlePause = useCallback(async (name, instanceId) => {
+    const key = workerInstanceKey({ name, instance_id: instanceId });
+    const instanceQuery = instanceId != null ? `?instance_id=${instanceId}` : '';
     try {
       const res = await fetch(
-        `/api/workspace/${workspaceId}/workers/${encodeURIComponent(name)}/pause`,
+        `/api/workspace/${workspaceId}/workers/${encodeURIComponent(name)}/pause${instanceQuery}`,
         { method: 'POST' }
       );
       if (!res.ok) {
@@ -629,21 +642,27 @@ export default function WorkerManagementPanel({
         throw new Error(body?.detail?.error || `HTTP ${res.status}`);
       }
       setWorkers((prev) =>
-        prev.map((w) => (w.name === name ? { ...w, runtime_status: 'pausing' } : w))
+        prev.map((w) =>
+          w.name === name && (w.instance_id ?? null) === (instanceId ?? null)
+            ? { ...w, runtime_status: 'pausing' }
+            : w
+        )
       );
-      setStopErrors((prev) => { const n = { ...prev }; delete n[name]; return n; });
+      setStopErrors((prev) => { const n = { ...prev }; delete n[key]; return n; });
     } catch (err) {
-      setStopErrors((prev) => ({ ...prev, [name]: err.message }));
+      setStopErrors((prev) => ({ ...prev, [key]: err.message }));
       setTimeout(() => {
-        setStopErrors((prev) => { const n = { ...prev }; delete n[name]; return n; });
+        setStopErrors((prev) => { const n = { ...prev }; delete n[key]; return n; });
       }, 3000);
     }
   }, [workspaceId]);
 
-  const handleResume = useCallback(async (name) => {
+  const handleResume = useCallback(async (name, instanceId) => {
+    const key = workerInstanceKey({ name, instance_id: instanceId });
+    const instanceQuery = instanceId != null ? `?instance_id=${instanceId}` : '';
     try {
       const res = await fetch(
-        `/api/workspace/${workspaceId}/workers/${encodeURIComponent(name)}/resume`,
+        `/api/workspace/${workspaceId}/workers/${encodeURIComponent(name)}/resume${instanceQuery}`,
         { method: 'POST' }
       );
       if (!res.ok) {
@@ -651,13 +670,17 @@ export default function WorkerManagementPanel({
         throw new Error(body?.detail?.error || `HTTP ${res.status}`);
       }
       setWorkers((prev) =>
-        prev.map((w) => (w.name === name ? { ...w, runtime_status: 'ready' } : w))
+        prev.map((w) =>
+          w.name === name && (w.instance_id ?? null) === (instanceId ?? null)
+            ? { ...w, runtime_status: 'ready' }
+            : w
+        )
       );
-      setStopErrors((prev) => { const n = { ...prev }; delete n[name]; return n; });
+      setStopErrors((prev) => { const n = { ...prev }; delete n[key]; return n; });
     } catch (err) {
-      setStopErrors((prev) => ({ ...prev, [name]: err.message }));
+      setStopErrors((prev) => ({ ...prev, [key]: err.message }));
       setTimeout(() => {
-        setStopErrors((prev) => { const n = { ...prev }; delete n[name]; return n; });
+        setStopErrors((prev) => { const n = { ...prev }; delete n[key]; return n; });
       }, 3000);
     }
   }, [workspaceId]);
@@ -847,10 +870,16 @@ export default function WorkerManagementPanel({
             const isRunning = canStop(w.runtime_status);
             const toolsList = Array.isArray(w.tools) ? w.tools : [];
             const perms = w.permission_footprint || {};
+            const instKey = workerInstanceKey(w);
+            const dispLabel = w.instance_label || w.name;
+            const isSelected =
+              selectedWorker?.name === w.name &&
+              selectedWorker?.workspaceId === workspaceId &&
+              (selectedWorker.instance_id == null || selectedWorker.instance_id === w.instance_id);
 
             return (
               <div
-                key={w.name || i}
+                key={w.name ? instKey : i}
                 style={{
                   display: 'flex',
                   alignItems: 'center',
@@ -862,23 +891,17 @@ export default function WorkerManagementPanel({
                   cursor: 'pointer',
                   borderRadius: '0',
                   transition: 'background 0.15s',
-                  background:
-                    selectedWorker?.name === w.name && selectedWorker?.workspaceId === workspaceId
-                      ? '#45475a'
-                      : 'transparent',
+                  background: isSelected ? '#45475a' : 'transparent',
                 }}
                 onMouseEnter={(e) => {
                   e.currentTarget.style.background = '#585b70';
                 }}
                 onMouseLeave={(e) => {
-                  e.currentTarget.style.background =
-                    selectedWorker?.name === w.name && selectedWorker?.workspaceId === workspaceId
-                      ? '#45475a'
-                      : 'transparent';
+                  e.currentTarget.style.background = isSelected ? '#45475a' : 'transparent';
                 }}
                 onClick={() => {
-                  dismissedWorkersRef.current.delete(w.name);
-                  onSelectWorker?.(w.name, workspaceId);
+                  dismissedWorkersRef.current.delete(instKey);
+                  onSelectWorker?.(w.name, workspaceId, w.instance_id, w.instance_label);
                 }}
               >
                 {/* Status dot */}
@@ -894,9 +917,9 @@ export default function WorkerManagementPanel({
                     textOverflow: 'ellipsis',
                     minWidth: 0,
                   }}
-                  title={w.name}
+                  title={dispLabel}
                 >
-                  {w.name}
+                  {dispLabel}
                 </span>
 
                 {/* Description */}
@@ -966,7 +989,7 @@ export default function WorkerManagementPanel({
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
-                            handleResume(w.name);
+                            handleResume(w.name, w.instance_id);
                           }}
                           style={{
                             background: '#a6e3a1',
@@ -980,7 +1003,7 @@ export default function WorkerManagementPanel({
                             lineHeight: '1.4',
                             marginRight: '4px',
                           }}
-                          title={`Resume ${w.name}`}
+                          title={`Resume ${dispLabel}`}
                         >
                           ▶ Resume
                         </button>
@@ -1000,7 +1023,7 @@ export default function WorkerManagementPanel({
                             lineHeight: '1.4',
                             marginRight: '4px',
                           }}
-                          title={`Pausing ${w.name}…`}
+                          title={`Pausing ${dispLabel}…`}
                         >
                           ⏸ Pausing…
                         </button>
@@ -1009,7 +1032,7 @@ export default function WorkerManagementPanel({
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
-                              handlePause(w.name);
+                              handlePause(w.name, w.instance_id);
                             }}
                             style={{
                               background: '#f9e2af',
@@ -1023,7 +1046,7 @@ export default function WorkerManagementPanel({
                               lineHeight: '1.4',
                               marginRight: '4px',
                             }}
-                            title={`Pause ${w.name}`}
+                            title={`Pause ${dispLabel}`}
                           >
                             ⏸ Pause
                           </button>
@@ -1034,7 +1057,7 @@ export default function WorkerManagementPanel({
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
-                            handleStop(w.name);
+                            handleStop(w.name, w.instance_id);
                           }}
                           style={{
                             background: '#f38ba8',
@@ -1047,7 +1070,7 @@ export default function WorkerManagementPanel({
                             fontSize: '0.65rem',
                             lineHeight: '1.4',
                           }}
-                          title={`Stop ${w.name}`}
+                          title={`Stop ${dispLabel}`}
                         >
                           Stop
                         </button>
@@ -1113,14 +1136,16 @@ export default function WorkerManagementPanel({
 
       {/* ── Runtime bottom bar: current task for selected worker ──────── */}
       {workers.map((w) => {
+        const instKey = workerInstanceKey(w);
         if (
           selectedWorker?.name === w.name &&
           selectedWorker?.workspaceId === workspaceId &&
+          (selectedWorker.instance_id == null || selectedWorker.instance_id === w.instance_id) &&
           w.current_task
         ) {
           return (
             <div
-              key={`task-${w.name}`}
+              key={`task-${instKey}`}
               style={{
                 marginTop: '0.4rem',
                 fontSize: '0.8rem',
@@ -1135,7 +1160,7 @@ export default function WorkerManagementPanel({
               }}
               title={w.current_task}
             >
-              <strong>{w.name}:</strong> {truncate(w.current_task, 100)}
+              <strong>{w.instance_label || w.name}:</strong> {truncate(w.current_task, 100)}
             </div>
           );
         }
@@ -1165,7 +1190,7 @@ export default function WorkerManagementPanel({
           if (permEntries.length === 0) return null;
           return (
             <div
-              key={`perms-${w.name}`}
+              key={`perms-${workerInstanceKey(w)}`}
               style={{
                 display: 'flex',
                 gap: '0.3rem',
@@ -1174,7 +1199,7 @@ export default function WorkerManagementPanel({
               }}
             >
               <span style={{ color: '#6c7086', fontSize: '0.7rem', marginRight: '0.2rem' }}>
-                {w.name}:
+                {w.instance_label || w.name}:
               </span>
               {permEntries.map(([k, v]) => (
                 <PermissionPill key={k} name={k} value={v} />

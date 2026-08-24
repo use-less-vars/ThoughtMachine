@@ -164,13 +164,13 @@ class _RunSafetyPatches(unittest.TestCase):
 
 def _inject_fake(worker_name, fake, session_id="s1"):
     with _registry_lock:
-        _worker_registry[(session_id, worker_name)] = fake
+        _worker_registry[(session_id, worker_name, 1)] = fake
     return fake
 
 
 def _remove_fake(worker_name, session_id="s1"):
     with _registry_lock:
-        _worker_registry.pop((session_id, worker_name), None)
+        _worker_registry.pop((session_id, worker_name, 1), None)
 
 
 # ---------------------------------------------------------------------------

@@ -316,6 +316,8 @@ describe('Workers section', () => {
           description: 'first worker',
           tools: ['FileEditor', 'GitTool'],
           runtime_status: 'ready',
+          instance_id: 1,
+          instance_label: 'w1',
         },
       ]),
     })
@@ -324,7 +326,7 @@ describe('Workers section', () => {
     expect(screen.getByText('first worker')).toBeInTheDocument()
     expect(screen.getByText('ready')).toBeInTheDocument()
     expect(screen.getByText('2')).toBeInTheDocument() // tools count
-    expect(onSelectWorker).toHaveBeenCalledWith('w1', 'ws-1')
+    expect(onSelectWorker).toHaveBeenCalledWith('w1', 'ws-1', 1, 'w1')
   })
 
   it('POSTs to the stop endpoint when stopping a running worker', async () => {

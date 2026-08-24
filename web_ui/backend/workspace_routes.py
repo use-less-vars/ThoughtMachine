@@ -403,6 +403,34 @@ def _seconds_since_heartbeat(iso_ts: Optional[str]) -> Optional[float]:
     return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
 
 
+def _worker_instance_key(label: str):
+    """Split a worker directory label into (base_name, instance_id).
+
+    Instance dirs are named with ``instance_label``: the bare worker name for
+    instance 1 and ``<name>#<N>`` for N>1.  A label whose final ``#`` suffix is
+    an integer belongs to that instance; anything else is treated as its own
+    base name at instance 1.
+    """
+    if "#" in label:
+        base, _, suffix = label.rpartition("#")
+        if suffix.isdigit():
+            return base, int(suffix)
+    return label, 1
+
+
+def _query_default(value):
+    """Normalize a FastAPI ``Query`` sentinel to its declared default.
+
+    FastAPI substitutes ``Query(...)`` defaults for their value only while
+    binding HTTP requests; direct calls (e.g. tests invoking the endpoint
+    function) receive the ``Query`` object itself.  Treating that sentinel as
+    ``None`` keeps both paths identical for these optional params.
+    """
+    from fastapi.params import Query as QueryParam
+
+    return None if isinstance(value, QueryParam) else value
+
+
 @router.get("/{ws_id}/workers")
 async def get_workers(
     ws_id: str,
@@ -412,12 +440,18 @@ async def get_workers(
 
     Each worker entry includes:
       - Config fields from workers.json (name, system_prompt, tool_classes, etc.)
+      - instance_id:     1 for the legacy/default instance, N for N>1
+      - instance_label:  "<name>" for instance 1, "<name>#<N>" for N>1
       - runtime_status:  "ready" | "busy" | "completed" | "error" | None
       - current_task:    current activity description (if running)
       - last_heartbeat:  ISO-8601 timestamp of last activity
       - error:           error message (if failed)
       - has_persisted_context: whether the worker has saved conversation on disk
+
+    One entry is emitted per live on-disk instance of each config; configs
+    without any on-disk instance keep a single entry at instance 1.
     """
+    name = _query_default(name)
     ensure_workspace_dirs(ws_id)
     ws_dir = _workspace_dir(ws_id)
 
@@ -523,7 +557,16 @@ async def get_workers(
                     except (json.JSONDecodeError, OSError, TypeError, ValueError):
                         pass
 
-    # 4. Merge everything
+    # 4. Merge everything — one entry per runtime/persisted instance per config.
+    #    Worker dirs are keyed by instance label ("<name>" for instance 1,
+    #    "<name>#<N>" for N>1), so a single config may back several live
+    #    instances.  Configs with no on-disk instance keep the legacy single
+    #    entry (instance_id 1, all runtime fields None).
+    instances_by_name: Dict[str, set] = {}
+    for label in set(runtime_statuses) | set(persisted_names):
+        base, iid = _worker_instance_key(label)
+        instances_by_name.setdefault(base, set()).add(iid)
+
     result = []
     for cfg in configs:
         if isinstance(cfg, str):
@@ -532,29 +575,35 @@ async def get_workers(
             cfg = {"name": cfg}
         else:
             worker_name = cfg.get("name", "")
-        entry = dict(cfg)
-        if worker_name in runtime_statuses:
-            entry["runtime_status"] = runtime_statuses[worker_name]["runtime_status"]
-            entry["current_task"] = runtime_statuses[worker_name]["current_task"]
-            entry["last_heartbeat"] = runtime_statuses[worker_name]["last_heartbeat"]
-            entry["error"] = runtime_statuses[worker_name]["error"]
-            entry["session_id"] = runtime_statuses[worker_name]["session_id"]
-            entry["current_context_tokens"] = runtime_statuses[worker_name]["current_context_tokens"]
-            entry["max_context_tokens"] = runtime_statuses[worker_name]["max_context_tokens"]
-        else:
-            entry["runtime_status"] = None
-            entry["current_task"] = None
-            entry["last_heartbeat"] = None
-            entry["error"] = None
-            entry["session_id"] = None
-            entry["current_context_tokens"] = None
-            entry["max_context_tokens"] = None
-        entry["has_persisted_context"] = worker_name in persisted_names
-        entry["pruned_since_last_query"] = pruned_since_last_query.get(worker_name, 0)
-        entry["time_since_last_query"] = _seconds_since_heartbeat(
-            entry.get("last_heartbeat")
-        )
-        result.append(entry)
+        iids = sorted(instances_by_name.get(worker_name, set()) or {1})
+        for iid in iids:
+            label = _WorkerRegistry.instance_label(worker_name, iid)
+            entry = dict(cfg)
+            entry["instance_id"] = iid
+            entry["instance_label"] = label
+            rt = runtime_statuses.get(label)
+            if rt is not None:
+                entry["runtime_status"] = rt["runtime_status"]
+                entry["current_task"] = rt["current_task"]
+                entry["last_heartbeat"] = rt["last_heartbeat"]
+                entry["error"] = rt["error"]
+                entry["session_id"] = rt["session_id"]
+                entry["current_context_tokens"] = rt["current_context_tokens"]
+                entry["max_context_tokens"] = rt["max_context_tokens"]
+            else:
+                entry["runtime_status"] = None
+                entry["current_task"] = None
+                entry["last_heartbeat"] = None
+                entry["error"] = None
+                entry["session_id"] = None
+                entry["current_context_tokens"] = None
+                entry["max_context_tokens"] = None
+            entry["has_persisted_context"] = label in persisted_names
+            entry["pruned_since_last_query"] = pruned_since_last_query.get(label, 0)
+            entry["time_since_last_query"] = _seconds_since_heartbeat(
+                entry.get("last_heartbeat")
+            )
+            result.append(entry)
 
     # 5. Optional ?name= filter — return single worker entry or 404
     if name is not None:
@@ -773,12 +822,25 @@ async def get_effective_permissions(
 # ── POST /api/workspace/{ws_id}/workers/{name}/stop ────────────────────────
 
 @router.post("/{ws_id}/workers/{name}/stop")
-async def stop_worker(ws_id: str, name: str):
+async def stop_worker(
+    ws_id: str,
+    name: str,
+    instance_id: Optional[int] = Query(
+        None,
+        description="Target a specific worker instance (default: legacy by-name behavior)",
+    ),
+):
     """Stop a running worker via a file-based command signal.
 
     Supports both directory layouts:
       - ``workers/<session_id>/<name>/`` (session-scoped)
       - ``workers/<name>/`` (legacy, no session)
+
+    When ``instance_id`` is provided the command targets that specific
+    instance: the directory is resolved as ``<name>`` (instance 1) or
+    ``<name>#<N>`` (N>1) and only the matching in-memory thread is signalled.
+    Without it, the legacy by-name behavior is kept (first matching directory,
+    all matching threads).
 
     Writes ``{"action": "stop"}`` to the worker's ``command.json`` so that
     the worker thread (which polls for this file) picks it up within 2 seconds.
@@ -798,6 +860,15 @@ async def stop_worker(ws_id: str, name: str):
     ensure_workspace_dirs(ws_id)
     ws_dir = _workspace_dir(ws_id)
     workers_dir = ws_dir / "workers"
+    instance_id = _query_default(instance_id)
+
+    # Optional instance targeting: with instance_id, resolve the instance
+    # directory "<name>" (instance 1) or "<name>#<N>" (N>1).  Without it,
+    # keep the legacy by-name lookup (first matching directory).
+    target_label = (
+        _WorkerRegistry.instance_label(name, instance_id)
+        if instance_id is not None else None
+    )
 
     # ── Find the worker directory (session-scoped first, then legacy) ──
     worker_dir: Optional[Path] = None
@@ -809,14 +880,14 @@ async def stop_worker(ws_id: str, name: str):
             # Check if this is a session directory (contains sub-worker dirs)
             first_child = next(subdir.iterdir(), None) if subdir.is_dir() else None
             if first_child is not None and first_child.is_dir():
-                # Session-scoped: workers/<session_id>/<name>/
-                candidate = subdir / name
+                # Session-scoped: workers/<session_id>/<name>/ or <name#N>/
+                candidate = subdir / (target_label if target_label is not None else name)
                 if candidate.is_dir():
                     worker_dir = candidate
                     break
             else:
-                # Legacy: workers/<name>/
-                if subdir.name == name:
+                # Legacy: workers/<name>/ or workers/<name#N>/
+                if subdir.name == (target_label if target_label is not None else name):
                     worker_dir = subdir
                     break
 
@@ -840,27 +911,49 @@ async def stop_worker(ws_id: str, name: str):
     }, worker_dir / "status.json")
 
     # Fast-path: if the thread is in-memory (same process), signal directly.
-    # Registry keys are tuples (session_id, worker_name), so iterate all
-    # entries matching the worker name across all sessions.
+    # Registry keys are tuples (session_id, worker_name[, instance_id]), so
+    # iterate all entries matching the worker name — optionally narrowed to
+    # the requested instance.
     with _registry_lock:
-        for (sid, wname), thread in list(_worker_registry.items()):
-            if wname == name:
-                try:
-                    thread.stop()
-                except Exception:
-                    pass  # File-based stop will still work
+        for key, thread in list(_worker_registry.items()):
+            wname = key[1]
+            if wname != name:
+                continue
+            if instance_id is not None and (key[2] if len(key) > 2 else 1) != instance_id:
+                continue
+            try:
+                thread.stop()
+            except Exception:
+                pass  # File-based stop will still work
 
-    return {"status": "ok", "name": name}
+    resp = {"status": "ok", "name": name}
+    if target_label is not None:
+        resp["instance_id"] = instance_id
+        resp["instance_label"] = target_label
+    return resp
 
 # ── POST /api/workspace/{ws_id}/workers/{name}/pause ───────────────────────
 
 @router.post("/{ws_id}/workers/{name}/pause")
-async def pause_worker(ws_id: str, name: str):
+async def pause_worker(
+    ws_id: str,
+    name: str,
+    instance_id: Optional[int] = Query(
+        None,
+        description="Target a specific worker instance (default: legacy by-name behavior)",
+    ),
+):
     """Pause a running worker after it completes its current turn.
 
     Supports both directory layouts:
       - ``workers/<session_id>/<name>/`` (session-scoped)
       - ``workers/<name>/`` (legacy, no session)
+
+    When ``instance_id`` is provided the command targets that specific
+    instance: the directory is resolved as ``<name>`` (instance 1) or
+    ``<name>#<N>`` (N>1) and only the matching in-memory thread is signalled.
+    Without it, the legacy by-name behavior is kept (first matching directory,
+    all matching threads).
 
     Writes ``{"action": "pause"}`` to the worker's ``command.json`` so that
     the worker thread (which polls for this file) picks it up within 2 seconds.
@@ -879,6 +972,15 @@ async def pause_worker(ws_id: str, name: str):
     ensure_workspace_dirs(ws_id)
     ws_dir = _workspace_dir(ws_id)
     workers_dir = ws_dir / "workers"
+    instance_id = _query_default(instance_id)
+
+    # Optional instance targeting: with instance_id, resolve the instance
+    # directory "<name>" (instance 1) or "<name>#<N>" (N>1).  Without it,
+    # keep the legacy by-name lookup (first matching directory).
+    target_label = (
+        _WorkerRegistry.instance_label(name, instance_id)
+        if instance_id is not None else None
+    )
 
     # ── Find the worker directory (session-scoped first, then legacy) ──
     worker_dir: Optional[Path] = None
@@ -890,14 +992,14 @@ async def pause_worker(ws_id: str, name: str):
             # Check if this is a session directory (contains sub-worker dirs)
             first_child = next(subdir.iterdir(), None) if subdir.is_dir() else None
             if first_child is not None and first_child.is_dir():
-                # Session-scoped: workers/<session_id>/<name>/
-                candidate = subdir / name
+                # Session-scoped: workers/<session_id>/<name>/ or <name#N>/
+                candidate = subdir / (target_label if target_label is not None else name)
                 if candidate.is_dir():
                     worker_dir = candidate
                     break
             else:
-                # Legacy: workers/<name>/
-                if subdir.name == name:
+                # Legacy: workers/<name>/ or workers/<name#N>/
+                if subdir.name == (target_label if target_label is not None else name):
                     worker_dir = subdir
                     break
 
@@ -920,28 +1022,50 @@ async def pause_worker(ws_id: str, name: str):
     }, worker_dir / "status.json")
 
     # Fast-path: if the thread is in-memory (same process), signal directly.
-    # Registry keys are tuples (session_id, worker_name), so iterate all
-    # entries matching the worker name across all sessions.
+    # Registry keys are tuples (session_id, worker_name[, instance_id]), so
+    # iterate all entries matching the worker name — optionally narrowed to
+    # the requested instance.
     with _registry_lock:
-        for (sid, wname), thread in list(_worker_registry.items()):
-            if wname == name:
-                try:
-                    thread.pause()
-                except Exception:
-                    pass  # File-based pause will still work
+        for key, thread in list(_worker_registry.items()):
+            wname = key[1]
+            if wname != name:
+                continue
+            if instance_id is not None and (key[2] if len(key) > 2 else 1) != instance_id:
+                continue
+            try:
+                thread.pause()
+            except Exception:
+                pass  # File-based pause will still work
 
-    return {"status": "pausing", "name": name}
+    resp = {"status": "pausing", "name": name}
+    if target_label is not None:
+        resp["instance_id"] = instance_id
+        resp["instance_label"] = target_label
+    return resp
 
 
 # ── POST /api/workspace/{ws_id}/workers/{name}/resume ──────────────────────
 
 @router.post("/{ws_id}/workers/{name}/resume")
-async def resume_worker(ws_id: str, name: str):
+async def resume_worker(
+    ws_id: str,
+    name: str,
+    instance_id: Optional[int] = Query(
+        None,
+        description="Target a specific worker instance (default: legacy by-name behavior)",
+    ),
+):
     """Resume a paused worker.
 
     Supports both directory layouts:
       - ``workers/<session_id>/<name>/`` (session-scoped)
       - ``workers/<name>/`` (legacy, no session)
+
+    When ``instance_id`` is provided the command targets that specific
+    instance: the directory is resolved as ``<name>`` (instance 1) or
+    ``<name>#<N>`` (N>1) and only the matching in-memory thread is signalled.
+    Without it, the legacy by-name behavior is kept (first matching directory,
+    all matching threads).
 
     Writes ``{"action": "resume"}`` to the worker's ``command.json`` so that
     the worker thread (which polls for this file) picks it up within 2 seconds.
@@ -956,6 +1080,15 @@ async def resume_worker(ws_id: str, name: str):
     ensure_workspace_dirs(ws_id)
     ws_dir = _workspace_dir(ws_id)
     workers_dir = ws_dir / "workers"
+    instance_id = _query_default(instance_id)
+
+    # Optional instance targeting: with instance_id, resolve the instance
+    # directory "<name>" (instance 1) or "<name>#<N>" (N>1).  Without it,
+    # keep the legacy by-name lookup (first matching directory).
+    target_label = (
+        _WorkerRegistry.instance_label(name, instance_id)
+        if instance_id is not None else None
+    )
 
     # ── Find the worker directory (session-scoped first, then legacy) ──
     worker_dir: Optional[Path] = None
@@ -967,14 +1100,14 @@ async def resume_worker(ws_id: str, name: str):
             # Check if this is a session directory (contains sub-worker dirs)
             first_child = next(subdir.iterdir(), None) if subdir.is_dir() else None
             if first_child is not None and first_child.is_dir():
-                # Session-scoped: workers/<session_id>/<name>/
-                candidate = subdir / name
+                # Session-scoped: workers/<session_id>/<name>/ or <name#N>/
+                candidate = subdir / (target_label if target_label is not None else name)
                 if candidate.is_dir():
                     worker_dir = candidate
                     break
             else:
-                # Legacy: workers/<name>/
-                if subdir.name == name:
+                # Legacy: workers/<name>/ or workers/<name#N>/
+                if subdir.name == (target_label if target_label is not None else name):
                     worker_dir = subdir
                     break
 
@@ -988,15 +1121,26 @@ async def resume_worker(ws_id: str, name: str):
     _atomic_write_json({"action": "resume"}, worker_dir / "command.json")
 
     # Fast-path: if the thread is in-memory (same process), signal directly.
+    # Registry keys are tuples (session_id, worker_name[, instance_id]), so
+    # iterate all entries matching the worker name — optionally narrowed to
+    # the requested instance.
     with _registry_lock:
-        for (sid, wname), thread in list(_worker_registry.items()):
-            if wname == name:
-                try:
-                    thread.resume()
-                except Exception:
-                    pass  # File-based resume will still work
+        for key, thread in list(_worker_registry.items()):
+            wname = key[1]
+            if wname != name:
+                continue
+            if instance_id is not None and (key[2] if len(key) > 2 else 1) != instance_id:
+                continue
+            try:
+                thread.resume()
+            except Exception:
+                pass  # File-based resume will still work
 
-    return {"status": "resumed", "name": name}
+    resp = {"status": "resumed", "name": name}
+    if target_label is not None:
+        resp["instance_id"] = instance_id
+        resp["instance_label"] = target_label
+    return resp
 
 
 

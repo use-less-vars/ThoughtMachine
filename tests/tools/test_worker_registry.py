@@ -80,9 +80,10 @@ class TestWorkerThreadRegistry:
         registry.register_worker("sess2", "w1", "c")
         all_w = registry.get_all_workers()
         assert len(all_w) == 3
-        assert all_w[("sess1", "w1")] == "a"
-        assert all_w[("sess1", "w2")] == "b"
-        assert all_w[("sess2", "w1")] == "c"
+        # Keys are (session, name, instance_id) triples; default instance is 1.
+        assert all_w[("sess1", "w1", 1)] == "a"
+        assert all_w[("sess1", "w2", 1)] == "b"
+        assert all_w[("sess2", "w1", 1)] == "c"
 
     def test_find_workers_by_name(self, registry):
         registry.register_worker("sess1", "find_me", "thread_a")
@@ -169,13 +170,19 @@ class TestWorkerRegistryIntegration:
             mock_registry.shutdown_workers.assert_called_once_with(timeout=3.0)
 
             w.register_worker_event_bus("s", "w", "bus")
-            mock_registry.register_event_bus.assert_called_once_with("s", "w", "bus")
+            mock_registry.register_event_bus.assert_called_once_with(
+                "s", "w", "bus", instance_id=1
+            )
 
             w.unregister_worker_event_bus("s", "w")
-            mock_registry.unregister_event_bus.assert_called_once_with("s", "w",)
+            mock_registry.unregister_event_bus.assert_called_once_with(
+                "s", "w", instance_id=1
+            )
 
             w.get_worker_event_bus("s", "w")
-            mock_registry.get_event_bus.assert_called_once_with("s", "w")
+            mock_registry.get_event_bus.assert_called_once_with(
+                "s", "w", instance_id=1
+            )
 
             w.get_worker_event_buses_for_session("s")
             mock_registry.get_event_buses_for_session.assert_called_once_with("s")

@@ -57,7 +57,7 @@ function NewEventsButton({ onClick }) {
 }
 
 // ── Main component ────────────────────────────────────────────────────
-function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomingEvents = [] }) {
+function WorkerOutputPanel({ workspaceId, workerName, instanceId, instanceLabel, sessionId, onClose, incomingEvents = [] }) {
 
   
   // Panel resize state (self-contained)
@@ -148,7 +148,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
     setEvents([]);
     eventsRef.current = [];
     seenEventKeysRef.current = new Set();
-  }, [workspaceId, workerName, sessionId]);
+  }, [workspaceId, workerName, instanceId, sessionId]);
 
   // ── Shared dedup key computation ──────────────────────────────────────
   // Events are received via WebSocket incomingEvents prop (no polling).
@@ -199,7 +199,19 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
     const relevantEvents = incomingEvents.filter(e => {
       const evtWorkerName = e.worker_name || e.response?.worker_name
       // REQUIRE a worker_name — events without one are main-agent events, not worker events
-      return evtWorkerName && evtWorkerName === workerName
+      if (!evtWorkerName || evtWorkerName !== workerName) return false
+      // Instance scoping: match by id when both sides have it; otherwise fall
+      // back to label when both sides have it. Events without comparable
+      // instance info are kept for backward compatibility with older streams.
+      const evtInstanceId = e.instance_id ?? e.response?.instance_id
+      const evtInstanceLabel = e.instance_label ?? e.response?.instance_label
+      if (evtInstanceId != null && instanceId != null) {
+        return evtInstanceId === instanceId
+      }
+      if (evtInstanceLabel && instanceLabel) {
+        return evtInstanceLabel === instanceLabel
+      }
+      return true
     })
 
     if (relevantEvents.length === 0) {
@@ -582,7 +594,8 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
     }
     setStopError('');
     try {
-      const res = await fetch(`/api/workspace/${workspaceId}/workers/${encodeURIComponent(workerName)}/stop`, {
+      const instanceQuery = instanceId != null ? `?instance_id=${instanceId}` : '';
+      const res = await fetch(`/api/workspace/${workspaceId}/workers/${encodeURIComponent(workerName)}/stop${instanceQuery}`, {
         method: 'POST',
       });
       if (!res.ok) {
@@ -595,7 +608,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
       setStopError(err.message);
       setTimeout(() => setStopError(''), 3000);
     }
-  }, [workspaceId, workerName]);
+  }, [workspaceId, workerName, instanceId]);
 
   const canStop = runtimeStatus === 'busy' || runtimeStatus === 'ready';
 
@@ -611,7 +624,8 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
     if (runtimeStatus === 'paused') return;
     setStopError('');
     try {
-      const res = await fetch(`/api/workspace/${workspaceId}/workers/${encodeURIComponent(workerName)}/pause`, {
+      const instanceQuery = instanceId != null ? `?instance_id=${instanceId}` : '';
+      const res = await fetch(`/api/workspace/${workspaceId}/workers/${encodeURIComponent(workerName)}/pause${instanceQuery}`, {
         method: 'POST',
       });
       if (!res.ok) {
@@ -625,7 +639,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
       setStopError(err.message);
       setTimeout(() => setStopError(''), 3000);
     }
-  }, [workspaceId, workerName, sessionId, runtimeStatus]);
+  }, [workspaceId, workerName, instanceId, sessionId, runtimeStatus]);
 
   const handleResume = useCallback(async () => {
     if (!workspaceId || !workerName) return;
@@ -637,7 +651,8 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
     }
     setStopError('');
     try {
-      const res = await fetch(`/api/workspace/${workspaceId}/workers/${encodeURIComponent(workerName)}/resume`, {
+      const instanceQuery = instanceId != null ? `?instance_id=${instanceId}` : '';
+      const res = await fetch(`/api/workspace/${workspaceId}/workers/${encodeURIComponent(workerName)}/resume${instanceQuery}`, {
         method: 'POST',
       });
       if (!res.ok) {
@@ -650,7 +665,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
       setStopError(err.message);
       setTimeout(() => setStopError(''), 3000);
     }
-  }, [workspaceId, workerName, sessionId]);
+  }, [workspaceId, workerName, instanceId, sessionId]);
 
   const canPause = runtimeStatus === 'busy' || runtimeStatus === 'ready';
   const canResume = runtimeStatus === 'paused';
@@ -731,7 +746,7 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
             {isRunning ? 'Running' : 'Idle'}
           </span>
           <span className="worker-output-header-label">
-            Worker: {workerName}
+            Worker: {instanceLabel || workerName}
           </span>
           <span className="worker-output-header-ctx">
             ctx: {workerInfo && workerInfo.max_context_tokens > 0 ? `${formatTokens(workerInfo.current_context_tokens ?? 0)} / ${formatTokens(workerInfo.max_context_tokens)}` : '—'}
@@ -834,8 +849,8 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
 
         {/* ── Bottom bar (matches main QueryBar height) ─────────────── */}
         <div className="worker-output-bottom-bar">
-          <span className="worker-output-bottom-name" title={workerName}>
-            {truncate(workerName, 15)}
+          <span className="worker-output-bottom-name" title={instanceLabel || workerName}>
+            {truncate(instanceLabel || workerName, 15)}
           </span>
           <span className="worker-output-bottom-elapsed">
             ⏱ {elapsedTime(startTime)}
@@ -866,6 +881,8 @@ function WorkerOutputPanel({ workspaceId, workerName, sessionId, onClose, incomi
 function workerOutputPropsEqual(prevProps, nextProps) {
   if (prevProps.workspaceId !== nextProps.workspaceId) return false;
   if (prevProps.workerName !== nextProps.workerName) return false;
+  if (prevProps.instanceId !== nextProps.instanceId) return false;
+  if (prevProps.instanceLabel !== nextProps.instanceLabel) return false;
   if (prevProps.sessionId !== nextProps.sessionId) return false;
   if (prevProps.onClose !== nextProps.onClose) return false;
   const prevEvents = prevProps.incomingEvents || [];

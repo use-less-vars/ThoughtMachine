@@ -186,7 +186,7 @@ class TestSpawnAutoQueryCutoff(unittest.TestCase):
                     result = tool._action_spawn([], "ws-1")
             finally:
                 with _registry_lock:
-                    _worker_registry.pop(("s1", "w-spawn"), None)
+                    _worker_registry.pop(("s1", "w-spawn", 1), None)
 
             self.assertIn("did not respond within 600s", result["error"])
             self.assertIn("still alive", result["note"])
@@ -209,12 +209,12 @@ class TestQueryActionTimeout(unittest.TestCase):
         )
         fake._last_elapsed.return_value = None
         with _registry_lock:
-            _worker_registry[("s1", "w-query")] = fake
+            _worker_registry[("s1", "w-query", 1)] = fake
         try:
             result = tool._action_query([])
         finally:
             with _registry_lock:
-                _worker_registry.pop(("s1", "w-query"), None)
+                _worker_registry.pop(("s1", "w-query", 1), None)
 
         self.assertIn("error", result)
         self.assertIn("Worker 'w-query' did not respond within 300.0s", result["error"])
@@ -603,12 +603,12 @@ class TestStopPathCompacts(_RunSafetyPatches):
 
             tool = Worker(action="stop", worker_name="w-stop", session_id="s1")
             with _registry_lock:
-                _worker_registry[("s1", "w-stop")] = thread
+                _worker_registry[("s1", "w-stop", 1)] = thread
             try:
                 tool._action_stop([])
             finally:
                 with _registry_lock:
-                    _worker_registry.pop(("s1", "w-stop"), None)
+                    _worker_registry.pop(("s1", "w-stop", 1), None)
 
             data = json.loads(
                 (thread._worker_dir / "context.json").read_text(encoding="utf-8")
