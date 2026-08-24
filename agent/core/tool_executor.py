@@ -327,6 +327,7 @@ class ToolExecutor:
                     'token_monitor_critical_threshold': getattr(self.config, 'token_monitor_critical_threshold', None),
                     'use_workspace_lifecycle_manager': getattr(self.config, 'use_workspace_lifecycle_manager', False),
                     'use_container_registry': getattr(self.config, 'use_container_registry', False),
+                    'git_allow_worktree_commits': getattr(self.config, 'git_allow_worktree_commits', False),
                 }
             else:
                 tool_args['agent_config'] = None
