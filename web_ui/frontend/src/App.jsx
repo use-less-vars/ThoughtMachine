@@ -80,7 +80,7 @@ export default function App() {
   const [workspaceKnownTick, setWorkspaceKnownTick] = useState(0)  // bump when a session→workspace mapping appears
 
   // ── Worker panel state per session ────────────────────────────────────
-  // Map: sessionId -> { name, workspaceId } | null
+  // Map: sessionId -> { name, workspaceId, instance_id, instance_label } | null
   // Persisted in localStorage so panel state survives tab switches & page reloads.
   const [workerPanelState, setWorkerPanelState] = useState(() => {
     try {
@@ -96,7 +96,7 @@ export default function App() {
   const [loggingConfigError, setLoggingConfigError] = useState(null)
   const [workerEvents, setWorkerEvents] = useState({})  // { [sessionId]: [event, ...] } live WS worker events
 
-  const pendingWorkerSelectionRef = useRef(null)  // { workerName, workspaceId } queued before activeSessionId is set
+  const pendingWorkerSelectionRef = useRef(null)  // { workerName, workspaceId, instanceId, instanceLabel } queued before activeSessionId is set
   const tabActionsRef = useRef({})                // tabId -> { sendCommand, getSessionId }
 
   // ── Per-workspace tab strip selectors (currentWs-scoped) ─────────────
@@ -421,16 +421,21 @@ export default function App() {
     }
   }, [navigate])
 
-  const handleSelectWorker = useCallback((workerName, workspaceId) => {
+  const handleSelectWorker = useCallback((workerName, workspaceId, instanceId, instanceLabel) => {
     if (!activeSessionId) {
       // Queue the selection — activeSessionId may not be available yet
-      pendingWorkerSelectionRef.current = { workerName, workspaceId }
+      pendingWorkerSelectionRef.current = { workerName, workspaceId, instanceId, instanceLabel }
       return
     }
     pendingWorkerSelectionRef.current = null
     setWorkerPanelState(prev => ({
       ...prev,
-      [activeSessionId]: { name: workerName, workspaceId }
+      [activeSessionId]: {
+        name: workerName,
+        workspaceId,
+        instance_id: instanceId,
+        instance_label: instanceLabel,
+      }
     }))
   }, [activeSessionId])
 
@@ -455,13 +460,20 @@ export default function App() {
       // Use canonical dedup key: normalize worker_message/assistant_message/final_response
       // variants to 'final_response' so the same logical event arriving with different
       // WS type values (e.g. worker:assistant_message vs worker:worker_message) is caught.
-      const rawType = event.type?.replace('worker:', '') || ''
-      const canonicalType = (
-        rawType === 'worker_message' ||
-        rawType === 'final_response' ||
-        rawType === 'assistant_message'
-      ) ? 'final_response' : rawType
-      const key = canonicalType + '|' + (event.timestamp || '')
+      // Dedup key helper: canonical type + timestamp + instance identity (when present)
+      const evtKey = (e) => {
+        const eRawType = e.type?.replace('worker:', '') || ''
+        const eCanonicalType = (
+          eRawType === 'worker_message' ||
+          eRawType === 'final_response' ||
+          eRawType === 'assistant_message'
+        ) ? 'final_response' : eRawType
+        const instancePart =
+          (e.instance_id != null ? `|i${e.instance_id}` : '') +
+          (e.instance_label ? `|l${e.instance_label}` : '')
+        return eCanonicalType + '|' + (e.timestamp || '') + instancePart
+      }
+      const key = evtKey(event)
       const incomingVisible = isWorkerEventRenderable(event)
       // Only renderable stored events can block a duplicate — an earlier empty
       // placeholder must not consume the dedup key, otherwise the full-content
@@ -470,13 +482,7 @@ export default function App() {
       // ctx counter and token updates), never blocked.
       if (incomingVisible && events.some(e => {
         if (!isWorkerEventRenderable(e)) return false
-        const eRawType = e.type?.replace('worker:', '') || ''
-        const eCanonicalType = (
-          eRawType === 'worker_message' ||
-          eRawType === 'final_response' ||
-          eRawType === 'assistant_message'
-        ) ? 'final_response' : eRawType
-        return (eCanonicalType + '|' + (e.timestamp || '')) === key
+        return evtKey(e) === key
       })) {
         console.log('[TOKEN_PIPELINE] App.handleWorkerEvent: DEDUPED event', { type: event.type, key })
         return prev  // dedup
@@ -664,7 +670,12 @@ export default function App() {
       pendingWorkerSelectionRef.current = null
       setWorkerPanelState(prev => ({
         ...prev,
-        [activeSessionId]: { name: pending.workerName, workspaceId: pending.workspaceId }
+        [activeSessionId]: {
+          name: pending.workerName,
+          workspaceId: pending.workspaceId,
+          instance_id: pending.instanceId,
+          instance_label: pending.instanceLabel,
+        }
       }))
     }
   }, [activeSessionId])
@@ -789,6 +800,8 @@ export default function App() {
             <WorkerOutputPanel
               workspaceId={selectedWorker.workspaceId}
               workerName={selectedWorker.name}
+              instanceId={selectedWorker.instance_id}
+              instanceLabel={selectedWorker.instance_label}
               sessionId={activeSessionId}
               onClose={handleCloseWorkerPanel}
               incomingEvents={workerEvents[activeSessionId] || []}

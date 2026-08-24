@@ -29,6 +29,10 @@ function eventId(evt) {
   const parts = []
   if (evt.session_id) parts.push(evt.session_id)
   if (evt.worker_name) parts.push(evt.worker_name)
+  // Include instance identity so per-instance events from the same worker
+  // (multi-instance spawns) don't collide in dedup keys
+  if (evt.instance_id != null) parts.push(`i${evt.instance_id}`)
+  if (evt.instance_label) parts.push(`l${evt.instance_label}`)
   if (evt.timestamp) parts.push(evt.timestamp)
   parts.push(evt.event || '')
   return parts.join('_')
@@ -350,6 +354,22 @@ export default function adaptWorkerEvent(evt) {
         _id: eventId(evt),
         role: 'user',
         content: `🔴 Worker error (${workerName3}): ${errMsg}`,
+        is_system_notification: true,
+        is_worker_event: true,
+      }
+    }
+
+    case 'worker_partial_result': {
+      const pResp = evt.response || {}
+      const partialText = pResp.content || pResp.partial_text || pResp.result || ''
+      const status = pResp.status || ''
+      const suffix = status ? ` (${status})` : ''
+      return {
+        _id: eventId(evt),
+        role: 'system',
+        content: partialText
+          ? `📝 Worker partial result${suffix}: ${partialText}`
+          : `📝 Worker partial result${suffix}`,
         is_system_notification: true,
         is_worker_event: true,
       }
