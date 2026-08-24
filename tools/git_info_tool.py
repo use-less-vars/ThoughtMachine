@@ -465,8 +465,22 @@ class GitInfoTool(ToolBase):
                 raise
             return self._truncate_output(f"Error executing git operation: {e}")
     
-    def _run_git(self, repo_root: Path, args: List[str], timeout: int = 30) -> str:
-        """Run git command and return output."""
+    def _run_git(
+        self,
+        repo_root: Path,
+        args: List[str],
+        timeout: int = 30,
+        allow_host_fallback: bool = True,
+    ) -> str:
+        """Run git command and return output.
+
+        ``allow_host_fallback=False`` makes container execution mandatory: if
+        container mode is required but unavailable (no container, degraded
+        host_fallback, policy denial), ``_run_git_raw`` raises RuntimeError
+        instead of degrading to the host backend. The host backend injects
+        ``--no-verify`` and ``core.hooksPath=/dev/null``, which would bypass
+        the QA gate -- forbidden for policy-allowed agent commits.
+        """
         # Defense-in-depth: never run git with a cwd outside the workspace.
         # Raises ValueError (handled by execute()'s caller) if repo_root
         # escapes the workspace. execute() already validates before calling
@@ -475,7 +489,10 @@ class GitInfoTool(ToolBase):
 
         try:
             exit_code, stdout, stderr = self._run_git_raw(
-                repo_root, args, timeout=timeout
+                repo_root,
+                args,
+                timeout=timeout,
+                allow_host_fallback=allow_host_fallback,
             )
             if exit_code != 0:
                 return f"Git command failed (exit code {exit_code}):\n{stderr}"
@@ -490,11 +507,20 @@ class GitInfoTool(ToolBase):
             # Fail closed: a denied git:read/git:write permission must surface
             # to the caller, not be swallowed into a generic error string.
             raise
+        except RuntimeError:
+            # Fail closed: container-mandatory execution must surface as a
+            # hard error rather than degrade to the host backend (which
+            # injects --no-verify / core.hooksPath=/dev/null).
+            raise
         except Exception as e:
             return f"Error running git command: {e}"
 
     def _run_git_raw(
-        self, repo_root: Path, args: List[str], timeout: int = 30
+        self,
+        repo_root: Path,
+        args: List[str],
+        timeout: int = 30,
+        allow_host_fallback: bool = True,
     ) -> tuple:
         """Execute git in the active execution mode.
 
@@ -512,6 +538,12 @@ class GitInfoTool(ToolBase):
         generic failure.
         """
         if not self._use_container_mode():
+            if not allow_host_fallback:
+                raise RuntimeError(
+                    "GitInfoTool: containerized git execution is mandatory "
+                    "for this operation but container mode is not active "
+                    "(host backend would bypass the commit QA gate)"
+                )
             self._last_execution_mode = "host_fallback"
             self._last_failure_reason = None
             self._last_fallback_used = False
@@ -553,7 +585,13 @@ class GitInfoTool(ToolBase):
             raise RuntimeError(
                 f"GitInfoTool: containerized git execution unavailable: {detail}"
             )
-        # host_fallback: graceful degradation to the hardened host path.
+        # host_fallback: graceful degradation to the hardened host path --
+        # unless container execution is mandatory for this call.
+        if not allow_host_fallback:
+            raise RuntimeError(
+                "GitInfoTool: containerized git execution is mandatory for "
+                f"this operation but execution degraded to host: {detail}"
+            )
         logger.warning(
             "GitInfoTool degraded containerized git execution to hardened "
             "host git: %s (operation=%s)",
@@ -1038,6 +1076,46 @@ class GitInfoTool(ToolBase):
             return False
         return content.startswith("gitdir:")
 
+    def _feature_branch_agent_commit_allowed(self, repo_root: Path) -> bool:
+        """Narrow allow for agent commits in operator-managed worktrees.
+
+        An agent commit is permitted in an operator-managed worktree only
+        when ALL of the following hold:
+
+        1. ``agent_config['git_allow_worktree_commits']`` is exactly True.
+        2. The current branch is ``feat/*`` or ``fix/*`` (dev, main, master,
+           release/*, hotfix/* and anything else are rejected).
+        3. Container git execution is active (``_use_container_mode()``).
+        4. Container execution is mandatory for the branch check too: no
+           host fallback may resolve the branch, because the host backend
+           injects ``--no-verify`` / ``core.hooksPath=/dev/null`` and would
+           bypass the QA gate.
+
+        Any violation returns False so the caller keeps the existing
+        operator-managed-worktree block.
+        """
+        config = getattr(self, "agent_config", None) or {}
+        if config.get("git_allow_worktree_commits") is not True:
+            return False
+        if not self._use_container_mode():
+            return False
+        try:
+            output = self._run_git(
+                repo_root,
+                ["rev-parse", "--abbrev-ref", "HEAD"],
+                allow_host_fallback=False,
+            )
+        except (RuntimeError, PermissionError):
+            # Container-mandatory branch resolution failed (container
+            # unavailable, policy denial): fail closed, never degrade.
+            return False
+        branch = (output or "").strip().splitlines()[0].strip() if (output or "").strip() else ""
+        # A bare prefix ("feat/", "fix/", "feat/   ") is NOT a valid feature
+        # branch: the branch name must have a non-whitespace suffix after the
+        # slash (e.g. "feat/foo"). startswith() alone would wrongly accept
+        # these, so match the full shape instead.
+        return bool(re.match(r"^(feat|fix)/.+$", branch))
+
     @staticmethod
     def _validate_branch_name(name: str) -> str:
         """Validate a branch name against the tool's safe-name allowlist.
@@ -1225,8 +1303,15 @@ class GitInfoTool(ToolBase):
         output = self._run_git(repo_root, args)
         return self._with_mode(self._truncate_output(output))
 
-    def _git_add(self, repo_root: Path) -> str:
-        """Run git add. Accepts single file path (str) or multiple (list)."""
+    def _git_add(
+        self, repo_root: Path, allow_host_fallback: bool = True
+    ) -> str:
+        """Run git add. Accepts single file path (str) or multiple (list).
+
+        ``allow_host_fallback`` is forwarded to ``_run_git``; the commit
+        flow passes False so staging cannot degrade to the host backend
+        when a policy-allowed worktree commit mandates container execution.
+        """
         args = ["add"]
         if self.file_path:
             # Normalize to list for uniform handling
@@ -1241,7 +1326,7 @@ class GitInfoTool(ToolBase):
                     return self._truncate_output(f"Error: {e}")
         else:
             args.append("-A")  # Stage all changes
-        output = self._run_git(repo_root, args)
+        output = self._run_git(repo_root, args, allow_host_fallback=allow_host_fallback)
         return self._truncate_output(output)
 
     def _git_commit(self, repo_root: Path) -> str:
@@ -1266,17 +1351,51 @@ class GitInfoTool(ToolBase):
         """
         # Operator-managed worktrees (a .git FILE pointing at a gitdir) are
         # committed host-side by the operator; block in-workspace commits
-        # before any git subprocess can run.
+        # before any git subprocess can run. Narrow exception: agent commits
+        # on feat/* or fix/* branches with the explicit config flag and
+        # mandatory container execution (see
+        # _feature_branch_agent_commit_allowed). When the exception applies,
+        # container execution stays mandatory for the add/commit subprocesses
+        # themselves (allow_host_fallback=False).
+        worktree_commit_allowed = False
         if self._is_operator_managed_worktree(repo_root):
-            return self._truncate_output(
-                "Error: commits in this workspace are performed host-side by "
-                "the operator (workspace is an operator-managed git worktree)"
-            )
+            if not self._feature_branch_agent_commit_allowed(repo_root):
+                return self._truncate_output(
+                    "Error: commits in this workspace are performed host-side by "
+                    "the operator (workspace is an operator-managed git worktree)"
+                )
+            worktree_commit_allowed = True
 
         if not self.message or not self.message.strip():
             return "Error: message is required for commit operation"
 
+        # Policy-allowed agent commits must name their paths: the
+        # ``git add -A`` full-worktree sweep below would stage unvetted
+        # changes (review-gate bypass). Require explicit file_path(s).
+        if worktree_commit_allowed and not self.file_path:
+            return self._truncate_output(
+                "Error: file_path is required for agent commits on feature branches"
+            )
+
         if self.file_path:
+            if worktree_commit_allowed:
+                # Policy-allowed agent commit: stage ONLY the named paths
+                # (never ``-A``; _git_add uses self.file_path) and commit,
+                # with mandatory container execution for both subprocesses.
+                add_output = self._git_add(
+                    repo_root, allow_host_fallback=False
+                )
+                if (
+                    "Git command failed" in add_output
+                    or add_output.startswith("Error:")
+                ):
+                    return self._truncate_output(add_output)
+                output = self._run_git(
+                    repo_root,
+                    ["commit", "-m", self.message],
+                    allow_host_fallback=False,
+                )
+                return self._with_mode(self._truncate_output(output))
             try:
                 rels = self._validated_rel_paths(repo_root, self.file_path)
             except ValueError as e:
@@ -1284,15 +1403,23 @@ class GitInfoTool(ToolBase):
             if not rels:
                 return "Error: file_path is required for commit operation (at least one path)"
             args = ["commit", "-m", self.message, "--"] + rels
-            output = self._run_git(repo_root, args)
+            output = self._run_git(
+                repo_root, args, allow_host_fallback=not worktree_commit_allowed
+            )
             return self._with_mode(self._truncate_output(output))
 
         # Full commit: auto-stage the whole worktree, then commit. A failure
         # in the add step propagates exactly as the historical flow did.
-        add_output = self._git_add(repo_root)
+        add_output = self._git_add(
+            repo_root, allow_host_fallback=not worktree_commit_allowed
+        )
         if "Git command failed" in add_output:
             return self._truncate_output(add_output)
-        output = self._run_git(repo_root, ["commit", "-m", self.message])
+        output = self._run_git(
+            repo_root,
+            ["commit", "-m", self.message],
+            allow_host_fallback=not worktree_commit_allowed,
+        )
         return self._with_mode(self._truncate_output(output))
 
     def _git_init(self, repo_root: Path) -> str:
