@@ -177,7 +177,7 @@ class AgentConfig(BaseModel):
         """Map the ``agent_soft_budget_seconds`` config key onto ``timeout_seconds``.
 
         The shipped factory config (``resources/default_config.json``) carries
-        ``agent_soft_budget_seconds`` (600). When that key is present and no
+        ``agent_soft_budget_seconds`` (300). When that key is present and no
         explicit ``timeout_seconds`` is supplied, it becomes the soft-budget
         value; when the key is absent, the field default
         (``SOFT_BUDGET_FALLBACK_SECONDS`` = 300) applies.

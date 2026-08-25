@@ -541,7 +541,7 @@ class TestFactoryEdgeCases:
 def test_soft_budget_key_loaded_from_default_config():
     """agent_soft_budget_seconds ships in the factory config and maps to timeout_seconds.
 
-    - shipped factory config (resources/default_config.json) carries the key == 600;
+    - shipped factory config (resources/default_config.json) carries the key == 300;
     - the config key wins when building AgentConfig from the factory config;
     - with the key absent, the code fallback (SOFT_BUDGET_FALLBACK_SECONDS) applies.
     """
@@ -549,8 +549,8 @@ def test_soft_budget_key_loaded_from_default_config():
     from agent.config.models import AgentConfig
 
     fc = load_factory_config()
-    assert fc.get("agent_soft_budget_seconds") == 600
-    assert AgentConfig(**fc).timeout_seconds == 600  # config key wins
+    assert fc.get("agent_soft_budget_seconds") == 300
+    assert AgentConfig(**fc).timeout_seconds == 300  # config key wins
     assert AgentConfig().timeout_seconds == 300  # SOFT_BUDGET_FALLBACK_SECONDS fallback
 
 
