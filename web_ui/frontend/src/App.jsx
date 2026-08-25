@@ -31,14 +31,15 @@
  *   #/session/:sessionId  → tabbed session view (tab ensured + activated)
  */
 
-import React, { useEffect, useRef, useCallback, useState } from 'react'
+import React, { useEffect, useRef, useCallback, useState, useMemo } from 'react'
 import useStore from './store/useStore'
 import useWorkspaceStore from './store/workspaceStore'
 import useSessionTabsStore from './sessionTabsStore'
 import SessionTab from './components/SessionTab'
 import TabBar from './components/TabBar'
-import WorkerOutputPanel from './components/WorkerOutputPanel'
+import WorkerPanelArea from './components/WorkerPanelArea'
 import { isWorkerEventRenderable } from './components/chat/adaptWorkerEvent'
+import { routeEventsToPanels } from './components/chat/workerEventRouting'
 import LoggingPanel from './components/LoggingPanel'
 import WorkspaceSelector from './components/WorkspaceSelector'
 import WorkspacePanel from './components/workspace/WorkspacePanel'
@@ -48,6 +49,29 @@ import './styles.css'
 const WS_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
 const WS_URL = `ws://${window.location.hostname}:${WS_PORT}/ws`
 const TABS_PREFIX = 'tm.sessionTabs.'
+const WORKER_PANELS_PREFIX = 'tm.workerPanels.'
+const PANEL_SIZE_MIN = 250
+const PANEL_SIZE_MAX = 600
+const PANEL_SIZE_DEFAULT = 350
+// Instance key uniquely identifying a worker panel within a session
+// (worker name + instance id; missing instance id treated as '0').
+const workerPanelInstanceKey = (panel) => `${panel.worker_name}#${panel.instance_id ?? '0'}`
+// Session ids that already have tabs in the tab store. Used at boot to
+// decide which per-session worker-panel state to restore from localStorage.
+function bootSessionIds() {
+  try {
+    const tabState = useSessionTabsStore.getState()
+    const sessions = new Set()
+    Object.values(tabState.byWorkspace || {}).forEach(we => {
+      (we?.tabs || []).forEach(t => {
+        if (t?.sessionId) sessions.add(t.sessionId)
+      })
+    })
+    return sessions
+  } catch {
+    return new Set()
+  }
+}
 
 export default function App() {
   const route = useRoute()
@@ -76,16 +100,43 @@ export default function App() {
   const hubHasConnectedOnceRef = useRef(false)   // persist past StrictMode double-mount
   const [hubReady, setHubReady] = useState(false)
   const hydratedRef = useRef(false)              // boot-time restore ran once
+  const tabsSeenOnceRef = useRef(new Set())      // session ids ever seen in tabs (guards the LS sweep)
+  const panelsRestoredRef = useRef(false)        // worker-panel LS restore ran once
   const bootWsRef = useRef(null)                 // workspace hydrated at boot
   const [workspaceKnownTick, setWorkspaceKnownTick] = useState(0)  // bump when a session→workspace mapping appears
 
-  // ── Worker panel state per session ────────────────────────────────────
-  // Map: sessionId -> { name, workspaceId, instance_id, instance_label } | null
-  // Persisted in localStorage so panel state survives tab switches & page reloads.
-  const [workerPanelState, setWorkerPanelState] = useState(() => {
+  // ── Worker panels state per session ───────────────────────────────────
+  // workerPanelsBySession: { [sessionId]: [panel, ...] } — panel = { instance_id,
+  //   instance_label, worker_name, workspaceId, size, maximized, pinned, order }
+  // focusedPanelBySession: { [sessionId]: instanceKey | null } — focused panel
+  //   per session (null → fall back to the most recently opened panel).
+  // Persisted per-session in localStorage (tm.workerPanels.<sid> and .focused).
+  const [workerPanelsBySession, setWorkerPanelsBySession] = useState(() => {
     try {
-      const saved = localStorage.getItem('workerPanelState')
-      return saved ? JSON.parse(saved) : {}
+      const sessions = bootSessionIds()
+      const result = {}
+      sessions.forEach(sid => {
+        const saved = localStorage.getItem(WORKER_PANELS_PREFIX + sid)
+        if (!saved) return
+        const parsed = JSON.parse(saved)
+        if (!Array.isArray(parsed)) return
+        const panels = parsed.filter(p => p && typeof p === 'object' && p.worker_name)
+        if (panels.length > 0) result[sid] = panels
+      })
+      return result
+    } catch {
+      return {}
+    }
+  })
+  const [focusedPanelBySession, setFocusedPanelBySession] = useState(() => {
+    try {
+      const sessions = bootSessionIds()
+      const result = {}
+      sessions.forEach(sid => {
+        const saved = localStorage.getItem(WORKER_PANELS_PREFIX + sid + '.focused')
+        if (saved != null) result[sid] = saved
+      })
+      return result
     } catch {
       return {}
     }
@@ -104,7 +155,30 @@ export default function App() {
   const tabs = storeEntry?.tabs || []
   const activeSessionId = storeEntry?.activeSessionId || null
   const activeTab = tabs.find(t => t.sessionId === activeSessionId) || null
-  const selectedWorker = activeSessionId ? (workerPanelState[activeSessionId] ?? null) : null
+  // Focused worker panel per session: explicit focus wins, else the most
+  // recently opened (last) panel. selectedWorker exposes the consumer
+  // contract: name, workspaceId, instance_id, instance_label.
+  const focusedPanelInstanceKeyFor = (sid) => {
+    const panels = workerPanelsBySession[sid] || []
+    if (panels.length === 0) return null
+    const focused = focusedPanelBySession[sid]
+    if (focused != null && panels.some(p => workerPanelInstanceKey(p) === focused)) return focused
+    return workerPanelInstanceKey(panels[panels.length - 1])
+  }
+  const focusedInstanceKey = activeSessionId ? focusedPanelInstanceKeyFor(activeSessionId) : null
+  const selectedWorker = (activeSessionId && focusedInstanceKey)
+    ? (() => {
+        const panels = workerPanelsBySession[activeSessionId] || []
+        const entry = panels.find(p => workerPanelInstanceKey(p) === focusedInstanceKey) || null
+        return entry ? { ...entry, name: entry.worker_name, workspaceId: entry.workspaceId } : null
+      })()
+    : null
+  // Worker events pre-routed to per-panel buckets ({ [instanceKey]: [event, ...] }).
+  // Routing is pure — every event goes to EVERY panel it matches.
+  const routedEvents = useMemo(
+    () => routeEventsToPanels(workerEvents[activeSessionId] || [], workerPanelsBySession[activeSessionId] || []),
+    [workerEvents, activeSessionId, workerPanelsBySession]
+  )
 
   const tabRunningStates = useStore(s => s.tabRunningStates)
   const routeSessionConfig = useStore(s => (route?.view === 'session' && route.id ? s.sessionConfigs[route.id] : undefined))
@@ -421,6 +495,106 @@ export default function App() {
     }
   }, [navigate])
 
+  const openPanel = useCallback((sessionId, { name, workspaceId, instance_id, instance_label }) => {
+    if (!sessionId || !name) return
+    const newKey = `${name}#${instance_id ?? '0'}`
+    setWorkerPanelsBySession(prev => {
+      const panels = prev[sessionId] || []
+      if (panels.some(p => workerPanelInstanceKey(p) === newKey)) return prev
+      return {
+        ...prev,
+        [sessionId]: [
+          ...panels,
+          {
+            instance_id,
+            instance_label,
+            worker_name: name,
+            workspaceId,
+            size: PANEL_SIZE_DEFAULT,
+            maximized: false,
+            pinned: false,
+            order: panels.length,
+          },
+        ],
+      }
+    })
+    setFocusedPanelBySession(prev => ({ ...prev, [sessionId]: newKey }))
+  }, [])
+
+  const closePanel = useCallback((sessionId, instanceKey) => {
+    if (!sessionId || !instanceKey) return
+    const panels = workerPanelsBySession[sessionId] || []
+    const idx = panels.findIndex(p => workerPanelInstanceKey(p) === instanceKey)
+    if (idx === -1) return
+    const nextPanels = panels.filter((_, i) => i !== idx).map((p, i) => ({ ...p, order: i }))
+    setWorkerPanelsBySession(prev => ({ ...prev, [sessionId]: nextPanels }))
+    setFocusedPanelBySession(prev => {
+      if (prev[sessionId] !== instanceKey) return prev
+      const nextKey = nextPanels.length > 0
+        ? workerPanelInstanceKey(nextPanels[Math.min(idx, nextPanels.length - 1)])
+        : null
+      return { ...prev, [sessionId]: nextKey }
+    })
+  }, [workerPanelsBySession])
+
+  const reorderPanel = useCallback((sessionId, instanceKey, direction) => {
+    if (!sessionId || !instanceKey) return
+    const panels = workerPanelsBySession[sessionId] || []
+    const idx = panels.findIndex(p => workerPanelInstanceKey(p) === instanceKey)
+    if (idx === -1) return
+    const to = direction === 'left' ? idx - 1 : idx + 1
+    if (to < 0 || to >= panels.length) return
+    const next = panels.slice()
+    const [moved] = next.splice(idx, 1)
+    next.splice(to, 0, moved)
+    setWorkerPanelsBySession(prev => ({
+      ...prev,
+      [sessionId]: next.map((p, i) => ({ ...p, order: i })),
+    }))
+  }, [workerPanelsBySession])
+
+  const resizePanel = useCallback((sessionId, instanceKey, width) => {
+    if (!sessionId || !instanceKey) return
+    const clamped = Math.max(PANEL_SIZE_MIN, Math.min(PANEL_SIZE_MAX, width))
+    setWorkerPanelsBySession(prev => {
+      const panels = prev[sessionId] || []
+      if (!panels.some(p => workerPanelInstanceKey(p) === instanceKey)) return prev
+      return {
+        ...prev,
+        [sessionId]: panels.map(p => (workerPanelInstanceKey(p) === instanceKey ? { ...p, size: clamped } : p)),
+      }
+    })
+  }, [])
+
+  const toggleMaximize = useCallback((sessionId, instanceKey) => {
+    if (!sessionId || !instanceKey) return
+    setWorkerPanelsBySession(prev => {
+      const panels = prev[sessionId] || []
+      if (!panels.some(p => workerPanelInstanceKey(p) === instanceKey)) return prev
+      return {
+        ...prev,
+        [sessionId]: panels.map(p => (workerPanelInstanceKey(p) === instanceKey ? { ...p, maximized: !p.maximized } : p)),
+      }
+    })
+  }, [])
+
+  const togglePin = useCallback((sessionId, instanceKey) => {
+    if (!sessionId || !instanceKey) return
+    setWorkerPanelsBySession(prev => {
+      const panels = prev[sessionId] || []
+      if (!panels.some(p => workerPanelInstanceKey(p) === instanceKey)) return prev
+      return {
+        ...prev,
+        [sessionId]: panels.map(p => (workerPanelInstanceKey(p) === instanceKey ? { ...p, pinned: !p.pinned } : p)),
+      }
+    })
+  }, [])
+
+  const focusPanel = useCallback((sessionId, instanceKey) => {
+    if (!sessionId || !instanceKey) return
+    setFocusedPanelBySession(prev => ({ ...prev, [sessionId]: instanceKey }))
+  }, [])
+
   const handleSelectWorker = useCallback((workerName, workspaceId, instanceId, instanceLabel) => {
     if (!activeSessionId) {
       // Queue the selection — activeSessionId may not be available yet
@@ -428,24 +602,19 @@ export default function App() {
       return
     }
     pendingWorkerSelectionRef.current = null
-    setWorkerPanelState(prev => ({
-      ...prev,
-      [activeSessionId]: {
-        name: workerName,
-        workspaceId,
-        instance_id: instanceId,
-        instance_label: instanceLabel,
-      }
-    }))
-  }, [activeSessionId])
+    openPanel(activeSessionId, { name: workerName, workspaceId, instance_id: instanceId, instance_label: instanceLabel })
+  }, [activeSessionId, openPanel])
 
   const handleCloseWorkerPanel = useCallback(() => {
     if (!activeSessionId) return
-    setWorkerPanelState(prev => ({
-      ...prev,
-      [activeSessionId]: null
-    }))
-  }, [activeSessionId])
+    const panels = workerPanelsBySession[activeSessionId] || []
+    if (panels.length === 0) return
+    const focused = focusedPanelBySession[activeSessionId]
+    const key = (focused != null && panels.some(p => workerPanelInstanceKey(p) === focused))
+      ? focused
+      : workerPanelInstanceKey(panels[panels.length - 1])
+    closePanel(activeSessionId, key)
+  }, [activeSessionId, workerPanelsBySession, focusedPanelBySession, closePanel])
 
   // ── Handle worker lifecycle events from SessionTab WS ─────────────────
   const handleWorkerEvent = useCallback((sessionId, event) => {
@@ -606,6 +775,47 @@ export default function App() {
     hydratedRef.current = true
   }, [])
 
+  // ── Restore per-session worker panels from localStorage ───────────────
+  // Runs once, AFTER the R7 boot hydration (the tab store is still empty when
+  // the useState initializers above run, so boot-time restore cannot happen
+  // there). Merges saved panels/focused keys for every session that already
+  // has a tab, only ADDING sessions that are not yet in memory (no clobber).
+  useEffect(() => {
+    if (panelsRestoredRef.current) return
+    panelsRestoredRef.current = true
+    try {
+      const tabState = useSessionTabsStore.getState()
+      const sessionIds = new Set()
+      Object.values(tabState.byWorkspace || {}).forEach(we => {
+        (we?.tabs || []).forEach(t => {
+          if (t?.sessionId) sessionIds.add(t.sessionId)
+        })
+      })
+      sessionIds.forEach(sid => {
+        const saved = localStorage.getItem(WORKER_PANELS_PREFIX + sid)
+        if (saved) {
+          try {
+            const parsed = JSON.parse(saved)
+            if (Array.isArray(parsed)) {
+              const panels = parsed.filter(p => p && typeof p === 'object' && p.worker_name)
+              if (panels.length > 0) {
+                setWorkerPanelsBySession(prev => (prev[sid] ? prev : { ...prev, [sid]: panels }))
+              }
+            }
+          } catch {
+            // malformed entry — ignore
+          }
+        }
+        const focused = localStorage.getItem(WORKER_PANELS_PREFIX + sid + '.focused')
+        if (focused != null) {
+          setFocusedPanelBySession(prev => (prev[sid] != null ? prev : { ...prev, [sid]: focused }))
+        }
+      })
+    } catch {
+      // localStorage unavailable — memory state still works this session
+    }
+  }, [])
+
   // ── Hydrate the strip whenever we land on a workspace route ───────────
   useEffect(() => {
     if (route?.view === 'workspace' && route.id) {
@@ -646,21 +856,75 @@ export default function App() {
     }
   }, [route, workspaceKnownTick, routeSessionConfig, currentWs])
 
-  // ── Persist worker panel state to localStorage ────────────────────────
+  // ── Persist worker panels state to localStorage (per session) ───────────
   useEffect(() => {
-    localStorage.setItem('workerPanelState', JSON.stringify(workerPanelState))
-  }, [workerPanelState])
+    Object.entries(workerPanelsBySession).forEach(([sid, panels]) => {
+      try {
+        localStorage.setItem(WORKER_PANELS_PREFIX + sid, JSON.stringify(panels))
+      } catch {
+        // ignore quota / security errors — memory state still works this session
+      }
+    })
+  }, [workerPanelsBySession])
+
+  // Focused key per session: null → remove the focused key entirely.
+  useEffect(() => {
+    Object.entries(focusedPanelBySession).forEach(([sid, key]) => {
+      try {
+        if (key == null) {
+          localStorage.removeItem(WORKER_PANELS_PREFIX + sid + '.focused')
+        } else {
+          localStorage.setItem(WORKER_PANELS_PREFIX + sid + '.focused', key)
+        }
+      } catch {
+        // ignore
+      }
+    })
+  }, [focusedPanelBySession])
+
+  // One-time migration: drop the legacy global 'workerPanelState' key.
+  useEffect(() => {
+    try {
+      localStorage.removeItem('workerPanelState')
+    } catch {
+      // ignore
+    }
+  }, [])
 
   // ── Clean up stale keys when sessions are removed from tabs ───────────
   useEffect(() => {
     const activeSessionIds = new Set(tabs.map(t => t.sessionId).filter(Boolean))
-    setWorkerPanelState(prev => {
+    // Remember every session id ever seen in tabs. The LS sweep below only
+    // removes keys for sessions that were seen at least once and are gone
+    // now, so a mount-time run with empty/stale tabs can never wipe other
+    // (not yet hydrated) workspaces' panel state.
+    activeSessionIds.forEach(sid => tabsSeenOnceRef.current.add(sid))
+    setWorkerPanelsBySession(prev => {
       const stale = Object.keys(prev).filter(id => !activeSessionIds.has(id))
       if (stale.length === 0) return prev
       const next = { ...prev }
       stale.forEach(id => delete next[id])
       return next
     })
+    setFocusedPanelBySession(prev => {
+      const stale = Object.keys(prev).filter(id => !activeSessionIds.has(id))
+      if (stale.length === 0) return prev
+      const next = { ...prev }
+      stale.forEach(id => delete next[id])
+      return next
+    })
+    // Remove persisted per-session keys for sessions that no longer have tabs.
+    // Skipped until at least one tab has been observed (mount runs with empty
+    // tabs must not wipe freshly-restored localStorage).
+    if (tabsSeenOnceRef.current.size > 0) {
+      Object.keys(localStorage).forEach(key => {
+        if (!key.startsWith(WORKER_PANELS_PREFIX)) return
+        const sid = key.slice(WORKER_PANELS_PREFIX.length).replace(/\.focused$/, '')
+        if (tabsSeenOnceRef.current.has(sid) && !activeSessionIds.has(sid)) {
+          localStorage.removeItem(key)
+        }
+      })
+    }
   }, [tabs])
 
   // ── Flush any pending worker selection once activeSessionId becomes available ──
@@ -668,17 +932,14 @@ export default function App() {
     const pending = pendingWorkerSelectionRef.current
     if (pending && activeSessionId) {
       pendingWorkerSelectionRef.current = null
-      setWorkerPanelState(prev => ({
-        ...prev,
-        [activeSessionId]: {
-          name: pending.workerName,
-          workspaceId: pending.workspaceId,
-          instance_id: pending.instanceId,
-          instance_label: pending.instanceLabel,
-        }
-      }))
+      openPanel(activeSessionId, {
+        name: pending.workerName,
+        workspaceId: pending.workspaceId,
+        instance_id: pending.instanceId,
+        instance_label: pending.instanceLabel,
+      })
     }
-  }, [activeSessionId])
+  }, [activeSessionId, openPanel])
 
   // ── Fetch logging config (callable for retry) ─────────────────────────
   const fetchLoggingConfig = useCallback(() => {
@@ -794,20 +1055,21 @@ export default function App() {
           />
         )}
 
-        {/* Worker Output Panel — right sidebar for worker event logs */}
-        <div className="worker-output-panel">
-          {selectedWorker && (
-            <WorkerOutputPanel
-              workspaceId={selectedWorker.workspaceId}
-              workerName={selectedWorker.name}
-              instanceId={selectedWorker.instance_id}
-              instanceLabel={selectedWorker.instance_label}
-              sessionId={activeSessionId}
-              onClose={handleCloseWorkerPanel}
-              incomingEvents={workerEvents[activeSessionId] || []}
-            />
-          )}
-        </div>
+        {/* Worker Panel Area — multi-panel sidebar for worker event logs */}
+        <WorkerPanelArea
+          sessionId={activeSessionId}
+          workspaceId={currentWs}
+          panels={workerPanelsBySession[activeSessionId] || []}
+          focusedKey={focusedPanelBySession[activeSessionId] || null}
+          eventsByKey={routedEvents}
+          onClose={(key) => closePanel(activeSessionId, key)}
+          onFocus={(key) => focusPanel(activeSessionId, key)}
+          onResize={(key, w) => resizePanel(activeSessionId, key, w)}
+          onToggleMaximize={(key) => toggleMaximize(activeSessionId, key)}
+          onTogglePin={(key) => togglePin(activeSessionId, key)}
+          onMoveLeft={(key) => reorderPanel(activeSessionId, key, 'left')}
+          onMoveRight={(key) => reorderPanel(activeSessionId, key, 'right')}
+        />
 
       </div>
     </div>

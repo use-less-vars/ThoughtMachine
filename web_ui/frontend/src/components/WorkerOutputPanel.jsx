@@ -6,6 +6,7 @@ import useStore from '../store/useStore';
 const PANEL_MIN = 250;
 const PANEL_MAX = 600;
 const PANEL_DEFAULT = 350;
+const noop = () => {};
 
 
 function relativeTime(isoString) {
@@ -57,28 +58,33 @@ function NewEventsButton({ onClick }) {
 }
 
 // ── Main component ────────────────────────────────────────────────────
-function WorkerOutputPanel({ workspaceId, workerName, instanceId, instanceLabel, sessionId, onClose, incomingEvents = [] }) {
+function WorkerOutputPanel({
+  workspaceId,
+  workerName,
+  instanceId,
+  instanceLabel,
+  sessionId,
+  onClose,
+  incomingEvents = [],
+  size = PANEL_DEFAULT,
+  maximized = false,
+  pinned = false,
+  onResize = noop,
+  onToggleMaximize,
+  onTogglePin,
+}) {
 
   
-  // Panel resize state (self-contained)
-  const [panelWidth, setPanelWidth] = useState(PANEL_DEFAULT);
+  // Panel width is controlled by the parent via props.size. The drag only
+  // manipulates the DOM directly for smoothness, then reports the final
+  // width via onResize (no localStorage persistence here anymore).
   const dragRef = useRef(null);
   const panelRef = useRef(null);
-  const storageKey = 'worker-output-panel-width';
-
-  // Restore persisted width
-  useEffect(() => {
-    const saved = localStorage.getItem(storageKey);
-    if (saved) {
-      const w = Math.max(PANEL_MIN, Math.min(PANEL_MAX, Number(saved)));
-      setPanelWidth(w);
-    }
-  }, []);
 
   const handleResizeStart = useCallback((e) => {
     e.preventDefault();
     const startX = e.clientX;
-    const startWidth = panelWidth;
+    const startWidth = size;
     dragRef.current = 'dragging';
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
@@ -100,23 +106,18 @@ function WorkerOutputPanel({ workspaceId, workerName, instanceId, instanceLabel,
       document.body.style.userSelect = '';
       document.removeEventListener('mousemove', handleMouseMove);
       document.removeEventListener('mouseup', handleMouseUp);
-      // Sync final width back to React state
+      // Report final width back to the parent (state now lives there)
       if (panelRef.current) {
         const finalWidth = parseInt(panelRef.current.style.width, 10);
-        if (finalWidth && finalWidth !== panelWidth) {
-          setPanelWidth(finalWidth);
+        if (finalWidth && finalWidth !== size) {
+          onResize(finalWidth);
         }
       }
     };
 
     document.addEventListener('mousemove', handleMouseMove);
     document.addEventListener('mouseup', handleMouseUp);
-  }, [panelWidth]);
-
-  // Persist width changes
-  useEffect(() => {
-    localStorage.setItem(storageKey, String(panelWidth));
-  }, [panelWidth]);
+  }, [size, onResize]);
 
   // ── Worker info (name, status, current_task) ──────────────────────────
   const [workerInfo, setWorkerInfo] = useState(null);
@@ -693,9 +694,9 @@ function WorkerOutputPanel({ workspaceId, workerName, instanceId, instanceLabel,
       <div
         className="worker-output-no-selection"
         style={{
-          width: panelWidth,
-          minWidth: PANEL_MIN,
-          maxWidth: PANEL_MAX,
+          width: maximized ? '100%' : size,
+          minWidth: maximized ? 0 : PANEL_MIN,
+          maxWidth: maximized ? 'none' : PANEL_MAX,
           flexShrink: 0,
           borderLeft: '1px solid var(--border)',
         }}
@@ -725,9 +726,9 @@ function WorkerOutputPanel({ workspaceId, workerName, instanceId, instanceLabel,
         ref={panelRef}
         className="worker-output-inner"
         style={{
-          width: panelWidth,
-          minWidth: PANEL_MIN,
-          maxWidth: PANEL_MAX,
+          width: maximized ? '100%' : size,
+          minWidth: maximized ? 0 : PANEL_MIN,
+          maxWidth: maximized ? 'none' : PANEL_MAX,
           flexShrink: 0,
         }}
       >
@@ -758,6 +759,24 @@ function WorkerOutputPanel({ workspaceId, workerName, instanceId, instanceLabel,
               {truncate(workerInfo.current_task, 50)}
             </span>
           )}
+          {onToggleMaximize && (
+            <button
+              className="worker-output-maximize-btn worker-output-close-btn"
+              onClick={onToggleMaximize}
+              title={maximized ? 'Restore panel' : 'Maximize panel'}
+            >
+              {maximized ? '⤡' : '⤢'}
+            </button>
+          )}
+          {onTogglePin && (
+            <button
+              className="worker-output-pin-btn worker-output-close-btn"
+              onClick={onTogglePin}
+              title={pinned ? 'Unpin panel' : 'Pin panel'}
+            >
+              {pinned ? '📌' : '📍'}
+            </button>
+          )}
           {onClose && (
             <button
               className="worker-output-close-btn"
@@ -783,8 +802,6 @@ function WorkerOutputPanel({ workspaceId, workerName, instanceId, instanceLabel,
             </div>
           )}
 
-          {events.map((evt, idx) => {
-            const msg = adaptWorkerEvent(evt);
           {runtimeStatus === 'paused' ? (
             <button
               className="worker-output-resume-btn"
@@ -802,6 +819,9 @@ function WorkerOutputPanel({ workspaceId, workerName, instanceId, instanceLabel,
               ⏸ Pause
             </button>
           )}
+
+          {events.map((evt, idx) => {
+            const msg = adaptWorkerEvent(evt);
 
             if (!msg) {
               console.log('[WorkerOutputPanel] render: adaptWorkerEvent returned null for event', evt.event || 'unknown');
@@ -885,6 +905,12 @@ function workerOutputPropsEqual(prevProps, nextProps) {
   if (prevProps.instanceLabel !== nextProps.instanceLabel) return false;
   if (prevProps.sessionId !== nextProps.sessionId) return false;
   if (prevProps.onClose !== nextProps.onClose) return false;
+  if (prevProps.size !== nextProps.size) return false;
+  if (prevProps.maximized !== nextProps.maximized) return false;
+  if (prevProps.pinned !== nextProps.pinned) return false;
+  if (prevProps.onResize !== nextProps.onResize) return false;
+  if (prevProps.onToggleMaximize !== nextProps.onToggleMaximize) return false;
+  if (prevProps.onTogglePin !== nextProps.onTogglePin) return false;
   const prevEvents = prevProps.incomingEvents || [];
   const nextEvents = nextProps.incomingEvents || [];
   if (prevEvents === nextEvents) return true;
