@@ -15,12 +15,15 @@ import pytest
 from agent.core.message import Message
 from session.history_pruner import (
     FINAL_TOOL_NAMES,
+    RESPOND_FAMILY_NAMES,
     PruningPolicy,
     prune_user_history,
     _find_summary_indices,
     _group_turns,
     _is_system_notification,
 )
+from session.models import Session
+from session.store import FileSystemSessionStore
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -570,8 +573,9 @@ class TestAssistantStartedTurns:
         assert result[0]['content'] == 'Direct answer without user'
 
     def test_compact_no_user_with_tool_calls(self):
-        """A turn starting with assistant-with-tc (no user) keeps assistant
-        and final tool result."""
+        """A turn starting with assistant-with-tc (no user): assistant kept
+        as TEXT ONLY and the Respond-family tool result converted to an
+        assistant-style message — no orphaned tool call IDs survive."""
         from session.history_pruner import _compact_turn
         _reset_seq()
         tc = _tool_call('Final', 'call_f')
@@ -580,9 +584,12 @@ class TestAssistantStartedTurns:
             _tool('Result', 'call_f'),
         ]
         result = _compact_turn(turn, PruningPolicy())
-        assert len(result) == 2  # assistant + tool result
+        assert len(result) == 2  # assistant text + converted result
         assert result[0]['role'] == 'assistant'
-        assert result[1]['role'] == 'tool'
+        assert 'tool_calls' not in result[0]
+        assert result[1]['role'] == 'assistant'
+        assert result[1]['content'] == 'Result'
+        assert 'tool_call_id' not in result[1]
 
     def test_pruning_between_user_and_assistant(self):
         """Integration: if a summary falls between user and its assistant,
@@ -632,19 +639,21 @@ class TestAssistantStartedTurns:
         result = prune_user_history(history)
         # Old region compacted:
         #   - S1 is system passthrough
-        #   - _group_turns on [user, asst(w tc), tool, asst] gives:
-        #     turn 1: [user]
-        #     turn 2: [asst(w tc), tool, asst]
-        #   - _compact_turn turn 1: [user] (plain assistant? no, just user with no asst - returns [user])
-        #   - _compact_turn turn 2: starts with asst(w tc), no final tool -> keep_plain_answer_only
-        #     keeps last asst with content and no tc = asst('Found a.txt')
-        # So compacted = [S1, user('Find file'), asst('Found a.txt')]
+        #   - turn 1 [user('Find file')] -> [user('Find file')]
+        #   - turn 2 [asst('Searching...' w tc), tool, asst('Found a.txt')] ->
+        #     asst text kept (tool_calls stripped), GlobTool result dropped,
+        #     asst('Found a.txt') kept as text
+        # So compacted = [S1, user('Find file'), asst('Searching...'), asst('Found a.txt')]
         user_msgs = [m for m in result if m.get('role') == 'user' and not _is_system_notification(m)]
         assert len(user_msgs) == 3  # Find file, Q2, Q3
-        # The old region's assistant 'Found a.txt' should be present (plain answer kept)
+        # The old region's assistant 'Found a.txt' should be present (text kept)
         assert any(m.get('content') == 'Found a.txt' for m in result)
-        # The intermediate asst 'Searching...' with tool calls should NOT be present
-        assert not any(m.get('content') == 'Searching...' for m in result)
+        # The intermediate asst 'Searching...' is kept as TEXT ONLY
+        searching = [m for m in result if m.get('content') == 'Searching...']
+        assert len(searching) == 1
+        assert 'tool_calls' not in searching[0]
+        # The GlobTool result is dropped (not Respond-family)
+        assert not any(m.get('content') == '["a.txt"]' for m in result)
 
 
 class TestSeqNumberingPreserved:
@@ -812,3 +821,105 @@ class TestFinalToolNames:
 
     def test_no_extra_names(self):
         assert len(FINAL_TOOL_NAMES) == 3
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Old-region semantics: end-to-end through the real store (save-time)
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestOldRegionNewSemantics:
+    """End-to-end tests through FileSystemSessionStore.save_session (pruning
+    enabled) for the new old-region semantics: user messages kept, assistant
+    TEXT only, Respond-family tool results converted to assistant-style text,
+    everything else dropped, last two summary cycles byte-identical."""
+
+    @staticmethod
+    def _build_history() -> List[Dict[str, Any]]:
+        """prompt, cycle 0 (3 tool calls incl. Respond), S1, cycle 1, S2,
+        Q2/A2. Summaries at indices 6 and 10 -> old region = [0:6]."""
+        _reset_seq()
+        g0 = _tool_call('GitInfoTool', 'g0')
+        w0 = _tool_call('Worker', 'w0')
+        r0 = _tool_call('Respond', 'r0')
+        r1 = _tool_call('Respond', 'r1')
+        return [
+            _sys('prompt'),                                            # 0
+            _user('Q0'),                                               # 1
+            _asst('Running...', tool_calls=[g0, w0, r0]),              # 2
+            _tool('{"exit_code":0}', 'g0'),                            # 3
+            _tool('{"found":"x"}', 'w0'),                              # 4
+            _tool('Answer 0', 'r0', response_type='answer'),           # 5
+            _summary('S1'),                                            # 6
+            _user('Q1'),                                               # 7
+            _asst('Thinking...', tool_calls=[r1]),                     # 8
+            _tool('Answer 1', 'r1', response_type='answer'),           # 9
+            _summary('S2'),                                            # 10
+            _user('Q2'),                                               # 11
+            _asst('A2'),                                               # 12
+        ]
+
+    @staticmethod
+    def _save(tmp_path, history):
+        store = FileSystemSessionStore(
+            sessions_dir=str(tmp_path / 'sessions'),
+            state_dir=str(tmp_path / 'state'),
+        )
+        session = Session.from_persistable_dict({
+            'session_id': 'pruner-old-region',
+            'metadata': {'name': 'Pruner Old Region'},
+            'user_history': list(history),
+        })
+        sid = session.session_id
+        store.save_session(session)
+        path = store._find_session_path(sid)
+        assert path is not None and path.exists()
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    def test_old_region_has_no_orphaned_tool_calls(self, tmp_path):
+        history = self._build_history()
+        data = self._save(tmp_path, history)
+        old = data['user_history'][:6]
+        # No assistant keeps a tool_calls array and no tool message survives
+        assert all('tool_calls' not in m for m in old)
+        assert all(m.get('role') != 'tool' for m in old)
+
+    def test_old_region_keeps_user_messages(self, tmp_path):
+        history = self._build_history()
+        data = self._save(tmp_path, history)
+        out = data['user_history']
+        contents = [m.get('content') for m in out]
+        # Q0 lives in the old region; Q1/Q2 in the kept region
+        assert 'Q0' in contents
+        assert 'Q1' in contents
+        assert 'Q2' in contents
+
+    def test_old_region_keeps_assistant_text_only(self, tmp_path):
+        history = self._build_history()
+        data = self._save(tmp_path, history)
+        old = data['user_history'][:6]
+        running = [m for m in old if m.get('content') == 'Running...']
+        assert len(running) == 1
+        assert 'tool_calls' not in running[0]
+        assert 'reasoning_content' not in running[0]
+
+    def test_old_region_keeps_respond_family_output_only(self, tmp_path):
+        history = self._build_history()
+        data = self._save(tmp_path, history)
+        old = data['user_history'][:6]
+        asst_contents = [m.get('content') for m in old if m.get('role') == 'assistant']
+        # Respond tool output converted to assistant-style text
+        assert 'Answer 0' in asst_contents
+        # Non-Respond tool outputs dropped entirely
+        serialized = json.dumps(old)
+        assert '{"exit_code":0}' not in serialized
+        assert '{"found":"x"}' not in serialized
+
+    def test_last_two_summary_cycles_preserved(self, tmp_path):
+        history = self._build_history()
+        data = self._save(tmp_path, history)
+        out = data['user_history']
+        s1_idx = next(i for i, m in enumerate(out) if m.get('content') == 'S1')
+        # Everything from the second-last summary on is byte-identical
+        assert out[s1_idx:] == history[6:]

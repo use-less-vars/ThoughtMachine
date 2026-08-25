@@ -291,13 +291,15 @@ class FileSystemSessionStore(SessionStore):
         if 'metadata' in data and 'external_file_path' in data['metadata']:
             del data['metadata']['external_file_path']
 
-        # Session history bounding: only main-agent sessions (metadata['agent_type']
-        # == 'main') whose serialized payload exceeds the cap are bounded, right
-        # before the atomic write. session_size_bytes is then written for those
-        # sessions via fixpoint so the stored value equals the real file size.
-        # Sessions without the flag are skipped entirely (defensive: worker
-        # sessions and legacy files must never be touched).
-        if isinstance(data.get('metadata'), dict) and data['metadata'].get('agent_type') == 'main':
+        # Session history bounding: applies to main-agent sessions
+        # (metadata['agent_type'] == 'main') AND legacy sessions whose metadata
+        # lacks agent_type or has it explicitly set to None — those files are
+        # treated as main-agent sessions and capped too, right before the atomic
+        # write. session_size_bytes is then written for those sessions via
+        # fixpoint so the stored value equals the real file size.
+        # Explicit non-main agent_type values (e.g. 'worker') are still skipped
+        # entirely (defensive: worker sessions never write store files).
+        if isinstance(data.get('metadata'), dict) and data['metadata'].get('agent_type') in (None, 'main'):
             from session.size_bounding import (
                 apply_session_size_bounding,
                 payload_size_bytes,

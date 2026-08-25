@@ -503,6 +503,7 @@ class TestStoreIntegration:
     def test_no_size_field_for_non_main_session(self, tmp_path):
         store = _make_store(tmp_path)
         session = Session()
+        session.metadata['agent_type'] = 'worker'
         session.metadata['name'] = 'Worker Session'
         session.add_message('user', 'u' * 1_100_000)
         session.add_message('assistant', 'a' * 1_100_000)
@@ -552,3 +553,72 @@ class TestRoundTrip:
         })
         assert s.session_id == 'x'
         assert len(s.user_history) == 0
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Store-level size cap for missing / None / legacy agent_type
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestSizeCapWithoutMainFlag:
+    """The store-level size cap applies to sessions whose metadata has no
+    agent_type, agent_type=None, or agent_type='main'; only explicit
+    non-main values (e.g. 'worker') remain exempt."""
+
+    def _assert_capped(self, store, session):
+        sid = session.session_id
+        store.save_session(session)
+        path = store._find_session_path(sid)
+        assert path is not None and path.exists()
+        assert os.path.getsize(path) <= SESSION_SIZE_CAP_BYTES
+        return path
+
+    def test_size_cap_applies_when_agent_type_missing(self, tmp_path):
+        store = _make_store(tmp_path)
+        session = Session()
+        session.metadata['name'] = 'No Agent Type'
+        session.add_message('user', 'u' * 1_100_000)
+        session.add_message('assistant', 'a' * 1_100_000)
+        path = self._assert_capped(store, session)
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        assert isinstance(data.get('session_size_bytes'), int)
+
+    def test_size_cap_applies_when_agent_type_none(self, tmp_path):
+        store = _make_store(tmp_path)
+        session = Session()
+        session.metadata['agent_type'] = None
+        session.metadata['name'] = 'None Agent Type'
+        session.add_message('user', 'u' * 1_100_000)
+        session.add_message('assistant', 'a' * 1_100_000)
+        path = self._assert_capped(store, session)
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        assert isinstance(data.get('session_size_bytes'), int)
+
+    def test_size_cap_applies_to_legacy_session_file(self, tmp_path):
+        store = _make_store(tmp_path)
+        session = Session.from_persistable_dict({
+            'session_id': 'legacy-1',
+            'metadata': {'name': 'Legacy'},
+            'user_history': [
+                {'role': 'user', 'content': 'u' * 1_100_000},
+                {'role': 'assistant', 'content': 'a' * 1_100_000},
+            ],
+            'config': {'system_prompt': 'x'},
+        })
+        self._assert_capped(store, session)
+
+    def test_oversized_session_shrinks_below_2mb(self, tmp_path):
+        store = _make_store(tmp_path)
+        session = Session()
+        session.metadata['agent_type'] = 'main'
+        session.metadata['name'] = 'Oversized'
+        for _ in range(3):
+            session.add_message('user', 'u' * 800_000)
+            session.add_message('assistant', 'a' * 800_000)
+        original_len = len(session.user_history)
+        path = self._assert_capped(store, session)
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        assert len(data['user_history']) < original_len
