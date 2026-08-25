@@ -3999,6 +3999,41 @@ class Worker(ToolBase):
             "stale": stale,
         }
 
+    def _wait_for_worker_exit(self, thread) -> bool:
+        """Wait (bounded) for a cooperatively-stopped worker thread to exit.
+
+        Used by the sync-query timeout path so ``_action_query`` never returns
+        while the worker thread is still alive (e.g. stuck inside a
+        DockerCodeRunner call): the caller must observe a terminal state, not
+        an in-flight thread. Same join-retry pattern as ``_action_stop``
+        (budget = max(30, thread timeout)); never Thread.kill. Returns True
+        when the thread exited within the budget, False when the budget
+        elapsed with the daemon thread still alive (the envelope then reports
+        the degraded outcome and the thread is left to terminate on its own).
+        """
+        _join_budget = max(30, getattr(thread, "_timeout_seconds", 600) or 600)
+        _join_elapsed = 0.0
+        _join_step = 2.0
+        while _join_elapsed < _join_budget:
+            thread.join(timeout=_join_step)
+            _join_elapsed += _join_step
+            if not thread.is_alive():
+                return True
+            logger.debug(
+                "Still waiting for worker '%s' to stop "
+                "(%.0f/%ds elapsed)",
+                self.worker_name, _join_elapsed, _join_budget,
+            )
+        if thread.is_alive():
+            logger.warning(
+                "Worker '%s' did not stop within %ds budget after query "
+                "timeout; returning envelope with thread still running "
+                "(daemon thread)",
+                self.worker_name, _join_budget,
+            )
+            return False
+        return True
+
     def _action_query(self, workers: list) -> dict:
         """Query a worker and wait for a response (synchronous, blocking)."""
         try:
@@ -4079,6 +4114,33 @@ class Worker(ToolBase):
                 thread._cleanup_worker_containers()
             except Exception:
                 pass
+            # ── Stop guarantee: bounded wait for actual thread exit ──
+            # The sync call must not return while the worker thread is still
+            # alive (it may be stuck inside a DockerCodeRunner call): the
+            # caller would observe a terminal envelope while the thread is
+            # still in flight. join() in retry steps (same pattern as
+            # _action_stop), bounded by max(30, timeout_seconds). Never
+            # Thread.kill — if the budget elapses the daemon thread is left to
+            # terminate on its own and the envelope reports the degraded
+            # outcome.
+            clean_exit = self._wait_for_worker_exit(thread)
+            stopped_note = (
+                "Worker did not respond in time and was stopped cooperatively "
+                "(its containers were reclaimed). Re-spawn the worker before "
+                "querying it again."
+            )
+            degraded_note = (
+                "Worker did not respond in time and was stopped cooperatively, "
+                "but it did not exit within the stop budget and may still be "
+                "terminating in the background. Re-spawn the worker before "
+                "querying it again."
+            )
+            if not clean_exit:
+                logger.warning(
+                    "Worker '%s' still alive after query-timeout stop budget; "
+                    "returning envelope with thread running",
+                    self.worker_name,
+                )
             # Heartbeat classification now only shapes the message content —
             # both branches terminate the worker, because a timed-out query is
             # final (the worker was stopped and its containers reclaimed).
@@ -4104,13 +4166,13 @@ class Worker(ToolBase):
                             "worker_name": self.worker_name,
                             "status": thread.status,
                             "current_task": thread.current_task,
-                            "note": "Worker did not respond in time and was stopped cooperatively (its containers were reclaimed). Re-spawn the worker before querying it again.",
+                            "note": degraded_note if not clean_exit else stopped_note,
                         }
                 except (ValueError, TypeError):
                     pass  # Malformed heartbeat — fall through to generic timeout
             return {
                 "error": str(exc),
-                "note": "Worker did not respond in time and was stopped cooperatively (its containers were reclaimed). Re-spawn the worker before querying it again.",
+                "note": degraded_note if not clean_exit else stopped_note,
                 "worker_name": self.worker_name,
                 "status": thread.status,
             }

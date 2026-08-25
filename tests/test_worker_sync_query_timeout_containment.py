@@ -428,9 +428,21 @@ def test_query_timeout_while_busy_reclaims_containers_synchronously(tmp_path, mo
     stop_calls = []
     orig_stop = thread.stop
     thread.stop = lambda: (stop_calls.append(True), orig_stop())[1]
+    # Recorder distinguishes WHO invoked cleanup: the timeout branch runs on
+    # the caller thread (recorded as False), run()'s finally teardown runs on
+    # the worker thread (recorded as True). Both are idempotent; the guarantee
+    # is that the FIRST call comes from the timeout branch while the worker is
+    # still genuinely busy.
     cleanup_calls = []
+    cleanup_called = threading.Event()
     orig_cleanup = thread._cleanup_worker_containers
-    thread._cleanup_worker_containers = lambda: (cleanup_calls.append(True), orig_cleanup())[1]
+
+    def _recording_cleanup():
+        cleanup_calls.append(threading.current_thread() is thread)
+        cleanup_called.set()
+        return orig_cleanup()
+
+    thread._cleanup_worker_containers = _recording_cleanup
 
     # Fake send_query: wait until the worker is genuinely busy, THEN time out.
     def _timeout(query, timeout=300.0):
@@ -439,12 +451,23 @@ def test_query_timeout_while_busy_reclaims_containers_synchronously(tmp_path, mo
 
     thread.send_query = _timeout
 
+    # STOP-GUARANTEE semantics: the timeout branch now WAITS (bounded) for the
+    # thread to exit before returning the envelope. In the real world the
+    # blocked DockerCodeRunner call fails once the timeout path stops the
+    # worker's container, so the thread exits on its own; simulate that by
+    # releasing the Docker block as soon as the synchronous cleanup runs.
+    def _docker_call_fails_after_cleanup():
+        assert cleanup_called.wait(timeout=10.0), "cleanup never ran"
+        release.set()
+
+    threading.Thread(target=_docker_call_fails_after_cleanup, daemon=True).start()
+
     tool = Worker(action="query", worker_name="w4", worker_query="hello", session_id="sess-4")
     t0 = time.monotonic()
     envelope = tool._action_query([])
     elapsed = time.monotonic() - t0
 
-    # (1) Envelope: prompt cooperative-stop return, no join.
+    # (1) Envelope: prompt cooperative-stop return after the bounded wait.
     assert elapsed < 5.0
     assert envelope["error"]
     assert "stopped cooperatively" in envelope["note"]
@@ -455,11 +478,15 @@ def test_query_timeout_while_busy_reclaims_containers_synchronously(tmp_path, mo
     # (2) thread.stop() invoked from the timeout branch.
     assert stop_calls == [True]
 
-    # (3) _cleanup_worker_containers() invoked DIRECTLY from the timeout branch.
-    assert cleanup_calls == [True]
+    # (3) _cleanup_worker_containers() invoked DIRECTLY from the timeout branch
+    # (caller thread, while the worker is still busy), and AGAIN by run()'s own
+    # finally teardown once the released Docker call let the thread exit.
+    assert cleanup_calls == [False, True], f"unexpected cleanup callers: {cleanup_calls}"
 
-    # (4) IMMEDIATE reclaim while the worker is STILL busy inside _run_tool_loop.
-    assert thread.is_alive(), "worker must still be inside _run_tool_loop"
+    # (4) STOP GUARANTEE: the sync call returned only after the worker thread
+    # actually exited — no orphan thread survives the call.
+    assert not thread.is_alive(), "worker thread still alive after sync call returned"
+    assert thread.status == "stopped"
     assert [c.id for c in cm.stopped] == ["c-owned"]
     assert [c.id for c in cm.removed] == ["c-owned"]
     assert not any(c.labels.get(_WORKER_CONTAINER_LABEL) == owner for c in cm.containers)
@@ -468,10 +495,7 @@ def test_query_timeout_while_busy_reclaims_containers_synchronously(tmp_path, mo
     assert any(c.id == "c-res" for c in cm.containers)
     assert [c.id for c in cm.stopped + cm.removed].count("c-res") == 0
 
-    # (6) Terminal path: the in-flight query still drains, then run() exits.
-    release.set()
-    assert _wait_until(lambda: not thread.is_alive(), timeout=10.0), "worker thread still alive"
-    assert thread.status == "stopped"
+    # (6) Terminal path ran: registry shows stopped; in-flight query drained.
     with worker_module._registry_lock:
         entry = worker_module._worker_registry.get(("sess-4", "w4", 1))
     assert entry is None or entry.status == "stopped"
