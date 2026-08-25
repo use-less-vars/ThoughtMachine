@@ -76,6 +76,7 @@ const modalBox = {
 
 const STATUS_DOT_COLORS = {
   ready: '#585b70',    /* grey — idle, spawned but not doing anything */
+  running: '#a6e3a1',  /* green — real runtime_status for an active worker */
   busy: '#a6e3a1',     /* green with pulse — actively processing */
   completed: '#6c7086', /* muted grey — finished */
   error: '#f38ba8',    /* red — something went wrong */
@@ -94,6 +95,29 @@ function relativeTime(ts) {
   const diffHr = Math.floor(diffMin / 60);
   if (diffHr < 24) return `${diffHr}h ago`;
   return `${Math.floor(diffHr / 24)}d ago`;
+}
+
+// ── Helper: compact token count (12400 -> '12.4k') ──────────────────────────
+function formatTokens(n) {
+  if (n == null) return '';
+  if (n >= 1000) {
+    const k = n / 1000;
+    return `${k % 1 === 0 ? k.toFixed(0) : k.toFixed(1)}k`;
+  }
+  return String(n);
+}
+
+// ── Helper: human-readable duration (130 -> '2m 10s', 3600 -> '1h') ────────
+function formatDuration(sec) {
+  if (sec == null || sec < 0 || !Number.isFinite(sec)) return '';
+  const s = Math.round(sec);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const remS = s % 60;
+  if (m < 60) return remS === 0 ? `${m}m` : `${m}m ${remS}s`;
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  return remM === 0 ? `${h}h` : `${h}h ${remM}m`;
 }
 
 // ── Helper: truncate ───────────────────────────────────────────────────────
@@ -971,7 +995,7 @@ export default function WorkerManagementPanel({
                           color:
                             w.runtime_status === 'error'
                               ? '#f38ba8'
-                              : w.runtime_status === 'busy'
+                              : w.runtime_status === 'busy' || w.runtime_status === 'running'
                                 ? '#89b4fa'
                                 : w.runtime_status === 'pausing' || w.runtime_status === 'paused'
                                   ? '#f9e2af'
@@ -1075,11 +1099,44 @@ export default function WorkerManagementPanel({
                           Stop
                         </button>
                       )}
-                      {w.last_heartbeat && (
-                        <span style={{ color: '#6c7086', fontSize: '0.65rem' }}>
-                          {relativeTime(w.last_heartbeat)}
+                      {/* manual-pause badge (payload.paused_manually) */}
+                      {w.paused_manually && (
+                        <span
+                          title="Paused manually"
+                          style={{
+                            background: '#f9e2af',
+                            color: '#1e1e2e',
+                            borderRadius: '3px',
+                            padding: '0.1rem 0.3rem',
+                            fontSize: '0.6rem',
+                            fontWeight: 600,
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
+                          manual pause
                         </span>
                       )}
+                      {/* compact token indicator */}
+                      {w.current_context_tokens != null && (
+                        <span style={{ color: '#a6adc8', fontSize: '0.65rem' }} title="Context tokens">
+                          ctx: {formatTokens(w.current_context_tokens)}
+                          {w.max_context_tokens != null
+                            ? ` / ${formatTokens(w.max_context_tokens)}`
+                            : ''}
+                        </span>
+                      )}
+                      {/* time since last query (falls back to heartbeat) */}
+                      {(w.time_since_last_query != null && w.time_since_last_query >= 0) ||
+                      w.last_heartbeat ? (
+                        <span
+                          style={{ color: '#6c7086', fontSize: '0.65rem' }}
+                          title="Time since last query"
+                        >
+                          {w.time_since_last_query != null && w.time_since_last_query >= 0
+                            ? formatDuration(w.time_since_last_query)
+                            : relativeTime(w.last_heartbeat)}
+                        </span>
+                      ) : null}
                     </>
                   ) : (
                     <span style={{ color: '#6c7086' }}>—</span>
