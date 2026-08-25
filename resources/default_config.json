@@ -10,6 +10,7 @@
   "token_monitor_warning_threshold": 65000,
   "token_monitor_critical_threshold": 80000,
   "turn_monitor_enabled": true,
+  "agent_soft_budget_seconds": 300,
   "enable_logging": true,
   "log_dir": "./logs",
   "log_level": "INFO",

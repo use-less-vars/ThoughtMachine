@@ -531,3 +531,61 @@ class TestFactoryEdgeCases:
         fc = load_factory_config()
         # The factory JSON has "system_prompt": ""
         assert fc.get("system_prompt") == ""
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Timeout unification (PART 2a/2b): soft-budget config key + idle-site wiring
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_soft_budget_key_loaded_from_default_config():
+    """agent_soft_budget_seconds ships in the factory config and maps to timeout_seconds.
+
+    - shipped factory config (resources/default_config.json) carries the key == 300;
+    - the config key wins when building AgentConfig from the factory config;
+    - with the key absent, the code fallback (SOFT_BUDGET_FALLBACK_SECONDS) applies.
+    """
+    from agent.config.loader import load_factory_config
+    from agent.config.models import AgentConfig
+
+    fc = load_factory_config()
+    assert fc.get("agent_soft_budget_seconds") == 300
+    assert AgentConfig(**fc).timeout_seconds == 300  # config key wins
+    assert AgentConfig().timeout_seconds == 300  # SOFT_BUDGET_FALLBACK_SECONDS fallback
+
+
+def test_idle_timeout_constants_are_unified():
+    """All four idle sites resolve to the shared IDLE_TIMEOUT_SECONDS constant."""
+    import inspect
+
+    from agent.config.timeout_constants import IDLE_TIMEOUT_SECONDS
+
+    assert IDLE_TIMEOUT_SECONDS == 600
+
+    from docker_executor import DockerExecutor
+    from tools.docker_code_runner import DockerCodeRunner
+    from thoughtmachine.security import setup_docker_sandbox
+    from tools.workspace.check_system import CheckSystem
+
+    # 1. DockerExecutor.__init__ idle_timeout default
+    assert (
+        inspect.signature(DockerExecutor.__init__).parameters["idle_timeout"].default
+        == IDLE_TIMEOUT_SECONDS
+    )
+    # 2. DockerCodeRunner idle_timeout pydantic field default
+    assert DockerCodeRunner.model_fields["idle_timeout"].default == IDLE_TIMEOUT_SECONDS
+    # 3. thoughtmachine.security.setup_docker_sandbox idle_timeout default
+    assert (
+        inspect.signature(setup_docker_sandbox).parameters["idle_timeout"].default
+        == IDLE_TIMEOUT_SECONDS
+    )
+    # 4. CheckSystem my_config display fallback: a config lacking timeout_seconds
+    #    yields IDLE_TIMEOUT_SECONDS (600).
+    cs = CheckSystem(
+        query="my_config",
+        allowlist=["my_config"],
+        workspace_id="ws1",
+        agent_config={"provider": "test", "model": "test"},
+    )
+    assert cs._query_my_config()["timeout_seconds"] == IDLE_TIMEOUT_SECONDS
+

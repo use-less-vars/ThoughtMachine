@@ -31,6 +31,8 @@ from pydantic import Field
 
 from tools.base import ToolBase
 
+from agent.config.timeout_constants import IDLE_TIMEOUT_SECONDS
+
 # ---------------------------------------------------------------------------
 # Optional dependencies
 # ---------------------------------------------------------------------------
@@ -429,7 +431,7 @@ class CheckSystem(ToolBase):
             result = {
                 "provider": cfg.get("provider", cfg.get("provider_type", "")),
                 "model": cfg.get("model", ""),
-                "timeout_seconds": cfg.get("timeout_seconds", 600),
+                "timeout_seconds": cfg.get("timeout_seconds", IDLE_TIMEOUT_SECONDS),
                 "max_turns": cfg.get("max_turns", 50),
                 "enabled_tools": cfg.get("enabled_tools", []),
                 "temperature": cfg.get("temperature", 0.7),

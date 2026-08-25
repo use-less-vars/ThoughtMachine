@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 import typing
 from agent import events as ev
 from agent.logging import log
+from agent.config.timeout_constants import SOFT_BUDGET_FALLBACK_SECONDS
 
 class TokenState(enum.Enum):
     """Token usage state based on conversation token count."""
@@ -61,7 +62,7 @@ class AgentState:
     last_turn_warning_count: int = 0
     last_time_warning: Optional[str] = None
     last_time_warning_count: int = 0
-    timeout_seconds: int = 300
+    timeout_seconds: int = SOFT_BUDGET_FALLBACK_SECONDS
     time_warning_threshold: int = 240
     time_start: Optional[float] = None
     restriction_reason: Optional[str] = None

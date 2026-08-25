@@ -551,3 +551,105 @@ def test_instance_label_helpers():
     assert _worker_instance_parts("w2#2") == ("w2", 2)
     assert _worker_instance_parts("w2") == ("w2", 1)
     assert _worker_instance_parts("w2#x") == ("w2#x", 1)
+
+
+# ── POST .../workers/stop_all ──────────────────────────────────────────────
+
+
+def test_stop_all_stops_multiple_worker_instances(tmp_path, monkeypatch):
+    """stop_all_workers() stops every instance (legacy + session-scoped):
+    one per-worker result each, command.json/status.json written per
+    directory, and every matching in-memory thread fast-pathed.  A
+    session_id filter narrows the stop to that session only."""
+    _use_tmp_workspace(monkeypatch, tmp_path)
+    with workspace_routes._registry_lock:
+        workspace_routes._worker_registry[("sess-x", "default", 1)] = t1 = MagicMock()
+        workspace_routes._worker_registry[("sess-x", "default", 2)] = t2 = MagicMock()
+        workspace_routes._worker_registry[("sess-a", "alpha", 1)] = t3 = MagicMock()
+        workspace_routes._worker_registry[("sess-b", "beta", 1)] = t4 = MagicMock()
+    for sub in ("default", "default#2", "sess-a/alpha", "sess-b/beta"):
+        _write_json(tmp_path / "workers" / sub / "status.json", {})
+
+    results = asyncio.run(workspace_routes.stop_all_workers("ws-1"))
+    assert isinstance(results, list)
+    assert len(results) == 4
+    for res in results:
+        assert set(res.keys()) == {"worker_name", "instance_id", "status", "error"}
+        assert res["status"] == "ok"
+        assert res["error"] is None
+    assert sorted(r["instance_id"] for r in results if r["worker_name"] == "default") == [1, 2]
+    assert sorted(r["worker_name"] for r in results) == ["alpha", "beta", "default", "default"]
+
+    for sub in ("default", "default#2", "sess-a/alpha", "sess-b/beta"):
+        cmd = json.loads((tmp_path / "workers" / sub / "command.json").read_text())
+        assert cmd == {"action": "stop"}
+        status = json.loads((tmp_path / "workers" / sub / "status.json").read_text())
+        assert status["runtime_status"] == "completed"
+    t1.stop.assert_called_once()
+    t2.stop.assert_called_once()
+    t3.stop.assert_called_once()
+    t4.stop.assert_called_once()
+
+    # Session filter: only sess-a's workers are touched; other sessions
+    # (existing and a freshly added one) are left alone.
+    _write_json(tmp_path / "workers" / "sess-c" / "gamma" / "status.json", {})
+    results = asyncio.run(workspace_routes.stop_all_workers(
+        "ws-1", workspace_routes.StopAllWorkersBody(session_id="sess-a")
+    ))
+    assert len(results) == 1
+    assert results[0]["worker_name"] == "alpha"
+    assert results[0]["instance_id"] == 1
+    assert results[0]["status"] == "ok"
+    assert results[0]["error"] is None
+    assert t3.stop.call_count == 2
+    assert t1.stop.call_count == 1
+    assert t2.stop.call_count == 1
+    assert t4.stop.call_count == 1
+    assert not (tmp_path / "workers" / "sess-c" / "gamma" / "command.json").exists()
+
+
+def test_stop_all_returns_per_worker_results_and_continues_on_failure(tmp_path, monkeypatch):
+    """stop_all_workers() records per-worker results: a failing worker is
+    reported with status/error while the remaining workers are still
+    processed and reported ok.  With no workers dir at all it returns an
+    empty list."""
+    _use_tmp_workspace(monkeypatch, tmp_path)
+    with workspace_routes._registry_lock:
+        workspace_routes._worker_registry[("sess-x", "good", 1)] = tg = MagicMock()
+    _write_json(tmp_path / "workers" / "good" / "status.json", {})
+    _write_json(tmp_path / "workers" / "ghost" / "status.json", {})
+
+    real_stop = workspace_routes._stop_worker_instance
+
+    def fake_stop(ws_dir, name, instance_id=None, session_id=None):
+        if name == "ghost":
+            raise HTTPException(status_code=404, detail={"status": "not_found", "name": name})
+        return real_stop(ws_dir, name, instance_id, session_id=session_id)
+
+    monkeypatch.setattr(workspace_routes, "_stop_worker_instance", fake_stop)
+
+    results = asyncio.run(workspace_routes.stop_all_workers("ws-1"))
+    assert isinstance(results, list)
+    assert len(results) == 2
+    by_name = {r["worker_name"]: r for r in results}
+    assert set(by_name.keys()) == {"good", "ghost"}
+
+    good = by_name["good"]
+    assert good["instance_id"] == 1
+    assert good["status"] == "ok"
+    assert good["error"] is None
+    cmd = json.loads((tmp_path / "workers" / "good" / "command.json").read_text())
+    assert cmd == {"action": "stop"}
+    tg.stop.assert_called_once()
+
+    ghost = by_name["ghost"]
+    assert ghost["instance_id"] == 1
+    assert ghost["status"] == "not_found"
+    assert ghost["error"] is not None
+    # The helper raised before touching disk for the failing worker.
+    assert not (tmp_path / "workers" / "ghost" / "command.json").exists()
+
+    # No workers dir at all -> empty list, no error.
+    monkeypatch.setattr(workspace_routes, "_workspace_dir", lambda ws_id: tmp_path / "empty")
+    assert asyncio.run(workspace_routes.stop_all_workers("ws-1")) == []
+

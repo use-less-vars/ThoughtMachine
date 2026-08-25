@@ -834,48 +834,49 @@ async def get_effective_permissions(
 
 # ── GET /api/workspace/{ws_id}/workers/{name}/events ─────────────────────
 
-# ── POST /api/workspace/{ws_id}/workers/{name}/stop ────────────────────────
+# ── POST /api/workspace/{ws_id}/workers/stop_all ───────────────────────────
 
-@router.post("/{ws_id}/workers/{name}/stop")
-async def stop_worker(
-    ws_id: str,
-    name: str,
-    instance_id: Optional[int] = Query(
-        None,
-        description="Target a specific worker instance (default: legacy by-name behavior)",
-    ),
-):
-    """Stop a running worker via a file-based command signal.
 
-    Supports both directory layouts:
-      - ``workers/<session_id>/<name>/`` (session-scoped)
-      - ``workers/<name>/`` (legacy, no session)
+class StopAllWorkersBody(BaseModel):
+    """Optional request body for ``POST .../workers/stop_all``.
 
-    When ``instance_id`` is provided the command targets that specific
-    instance: the directory is resolved as ``<name>`` (instance 1) or
-    ``<name>#<N>`` (N>1) and only the matching in-memory thread is signalled.
-    Without it, the legacy by-name behavior is kept (first matching directory,
-    all matching threads).
-
-    Writes ``{"action": "stop"}`` to the worker's ``command.json`` so that
-    the worker thread (which polls for this file) picks it up within 2 seconds.
-    Also attempts an in-memory stop as a fast path if the thread is in the
-    registry.  Returns immediately — the worker will transition to ``stopped``
-    asynchronously.
-
-    Also immediately writes ``status.json`` with ``runtime_status: "completed"``
-    so the web UI's next poll sees a terminal state right away (instead of
-    "jumping back" to "busy" when the optimistic update gets overwritten
-    before the worker processes the stop).
-
-    Returns:
-        200 with ``{"status": "ok", "name": name}`` on success.
-        404 if the worker directory does not exist.
+    ``session_id`` restricts the stop to the workers of one session
+    (``workers/<session_id>/...``).  An absent body (or ``session_id: null``)
+    stops every worker instance in the workspace.
     """
-    ensure_workspace_dirs(ws_id)
-    ws_dir = _workspace_dir(ws_id)
+
+    session_id: Optional[str] = None
+
+
+def _stop_worker_instance(
+    ws_dir: Path,
+    name: str,
+    instance_id: Optional[int] = None,
+    session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Cooperatively stop a single worker instance.
+
+    Shared by the per-worker ``stop`` route and the ``stop_all`` route so
+    both use the exact same semantics:
+
+    * resolve the worker directory from the same on-disk layout
+      (``workers/<session_id>/<name>[/<name>#<N>]`` session-scoped or legacy
+      ``workers/<name>``/``workers/<name>#<N>``),
+    * write ``command.json`` with ``{"action": "stop"}`` so the polling
+      worker thread picks the signal up (within its poll interval),
+    * optimistically write ``status.json`` with
+      ``runtime_status: "completed"`` so the UI sees a terminal state
+      immediately (instead of "jumping back" to "busy" before the worker
+      processes the stop),
+    * fast-path the in-memory registry thread, optionally narrowed by
+      ``session_id`` and ``instance_id`` (no ``Thread.kill`` — the worker
+      stops cooperatively).
+
+    Returns the per-worker response dict used by the stop route
+    (``{"status": "ok", "name": name}``, plus ``instance_id`` /
+    ``instance_label`` when ``instance_id`` is not None).
+    """
     workers_dir = ws_dir / "workers"
-    instance_id = _query_default(instance_id)
 
     # Optional instance targeting: with instance_id, resolve the instance
     # directory "<name>" (instance 1) or "<name>#<N>" (N>1).  Without it,
@@ -928,11 +929,13 @@ async def stop_worker(
     # Fast-path: if the thread is in-memory (same process), signal directly.
     # Registry keys are tuples (session_id, worker_name[, instance_id]), so
     # iterate all entries matching the worker name — optionally narrowed to
-    # the requested instance.
+    # the requested session and/or instance.
     with _registry_lock:
         for key, thread in list(_worker_registry.items()):
             wname = key[1]
             if wname != name:
+                continue
+            if session_id is not None and (key[0] if len(key) > 0 else None) != session_id:
                 continue
             if instance_id is not None and (key[2] if len(key) > 2 else 1) != instance_id:
                 continue
@@ -946,6 +949,142 @@ async def stop_worker(
         resp["instance_id"] = instance_id
         resp["instance_label"] = target_label
     return resp
+
+
+def _enumerate_worker_instances(
+    ws_dir: Path,
+    session_id: Optional[str] = None,
+) -> List[tuple]:
+    """Enumerate ``(worker_name, instance_id)`` pairs from the same on-disk
+    layout the per-worker routes use.
+
+    Session-scoped directories (``workers/<session_id>/<name>/`` or
+    ``<name>#<N>/``) yield one entry per instance; when ``session_id`` is
+    given only that session's directory is considered.  Legacy directories
+    (``workers/<name>/``, ``workers/<name>#<N>/``) are included only when no
+    ``session_id`` filter is active.  Non-directory entries are skipped.
+    """
+    workers_dir = ws_dir / "workers"
+    if not workers_dir.is_dir():
+        return []
+    targets: List[tuple] = []
+    for subdir in workers_dir.iterdir():
+        if not subdir.is_dir():
+            continue
+        first_child = next(subdir.iterdir(), None) if subdir.is_dir() else None
+        if first_child is not None and first_child.is_dir():
+            # Session-scoped: workers/<session_id>/<name>[/<name>#<N>]/
+            if session_id is not None and subdir.name != session_id:
+                continue
+            for worker_subdir in subdir.iterdir():
+                if not worker_subdir.is_dir():
+                    continue
+                targets.append(_worker_instance_key(worker_subdir.name))
+        else:
+            # Legacy: workers/<name>/ or workers/<name#N>/
+            if session_id is not None:
+                continue
+            targets.append(_worker_instance_key(subdir.name))
+    return targets
+
+
+@router.post("/{ws_id}/workers/stop_all")
+async def stop_all_workers(ws_id: str, body: Optional[StopAllWorkersBody] = None):
+    """Cooperatively stop every worker instance in the workspace.
+
+    Enumerates instances from the same on-disk layout the per-worker ``stop``
+    route uses (``workers/<session_id>/<name>[/<name>#<N>]`` and legacy
+    ``workers/<name>``/``workers/<name>#<N>``) and stops each one through the
+    shared per-worker helper: a file-based ``command.json`` signal plus an
+    optimistic ``status.json`` (``runtime_status: "completed"``) plus the
+    in-memory registry fast-path.  No ``Thread.kill`` — workers stop
+    cooperatively on their next poll.  No job_registry or container changes.
+
+    An optional JSON body ``{"session_id": "<id>"}`` restricts the stop to
+    that session's workers; an absent or empty body stops all instances.
+    If one worker fails, the remaining workers are still processed.
+
+    Returns:
+        200 with a JSON list of per-worker results::
+
+            [{"worker_name": ..., "instance_id": ...,
+              "status": "ok" | "not_found" | "error", "error": ...|None}, ...]
+    """
+    ensure_workspace_dirs(ws_id)
+    ws_dir = _workspace_dir(ws_id)
+    session_filter = body.session_id if body is not None else None
+    targets = _enumerate_worker_instances(ws_dir, session_id=session_filter)
+    results = []
+    for name, instance_id in targets:
+        try:
+            resp = _stop_worker_instance(
+                ws_dir, name, instance_id, session_id=session_filter
+            )
+            results.append({
+                "worker_name": name,
+                "instance_id": resp.get("instance_id", instance_id),
+                "status": resp.get("status", "ok"),
+                "error": None,
+            })
+        except HTTPException as exc:
+            results.append({
+                "worker_name": name,
+                "instance_id": instance_id,
+                "status": "not_found",
+                "error": exc.detail if isinstance(exc.detail, str) else json.dumps(exc.detail, default=str),
+            })
+        except Exception as exc:  # pragma: no cover - defensive
+            results.append({
+                "worker_name": name,
+                "instance_id": instance_id,
+                "status": "error",
+                "error": str(exc),
+            })
+    return results
+
+
+# ── POST /api/workspace/{ws_id}/workers/{name}/stop ────────────────────────
+
+@router.post("/{ws_id}/workers/{name}/stop")
+async def stop_worker(
+    ws_id: str,
+    name: str,
+    instance_id: Optional[int] = Query(
+        None,
+        description="Target a specific worker instance (default: legacy by-name behavior)",
+    ),
+):
+    """Stop a running worker via a file-based command signal.
+
+    Supports both directory layouts:
+      - ``workers/<session_id>/<name>/`` (session-scoped)
+      - ``workers/<name>/`` (legacy, no session)
+
+    When ``instance_id`` is provided the command targets that specific
+    instance: the directory is resolved as ``<name>`` (instance 1) or
+    ``<name>#<N>`` (N>1) and only the matching in-memory thread is signalled.
+    Without it, the legacy by-name behavior is kept (first matching directory,
+    all matching threads).
+
+    Writes ``{"action": "stop"}`` to the worker's ``command.json`` so that
+    the worker thread (which polls for this file) picks it up within 2 seconds.
+    Also attempts an in-memory stop as a fast path if the thread is in the
+    registry.  Returns immediately — the worker will transition to ``stopped``
+    asynchronously.
+
+    Also immediately writes ``status.json`` with ``runtime_status: "completed"``
+    so the web UI's next poll sees a terminal state right away (instead of
+    "jumping back" to "busy" when the optimistic update gets overwritten
+    before the worker processes the stop).
+
+    Returns:
+        200 with ``{"status": "ok", "name": name}`` on success.
+        404 if the worker directory does not exist.
+    """
+    ensure_workspace_dirs(ws_id)
+    ws_dir = _workspace_dir(ws_id)
+    instance_id = _query_default(instance_id)
+    return _stop_worker_instance(ws_dir, name, instance_id)
 
 # ── POST /api/workspace/{ws_id}/workers/{name}/pause ───────────────────────
 

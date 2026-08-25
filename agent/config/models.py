@@ -8,6 +8,7 @@ from agent.logging import log
 from agent.config.presets import AGENT_TOOLS, ENGINEER_TOOLS
 from tools import SIMPLIFIED_TOOL_CLASSES
 from thoughtmachine.security import SessionPermissions
+from agent.config.timeout_constants import SOFT_BUDGET_FALLBACK_SECONDS
 
 # Category constants for AgentConfig fields
 RESTART_REQUIRED = "restart_required"
@@ -109,7 +110,7 @@ class AgentConfig(BaseModel):
     tool_output_token_limit: int = Field(default=10000, description='Maximum token limit for tool outputs (default 10,000 tokens)')
     detail: Literal['minimal', 'normal', 'verbose'] = Field(default='normal', description='Detail level for event display')
     enabled_tools: List[str] = Field(default_factory=lambda: [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES], description='List of enabled tool class names')
-    timeout_seconds: int = Field(default=300, description='Maximum runtime in seconds before timeout')
+    timeout_seconds: int = Field(default=SOFT_BUDGET_FALLBACK_SECONDS, description='Maximum runtime in seconds before timeout')
     time_monitor_enabled: bool = Field(default=False, description='Enable time-based execution monitoring')
     time_warning_threshold: int = Field(default=240, description='Elapsed seconds at which a time warning is issued (default 80% of timeout)')
     session_permissions: SessionPermissions = Field(
@@ -170,6 +171,22 @@ class AgentConfig(BaseModel):
         if filtered != v:
             return filtered
         return v
+
+    @model_validator(mode='before')
+    def map_agent_soft_budget_seconds(cls, values):
+        """Map the ``agent_soft_budget_seconds`` config key onto ``timeout_seconds``.
+
+        The shipped factory config (``resources/default_config.json``) carries
+        ``agent_soft_budget_seconds`` (300). When that key is present and no
+        explicit ``timeout_seconds`` is supplied, it becomes the soft-budget
+        value; when the key is absent, the field default
+        (``SOFT_BUDGET_FALLBACK_SECONDS`` = 300) applies.
+        """
+        if isinstance(values, dict):
+            budget = values.pop('agent_soft_budget_seconds', None)
+            if budget is not None and 'timeout_seconds' not in values:
+                values['timeout_seconds'] = budget
+        return values
 
     @model_validator(mode='after')
     def _apply_mode_system_prompt(self):
