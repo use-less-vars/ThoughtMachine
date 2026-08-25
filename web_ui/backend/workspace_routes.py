@@ -445,6 +445,9 @@ async def get_workers(
       - runtime_status:  "ready" | "busy" | "completed" | "error" | None
       - current_task:    current activity description (if running)
       - last_heartbeat:  ISO-8601 timestamp of last activity
+      - started_at:      ISO-8601 timestamp when the worker thread started
+      - last_query_at:   ISO-8601 timestamp of the last query accepted
+      - paused_manually: True only while the worker is manual-only paused
       - error:           error message (if failed)
       - has_persisted_context: whether the worker has saved conversation on disk
 
@@ -495,6 +498,9 @@ async def get_workers(
                                     "session_id": data.get("session_id") or session_id,
                                     "current_context_tokens": data.get("current_context_tokens"),
                                     "max_context_tokens": data.get("max_context_tokens"),
+                                    "started_at": data.get("started_at"),
+                                    "last_query_at": data.get("last_query_at"),
+                                    "paused_manually": data.get("paused_manually"),
                                 }
                             except (json.JSONDecodeError, OSError):
                                 pass
@@ -512,6 +518,9 @@ async def get_workers(
                             "session_id": data.get("session_id"),
                             "current_context_tokens": data.get("current_context_tokens"),
                             "max_context_tokens": data.get("max_context_tokens"),
+                            "started_at": data.get("started_at"),
+                            "last_query_at": data.get("last_query_at"),
+                            "paused_manually": data.get("paused_manually"),
                         }
                     except (json.JSONDecodeError, OSError):
                         pass
@@ -590,6 +599,9 @@ async def get_workers(
                 entry["session_id"] = rt["session_id"]
                 entry["current_context_tokens"] = rt["current_context_tokens"]
                 entry["max_context_tokens"] = rt["max_context_tokens"]
+                entry["started_at"] = rt["started_at"]
+                entry["last_query_at"] = rt["last_query_at"]
+                entry["paused_manually"] = rt["paused_manually"]
             else:
                 entry["runtime_status"] = None
                 entry["current_task"] = None
@@ -598,6 +610,9 @@ async def get_workers(
                 entry["session_id"] = None
                 entry["current_context_tokens"] = None
                 entry["max_context_tokens"] = None
+                entry["started_at"] = None
+                entry["last_query_at"] = None
+                entry["paused_manually"] = None
             entry["has_persisted_context"] = label in persisted_names
             entry["pruned_since_last_query"] = pruned_since_last_query.get(label, 0)
             entry["time_since_last_query"] = _seconds_since_heartbeat(
