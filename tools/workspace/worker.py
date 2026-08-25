@@ -1000,6 +1000,12 @@ class WorkerThread(threading.Thread):
         self.error: Optional[str] = None
         self.last_heartbeat: Optional[str] = None
         self._last_heartbeat_monotonic: float = 0.0
+        # Worker tray truth fields — persisted in status.json, exposed via
+        # GET /workspace/{ws_id}/workers and published in worker_status WS
+        # events. ``paused_manually`` is derived from ``_manual_only_pause``
+        # (defined below), never a separate attribute.
+        self.started_at: Optional[str] = None
+        self.last_query_at: Optional[str] = None
         self._last_reasoning: Optional[str] = None
 
         # Telemetry tracking
@@ -1997,6 +2003,9 @@ class WorkerThread(threading.Thread):
         reusing them for subsequent queries to maintain conversation state.
         """
         self.last_heartbeat = datetime.now(timezone.utc).isoformat()
+        # Worker tray truth: run() executes exactly once per thread, so this
+        # is the worker's birth timestamp.
+        self.started_at = datetime.now(timezone.utc).isoformat()
 
         try:
             # ── Load persisted context or create fresh ────────────────
@@ -2161,6 +2170,9 @@ class WorkerThread(threading.Thread):
                                         "status": "paused",
                                         "current_context_tokens": self.get_current_context_tokens(),
                                         "max_context_tokens": self.max_context_tokens,
+                                        "started_at": self.started_at,
+                                        "last_query_at": self.last_query_at,
+                                        "paused_manually": bool(self._manual_only_pause),
                                     },
                                     source=f"worker:{self.worker_name}",
                                     session_id=self.session_id or "",
@@ -2199,6 +2211,9 @@ class WorkerThread(threading.Thread):
                                         "status": "ready",
                                         "current_context_tokens": self.get_current_context_tokens(),
                                         "max_context_tokens": self.max_context_tokens,
+                                        "started_at": self.started_at,
+                                        "last_query_at": self.last_query_at,
+                                        "paused_manually": bool(self._manual_only_pause),
                                     },
                                     source=f"worker:{self.worker_name}",
                                     session_id=self.session_id or "",
@@ -2240,6 +2255,8 @@ class WorkerThread(threading.Thread):
                 # out mid-attempt) so a later force-respawn can tell whether
                 # the last attempt completed.
                 self._last_query = query
+                # Worker tray truth: record when this worker accepted a query.
+                self.last_query_at = datetime.now(timezone.utc).isoformat()
 
                 # ── Create Agent lazily (first query only) ────────────
                 if self._agent is None:
@@ -2290,6 +2307,9 @@ class WorkerThread(threading.Thread):
                                 "current_task": self.current_task,
                                 "current_context_tokens": self.get_current_context_tokens(),
                                 "max_context_tokens": self.max_context_tokens,
+                                "started_at": self.started_at,
+                                "last_query_at": self.last_query_at,
+                                "paused_manually": bool(self._manual_only_pause),
                             },
                             source=f"worker:{self.worker_name}",
                             session_id=self.session_id or "",
@@ -2352,6 +2372,9 @@ class WorkerThread(threading.Thread):
                                     "status": "paused",
                                     "current_context_tokens": self.get_current_context_tokens(),
                                     "max_context_tokens": self.max_context_tokens,
+                                    "started_at": self.started_at,
+                                    "last_query_at": self.last_query_at,
+                                    "paused_manually": bool(self._manual_only_pause),
                                 },
                                 source=f"worker:{self.worker_name}",
                                 session_id=self.session_id or "",
@@ -2427,6 +2450,9 @@ class WorkerThread(threading.Thread):
                                     "status": "ready",
                                     "current_context_tokens": self.get_current_context_tokens(),
                                     "max_context_tokens": self.max_context_tokens,
+                                    "started_at": self.started_at,
+                                    "last_query_at": self.last_query_at,
+                                    "paused_manually": bool(self._manual_only_pause),
                                 },
                                 source=f"worker:{self.worker_name}",
                                 session_id=self.session_id or "",
@@ -2470,6 +2496,9 @@ class WorkerThread(threading.Thread):
                                 "status": "ready",
                                 "current_context_tokens": self.get_current_context_tokens(),
                                 "max_context_tokens": self.max_context_tokens,
+                                "started_at": self.started_at,
+                                "last_query_at": self.last_query_at,
+                                "paused_manually": bool(self._manual_only_pause),
                             },
                             source=f"worker:{self.worker_name}",
                             session_id=self.session_id or "",
@@ -2832,7 +2861,8 @@ class WorkerThread(threading.Thread):
 
         This file is read by ``GET /api/workspace/{ws_id}/workers``
         to populate ``runtime_status``, ``current_task``,
-        ``last_heartbeat`` and ``error`` for each worker.
+        ``last_heartbeat``, ``error``, ``started_at``,
+        ``last_query_at`` and ``paused_manually`` for each worker.
         """
         data = {
             "runtime_status": self.status,
@@ -2842,6 +2872,9 @@ class WorkerThread(threading.Thread):
             "session_id": self.session_id,
             "current_context_tokens": self.get_current_context_tokens(),
             "max_context_tokens": self.max_context_tokens,
+            "started_at": self.started_at,
+            "last_query_at": self.last_query_at,
+            "paused_manually": bool(self._manual_only_pause),
         }
         target = self._worker_dir / "status.json"
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -4335,15 +4368,15 @@ class Worker(ToolBase):
                     continue
                 if not want_all:
                     continue
-                try:
-                    thread.pause()
-                except Exception:
-                    pass
                 if manual_only:
                     try:
                         thread._manual_only_pause = True
                     except Exception:
                         pass
+                try:
+                    thread.pause()
+                except Exception:
+                    pass
                 paused_workers.append({
                     "worker_name": key[1],
                     "instance_id": key[2] if len(key) >= 3 else 1,
