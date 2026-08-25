@@ -298,8 +298,21 @@ class FileSystemSessionStore(SessionStore):
         # Sessions without the flag are skipped entirely (defensive: worker
         # sessions and legacy files must never be touched).
         if isinstance(data.get('metadata'), dict) and data['metadata'].get('agent_type') == 'main':
-            from session.size_bounding import apply_session_size_bounding, set_session_size_bytes
+            from session.size_bounding import (
+                apply_session_size_bounding,
+                payload_size_bytes,
+                set_session_size_bytes,
+                SESSION_SIZE_CAP_BYTES,
+            )
             apply_session_size_bounding(data)
+            # Re-measure guard: even when no summary boundary exists (or a single
+            # message alone exceeds the cap), drop the oldest messages one at a
+            # time until the serialized payload is at or below the hard cap, so
+            # the stored file always fits. history_over_capacity (set by the
+            # bounder when a single message alone is over the cap) is never
+            # cleared here.
+            while payload_size_bytes(data) > SESSION_SIZE_CAP_BYTES and data.get('user_history'):
+                data['user_history'].pop(0)
             set_session_size_bytes(data)
 
         # Determine the target directory and friendly filename

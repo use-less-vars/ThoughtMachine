@@ -585,6 +585,13 @@ def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] =
     
     return canonical_abs
 
+
+# Imported here (still module-level, before setup_docker_sandbox's def-time
+# default) to break the import cycle: agent/config/models.py imports names
+# from this module while it is still initializing.
+from agent.config.timeout_constants import IDLE_TIMEOUT_SECONDS
+
+
 def setup_docker_sandbox(
     image: str,
     workspace_path: str,
@@ -592,7 +599,7 @@ def setup_docker_sandbox(
     mem_limit: str = "512m",
     cpu_quota: int = 50000,
     force_rebuild: bool = False,
-    idle_timeout: int = 300
+    idle_timeout: int = IDLE_TIMEOUT_SECONDS
 ) -> 'DockerExecutor':
     """
     Set up a Docker sandbox container using the centralized DockerExecutor.

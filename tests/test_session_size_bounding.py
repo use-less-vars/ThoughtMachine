@@ -2,19 +2,25 @@
 Tests for session size bounding (``session/size_bounding.py``).
 
 Covers:
-- Cap enforcement order: 2 newest cycles kept full, older cycles compacted to
-  ``[query, terminal]``, oldest compacted cycles dropped first, non-terminal
-  tool outputs truncated to a byte budget, and the ``history_over_capacity``
-  overrun flag.
-- Terminal-answer identification: Respond tool results with ``response_type``,
-  legacy Final/FinalReport/RequestUserInteraction results mapped via
-  ``tool_call_id``, standalone assistant messages (reasoning stripped), and
-  the query-only fallback.
+- Summary-anchored bounding: the history is cut at the second-last summary
+  INCLUSIVE; everything from there on survives byte-identical, while the
+  older region is filtered down to user queries, plain assistant messages
+  and Respond-family tool results (non-Respond tool outputs are DROPPED,
+  never truncated).
+- Older-region filtering: Respond/Final/FinalReport/RequestUserInteraction
+  results are resolved via ``tool_call_id`` -> assistant ``tool_calls``
+  mapping; orphan tool results, assistant tool-call carriers and system
+  notifications are dropped.
+- Oldest-first dropping: the drop loop pops the oldest messages from the
+  filtered older region, then from the kept region, re-measuring until the
+  payload fits under the cap.
+- Overrun flag: ``history_over_capacity`` is set only when a single message
+  alone serializes over the cap and is never cleared.
 - Main-agent gate: payloads without ``metadata['agent_type'] == 'main'`` or
-  under the cap are never mutated.
-- Store integration: ``session_size_bytes`` is written for main-agent sessions
-  only and exposed through ``load_session_metadata``,
-  ``load_sessions_metadata_batch`` and ``get_session_size_bytes``; save/load
+  under the cap are never mutated; fewer than two summaries leaves the
+  payload untouched (the store's re-measure guard enforces the cap).
+- Store integration: ``session_size_bytes`` is written for main-agent
+  sessions only, stored files never exceed the hard cap, and save/load
   round-trip stays lossless.
 """
 from __future__ import annotations
@@ -34,10 +40,11 @@ from agent.core.message import Message
 from session.models import Session
 from session.size_bounding import (
     SESSION_SIZE_CAP_BYTES,
-    TOOL_CONTENT_BUDGET_BYTES,
     TRUNCATED_SUFFIX,
+    _filter_older_region,
     _serialize,
     _strip_message,
+    _tool_name_map,
     apply_session_size_bounding,
     payload_size_bytes,
 )
@@ -84,6 +91,23 @@ def _tool_call(name: str, call_id: str, args: str = '{}') -> dict:
     return {'id': call_id, 'type': 'function', 'function': {'name': name, 'arguments': args}}
 
 
+def _summary(content: str, **kw) -> dict:
+    return _msg('system', content, summary=True, **kw)
+
+
+def _cycle(i: int, tool_size: int) -> list:
+    """One user->tool cycle: query, tool-call carrier, big tool output,
+    Respond terminal."""
+    g = _tool_call('GlobTool', f'g{i}')
+    r = _tool_call('Respond', f'r{i}')
+    return [
+        _user(f'Query {i}'),
+        _asst('thinking', tool_calls=[g, r]),
+        _tool('T' * tool_size, f'g{i}'),
+        _tool(f'Answer {i}', f'r{i}', response_type='answer'),
+    ]
+
+
 def _payload(history, metadata=None) -> dict:
     return {
         'session_id': 'test-session',
@@ -100,75 +124,108 @@ def _make_store(tmp_path) -> FileSystemSessionStore:
     )
 
 
-# ── Cap enforcement order (newest 2 full, older compacted) ──────────────────
+# ── Cap enforcement order (summary-anchored) ────────────────────────────────
 
 class TestCapEnforcementOrder:
-    def test_two_newest_cycles_full_older_compacted(self):
-        """4 over-cap cycles: oldest 2 compact to [query, terminal],
-        newest 2 stay byte-identical."""
+    def test_second_last_summary_anchor_keeps_latest_byte_identical(self):
+        """3 summaries + 3 cycles of 600k tool outputs: the history is cut at
+        the second-last summary INCLUSIVE; the kept region (second-last
+        summary and everything after) survives byte-identical, and the older
+        region is filtered to [user query, Respond terminal] only."""
         _reset_seq()
         history = []
-        for i in range(4):
-            g = _tool_call('GlobTool', f'g{i}')
-            r = _tool_call('Respond', f'r{i}')
-            history.append(_user(f'Query {i}'))
-            history.append(_asst('thinking', tool_calls=[g, r], reasoning_content=f'private {i}'))
-            history.append(_tool('T' * 600_000, f'g{i}'))
-            history.append(_tool(f'Answer text {i}', f'r{i}', response_type='answer'))
+        for i in range(3):
+            history.append(_summary(f'summary {i}'))
+            history.extend(_cycle(i, 700_000))
 
         data = _payload(history)
         assert payload_size_bytes(data) > SESSION_SIZE_CAP_BYTES
         assert apply_session_size_bounding(data) is True
 
         out = data['user_history']
-        assert len(out) == 12
-        # oldest 2 cycles compacted to exactly [query, terminal]
-        assert out[0] == history[0]
-        assert out[1] == history[3]
-        assert out[2] == history[4]
-        assert out[3] == history[7]
-        # queries and terminals are byte-identical to the originals
-        assert _serialize(out[0]) == _serialize(history[0])
-        assert _serialize(out[1]) == _serialize(history[3])
-        assert _serialize(out[2]) == _serialize(history[4])
-        assert _serialize(out[3]) == _serialize(history[7])
-        # 2 newest cycles kept full and byte-identical
-        assert out[4:8] == history[8:12]
-        assert out[8:12] == history[12:16]
+        # older region filtered: s0 (system) dropped, asst carrier + big
+        # GlobTool output dropped, only user0 and the Respond terminal kept
+        assert out[0] == history[1]
+        assert out[1] == history[4]
+        # kept region starts AT the second-last summary (inclusive) and is
+        # byte-identical to the original
+        assert out[2] == history[5]
+        assert out[2:] == history[5:]
+        assert _serialize(out[2:]) == _serialize(history[5:])
         assert payload_size_bytes(data) <= SESSION_SIZE_CAP_BYTES
         assert 'history_over_capacity' not in data['metadata']
 
 
-# ── Terminal-answer identification + compaction ─────────────────────────────
+# ── Older-region filtering (Respond-family resolution) ──────────────────────
 
 class TestTerminalAnswerIdentification:
-    def test_standalone_assistant_terminal_with_reasoning_stripped(self):
-        """Rule (c): standalone assistant message is the terminal; its
-        reasoning_content is stripped."""
+    def test_filter_keeps_respond_results_drops_intermediate_outputs(self):
+        """Respond-family tool results survive the older-region filter;
+        non-Respond tool outputs and assistant tool-call carriers are
+        dropped."""
         _reset_seq()
-        history = []
-        c1 = _tool_call('GlobTool', 'c1')
-        history.append(_user('Q'))
-        history.append(_asst('thinking', tool_calls=[c1], reasoning_content='private'))
-        history.append(_tool('T' * 950_000, 'c1'))
-        history.append(_asst('Final answer', reasoning_content='hidden'))
-        for i in range(2):
-            history.append(_user(f'fill user {i}'))
-            history.append(_asst('F' * 600_000))
+        older = [
+            _user('Query 0'),
+            _asst('thinking', tool_calls=[_tool_call('GlobTool', 'g0'),
+                                          _tool_call('Respond', 'r0')]),
+            _tool('T' * 950_000, 'g0'),
+            _tool('final answer', 'r0', response_type='answer'),
+        ]
+        name_map = _tool_name_map(older)
+        assert name_map == {'g0': 'GlobTool', 'r0': 'Respond'}
+        filtered = _filter_older_region(older, name_map)
+        assert [m['role'] for m in filtered] == ['user', 'tool']
+        assert filtered[0] == older[0]
+        assert filtered[1] == older[3]
+        assert 'T' * 950_000 not in json.dumps(filtered)
 
-        data = _payload(history)
-        assert apply_session_size_bounding(data) is True
+    def test_filter_keeps_legacy_respond_family_via_call_id_map(self):
+        """Legacy Final/FinalReport/RequestUserInteraction results resolve
+        through the call-id map and are kept by the older-region filter."""
+        _reset_seq()
+        older = [
+            _user('Query 0'),
+            _asst('thinking', tool_calls=[
+                _tool_call('Final', 'f0'),
+                _tool_call('FinalReport', 'fr0'),
+                _tool_call('RequestUserInteraction', 'ru0'),
+            ]),
+            _tool('Final result', 'f0'),
+            _tool('Report result', 'fr0'),
+            _tool('Clarify?', 'ru0'),
+        ]
+        name_map = _tool_name_map(older)
+        assert name_map == {
+            'f0': 'Final',
+            'fr0': 'FinalReport',
+            'ru0': 'RequestUserInteraction',
+        }
+        filtered = _filter_older_region(older, name_map)
+        assert [m['role'] for m in filtered] == ['user', 'tool', 'tool', 'tool']
+        assert [m['tool_call_id'] for m in filtered if m['role'] == 'tool'] == \
+            ['f0', 'fr0', 'ru0']
 
-        out = data['user_history']
-        assert len(out) == 6
-        assert out[0] == history[0]
-        assert out[1]['content'] == 'Final answer'
-        assert 'reasoning_content' not in out[1]
-        # no reasoning_content/tool_calls anywhere in the output
-        for m in out:
-            assert 'reasoning_content' not in m
-            assert 'tool_calls' not in m
-        assert payload_size_bytes(data) <= SESSION_SIZE_CAP_BYTES
+    def test_filter_drops_orphan_tool_results_and_system_notifications(self):
+        """Orphan tool results (unmapped call id), system notifications and
+        assistant tool-call carriers are dropped; plain assistant messages
+        survive."""
+        _reset_seq()
+        older = [
+            _user('Query 0'),
+            _msg('system', 'context refresh', is_system_notification=True),
+            _asst('thinking', tool_calls=[_tool_call('Respond', 'r0'),
+                                          _tool_call('GlobTool', 'g0')]),
+            _tool('orphan result', 'unknown-call-id'),
+            _tool('T' * 500, 'g0'),
+            _tool('kept answer', 'r0', response_type='answer'),
+            _asst('plain assistant message'),
+        ]
+        name_map = _tool_name_map(older)
+        filtered = _filter_older_region(older, name_map)
+        assert [m['role'] for m in filtered] == ['user', 'tool', 'assistant']
+        assert filtered[1]['tool_call_id'] == 'r0'
+        assert filtered[1]['content'] == 'kept answer'
+        assert filtered[2]['content'] == 'plain assistant message'
 
     def test_strip_message_removes_reasoning_and_tool_calls(self):
         """Unit check: _strip_message drops only the two private keys."""
@@ -182,196 +239,99 @@ class TestTerminalAnswerIdentification:
         assert stripped['content'] == 'hello'
         assert stripped['role'] == 'assistant'
 
-    def test_respond_terminal_kept_intermediate_tool_output_dropped(self):
-        """Rule (a): the Respond result (response_type) is the terminal;
-        the big intermediate GlobTool output is dropped."""
-        _reset_seq()
-        history = []
-        g0 = _tool_call('GlobTool', 'g0')
-        r0 = _tool_call('Respond', 'r0')
-        history.append(_user('Query 0'))
-        history.append(_asst('thinking', tool_calls=[g0, r0]))
-        history.append(_tool('T' * 950_000, 'g0'))
-        history.append(_tool('final answer', 'r0', response_type='answer'))
-        for i in range(2):
-            history.append(_user(f'fill user {i}'))
-            history.append(_asst('F' * 600_000))
 
-        data = _payload(history)
-        assert apply_session_size_bounding(data) is True
-
-        out = data['user_history']
-        assert len(out) == 6
-        assert out[0] == history[0]
-        assert out[1]['content'] == 'final answer'
-        assert out[1]['tool_call_id'] == 'r0'
-        assert 'T' * 950_000 not in json.dumps(out)
-        assert payload_size_bytes(data) <= SESSION_SIZE_CAP_BYTES
-
-    def test_legacy_final_result_dropped_respond_terminal_kept(self):
-        """A non-terminal legacy Final result is dropped when a real Respond
-        terminal exists later in the cycle."""
-        _reset_seq()
-        history = []
-        f0 = _tool_call('Final', 'f0')
-        rs0 = _tool_call('Respond', 'rs0')
-        history.append(_user('Query 0'))
-        history.append(_asst('thinking', tool_calls=[f0, rs0]))
-        history.append(_tool('Final result content', 'f0'))
-        history.append(_tool('X' * 950_000, 'gx'))
-        history.append(_tool('Respond answer', 'rs0', response_type='answer'))
-        for i in range(2):
-            history.append(_user(f'fill user {i}'))
-            history.append(_asst('F' * 600_000))
-
-        data = _payload(history)
-        assert apply_session_size_bounding(data) is True
-
-        out = data['user_history']
-        assert len(out) == 6
-        assert out[1]['content'] == 'Respond answer'
-        assert 'Final result content' not in json.dumps(out)
-        assert 'X' * 950_000 not in json.dumps(out)
-
-    def test_legacy_final_result_is_terminal_via_call_id_mapping(self):
-        """Rule (b): a Final tool result without response_type is still the
-        terminal because its tool_call_id maps to a Final call."""
-        _reset_seq()
-        history = []
-        f0 = _tool_call('Final', 'f0')
-        history.append(_user('Query 0'))
-        history.append(_asst('thinking', tool_calls=[f0]))
-        history.append(_tool('Final result content', 'f0'))
-        history.append(_tool('X' * 950_000, 'gx'))
-        for i in range(2):
-            history.append(_user(f'fill user {i}'))
-            history.append(_asst('F' * 600_000))
-
-        data = _payload(history)
-        assert apply_session_size_bounding(data) is True
-
-        out = data['user_history']
-        assert out[1]['content'] == 'Final result content'
-        assert out[1]['tool_call_id'] == 'f0'
-        assert 'X' * 950_000 not in json.dumps(out)
-
-    def test_legacy_request_user_interaction_result_is_terminal(self):
-        """Rule (b) also covers RequestUserInteraction results."""
-        _reset_seq()
-        history = []
-        ru0 = _tool_call('RequestUserInteraction', 'ru0')
-        history.append(_user('Query 0'))
-        history.append(_asst('thinking', tool_calls=[ru0]))
-        history.append(_tool('Please clarify: which file?', 'ru0'))
-        history.append(_tool('X' * 950_000, 'gx'))
-        for i in range(2):
-            history.append(_user(f'fill user {i}'))
-            history.append(_asst('F' * 600_000))
-
-        data = _payload(history)
-        assert apply_session_size_bounding(data) is True
-
-        out = data['user_history']
-        assert out[1]['content'] == 'Please clarify: which file?'
-        assert out[1]['tool_call_id'] == 'ru0'
-
-
-# ── Oldest-first dropping ────────────────────────────────────────────────────
+# ── Oldest-first dropping ───────────────────────────────────────────────────
 
 class TestOldestDroppedFirst:
-    def test_drops_oldest_compacted_cycles_first(self):
-        """6 cycles, middle terminals 550k each: exactly the 2 oldest are
-        dropped (2.76M -> drop -> 2.21M -> drop -> 1.66M under cap)."""
+    def test_drops_oldest_first_from_filtered_older_then_kept(self):
+        """3 summaries + 3 cycles of 1.05m tool outputs: the kept region
+        alone is over the cap, so the drop loop pops the filtered older
+        region first, then walks the kept region oldest-first, re-measuring
+        until the payload fits; the newest cycle survives byte-identical."""
         _reset_seq()
         history = []
-        for i in range(6):
-            g = _tool_call('GlobTool', f'g{i}')
-            r = _tool_call('Respond', f'r{i}')
-            history.append(_user(f'Query {i}'))
-            history.append(_asst('thinking', tool_calls=[g, r]))
-            history.append(_tool('mid', f'g{i}'))
-            terminal = 'A' * 550_000 if i < 4 else 'F' * 280_000
-            history.append(_tool(terminal, f'r{i}', response_type='answer'))
+        for i in range(3):
+            history.append(_summary(f'summary {i}'))
+            history.extend(_cycle(i, 1_050_000))
 
         data = _payload(history)
         assert payload_size_bytes(data) > SESSION_SIZE_CAP_BYTES
         assert apply_session_size_bounding(data) is True
 
+        kept = history[5:]
         out = data['user_history']
-        # exactly 2 oldest cycles dropped; remaining = c2,c3 compacted + c4,c5 full
-        assert len(out) == 12
-        assert out[0]['content'] == 'Query 2'
-        assert out[1]['content'] == 'A' * 550_000
-        assert out[2]['content'] == 'Query 3'
-        assert out[3]['content'] == 'A' * 550_000
-        assert out[4:8] == history[16:20]
-        assert out[8:12] == history[20:24]
+        assert payload_size_bytes(data) <= SESSION_SIZE_CAP_BYTES
+        # every surviving message comes from the kept region, oldest-first:
+        # out is a trailing slice of the kept region (filtered older fully
+        # drained first)
+        assert out == kept[len(kept) - len(out):]
+        # newest cycle byte-identical
+        assert out[-4:] == kept[-4:]
         all_content = json.dumps(out)
         assert 'Query 0' not in all_content
         assert 'Query 1' not in all_content
-        assert payload_size_bytes(data) <= SESSION_SIZE_CAP_BYTES
+        assert 'history_over_capacity' not in data['metadata']
 
 
-# ── Step-4 truncation of non-terminal tool outputs ──────────────────────────
+# ── No truncation: dropping is the only mechanism ───────────────────────────
 
 class TestTruncation:
-    def test_tool_outputs_truncated_to_budget_queries_terminals_kept(self):
-        """2 cycles with 1.5MB tool outputs: no compaction possible, the big
-        non-terminal tool outputs are truncated; queries/terminals untouched."""
+    def test_no_truncation_tool_outputs_kept_byte_for_byte(self):
+        """Tool outputs are NEVER truncated: kept messages stay byte-for-byte
+        and dropping is the only size-reduction mechanism. The 1.5m tool
+        output of the latest cycle survives intact; the older one is dropped
+        by filtering."""
         _reset_seq()
-        history = []
-        for i in range(2):
-            d = _tool_call('DockerCodeRunner', f'd{i}')
-            rd = _tool_call('Respond', f'rd{i}')
-            history.append(_user(f'Query {i}'))
-            history.append(_asst('thinking', tool_calls=[d, rd]))
-            history.append(_tool('T' * 1_500_000, f'd{i}'))
-            history.append(_tool(f'answer{i}', f'rd{i}', response_type='answer'))
+        history = [_summary('summary 0')]
+        history.extend(_cycle(0, 1_500_000))
+        history.append(_summary('summary 1'))
+        history.extend(_cycle(1, 1_500_000))
+        history.append(_summary('summary 2'))
 
         data = _payload(history)
         assert payload_size_bytes(data) > SESSION_SIZE_CAP_BYTES
         assert apply_session_size_bounding(data) is True
 
         out = data['user_history']
-        assert len(out) == 8
-        # queries byte-identical
-        assert out[0] == history[0]
-        assert out[4] == history[4]
-        # terminals byte-identical
-        assert out[3] == history[3]
-        assert out[7] == history[7]
-        # big tool outputs truncated to budget + suffix
-        prefix_budget = TOOL_CONTENT_BUDGET_BYTES - len(TRUNCATED_SUFFIX)
-        expected = ('T' * 1_500_000)[:prefix_budget] + TRUNCATED_SUFFIX
-        assert out[2]['content'] == expected
-        assert out[6]['content'] == expected
-        assert out[2]['tool_call_id'] == 'd0'
-        assert out[2]['seq'] == history[2]['seq']
-        assert 'history_over_capacity' not in data['metadata']
+        # [user0, Respond terminal0] + kept region from second-last summary
+        assert out == [history[1], history[4]] + history[5:]
+        # the big tool output of the latest cycle is byte-for-byte identical
+        assert out[5]['content'] == 'T' * 1_500_000
+        assert out[5]['tool_call_id'] == 'g1'
+        assert out[5] == history[8]
+        # the older big output was dropped, never truncated
+        assert TRUNCATED_SUFFIX not in json.dumps(out)
+        assert out.count(history[8]) == 1
         assert payload_size_bytes(data) <= SESSION_SIZE_CAP_BYTES
+        assert 'history_over_capacity' not in data['metadata']
 
 
-# ── Overrun: still over the cap after all steps ─────────────────────────────
+# ── Overrun: single message over the cap ────────────────────────────────────
 
 class TestOverrun:
-    def test_overrun_marks_history_over_capacity_and_keeps_messages(self):
-        """Terminal-only big content cannot be compacted or truncated: the
-        payload stays over the cap and the flag is set (never cleared)."""
+    def test_overrun_marks_history_over_capacity_and_stays_under_cap(self):
+        """A single message that alone serializes over the cap sets
+        history_over_capacity (never cleared); the drop loop still brings
+        the final payload under the cap, even if that empties the history."""
         _reset_seq()
-        history = []
-        for i in range(2):
-            rd = _tool_call('Respond', f'rd{i}')
-            history.append(_user(f'Query {i}'))
-            history.append(_asst('thinking', tool_calls=[rd]))
-            history.append(_tool('A' * 1_500_000, f'rd{i}', response_type='answer'))
-
+        history = [
+            _summary('summary 0'),
+            _summary('summary 1'),
+            _user('u' * 2_100_000),
+            _asst('small'),
+        ]
         data = _payload(history)
         assert apply_session_size_bounding(data) is True
-
-        out = data['user_history']
-        assert out == history
         assert data['metadata']['history_over_capacity'] is True
-        assert payload_size_bytes(data) > SESSION_SIZE_CAP_BYTES
+        assert payload_size_bytes(data) <= SESSION_SIZE_CAP_BYTES
+        # the over-cap message itself is dropped
+        assert 'u' * 2_100_000 not in json.dumps(data['user_history'])
+
+        # flag is never cleared on a subsequent (no-op) call
+        before = copy.deepcopy(data)
+        assert apply_session_size_bounding(data) is False
+        assert data == before
+        assert data['metadata']['history_over_capacity'] is True
 
 
 # ── Main-agent gate ─────────────────────────────────────────────────────────
@@ -403,6 +363,110 @@ class TestMainAgentGate:
         assert payload_size_bytes(data) <= SESSION_SIZE_CAP_BYTES
         assert apply_session_size_bounding(data) is False
         assert data == before
+
+    def test_fewer_than_two_summaries_untouched(self):
+        """With fewer than two summaries the bounder leaves the payload
+        unchanged (the store's re-measure guard enforces the cap)."""
+        _reset_seq()
+        history = [_summary('summary 0'), _user('u' * 2_100_000)]
+        data = _payload(history)
+        before = copy.deepcopy(data)
+        assert payload_size_bytes(data) > SESSION_SIZE_CAP_BYTES
+        assert apply_session_size_bounding(data) is False
+        assert data == before
+
+
+# ── Hard-cap guarantee (bounder + store re-measure guard) ───────────────────
+
+class TestHardCapGuarantees:
+    def test_hard_cap_keeps_serialized_session_under_2mb_large_payload(self, tmp_path):
+        """3 summaries + 3 cycles of 900k tool outputs: after bounding the
+        payload is under 2 MB, the latest two-cycle region is intact, and
+        the stored file re-serializes under 2,000,000 bytes."""
+        _reset_seq()
+        history = []
+        for i in range(3):
+            history.append(_summary(f'summary {i}'))
+            history.extend(_cycle(i, 900_000))
+
+        data = _payload(history)
+        assert payload_size_bytes(data) > SESSION_SIZE_CAP_BYTES
+        assert apply_session_size_bounding(data) is True
+        assert payload_size_bytes(data) <= SESSION_SIZE_CAP_BYTES
+
+        out = data['user_history']
+        # filtered older = [user0, Respond terminal0]; kept region from the
+        # second-last summary inclusive — latest two cycles intact
+        assert out == [history[1], history[4]] + history[5:]
+        assert out[-8:] == history[7:15]
+
+        # exercise the full save path and read the file back
+        store = _make_store(tmp_path)
+        session = Session.from_persistable_dict({
+            'session_id': 'hard-cap-session',
+            'metadata': {'agent_type': 'main', 'name': 'Hard Cap'},
+            'user_history': out,
+        })
+        sid = session.session_id
+        store.save_session(session)
+
+        path = store._find_session_path(sid)
+        assert path is not None and path.exists()
+        assert os.path.getsize(path) <= 2_000_000
+        with open(path, 'r', encoding='utf-8') as f:
+            stored = json.load(f)
+        assert len(json.dumps(stored, indent=2, default=str).encode('utf-8')) <= 2_000_000
+
+    def test_remeasure_guard_triggers_when_still_over_cap(self, tmp_path):
+        """The store's re-measure guard is the last line of defense: even
+        when the bounder leaves the payload over the cap (fewer than two
+        summaries), save_session still guarantees a stored file <= 2 MB."""
+        store = _make_store(tmp_path)
+
+        # Scenario A: <2 summaries + a single >2MB message — bounder no-ops
+        # (unchanged), the store guard drops messages until the file fits.
+        _reset_seq()
+        history_a = [_summary('summary 0'), _user('u' * 2_100_000)]
+        data_a = _payload(history_a)
+        before = copy.deepcopy(data_a)
+        assert apply_session_size_bounding(data_a) is False
+        assert data_a == before
+
+        session_a = Session.from_persistable_dict({
+            'session_id': 'guard-a',
+            'metadata': {'agent_type': 'main', 'name': 'Guard A'},
+            'user_history': data_a['user_history'],
+        })
+        store.save_session(session_a)
+        path_a = store._find_session_path(session_a.session_id)
+        assert path_a is not None and path_a.exists()
+        assert os.path.getsize(path_a) <= 2_000_000
+
+        # Scenario B: >=2 summaries + a single >2MB message — the bounder
+        # sets the flag and drops the over-cap message; the flag survives a
+        # later call and the stored file is still <= 2 MB.
+        _reset_seq()
+        history_b = [
+            _summary('summary 0'),
+            _summary('summary 1'),
+            _user('u' * 2_100_000),
+        ]
+        data_b = _payload(history_b)
+        assert apply_session_size_bounding(data_b) is True
+        assert data_b['metadata']['history_over_capacity'] is True
+        assert payload_size_bytes(data_b) <= SESSION_SIZE_CAP_BYTES
+        assert apply_session_size_bounding(data_b) is False
+        assert data_b['metadata']['history_over_capacity'] is True
+
+        session_b = Session.from_persistable_dict({
+            'session_id': 'guard-b',
+            'metadata': dict(data_b['metadata'], name='Guard B'),
+            'user_history': data_b['user_history'],
+        })
+        store.save_session(session_b)
+        path_b = store._find_session_path(session_b.session_id)
+        assert path_b is not None and path_b.exists()
+        assert os.path.getsize(path_b) <= 2_000_000
 
 
 # ── Store integration: session_size_bytes ───────────────────────────────────

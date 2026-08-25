@@ -8,6 +8,8 @@ from typing import ClassVar, List, Literal, Optional, Dict, Any
 from pydantic import Field, field_validator, model_validator
 from .base import ToolBase
 
+from agent.config.timeout_constants import IDLE_TIMEOUT_SECONDS
+
 # Worker-name context var (stdlib-only leaf module — no circular import).
 # Falls back to None so the runner keeps working outside a worker turn.
 try:
@@ -178,7 +180,7 @@ class DockerCodeRunner(ToolBase):
         description="Interpreter to use for executing script (e.g., 'bash', 'python3', 'sh'). Default: 'bash'"
     )
     idle_timeout: int = Field(
-        default=600,
+        default=IDLE_TIMEOUT_SECONDS,
         description="Idle timeout in seconds for container pooling. Container will be closed after this period of inactivity. Default: 600 seconds (10 minutes)."
     )
     worker_name: Optional[str] = Field(

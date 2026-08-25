@@ -22,6 +22,7 @@ between integrity checks and container creation/recreation.
 
 """
 
+from agent.config.timeout_constants import IDLE_TIMEOUT_SECONDS
 from agent.logging import log
 import docker
 import docker.types
@@ -406,7 +407,7 @@ class DockerExecutor:
         mem_limit: str = "1g",
         cpu_quota: int = 100000,
         force_rebuild: bool = False,
-        idle_timeout: int = 600,
+        idle_timeout: int = IDLE_TIMEOUT_SECONDS,
         session_permissions=None,
         workspace_id: str = None,
     ):
