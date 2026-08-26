@@ -145,6 +145,11 @@ class SessionConfig(BaseModel):
         default=False,
         description='Allow agent commits in operator-managed git worktrees on feat/* or fix/* branches (feature flag).',
     )
+    max_workers_per_session: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description='Maximum number of live worker threads this session may run at once (None = factory default 3).',
+    )
 
     # ── Validators ──────────────────────────────────────────────────────
 
@@ -257,6 +262,8 @@ class SessionConfig(BaseModel):
         kwargs['use_workspace_lifecycle_manager'] = bool(self.use_workspace_lifecycle_manager)
         kwargs['use_container_registry'] = bool(self.use_container_registry)
         kwargs['git_allow_worktree_commits'] = bool(self.git_allow_worktree_commits)
+        if self.max_workers_per_session is not None:
+            kwargs['max_workers_per_session'] = self.max_workers_per_session
 
         return AgentConfig(**kwargs)
 
