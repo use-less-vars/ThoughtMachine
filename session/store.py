@@ -299,7 +299,7 @@ class FileSystemSessionStore(SessionStore):
         # fixpoint so the stored value equals the real file size.
         # Explicit non-main agent_type values (e.g. 'worker') are still skipped
         # entirely (defensive: worker sessions never write store files).
-        if isinstance(data.get('metadata'), dict) and data['metadata'].get('agent_type') in (None, 'main'):
+        if isinstance(data.get('metadata'), dict) and (data.get('metadata') or {}).get('agent_type') in (None, 'main'):
             from session.size_bounding import (
                 apply_session_size_bounding,
                 payload_size_bytes,
