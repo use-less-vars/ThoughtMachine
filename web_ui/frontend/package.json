@@ -2,6 +2,9 @@
   "name": "thoughtmachine-gui",
   "private": true,
   "version": "0.1.0",
+  "engines": {
+    "node": ">=18"
+  },
   "type": "module",
   "_comment": "react-router-dom added for Workspace Panel routing (Phase 1) but NOT installed — run npm install before importing it; current phase uses the dependency-free hash router in src/router.js so the app builds without it.",
   "scripts": {
