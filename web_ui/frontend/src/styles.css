@@ -131,6 +131,19 @@ body {
   background: rgba(243, 139, 168, 0.25);
 }
 
+/* ── Docker health banner (top-level; shown when the Docker daemon is unreachable) ── */
+.docker-health-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 1rem;
+  background: rgba(249, 226, 175, 0.12);
+  color: var(--warning);
+  border-bottom: 1px solid rgba(249, 226, 175, 0.3);
+  font-size: 0.82rem;
+  font-family: var(--font-sans);
+}
+
 /* ──────────────────────────────────────────────────────────────────────────
    ConfigPanel (sidebar)
    ────────────────────────────────────────────────────────────────────────── */

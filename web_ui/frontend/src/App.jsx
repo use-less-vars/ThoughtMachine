@@ -146,6 +146,7 @@ export default function App() {
   const [loggingConfig, setLoggingConfig] = useState(null)
   const [loggingConfigError, setLoggingConfigError] = useState(null)
   const [workerEvents, setWorkerEvents] = useState({})  // { [sessionId]: [event, ...] } live WS worker events
+  const [dockerHealth, setDockerHealth] = useState(null)  // /api/health/containers payload (null while loading)
 
   const pendingWorkerSelectionRef = useRef(null)  // { workerName, workspaceId, instanceId, instanceLabel } queued before activeSessionId is set
   const tabActionsRef = useRef({})                // tabId -> { sendCommand, getSessionId }
@@ -963,6 +964,29 @@ export default function App() {
     fetchLoggingConfig()
   }, [fetchLoggingConfig])
 
+  // ── Fetch Docker daemon health on mount (drives the degraded-Docker banner) ─
+  useEffect(() => {
+    const hostname = window.location.hostname
+    const port = import.meta.env.VITE_BACKEND_PORT || '8000'
+    fetch(`http://${hostname}:${port}/api/health/containers`)
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        return res.json()
+      })
+      .then(data => setDockerHealth(data))
+      .catch(err => {
+        console.error('Failed to fetch Docker health:', err)
+        setDockerHealth({
+          status: 'degraded',
+          docker: {
+            available: false,
+            reason: 'docker_host_unreachable',
+            hint: 'Backend unreachable — Docker health cannot be determined.',
+          },
+        })
+      })
+  }, [])
+
   // ── Persist active session ID in localStorage (legacy key, still written;
   //    the new tm.sessionTabs.<ws> entry is the source of truth) ─────────
   useEffect(() => {
@@ -976,6 +1000,11 @@ export default function App() {
   // ── Render ────────────────────────────────────────────────────────────
   return (
     <div className="app-container">
+      {dockerHealth && dockerHealth.status !== 'ok' && (
+        <div className="docker-health-banner" role="alert">
+          ⚠ Docker unavailable — {dockerHealth.docker?.hint || 'The Docker daemon is not reachable.'}
+        </div>
+      )}
       <div className="app-main">
         <div className="app-center tab-content-area">
           {/* Per-workspace session tab strip (frontend-only state).

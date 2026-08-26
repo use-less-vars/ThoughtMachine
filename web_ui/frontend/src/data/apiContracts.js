@@ -46,7 +46,7 @@ export const API_ENDPOINTS = {
       method: 'GET',
       path: '/api/health/containers',
       status: 'implemented',
-      notes: 'backend source: web_ui/backend/server.py (response { docker: status })',
+      notes: 'backend source: web_ui/backend/server.py (response { status, docker: { available, reason, hint, version, error }, checked_at }; reason: daemon_down|permission_denied|lib_missing|import_failed|docker_host_unreachable)',
     },
 
     // --- Workers ------------------------------------------------------------

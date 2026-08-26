@@ -361,10 +361,20 @@ const useWorkspaceStore = create((set, get) => ({
       }
 
       // ── Docker availability (tri-state) ──
-      // true only when health reports 'reachable'; false when the health call
-      // responded with any other value; null (unverified) when the health
-      // fetch itself failed (tryGet returns null).
-      const dockerAvailable = healthData === null ? null : healthData.docker === 'reachable'
+      // true only when the health payload reports Docker available; false when
+      // it reports unavailable; null (unverified) when the health fetch itself
+      // failed (tryGet returns null). Tolerates both the legacy flat string
+      // ("reachable"/other) and the nested dispatch shape
+      // ({"available": bool, "reason": ...}).
+      const healthDocker = healthData && healthData.docker
+      const dockerAvailable =
+        healthData === null
+          ? null
+          : typeof healthDocker === 'string'
+            ? healthDocker === 'reachable'
+            : healthDocker
+              ? healthDocker.available === true
+              : false
 
       // ── Workers (bare array of config + runtime keys) ──
       const workers = Array.isArray(workersData) ? workersData.map(mapWorker) : []

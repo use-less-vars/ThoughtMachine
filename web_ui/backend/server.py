@@ -113,6 +113,7 @@ import tempfile
 import time
 import traceback
 import threading
+from datetime import datetime, timezone
 
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
@@ -2881,17 +2882,113 @@ def workspace_container_delete(workspace_id: str, container_name: str,
 
 @app.get("/api/health/containers")
 def health_containers():
-    """Report whether the Docker daemon is reachable from the server."""
+    """Report whether the Docker daemon is reachable from the server.
+
+    Returns a structured payload so callers can surface degraded Docker
+    access with an actionable hint instead of a bare status string.
+    The "status" key stays backward compatible ("ok"/"degraded"); the
+    "docker" key carries the dispatch spec:
+      {"available": bool, "reason": str-or-null, "hint": str-or-null,
+       "version": str-or-null, "error": str-or-null}
+    where reason is exactly one of daemon_down | permission_denied |
+    lib_missing | import_failed | docker_host_unreachable, or null when
+    Docker is available.
+    """
+    checked_at = datetime.now(timezone.utc).isoformat()
+    client = None
     try:
         import docker as _docker
         client = _docker.from_env()
+        client.ping()
+        version = None
         try:
-            client.ping()
-        finally:
-            client.close()
-        return {"status": "ok", "docker": "reachable"}
-    except Exception:
-        return {"status": "degraded", "docker": "unreachable"}
+            version = client.version().get("Version")
+        except Exception:
+            version = None
+        log("INFO", "server.health_containers",
+            "Docker daemon reachable"
+            + (f" (version {version})" if version else ""))
+        return {
+            "status": "ok",
+            "docker": {
+                "available": True,
+                "reason": None,
+                "hint": None,
+                "version": version,
+                "error": None,
+            },
+            "checked_at": checked_at,
+        }
+    except ImportError as exc:
+        # Docker SDK missing, or a docker-backed tool failed to import.
+        # Distinguish via the import-failure registry tools/__init__ keeps.
+        reason = "lib_missing"
+        hint = "Install the Docker SDK: .venv/bin/pip install docker"
+        try:
+            import tools
+            failed = [
+                f for f in getattr(tools, "IMPORT_FAILURES", [])
+                if f.get("tool") in ("DockerCodeRunner", "container_control")
+            ]
+            if failed:
+                reason = "import_failed"
+                hint = (
+                    "The Docker tool failed to load: "
+                    f"{failed[0].get('error')} — check the server logs"
+                )
+        except Exception:
+            pass
+        log("ERROR", "server.health_containers",
+            f"Docker SDK unavailable: {exc}")
+        return {
+            "status": "degraded",
+            "docker": {
+                "available": False,
+                "reason": reason,
+                "hint": hint,
+                "version": None,
+                "error": str(exc),
+            },
+            "checked_at": checked_at,
+        }
+    except Exception as exc:
+        msg = str(exc).lower()
+        if isinstance(exc, PermissionError) or "permission denied" in msg:
+            reason = "permission_denied"
+            hint = (
+                "Add your user to the docker group (sudo usermod -aG docker $USER) "
+                "and re-login, or run the server as a docker-group user."
+            )
+        elif any(token in msg for token in (
+                "connection refused", "cannot connect", "socket",
+                "connect", "timeout", "daemon")):
+            reason = "daemon_down"
+            hint = "Start the Docker daemon: sudo systemctl enable --now docker"
+        else:
+            reason = "docker_host_unreachable"
+            hint = (
+                f"Docker host unreachable: {str(exc)[:200]} — "
+                "check DOCKER_HOST and docker context."
+            )
+        log("ERROR", "server.health_containers",
+            f"Docker daemon unreachable: {exc}")
+        return {
+            "status": "degraded",
+            "docker": {
+                "available": False,
+                "reason": reason,
+                "hint": hint,
+                "version": None,
+                "error": str(exc),
+            },
+            "checked_at": checked_at,
+        }
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
 
 @app.get("/")
