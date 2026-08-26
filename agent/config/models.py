@@ -8,7 +8,7 @@ from agent.logging import log
 from agent.config.presets import AGENT_TOOLS, ENGINEER_TOOLS
 from tools import SIMPLIFIED_TOOL_CLASSES
 from thoughtmachine.security import SessionPermissions
-from agent.config.timeout_constants import SOFT_BUDGET_FALLBACK_SECONDS
+from thoughtmachine.timeout_constants import SOFT_BUDGET_FALLBACK_SECONDS
 
 # Category constants for AgentConfig fields
 RESTART_REQUIRED = "restart_required"

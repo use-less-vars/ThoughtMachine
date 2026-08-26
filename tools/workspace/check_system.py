@@ -31,7 +31,7 @@ from pydantic import Field
 
 from tools.base import ToolBase
 
-from agent.config.timeout_constants import IDLE_TIMEOUT_SECONDS
+from thoughtmachine.timeout_constants import IDLE_TIMEOUT_SECONDS
 
 # ---------------------------------------------------------------------------
 # Optional dependencies

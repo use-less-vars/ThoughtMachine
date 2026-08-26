@@ -22,7 +22,7 @@ between integrity checks and container creation/recreation.
 
 """
 
-from agent.config.timeout_constants import IDLE_TIMEOUT_SECONDS
+from thoughtmachine.timeout_constants import IDLE_TIMEOUT_SECONDS
 from agent.logging import log
 import docker
 import docker.types

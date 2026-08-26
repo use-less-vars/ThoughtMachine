@@ -8,7 +8,7 @@ from typing import ClassVar, List, Literal, Optional, Dict, Any
 from pydantic import Field, field_validator, model_validator
 from .base import ToolBase
 
-from agent.config.timeout_constants import IDLE_TIMEOUT_SECONDS
+from thoughtmachine.timeout_constants import IDLE_TIMEOUT_SECONDS
 
 # Worker-name context var (stdlib-only leaf module — no circular import).
 # Falls back to None so the runner keeps working outside a worker turn.

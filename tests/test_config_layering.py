@@ -558,7 +558,7 @@ def test_idle_timeout_constants_are_unified():
     """All four idle sites resolve to the shared IDLE_TIMEOUT_SECONDS constant."""
     import inspect
 
-    from agent.config.timeout_constants import IDLE_TIMEOUT_SECONDS
+    from thoughtmachine.timeout_constants import IDLE_TIMEOUT_SECONDS
 
     assert IDLE_TIMEOUT_SECONDS == 600
 

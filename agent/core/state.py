@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import typing
 from agent import events as ev
 from agent.logging import log
-from agent.config.timeout_constants import SOFT_BUDGET_FALLBACK_SECONDS
+from thoughtmachine.timeout_constants import SOFT_BUDGET_FALLBACK_SECONDS
 
 class TokenState(enum.Enum):
     """Token usage state based on conversation token count."""
