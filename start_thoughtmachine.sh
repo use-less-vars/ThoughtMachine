@@ -4,14 +4,23 @@
 #
 #  Preflight doctor + launcher for ThoughtMachine.
 #  Runs all checks first; when they pass it starts the app:
-#    * default (dev):  vite on 127.0.0.1:5173 in the background, then the
-#                      backend (.venv/bin/python -m web_ui.backend.server)
-#                      in the foreground. When the backend exits, vite is
-#                      stopped too.
-#    * --prod / -p:    production mode, single foreground process:
+#    * default (dev):  vite on 127.0.0.1:5173 in the background, plus the
+#                      backend (.venv/bin/python -m web_ui.backend.server).
+#                      The backend is health-checked (GET /api/health) BEFORE
+#                      the frontend is started; when the backend exits, vite
+#                      is stopped too.
+#    * --prod / -p:    production mode, single process:
 #                      .venv/bin/python -m web_ui.backend.server --serve-frontend
+#    * --doctor:       preflight (tolerates a missing/unusable Docker daemon) +
+#                      start the backend, verify /api/health, print
+#                      BACKEND-HEALTHY and keep running.
 #    * --check-only:   run ONLY the preflight checks, then exit 0 without
 #                      starting anything (also honors TM_CHECK_ONLY=1).
+#
+#  The backend is always started in the background with stdout+stderr
+#  redirected to logs/backend_startup.log; the script polls
+#  http://127.0.0.1:8000/api/health for up to 30 s before considering the
+#  backend up. The frontend is only started after the backend is healthy.
 #===============================================================================
 set -u
 
@@ -21,20 +30,24 @@ cd "$SCRIPT_DIR"
 DOCTOR="$SCRIPT_DIR/scripts/doctor_checks.py"
 PROD_MODE=false
 CHECK_ONLY=false
+DOCTOR_MODE=false
 
 for arg in "$@"; do
     case "$arg" in
         --prod|-p)          PROD_MODE=true ;;
         --check-only)       CHECK_ONLY=true ;;
+        --doctor)           DOCTOR_MODE=true ;;
         --help|-h)
-            echo "Usage: $0 [--prod] [--check-only]"
+            echo "Usage: $0 [--prod] [--check-only] [--doctor]"
             echo "  --prod / -p   production mode: backend serves the built frontend"
             echo "  --check-only  run preflight checks only, then exit 0"
+            echo "  --doctor      preflight (Docker problems only warn) + start the backend,"
+            echo "                verify /api/health, print BACKEND-HEALTHY and keep running"
             exit 0
             ;;
         *)
             echo "Unknown argument: $arg"
-            echo "Usage: $0 [--prod] [--check-only]"
+            echo "Usage: $0 [--prod] [--check-only] [--doctor]"
             exit 1
             ;;
     esac
@@ -54,10 +67,108 @@ d = json.load(sys.stdin)
 print(d.get(sys.argv[1], "") if isinstance(d, dict) else "")' "$1" 2>/dev/null || true
 }
 
+BACKEND_PID=""
+VITE_PID=""
+BACKEND_LOG="$SCRIPT_DIR/logs/backend_startup.log"
+
+cleanup() {
+    if [ -n "${VITE_PID:-}" ]; then
+        kill "$VITE_PID" 2>/dev/null || true
+        wait "$VITE_PID" 2>/dev/null || true
+    fi
+    if [ -n "${BACKEND_PID:-}" ]; then
+        kill "$BACKEND_PID" 2>/dev/null || true
+        wait "$BACKEND_PID" 2>/dev/null || true
+    fi
+}
+trap 'cleanup; exit 130' INT TERM
+
+# Poll GET http://127.0.0.1:8000/api/health for up to 30 s (30 x 1 s).
+# Returns 0 when the backend answers 200; 1 on timeout or early exit.
+# Fallback: when /api/health returns 404 (route not registered in this build),
+# probe /api/health/containers (the real readiness endpoint) instead.
+wait_for_backend() {
+    python3 - "$1" <<'PY'
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+pid = sys.argv[1]
+have_proc = os.path.isdir("/proc")
+deadline = time.time() + 30
+while time.time() < deadline:
+    if have_proc and not os.path.isdir("/proc/%s" % pid):
+        break
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8000/api/health", timeout=2) as resp:
+            if resp.status == 200:
+                sys.exit(0)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:8000/api/health/containers", timeout=2) as resp2:
+                    if resp2.status == 200:
+                        sys.exit(0)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    time.sleep(1)
+sys.exit(1)
+PY
+    return $?
+}
+
+# Start the backend in the background with stdout+stderr -> logs/backend_startup.log
+# and wait for it to become healthy. Exits 1 (with the log tail) on failure.
+start_backend() {
+    # $1 = backend command line (kept word-split on purpose)
+    mkdir -p "$SCRIPT_DIR/logs"
+    echo "  Starting backend, log -> logs/backend_startup.log ..."
+    # shellcheck disable=SC2086
+    $1 >"$BACKEND_LOG" 2>&1 &
+    BACKEND_PID=$!
+    echo "  Backend PID: $BACKEND_PID"
+    if ! wait_for_backend "$BACKEND_PID"; then
+        kill "$BACKEND_PID" 2>/dev/null || true
+        wait "$BACKEND_PID" 2>/dev/null || true
+        echo ""
+        echo "Backend failed to start. See logs/backend_startup.log. Last lines:"
+        tail -50 "$BACKEND_LOG" 2>/dev/null | sed 's/^/  /'
+        exit 1
+    fi
+    echo "  Backend is healthy (/api/health)."
+}
+
 echo "============================================"
 echo "  ThoughtMachine - preflight check"
 echo "============================================"
 echo ""
+
+# ------------------------------------------- required tools (before all checks)
+echo "Required tools ..."
+MISSING_TOOLS=""
+for tool in ss sg apt-get python3 node; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        case "$tool" in
+            ss)       HINT="install iproute2 (e.g. apt-get install -y iproute2)" ;;
+            sg)       HINT="install util-linux (e.g. apt-get install -y util-linux)" ;;
+            python3)  HINT="install python3 (e.g. apt-get install -y python3)" ;;
+            node)     HINT="install Node.js >= 18 (package 'nodejs' or https://nodejs.org / NodeSource)" ;;
+            *)        HINT="" ;;
+        esac
+        MISSING_TOOLS="${MISSING_TOOLS}    - ${tool}: ${HINT}"$'\n'
+    fi
+done
+if [ -n "$MISSING_TOOLS" ]; then
+    echo "      FAILED: required tools are missing:"
+    printf '%s' "$MISSING_TOOLS" | sed 's/^/      /'
+    echo "      Install the missing tools, then re-run this script."
+    exit 1
+fi
+echo "      ok."
 
 # --------------------------------------------------------- [1/7] venv (critical)
 echo "[1/7] Python virtual environment ..."
@@ -81,32 +192,50 @@ if [ "$DOCKER_RC" -ne 0 ]; then
     case "$DOCKER_REASON" in
         permission_denied)
             if [ "${TM_REEXEC:-}" = "1" ]; then
-                echo "      FAILED: Docker permission problem persists even inside the 'docker' group."
-                echo "      Re-login or run: newgrp docker"
-                exit 1
-            fi
-            if ! command -v sg >/dev/null 2>&1; then
+                if $DOCTOR_MODE; then
+                    echo "      WARNING: Docker permission problem persists even inside the 'docker' group (continuing in --doctor mode)."
+                else
+                    echo "      FAILED: Docker permission problem persists even inside the 'docker' group."
+                    echo "      Re-login or run: newgrp docker"
+                    exit 1
+                fi
+            elif ! command -v sg >/dev/null 2>&1; then
                 echo "      FAILED: 'sg' command not found - cannot re-run inside the docker group."
                 echo "      Re-login or run: newgrp docker"
                 exit 1
+            else
+                echo "      Re-running inside the 'docker' group ..."
+                export TM_REEXEC=1
+                exec sg docker -c "cd '$SCRIPT_DIR' && '$SCRIPT_DIR/$(basename "$0")' $*"
             fi
-            echo "      Re-running inside the 'docker' group ..."
-            export TM_REEXEC=1
-            exec sg docker -c "cd '$SCRIPT_DIR' && '$SCRIPT_DIR/$(basename "$0")'"
             ;;
-        daemon_down)
-            echo "      FAILED: Docker daemon is not running."
-            echo "      Start it with:  sudo systemctl enable --now docker"
-            exit 1
+        daemon_down|lib_missing)
+            if $DOCTOR_MODE; then
+                echo "      WARNING: Docker is not usable (reason: $DOCKER_REASON) - continuing in --doctor mode."
+                [ -n "$DOCKER_DETAIL" ] && printf '%s\n' "$DOCKER_DETAIL" | sed 's/^/      /'
+            else
+                echo "      FAILED: Docker is not usable (reason: ${DOCKER_REASON:-unknown})."
+                [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
+                if [ "$DOCKER_REASON" = "daemon_down" ]; then
+                    echo "      Start it with:  sudo systemctl enable --now docker"
+                fi
+                exit 1
+            fi
             ;;
         *)
-            echo "      FAILED: Docker is not usable (reason: ${DOCKER_REASON:-unknown})."
-            [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
-            exit 1
+            if $DOCTOR_MODE; then
+                echo "      WARNING: Docker check failed (reason: ${DOCKER_REASON:-unknown}) - continuing in --doctor mode."
+                [ -n "$DOCKER_DETAIL" ] && printf '%s\n' "$DOCKER_DETAIL" | sed 's/^/      /'
+            else
+                echo "      FAILED: Docker is not usable (reason: ${DOCKER_REASON:-unknown})."
+                [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
+                exit 1
+            fi
             ;;
     esac
+else
+    echo "      ok."
 fi
-echo "      ok."
 
 # ------------------------------------------------ [3/7] Ports 8000 (API) / 5173 (Vite)
 echo "[3/7] Ports 8000 (backend) and 5173 (frontend) ..."
@@ -163,6 +292,21 @@ if $CHECK_ONLY; then
 fi
 
 # ------------------------------------------------------------------- launch
+if $DOCTOR_MODE; then
+    echo "============================================"
+    echo "  ThoughtMachine - doctor mode"
+    echo "============================================"
+    echo ""
+    start_backend ".venv/bin/python -m web_ui.backend.server"
+    echo ""
+    echo "BACKEND-HEALTHY"
+    echo "  (--doctor: backend verified healthy; press Ctrl-C to stop)"
+    wait "$BACKEND_PID"
+    BACKEND_RC=$?
+    echo "  Backend exited (rc=$BACKEND_RC)."
+    exit "$BACKEND_RC"
+fi
+
 if $PROD_MODE; then
     echo "============================================"
     echo "  ThoughtMachine - production mode"
@@ -170,7 +314,13 @@ if $PROD_MODE; then
     echo "============================================"
     echo ""
     export TM_NPM_CMD="$(command -v npm 2>/dev/null || true)"
-    exec .venv/bin/python -m web_ui.backend.server --serve-frontend
+    start_backend ".venv/bin/python -m web_ui.backend.server --serve-frontend"
+    echo ""
+    echo "  Backend is running (PID $BACKEND_PID); serving the frontend on http://localhost:8000."
+    echo "  Stop it with Ctrl-C."
+    wait "$BACKEND_PID"
+    BACKEND_RC=$?
+    exit "$BACKEND_RC"
 fi
 
 echo "============================================"
@@ -179,6 +329,8 @@ echo "  Backend:   http://localhost:8000"
 echo "  Frontend:  http://localhost:5173"
 echo "============================================"
 echo ""
+
+start_backend ".venv/bin/python -m web_ui.backend.server"
 
 FRONTEND_DIR="$SCRIPT_DIR/web_ui/frontend"
 VITE_BIN="$FRONTEND_DIR/node_modules/.bin/vite"
@@ -197,6 +349,7 @@ fi
 for i in 1 2 3 4 5 6 7 8 9 10; do
     if ! kill -0 "$VITE_PID" 2>/dev/null; then
         echo "  FAILED: the frontend dev server exited during startup."
+        cleanup
         exit 1
     fi
     if (command -v ss >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -q ':5173 ') || \
@@ -207,14 +360,13 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
 done
 
 echo ""
-echo "  Starting backend (.venv/bin/python -m web_ui.backend.server) ..."
+echo "  Backend is running (PID $BACKEND_PID) with the frontend dev server on http://localhost:5173."
 echo "  Stop it with Ctrl-C; the frontend dev server is stopped automatically."
 echo ""
-.venv/bin/python -m web_ui.backend.server
+wait "$BACKEND_PID"
 BACKEND_RC=$?
 
 echo "  Backend exited (rc=$BACKEND_RC) - stopping the frontend dev server ..."
-kill "$VITE_PID" 2>/dev/null || true
-wait "$VITE_PID" 2>/dev/null || true
+cleanup
 
 exit "$BACKEND_RC"
