@@ -72,11 +72,14 @@ SPAWN_QUEUE_TIMEOUT = 600
 
 # ── Session-level worker spawn cap (safe default) ──
 # Limits how many LIVE worker threads a single session may have running at
-# once. Configurable per session via the ``max_workers`` config key (top-level
-# agent_config, or nested under ``session_config``). Force-replacements
-# (force=True) do NOT count toward the cap — the stale instance is stopped
-# and removed from the registry before the cap check runs.
-MAX_WORKERS_PER_SESSION = 5
+# once. Configurable per session via the ``max_workers_per_session`` config
+# key (top-level agent_config, or nested under ``session_config``; the legacy
+# ``max_workers`` key is still honoured for backwards compatibility).
+# Force-replacements (force=True) do NOT count toward the cap — the stale
+# instance is stopped and removed from the registry before the cap check
+# runs. Continued reuse of an existing live worker (spawned=False) never
+# counts as a new spawn.
+MAX_WORKERS_PER_SESSION = 3
 
 # Registry key fallback used when a worker is spawned without a session_id.
 _NO_SESSION_KEY = "<no-session>"
@@ -3125,7 +3128,7 @@ class Worker(ToolBase):
 
     skip_output_truncation: ClassVar[bool] = True
 
-    VALID_ACTIONS: ClassVar[list[str]] = ["list", "spawn", "check", "query", "stop", "submit_query", "job_status", "join", "wait_for_job", "pause", "resume"]
+    VALID_ACTIONS: ClassVar[list[str]] = ["list", "spawn", "check", "query", "stop", "submit_query", "job_status", "join", "wait_for_job", "pause", "resume", "reset"]
 
     # ── Pydantic v2 validator: coerce plain string context to {"query": ...} ──
     @field_validator('context', mode='before')
@@ -3145,7 +3148,7 @@ class Worker(ToolBase):
                     "available_actions": self.VALID_ACTIONS,
                 })
 
-            if self.action in ("spawn", "check", "query", "submit_query", "join", "wait_for_job") and not self.worker_name:
+            if self.action in ("spawn", "check", "query", "submit_query", "join", "wait_for_job", "reset") and not self.worker_name:
                 return json.dumps({
                     "error": f"worker_name is required for action '{self.action}'",
                 })
@@ -3188,6 +3191,7 @@ class Worker(ToolBase):
                 "wait_for_job": lambda: self._action_join(workers),
                 "pause": lambda: self._action_pause(workers),
                 "resume": lambda: self._action_resume(workers),
+                "reset": lambda: self._action_reset(workers),
             }[self.action]
 
             result = handler()
@@ -3390,7 +3394,15 @@ class Worker(ToolBase):
         the safe default ``MAX_WORKERS_PER_SESSION``.
         """
         cfg = self.agent_config or {}
-        raw = cfg.get("max_workers")
+        # Preferred key: ``max_workers_per_session`` (top-level, then nested
+        # under ``session_config``), then the legacy ``max_workers`` key.
+        raw = cfg.get("max_workers_per_session")
+        if raw is None:
+            nested_cfg = cfg.get("session_config")
+            if isinstance(nested_cfg, dict):
+                raw = nested_cfg.get("max_workers_per_session")
+        if raw is None:
+            raw = cfg.get("max_workers")
         if raw is None:
             nested_cfg = cfg.get("session_config")
             if isinstance(nested_cfg, dict):
@@ -3545,12 +3557,19 @@ class Worker(ToolBase):
                         # Paused worker — auto-resume and re-route the new query.
                         resume_paused_worker = existing
                     else:
+                        # Continue-existing routing: an explicit instance that
+                        # is live and not paused is reused, not rejected.
                         return {
-                            "error": (
-                                f"Worker '{self.worker_name}' instance "
-                                f"{explicit_iid} is already running"
-                            ),
+                            "worker_name": self.worker_name,
+                            "instance_id": explicit_iid,
+                            "instance_label": getattr(existing, "instance_label", None),
+                            "spawned": False,
                             "status": existing.status,
+                            "message": (
+                                f"Worker '{self.worker_name}' instance "
+                                f"{explicit_iid} is already running; reusing "
+                                "the existing instance."
+                            ),
                         }
                 else:
                     spawn_iid = explicit_iid
@@ -3567,6 +3586,21 @@ class Worker(ToolBase):
                             "status": "paused",
                         }
                     resume_paused_worker = live_same[0][1]
+                elif len(live_same) == 1 and not self.force:
+                    # Continue-existing routing: a single live (non-paused)
+                    # instance is reused instead of spawning a duplicate.
+                    existing = live_same[0][1]
+                    return {
+                        "worker_name": self.worker_name,
+                        "instance_id": live_same[0][0],
+                        "instance_label": getattr(existing, "instance_label", None),
+                        "spawned": False,
+                        "status": existing.status,
+                        "message": (
+                            f"Worker '{self.worker_name}' is already running; "
+                            "reusing the existing instance."
+                        ),
+                    }
                 else:
                     spawn_iid = max([iid for iid, _ in live_same], default=0) + 1
 
@@ -4599,3 +4633,146 @@ class Worker(ToolBase):
             "status": "stopped",
             "message": f"Worker '{self.worker_name}' stopped successfully.",
         }
+
+    def _action_reset(self, workers: list) -> dict:
+        """Stop a worker, DROP its persisted context, and free its spawn slot.
+
+        Mirrors ``_action_stop`` resolution (current session first, then a
+        cross-session fallback), but instead of persisting the final context
+        the worker's state files (context.json / status.json / command.json)
+        are DELETED so the next spawn starts completely fresh.  Other
+        workers and resource containers are never touched.
+        """
+
+        def _drop_persisted_files(t: Any) -> None:
+            wdir = getattr(t, "_worker_dir", None)
+            if wdir is None:
+                return
+            for fname in ("context.json", "status.json", "command.json"):
+                try:
+                    (wdir / fname).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        def _reset_one(t: Any, sid: str) -> dict:
+            try:
+                t.stop()
+                # Robust join with retry (same pattern as _action_stop): the
+                # worker may be blocked inside a slow LLM call.
+                _budget = max(30, t._timeout_seconds)
+                _elapsed = 0.0
+                while _elapsed < _budget:
+                    t.join(timeout=2.0)
+                    _elapsed += 2.0
+                    if not t.is_alive():
+                        break
+                if t.is_alive():
+                    logger.warning(
+                        "Reset: worker '%s' did not stop within %ds budget; "
+                        "dropping its context anyway.",
+                        self.worker_name, _budget,
+                    )
+            except Exception as exc:
+                logger.exception("Error stopping worker '%s' during reset", self.worker_name)
+                return {"session_id": sid, "error": str(exc)}
+            finally:
+                t._cleanup_worker_containers()
+                with _registry_lock:
+                    for key, existing_t in list(_worker_registry.items()):
+                        if (
+                            key[0] == sid
+                            and key[1] == self.worker_name
+                            and existing_t is t
+                        ):
+                            _worker_registry.pop(key, None)
+                # Delete AFTER the join completes so the thread's run()
+                # finally-block (which re-saves the context) cannot resurrect it.
+                _drop_persisted_files(t)
+            return {"session_id": sid, "status": "reset"}
+
+        session_key = self.session_id or _NO_SESSION_KEY
+        try:
+            thread, sid, iid = _resolve_worker_thread(
+                self.worker_name,
+                instance_id=self.instance_id,
+                session_id=session_key,
+            )
+        except _WorkerAmbiguityError as exc:
+            msg = str(exc)
+            all_instances = []
+            if self.instance_id is None and "is not running" in msg:
+                # Not found in current session → search across all sessions.
+                all_instances = self._find_all_worker_threads(self.worker_name)
+            if "ambiguous" in msg:
+                return {
+                    "error": msg,
+                    "worker_name": self.worker_name,
+                }
+            if not all_instances:
+                entry = self._find_worker(workers, self.worker_name)
+                if entry:
+                    return {
+                        "worker_name": self.worker_name,
+                        "status": "reset",
+                        "message": (
+                            f"Worker '{self.worker_name}' was not running; "
+                            "nothing to reset."
+                        ),
+                        "freed_slot": False,
+                    }
+                return {
+                    "error": f"Worker '{self.worker_name}' not found",
+                }
+
+            # Found in another session — reset all matching instances.
+            reset_info = []
+            for sid, t in all_instances:
+                logger.info("Cross-session reset: resetting worker '%s'", self.worker_name)
+                info = _reset_one(t, sid)
+                if info not in reset_info:
+                    reset_info.append(info)
+            return {
+                "worker_name": self.worker_name,
+                "status": "reset",
+                "message": (
+                    f"Reset {len(reset_info)} instance(s) of worker "
+                    f"'{self.worker_name}' across sessions."
+                ),
+                "reset_instances": reset_info,
+                "freed_slot": True,
+            }
+
+        # ── Found in current session ──
+        if not thread.is_alive():
+            with _registry_lock:
+                _worker_registry.pop((sid, self.worker_name, iid), None)
+            thread._cleanup_worker_containers()
+            _drop_persisted_files(thread)
+            return {
+                "worker_name": self.worker_name,
+                "instance_id": iid,
+                "status": "reset",
+                "message": (
+                    f"Worker '{self.worker_name}' was already stopped; "
+                    "state files removed."
+                ),
+                "freed_slot": True,
+            }
+
+        info = _reset_one(thread, sid)
+        max_workers = self._effective_max_workers()
+        live_workers = self._live_workers_in_session(session_key)
+        return {
+            "worker_name": self.worker_name,
+            "instance_id": iid,
+            "status": "reset",
+            "message": (
+                f"Worker '{self.worker_name}' stopped and its context was "
+                "reset (state files dropped)."
+            ),
+            "freed_slot": True,
+            "max_workers": max_workers,
+            "live_workers": live_workers,
+            "reset_instance": info,
+        }
+

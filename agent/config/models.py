@@ -62,6 +62,7 @@ class AgentConfig(BaseModel):
         'time_monitor_enabled': HOT_SWAPPABLE,
         'time_warning_threshold': HOT_SWAPPABLE,
         'worker_mode': HOT_SWAPPABLE,
+        'max_workers_per_session': HOT_SWAPPABLE,
         'use_workspace_lifecycle_manager': HOT_SWAPPABLE,
         'use_container_registry': HOT_SWAPPABLE,
         'git_allow_worktree_commits': HOT_SWAPPABLE,
@@ -82,6 +83,11 @@ class AgentConfig(BaseModel):
     model_override: Optional[str] = Field(default=None, description='Override model from the profile (leaves provider_id intact)')
     temperature: float = 0.2
     max_turns: int = 100
+    max_workers_per_session: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description='Maximum number of live worker threads a session may run at once (None = factory default 3)',
+    )
     stop_check: Optional[Callable[[], bool]] = Field(default=None, description='Runtime stop-check callback. Called periodically during agent execution to check if processing should be aborted. Return True to signal stop. Not serialised to/from JSON config.')
     mode: str = Field(default="agent", description='Session mode: "agent", "engineer", or "custom". Determines the default system prompt used when no explicit system prompt is provided.')
     system_prompt: Optional[str] = None
