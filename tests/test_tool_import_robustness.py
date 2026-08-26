@@ -60,3 +60,49 @@ def test_import_order_agent_config_first_does_not_break_tools():
         f"rc={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
     )
     assert "IMPORT-ORDER-OK" in proc.stdout
+
+
+# ---- Phase B: web_ui workspace-routes / backend entrypoint import order ----
+
+_WORKSPACE_ROUTES_FIRST = (
+    "import web_ui.backend.workspace_routes\n"
+    "from tools import SIMPLIFIED_TOOL_CLASSES\n"
+    "names = [c.__name__ for c in SIMPLIFIED_TOOL_CLASSES]\n"
+    "assert 'DockerCodeRunner' in names, names\n"
+    "print('IMPORT-ORDER-OK')\n"
+)
+
+_BACKEND_ENTRYPOINT = (
+    "import web_ui.backend.server\n"
+    "print('BACKEND-IMPORT-OK')\n"
+)
+
+
+def test_import_order_workspace_routes_first_does_not_break_tools():
+    """web_ui.backend.workspace_routes is imported at backend startup before
+    `tools`; that order must still register DockerCodeRunner.
+
+    NOTE: `'DockerCodeRunner' in SIMPLIFIED_TOOL_CLASSES` would be False BY
+    DESIGN (the list holds class objects; string-in-list compares identity),
+    so the name-based any() check is used instead.
+    """
+    proc = _run_import_order(_WORKSPACE_ROUTES_FIRST)
+    assert proc.returncode == 0, (
+        f"rc={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
+    assert "IMPORT-ORDER-OK" in proc.stdout
+
+
+def test_backend_entrypoint_imports_without_error():
+    """The FastAPI backend entrypoint (web_ui.backend.server) must import
+    cleanly. uvicorn only runs under `__main__`, so importing must not bind
+    ports or hang.
+    """
+    proc = _run_import_order(_BACKEND_ENTRYPOINT)
+    assert proc.returncode == 0, (
+        f"rc={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
+    assert "BACKEND-IMPORT-OK" in proc.stdout
+    assert "ImportError" not in proc.stderr
+    assert "ModuleNotFoundError" not in proc.stderr
+
