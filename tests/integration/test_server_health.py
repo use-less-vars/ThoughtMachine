@@ -392,25 +392,41 @@ def test_delete_endpoint(contract_server):
 # -- GET /api/health/containers ------------------------------------------------
 
 def test_health_containers_ok(contract_server):
-    """Docker daemon reachable -> {"status": "ok", "docker": "reachable"}."""
+    """Docker daemon reachable -> status 'ok', docker.available True."""
     app, _ = contract_server
     fake_client = mock.MagicMock()
     fake_client.ping.return_value = True
+    fake_client.version.return_value = {"Version": "27.3.1"}
     with TestClient(app) as client:
         with mock.patch("docker.from_env", return_value=fake_client):
             resp = client.get("/api/health/containers")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok", "docker": "reachable"}
+    payload = resp.json()
+    assert payload["status"] == "ok"
+    assert payload["docker"]["available"] is True
+    assert payload["docker"]["reason"] is None
+    assert payload["docker"]["hint"] is None
+    assert payload["docker"]["version"] == "27.3.1"
+    assert payload["docker"]["error"] is None
+    assert "checked_at" in payload
     fake_client.ping.assert_called_once()
     fake_client.close.assert_called_once()
 
 
 def test_health_containers_degraded(contract_server):
-    """Docker daemon unreachable -> {"status": "degraded", "docker": "unreachable"}."""
+    """Docker daemon unreachable -> status 'degraded', docker.available False
+    and a structured reason token (docker_host_unreachable for this error)."""
     app, _ = contract_server
     with TestClient(app) as client:
         with mock.patch("docker.from_env", side_effect=RuntimeError("no docker")):
             resp = client.get("/api/health/containers")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "degraded", "docker": "unreachable"}
+    payload = resp.json()
+    assert payload["status"] == "degraded"
+    assert payload["docker"]["available"] is False
+    assert payload["docker"]["reason"] == "docker_host_unreachable"
+    assert isinstance(payload["docker"]["hint"], str) and payload["docker"]["hint"]
+    assert payload["docker"]["version"] is None
+    assert isinstance(payload["docker"]["error"], str) and payload["docker"]["error"]
+    assert "checked_at" in payload
 
