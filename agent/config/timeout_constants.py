@@ -1,21 +1,27 @@
 """
-Shared timeout constants — single source of truth for the timeout-unification
-constants introduced in PART 2a of the stabilization plan.
+Backward-compatible re-export shim for the shared timeout constants.
 
-- ``IDLE_TIMEOUT_SECONDS``       — unified idle/cleanup constant (used by the
-  four idle sites: docker idle close, container pooling, etc.).
-- ``SOFT_BUDGET_FALLBACK_SECONDS`` — engine-code fallback used when the
-  ``agent_soft_budget_seconds`` config key is absent.
-- ``SHIPPED_SOFT_BUDGET_SECONDS``  — value shipped in
-  ``resources/default_config.json`` under ``agent_soft_budget_seconds``.
+The canonical, dependency-free definitions live in
+``thoughtmachine.timeout_constants``. The ``thoughtmachine`` package imports
+nothing, so importing that module can never trigger a circular import — unlike
+importing this one at module level from ``thoughtmachine.security``, which used
+to pull in ``agent.config.models`` -> ``tools`` -> ``tools.docker_code_runner``
+-> ``thoughtmachine.security`` (a cycle that silently dropped DockerCodeRunner
+from TOOL_CLASSES on certain first-import orders).
 
-This module is intentionally dependency-free so it can be imported from
-anywhere in the engine (models, state, tools, infra) without circular-import
-risk.
+Keeping this module as a thin re-export preserves every existing importer
+(``agent.config.models``, ``agent.core.state``, ``docker_executor``,
+``tools.docker_code_runner``, ``tools.workspace.check_system``, tests).
 """
 
-IDLE_TIMEOUT_SECONDS = 600
+from thoughtmachine.timeout_constants import (
+    IDLE_TIMEOUT_SECONDS,
+    SOFT_BUDGET_FALLBACK_SECONDS,
+    SHIPPED_SOFT_BUDGET_SECONDS,
+)
 
-SOFT_BUDGET_FALLBACK_SECONDS = 300
-
-SHIPPED_SOFT_BUDGET_SECONDS = 300
+__all__ = [
+    "IDLE_TIMEOUT_SECONDS",
+    "SOFT_BUDGET_FALLBACK_SECONDS",
+    "SHIPPED_SOFT_BUDGET_SECONDS",
+]

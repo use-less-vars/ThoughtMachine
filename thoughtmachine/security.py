@@ -587,9 +587,14 @@ def validate_path(path: str, mode: str = 'read', workspace_path: Optional[str] =
 
 
 # Imported here (still module-level, before setup_docker_sandbox's def-time
-# default) to break the import cycle: agent/config/models.py imports names
-# from this module while it is still initializing.
-from agent.config.timeout_constants import IDLE_TIMEOUT_SECONDS
+# default). Imported from thoughtmachine.timeout_constants (a dependency-free
+# module; the thoughtmachine package imports nothing) rather than
+# agent.config.timeout_constants, because importing agent.config at module
+# level used to pull in agent.config.models -> tools ->
+# tools.docker_code_runner -> back into this module while it was still
+# initializing — a circular import that silently dropped DockerCodeRunner
+# from TOOL_CLASSES.
+from thoughtmachine.timeout_constants import IDLE_TIMEOUT_SECONDS
 
 
 def setup_docker_sandbox(
