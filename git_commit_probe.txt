@@ -1,0 +1,5 @@
+Git commit pipeline probe
+=========================
+Created 2026-08-27 to verify the pre-commit hook (import gate, live /health
+check, WS smoke) works in the git resource container (tm-resource-git) after
+the dependency fix. This file has no functional purpose and may be deleted.

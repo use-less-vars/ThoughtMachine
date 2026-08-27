@@ -37,18 +37,31 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
 # ── Python resolution ─────────────────────────────────────────────────────────
-# Honour an explicit $PYTHON if set and executable; otherwise prefer the repo
-# venv (derived from hook location, so any checkout path works), else python3.
-if [ -n "${PYTHON:-}" ] && [ -x "$PYTHON" ]; then
+# Honour an explicit $PYTHON if set; otherwise probe each candidate in order
+# (repo venv, then python3 from PATH) and use the FIRST one that can import
+# the hook's required dependencies.  An interpreter that exists but lacks the
+# deps is skipped, not used blindly — a bad pick would fail mid-hook.
+REQUIRED_IMPORTS="web_ui.backend.server starlette.testclient pytest"
+probe_python() {
+    local cand="$1"
+    [ -x "$cand" ] || return 1
+    local mod
+    for mod in $REQUIRED_IMPORTS; do
+        "$cand" -c "import $mod" >/dev/null 2>&1 || return 1
+    done
+    return 0
+}
+
+if [ -n "${PYTHON:-}" ] && probe_python "$PYTHON"; then
     :
-elif [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+elif probe_python "$REPO_ROOT/.venv/bin/python"; then
     PYTHON="$REPO_ROOT/.venv/bin/python"
-elif [ -x "$REPO_ROOT/.venv/bin/python3" ]; then
+elif probe_python "$REPO_ROOT/.venv/bin/python3"; then
     PYTHON="$REPO_ROOT/.venv/bin/python3"
-elif command -v python3 >/dev/null 2>&1; then
+elif command -v python3 >/dev/null 2>&1 && probe_python "$(command -v python3)"; then
     PYTHON="$(command -v python3)"
 else
-    echo "error: no Python interpreter found (expected $REPO_ROOT/.venv)" >&2
+    echo "error: no Python interpreter with required dependencies found (probed \$PYTHON, $REPO_ROOT/.venv, python3; need: $REQUIRED_IMPORTS)" >&2
     exit 1
 fi
 
