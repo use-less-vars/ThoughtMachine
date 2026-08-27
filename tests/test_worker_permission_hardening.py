@@ -25,7 +25,7 @@ H. GitInfoTool routing: 'ask' defers, 'banned' denies (fail-closed), for both
 I. Bridge apply_config / save / load round-trips session_permissions.
 J. Global-defaults worker config allowlist (only the six known keys persist;
    absent keys fall back to constructor defaults).
-K. Per-session worker spawn cap (``max_workers``) safe default 5.
+K. Per-session worker spawn cap (``max_workers``) safe default 3.
 
 Harnesses mirror the existing suites: tests/test_worker_max_workers.py
 (registry snapshot + patched workspace plumbing), tests/test_ask_permission.py
@@ -421,7 +421,7 @@ class TestFailClosedSpawnGuard:
 
 
 class TestMaxWorkersCap:
-    """Per-session live-worker cap: safe default 5, config key lowers/raises."""
+    """Per-session live-worker cap: safe default 3, config key lowers/raises."""
 
     def _seed(self, harness, names, session=SESSION_H, alive=True):
         with harness.registry._registry_lock:
@@ -433,28 +433,29 @@ class TestMaxWorkersCap:
                 harness.registry._worker_registry[(session, name, 1)] = t
 
     def test_default_cap_refuses_sixth(self, spawn_harness):
+        # The default cap is now 3, so the "sixth" spawn is really the 4th.
         spawn_harness.set_definitions([
-            {"name": f"w{i}", "status": "ready", "tools": []} for i in range(1, 7)
+            {"name": f"w{i}", "status": "ready", "tools": []} for i in range(1, 5)
         ])
-        for i in range(1, 6):
+        for i in range(1, 4):
             result = _spawn_worker(spawn_harness, f"w{i}")
             assert result.get("spawned"), f"spawn w{i} should succeed below cap: {result}"
-        result = _spawn_worker(spawn_harness, "w6")
+        result = _spawn_worker(spawn_harness, "w4")
         assert "error" in result
         assert "limit" in result["error"].lower()
-        assert result.get("max_workers") == 5
-        assert result.get("live_workers") == 5
-        # w1..w5 created threads; the refused w6 must NOT create a 6th.
-        assert spawn_harness.thread_cls.call_count == 5
+        assert result.get("max_workers") == 3
+        assert result.get("live_workers") == 3
+        # w1..w3 created threads; the refused w4 must NOT create a 4th.
+        assert spawn_harness.thread_cls.call_count == 3
 
     def test_dead_workers_do_not_count_toward_cap(self, spawn_harness):
         spawn_harness.set_definitions([
-            {"name": f"w{i}", "status": "ready", "tools": []} for i in range(1, 7)
+            {"name": f"w{i}", "status": "ready", "tools": []} for i in range(1, 5)
         ])
-        self._seed(spawn_harness, ["w1", "w2", "w3", "w4"], alive=True)
-        self._seed(spawn_harness, ["w5"], alive=False)
-        result = _spawn_worker(spawn_harness, "w6")
-        assert result.get("spawned"), f"4 live < cap 5: {result}"
+        self._seed(spawn_harness, ["w1", "w2"], alive=True)
+        self._seed(spawn_harness, ["w3"], alive=False)
+        result = _spawn_worker(spawn_harness, "w4")
+        assert result.get("spawned"), f"2 live < cap 3: {result}"
 
     def test_session_config_key_lowers_cap(self, spawn_harness):
         cfg = {
@@ -473,9 +474,9 @@ class TestMaxWorkersCap:
 
     def test_force_replace_does_not_count_as_new_spawn(self, spawn_harness):
         spawn_harness.set_definitions([
-            {"name": f"w{i}", "status": "ready", "tools": []} for i in range(1, 6)
+            {"name": f"w{i}", "status": "ready", "tools": []} for i in range(1, 5)
         ])
-        self._seed(spawn_harness, ["w1", "w2", "w3", "w4", "w5"])
+        self._seed(spawn_harness, ["w1", "w2", "w3"])
         result = _spawn_worker(spawn_harness, "w3", force=True)
         assert result.get("spawned"), f"force-replace at cap: {result}"
         with spawn_harness.registry._registry_lock:
@@ -484,7 +485,7 @@ class TestMaxWorkersCap:
                 for (sid, name, _iid), t in spawn_harness.registry._worker_registry.items()
                 if sid == SESSION_H and t.is_alive()
             ]
-        assert len(live) == 5
+        assert len(live) == 3
 
 
 # =========================================================================
