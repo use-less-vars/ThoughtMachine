@@ -131,7 +131,8 @@ body {
   background: rgba(243, 139, 168, 0.25);
 }
 
-/* ── Docker health banner (top-level; shown when the Docker daemon is unreachable) ── */
+/* ── Docker health banner (top-level; shown when the backend is unreachable
+      or the Docker daemon is unavailable) ── */
 .docker-health-banner {
   display: flex;
   align-items: center;
@@ -142,6 +143,30 @@ body {
   border-bottom: 1px solid rgba(249, 226, 175, 0.3);
   font-size: 0.82rem;
   font-family: var(--font-sans);
+}
+
+.docker-health-banner-text {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.docker-health-banner-dismiss {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--warning);
+  font-size: 0.9rem;
+  line-height: 1;
+  padding: 0.15rem 0.3rem;
+  border-radius: 4px;
+  transition: background 0.15s;
+  flex-shrink: 0;
+}
+
+.docker-health-banner-dismiss:hover {
+  background: rgba(249, 226, 175, 0.25);
 }
 
 /* ──────────────────────────────────────────────────────────────────────────

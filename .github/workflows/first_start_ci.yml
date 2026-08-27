@@ -1,0 +1,148 @@
+#===============================================================================
+# first_start_ci.yml - "first start" smoke test for the installer + launcher.
+#
+# Proves on a pristine Debian 13 container that:
+#   (1) ./install.sh completes successfully (exit 0);
+#   (2) ./start_thoughtmachine.sh --check-only passes every pre-launch check;
+#   (3) ./start_thoughtmachine.sh --doctor boots the backend even when Docker
+#       is unavailable, and GET /api/health/containers answers with a clean
+#       "degraded" payload instead of crashing the server.
+#
+# DESIGN NOTES (read before changing anything here):
+#   * --check-only REQUIRES a working Docker daemon. In start_thoughtmachine.sh
+#     the docker check ([2/7]) treats daemon_down / lib_missing as FATAL in
+#     every mode except --doctor. The job therefore runs in a debian:13
+#     container (GitHub Actions mounts the host's /var/run/docker.sock into
+#     job containers) and installs the docker.io CLI: `docker info` then
+#     succeeds against the host daemon, so --check-only passes.
+#   * The ~/.thoughtmachine check ([5/7]) is fatal in ALL modes, so the job
+#     pre-creates $HOME/.thoughtmachine before running the launcher.
+#   * The final step deliberately sets DOCKER_HOST to a dead TCP endpoint.
+#     The backend's Docker SDK honors DOCKER_HOST, so the health endpoint
+#     deterministically reports degraded/daemon_down - this exercises the
+#     "no Docker available" path a real first start can hit, and proves the
+#     UI/health layer degrades gracefully instead of failing hard.
+#===============================================================================
+name: First-Start CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: first-start-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  first-start:
+    name: Install + check-only + degraded health
+    runs-on: ubuntu-latest
+    container: debian:13
+    steps:
+      #-------------------------------------------------------------------------
+      # Prerequisites. python3-venv is required by `python3 -m venv`;
+      # python3-dev + build-essential cover pip sdists; nodejs (Debian 13
+      # ships 20.x >= 18) satisfies the Node check; iproute2 provides `ss`,
+      # util-linux provides `sg`; docker.io provides the docker CLI that
+      # talks to the host socket GitHub Actions mounts into this container.
+      #-------------------------------------------------------------------------
+      - name: Install prerequisite packages
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            python3 python3-pip python3-venv python3-dev build-essential \
+            nodejs npm curl git iproute2 util-linux docker.io
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # start_thoughtmachine.sh check [5/7] (~/.thoughtmachine writable) is
+      # fatal in ALL modes - even --check-only - so it must exist up front.
+      - name: Pre-create $HOME/.thoughtmachine
+        run: mkdir -p "$HOME/.thoughtmachine"
+
+      # venv + Node.js are critical in install.sh and must pass; the Docker
+      # steps warn+skip here by design (they are non-critical in install.sh).
+      - name: Run ./install.sh
+        run: bash install.sh
+
+      # Full pre-launch gate: venv, docker (via mounted host socket + CLI),
+      # ports 8000/5173, Node.js >= 18, ~/.thoughtmachine. Exits 0 only if
+      # every check passes.
+      - name: Run ./start_thoughtmachine.sh --check-only
+        run: bash start_thoughtmachine.sh --check-only
+
+      #-------------------------------------------------------------------------
+      # Doctor mode with Docker UNAVAILABLE: DOCKER_HOST points at a dead TCP
+      # endpoint, so the doctor's docker check reports daemon_down (WARNING +
+      # continue in --doctor mode) and the backend's Docker SDK fails the same
+      # way -> /api/health/containers must answer HTTP 200 with
+      # docker.available=false and a degraded reason from the taxonomy.
+      #-------------------------------------------------------------------------
+      - name: Doctor mode degrades gracefully without Docker
+        env:
+          DOCKER_HOST: tcp://127.0.0.1:2375
+        run: |
+          mkdir -p logs
+          bash start_thoughtmachine.sh --doctor > logs/doctor_ci.log 2>&1 &
+          DOCTOR_PID=$!
+          echo "doctor wrapper pid: $DOCTOR_PID"
+
+          # Poll /api/health/containers (NOT /api/health - that route does not
+          # exist) for up to 30s. The backend writes logs/backend_startup.log.
+          HEALTH_BODY=""
+          for _ in $(seq 1 30); do
+            HEALTH_BODY="$(curl -fsS --max-time 2 http://127.0.0.1:8000/api/health/containers 2>/dev/null || true)"
+            if [ -n "$HEALTH_BODY" ]; then
+              break
+            fi
+            if ! kill -0 "$DOCTOR_PID" 2>/dev/null; then
+              echo "doctor wrapper exited early - tail of logs/doctor_ci.log:"
+              tail -n 40 logs/doctor_ci.log || true
+              break
+            fi
+            sleep 1
+          done
+
+          if [ -z "$HEALTH_BODY" ]; then
+            echo "::error::GET /api/health/containers never returned HTTP 200 within 30s"
+            tail -n 100 logs/doctor_ci.log || true
+            exit 1
+          fi
+
+          # Assert the degraded payload shape. exit 1 fails the step.
+          python3 - "$HEALTH_BODY" <<'PY' || exit 1
+          import json, sys
+          try:
+              data = json.loads(sys.argv[1])
+          except Exception as exc:
+              print(f"::error::health payload is not valid JSON: {exc}")
+              sys.exit(1)
+          assert isinstance(data, dict), "health payload is not a JSON object"
+          assert data.get("checked_at"), "checked_at missing from health payload"
+          docker_info = data.get("docker")
+          assert isinstance(docker_info, dict), "'docker' key missing from health payload"
+          assert docker_info.get("available") is False, \
+              "docker.available should be False (DOCKER_HOST deliberately broken)"
+          reason = docker_info.get("reason")
+          assert reason in {"daemon_down", "lib_missing", "permission_denied"}, \
+              f"unexpected degraded reason: {reason!r}"
+          print(f"OK: health degraded as expected (reason={reason})")
+          PY
+
+          # The backend must have started cleanly - no import errors/tracebacks.
+          if grep -nE 'ImportError|ModuleNotFoundError|Traceback' \
+              logs/backend_startup.log logs/doctor_ci.log; then
+            echo "::error::backend startup / doctor logs contain Python errors"
+            exit 1
+          fi
+          echo "OK: no import errors/tracebacks in backend startup logs"
+
+          # Cleanup: stop the backend first (the --doctor wrapper waits on it),
+          # then the wrapper itself.
+          pkill -f 'web_ui.backend.server' 2>/dev/null || true
+          kill "$DOCTOR_PID" 2>/dev/null || true
+          sleep 1
+          if kill -0 "$DOCTOR_PID" 2>/dev/null; then
+            kill -9 "$DOCTOR_PID" 2>/dev/null || true
+          fi

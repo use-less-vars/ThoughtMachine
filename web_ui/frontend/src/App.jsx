@@ -146,10 +146,13 @@ export default function App() {
   const [loggingConfig, setLoggingConfig] = useState(null)
   const [loggingConfigError, setLoggingConfigError] = useState(null)
   const [workerEvents, setWorkerEvents] = useState({})  // { [sessionId]: [event, ...] } live WS worker events
-  const [dockerHealth, setDockerHealth] = useState(null)  // /api/health/containers payload (null while loading)
+  const [dockerHealth, setDockerHealth] = useState(null)  // /api/health/containers payload (null while loading or backend down)
+  const [backendDown, setBackendDown] = useState(false)   // health fetch failed or non-200 → backend unreachable
+  const [backendBannerDismissed, setBackendBannerDismissed] = useState(false)
 
   const pendingWorkerSelectionRef = useRef(null)  // { workerName, workspaceId, instanceId, instanceLabel } queued before activeSessionId is set
   const tabActionsRef = useRef({})                // tabId -> { sendCommand, getSessionId }
+  const healthInFlightRef = useRef(false)         // guards overlapping health polls
 
   // ── Per-workspace tab strip selectors (currentWs-scoped) ─────────────
   const storeEntry = useSessionTabsStore(s => (currentWs ? s.byWorkspace[currentWs] : null))
@@ -959,33 +962,44 @@ export default function App() {
       })
   }, [])
 
+  // ── Poll backend health (drives the backend-down + degraded-Docker banners) ─
+  // The FIRST fetch the app makes: GET /api/health/containers on mount, then
+  // every 10s. A fetch failure or non-200 means the backend itself is down →
+  // the "Backend not running" banner; only a 200 renders the structured
+  // docker payload (available/reason/hint). The ref guard skips a poll tick
+  // while the previous request is still in flight, so polls never overlap.
+  const checkBackendHealth = useCallback(async () => {
+    if (healthInFlightRef.current) return
+    healthInFlightRef.current = true
+    const hostname = window.location.hostname
+    const port = import.meta.env.VITE_BACKEND_PORT || '8000'
+    try {
+      const res = await fetch(`http://${hostname}:${port}/api/health/containers`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      setDockerHealth(data)
+      setBackendDown(false)
+      // Recovery re-arms the "Backend not running" banner for a future outage.
+      setBackendBannerDismissed(false)
+    } catch (err) {
+      console.error('Failed to fetch backend health:', err)
+      setDockerHealth(null)
+      setBackendDown(true)
+    } finally {
+      healthInFlightRef.current = false
+    }
+  }, [])
+
+  useEffect(() => {
+    checkBackendHealth()
+    const interval = setInterval(checkBackendHealth, 10000)
+    return () => clearInterval(interval)
+  }, [checkBackendHealth])
+
   // ── Fetch initial logging config on mount ─────────────────────────────
   useEffect(() => {
     fetchLoggingConfig()
   }, [fetchLoggingConfig])
-
-  // ── Fetch Docker daemon health on mount (drives the degraded-Docker banner) ─
-  useEffect(() => {
-    const hostname = window.location.hostname
-    const port = import.meta.env.VITE_BACKEND_PORT || '8000'
-    fetch(`http://${hostname}:${port}/api/health/containers`)
-      .then(res => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        return res.json()
-      })
-      .then(data => setDockerHealth(data))
-      .catch(err => {
-        console.error('Failed to fetch Docker health:', err)
-        setDockerHealth({
-          status: 'degraded',
-          docker: {
-            available: false,
-            reason: 'docker_host_unreachable',
-            hint: 'Backend unreachable — Docker health cannot be determined.',
-          },
-        })
-      })
-  }, [])
 
   // ── Persist active session ID in localStorage (legacy key, still written;
   //    the new tm.sessionTabs.<ws> entry is the source of truth) ─────────
@@ -997,12 +1011,46 @@ export default function App() {
     // so the open_sessions handler can read it before any tab is active.
   }, [activeSessionId])
 
+  // ── Docker availability (tri-state, mirrors workspaceStore) ──────────
+  // null while loading; true/false from the health payload. Tolerates both
+  // the legacy flat string ("reachable"/other) and the structured dispatch
+  // shape ({"available": bool, "reason": ..., "hint": ...}).
+  const dockerInfo = dockerHealth?.docker
+  const dockerAvailable =
+    dockerHealth === null
+      ? null
+      : typeof dockerInfo === 'string'
+        ? dockerInfo === 'reachable'
+        : dockerInfo
+          ? dockerInfo.available === true
+          : false
+  const dockerReason =
+    dockerInfo && typeof dockerInfo === 'object' ? dockerInfo.reason : null
+  const dockerHint =
+    dockerInfo && typeof dockerInfo === 'object' ? dockerInfo.hint : null
+  const degradedText = [
+    dockerHint,
+    dockerReason ? `(${dockerReason})` : null,
+  ].filter(Boolean).join(' ') || 'The Docker daemon is not reachable.'
+
   // ── Render ────────────────────────────────────────────────────────────
   return (
     <div className="app-container">
-      {dockerHealth && dockerHealth.status !== 'ok' && (
+      {backendDown && !backendBannerDismissed && (
         <div className="docker-health-banner" role="alert">
-          ⚠ Docker unavailable — {dockerHealth.docker?.hint || 'The Docker daemon is not reachable.'}
+          <span className="docker-health-banner-text">Backend not running. Check logs/backend_startup.log for details.</span>
+          <button
+            className="docker-health-banner-dismiss"
+            onClick={() => setBackendBannerDismissed(true)}
+            aria-label="Dismiss"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+      {!backendDown && dockerAvailable === false && (
+        <div className="docker-health-banner" role="alert">
+          ⚠ Docker unavailable — {degradedText}
         </div>
       )}
       <div className="app-main">
