@@ -2513,6 +2513,13 @@ async def health():
         "revision": _SERVER_REVISION,
     }
 
+
+@app.get("/api/health")
+async def api_health():
+    """Structured health alias of GET /health (back-compat mirror)."""
+    return await health()
+
+
 @app.get("/api/container/integrity")
 def container_integrity(workspace: str = "", permissions: str = ""):
     """Return container integrity status for the given workspace.

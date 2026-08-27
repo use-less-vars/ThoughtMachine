@@ -963,21 +963,37 @@ export default function App() {
   }, [])
 
   // ── Poll backend health (drives the backend-down + degraded-Docker banners) ─
-  // The FIRST fetch the app makes: GET /api/health/containers on mount, then
-  // every 10s. A fetch failure or non-200 means the backend itself is down →
-  // the "Backend not running" banner; only a 200 renders the structured
-  // docker payload (available/reason/hint). The ref guard skips a poll tick
-  // while the previous request is still in flight, so polls never overlap.
+  // Two-step probe, run on mount then every 10s:
+  //   Step 1  GET /api/health           — liveness only. A fetch failure or
+  //             non-200 means the backend itself is down → the
+  //             "Backend not running" banner.
+  //   Step 2  GET /api/health/containers — only when Step 1 succeeded. A 200
+  //             renders the structured docker payload (available/reason/hint);
+  //             a failure here leaves Docker "unverified" (no banner, no raw
+  //             error text) — the backend is up, so the backend-down banner
+  //             would be wrong.
+  // The ref guard skips a poll tick while the previous request is still in
+  // flight, so polls never overlap.
   const checkBackendHealth = useCallback(async () => {
     if (healthInFlightRef.current) return
     healthInFlightRef.current = true
     const hostname = window.location.hostname
     const port = import.meta.env.VITE_BACKEND_PORT || '8000'
     try {
-      const res = await fetch(`http://${hostname}:${port}/api/health/containers`)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
-      setDockerHealth(data)
+      // Step 1: backend liveness
+      const healthRes = await fetch(`http://${hostname}:${port}/api/health`)
+      if (!healthRes.ok) throw new Error(`HTTP ${healthRes.status}`)
+      try {
+        // Step 2: structured Docker availability (only when the backend is up)
+        const res = await fetch(`http://${hostname}:${port}/api/health/containers`)
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        setDockerHealth(await res.json())
+      } catch (err) {
+        // Backend is up but the containers probe failed → Docker unverified.
+        // Deliberately NOT backendDown: no banner, no raw error text.
+        console.error('Failed to fetch Docker health:', err)
+        setDockerHealth(null)
+      }
       setBackendDown(false)
       // Recovery re-arms the "Backend not running" banner for a future outage.
       setBackendBannerDismissed(false)
@@ -1024,21 +1040,22 @@ export default function App() {
         : dockerInfo
           ? dockerInfo.available === true
           : false
-  const dockerReason =
-    dockerInfo && typeof dockerInfo === 'object' ? dockerInfo.reason : null
   const dockerHint =
     dockerInfo && typeof dockerInfo === 'object' ? dockerInfo.hint : null
-  const degradedText = [
-    dockerHint,
-    dockerReason ? `(${dockerReason})` : null,
-  ].filter(Boolean).join(' ') || 'The Docker daemon is not reachable.'
+  // Only the actionable hint is shown — never raw error text. Fall back to a
+  // still-actionable generic line when the hint is missing/empty (the banner
+  // already prefixes "⚠ Docker unavailable — ").
+  const degradedText =
+    dockerHint && typeof dockerHint === 'string' && dockerHint.trim()
+      ? dockerHint
+      : 'see the backend startup log for details'
 
   // ── Render ────────────────────────────────────────────────────────────
   return (
     <div className="app-container">
       {backendDown && !backendBannerDismissed && (
         <div className="docker-health-banner" role="alert">
-          <span className="docker-health-banner-text">Backend not running. Check logs/backend_startup.log for details.</span>
+          <span className="docker-health-banner-text">Backend not running — check logs/backend_startup.log</span>
           <button
             className="docker-health-banner-dismiss"
             onClick={() => setBackendBannerDismissed(true)}
