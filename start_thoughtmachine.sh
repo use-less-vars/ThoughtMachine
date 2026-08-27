@@ -17,15 +17,21 @@
 #    * --check-only:   run ONLY the preflight checks, then exit 0 without
 #                      starting anything (also honors TM_CHECK_ONLY=1).
 #
-#  The backend is always started in the background with stdout+stderr
-#  redirected to logs/backend_startup.log; the script polls
-#  http://127.0.0.1:8000/api/health for up to 30 s before considering the
-#  backend up. The frontend is only started after the backend is healthy.
+#  The backend is always started in the background; its stdout+stderr are
+#  mirrored to the console AND to logs/backend_startup.log (via tee). The
+#  script polls http://127.0.0.1:8000/api/health for up to 30 s before
+#  considering the backend up. The frontend is only started after the
+#  backend is healthy.
 #===============================================================================
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# Make sure standard system paths are on PATH for docker detection even in
+# minimal environments (cron/systemd, non-login shells).
+case ":$PATH:" in *:/usr/bin:*) ;; *) export PATH="/usr/bin:$PATH" ;; esac
+case ":$PATH:" in *:/usr/sbin:*) ;; *) export PATH="/usr/sbin:$PATH" ;; esac
 
 DOCTOR="$SCRIPT_DIR/scripts/doctor_checks.py"
 PROD_MODE=false
@@ -121,14 +127,17 @@ PY
     return $?
 }
 
-# Start the backend in the background with stdout+stderr -> logs/backend_startup.log
-# and wait for it to become healthy. Exits 1 (with the log tail) on failure.
+# Start the backend in the background with stdout+stderr mirrored to the
+# console and logs/backend_startup.log, then wait for it to become healthy.
+# Exits 1 (with the log tail) on failure.
 start_backend() {
     # $1 = backend command line (kept word-split on purpose)
     mkdir -p "$SCRIPT_DIR/logs"
-    echo "  Starting backend, log -> logs/backend_startup.log ..."
+    echo "  Starting backend; console output mirrored to logs/backend_startup.log ..."
     # shellcheck disable=SC2086
-    $1 >"$BACKEND_LOG" 2>&1 &
+    # The subshell execs the backend, so $! is the backend's own PID (tee's
+    # PID is not captured); tee truncates the log on start.
+    ( exec $1 ) > >(tee "$BACKEND_LOG") 2>&1 &
     BACKEND_PID=$!
     echo "  Backend PID: $BACKEND_PID"
     if ! wait_for_backend "$BACKEND_PID"; then
@@ -196,7 +205,10 @@ if [ "$DOCKER_RC" -ne 0 ]; then
     DOCKER_DETAIL="$(printf '%s' "$DOCKER_OUT" | json_get detail)"
     case "$DOCKER_REASON" in
         permission_denied)
-            if [ "${TM_REEXEC:-}" = "1" ]; then
+            if $CHECK_ONLY; then
+                echo "      WARNING: Docker permission problem (reason: permission_denied) - continuing in --check-only mode."
+                [ -n "$DOCKER_DETAIL" ] && printf '%s\n' "$DOCKER_DETAIL" | sed 's/^/      /'
+            elif [ "${TM_REEXEC:-}" = "1" ]; then
                 if $DOCTOR_MODE; then
                     echo "      WARNING: Docker permission problem persists even inside the 'docker' group (continuing in --doctor mode)."
                 else
@@ -215,7 +227,10 @@ if [ "$DOCKER_RC" -ne 0 ]; then
             fi
             ;;
         daemon_down|lib_missing)
-            if $DOCTOR_MODE; then
+            if $CHECK_ONLY; then
+                echo "      WARNING: Docker is not usable (reason: $DOCKER_REASON) - continuing in --check-only mode."
+                [ -n "$DOCKER_DETAIL" ] && printf '%s\n' "$DOCKER_DETAIL" | sed 's/^/      /'
+            elif $DOCTOR_MODE; then
                 echo "      WARNING: Docker is not usable (reason: $DOCKER_REASON) - continuing in --doctor mode."
                 [ -n "$DOCKER_DETAIL" ] && printf '%s\n' "$DOCKER_DETAIL" | sed 's/^/      /'
             else
@@ -228,7 +243,10 @@ if [ "$DOCKER_RC" -ne 0 ]; then
             fi
             ;;
         *)
-            if $DOCTOR_MODE; then
+            if $CHECK_ONLY; then
+                echo "      WARNING: Docker check failed (reason: ${DOCKER_REASON:-unknown}) - continuing in --check-only mode."
+                [ -n "$DOCKER_DETAIL" ] && printf '%s\n' "$DOCKER_DETAIL" | sed 's/^/      /'
+            elif $DOCTOR_MODE; then
                 echo "      WARNING: Docker check failed (reason: ${DOCKER_REASON:-unknown}) - continuing in --doctor mode."
                 [ -n "$DOCKER_DETAIL" ] && printf '%s\n' "$DOCKER_DETAIL" | sed 's/^/      /'
             else
