@@ -4045,7 +4045,13 @@ class Worker(ToolBase):
         elapsed with the daemon thread still alive (the envelope then reports
         the degraded outcome and the thread is left to terminate on its own).
         """
-        _join_budget = max(30, getattr(thread, "_timeout_seconds", 600) or 600)
+        # The thread may be a test double (or otherwise lack a numeric
+        # ``_timeout_seconds``); fall back to the module default so the join
+        # budget stays a bounded number.
+        _timeout_seconds = getattr(thread, "_timeout_seconds", 600)
+        if not isinstance(_timeout_seconds, (int, float)):
+            _timeout_seconds = 600
+        _join_budget = max(30, int(_timeout_seconds or 600))
         _join_elapsed = 0.0
         _join_step = 2.0
         while _join_elapsed < _join_budget:

@@ -122,33 +122,33 @@ class TestWorkerMaxWorkers(unittest.TestCase):
 
     def test_spawn_beyond_cap_refused(self):
         """Spawn past the cap is refused with a clean error, no thread created."""
-        self._seed_workers(["w1", "w2", "w3", "w4", "w5"])
-        result = self._spawn("w6")
+        self._seed_workers(["w1", "w2", "w3"])
+        result = self._spawn("w4")
         self.assertIn("error", result)
         self.assertIn("limit", result["error"].lower())
-        self.assertEqual(result.get("max_workers"), 5)
-        self.assertEqual(result.get("live_workers"), 5)
+        self.assertEqual(result.get("max_workers"), 3)
+        self.assertEqual(result.get("live_workers"), 3)
         self._mock_thread_cls.assert_not_called()
 
     def test_dead_workers_do_not_count_toward_cap(self):
         """Only LIVE workers count; a stopped registry entry is ignored."""
-        self._seed_workers(["w1", "w2", "w3", "w4"], alive=True)
-        self._seed_workers(["w5"], alive=False)
-        result = self._spawn("w6")
-        self.assertTrue(result.get("spawned"), f"4 live < cap 5: {result}")
+        self._seed_workers(["w1", "w2"], alive=True)
+        self._seed_workers(["w3"], alive=False)
+        result = self._spawn("w4")
+        self.assertTrue(result.get("spawned"), f"2 live < cap 3: {result}")
 
     # ── (b) safe default cap without config ─────────────────────────────
 
     def test_default_cap_without_config_key(self):
-        """With no config key, the safe default cap (5) applies."""
-        for i in range(1, 6):
+        """With no config key, the safe default cap (3) applies."""
+        for i in range(1, 4):
             result = self._spawn(f"w{i}")
             self.assertTrue(
                 result.get("spawned"), f"spawn w{i} should succeed below cap: {result}"
             )
-        result = self._spawn("w6")
+        result = self._spawn("w4")
         self.assertIn("error", result)
-        self.assertEqual(result.get("max_workers"), 5)
+        self.assertEqual(result.get("max_workers"), 3)
 
     # ── (c) session config key raises/lowers the cap ─────────────────────
 
@@ -197,21 +197,21 @@ class TestWorkerMaxWorkers(unittest.TestCase):
 
     def test_force_replace_does_not_count_as_new_spawn(self):
         """At the cap, force-replacing an existing worker is still allowed."""
-        self._seed_workers(["w1", "w2", "w3", "w4", "w5"])
+        self._seed_workers(["w1", "w2", "w3"])
         result = self._spawn("w3", force=True)
         self.assertTrue(
             result.get("spawned"),
             f"force-replace should not count as a new spawn: {result}",
         )
         self.assertEqual(result.get("worker_name"), "w3")
-        # Registry still holds exactly 5 live entries (4 old + 1 replacement).
+        # Registry still holds exactly 3 live entries (2 old + 1 replacement).
         with self._registry._registry_lock:
             live = [
                 (sid, name)
                 for (sid, name, _iid), t in self._registry._worker_registry.items()
                 if sid == SESSION and t.is_alive()
             ]
-        self.assertEqual(len(live), 5)
+        self.assertEqual(len(live), 3)
 
 
 if __name__ == "__main__":

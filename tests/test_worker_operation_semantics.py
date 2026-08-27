@@ -9,8 +9,9 @@ semantics end-to-end:
   2. every live instance counts toward the per-session spawn cap;
   3. name-only ``check`` against multiple live instances errors with an
      ambiguity message (labels included); ``instance_id`` disambiguates;
-  4. a name-only spawn when a single live instance exists allocates the
-     next free instance id;
+  4. a name-only spawn when a single live instance exists reuses it
+     (continue-existing routing); an explicit ``instance_id`` allocates
+     the next free id;
   5. a name-only spawn when the single live instance is PAUSED auto-resumes
      it instead of spawning a duplicate;
   6. ``force=True`` stops *all* instances of the name (across sessions) and
@@ -100,6 +101,8 @@ class TestWorkerOperationSemantics(unittest.TestCase):
         t.instance_label = WorkerRegistry.instance_label(
             kwargs.get("name", "worker"), t.instance_id
         )
+        t.status = "ready"  # keep continue-existing reuse payloads JSON-serializable
+        t._timeout_seconds = 30
         return t
 
     def _restore_registry(self) -> None:
@@ -123,7 +126,11 @@ class TestWorkerOperationSemantics(unittest.TestCase):
     def _seed_fake(
         self, session: str, name: str, iid: int, status: str = "ready"
     ) -> MagicMock:
+        from tools.workspace.worker_registry import WorkerRegistry
+
         t = _live_thread(status=status)
+        t.instance_id = iid
+        t.instance_label = WorkerRegistry.instance_label(name, iid)
         with self._registry._registry_lock:
             self._registry._worker_registry[(session, name, iid)] = t
         return t
@@ -167,16 +174,24 @@ class TestWorkerOperationSemantics(unittest.TestCase):
     # ── 1. name-only spawns allocate fresh instance ids ────────────────
 
     def test_spawn_same_name_creates_instances(self):
-        """Two name-only spawns of the same worker produce instances 1 and 2."""
+        """Same-name spawns: first creates instance 1; a second name-only
+        spawn reuses it (continue-existing routing) instead of duplicating;
+        an explicit instance_id then allocates the next free id."""
         r1 = self._spawn("w1")
         self.assertTrue(r1.get("spawned"), f"first spawn: {r1}")
         self.assertEqual(r1.get("instance_id"), 1)
         self.assertEqual(r1.get("instance_label"), "w1")
 
         r2 = self._spawn("w1")
-        self.assertTrue(r2.get("spawned"), f"second spawn: {r2}")
-        self.assertEqual(r2.get("instance_id"), 2)
-        self.assertEqual(r2.get("instance_label"), "w1#2")
+        self.assertFalse(r2.get("spawned"), f"second spawn: {r2}")
+        self.assertEqual(r2.get("instance_id"), 1)
+        self.assertEqual(r2.get("instance_label"), "w1")
+        self.assertIn("reusing", r2.get("message", "").lower())
+
+        r3 = self._spawn("w1", instance_id=2)
+        self.assertTrue(r3.get("spawned"), f"explicit iid spawn: {r3}")
+        self.assertEqual(r3.get("instance_id"), 2)
+        self.assertEqual(r3.get("instance_label"), "w1#2")
 
         self.assertEqual(
             self._registry_keys_for("w1"),
@@ -187,15 +202,15 @@ class TestWorkerOperationSemantics(unittest.TestCase):
 
     def test_spawn_instances_count_toward_cap(self):
         """Instances of the same name count individually toward the cap."""
-        for name in ["w1", "w1", "w2", "w2", "w2"]:  # 5 live instances
-            result = self._spawn(name)
-            self.assertTrue(result.get("spawned"), f"{name}: {result}")
+        for iid in (1, 2, 3):  # 3 live instances of the same name
+            result = self._spawn("w1", instance_id=iid)
+            self.assertTrue(result.get("spawned"), f"w1#{iid}: {result}")
 
-        result = self._spawn("w3")
+        result = self._spawn("w1", instance_id=4)
         self.assertIn("error", result)
         self.assertIn("limit", result["error"].lower())
-        self.assertEqual(result.get("max_workers"), 5)
-        self.assertEqual(result.get("live_workers"), 5)
+        self.assertEqual(result.get("max_workers"), 3)
+        self.assertEqual(result.get("live_workers"), 3)
 
     # ── 3. ambiguous name-only actions require instance_id ─────────────
 
@@ -217,15 +232,22 @@ class TestWorkerOperationSemantics(unittest.TestCase):
         self.assertEqual(resolved.get("session_id"), SESSION)
         self.assertEqual(resolved.get("status"), "ready")
 
-    # ── 4. single live instance → next free id on name-only spawn ──────
+    # ── 4. single live instance → reuse (continue-existing) / explicit iid ──────
 
     def test_spawn_name_only_single_instance_works(self):
-        """One live instance present: name-only spawn takes the next id."""
+        """One live instance present: a name-only spawn reuses it instead of
+        duplicating; an explicit instance_id then allocates the next free id."""
         self._seed_fake(SESSION, "w1", 1)
         result = self._spawn("w1")
-        self.assertTrue(result.get("spawned"), f"spawn: {result}")
-        self.assertEqual(result.get("instance_id"), 2)
-        self.assertEqual(result.get("instance_label"), "w1#2")
+        self.assertFalse(result.get("spawned"), f"spawn: {result}")
+        self.assertEqual(result.get("instance_id"), 1)
+        self.assertEqual(result.get("instance_label"), "w1")
+        self.assertIn("reusing", result.get("message", "").lower())
+
+        result2 = self._spawn("w1", instance_id=2)
+        self.assertTrue(result2.get("spawned"), f"explicit iid spawn: {result2}")
+        self.assertEqual(result2.get("instance_id"), 2)
+        self.assertEqual(result2.get("instance_label"), "w1#2")
         self.assertEqual(
             self._registry_keys_for("w1"),
             [(SESSION, "w1", 1), (SESSION, "w1", 2)],
@@ -811,16 +833,16 @@ class TestWorkerPauseResumeSemantics(_OpSemBase):
 
     def test_spawn_paused_live_instance_counts_toward_cap(self):
         """A paused-but-live instance still consumes a spawn-cap slot."""
-        for name in ["w1", "w2", "w3", "w4"]:
+        for name in ["w1", "w2"]:
             self.assertTrue(self._spawn(name).get("spawned"), name)
-        self._seed_join_fake(SESSION, "w1", 2, status="paused")  # live → 5 total
+        self._seed_join_fake(SESSION, "w1", 2, status="paused")  # live → 3 total
 
-        result = self._spawn("w5")
+        result = self._spawn("w3")
 
         self.assertIn("error", result)
         self.assertIn("limit", result["error"].lower())
-        self.assertEqual(result.get("max_workers"), 5)
-        self.assertEqual(result.get("live_workers"), 5)
+        self.assertEqual(result.get("max_workers"), 3)
+        self.assertEqual(result.get("live_workers"), 3)
 
     # ── exact-owner container cleanup ────────────────────────────────────────────────
 
