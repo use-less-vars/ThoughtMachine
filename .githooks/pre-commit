@@ -41,7 +41,7 @@ cd "$REPO_ROOT" || exit 1
 # (repo venv, then python3 from PATH) and use the FIRST one that can import
 # the hook's required dependencies.  An interpreter that exists but lacks the
 # deps is skipped, not used blindly — a bad pick would fail mid-hook.
-REQUIRED_IMPORTS="web_ui.backend.server starlette.testclient pytest"
+REQUIRED_IMPORTS="web_ui.backend.server starlette.testclient pytest uvicorn"
 probe_python() {
     local cand="$1"
     [ -x "$cand" ] || return 1
@@ -60,8 +60,10 @@ elif probe_python "$REPO_ROOT/.venv/bin/python3"; then
     PYTHON="$REPO_ROOT/.venv/bin/python3"
 elif command -v python3 >/dev/null 2>&1 && probe_python "$(command -v python3)"; then
     PYTHON="$(command -v python3)"
+elif command -v python >/dev/null 2>&1 && probe_python "$(command -v python)"; then
+    PYTHON="$(command -v python)"
 else
-    echo "error: no Python interpreter with required dependencies found (probed \$PYTHON, $REPO_ROOT/.venv, python3; need: $REQUIRED_IMPORTS)" >&2
+    echo "No Python interpreter found with required dependencies (fastapi, uvicorn, starlette, pytest). Run pip install -r requirements.txt inside the container or on the host." >&2
     exit 1
 fi
 
