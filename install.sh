@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 #===============================================================================
-# install.sh - one-command installer for ThoughtMachine
+# install.sh - one-command installer for ThoughtMachine (Linux / x86_64)
+#
+# Supported platforms: Debian/Ubuntu on x86_64 (amd64). Other OSes/arches
+# exit early with a pointer to the right installer (install_thoughtmachine.bat
+# on Windows; manual setup on macOS).
 #
 # Runs the doctor checks and fixes what it can:
-#   [1/4] Docker daemon   (non-critical: warn + continue if it cannot start)
-#   [2/4] Docker group    (non-critical: add user, then "Re-login or run: newgrp docker")
-#   [3/4] Python venv     (CRITICAL: abort with exit 1 on failure)
-#   [4/4] Node.js >= 18   (CRITICAL: abort with exit 1 on failure)
+#   [1/5] Python >= 3.11  (CRITICAL: abort with exit 1 on failure)
+#   [2/5] Docker daemon   (CRITICAL: install or start, abort with exit 1 on failure)
+#   [3/5] Docker group    (non-critical: add user, then "Re-login or run: newgrp docker")
+#   [4/5] Python venv     (CRITICAL: abort with exit 1 on failure)
+#   [5/5] Node.js >= 18   (CRITICAL: abort with exit 1 on failure)
 #
 # Every step is idempotent - re-running is safe.
 # No global `set -e`: failures are handled explicitly step by step.
@@ -36,36 +41,135 @@ echo "  ThoughtMachine - Install"
 echo "============================================"
 echo ""
 
-# ------------------------------------------------------------------ [1/4] Docker daemon
-echo "[1/4] Docker daemon ..."
+# ---------------------------------------------------------------- platform gate
+# The Linux installer targets Debian/Ubuntu on x86_64. Anything else exits
+# early with a pointer to the right path.
+UNAME_S="$(uname -s 2>/dev/null || echo unknown)"
+case "$UNAME_S" in
+    Darwin)
+        echo "ERROR: macOS is not supported by this installer."
+        echo "       Install Docker Desktop, Python >= 3.11 and Node.js >= 18,"
+        echo "       then run ./start_thoughtmachine.sh directly."
+        exit 1
+        ;;
+    MINGW*|MSYS*|CYGWIN*)
+        echo "ERROR: this is the Linux installer; on Windows use install_thoughtmachine.bat."
+        exit 1
+        ;;
+    Linux) ;;
+    *)
+        echo "ERROR: unsupported operating system: $UNAME_S (expected Linux)."
+        exit 1
+        ;;
+esac
+
+UNAME_M="$(uname -m 2>/dev/null || echo unknown)"
+case "$UNAME_M" in
+    x86_64|amd64) ;;
+    *)
+        echo "ERROR: unsupported architecture: $UNAME_M (expected x86_64/amd64)."
+        exit 1
+        ;;
+esac
+
+DISTRO_ID="$(sed -n 's/^ID=//p' /etc/os-release 2>/dev/null | tr -d '"' | head -n1)"
+case "$DISTRO_ID" in
+    debian|ubuntu) ;;
+    *)
+        echo "ERROR: unsupported distribution: ${DISTRO_ID:-unknown} (expected debian or ubuntu)."
+        exit 1
+        ;;
+esac
+
+# ------------------------------------------------------------------ [1/5] Python (critical)
+echo "[1/5] Python >= 3.11 ..."
+PY_OUT="$(doctor --check-python 2>&1)"
+PY_RC=$?
+if [ "$PY_RC" -ne 0 ]; then
+    PY_REASON="$(printf '%s' "$PY_OUT" | json_get reason)"
+    PY_DETAIL="$(printf '%s' "$PY_OUT" | json_get detail)"
+    echo "      FAILED: Python >= 3.11 is required but not available (reason: ${PY_REASON:-unknown})."
+    [ -n "$PY_DETAIL" ] && echo "      $PY_DETAIL"
+    echo "      Install Python >= 3.11 (e.g. https://www.python.org/downloads/), then re-run ./install.sh"
+    echo ""
+    echo "  Installation aborted."
+    exit 1
+fi
+PY_VERSION="$(printf '%s' "$PY_OUT" | json_get version)"
+echo "      ok (python3 ${PY_VERSION:-version unknown})."
+DONE_OK+=("Python >= 3.11 (${PY_VERSION:-unknown})")
+echo ""
+
+# ------------------------------------------------------------------ [2/5] Docker daemon (critical)
+echo "[2/5] Docker daemon ..."
 DOCKER_OUT="$(doctor --check-docker 2>&1)"
 DOCKER_RC=$?
 if [ "$DOCKER_RC" -ne 0 ]; then
     DOCKER_REASON="$(printf '%s' "$DOCKER_OUT" | json_get reason)"
-    if [ "$DOCKER_REASON" = "daemon_down" ]; then
-        echo "      daemon not running - trying to start it (may prompt for sudo password)..."
-        doctor --ensure-docker-daemon 2>&1 | sed 's/^/      /' || true
-        DOCKER_OUT="$(doctor --check-docker 2>&1)"
-        DOCKER_RC=$?
-    fi
-    if [ "$DOCKER_RC" -ne 0 ]; then
-        DOCKER_DETAIL="$(printf '%s' "$DOCKER_OUT" | json_get detail)"
-        echo "      WARNING: Docker is not usable (reason: ${DOCKER_REASON:-unknown})."
-        [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
-        echo "      Non-critical: continuing, but containers will not work until Docker runs."
-        DONE_SKIP+=("Docker daemon (not running)")
-    else
-        echo "      ok."
-        DONE_OK+=("Docker daemon")
-    fi
-else
+    DOCKER_DETAIL="$(printf '%s' "$DOCKER_OUT" | json_get detail)"
+    case "$DOCKER_REASON" in
+        lib_missing)
+            if sudo -n true 2>/dev/null; then
+                echo "      docker CLI not found - installing docker.io via apt-get (may take a moment)..."
+                sudo apt-get update && sudo apt-get install -y docker.io 2>&1 | sed 's/^/      /' || true
+            else
+                echo "      FAILED: Docker is not installed and this installer needs sudo to install it."
+                echo "      Run this yourself, then re-run ./install.sh:"
+                echo "      sudo apt-get update && sudo apt-get install -y docker.io"
+                echo ""
+                echo "  Installation aborted."
+                exit 1
+            fi
+            DOCKER_OUT="$(doctor --check-docker 2>&1)"
+            DOCKER_RC=$?
+            if [ "$DOCKER_RC" -ne 0 ]; then
+                DOCKER_DETAIL="$(printf '%s' "$DOCKER_OUT" | json_get detail)"
+                echo "      FAILED: Docker still not usable after installation."
+                [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
+                echo "      Start it with:  sudo systemctl enable --now docker"
+                echo ""
+                echo "  Installation aborted."
+                exit 1
+            fi
+            ;;
+        daemon_down)
+            echo "      daemon not running - trying to start it (may prompt for sudo password)..."
+            doctor --ensure-docker-daemon 2>&1 | sed 's/^/      /' || true
+            DOCKER_OUT="$(doctor --check-docker 2>&1)"
+            DOCKER_RC=$?
+            if [ "$DOCKER_RC" -ne 0 ]; then
+                DOCKER_DETAIL="$(printf '%s' "$DOCKER_OUT" | json_get detail)"
+                echo "      FAILED: Docker daemon could not be started."
+                [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
+                echo "      Start it with:  sudo systemctl enable --now docker"
+                echo ""
+                echo "  Installation aborted."
+                exit 1
+            fi
+            ;;
+        permission_denied)
+            echo "      WARNING: Docker permission problem (reason: permission_denied)."
+            [ -n "$DOCKER_DETAIL" ] && printf '%s\n' "$DOCKER_DETAIL" | sed 's/^/      /'
+            echo "      Non-critical here: the next step adds your user to the 'docker' group."
+            DONE_SKIP+=("Docker daemon (permission problem - fixed by the group step)")
+            ;;
+        *)
+            echo "      FAILED: Docker is not usable (reason: ${DOCKER_REASON:-unknown})."
+            [ -n "$DOCKER_DETAIL" ] && echo "      $DOCKER_DETAIL"
+            echo ""
+            echo "  Installation aborted."
+            exit 1
+            ;;
+    esac
+fi
+if [ "$DOCKER_RC" -eq 0 ]; then
     echo "      ok."
     DONE_OK+=("Docker daemon")
 fi
 echo ""
 
-# ------------------------------------------------------------------ [2/4] Docker group
-echo "[2/4] Docker group ..."
+# ------------------------------------------------------------------ [3/5] Docker group
+echo "[3/5] Docker group ..."
 GROUP_OUT="$(doctor --check-docker-group 2>&1)"
 GROUP_RC=$?
 if [ "$GROUP_RC" -ne 0 ]; then
@@ -79,8 +183,8 @@ else
 fi
 echo ""
 
-# ------------------------------------------------------------------ [3/4] venv (critical)
-echo "[3/4] Python virtual environment ..."
+# ------------------------------------------------------------------ [4/5] venv (critical)
+echo "[4/5] Python virtual environment ..."
 VENV_OUT="$(doctor --ensure-venv 2>&1)"
 VENV_RC=$?
 if [ "$VENV_RC" -ne 0 ]; then
@@ -100,8 +204,8 @@ else
 fi
 echo ""
 
-# ------------------------------------------------------------------ [4/4] node (critical)
-echo "[4/4] Node.js ..."
+# ------------------------------------------------------------------ [5/5] node (critical)
+echo "[5/5] Node.js ..."
 NODE_OUT="$(doctor --check-node 2>&1)"
 NODE_RC=$?
 if [ "$NODE_RC" -ne 0 ]; then
@@ -114,7 +218,8 @@ if [ "$NODE_RC" -ne 0 ]; then
     echo "  Installation aborted."
     exit 1
 fi
-echo "      ok."
+NODE_VERSION="$(printf '%s' "$NODE_OUT" | json_get version)"
+echo "      ok (node ${NODE_VERSION:-version unknown})."
 DONE_OK+=("Node.js")
 echo ""
 
@@ -129,5 +234,5 @@ if [ "${#DONE_SKIP[@]}" -gt 0 ]; then
     printf '  [--]  %s\n' "${DONE_SKIP[@]}"
 fi
 echo ""
-echo "Starte mit ./start_thoughtmachine.sh"
+echo "Next step: ./start_thoughtmachine.sh"
 exit 0

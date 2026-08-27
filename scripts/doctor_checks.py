@@ -16,12 +16,15 @@ exactly one JSON object on stdout and exits 0 (ok) / 1 (not ok) / 2 (error):
     python3 scripts/doctor_checks.py --check-docker
     python3 scripts/doctor_checks.py --check-port 8000
     python3 scripts/doctor_checks.py --check-node [--floor 18]
+    python3 scripts/doctor_checks.py --check-python [--python-min 3.11]
     python3 scripts/doctor_checks.py --check-venv [--path .venv]
     python3 scripts/doctor_checks.py --check-dotthoughtmachine [--path DIR]
     python3 scripts/doctor_checks.py --check-tools
     python3 scripts/doctor_checks.py --ensure-venv [--path .venv] [--requirements requirements.txt]
     python3 scripts/doctor_checks.py --ensure-docker-group [--user NAME]
     python3 scripts/doctor_checks.py --ensure-docker-daemon
+    python3 scripts/doctor_checks.py --check-stale-containers
+    python3 scripts/doctor_checks.py --clean-stale-containers
 """
 
 from __future__ import annotations
@@ -195,6 +198,63 @@ def check_node_version(floor: str = "18") -> Dict[str, Any]:
         "ok": False,
         "reason": "too_old",
         "detail": "node %s is too old — install Node.js >= %s (https://nodejs.org) and ensure it is on PATH" % (version, floor),
+    }
+
+
+def _parse_python_min(value: str) -> tuple:
+    """Parse a ``MAJOR.MINOR`` python floor like "3.11" into (major, minor).
+
+    Raises ValueError on malformed input.
+    """
+    parts = value.split(".")
+    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        raise ValueError("expected MAJOR.MINOR, got %r" % value)
+    return (int(parts[0]), int(parts[1]))
+
+
+def check_python_version(floor: str = "3.11") -> Dict[str, Any]:
+    """Check the system ``python3`` major.minor version meets ``floor``.
+
+    Queries ``python3 -c "import sys; print('%d %d' % sys.version_info[:2])"``.
+    reason: "missing" | "too_old" | "other". Always includes a ``version``
+    key (the detected "MAJOR.MINOR" string, or "" when undetectable).
+    """
+    try:
+        floor_major, floor_minor = _parse_python_min(floor)
+    except ValueError:
+        return {"ok": False, "reason": "other", "version": "",
+                "detail": "invalid floor value: %r (expected MAJOR.MINOR like 3.11)" % floor}
+    try:
+        proc = _run(["python3", "-c", "import sys; print('%d %d' % sys.version_info[:2])"])
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "reason": "missing",
+            "version": "",
+            "detail": "python3: command not found on PATH \u2014 install Python >= %s (https://www.python.org/downloads/) and ensure it is on PATH" % floor,
+        }
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"ok": False, "reason": "other", "version": "", "detail": str(exc)}
+    if proc.returncode != 0:
+        return {"ok": False, "reason": "other", "version": "",
+                "detail": (proc.stderr or proc.stdout or "python3 version probe failed").strip()}
+    parts = proc.stdout.strip().split()
+    if len(parts) != 2:
+        return {"ok": False, "reason": "other", "version": "",
+                "detail": "could not parse python3 version output: %r" % proc.stdout.strip()}
+    try:
+        major, minor = int(parts[0]), int(parts[1])
+    except ValueError:
+        return {"ok": False, "reason": "other", "version": "",
+                "detail": "could not parse python3 version output: %r" % proc.stdout.strip()}
+    version = "%d.%d" % (major, minor)
+    if (major, minor) >= (floor_major, floor_minor):
+        return {"ok": True, "version": version, "detail": "python3 %s meets the >= %s requirement" % (version, floor)}
+    return {
+        "ok": False,
+        "reason": "too_old",
+        "version": version,
+        "detail": "python3 %s is too old \u2014 install Python >= %s (https://www.python.org/downloads/) and ensure it is on PATH" % (version, floor),
     }
 
 
@@ -460,6 +520,120 @@ def ensure_docker_daemon() -> Dict[str, Any]:
     return {"ok": True, "changed": True, "detail": "docker daemon enabled and started (sudo systemctl enable --now docker)"}
 
 
+# Statuses that mean a container is in active use and must never be cleaned.
+_IN_USE_STATUSES = {"running", "paused", "restarting", "removing"}
+
+
+def _parse_container_labels(labels: str) -> Dict[str, str]:
+    """Parse a ``docker ps`` Labels field ("k=v,k2=v2") into a dict."""
+    result: Dict[str, str] = {}
+    for part in labels.split(","):
+        if "=" in part:
+            key, _, value = part.partition("=")
+            result[key] = value
+    return result
+
+
+def _container_belongs_to_thoughtmachine(entry: Dict[str, Any]) -> bool:
+    """True when a ``docker ps`` JSON entry belongs to ThoughtMachine.
+
+    Recognized by any ``thoughtmachine.*`` label (workspace/container ids)
+    or by the agent-exec-/tm-res- container name prefixes.
+    """
+    labels = _parse_container_labels(entry.get("Labels") or "")
+    if any(key.startswith("thoughtmachine.") for key in labels):
+        return True
+    name = str(entry.get("Names", "")).strip()
+    return name.startswith("agent-exec-") or name.startswith("tm-res-")
+
+
+def check_stale_containers() -> Dict[str, Any]:
+    """Check for stopped ThoughtMachine containers that can be cleaned up.
+
+    Runs ``docker ps -a --no-trunc --format '{{json .}}'`` and classifies
+    every container that is NOT in an in-use state AND belongs to
+    ThoughtMachine as stale.
+
+    ok=False when stale containers exist (rc 1 -> the launcher knows there
+    is work to do). A docker outage reports ok False with
+    reason "docker_unavailable", count 0 (callers decide whether to block).
+    """
+    try:
+        proc = _run(["docker", "ps", "-a", "--no-trunc", "--format", "{{json .}}"])
+    except FileNotFoundError:
+        return {"ok": False, "reason": "docker_unavailable", "count": 0, "containers": [],
+                "detail": "docker CLI not found on PATH \u2014 cannot check for stale containers"}
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"ok": False, "reason": "docker_unavailable", "count": 0, "containers": [], "detail": str(exc)}
+    if proc.returncode != 0:
+        return {"ok": False, "reason": "docker_unavailable", "count": 0, "containers": [],
+                "detail": (proc.stderr or proc.stdout or "docker ps failed").strip()}
+    stale: List[Dict[str, Any]] = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        state = str(entry.get("State", "")).strip()
+        if state in _IN_USE_STATUSES:
+            continue
+        if not _container_belongs_to_thoughtmachine(entry):
+            continue
+        stale.append({
+            "id": entry.get("ID", ""),
+            "name": str(entry.get("Names", "")).strip(),
+            "state": state,
+            "status": str(entry.get("Status", "")).strip(),
+        })
+    detail = "no stale ThoughtMachine containers" if not stale else \
+        "%d stale ThoughtMachine container(s): %s" % (
+            len(stale), ", ".join(s["name"] or s["id"] for s in stale))
+    return {"ok": not stale, "count": len(stale), "containers": stale, "detail": detail}
+
+
+def clean_stale_containers() -> Dict[str, Any]:
+    """Remove the stale ThoughtMachine containers reported by
+    ``check_stale_containers`` (``docker rm`` per container, best effort).
+
+    A container that is already gone ("No such container") counts as
+    removed, so the operation is idempotent. ok=False only when docker is
+    unavailable or a removal actually failed.
+    """
+    check = check_stale_containers()
+    if not check.get("ok") and check.get("reason") == "docker_unavailable":
+        return {"ok": False, "changed": False, "removed": [], "failed": [],
+                "detail": check["detail"]}
+    removed: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    for container in check.get("containers", []):
+        cid = container.get("id", "")
+        try:
+            proc = _run(["docker", "rm", cid])
+        except Exception as exc:  # pragma: no cover - defensive
+            failed.append({"id": cid, "name": container.get("name", ""), "error": str(exc)})
+            continue
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "docker rm failed").strip()
+            if "no such container" in err.lower():
+                removed.append({"id": cid, "name": container.get("name", ""), "already_gone": True})
+            else:
+                failed.append({"id": cid, "name": container.get("name", ""), "error": err})
+        else:
+            removed.append({"id": cid, "name": container.get("name", "")})
+    ok = not failed
+    detail = "removed %d stale container(s)" % len(removed)
+    if failed:
+        detail += "; %d failed: %s" % (len(failed), ", ".join(f["name"] or f["id"] for f in failed))
+    if not removed and not failed:
+        detail = "no stale ThoughtMachine containers to remove"
+    return {"ok": ok, "changed": bool(removed), "removed": removed, "failed": failed, "detail": detail}
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def _emit(result: Dict[str, Any]) -> int:
@@ -496,6 +670,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="check a TCP port is free (ss -ltn)")
     parser.add_argument("--check-node", action="store_true", dest="check_node",
                         help="check the Node.js major version meets the floor")
+    parser.add_argument("--check-python", action="store_true", dest="check_python",
+                        help="check the python3 version meets the minimum (3.11)")
     parser.add_argument("--check-venv", action="store_true", dest="check_venv",
                         help="check the virtualenv exists with an executable python")
     parser.add_argument("--check-dotthoughtmachine", action="store_true", dest="check_dotthoughtmachine",
@@ -509,8 +685,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="add the current user to the docker group via sudo")
     parser.add_argument("--ensure-docker-daemon", action="store_true", dest="ensure_docker_daemon",
                         help="start + enable the docker daemon via systemd")
+    parser.add_argument("--check-stale-containers", action="store_true", dest="check_stale_containers",
+                        help="list stopped ThoughtMachine containers that can be cleaned up")
+    parser.add_argument("--clean-stale-containers", action="store_true", dest="clean_stale_containers",
+                        help="remove stopped ThoughtMachine containers (best effort)")
     parser.add_argument("--floor", default="18", metavar="MAJOR",
                         help="minimum Node.js major version for --check-node (default: 18)")
+    parser.add_argument("--python-min", default="3.11", metavar="MAJOR.MINOR",
+                        help="minimum python3 version for --check-python (default: 3.11)")
     parser.add_argument("--path", default=None, metavar="DIR",
                         help="directory for --check-venv/--ensure-venv (default: .venv) or "
                              "--check-dotthoughtmachine (default: ~/.thoughtmachine)")
@@ -534,6 +716,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _emit(check_port_free(args.check_port))
         if args.check_node:
             return _emit(check_node_version(args.floor))
+        if args.check_python:
+            return _emit(check_python_version(args.python_min))
         if args.check_venv:
             return _emit(check_venv(args.path or ".venv"))
         if args.check_dotthoughtmachine:
@@ -546,6 +730,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _emit(ensure_docker_group(args.user))
         if args.ensure_docker_daemon:
             return _emit(ensure_docker_daemon())
+        if args.check_stale_containers:
+            return _emit(check_stale_containers())
+        if args.clean_stale_containers:
+            return _emit(clean_stale_containers())
     except Exception as exc:  # pragma: no cover - last-resort error path
         sys.stderr.write("error: %s\n" % exc)
         return 2
