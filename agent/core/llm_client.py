@@ -10,6 +10,26 @@ from agent.logging import log
 from llm_providers.factory import ProviderFactory
 from llm_providers.exceptions import ProviderError, RateLimitExceeded, AuthenticationError, ModelNotFoundError, TokenLimitExceededError, ProviderTimeoutError, InvalidConfigError, ProviderNotFoundError, ToolFormatError
 
+
+def _coerce_positive_int(value, default):
+    """Coerce a value to a positive int, falling back to default for bad input."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed < 0:
+        return default
+    return parsed
+
+
+def _resolve_timeout_setting(provider_config, key, env_name, default):
+    """Resolve a timeout/retry setting: env var wins, then provider_config, then default."""
+    env_value = os.environ.get(env_name)
+    if env_value is not None and env_value.strip() != "":
+        return _coerce_positive_int(env_value, default)
+    return _coerce_positive_int(provider_config.get(key), default)
+
+
 class LLMError(ProviderError):
     """Generic LLM error for provider-independent error handling."""
 
@@ -34,7 +54,10 @@ class LLMClient:
         self.config = config
         self.session = session
         self.logger = logger
-        self.provider = ProviderFactory.create_provider(provider_type=config.provider_type, api_key=config.api_key, base_url=config.base_url, model=config.model, temperature=config.temperature)
+        pc = dict(getattr(config, 'provider_config', None) or {})
+        timeout = _resolve_timeout_setting(pc, 'timeout', 'LLM_TIMEOUT', 120)
+        max_retries = _resolve_timeout_setting(pc, 'max_retries', 'LLM_MAX_RETRIES', 3)
+        self.provider = ProviderFactory.create_provider(provider_type=config.provider_type, api_key=config.api_key, base_url=config.base_url, model=config.model, temperature=config.temperature, timeout=timeout, max_retries=max_retries)
         self.context_builder = None
 
     def create_context_builder(self):

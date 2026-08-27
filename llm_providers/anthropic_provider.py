@@ -9,9 +9,14 @@ import os
 import sys
 import anthropic
 from anthropic import APIError, RateLimitError
+try:
+    from anthropic import APITimeoutError
+except ImportError:  # pragma: no cover - SDK < 1.0
+    class APITimeoutError(APIError):  # never raised by old SDKs
+        pass
 from .base import LLMProvider, ProviderConfig, LLMResponse
 from .tool_converter import ToolFormatConverter
-from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError, TokenLimitExceededError
+from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError, TokenLimitExceededError, ProviderTimeoutError
 from agent.logging import log
 
 class AnthropicProvider(LLMProvider):
@@ -77,6 +82,8 @@ class AnthropicProvider(LLMProvider):
                 log('DEBUG', 'llm.anthropic', f'[DEBUG_ANTHROPIC_ERROR] RateLimitError: {e}')
             raise RateLimitExceeded(f'Rate limit exceeded: {e}')
         except APIError as e:
+            if isinstance(e, APITimeoutError):
+                raise ProviderTimeoutError(f'Request timed out: {e}')
             if os.environ.get('DEBUG_ANTHROPIC'):
                 log('DEBUG', 'llm.anthropic', f'[DEBUG_ANTHROPIC_ERROR] APIError: {e}')
                 if hasattr(e, 'response'):
@@ -106,6 +113,8 @@ class AnthropicProvider(LLMProvider):
                 api_error.raw_response = e.response
             raise api_error
         except Exception as e:
+            if isinstance(e, APITimeoutError):
+                raise ProviderTimeoutError(f'Request timed out: {e}')
             if os.environ.get('DEBUG_ANTHROPIC'):
                 log('DEBUG', 'llm.anthropic', f'[DEBUG_ANTHROPIC_ERROR] Exception type: {type(e)}')
                 log('DEBUG', 'llm.anthropic', f'[DEBUG_ANTHROPIC_ERROR] Exception message: {e}')

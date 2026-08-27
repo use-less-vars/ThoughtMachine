@@ -7,9 +7,14 @@ import time
 import os
 import sys
 from openai import OpenAI, APIError, RateLimitError, APIConnectionError
+try:
+    from openai import APITimeoutError
+except ImportError:  # pragma: no cover - SDK < 1.0
+    class APITimeoutError(APIError):  # never raised by old SDKs
+        pass
 import tiktoken
 from .base import LLMProvider, ProviderConfig, LLMResponse
-from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError, TokenLimitExceededError
+from .exceptions import ProviderError, RateLimitExceeded, AuthenticationError, TokenLimitExceededError, ProviderTimeoutError
 from agent.logging import log
 
 class OpenAICompatibleProvider(LLMProvider):
@@ -358,6 +363,8 @@ class OpenAICompatibleProvider(LLMProvider):
                 rate_limit_error.raw_response = e.response
             raise rate_limit_error
         except APIError as e:
+            if isinstance(e, APITimeoutError):
+                raise ProviderTimeoutError(f'Request timed out: {e}')
             import os
             if os.environ.get('DEBUG_OPENAI'):
                 log('DEBUG', 'llm.openai', f'APIError caught: {e}')
@@ -404,6 +411,8 @@ class OpenAICompatibleProvider(LLMProvider):
                 api_error.raw_response = e.response
             raise api_error
         except Exception as e:
+            if isinstance(e, APITimeoutError):
+                raise ProviderTimeoutError(f'Request timed out: {e}')
             import os
             if os.environ.get('DEBUG_OPENAI'):
                 log('DEBUG', 'llm.openai', f'Exception type: {type(e)}')
