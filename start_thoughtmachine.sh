@@ -149,26 +149,27 @@ echo ""
 
 # ------------------------------------------- required tools (before all checks)
 echo "Required tools ..."
-MISSING_TOOLS=""
-for tool in ss sg apt-get python3 node; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-        case "$tool" in
-            ss)       HINT="install iproute2 (e.g. apt-get install -y iproute2)" ;;
-            sg)       HINT="install util-linux (e.g. apt-get install -y util-linux)" ;;
-            python3)  HINT="install python3 (e.g. apt-get install -y python3)" ;;
-            node)     HINT="install Node.js >= 18 (package 'nodejs' or https://nodejs.org / NodeSource)" ;;
-            *)        HINT="" ;;
-        esac
-        MISSING_TOOLS="${MISSING_TOOLS}    - ${tool}: ${HINT}"$'\n'
-    fi
-done
-if [ -n "$MISSING_TOOLS" ]; then
+TOOLS_OUT="$(doctor --check-tools 2>&1)"
+TOOLS_RC=$?
+if [ "$TOOLS_RC" -ne 0 ]; then
     echo "      FAILED: required tools are missing:"
-    printf '%s' "$MISSING_TOOLS" | sed 's/^/      /'
+    printf '%s' "$TOOLS_OUT" | python3 -c 'import json, sys
+d = json.load(sys.stdin)
+for name in d.get("critical_missing", []):
+    print("    - %s: %s" % (name, d["tools"][name].get("hint", "")))' 2>/dev/null | sed 's/^/      /'
     echo "      Install the missing tools, then re-run this script."
     exit 1
 fi
+DOCKER_PRESENT="$(printf '%s' "$TOOLS_OUT" | json_get docker_present)"
+if [ "$DOCKER_PRESENT" = "False" ]; then
+    echo "      NOTE: docker not found - continuing without Docker (degraded mode)."
+    echo "      Install it with:  $(printf '%s' "$TOOLS_OUT" | json_get docker_hint)"
+fi
 echo "      ok."
+
+# system health table (informational; failures do not block startup)
+python3 -m thoughtmachine.doctor || true
+echo ""
 
 # --------------------------------------------------------- [1/7] venv (critical)
 echo "[1/7] Python virtual environment ..."
@@ -179,6 +180,10 @@ if [ "$VENV_RC" -ne 0 ]; then
     printf '%s\n' "$VENV_OUT" | sed 's/^/      /'
     echo "      Run ./install.sh first"
     exit 1
+fi
+VENV_BROKEN="$(printf '%s' "$VENV_OUT" | json_get broken_reason)"
+if [ -n "$VENV_BROKEN" ]; then
+    echo "Venv is broken. Recreating automatically..."
 fi
 echo "      ok."
 
@@ -270,9 +275,14 @@ echo "[5/7] ~/.thoughtmachine writable ..."
 TM_OUT="$(doctor --check-dotthoughtmachine 2>&1)"
 TM_RC=$?
 if [ "$TM_RC" -ne 0 ]; then
-    TM_HINT="$(printf '%s' "$TM_OUT" | json_get hint)"
-    echo "      FAILED: ~/.thoughtmachine is not writable."
-    echo "      Fix with:  ${TM_HINT:-sudo chown -R \$USER ~/.thoughtmachine}"
+    if sudo -n true 2>/dev/null; then
+        sudo chown -R "$USER" ~/.thoughtmachine 2>/dev/null || true
+        TM_OUT="$(doctor --check-dotthoughtmachine 2>&1)"
+        TM_RC=$?
+    fi
+fi
+if [ "$TM_RC" -ne 0 ]; then
+    echo "Vault not writable. Fix with: sudo chown -R $USER ~/.thoughtmachine"
     exit 1
 fi
 echo "      ok."

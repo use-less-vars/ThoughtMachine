@@ -18,6 +18,7 @@ exactly one JSON object on stdout and exits 0 (ok) / 1 (not ok) / 2 (error):
     python3 scripts/doctor_checks.py --check-node [--floor 18]
     python3 scripts/doctor_checks.py --check-venv [--path .venv]
     python3 scripts/doctor_checks.py --check-dotthoughtmachine [--path DIR]
+    python3 scripts/doctor_checks.py --check-tools
     python3 scripts/doctor_checks.py --ensure-venv [--path .venv] [--requirements requirements.txt]
     python3 scripts/doctor_checks.py --ensure-docker-group [--user NAME]
     python3 scripts/doctor_checks.py --ensure-docker-daemon
@@ -31,6 +32,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from typing import Any, Dict, List, Optional
@@ -196,16 +198,83 @@ def check_node_version(floor: str = "18") -> Dict[str, Any]:
     }
 
 
-def check_venv(path: str = ".venv") -> Dict[str, Any]:
-    """Check that a virtualenv exists at ``path`` with an executable python."""
+def _venv_python_executable(python: str) -> bool:
+    """True when ``python`` is executable by the current user.
+
+    os.access(X_OK) alone returns True for root on any file, so the mode
+    bits are also required to keep the predicate reliable when running as
+    root (e.g. in containers/CI).
+    """
+    try:
+        return os.access(python, os.X_OK) and bool(os.stat(python).st_mode & 0o111)
+    except OSError:
+        return False
+
+
+def _venv_broken_reason(path: str) -> Optional[str]:
+    """Return a machine-readable broken-reason for the venv at ``path``.
+
+    Structural predicates only (no subprocess). Each predicate is
+    INDEPENDENT -- the venv is broken when ANY of them holds:
+
+    * ``"python_missing"`` -- bin/python is absent (or the dir is missing)
+    * ``"not_executable"`` -- bin/python is not executable by the current
+      user (mode bits AND os.access, root-proof) or is a dead symlink
+    * ``"no_pyvenv_cfg"``  -- pyvenv.cfg is missing (incomplete venv)
+
+    Returns None when the structure looks acceptable; callers then decide
+    between 'up to date' and 'needs update' (optionally probing pip).
+    """
     if not os.path.isdir(path):
-        return {"ok": False, "reason": "missing", "detail": "virtualenv %s does not exist — run: python3 -m venv %s" % (path, path)}
+        return "python_missing"
     python = os.path.join(path, "bin", "python")
+    if os.path.islink(python) and not os.path.exists(python):
+        return "not_executable"
     if not os.path.isfile(python):
-        return {"ok": False, "reason": "broken", "detail": "virtualenv %s has no bin/python (is it a real venv?)" % path}
-    if not os.access(python, os.X_OK):
-        return {"ok": False, "reason": "broken", "detail": "virtualenv python %s is not executable" % python}
-    return {"ok": True, "detail": "virtualenv %s exists with executable python" % path}
+        return "python_missing"
+    if not _venv_python_executable(python):
+        return "not_executable"
+    if not os.path.isfile(os.path.join(path, "pyvenv.cfg")):
+        return "no_pyvenv_cfg"
+    return None
+
+
+def check_venv(path: str = ".venv") -> Dict[str, Any]:
+    """Check that a virtualenv exists at ``path`` with an executable python.
+
+    Shares the structural predicates with ensure_venv; a broken venv
+    reports ok False with a machine-readable ``broken_reason``.
+    """
+    broken = _venv_broken_reason(path)
+    if broken is None:
+        return {"ok": True, "detail": "virtualenv %s exists with executable python" % path}
+    if not os.path.isdir(path):
+        return {
+            "ok": False,
+            "reason": "missing",
+            "broken_reason": broken,
+            "detail": "virtualenv %s does not exist — run: python3 -m venv %s" % (path, path),
+        }
+    if broken == "python_missing":
+        return {
+            "ok": False,
+            "reason": "broken",
+            "broken_reason": broken,
+            "detail": "virtualenv %s has no bin/python (is it a real venv?)" % path,
+        }
+    if broken == "not_executable":
+        return {
+            "ok": False,
+            "reason": "broken",
+            "broken_reason": broken,
+            "detail": "virtualenv python %s is not executable" % os.path.join(path, "bin", "python"),
+        }
+    return {
+        "ok": False,
+        "reason": "broken",
+        "broken_reason": broken,
+        "detail": "virtualenv %s has no pyvenv.cfg (incomplete venv)" % path,
+    }
 
 
 def check_dot_thoughtmachine_writable(path: Optional[str] = None) -> Dict[str, Any]:
@@ -219,16 +288,81 @@ def check_dot_thoughtmachine_writable(path: Optional[str] = None) -> Dict[str, A
     return {"ok": True, "hint": None, "detail": "%s exists and is writable" % target}
 
 
+def check_tools() -> Dict[str, Any]:
+    """Check the tools required to run ThoughtMachine are on PATH.
+
+    Returns ONE JSON object with:
+      * ``tools`` -- dict name -> {"present": bool, "critical": bool, "hint": str}
+      * ``critical_missing`` -- list of missing CRITICAL tool names
+      * ``docker_present`` / ``docker_hint`` -- convenience keys for the
+        launcher's warn-only docker note
+
+    Critical tools: python3, node, npm, ss, sg, apt-get. Docker is
+    NON-critical: the project supports a docker-less degraded mode, so a
+    missing docker CLI never fails the check (warn-only).
+    """
+    critical = {
+        "python3": "sudo apt-get install python3",
+        "node": "Node.js >= 18 required",
+        "npm": "install Node.js >= 18 (includes npm)",
+        "ss": "sudo apt-get install iproute2",
+        "sg": "sudo apt-get install util-linux",
+        "apt-get": "sudo apt-get update",
+    }
+    docker_hint = "sudo apt-get install docker.io (or install docker-ce: https://docs.docker.com/engine/install/)"
+    tools: Dict[str, Any] = {}
+    critical_missing: List[str] = []
+    for name, hint in critical.items():
+        present = shutil.which(name) is not None
+        tools[name] = {"present": present, "critical": True, "hint": hint}
+        if not present:
+            critical_missing.append(name)
+    docker_present = shutil.which("docker") is not None
+    tools["docker"] = {"present": docker_present, "critical": False, "hint": docker_hint}
+    ok = not critical_missing
+    detail = "all required tools are present" if ok else "missing critical tools: %s" % ", ".join(critical_missing)
+    return {
+        "ok": ok,
+        "detail": detail,
+        "tools": tools,
+        "critical_missing": critical_missing,
+        "docker_present": docker_present,
+        "docker_hint": docker_hint,
+    }
+
+
 # ── ensures ───────────────────────────────────────────────────────────────────
 
-def ensure_venv(path: str = ".venv", requirements: str = "requirements.txt") -> Dict[str, Any]:
-    """Create the venv (if missing) and install dependencies idempotently.
+def _create_venv(path: str) -> Optional[str]:
+    """Create a venv at ``path`` with ``python3 -m venv``.
 
-    Idempotency mechanism: dependencies are installed only when the stamp
-    file ``<path>/.tm-requirements.stamp`` does not match the sha256 of the
-    current ``requirements.txt`` content. After a successful install the
-    stamp is written, so a second run with an unchanged requirements.txt
-    does nothing (changed=False).
+    Returns None on success, or an error detail string on failure.
+    """
+    try:
+        proc = _run(["python3", "-m", "venv", path])
+    except FileNotFoundError:
+        return "python3: command not found on PATH — install Python 3 (https://www.python.org/downloads/)"
+    except Exception as exc:  # pragma: no cover - defensive
+        return str(exc)
+    if proc.returncode != 0:
+        return (proc.stderr or proc.stdout or "venv creation failed").strip()
+    return None
+
+
+def ensure_venv(path: str = ".venv", requirements: str = "requirements.txt") -> Dict[str, Any]:
+    """Create the venv (if missing or broken) and install dependencies idempotently.
+
+    Self-healing: a venv whose structure is broken (bin/python missing or
+    not executable, pyvenv.cfg missing) or whose ``python -m pip --version``
+    fails is removed and recreated from scratch, then dependencies are
+    reinstalled; the result carries ``broken_reason`` and
+    ``detail: "recreated: <reason>"``.
+
+    Idempotency: on a healthy venv whose stamp file
+    ``<path>/.tm-requirements.stamp`` matches the sha256 of the current
+    ``requirements.txt`` nothing is done (changed=False). The pip health
+    probe is only run when the stamp is outdated or the structure is
+    suspect, so the healthy up-to-date path makes no subprocess calls.
     """
     python = os.path.join(path, "bin", "python")
     stamp = os.path.join(path, ".tm-requirements.stamp")
@@ -236,20 +370,42 @@ def ensure_venv(path: str = ".venv", requirements: str = "requirements.txt") -> 
     if digest is None:
         return {"ok": False, "changed": False, "detail": "requirements file %s not found (run from the repo root)" % requirements}
 
+    broken = _venv_broken_reason(path)
     created = False
-    if not os.path.isfile(python):
-        try:
-            proc = _run(["python3", "-m", "venv", path])
-        except FileNotFoundError:
-            return {"ok": False, "changed": False, "detail": "python3: command not found on PATH — install Python 3 (https://www.python.org/downloads/)"}
-        except Exception as exc:  # pragma: no cover - defensive
-            return {"ok": False, "changed": False, "detail": str(exc)}
-        if proc.returncode != 0:
-            return {"ok": False, "changed": False, "detail": (proc.stderr or proc.stdout or "venv creation failed").strip()}
-        created = True
+    broken_reason: Optional[str] = None
 
-    if not created and _read_stamp(stamp) == digest:
-        return {"ok": True, "changed": False, "detail": "virtualenv %s ready; dependencies up to date (stamp matches %s)" % (path, requirements)}
+    if broken is not None:
+        # Existing-but-broken venv -> remove it and recreate from scratch.
+        if os.path.isdir(path):
+            broken_reason = broken
+            try:
+                shutil.rmtree(path)
+            except OSError as exc:
+                return {"ok": False, "changed": False, "detail": "cannot remove broken venv %s: %s" % (path, exc)}
+        err = _create_venv(path)
+        if err is not None:
+            return {"ok": False, "changed": False, "detail": err}
+        created = True
+    else:
+        if _read_stamp(stamp) == digest:
+            return {"ok": True, "changed": False, "detail": "virtualenv %s ready; dependencies up to date (stamp matches %s)" % (path, requirements)}
+        # Structure acceptable but the stamp is outdated/absent: probe pip
+        # health (short timeout) before deciding between reinstall and
+        # recreate. The healthy up-to-date path above never gets here.
+        try:
+            probe = _run([python, "-m", "pip", "--version"], timeout=15)
+        except Exception:
+            probe = None
+        if probe is None or probe.returncode != 0:
+            broken_reason = "pip_broken"
+            try:
+                shutil.rmtree(path)
+            except OSError as exc:
+                return {"ok": False, "changed": False, "detail": "cannot remove broken venv %s: %s" % (path, exc)}
+            err = _create_venv(path)
+            if err is not None:
+                return {"ok": False, "changed": False, "detail": err}
+            created = True
 
     pip = os.path.join(path, "bin", "pip")
     try:
@@ -259,6 +415,8 @@ def ensure_venv(path: str = ".venv", requirements: str = "requirements.txt") -> 
     if proc.returncode != 0:
         return {"ok": False, "changed": created, "detail": (proc.stderr or proc.stdout or "pip install failed").strip()}
     _write_stamp(stamp, digest)
+    if broken_reason is not None:
+        return {"ok": True, "changed": True, "detail": "recreated: %s" % broken_reason, "broken_reason": broken_reason}
     what = "created and populated" if created else "updated"
     return {"ok": True, "changed": True, "detail": "virtualenv %s %s; installed dependencies from %s and wrote stamp" % (path, what, requirements)}
 
@@ -342,6 +500,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="check the virtualenv exists with an executable python")
     parser.add_argument("--check-dotthoughtmachine", action="store_true", dest="check_dotthoughtmachine",
                         help="check ~/.thoughtmachine exists and is writable")
+    parser.add_argument("--check-tools", action="store_true", dest="check_tools",
+                        help="check required tools (python3, node, npm, ss, sg, apt-get) are on PATH; "
+                             "docker is warn-only (degraded mode is supported)")
     parser.add_argument("--ensure-venv", action="store_true", dest="ensure_venv",
                         help="create the venv if missing and install requirements.txt idempotently")
     parser.add_argument("--ensure-docker-group", action="store_true", dest="ensure_docker_group",
@@ -377,6 +538,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _emit(check_venv(args.path or ".venv"))
         if args.check_dotthoughtmachine:
             return _emit(check_dot_thoughtmachine_writable(args.path))
+        if args.check_tools:
+            return _emit(check_tools())
         if args.ensure_venv:
             return _emit(ensure_venv(args.path or ".venv", args.requirements))
         if args.ensure_docker_group:

@@ -66,6 +66,12 @@ def test_installer_script_is_idempotent(tmp_path, monkeypatch):
     venv = tmp_path / ".venv"
     (venv / "bin").mkdir(parents=True)
     (venv / "bin" / "python").write_text("#!/bin/sh\n")
+    # Fixture divergence: doctor_checks now classifies a venv as BROKEN when
+    # bin/python is not executable or pyvenv.cfg is missing (un-gated
+    # predicates), so the fake venv gets +x and a pyvenv.cfg to stay
+    # structurally healthy and exercise the 'updated' path as before.
+    (venv / "bin" / "python").chmod(0o755)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
     (venv / "bin" / "pip").write_text("#!/bin/sh\n")
     requirements = tmp_path / "requirements.txt"
     requirements.write_text("fastapi>=0.100\n")

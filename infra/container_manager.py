@@ -601,6 +601,16 @@ class ContainerManager:
             # teardown compares the label value EXACTLY (mismatched/stale
             # values are ignored).
             labels["thoughtmachine.worker"] = worker_name
+            # Self-heal: a crashed/hung worker session may have left stale
+            # containers behind (same owner identity, created/exited/dead).
+            # Remove them BEFORE the fresh create so a name collision can
+            # never block a worker respawn. Best-effort: a failure here must
+            # not block the spawn.
+            try:
+                cleanup_stale_worker_containers(self.client, worker_name)
+            except Exception as exc:
+                log("WARNING", "docker.container_manager",
+                    f"Stale worker container cleanup failed for {worker_name}: {exc}")
         _audit("CONTAINER_CREATE",
                f"image={image} network={network_mode} name={name} session={self.session_id}")
 
@@ -1547,6 +1557,69 @@ def cleanup_workspace(workspace_id, docker_client):
             pass
     _audit("CONTAINER_CLEANUP", f"workspace={wid} count={removed}")
     return {"removed": removed}
+
+
+# ── Stale worker-container cleanup (crashed/hung worker sessions) ────────────
+_WORKER_LABEL = "thoughtmachine.worker"
+_REMOVABLE_WORKER_STATES = {"created", "exited", "dead"}
+
+
+def cleanup_stale_worker_containers(docker_client, owner_identity):
+    """Remove containers a crashed/hung worker session left behind.
+
+    Worker containers carry ``thoughtmachine.worker=<owner identity>`` (see
+    ``ContainerManager.start(worker_name=...)``). When a worker dies without
+    teardown, its container lingers in ``created``/``exited``/``dead`` state
+    and can block a later respawn of the same worker (docker name/label
+    collisions).
+
+    Only containers whose label value EXACTLY matches ``owner_identity`` and
+    whose state is one of ``{'created', 'exited', 'dead'}`` are removed:
+    running workers, paused/restarting containers and resource containers
+    (``thoughtmachine.resource`` label) are never touched. The label filter
+    runs server-side; the per-container checks are defensive for fake/missing
+    attributes (all access via ``getattr``).
+
+    Returns the list of removed container ids. Never raises: failures are
+    logged and skipped.
+    """
+    removed = []
+    try:
+        matches = docker_client.containers.list(
+            all=True,
+            filters={"label": {_WORKER_LABEL: owner_identity}},
+        )
+    except Exception as exc:
+        log("WARNING", "docker.container_manager",
+            f"Failed to list stale worker containers for {owner_identity}: {exc}")
+        return removed
+    for container in matches or []:
+        try:
+            labels = getattr(container, "labels", None) or {}
+            if labels.get(_WORKER_LABEL) != owner_identity:
+                # Not ours (defensive: the label filter runs server-side, but
+                # fake/mislabeled containers must never be touched).
+                continue
+            if labels.get(_RESOURCE_LABEL):
+                # Resource containers are owned by infra/resource_container_manager.
+                continue
+            status = getattr(container, "status", None)
+            if status is None:
+                attrs = getattr(container, "attrs", None) or {}
+                status = (attrs.get("State") or {}).get("Status")
+            if status not in _REMOVABLE_WORKER_STATES:
+                continue
+            container_id = getattr(container, "id", None)
+            container.remove(force=True)
+            removed.append(container_id)
+            short = str(container_id)[:12]
+            log("INFO", "docker.container_manager",
+                f"Removed stale worker container {short} ({status}) for {owner_identity}")
+        except Exception as exc:
+            log("WARNING", "docker.container_manager",
+                f"Failed to remove stale worker container "
+                f"{getattr(container, 'id', getattr(container, 'name', '?'))}: {exc}")
+    return removed
 
 
 # ── Idle/TTL + orphan sweep for EXITED workspace containers ─────────────────
