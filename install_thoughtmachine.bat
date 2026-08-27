@@ -6,7 +6,9 @@ REM  Checks prerequisites, then creates venv, installs deps, builds frontend.
 REM
 REM  Prerequisites (install manually if missing):
 REM    - Python 3.11-3.13 from https://www.python.org/downloads/
-REM    - Node.js LTS from https://nodejs.org/
+REM    - Node.js 18+ (LTS) from https://nodejs.org/
+REM    - Docker Desktop from https://www.docker.com/products/docker-desktop/
+REM      Docker Desktop is required for full functionality. Some features will be disabled.
 REM ---------------------------------------------------------------------------
 
 setlocal enabledelayedexpansion
@@ -120,8 +122,19 @@ where node >nul 2>nul
 if not errorlevel 1 (
     for /f "tokens=*" %%v in ('node --version') do set NODE_VER=%%v
     if defined NODE_VER (
-        echo   [+] Node.js ^(!NODE_VER!^)
-        set NODE_OK=1
+        set "NODE_MAJOR=!NODE_VER:v=!"
+        for /f "tokens=1 delims=." %%m in ("!NODE_MAJOR!") do set "NODE_MAJOR=%%m"
+        if defined NODE_MAJOR (
+            if !NODE_MAJOR! GEQ 18 (
+                echo   [+] Node.js ^(!NODE_VER!^)
+                set NODE_OK=1
+            ) else (
+                echo   [x] Node.js !NODE_VER! found but too old.
+                echo       Need Node.js 18 or newer.
+            )
+        ) else (
+            echo   [x] Could not parse node version: !NODE_VER!
+        )
     )
 ) else (
     echo   [x] Node.js not found. Install Node.js LTS from:
@@ -150,6 +163,19 @@ if !NODE_OK!==1 (
     echo   [ ] skipped - Node.js missing
 )
 
+echo(
+echo   --- Docker Desktop ---
+
+set DOCKER_OK=0
+docker info >nul 2>&1
+if not errorlevel 1 (
+    set DOCKER_OK=1
+    echo   [+] Docker Desktop is running
+) else (
+    echo Docker Desktop is required for full functionality. Some features will be disabled.
+    echo       Install from https://www.docker.com/products/docker-desktop/
+    echo       The app will still run; RAG/vector features need Docker.
+)
 echo(
 echo   --- Summary ---
 
@@ -294,10 +320,11 @@ echo   [+] Install complete!
 echo(
 echo   Next steps:
 echo(
-echo     1. Double-click: start_thoughtmachine.bat
+echo     1. Start the app (dev mode, hot-reload):
+echo        python start_windows.py
 echo(
 echo     2. Or for production mode (serves from dist/):
-echo        start_thoughtmachine.bat --prod
+echo        python start_windows.py --prod
 echo(
 echo     3. Open http://127.0.0.1:8000 in your browser
 echo(
