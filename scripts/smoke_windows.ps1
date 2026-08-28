@@ -159,7 +159,7 @@ try {
     $healthy = $false
     for ($i = 0; $i -lt 60; $i++) {
         try {
-            $resp = Invoke-WebRequest -Uri "http://127.0.0.1:8000/health" -UseBasicParsing -TimeoutSec 2
+            $resp = Invoke-WebRequest -Uri "http://127.0.0.1:8000/api/health" -UseBasicParsing -TimeoutSec 2
             if ($resp.StatusCode -eq 200) {
                 $healthy = $true
                 break
@@ -169,7 +169,7 @@ try {
         }
     }
     if ($healthy) {
-        Write-Host "OK: backend healthy (http://127.0.0.1:8000/health)"
+        Write-Host "OK: backend healthy (http://127.0.0.1:8000/api/health)"
     } else {
         Write-Fail "Backend did not become healthy within 60s."
         if (Test-Path (Join-Path $Root "smoke_backend.err.log")) {
