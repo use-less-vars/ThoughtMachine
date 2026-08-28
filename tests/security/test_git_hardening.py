@@ -78,10 +78,11 @@ def hardened_repo(tmp_path):
     return workspace, repo, marker
 
 
-def _commit_tool(workspace, repo, message="test commit"):
+def _commit_tool(workspace, repo, message="test commit", file_path="hello.txt"):
     return GitInfoTool(
         operation="commit",
         message=message,
+        file_path=file_path,
         working_dir=str(repo),
         workspace_path=str(workspace),
     )
@@ -206,7 +207,7 @@ def test_ambient_global_config_is_ignored(hardened_repo, monkeypatch, tmp_path):
 
     (repo / "a.txt").write_text("a\n")
     _run_git_clean(repo, "add", "a.txt")
-    result = _commit_tool(workspace, repo, message="config-isolated commit").execute()
+    result = _commit_tool(workspace, repo, message="config-isolated commit", file_path="a.txt").execute()
     assert "Git command failed" not in result
 
     log = _run_git_clean(repo, "log", "--format=%an <%ae>")
@@ -226,10 +227,11 @@ FULL_PERMISSIONS = {
 }
 
 
-def _vault_commit_tool(workspace, repo, ws_id, message="vault hook commit"):
+def _vault_commit_tool(workspace, repo, ws_id, message="vault hook commit", file_path="hello.txt"):
     return GitInfoTool(
         operation="commit",
         message=message,
+        file_path=file_path,
         working_dir=str(repo),
         workspace_path=str(workspace),
         workspace_id=ws_id,
@@ -350,6 +352,7 @@ def test_commit_denied_without_git_write_permission(hardened_repo):
     tool = GitInfoTool(
         operation="commit",
         message="nope",
+        file_path="hello.txt",
         working_dir=str(repo),
         workspace_path=str(workspace),
         session_permissions={
@@ -372,7 +375,7 @@ def test_normal_git_operations(hardened_repo):
     workspace, repo, _ = hardened_repo
     (repo / "a.txt").write_text("a\n")
     _run_git_clean(repo, "add", "a.txt")
-    _commit_tool(workspace, repo, message="base").execute()
+    _commit_tool(workspace, repo, message="base", file_path="a.txt").execute()
 
     for op, kwargs in (
         ("status", {}),

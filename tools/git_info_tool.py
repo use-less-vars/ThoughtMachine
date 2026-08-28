@@ -1149,8 +1149,12 @@ class GitInfoTool(ToolBase):
         Accepts a single path (str) or multiple paths (list of str). Each
         path must be a string and must resolve inside the workspace; returns
         paths relative to ``repo_root`` for use as git path arguments. Raises
-        ``ValueError`` for invalid path types, empty paths, or paths outside
-        the workspace.
+        ``ValueError`` for invalid path types, empty paths, paths outside
+        the workspace, and paths that would make git touch more than the
+        explicitly named file(s): ``.`` / ``..`` (whole-tree sweeps,
+        equivalent to ``git add -A``) and git pathspec wildcards / magic
+        characters (``* ? [ ] : \\``) and leading ``-`` are rejected up
+        front so an agent can only stage paths it actually names.
         """
         path_list = paths if isinstance(paths, list) else [paths]
         rels = []
@@ -1161,9 +1165,30 @@ class GitInfoTool(ToolBase):
                 )
             if not p:
                 raise ValueError("Invalid empty file path")
+            if p in (".", ".."):
+                raise ValueError(
+                    f"Invalid file path {p!r}: whole-tree paths are not "
+                    "allowed; stage named files only"
+                )
+            if any(c in p for c in "*?[]:\\"):
+                raise ValueError(
+                    f"Invalid file path {p!r}: git pathspec wildcards and "
+                    "magic characters are not allowed; stage named files only"
+                )
+            if p.startswith("-"):
+                raise ValueError(
+                    f"Invalid file path {p!r}: paths may not start with '-' "
+                    "(option smuggling); stage named files only"
+                )
             file_abs = (repo_root / p).resolve()
             validated_abs = self._validate_path(str(file_abs))
-            rels.append(str(Path(validated_abs).relative_to(repo_root)))
+            rel = str(Path(validated_abs).relative_to(repo_root))
+            if rel in (".", ".."):
+                raise ValueError(
+                    f"Invalid file path {p!r}: resolves to {rel!r}, which "
+                    "would stage the whole tree; stage named files only"
+                )
+            rels.append(rel)
         return rels
 
     def _with_mode(self, output: str) -> str:
@@ -1303,6 +1328,20 @@ class GitInfoTool(ToolBase):
         output = self._run_git(repo_root, args)
         return self._with_mode(self._truncate_output(output))
 
+    def _is_git_error_output(self, output: str) -> bool:
+        """True when a _run_git/_git_add result string signals failure.
+
+        _run_git returns error-shaped strings on failure: "Git command
+        failed ...", "Git command timed out", "Git command not found ..."
+        or "Error running git command: ..."; _git_add prepends "Error: ..."
+        for argument-validation failures. On success git add emits no
+        stdout, so prefixing on "Git command" / "Error" is unambiguous.
+        The commit flow uses this to short-circuit before running ``git
+        commit`` on an un-staged file (which would otherwise fail with a
+        confusing "pathspec did not match" error).
+        """
+        return output.startswith("Git command") or output.startswith("Error")
+
     def _git_add(
         self, repo_root: Path, allow_host_fallback: bool = True
     ) -> str:
@@ -1314,34 +1353,38 @@ class GitInfoTool(ToolBase):
         """
         args = ["add"]
         if self.file_path:
-            # Normalize to list for uniform handling
-            paths = self.file_path if isinstance(self.file_path, list) else [self.file_path]
-            for path in paths:
-                try:
-                    file_abs = (repo_root / path).resolve()
-                    validated_abs = self._validate_path(str(file_abs))
-                    file_rel = Path(validated_abs).relative_to(repo_root)
-                    args.append(str(file_rel))
-                except ValueError as e:
-                    return self._truncate_output(f"Error: {e}")
+            # Same validation choke point as every other path consumer
+            # (_validated_rel_paths): rejects ".", "..", globs / pathspec
+            # magic and option-like "-" paths. "--" keeps option-like
+            # filenames from being parsed as git add flags.
+            try:
+                rels = self._validated_rel_paths(repo_root, self.file_path)
+            except ValueError as e:
+                return self._truncate_output(f"Error: {e}")
+            args.append("--")
+            args.extend(rels)
         else:
-            args.append("-A")  # Stage all changes
+            # The full-worktree sweep (git add -A) is removed: every caller
+            # must name the paths to stage explicitly.
+            return "Error: file_path is required for stage operation (at least one path)"
         output = self._run_git(repo_root, args, allow_host_fallback=allow_host_fallback)
         return self._truncate_output(output)
 
     def _git_commit(self, repo_root: Path) -> str:
-        """Run git commit.
+        """Run git commit (selective only).
 
-        Two modes:
-
-        - Full commit (no ``file_path``): the worktree is auto-staged via
-          ``git add -A`` (tracked modifications, deletions and untracked
-          files) and ``git commit -m <msg>`` captures the whole worktree
-          state. A failure in the add step propagates
-          (``Git command failed ...``).
-        - Selective commit (``file_path`` given): the commit is limited to
-          the listed paths (``git commit -m <msg> -- <paths>``) without
-          touching the index -- only the named files are committed.
+        ``file_path`` is REQUIRED: the commit is limited to the listed paths
+        (explicit ``git add -- <paths>`` staging + ``git commit -m <msg> --
+        <paths>``). There is no full-worktree mode -- the historical ``git
+        add -A`` auto-stage sweep is removed, so unvetted changes cannot be
+        swept into a commit past the review gate. The named paths are staged
+        explicitly (never ``-A``) before committing: ``git commit -- <paths>``
+        only commits files git already knows, so untracked files (e.g. the
+        first commit of a fresh repo) would otherwise fail with "pathspec ...
+        did not match any file(s) known to git". In the policy-allowed
+        worktree path the staging is container-mandatory
+        (allow_host_fallback=False); otherwise it uses the default fallback
+        policy.
 
         Commit hook policy lives in the execution backends: container mode
         runs the workspace-local .githooks dir (core.hooksPath override);
@@ -1369,56 +1412,45 @@ class GitInfoTool(ToolBase):
         if not self.message or not self.message.strip():
             return "Error: message is required for commit operation"
 
-        # Policy-allowed agent commits must name their paths: the
-        # ``git add -A`` full-worktree sweep below would stage unvetted
-        # changes (review-gate bypass). Require explicit file_path(s).
-        if worktree_commit_allowed and not self.file_path:
+        # Every commit must name its paths: the ``git add -A`` full-worktree
+        # sweep is removed, so a commit without explicit file_path(s) is
+        # rejected before any git subprocess runs.
+        if not self.file_path:
             return self._truncate_output(
-                "Error: file_path is required for agent commits on feature branches"
+                "Error: file_path is required for commit operation (at least one path)"
             )
 
-        if self.file_path:
-            if worktree_commit_allowed:
-                # Policy-allowed agent commit: stage ONLY the named paths
-                # (never ``-A``; _git_add uses self.file_path) and commit,
-                # with mandatory container execution for both subprocesses.
-                add_output = self._git_add(
-                    repo_root, allow_host_fallback=False
-                )
-                if (
-                    "Git command failed" in add_output
-                    or add_output.startswith("Error:")
-                ):
-                    return self._truncate_output(add_output)
-                output = self._run_git(
-                    repo_root,
-                    ["commit", "-m", self.message],
-                    allow_host_fallback=False,
-                )
-                return self._with_mode(self._truncate_output(output))
-            try:
-                rels = self._validated_rel_paths(repo_root, self.file_path)
-            except ValueError as e:
-                return self._truncate_output(f"Error: {e}")
-            if not rels:
-                return "Error: file_path is required for commit operation (at least one path)"
-            args = ["commit", "-m", self.message, "--"] + rels
+        if worktree_commit_allowed:
+            # Policy-allowed agent commit: stage ONLY the named paths
+            # (never ``-A``; _git_add uses self.file_path) and commit,
+            # with mandatory container execution for both subprocesses.
+            add_output = self._git_add(
+                repo_root, allow_host_fallback=False
+            )
+            if self._is_git_error_output(add_output):
+                return self._truncate_output(add_output)
             output = self._run_git(
-                repo_root, args, allow_host_fallback=not worktree_commit_allowed
+                repo_root,
+                ["commit", "-m", self.message],
+                allow_host_fallback=False,
             )
             return self._with_mode(self._truncate_output(output))
 
-        # Full commit: auto-stage the whole worktree, then commit. A failure
-        # in the add step propagates exactly as the historical flow did.
-        add_output = self._git_add(
-            repo_root, allow_host_fallback=not worktree_commit_allowed
-        )
-        if "Git command failed" in add_output:
+        try:
+            rels = self._validated_rel_paths(repo_root, self.file_path)
+        except ValueError as e:
+            return self._truncate_output(f"Error: {e}")
+        if not rels:
+            return "Error: file_path is required for commit operation (at least one path)"
+        # Stage exactly the named paths first (never ``-A``): ``git commit --
+        # <paths>`` only works for files git already knows, so an untracked
+        # file (e.g. the first commit of a fresh repo) must be staged first.
+        add_output = self._git_add(repo_root)
+        if self._is_git_error_output(add_output):
             return self._truncate_output(add_output)
+        args = ["commit", "-m", self.message, "--"] + rels
         output = self._run_git(
-            repo_root,
-            ["commit", "-m", self.message],
-            allow_host_fallback=not worktree_commit_allowed,
+            repo_root, args, allow_host_fallback=not worktree_commit_allowed
         )
         return self._with_mode(self._truncate_output(output))
 

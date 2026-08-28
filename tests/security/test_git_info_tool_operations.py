@@ -261,6 +261,54 @@ class TestStage:
         assert result.startswith("Error:")
         assert not _FakeSandbox.instances
 
+    # --- whole-tree / sweep-shaped inputs must be rejected up front: the
+    # tool's contract is named files only (never `git add -A` or an
+    # equivalent sweep via ".", globs, pathspec magic or option smuggling).
+    def test_dot_path_rejected(self, tmp_path, fake_sandbox):
+        tool = _host_tool(tmp_path, operation="stage", file_path=".")
+        result = tool._git_stage(tmp_path)
+
+        assert result.startswith("Error:")
+        assert not _FakeSandbox.instances
+
+    def test_dot_slash_resolves_to_whole_tree_rejected(
+        self, tmp_path, fake_sandbox
+    ):
+        tool = _host_tool(tmp_path, operation="stage", file_path="./")
+        result = tool._git_stage(tmp_path)
+
+        assert result.startswith("Error:")
+        assert not _FakeSandbox.instances
+
+    def test_glob_path_rejected(self, tmp_path, fake_sandbox):
+        tool = _host_tool(tmp_path, operation="stage", file_path="*.py")
+        result = tool._git_stage(tmp_path)
+
+        assert result.startswith("Error:")
+        assert not _FakeSandbox.instances
+
+    def test_recursive_glob_path_rejected(self, tmp_path, fake_sandbox):
+        tool = _host_tool(tmp_path, operation="stage", file_path="**/*")
+        result = tool._git_stage(tmp_path)
+
+        assert result.startswith("Error:")
+        assert not _FakeSandbox.instances
+
+    def test_pathspec_magic_rejected(self, tmp_path, fake_sandbox):
+        tool = _host_tool(tmp_path, operation="stage", file_path=":(glob)**")
+        result = tool._git_stage(tmp_path)
+
+        assert result.startswith("Error:")
+        assert not _FakeSandbox.instances
+
+    def test_option_like_path_rejected(self, tmp_path, fake_sandbox):
+        # file_path="-A" must never reach git: `git add -A` would sweep.
+        tool = _host_tool(tmp_path, operation="stage", file_path="-A")
+        result = tool._git_stage(tmp_path)
+
+        assert result.startswith("Error:")
+        assert not _FakeSandbox.instances
+
 
 # ---------------------------------------------------------------------------
 # unstage
@@ -365,42 +413,48 @@ class TestCommit:
         assert "failure_reason: none" in result
         assert "fallback_used: false" in result
 
-    def test_containerized_full_commit_argv(self, tmp_path, fake_manager):
+    def test_containerized_commit_without_file_path_rejected(self, tmp_path, fake_manager):
         (tmp_path / ".git").mkdir()
         tool = _container_tool(
             tmp_path, fake_manager, operation="commit", message="msg"
         )
-        tool._git_commit(tmp_path)
+        result = tool._git_commit(tmp_path)
 
-        # Full commit = auto-stage the whole worktree -> commit (two
-        # container exec calls, in that order; no index reset).
-        execs = [c for c in fake_manager.calls if c[0] == "exec"]
-        commands = [c[1] for c in execs]
-        assert commands == [
-            ["git", "add", "-A"],
-            ["git", "-c", "core.hooksPath=/workspace/.githooks",
-             "commit", "-m", "msg"],
-        ]
+        # Full-commit mode (git add -A) is removed: a commit without an
+        # explicit file_path is rejected before any git subprocess runs.
+        assert result == (
+            "Error: file_path is required for commit operation (at least one path)"
+        )
+        assert not [c for c in fake_manager.calls if c[0] == "exec"]
 
-    def test_full_commit_auto_stages_untracked_file(self, tmp_path, fake_manager):
-        """Regression: full commit re-stages untracked files (add -A).
+    def test_commit_with_explicit_path_stages_untracked_file(self, tmp_path, fake_manager):
+        """Regression: a commit naming an untracked file lands it in the repo.
 
         Mirrors the contract tests (test_post_commit_hook_never_executes,
         test_git_add_status_diff_log_work), which commit an untracked file on
-        a fresh repo via the tool without file_path: the auto-stage MUST run
-        before the commit.
+        a fresh repo via the tool with an explicit file_path. The named path
+        is staged explicitly first (``git add -- <path>`` -- never -A) because
+        ``git commit -- <path>`` only commits files git already knows.
         """
         (tmp_path / ".git").mkdir()
         (tmp_path / "hello.txt").write_text("hi\n", encoding="utf-8")
         tool = _container_tool(
-            tmp_path, fake_manager, operation="commit", message="add hello"
+            tmp_path, fake_manager, operation="commit",
+            message="add hello", file_path="hello.txt",
         )
-        tool._git_commit(tmp_path)
+        result = tool._git_commit(tmp_path)
 
         execs = [c for c in fake_manager.calls if c[0] == "exec"]
-        commands = [c[1] for c in execs]
-        assert commands[0] == ["git", "add", "-A"]  # auto-stage before commit
-        assert commands[1][-3:] == ["commit", "-m", "add hello"]
+        assert len(execs) == 2  # explicit stage of the named path + commit
+        assert execs[0][1] == ["git", "add", "--", "hello.txt"]
+        assert "-A" not in execs[0][1]
+        _kind, command, _kwargs = execs[-1]
+        assert command == [
+            "git", "-c", "core.hooksPath=/workspace/.githooks",
+            "commit", "-m", "add hello", "--", "hello.txt",
+        ]
+        assert "-A" not in command
+        assert "execution_mode: containerized" in result
 
     def test_missing_message_errors(self, tmp_path, fake_sandbox):
         (tmp_path / ".git").mkdir()
@@ -427,20 +481,30 @@ class TestCommit:
         """
         (tmp_path / ".git").mkdir()
         tool = _host_tool(
-            tmp_path, operation="commit", message="x --no-verify"
+            tmp_path, operation="commit", message="x --no-verify",
+            file_path="a.txt",
         )
         tool._git_commit(tmp_path)
 
-        # Full commit = add -A -> commit (2 sandbox invocations); each
-        # _run_git creates its own SandboxedExecution instance, so sum calls
-        # across all instances; the LAST one is the commit. No index reset.
+        # Selective commit = explicit stage of the named path (git add -- <path>)
+        # + git commit -- <path>; each _run_git creates its own
+        # SandboxedExecution instance, so sum calls across all instances.
+        # No index reset.
         assert sum(len(i.calls) for i in _FakeSandbox.instances) == 2
         assert all(
             "reset" not in command
             for inst in _FakeSandbox.instances
             for command, _kwargs in inst.calls
         )
-        command = _last_sandbox_command()
+        commands = [
+            command
+            for inst in _FakeSandbox.instances
+            for command, _kwargs in inst.calls
+        ]
+        add_cmd, commit_cmd = commands[0], commands[-1]
+        assert add_cmd[add_cmd.index("add"):] == ["add", "--", "a.txt"]
+        assert "-A" not in add_cmd
+        command = commit_cmd
         assert "x --no-verify" in command
         idx = command.index("commit")
         assert command[idx + 1] == "--no-verify"  # the ONE injected by hardening
@@ -451,21 +515,28 @@ class TestCommit:
         """CONTAINERIZED path: no --no-verify anywhere; message stays one argv element."""
         (tmp_path / ".git").mkdir()
         tool = _container_tool(
-            tmp_path, fake_manager, operation="commit", message="x --no-verify"
+            tmp_path, fake_manager, operation="commit",
+            message="x --no-verify", file_path="a.txt",
         )
         tool._git_commit(tmp_path)
 
         execs = [c for c in fake_manager.calls if c[0] == "exec"]
-        assert len(execs) == 2  # add -A -> commit
+        assert len(execs) == 2  # selective commit: explicit stage + commit
         assert all("reset" not in c[1] for c in execs)  # no index reset
-        _kind, command, _kwargs = _last_manager_exec(fake_manager)
+        # The stage subprocess precedes the commit; the message only ever
+        # appears in the commit argv, as a single element.
+        assert execs[0][1] == ["git", "add", "--", "a.txt"]
+        assert "-A" not in execs[0][1]
+        _kind, command, _kwargs = execs[-1]
         assert "x --no-verify" in command
         assert "--no-verify" not in command
         assert command[command.index("-m") + 1] == "x --no-verify"
 
     def test_host_commit_hooks_neutralized(self, tmp_path, fake_sandbox):
         (tmp_path / ".git").mkdir()
-        tool = _host_tool(tmp_path, operation="commit", message="x")
+        tool = _host_tool(
+            tmp_path, operation="commit", message="x", file_path="a.txt"
+        )
         tool._git_commit(tmp_path)
 
         command = _last_sandbox_command()
@@ -516,11 +587,15 @@ class TestWorktreeCommitGuard:
 
     def test_commit_allowed_when_git_is_directory(self, tmp_path, fake_sandbox):
         (tmp_path / ".git").mkdir()
-        tool = _host_tool(tmp_path, operation="commit", message="x")
+        tool = _host_tool(
+            tmp_path, operation="commit", message="x", file_path="a.txt"
+        )
         tool._git_commit(tmp_path)
 
         command = _last_sandbox_command()
-        assert command[command.index("commit"):] == ["commit", "--no-verify", "-m", "x"]
+        assert command[command.index("commit"):] == [
+            "commit", "--no-verify", "-m", "x", "--", "a.txt",
+        ]
 
 
 # ---------------------------------------------------------------------------
