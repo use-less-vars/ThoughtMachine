@@ -261,3 +261,71 @@ def test_script_prepends_system_paths_for_docker_detection():
     source = (REPO_ROOT / "start_thoughtmachine.sh").read_text()
     assert 'export PATH="/usr/bin:$PATH"' in source
     assert 'export PATH="/usr/sbin:$PATH"' in source
+
+
+# ---------------------------------------------------------------------------
+# install.sh integration tests (shim-based, same pattern as above)
+#
+# install.sh's doctor() calls are answered by the same fake `python3` shim,
+# which reports Docker as unusable (lib_missing) so both the CI and the
+# normal-machine paths are exercised without a real daemon. A fake `sudo`
+# (exit 1) keeps the non-CI abort path deterministic (no passwordless sudo).
+# ---------------------------------------------------------------------------
+
+
+def _make_install_repo(base):
+    """Copy the real install.sh (and its doctor helper) into an isolated repo dir."""
+    repo = base / "install_repo"
+    repo.mkdir()
+    shutil.copy(REPO_ROOT / "install.sh", repo / "install.sh")
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir()
+    shutil.copy(
+        REPO_ROOT / "scripts" / "doctor_checks.py",
+        scripts_dir / "doctor_checks.py",
+    )
+    return repo
+
+
+def _run_install_script(repo, base, reason, extra_env=None, fake_sudo=False):
+    shim_dir = _write_shim(base, reason)
+    if fake_sudo:
+        sudo = shim_dir / "sudo"
+        sudo.write_text("#!/bin/sh\nexit 1\n")
+        sudo.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = str(shim_dir) + os.pathsep + env.get("PATH", "")
+    env["HOME"] = str(base)
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        ["bash", str(repo / "install.sh")],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def test_install_ci_mode_skips_docker_checks(exec_tmp):
+    repo = _make_install_repo(exec_tmp)
+    result = _run_install_script(
+        repo, exec_tmp, "lib_missing", extra_env={"CI": "true"}
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "NOTE: CI environment detected — Docker checks skipped." in result.stdout
+    assert "[1/5] Python >= 3.11" in result.stdout  # non-Docker steps still run
+    assert "[2/5] Docker daemon" not in result.stdout
+    assert "sudo apt-get update && sudo apt-get install -y docker.io" not in result.stdout
+    assert "Installation aborted" not in result.stdout
+    assert "Next step: ./start_thoughtmachine.sh" in result.stdout
+
+
+def test_install_normal_mode_still_aborts_without_docker(exec_tmp):
+    repo = _make_install_repo(exec_tmp)
+    result = _run_install_script(repo, exec_tmp, "lib_missing", fake_sudo=True)
+    assert result.returncode == 1
+    assert "NOTE: CI environment detected" not in result.stdout
+    assert "FAILED: Docker is not installed and this installer needs sudo to install it." in result.stdout
+    assert "sudo apt-get update && sudo apt-get install -y docker.io" in result.stdout
+    assert "Installation aborted" in result.stdout
+
