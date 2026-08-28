@@ -93,6 +93,7 @@ jobs:
           mkdir -p logs
           bash start_thoughtmachine.sh --doctor > logs/doctor_ci.log 2>&1 &
           DOCTOR_PID=$!
+          WRAPPER_RC=0
           echo "doctor wrapper pid: $DOCTOR_PID"
 
           # Poll /api/health/containers (NOT /api/health - that route does not
@@ -104,8 +105,15 @@ jobs:
               break
             fi
             if ! kill -0 "$DOCTOR_PID" 2>/dev/null; then
-              echo "doctor wrapper exited early - tail of logs/doctor_ci.log:"
-              tail -n 40 logs/doctor_ci.log || true
+              if wait "$DOCTOR_PID" 2>/dev/null; then
+                WRAPPER_RC=0
+              else
+                WRAPPER_RC=$?
+              fi
+              echo "doctor wrapper exited early (rc=$WRAPPER_RC) - full logs/doctor_ci.log:"
+              cat logs/doctor_ci.log || true
+              echo "--- full logs/backend_startup.log: ---"
+              cat logs/backend_startup.log || true
               break
             fi
             sleep 1
@@ -113,7 +121,9 @@ jobs:
 
           if [ -z "$HEALTH_BODY" ]; then
             echo "::error::GET /api/health/containers never returned HTTP 200 within 30s"
-            tail -n 100 logs/doctor_ci.log || true
+            cat logs/doctor_ci.log || true
+            echo "--- full logs/backend_startup.log: ---"
+            cat logs/backend_startup.log || true
             exit 1
           fi
 
