@@ -11,9 +11,9 @@ ALL of the following hold:
    add/commit subprocesses themselves (``allow_host_fallback=False``) — the
    host backend injects ``--no-verify`` / ``core.hooksPath=/dev/null`` and
    would bypass the commit QA gate.
-5. The commit names explicit ``file_path``(s): the policy-allowed path
-   stages only those paths (never ``git add -A``) so unvetted changes
-   cannot be swept into the commit past the review gate.
+5. The commit names explicit ``file_path``(s): there is no full-worktree
+   mode -- every commit is limited to the named paths (never ``git add -A``),
+   so unvetted changes cannot be swept into the commit past the review gate.
 
 These tests exercise ``GitInfoTool._git_commit`` directly (bypassing
 ``execute()``) with monkeypatched execution backends, so no git binary and
@@ -191,7 +191,7 @@ def test_feature_branch_commit_allowed_with_flag_container_mode(
         "commit",
     ]
     assert ["rev-parse", "--abbrev-ref", "HEAD"] in container_args
-    assert ["add", "agent_change.py"] in container_args
+    assert ["add", "--", "agent_change.py"] in container_args
     assert all("-A" not in args for args in container_args)
     assert ["commit", "-m", "agent commit"] in container_args
     # The container path must never inject --no-verify.
@@ -448,14 +448,14 @@ def test_feature_branch_allowed_rejects_whitespace_only_suffix(
 
 
 # ---------------------------------------------------------------------------
-# Policy-allowed commits must name their paths: never `git add -A` (that
-# sweep would stage unvetted changes past the review gate).
+# Every commit must name its paths: full-commit mode (git add -A) is
+# removed, so a commit without file_path is rejected before any git
+# subprocess runs.
 # ---------------------------------------------------------------------------
 
 
-def test_feature_branch_commit_requires_file_path_when_allowed(
-    tmp_path, monkeypatch
-):
+def test_commit_requires_file_path(tmp_path, monkeypatch):
+    """No full-worktree mode: every commit must name its paths."""
     tool = _tool(agent_config={"git_allow_worktree_commits": True})
     monkeypatch.setattr(tool, "_is_operator_managed_worktree", lambda r: True)
     monkeypatch.setattr(tool, "_use_container_mode", lambda: True)
@@ -468,7 +468,7 @@ def test_feature_branch_commit_requires_file_path_when_allowed(
     result = tool._git_commit(tmp_path)
 
     assert result == (
-        "Error: file_path is required for agent commits on feature branches"
+        "Error: file_path is required for commit operation (at least one path)"
     )
     # Only the container-mandatory branch query ran; no add/commit.
     assert calls == [(["rev-parse", "--abbrev-ref", "HEAD"], False)]
@@ -499,7 +499,7 @@ def test_feature_branch_commit_stages_only_named_path(
     # container-mandatory (no host fallback anywhere).
     assert calls == [
         (["rev-parse", "--abbrev-ref", "HEAD"], False),
-        (["add", "agent_change.py"], False),
+        (["add", "--", "agent_change.py"], False),
         (["commit", "-m", "agent commit"], False),
     ]
     # The full-worktree sweep (`git add -A`) must never be used.

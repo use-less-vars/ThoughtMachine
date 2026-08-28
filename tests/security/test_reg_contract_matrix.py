@@ -147,6 +147,7 @@ def test_post_commit_hook_never_executes(tmp_path):
     tool = GitInfoTool(
         operation="commit",
         message="add hello",
+        file_path="hello.txt",
         working_dir=str(repo),
         session_permissions=FULL_PERMISSIONS,
     )
@@ -256,6 +257,7 @@ def test_host_file_write_to_hooks_then_commit_hook_ignored(tmp_path):
     tool = GitInfoTool(
         operation="commit",
         message="add hello",
+        file_path="hello.txt",
         working_dir=str(repo),
         session_permissions=FULL_PERMISSIONS,
     )
@@ -319,6 +321,7 @@ def test_git_add_status_diff_log_work(tmp_path):
     tool = GitInfoTool(
         operation="commit",
         message="base",
+        file_path="base.txt",
         working_dir=str(repo),
         session_permissions=FULL_PERMISSIONS,
     )
