@@ -25,6 +25,7 @@ class ProviderProfile(BaseModel):
     default_model: str = ''
     models: List[str] = Field(default_factory=list)
     timeout: int = 120
+    max_retries: Optional[int] = None
 
 
 class ProviderManager:
@@ -128,6 +129,8 @@ class ProviderManager:
         the authoritative source for ``provider_type``, ``base_url``, and
         ``api_key`` — they overwrite *config_dict* when non-empty (empty
         profile values leave the config's values intact).
+        ``timeout`` and ``max_retries`` (when not None) are copied into
+        ``provider_config`` so LLMClient applies them.
         For ``model``, ``model_override`` (if set) takes precedence over the
         profile's ``default_model``.  If ``model`` is explicitly provided in
         *config_dict* it is preserved; the profile's ``default_model`` is only
@@ -163,6 +166,18 @@ class ProviderManager:
             result['base_url']       = profile.base_url
         if profile.api_key:
             result['api_key']        = profile.api_key
+
+        # Timeout / retry settings: copy from profile into provider_config
+        # so LLMClient picks them up.  Only non-None values are copied (no
+        # empty keys); LLM_TIMEOUT / LLM_MAX_RETRIES env vars still take
+        # precedence inside LLMClient.
+        provider_cfg = dict(result.get('provider_config') or {})
+        if profile.timeout is not None:
+            provider_cfg['timeout'] = profile.timeout
+        if profile.max_retries is not None:
+            provider_cfg['max_retries'] = profile.max_retries
+        if provider_cfg:
+            result['provider_config'] = provider_cfg
 
         # Model: model_override > explicit user model > profile.default_model
         model_override = config_dict.get('model_override')
