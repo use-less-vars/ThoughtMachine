@@ -17,15 +17,22 @@
 #    * --check-only:   run ONLY the preflight checks, then exit 0 without
 #                      starting anything (also honors TM_CHECK_ONLY=1).
 #
-#  The backend is always started in the background with stdout+stderr
-#  redirected to logs/backend_startup.log; the script polls
-#  http://127.0.0.1:8000/api/health for up to 30 s before considering the
-#  backend up. The frontend is only started after the backend is healthy.
+#  The backend is always started in the background; its stdout+stderr are
+#  mirrored to the console AND to logs/backend_startup.log (via tee). The
+#  script polls http://127.0.0.1:8000/api/health for up to 30 s before
+#  considering the backend up. The frontend is only started after the
+#  backend is healthy.
 #===============================================================================
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# Make sure standard system paths are on PATH for docker detection even in
+# minimal environments (cron/systemd, non-login shells).
+case ":$PATH:" in *:/usr/bin:*) ;; *) export PATH="/usr/bin:$PATH" ;; esac
+case ":$PATH:" in *:/usr/sbin:*) ;; *) export PATH="/usr/sbin:$PATH" ;; esac
+mkdir -p "$SCRIPT_DIR/logs"
 
 DOCTOR="$SCRIPT_DIR/scripts/doctor_checks.py"
 PROD_MODE=false
@@ -121,14 +128,17 @@ PY
     return $?
 }
 
-# Start the backend in the background with stdout+stderr -> logs/backend_startup.log
-# and wait for it to become healthy. Exits 1 (with the log tail) on failure.
+# Start the backend in the background with stdout+stderr mirrored to the
+# console and logs/backend_startup.log, then wait for it to become healthy.
+# Exits 1 (with the log tail) on failure.
 start_backend() {
     # $1 = backend command line (kept word-split on purpose)
     mkdir -p "$SCRIPT_DIR/logs"
-    echo "  Starting backend, log -> logs/backend_startup.log ..."
+    echo "  Starting backend; console output mirrored to logs/backend_startup.log ..."
     # shellcheck disable=SC2086
-    $1 >"$BACKEND_LOG" 2>&1 &
+    # The subshell execs the backend, so $! is the backend's own PID (tee's
+    # PID is not captured); tee truncates the log on start.
+    ( exec $1 ) > >(tee "$BACKEND_LOG") 2>&1 &
     BACKEND_PID=$!
     echo "  Backend PID: $BACKEND_PID"
     if ! wait_for_backend "$BACKEND_PID"; then
@@ -171,8 +181,8 @@ echo "      ok."
 python3 -m thoughtmachine.doctor || true
 echo ""
 
-# --------------------------------------------------------- [1/7] venv (critical)
-echo "[1/7] Python virtual environment ..."
+# --------------------------------------------------------- [1/8] venv (critical)
+echo "[1/8] Python virtual environment ..."
 VENV_OUT="$(doctor --ensure-venv 2>&1)"
 VENV_RC=$?
 if [ "$VENV_RC" -ne 0 ]; then
@@ -187,8 +197,8 @@ if [ -n "$VENV_BROKEN" ]; then
 fi
 echo "      ok."
 
-# ------------------------------------------------------------ [2/7] Docker access
-echo "[2/7] Docker ..."
+# ------------------------------------------------------------ [2/8] Docker access
+echo "[2/8] Docker ..."
 DOCKER_OUT="$(doctor --check-docker 2>&1)"
 DOCKER_RC=$?
 if [ "$DOCKER_RC" -ne 0 ]; then
@@ -196,7 +206,10 @@ if [ "$DOCKER_RC" -ne 0 ]; then
     DOCKER_DETAIL="$(printf '%s' "$DOCKER_OUT" | json_get detail)"
     case "$DOCKER_REASON" in
         permission_denied)
-            if [ "${TM_REEXEC:-}" = "1" ]; then
+            if $CHECK_ONLY; then
+                echo "      WARNING: Docker permission problem (reason: permission_denied) - continuing in --check-only mode."
+                [ -n "$DOCKER_DETAIL" ] && printf '%s\n' "$DOCKER_DETAIL" | sed 's/^/      /'
+            elif [ "${TM_REEXEC:-}" = "1" ]; then
                 if $DOCTOR_MODE; then
                     echo "      WARNING: Docker permission problem persists even inside the 'docker' group (continuing in --doctor mode)."
                 else
@@ -215,7 +228,10 @@ if [ "$DOCKER_RC" -ne 0 ]; then
             fi
             ;;
         daemon_down|lib_missing)
-            if $DOCTOR_MODE; then
+            if $CHECK_ONLY; then
+                echo "      WARNING: Docker is not usable (reason: $DOCKER_REASON) - continuing in --check-only mode."
+                [ -n "$DOCKER_DETAIL" ] && printf '%s\n' "$DOCKER_DETAIL" | sed 's/^/      /'
+            elif $DOCTOR_MODE; then
                 echo "      WARNING: Docker is not usable (reason: $DOCKER_REASON) - continuing in --doctor mode."
                 [ -n "$DOCKER_DETAIL" ] && printf '%s\n' "$DOCKER_DETAIL" | sed 's/^/      /'
             else
@@ -228,7 +244,10 @@ if [ "$DOCKER_RC" -ne 0 ]; then
             fi
             ;;
         *)
-            if $DOCTOR_MODE; then
+            if $CHECK_ONLY; then
+                echo "      WARNING: Docker check failed (reason: ${DOCKER_REASON:-unknown}) - continuing in --check-only mode."
+                [ -n "$DOCKER_DETAIL" ] && printf '%s\n' "$DOCKER_DETAIL" | sed 's/^/      /'
+            elif $DOCTOR_MODE; then
                 echo "      WARNING: Docker check failed (reason: ${DOCKER_REASON:-unknown}) - continuing in --doctor mode."
                 [ -n "$DOCKER_DETAIL" ] && printf '%s\n' "$DOCKER_DETAIL" | sed 's/^/      /'
             else
@@ -242,8 +261,35 @@ else
     echo "      ok."
 fi
 
-# ------------------------------------------------ [3/7] Ports 8000 (API) / 5173 (Vite)
-echo "[3/7] Ports 8000 (backend) and 5173 (frontend) ..."
+# ---------------------------------------------- [3/8] Stale containers cleanup
+echo "[3/8] Stale ThoughtMachine containers ..."
+STALE_OUT="$(doctor --check-stale-containers 2>&1)"
+STALE_RC=$?
+STALE_COUNT="$(printf '%s' "$STALE_OUT" | json_get count)"
+if [ "$STALE_RC" -eq 0 ]; then
+    echo "      ok (no stale containers)."
+elif [ -z "$STALE_COUNT" ]; then
+    echo "      (stale-container check skipped)"
+else
+    STALE_DETAIL="$(printf '%s' "$STALE_OUT" | json_get detail)"
+    echo "      found ${STALE_COUNT} stale container(s)."
+    [ -n "$STALE_DETAIL" ] && printf '%s\n' "$STALE_DETAIL" | sed 's/^/      /'
+    if $CHECK_ONLY; then
+        echo "      (--check-only: stale containers reported, not removed)"
+    else
+        CLEAN_OUT="$(doctor --clean-stale-containers 2>&1)" || true
+        CLEAN_DETAIL="$(printf '%s' "$CLEAN_OUT" | json_get detail)"
+        if [ -n "$CLEAN_DETAIL" ]; then
+            echo "      $CLEAN_DETAIL."
+        else
+            echo "      (cleanup output unavailable - ignoring)"
+        fi
+    fi
+fi
+echo ""
+
+# ------------------------------------------------ [4/8] Ports 8000 (API) / 5173 (Vite)
+echo "[4/8] Ports 8000 (backend) and 5173 (frontend) ..."
 for port in 8000 5173; do
     PORT_OUT="$(doctor --check-port "$port" 2>&1)"
     PORT_RC=$?
@@ -256,8 +302,8 @@ for port in 8000 5173; do
 done
 echo "      ok."
 
-# -------------------------------------------------------------- [4/7] Node.js
-echo "[4/7] Node.js >= 18 ..."
+# -------------------------------------------------------------- [5/8] Node.js
+echo "[5/8] Node.js >= 18 ..."
 NODE_OUT="$(doctor --check-node 2>&1)"
 NODE_RC=$?
 if [ "$NODE_RC" -ne 0 ]; then
@@ -270,8 +316,8 @@ if [ "$NODE_RC" -ne 0 ]; then
 fi
 echo "      ok."
 
-# ------------------------------------------------ [5/7] ~/.thoughtmachine writable
-echo "[5/7] ~/.thoughtmachine writable ..."
+# ------------------------------------------------ [6/8] ~/.thoughtmachine writable
+echo "[6/8] ~/.thoughtmachine writable ..."
 TM_OUT="$(doctor --check-dotthoughtmachine 2>&1)"
 TM_RC=$?
 if [ "$TM_RC" -ne 0 ]; then
@@ -287,13 +333,13 @@ if [ "$TM_RC" -ne 0 ]; then
 fi
 echo "      ok."
 
-# ------------------------------------------------------------------ [6/7] Locale
-echo "[6/7] Locale ..."
+# ------------------------------------------------------------------ [7/8] Locale
+echo "[7/8] Locale ..."
 export LANG=C.UTF-8
 echo "      LANG set to C.UTF-8 (avoids locale-related errors)."
 
-# ------------------------------------------------------------ [7/7] Ready message
-echo "[7/7] All checks passed."
+# ------------------------------------------------------------ [8/8] Ready message
+echo "[8/8] All checks passed."
 echo ""
 
 if $CHECK_ONLY; then

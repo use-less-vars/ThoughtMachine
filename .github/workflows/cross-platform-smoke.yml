@@ -1,0 +1,140 @@
+#===============================================================================
+# cross-platform-smoke.yml - cross-platform install + backend smoke CI.
+#
+# Proves the two supported platforms boot the real backend and answer the
+# real health contract (GET /api/health - the legacy /health route does not
+# exist in the backend):
+#
+#   * linux-install (ubuntu-latest, NO job container): ./install.sh
+#     completes, ./start_thoughtmachine.sh --check-only passes (Docker
+#     problems only WARN in --check-only mode - degraded mode is supported),
+#     then the backend is started exactly like the launcher does
+#     (.venv/bin/python -m web_ui.backend.server) and GET /api/health is
+#     polled until HTTP 200, then the server is stopped.
+#
+#   * windows-smoke (windows-latest): a fresh venv is created, the Python
+#     dependencies are installed, the critical import is verified, and
+#     scripts/smoke_windows.ps1 boots the backend the same way the Windows
+#     launcher does (python -m web_ui.backend.server) and polls
+#     GET http://127.0.0.1:8000/api/health until HTTP 200, then stops it.
+#===============================================================================
+name: Cross-Platform Smoke
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: cross-platform-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  #---------------------------------------------------------------------------
+  # Job A - Linux: real installer + preflight gate + backend /api/health smoke
+  # on a stock ubuntu-latest runner (no container, no mounted docker socket
+  # needed - --check-only tolerates an unusable Docker daemon).
+  #---------------------------------------------------------------------------
+  linux-install:
+    name: Linux install + check-only + backend smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # install.sh check [4/5] needs `python3 -m venv` (python3-venv). The
+      # runner already ships python3, node >= 18, git, curl and a running
+      # Docker daemon, so python3-venv is the only apt-guaranteed gap.
+      - name: Install prerequisite packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-venv curl
+
+      # start_thoughtmachine.sh check [6/8] (~/.thoughtmachine writable) is
+      # fatal in ALL modes - even --check-only - so it must exist up front.
+      - name: Pre-create $HOME/.thoughtmachine
+        run: mkdir -p "$HOME/.thoughtmachine"
+
+      # install.sh: platform gate (Linux/x86_64/debian-or-ubuntu), Python
+      # >= 3.11, Docker daemon (already running on the runner), docker
+      # group, venv (created + dependencies installed), Node.js >= 18.
+      # Exits 0 only when every critical check passes.
+      - name: Run ./install.sh
+        run: bash install.sh
+
+      # Full pre-launch gate without starting anything. Docker daemon_down /
+      # lib_missing / permission problems only WARN in --check-only mode
+      # (the project supports a docker-less degraded mode), so this proves
+      # the checks that matter: tools, venv, ports, Node.js, vault.
+      - name: Run ./start_thoughtmachine.sh --check-only
+        run: bash start_thoughtmachine.sh --check-only
+
+      # Boot the real backend exactly like start_thoughtmachine.sh does
+      # (.venv/bin/python -m web_ui.backend.server), poll GET /api/health
+      # until HTTP 200 (up to 60s), then stop the server.
+      - name: Start backend and smoke GET /api/health
+        run: |
+          mkdir -p logs
+          .venv/bin/python -m web_ui.backend.server > logs/backend_ci.log 2>&1 &
+          BACKEND_PID=$!
+          echo "backend pid: $BACKEND_PID"
+          HTTP_CODE=""
+          for _ in $(seq 1 60); do
+            HTTP_CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:8000/api/health 2>/dev/null || true)"
+            if [ "$HTTP_CODE" = "200" ]; then
+              break
+            fi
+            if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+              echo "::error::backend exited before /api/health answered - tail of logs/backend_ci.log:"
+              tail -n 40 logs/backend_ci.log || true
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::GET /api/health never returned HTTP 200 within 60s (last code: ${HTTP_CODE:-none})"
+            tail -n 60 logs/backend_ci.log || true
+            kill "$BACKEND_PID" 2>/dev/null || true
+            exit 1
+          fi
+          echo "OK: GET /api/health returned HTTP 200"
+          kill "$BACKEND_PID" 2>/dev/null || true
+          wait "$BACKEND_PID" 2>/dev/null || true
+
+  #---------------------------------------------------------------------------
+  # Job B - Windows: venv + deps + critical import + scripts/smoke_windows.ps1
+  # (the smoke script polls GET http://127.0.0.1:8000/api/health - it was
+  # updated from the legacy /health route; the backend has no /health route).
+  #---------------------------------------------------------------------------
+  windows-smoke:
+    name: Windows venv + smoke script
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Create virtual environment
+        run: python -m venv .venv
+
+      - name: Upgrade pip and install project dependencies
+        run: |
+          .venv\Scripts\python -m pip install --upgrade pip
+          .venv\Scripts\python -m pip install -r requirements.txt
+
+      - name: Verify critical imports
+        run: .venv\Scripts\python -c "import web_ui.backend.server; print('IMPORTS_OK')"
+
+      # The script reuses the .venv, re-installs deps (idempotent), verifies
+      # imports, then boots the backend with the same invocation the Windows
+      # launcher uses (.venv\Scripts\python.exe -m web_ui.backend.server).
+      - name: Run scripts/smoke_windows.ps1
+        run: |
+          # Polls GET http://127.0.0.1:8000/api/health until HTTP 200 (inside the script), then stops the backend.
+          powershell -ExecutionPolicy Bypass -File scripts\smoke_windows.ps1

@@ -41,6 +41,7 @@ import WorkerPanelArea from './components/WorkerPanelArea'
 import { isWorkerEventRenderable } from './components/chat/adaptWorkerEvent'
 import { routeEventsToPanels } from './components/chat/workerEventRouting'
 import LoggingPanel from './components/LoggingPanel'
+import OnboardingWizard from './components/OnboardingWizard'
 import WorkspaceSelector from './components/WorkspaceSelector'
 import WorkspacePanel from './components/workspace/WorkspacePanel'
 import { useRoute, useNavigate } from './router'
@@ -149,6 +150,7 @@ export default function App() {
   const [dockerHealth, setDockerHealth] = useState(null)  // /api/health/containers payload (null while loading or backend down)
   const [backendDown, setBackendDown] = useState(false)   // health fetch failed or non-200 → backend unreachable
   const [backendBannerDismissed, setBackendBannerDismissed] = useState(false)
+  const [onboardingDone, setOnboardingDone] = useState(null)  // null = unknown / fetch failed (wizard hidden); false → show wizard
 
   const pendingWorkerSelectionRef = useRef(null)  // { workerName, workspaceId, instanceId, instanceLabel } queued before activeSessionId is set
   const tabActionsRef = useRef({})                // tabId -> { sendCommand, getSessionId }
@@ -433,6 +435,16 @@ export default function App() {
     const ws = wsRef.current
     if (!ws || ws.readyState !== WebSocket.OPEN) return
     ws.send(JSON.stringify({ command, ...payload }))
+  }, [])
+
+  // ── Wizard sendCommand (used ONLY for save_provider) ───────────────────
+  // Returns false when the hub WS is not open so the wizard can surface a
+  // "backend not ready" message instead of silently dropping the provider.
+  const wizardSend = useCallback((command, payload = {}) => {
+    const ws = wsRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false
+    ws.send(JSON.stringify({ command, ...payload }))
+    return true
   }, [])
 
   // ── Handle session renamed (triggered by SessionTab via callback) ─────
@@ -963,21 +975,37 @@ export default function App() {
   }, [])
 
   // ── Poll backend health (drives the backend-down + degraded-Docker banners) ─
-  // The FIRST fetch the app makes: GET /api/health/containers on mount, then
-  // every 10s. A fetch failure or non-200 means the backend itself is down →
-  // the "Backend not running" banner; only a 200 renders the structured
-  // docker payload (available/reason/hint). The ref guard skips a poll tick
-  // while the previous request is still in flight, so polls never overlap.
+  // Two-step probe, run on mount then every 10s:
+  //   Step 1  GET /api/health           — liveness only. A fetch failure or
+  //             non-200 means the backend itself is down → the
+  //             "Backend not running" banner.
+  //   Step 2  GET /api/health/containers — only when Step 1 succeeded. A 200
+  //             renders the structured docker payload (available/reason/hint);
+  //             a failure here leaves Docker "unverified" (no banner, no raw
+  //             error text) — the backend is up, so the backend-down banner
+  //             would be wrong.
+  // The ref guard skips a poll tick while the previous request is still in
+  // flight, so polls never overlap.
   const checkBackendHealth = useCallback(async () => {
     if (healthInFlightRef.current) return
     healthInFlightRef.current = true
     const hostname = window.location.hostname
     const port = import.meta.env.VITE_BACKEND_PORT || '8000'
     try {
-      const res = await fetch(`http://${hostname}:${port}/api/health/containers`)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
-      setDockerHealth(data)
+      // Step 1: backend liveness
+      const healthRes = await fetch(`http://${hostname}:${port}/api/health`)
+      if (!healthRes.ok) throw new Error(`HTTP ${healthRes.status}`)
+      try {
+        // Step 2: structured Docker availability (only when the backend is up)
+        const res = await fetch(`http://${hostname}:${port}/api/health/containers`)
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        setDockerHealth(await res.json())
+      } catch (err) {
+        // Backend is up but the containers probe failed → Docker unverified.
+        // Deliberately NOT backendDown: no banner, no raw error text.
+        console.error('Failed to fetch Docker health:', err)
+        setDockerHealth(null)
+      }
       setBackendDown(false)
       // Recovery re-arms the "Backend not running" banner for a future outage.
       setBackendBannerDismissed(false)
@@ -995,6 +1023,29 @@ export default function App() {
     const interval = setInterval(checkBackendHealth, 10000)
     return () => clearInterval(interval)
   }, [checkBackendHealth])
+
+  // ── First-run wizard: fetch onboarding status once on mount ────────────
+  // null (fetch failed / non-OK) keeps the wizard hidden — the backend-down
+  // banner already covers an unreachable backend.
+  useEffect(() => {
+    let cancelled = false
+    const hostname = window.location.hostname
+    const port = import.meta.env.VITE_BACKEND_PORT || '8000'
+    fetch(`http://${hostname}:${port}/api/onboarding/status`)
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        return res.json()
+      })
+      .then((data) => {
+        if (!cancelled) setOnboardingDone(data.onboarding_complete === true)
+      })
+      .catch((err) => {
+        console.error('Failed to fetch onboarding status:', err)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   // ── Fetch initial logging config on mount ─────────────────────────────
   useEffect(() => {
@@ -1024,21 +1075,22 @@ export default function App() {
         : dockerInfo
           ? dockerInfo.available === true
           : false
-  const dockerReason =
-    dockerInfo && typeof dockerInfo === 'object' ? dockerInfo.reason : null
   const dockerHint =
     dockerInfo && typeof dockerInfo === 'object' ? dockerInfo.hint : null
-  const degradedText = [
-    dockerHint,
-    dockerReason ? `(${dockerReason})` : null,
-  ].filter(Boolean).join(' ') || 'The Docker daemon is not reachable.'
+  // Only the actionable hint is shown — never raw error text. Fall back to a
+  // still-actionable generic line when the hint is missing/empty (the banner
+  // already prefixes "⚠ Docker unavailable — ").
+  const degradedText =
+    dockerHint && typeof dockerHint === 'string' && dockerHint.trim()
+      ? dockerHint
+      : 'see the backend startup log for details'
 
   // ── Render ────────────────────────────────────────────────────────────
   return (
     <div className="app-container">
       {backendDown && !backendBannerDismissed && (
         <div className="docker-health-banner" role="alert">
-          <span className="docker-health-banner-text">Backend not running. Check logs/backend_startup.log for details.</span>
+          <span className="docker-health-banner-text">Backend not running — check logs/backend_startup.log</span>
           <button
             className="docker-health-banner-dismiss"
             onClick={() => setBackendBannerDismissed(true)}
@@ -1149,6 +1201,14 @@ export default function App() {
         />
 
       </div>
+
+      {/* First-run setup wizard — last child of .app-container */}
+      {onboardingDone === false && (
+        <OnboardingWizard
+          onFinished={() => setOnboardingDone(true)}
+          sendCommand={wizardSend}
+        />
+      )}
     </div>
   )
 }
