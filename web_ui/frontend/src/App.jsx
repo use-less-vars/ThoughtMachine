@@ -41,6 +41,7 @@ import WorkerPanelArea from './components/WorkerPanelArea'
 import { isWorkerEventRenderable } from './components/chat/adaptWorkerEvent'
 import { routeEventsToPanels } from './components/chat/workerEventRouting'
 import LoggingPanel from './components/LoggingPanel'
+import OnboardingWizard from './components/OnboardingWizard'
 import WorkspaceSelector from './components/WorkspaceSelector'
 import WorkspacePanel from './components/workspace/WorkspacePanel'
 import { useRoute, useNavigate } from './router'
@@ -149,6 +150,7 @@ export default function App() {
   const [dockerHealth, setDockerHealth] = useState(null)  // /api/health/containers payload (null while loading or backend down)
   const [backendDown, setBackendDown] = useState(false)   // health fetch failed or non-200 → backend unreachable
   const [backendBannerDismissed, setBackendBannerDismissed] = useState(false)
+  const [onboardingDone, setOnboardingDone] = useState(null)  // null = unknown / fetch failed (wizard hidden); false → show wizard
 
   const pendingWorkerSelectionRef = useRef(null)  // { workerName, workspaceId, instanceId, instanceLabel } queued before activeSessionId is set
   const tabActionsRef = useRef({})                // tabId -> { sendCommand, getSessionId }
@@ -433,6 +435,16 @@ export default function App() {
     const ws = wsRef.current
     if (!ws || ws.readyState !== WebSocket.OPEN) return
     ws.send(JSON.stringify({ command, ...payload }))
+  }, [])
+
+  // ── Wizard sendCommand (used ONLY for save_provider) ───────────────────
+  // Returns false when the hub WS is not open so the wizard can surface a
+  // "backend not ready" message instead of silently dropping the provider.
+  const wizardSend = useCallback((command, payload = {}) => {
+    const ws = wsRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false
+    ws.send(JSON.stringify({ command, ...payload }))
+    return true
   }, [])
 
   // ── Handle session renamed (triggered by SessionTab via callback) ─────
@@ -1012,6 +1024,29 @@ export default function App() {
     return () => clearInterval(interval)
   }, [checkBackendHealth])
 
+  // ── First-run wizard: fetch onboarding status once on mount ────────────
+  // null (fetch failed / non-OK) keeps the wizard hidden — the backend-down
+  // banner already covers an unreachable backend.
+  useEffect(() => {
+    let cancelled = false
+    const hostname = window.location.hostname
+    const port = import.meta.env.VITE_BACKEND_PORT || '8000'
+    fetch(`http://${hostname}:${port}/api/onboarding/status`)
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        return res.json()
+      })
+      .then((data) => {
+        if (!cancelled) setOnboardingDone(data.onboarding_complete === true)
+      })
+      .catch((err) => {
+        console.error('Failed to fetch onboarding status:', err)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
   // ── Fetch initial logging config on mount ─────────────────────────────
   useEffect(() => {
     fetchLoggingConfig()
@@ -1166,6 +1201,14 @@ export default function App() {
         />
 
       </div>
+
+      {/* First-run setup wizard — last child of .app-container */}
+      {onboardingDone === false && (
+        <OnboardingWizard
+          onFinished={() => setOnboardingDone(true)}
+          sendCommand={wizardSend}
+        />
+      )}
     </div>
   )
 }
