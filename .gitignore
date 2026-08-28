@@ -123,6 +123,7 @@ config_snapshot.json
 
 # Local working docs — not part of the repo
 docs/*
+!docs/installation_guide.md
 !docs/logging.md
 !docs/decisions/
 !docs/decisions/logging-architecture.md
