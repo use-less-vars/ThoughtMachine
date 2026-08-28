@@ -142,3 +142,14 @@ docs/container_registry_design.md
 !docs/resource_execution_contract.md
 !docs/git_resource_execution_audit.md
 
+# Hygiene cleanup (2026-08-28): vendored pytest site-packages + pytest cache
+pytest_install/
+.pytest_cache/
+# WIP probes removed from tracking
+.docker_mount_test.txt
+test_ask_permission.txt
+# root scratch working docs
+/working_docs/
+line_number_report.md
+# huge WIP test-run log (removed from tracking)
+docs/testing/test_run_on_host.txt

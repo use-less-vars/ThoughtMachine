@@ -36,6 +36,18 @@ print(d.get(sys.argv[1], "") if isinstance(d, dict) else "")' "$1" 2>/dev/null |
 DONE_OK=()
 DONE_SKIP=()
 
+# ---------------------------------------------------------------- CI handling
+# GitHub Actions runners have no usable Docker daemon and no passwordless
+# sudo, so on CI the Docker steps must be optional. When CI is set, the
+# Docker install/daemon/group checks below are skipped; on a normal machine
+# (CI unset) the original behavior is preserved unchanged.
+CI="${CI:-}"
+if [ -n "$CI" ]; then
+    DOCKER_NONFATAL=1
+else
+    DOCKER_NONFATAL=0
+fi
+
 echo "============================================"
 echo "  ThoughtMachine - Install"
 echo "============================================"
@@ -100,6 +112,10 @@ echo "      ok (python3 ${PY_VERSION:-version unknown})."
 DONE_OK+=("Python >= 3.11 (${PY_VERSION:-unknown})")
 echo ""
 
+if [ "$DOCKER_NONFATAL" -eq 1 ]; then
+    echo "NOTE: CI environment detected — Docker checks skipped."
+    echo ""
+else
 # ------------------------------------------------------------------ [2/5] Docker daemon (critical)
 echo "[2/5] Docker daemon ..."
 DOCKER_OUT="$(doctor --check-docker 2>&1)"
@@ -182,6 +198,7 @@ else
     DONE_OK+=("Docker group")
 fi
 echo ""
+fi
 
 # ------------------------------------------------------------------ [4/5] venv (critical)
 echo "[4/5] Python virtual environment ..."
