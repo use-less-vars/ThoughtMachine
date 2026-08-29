@@ -39,6 +39,7 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import numbers
 import os
 import queue
 import tempfile
@@ -69,6 +70,71 @@ except ImportError:
 # via tool restrictions. The spawn Queue.get timeout must be a generous fixed
 # value so it never preempts the agent's own timeout logic.
 SPAWN_QUEUE_TIMEOUT = 600
+
+# ── Query wait grace ──
+# A worker's agent soft-times-out at ``timeout_seconds`` and then replies with
+# its timeout envelope. A caller waiting for that reply must therefore wait at
+# least ``timeout_seconds + QUERY_WAIT_GRACE_SECONDS`` so the worker's OWN
+# timeout envelope arrives before the caller force-stops it. Without the grace
+# the caller would preempt the worker's cooperative timeout with a destructive
+# stop and would surface a raw TimeoutError instead of the worker's timeout
+# envelope.
+QUERY_WAIT_GRACE_SECONDS = 60
+
+
+def _worker_timeout_detected(agent_state: Any, last_elapsed_val: Any, timeout_seconds: Any) -> bool:
+    """Return True when the agent state indicates a soft timeout (D3).
+
+    The production TimeState enum values are LOWERCASE ('critical' — see
+    agent/core/state.py), so the legacy uppercase-only comparison never
+    matched and soft timeouts were missed. Detection is robust via any of:
+      * restriction_reason == 'timeout' (state.py sets this when the agent's
+        time monitor crosses the timeout threshold), or
+      * time_state.value case-insensitively equal to 'CRITICAL', or
+      * the loop actually ran >= timeout_seconds (belt-and-braces fallback
+        for when the time monitor is disabled but the budget was exceeded).
+    """
+    if agent_state is None:
+        return False
+    reason = getattr(agent_state, "restriction_reason", None)
+    time_value = None
+    if hasattr(agent_state, "time_state") and hasattr(agent_state.time_state, "value"):
+        time_value = getattr(agent_state.time_state, "value", None)
+    if reason == "timeout":
+        return True
+    if time_value is not None and str(time_value).upper() == "CRITICAL":
+        return True
+    elapsed_over_budget = False
+    if isinstance(last_elapsed_val, (int, float)) and not isinstance(last_elapsed_val, bool):
+        try:
+            budget = float(timeout_seconds)
+        except (TypeError, ValueError):
+            budget = None
+        if budget is not None and budget > 0:
+            elapsed_over_budget = last_elapsed_val >= budget
+    return elapsed_over_budget
+
+
+def _worker_query_wait_timeout(timeout_seconds: Any, fallback: float = 300.0) -> float:
+    """Return the wall-clock wait a caller should allow for a worker reply.
+
+    A worker whose agent soft-times-out at ``timeout_seconds`` replies with
+    its own timeout envelope at roughly that deadline, so the caller must wait
+    ``timeout_seconds + QUERY_WAIT_GRACE_SECONDS``. Non-numeric or non-positive
+    values (e.g. ``None``, a mock's auto-attribute) fall back to ``fallback``
+    (the legacy fixed wait).
+    """
+    if timeout_seconds is None:
+        return fallback
+    # isinstance check rather than try/float(): a MagicMock auto-attribute
+    # supports __float__ (returning 1.0), which would silently bypass the
+    # fallback. numbers.Real is True only for genuine numeric types.
+    if not isinstance(timeout_seconds, numbers.Real):
+        return fallback
+    t = float(timeout_seconds)
+    if t <= 0:
+        return fallback
+    return t + QUERY_WAIT_GRACE_SECONDS
 
 # ── Session-level worker spawn cap (safe default) ──
 # Limits how many LIVE worker threads a single session may have running at
@@ -1909,15 +1975,22 @@ class WorkerThread(threading.Thread):
         # Store elapsed time for inclusion in query result
         self._last_elapsed_val = time.monotonic() - _start
 
-        # Detect timeout
+        # Detect timeout (D3). The production TimeState enum values are
+        # LOWERCASE ('critical' — see agent/core/state.py), so the legacy
+        # uppercase comparison never matched and soft timeouts were missed.
+        # Detect robustly via any of:
+        #   * restriction_reason == 'timeout' (state.py sets this when the
+        #     agent's time monitor crosses the timeout threshold), or
+        #   * time_state.value case-insensitively equal to 'CRITICAL', or
+        #   * the loop actually ran >= timeout_seconds (belt-and-braces
+        #     fallback for when the time monitor is disabled but the budget
+        #     was exceeded).
         if hasattr(self, '_agent') and self._agent is not None:
             try:
-                agent_state = self._agent.state
-                if (
-                    hasattr(agent_state, 'time_state')
-                    and hasattr(agent_state.time_state, 'value')
-                    and agent_state.time_state.value == "CRITICAL"
-                    and getattr(agent_state, 'restriction_reason', None) == "timeout"
+                if _worker_timeout_detected(
+                    self._agent.state,
+                    getattr(self, '_last_elapsed_val', None),
+                    getattr(self, '_timeout_seconds', None),
                 ):
                     self._timeout_triggered = True
             except Exception:
@@ -2542,9 +2615,13 @@ class WorkerThread(threading.Thread):
                     "token_usage": self._final_token_usage,
                 }
 
-                # Determine status for force-stop cases
+                # Determine status for force-stop cases. A soft timeout is
+                # terminal for the attempt even when the agent emitted a
+                # 'progress' status: the envelope must report 'timeout' so the
+                # caller surfaces the worker's own timeout instead of a
+                # still-running impression (D3).
                 status = self._respond_metadata.get("status")
-                if self._timeout_triggered and not status:
+                if self._timeout_triggered:
                     status = "timeout"
 
                 # Build envelope
@@ -2678,6 +2755,20 @@ class WorkerThread(threading.Thread):
                 except Exception:
                     pass
         finally:
+            # D2: a worker that TERMINATED VIA ITS OWN TIMEOUT MECHANISM is
+            # removed from the live registry so it never leaves a stale
+            # (ghost) entry behind. Cooperatively-stopped or completed workers
+            # KEEP their entry (callers observe the final status via
+            # action='check'; spawn only reuses live threads). Best-effort:
+            # the force-stop path may already have popped it.
+            if self._timeout_triggered:
+                try:
+                    _WorkerRegistry.get_instance().unregister_worker(
+                        self.session_id or "", self.worker_name,
+                        instance_id=self.instance_id,
+                    )
+                except Exception:
+                    pass
             try:
                 unregister_worker_event_bus(self.session_id or "", self.worker_name, instance_id=self.instance_id)
             except Exception:
@@ -3532,6 +3623,8 @@ class Worker(ToolBase):
         resume_paused_worker = None
         spawn_iid = None
         explicit_iid = self.instance_id
+        reuse_target = None  # (thread, instance_id, legacy_message); set when a
+                             # live non-paused instance is reused (D2).
         with _registry_lock:
             live_same = []
             for key, t in list(_worker_registry.items()):
@@ -3558,19 +3651,17 @@ class Worker(ToolBase):
                         resume_paused_worker = existing
                     else:
                         # Continue-existing routing: an explicit instance that
-                        # is live and not paused is reused, not rejected.
-                        return {
-                            "worker_name": self.worker_name,
-                            "instance_id": explicit_iid,
-                            "instance_label": getattr(existing, "instance_label", None),
-                            "spawned": False,
-                            "status": existing.status,
-                            "message": (
+                        # is live and not paused is reused, not rejected. Any
+                        # spawn query is delivered to it AFTER the lock (D2).
+                        reuse_target = (
+                            existing,
+                            explicit_iid,
+                            (
                                 f"Worker '{self.worker_name}' instance "
                                 f"{explicit_iid} is already running; reusing "
                                 "the existing instance."
                             ),
-                        }
+                        )
                 else:
                     spawn_iid = explicit_iid
             else:
@@ -3588,21 +3679,76 @@ class Worker(ToolBase):
                     resume_paused_worker = live_same[0][1]
                 elif len(live_same) == 1 and not self.force:
                     # Continue-existing routing: a single live (non-paused)
-                    # instance is reused instead of spawning a duplicate.
-                    existing = live_same[0][1]
-                    return {
-                        "worker_name": self.worker_name,
-                        "instance_id": live_same[0][0],
-                        "instance_label": getattr(existing, "instance_label", None),
-                        "spawned": False,
-                        "status": existing.status,
-                        "message": (
+                    # instance is reused instead of spawning a duplicate. Any
+                    # spawn query is delivered to it AFTER the lock (D2).
+                    reuse_target = (
+                        live_same[0][1],
+                        live_same[0][0],
+                        (
                             f"Worker '{self.worker_name}' is already running; "
                             "reusing the existing instance."
                         ),
-                    }
+                    )
                 else:
                     spawn_iid = max([iid for iid, _ in live_same], default=0) + 1
+
+        # ── Reuse deliver-and-block (D2) ──
+        # A spawn request colliding with a live, non-paused instance used to
+        # silently DROP its query. Now the query is delivered to the existing
+        # instance via send_query (private reply queue) and the caller blocks
+        # for the reply — same semantics as a query action, without spawning a
+        # duplicate. The existing worker is NEVER stopped on timeout: it is a
+        # pre-existing live instance, not one we spawned, and it can be
+        # queried again later.
+        if reuse_target is not None:
+            reuse_thread, reuse_iid, reuse_message = reuse_target
+            query = (
+                self.context.get("query", "")
+                if isinstance(self.context, dict)
+                else str(self.context or "")
+            )
+            if not query:
+                # No query to deliver — nothing was dropped; keep the legacy
+                # reuse message.
+                return {
+                    "worker_name": self.worker_name,
+                    "instance_id": reuse_iid,
+                    "instance_label": getattr(reuse_thread, "instance_label", None),
+                    "spawned": False,
+                    "status": reuse_thread.status,
+                    "message": reuse_message,
+                }
+            wait = _worker_query_wait_timeout(
+                getattr(reuse_thread, "_timeout_seconds", None),
+                fallback=300.0,
+            )
+            try:
+                response = reuse_thread.send_query(query, timeout=wait)
+            except TimeoutError as exc:
+                return {
+                    "error": str(exc),
+                    "note": (
+                        f"Worker '{self.worker_name}' instance {reuse_iid} did "
+                        "not respond within the query window; the existing "
+                        "instance is still alive and can be queried again via "
+                        "action='query'."
+                    ),
+                    "worker_name": self.worker_name,
+                    "instance_id": reuse_iid,
+                    "instance_label": getattr(reuse_thread, "instance_label", None),
+                    "spawned": False,
+                    "status": reuse_thread.status,
+                }
+            elapsed = reuse_thread._last_elapsed()
+            return {
+                "worker_name": self.worker_name,
+                "instance_id": reuse_iid,
+                "instance_label": getattr(reuse_thread, "instance_label", None),
+                "spawned": False,
+                "status": reuse_thread.status,
+                "response": response,
+                "elapsed_seconds": round(elapsed, 1) if elapsed is not None else None,
+            }
 
         if resume_paused_worker is not None:
             # Resume the paused worker and send the new query.
@@ -3632,11 +3778,15 @@ class Worker(ToolBase):
             resume_paused_worker._input_queue.put(query)
             if stale_query is not None:
                 resume_paused_worker._input_queue.put(stale_query)
+            resume_wait = _worker_query_wait_timeout(
+                getattr(resume_paused_worker, "_timeout_seconds", None),
+                fallback=SPAWN_QUEUE_TIMEOUT,
+            )
             try:
-                final_result = resume_paused_worker._output_queue.get(timeout=SPAWN_QUEUE_TIMEOUT)
+                final_result = resume_paused_worker._output_queue.get(timeout=resume_wait)
             except queue.Empty:
                 final_result = json.dumps({
-                    "error": f"Worker '{self.worker_name}' did not respond within {SPAWN_QUEUE_TIMEOUT}s",
+                    "error": f"Worker '{self.worker_name}' did not respond within {resume_wait}s",
                     "note": "Worker timed out. The paused worker was resumed but did not produce a response.",
                 })
             try:
@@ -3885,12 +4035,16 @@ class Worker(ToolBase):
             and "query" in thread._initial_context
         )
         if has_auto_query:
+            auto_wait = _worker_query_wait_timeout(
+                getattr(thread, "_timeout_seconds", None),
+                fallback=SPAWN_QUEUE_TIMEOUT,
+            )
             try:
-                final_result = thread._output_queue.get(timeout=SPAWN_QUEUE_TIMEOUT)
+                final_result = thread._output_queue.get(timeout=auto_wait)
             except queue.Empty:
                 final_result = json.dumps({
                     "error": f"Worker '{self.worker_name}' did not respond "
-                             f"within {SPAWN_QUEUE_TIMEOUT}s",
+                             f"within {auto_wait}s",
                     "note": "Worker timed out. The result above is partial work "
                              "completed before timeout. The worker thread is still "
                              "alive — you can query it again via action='query' to "
@@ -4119,9 +4273,19 @@ class Worker(ToolBase):
             except Exception:
                 pass
 
+        wait = _worker_query_wait_timeout(
+            getattr(thread, "_timeout_seconds", None),
+            fallback=300.0,
+        )
+        if wait != 300.0:
+            logger.info(
+                "query wait %.0fs (effective timeout %.0fs + grace) exceeds legacy 300s cap",
+                wait,
+                wait - QUERY_WAIT_GRACE_SECONDS,
+            )
         try:
             # Block until the worker responds
-            response = thread.send_query(self.worker_query, timeout=300.0)
+            response = thread.send_query(self.worker_query, timeout=wait)
             elapsed = thread._last_elapsed()
             result = {
                 "worker_name": self.worker_name,
@@ -4343,7 +4507,13 @@ class Worker(ToolBase):
                 "job_id": job_id,
                 "worker_name": self.worker_name,
             }
-        total = min(int(self.timeout_seconds or 60), 300)
+        requested_timeout = int(self.timeout_seconds or 60)
+        if requested_timeout > 300:
+            logger.info(
+                "wait_for_job: requested timeout %ds exceeds 300s cap; clamped to 300s",
+                requested_timeout,
+            )
+        total = min(requested_timeout, 300)
         deadline = time.monotonic() + total
         last_status = rec.get("status")
         while True:
