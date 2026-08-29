@@ -194,6 +194,12 @@ except ImportError as e:
     _record_import_failure("GitInfoTool", e)
 
 try:
+    from .host_bash_tool import HostBashTool
+    TOOL_CLASSES.append(HostBashTool)
+except ImportError as e:
+    _record_import_failure("HostBashTool", e)
+
+try:
     from .knowledge_base import KnowledgeBaseTool
     TOOL_CLASSES.append(KnowledgeBaseTool)
 except ImportError as e:

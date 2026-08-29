@@ -136,7 +136,8 @@ class CheckSystem(ToolBase):
                       "'workspace_info' (workspace metadata), "
                       "'network_diagnostics' (connectivity checks), "
                       "'event_bus_status' (EventBus subscriber info), "
-                      "'event_log' (tail recent EventLogger entries).",
+                      "'event_log' (tail recent EventLogger entries), "
+                      "'vault_status' (vault drift vs schema manifest).",
     )
 
     skip_output_truncation: ClassVar[bool] = True
@@ -248,6 +249,7 @@ class CheckSystem(ToolBase):
                 "mcp_servers": lambda: self._query_mcp_servers(ws_id),
                 "event_bus_status": lambda: self._query_event_bus_status(),
                 "event_log": lambda: self._query_event_log(),
+                "vault_status": lambda: self._query_vault_status(),
             }
 
             handler = handler_map.get(query)
@@ -828,6 +830,23 @@ class CheckSystem(ToolBase):
             return "\n".join(parts)
         except Exception as e:
             return f"[event_log] Error: {e}"
+
+    def _query_vault_status(self) -> dict:
+        """Run VaultDriftChecker against the vault root; returns a structured, secret-free report."""
+        checker = None
+        try:
+            from agent.config.vault_drift import VaultDriftChecker, DriftAbortError
+            from thoughtmachine.vault import vault_root
+        except ImportError as exc:
+            return {"status": "error", "error": f"vault status unavailable: {exc}", "aborted": True}
+        try:
+            checker = VaultDriftChecker(vault_root=vault_root())
+            return checker.check()
+        except DriftAbortError:
+            partial = checker.report() if checker is not None else None
+            if isinstance(partial, dict):
+                return partial
+            return {"status": "error", "aborted": True, "error": "vault drift check aborted"}
 
     def _query_mcp_servers(self, ws_id: Optional[str]) -> dict:
         """Return list of configured MCP servers."""

@@ -1,0 +1,416 @@
+{
+  "schema_version": 1,
+  "vault_version": 1,
+  "manifest_version": 1,
+  "vault_version_file": "vault_version.json",
+  "description": "ThoughtMachine vault schema manifest — declares the expected vault file layout, required fields, safe defaults, and redaction policy. Consumed by agent.config.vault_drift.VaultDriftChecker.",
+  "files": {
+    "vault_version.json": {
+      "description": "Top-level vault format version marker (new in this foundation).",
+      "required": true,
+      "backfill_on_missing": true,
+      "safe_default": {
+        "vault_version": 1
+      },
+      "root_type": "dict",
+      "fields": {
+        "vault_version": {
+          "type": "int",
+          "required": true,
+          "default": 1,
+          "min": 1,
+          "description": "Vault layout version. Bump when the vault file layout changes."
+        }
+      }
+    },
+    "providers.json": {
+      "description": "LEGACY top-level provider profiles file (read by agent/config/provider_profile.py PROVIDERS_FILE).",
+      "required": false,
+      "backfill_on_missing": false,
+      "root_type": "dict",
+      "fields": {
+        "profiles": {
+          "type": "list",
+          "required": true,
+          "default": [],
+          "description": "List of ProviderProfile dicts (id, label, provider_type, base_url, api_key, default_model, models, timeout, max_retries)."
+        },
+        "active_profile_id": {
+          "type": "string",
+          "required": false,
+          "default": null,
+          "description": "ID of the active provider profile, or null."
+        }
+      }
+    },
+    "system/providers.json": {
+      "description": "Provider profiles file in the new layout (seeded from resources/default_providers.json).",
+      "required": true,
+      "backfill_on_missing": true,
+      "safe_default": {
+        "profiles": [],
+        "active_profile_id": null
+      },
+      "root_type": "dict",
+      "fields": {
+        "profiles": {
+          "type": "list",
+          "required": true,
+          "default": [],
+          "description": "List of ProviderProfile dicts."
+        },
+        "active_profile_id": {
+          "type": "string",
+          "required": false,
+          "default": null,
+          "description": "ID of the active provider profile, or null."
+        }
+      }
+    },
+    "agent_config.json": {
+      "description": "LEGACY top-level agent config (read-compat only; agent/config/loader.py get_config_paths). Never written by the web UI anymore.",
+      "required": false,
+      "backfill_on_missing": false,
+      "root_type": "dict",
+      "fields": {
+        "provider_type": {
+          "type": "string",
+          "required": false,
+          "description": "Provider type, e.g. openai_compatible."
+        },
+        "provider_id": {
+          "type": "string",
+          "required": false,
+          "description": "Active provider profile ID."
+        },
+        "base_url": {
+          "type": "string",
+          "required": false,
+          "description": "Provider base URL."
+        },
+        "model": {
+          "type": "string",
+          "required": false,
+          "description": "Default model name."
+        },
+        "temperature": {
+          "type": "number",
+          "required": false,
+          "min": 0.0,
+          "max": 2.0,
+          "description": "Sampling temperature."
+        },
+        "max_turns": {
+          "type": "int",
+          "required": false,
+          "min": 1,
+          "description": "Maximum conversation turns."
+        },
+        "system_prompt": {
+          "type": "string",
+          "required": false,
+          "description": "System prompt override."
+        },
+        "session_permissions": {
+          "type": "dict",
+          "required": false,
+          "description": "Session permission profile (container, network, filesystem, system, git, execution)."
+        },
+        "enabled_tools": {
+          "type": "list",
+          "required": false,
+          "description": "List of enabled tool names."
+        },
+        "provider_config": {
+          "type": "dict",
+          "required": false,
+          "description": "Provider-specific config (timeout, max_retries, ...)."
+        },
+        "api_key": {
+          "type": "string",
+          "required": false,
+          "redact": true,
+          "description": "Provider API key. REDACTED in all checker output."
+        }
+      }
+    },
+    "user/defaults.json": {
+      "description": "Global default config persisted by the web UI (GLOBAL_DEFAULT_KEYS subset). Auto-created by web_ui/backend/config_manager.py load_global_defaults.",
+      "required": true,
+      "backfill_on_missing": true,
+      "safe_default": {
+        "provider_id": "",
+        "model": "",
+        "base_url": "https://api.deepseek.com/v1/",
+        "temperature": 1.0,
+        "max_turns": 200,
+        "system_prompt": ""
+      },
+      "root_type": "dict",
+      "fields": {
+        "provider_id": {
+          "type": "string",
+          "required": false,
+          "default": "",
+          "description": "Global default provider profile ID."
+        },
+        "model": {
+          "type": "string",
+          "required": false,
+          "default": "",
+          "description": "Global default model."
+        },
+        "base_url": {
+          "type": "string",
+          "required": false,
+          "default": "",
+          "description": "Global default provider base URL."
+        },
+        "temperature": {
+          "type": "number",
+          "required": false,
+          "default": 1.0,
+          "min": 0.0,
+          "max": 2.0,
+          "description": "Global default temperature."
+        },
+        "max_turns": {
+          "type": "int",
+          "required": false,
+          "default": 200,
+          "min": 1,
+          "description": "Global default max turns."
+        },
+        "system_prompt": {
+          "type": "string",
+          "required": false,
+          "default": "",
+          "description": "Global default system prompt."
+        }
+      }
+    },
+    "system/factory_defaults.json": {
+      "description": "System factory defaults (seeded from resources/factory_defaults.json; read by agent/config/config_manager.py resolve_config_defaults).",
+      "required": true,
+      "backfill_on_missing": true,
+      "safe_default": {
+        "version": "1",
+        "description": "System factory defaults — immutable base configuration for ThoughtMachine vault.",
+        "config": {
+          "max_turns": 50,
+          "temperature": 0.7,
+          "provider_id": "",
+          "model": "",
+          "system_prompt": ""
+        }
+      },
+      "root_type": "dict",
+      "fields": {
+        "version": {
+          "type": "string",
+          "required": true,
+          "default": "1",
+          "description": "Factory defaults version string."
+        },
+        "description": {
+          "type": "string",
+          "required": false,
+          "description": "Human-readable description."
+        },
+        "config": {
+          "type": "dict",
+          "required": true,
+          "description": "Factory config dict (max_turns, temperature, provider_id, model, system_prompt)."
+        }
+      }
+    },
+    "system/checksystem_allowlist.json": {
+      "description": "CheckSystem query allowlist with SHA-256 integrity (verified by thoughtmachine/vault.py verify_allowlist_integrity; missing/invalid disables ALL CheckSystem queries).",
+      "required": true,
+      "backfill_on_missing": true,
+      "safe_default": {
+        "version": 1,
+        "allowlist": [
+          "capabilities",
+          "container_status",
+          "dockerfile",
+          "effective_permissions",
+          "event_bus_status",
+          "event_log",
+          "mcp_servers",
+          "my_config",
+          "network_diagnostics",
+          "running_workers",
+          "workers",
+          "workspace_info"
+        ],
+        "sha256": "697c326308135db2b508b16261e849bb79dd75b1d529748a5f8d88e799afa2d8"
+      },
+      "root_type": "dict",
+      "fields": {
+        "version": {
+          "type": "int",
+          "required": true,
+          "default": 1,
+          "description": "Allowlist file version."
+        },
+        "allowlist": {
+          "type": "list",
+          "required": true,
+          "description": "Explicit query names (no wildcards allowed)."
+        },
+        "sha256": {
+          "type": "string",
+          "required": true,
+          "description": "SHA-256 over sorted, newline-joined allowlist entries. Drift here (without allowlist change) is a warning only — never auto-fixed."
+        }
+      }
+    },
+    "state/session_registry.json": {
+      "description": "Session registry (JSON list of session records).",
+      "required": true,
+      "backfill_on_missing": true,
+      "safe_default": [],
+      "root_type": "list",
+      "fields": {}
+    },
+    "state/workspace_registry.json": {
+      "description": "Workspace registry (JSON list of workspace records).",
+      "required": true,
+      "backfill_on_missing": true,
+      "safe_default": [],
+      "root_type": "list",
+      "fields": {}
+    },
+    "custom_system_prompt.txt": {
+      "description": "Custom system prompt text file (agent/config/loader.py CUSTOM_SYSTEM_PROMPT_PATH).",
+      "required": false,
+      "backfill_on_missing": false,
+      "root_type": "string",
+      "fields": {}
+    },
+    "system_prompt.txt": {
+      "description": "LEGACY system prompt text file (migrated to custom_system_prompt.txt).",
+      "required": false,
+      "backfill_on_missing": false,
+      "root_type": "string",
+      "fields": {}
+    },
+    "system/.vault_version": {
+      "description": "Vault version marker written by thoughtmachine/vault.py ensure_vault_defaults (content from bootstrap.get_version()).",
+      "required": false,
+      "backfill_on_missing": false,
+      "root_type": "string",
+      "fields": {}
+    },
+    "workspaces/*/config.json": {
+      "description": "Per-workspace config (capabilities, domain_allowlist, ...). Pattern entry: validated for every matching workspace.",
+      "required": false,
+      "pattern": true,
+      "root_type": "dict",
+      "fields": {
+        "capabilities": {
+          "type": "dict",
+          "required": false,
+          "description": "Workspace capability flags."
+        },
+        "domain_allowlist": {
+          "type": "list",
+          "required": false,
+          "description": "Allowed network domains."
+        }
+      }
+    },
+    "workspaces/*/workers.json": {
+      "description": "Per-workspace worker definitions. Pattern entry.",
+      "required": false,
+      "pattern": true,
+      "root_type": "list",
+      "fields": {}
+    },
+    "workspaces/*/capabilities.json": {
+      "description": "Per-workspace capabilities (token limits, docker/git flags). Pattern entry.",
+      "required": false,
+      "pattern": true,
+      "root_type": "dict",
+      "fields": {
+        "max_context_length": {
+          "type": "int",
+          "required": false,
+          "description": "Max context length in tokens."
+        },
+        "max_conversation_turns": {
+          "type": "int",
+          "required": false,
+          "description": "Max conversation turns."
+        },
+        "max_file_size_bytes": {
+          "type": "int",
+          "required": false,
+          "description": "Max file size in bytes."
+        },
+        "allow_docker": {
+          "type": "bool",
+          "required": false,
+          "description": "Whether Docker is allowed for this workspace."
+        },
+        "git_available": {
+          "type": "bool",
+          "required": false,
+          "description": "Whether git is available for this workspace."
+        }
+      }
+    },
+    "workspaces/*/mcp_servers.json": {
+      "description": "Per-workspace MCP server definitions. Pattern entry.",
+      "required": false,
+      "pattern": true,
+      "root_type": "list",
+      "fields": {}
+    },
+    "logs/*": {
+    "description": "Runtime log files (text) written by the application; not required, never backfilled.",
+    "required": false,
+    "pattern": true,
+    "root_type": "string"
+  },
+  "workspaces/*/defaults.json": {
+      "description": "Per-workspace default config (GLOBAL_DEFAULT_KEYS subset). Pattern entry.",
+      "required": false,
+      "pattern": true,
+      "root_type": "dict",
+      "fields": {
+        "provider_id": {
+          "type": "string",
+          "required": false,
+          "description": "Workspace default provider profile ID."
+        },
+        "model": {
+          "type": "string",
+          "required": false,
+          "description": "Workspace default model."
+        },
+        "base_url": {
+          "type": "string",
+          "required": false,
+          "description": "Workspace default base URL."
+        },
+        "temperature": {
+          "type": "number",
+          "required": false,
+          "description": "Workspace default temperature."
+        },
+        "max_turns": {
+          "type": "int",
+          "required": false,
+          "description": "Workspace default max turns."
+        },
+        "system_prompt": {
+          "type": "string",
+          "required": false,
+          "description": "Workspace default system prompt."
+        }
+      }
+    }
+  }
+}

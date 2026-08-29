@@ -66,6 +66,7 @@ class AgentConfig(BaseModel):
         'use_workspace_lifecycle_manager': HOT_SWAPPABLE,
         'use_container_registry': HOT_SWAPPABLE,
         'git_allow_worktree_commits': HOT_SWAPPABLE,
+        'allow_host_resources': HOT_SWAPPABLE,
         'mode': RESTART_REQUIRED,
     }
 
@@ -134,6 +135,10 @@ class AgentConfig(BaseModel):
     git_allow_worktree_commits: bool = Field(
         default=False,
         description='Allow agent commits in operator-managed git worktrees on feat/* or fix/* branches (feature flag).',
+    )
+    allow_host_resources: bool = Field(
+        default=False,
+        description='Allow the agent to run supervised host-shell commands via the host_bash tool (feature flag).',
     )
 
     @field_validator('system_prompt')
