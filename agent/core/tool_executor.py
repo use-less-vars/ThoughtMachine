@@ -328,6 +328,8 @@ class ToolExecutor:
                     'use_workspace_lifecycle_manager': getattr(self.config, 'use_workspace_lifecycle_manager', False),
                     'use_container_registry': getattr(self.config, 'use_container_registry', False),
                     'git_allow_worktree_commits': getattr(self.config, 'git_allow_worktree_commits', False),
+                    'allow_host_resources': getattr(self.config, 'allow_host_resources', False),
+                    'log_dir': getattr(self.config, 'log_dir', None),
                     'max_workers_per_session': getattr(self.config, 'max_workers_per_session', None),
                 }
             else:

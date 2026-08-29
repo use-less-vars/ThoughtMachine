@@ -149,6 +149,10 @@ class SessionConfig(BaseModel):
         default=False,
         description='Allow agent commits in operator-managed git worktrees on feat/* or fix/* branches (feature flag).',
     )
+    allow_host_resources: bool = Field(
+        default=False,
+        description='Allow supervised host-shell commands via the host_bash tool in this session (feature flag).',
+    )
     max_workers_per_session: Optional[int] = Field(
         default=None,
         ge=1,
@@ -269,6 +273,7 @@ class SessionConfig(BaseModel):
         kwargs['use_workspace_lifecycle_manager'] = bool(self.use_workspace_lifecycle_manager)
         kwargs['use_container_registry'] = bool(self.use_container_registry)
         kwargs['git_allow_worktree_commits'] = bool(self.git_allow_worktree_commits)
+        kwargs['allow_host_resources'] = bool(self.allow_host_resources)
         if self.max_workers_per_session is not None:
             kwargs['max_workers_per_session'] = self.max_workers_per_session
 
