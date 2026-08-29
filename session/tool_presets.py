@@ -39,6 +39,7 @@ _ALL_TOOLS = [
     "SearchCodebaseTool",
     # Git
     "GitInfoTool",
+    "GitWriteTool",
     # Execution
     "DockerCodeRunner",
     "ContainerStartTool",
@@ -86,6 +87,7 @@ AGENT_TOOLS = [
     "FileSearchTool",
     "FileSummaryTool",
     "GitInfoTool",
+    "GitWriteTool",
     "GlobTool",
     "KnowledgeBaseTool",
     "MCPValidator",
@@ -103,6 +105,7 @@ ENGINEER_TOOLS = [
     "SummarizeTool",
     "KnowledgeBaseTool",
     "GitInfoTool",
+    "GitWriteTool",
     "WorkingDocument",
 ]
 

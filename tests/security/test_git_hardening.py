@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 
 from tools.git_info_tool import GitInfoTool
+from tools.git_write_tool import GitWriteTool
 
 
 def _run_git_clean(cwd: Path, *args) -> subprocess.CompletedProcess:
@@ -79,12 +80,13 @@ def hardened_repo(tmp_path):
 
 
 def _commit_tool(workspace, repo, message="test commit", file_path="hello.txt"):
-    return GitInfoTool(
+    return GitWriteTool(
         operation="commit",
         message=message,
         file_path=file_path,
         working_dir=str(repo),
         workspace_path=str(workspace),
+        agent_config={"git_allow_worktree_commits": True},
     )
 
 
@@ -124,7 +126,7 @@ def test_container_path_commit_runs_githooks_only(tmp_path):
     --no-verify.
     """
     manager = _FakeManager()
-    tool = GitInfoTool(operation="commit", message="x")
+    tool = GitWriteTool(operation="commit", message="x")
     object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
     object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
     object.__setattr__(tool, "_ensure_resource_container", lambda: manager)
@@ -228,7 +230,7 @@ FULL_PERMISSIONS = {
 
 
 def _vault_commit_tool(workspace, repo, ws_id, message="vault hook commit", file_path="hello.txt"):
-    return GitInfoTool(
+    return GitWriteTool(
         operation="commit",
         message=message,
         file_path=file_path,
@@ -236,6 +238,7 @@ def _vault_commit_tool(workspace, repo, ws_id, message="vault hook commit", file
         workspace_path=str(workspace),
         workspace_id=ws_id,
         session_permissions=dict(FULL_PERMISSIONS),
+        agent_config={"git_allow_worktree_commits": True},
     )
 
 
@@ -349,7 +352,7 @@ def test_commit_denied_without_git_write_permission(hardened_repo):
     workspace, repo, _ = hardened_repo
     (repo / "hello.txt").write_text("hi\n")
     _run_git_clean(repo, "add", "hello.txt")
-    tool = GitInfoTool(
+    tool = GitWriteTool(
         operation="commit",
         message="nope",
         file_path="hello.txt",
@@ -363,6 +366,7 @@ def test_commit_denied_without_git_write_permission(hardened_repo):
             "system": "read",
             "execution": "banned",
         },
+        agent_config={"git_allow_worktree_commits": True},
     )
     with pytest.raises(PermissionError):
         tool.execute()

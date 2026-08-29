@@ -1,8 +1,12 @@
-"""Unit tests for GitInfoTool's new git operations.
+"""Unit tests for the git operations added in the GitInfoTool/GitWriteTool split.
 
 Covers the operations added to GitInfoTool: ``diff_cached``, ``branch_list``,
 ``branch_create``, ``checkout``, ``stage``, ``unstage``, plus selective commit
-and the operator-managed worktree commit guard. Mock-based (fake
+and the operator-managed worktree commit guard. Read operations (diff_cached,
+branch_list, ...) live in ``GitInfoTool``; write operations (branch_create,
+checkout, stage, unstage, commit) live in ``GitWriteTool`` (which subclasses
+GitInfoTool) and require the operator flag
+``agent_config['git_allow_worktree_commits']`` to be exactly True. Mock-based (fake
 SandboxedExecution / fake resource manager, mirroring
 ``tests/security/test_git_execution_mode.py``): no real git binary and no
 docker daemon are required.
@@ -25,6 +29,9 @@ from types import SimpleNamespace
 import pytest
 
 from tools.git_info_tool import GitInfoTool
+from tools.git_write_tool import GitWriteTool
+
+FLAG_ERROR = "Error: git:write requires the operator flag"
 
 
 # ---------------------------------------------------------------------------
@@ -89,20 +96,46 @@ def fake_manager():
 
 
 def _tool(tmp_path, **params):
-    """Construct a GitInfoTool wired to the workspace for path validation."""
+    """Construct a GitWriteTool wired to the workspace for path validation.
+
+    Write operations require the operator flag, so it is set by default
+    unless the caller overrides agent_config explicitly.
+    """
+    params.setdefault("agent_config", {"git_allow_worktree_commits": True})
+    tool = GitWriteTool(**params)
+    object.__setattr__(tool, "workspace_path", str(tmp_path))
+    return tool
+
+
+def _read_tool(tmp_path, **params):
+    """Construct a GitInfoTool (read operations) wired to the workspace."""
     tool = GitInfoTool(**params)
     object.__setattr__(tool, "workspace_path", str(tmp_path))
     return tool
 
 
 def _host_tool(tmp_path, **params):
-    """Tool that runs git on the hardened host path (no registry workspace)."""
+    """Write tool that runs git on the hardened host path (no registry workspace)."""
     return _tool(tmp_path, **params)
 
 
+def _read_host_tool(tmp_path, **params):
+    """Read tool that runs git on the hardened host path (no registry workspace)."""
+    return _read_tool(tmp_path, **params)
+
+
 def _container_tool(tmp_path, manager, **params):
-    """Tool wired for containerized git execution via a fake manager."""
+    """Write tool wired for containerized git execution via a fake manager."""
     tool = _tool(tmp_path, **params)
+    object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
+    object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
+    object.__setattr__(tool, "_resource_manager", manager)
+    return tool
+
+
+def _read_container_tool(tmp_path, manager, **params):
+    """Read tool wired for containerized git execution via a fake manager."""
+    tool = _read_tool(tmp_path, **params)
     object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
     object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
     object.__setattr__(tool, "_resource_manager", manager)
@@ -132,10 +165,10 @@ class TestBranchNameValidation:
     )
     def test_invalid_branch_names_rejected(self, bad):
         with pytest.raises(ValueError):
-            GitInfoTool._validate_branch_name(bad)
+            GitWriteTool._validate_branch_name(bad)
 
     def test_safe_branch_name_accepted(self):
-        assert GitInfoTool._validate_branch_name("feature/x-1.2") == "feature/x-1.2"
+        assert GitWriteTool._validate_branch_name("feature/x-1.2") == "feature/x-1.2"
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +380,7 @@ class TestUnstage:
 # ---------------------------------------------------------------------------
 class TestDiffCached:
     def test_with_paths(self, tmp_path, fake_manager):
-        tool = _container_tool(
+        tool = _read_container_tool(
             tmp_path, fake_manager, operation="diff_cached", file_path="a.txt"
         )
         result = tool._git_diff_cached(tmp_path)
@@ -360,7 +393,7 @@ class TestDiffCached:
         assert "execution_mode: containerized" in result
 
     def test_without_paths_no_separator(self, tmp_path, fake_sandbox):
-        tool = _host_tool(tmp_path, operation="diff_cached")
+        tool = _read_host_tool(tmp_path, operation="diff_cached")
         result = tool._git_diff_cached(tmp_path)
 
         command = _last_sandbox_command()
@@ -374,7 +407,7 @@ class TestDiffCached:
 # ---------------------------------------------------------------------------
 class TestBranchList:
     def test_plain_list(self, tmp_path, fake_manager):
-        tool = _container_tool(tmp_path, fake_manager, operation="branch_list")
+        tool = _read_container_tool(tmp_path, fake_manager, operation="branch_list")
         result = tool._git_branch_list(tmp_path)
 
         _kind, command, _kwargs = _last_manager_exec(fake_manager)
@@ -382,7 +415,7 @@ class TestBranchList:
         assert "execution_mode: containerized" in result
 
     def test_all_branches_flag(self, tmp_path, fake_sandbox):
-        tool = _host_tool(
+        tool = _read_host_tool(
             tmp_path, operation="branch_list", all_branches=True
         )
         tool._git_branch_list(tmp_path)
@@ -571,9 +604,25 @@ class TestWorktreeCommitGuard:
         tool = _host_tool(tmp_path, operation="commit", message="x")
         assert tool._is_operator_managed_worktree(tmp_path) is False
 
+    def test_other_write_ops_denied_without_flag_in_worktree(self, tmp_path):
+        # Without the operator flag the git:write gate fires for every write
+        # op, worktree or not: branch_create / stage / checkout all return
+        # FLAG_ERROR before any git subprocess could run.
+        self._make_worktree(tmp_path)
+
+        tool = GitWriteTool(operation="branch_create", branch="feature/x")
+        assert tool._git_branch_create(tmp_path) == FLAG_ERROR
+
+        tool = GitWriteTool(operation="stage", file_path="a.txt")
+        assert tool._git_stage(tmp_path) == FLAG_ERROR
+
+        tool = GitWriteTool(operation="checkout", branch="feature/x")
+        assert tool._git_checkout(tmp_path) == FLAG_ERROR
+
     def test_other_write_ops_allowed_in_worktree(self, tmp_path, fake_sandbox):
-        # The guard is commit-only: branch_create / stage / checkout keep
-        # working in an operator-managed worktree workspace.
+        # The worktree guard is commit-only: branch_create / stage / checkout
+        # keep working in an operator-managed worktree workspace when the
+        # operator flag is set.
         self._make_worktree(tmp_path)
 
         tool = _host_tool(tmp_path, operation="branch_create", branch="feature/x")
@@ -605,8 +654,6 @@ class TestExecutionModeTrailer:
     @pytest.mark.parametrize(
         "op,params",
         [
-            ("diff_cached", {}),
-            ("branch_list", {}),
             ("branch_create", {"branch": "feature/x"}),
             ("checkout", {"branch": "feature/x"}),
             ("stage", {"file_path": "a.txt"}),
@@ -615,7 +662,7 @@ class TestExecutionModeTrailer:
     )
     def test_host_fallback_trailer(self, tmp_path, fake_sandbox, op, params):
         tool = _host_tool(tmp_path, operation=op, **params)
-        result = tool.execute() if False else getattr(tool, f"_git_{op}")(tmp_path)
+        result = getattr(tool, f"_git_{op}")(tmp_path)
         assert "execution_mode: host_fallback" in result
 
     @pytest.mark.parametrize(
@@ -623,6 +670,16 @@ class TestExecutionModeTrailer:
         [
             ("diff_cached", {}),
             ("branch_list", {}),
+        ],
+    )
+    def test_host_fallback_read_trailer(self, tmp_path, fake_sandbox, op, params):
+        tool = _read_host_tool(tmp_path, operation=op, **params)
+        result = getattr(tool, f"_git_{op}")(tmp_path)
+        assert "execution_mode: host_fallback" in result
+
+    @pytest.mark.parametrize(
+        "op,params",
+        [
             ("branch_create", {"branch": "feature/x"}),
             ("checkout", {"branch": "feature/x"}),
             ("stage", {"file_path": "a.txt"}),
@@ -631,6 +688,18 @@ class TestExecutionModeTrailer:
     )
     def test_containerized_trailer(self, tmp_path, fake_manager, op, params):
         tool = _container_tool(tmp_path, fake_manager, operation=op, **params)
+        result = getattr(tool, f"_git_{op}")(tmp_path)
+        assert "execution_mode: containerized" in result
+
+    @pytest.mark.parametrize(
+        "op,params",
+        [
+            ("diff_cached", {}),
+            ("branch_list", {}),
+        ],
+    )
+    def test_containerized_read_trailer(self, tmp_path, fake_manager, op, params):
+        tool = _read_container_tool(tmp_path, fake_manager, operation=op, **params)
         result = getattr(tool, f"_git_{op}")(tmp_path)
         assert "execution_mode: containerized" in result
 
@@ -645,19 +714,25 @@ class TestNoRawFlagsExposed:
     }
 
     def test_schema_has_no_raw_flag_fields(self):
-        field_names = set(GitInfoTool.model_fields)
-        assert not (field_names & self.FORBIDDEN_KEYS)
-        assert not any(name.startswith("-") for name in field_names)
+        # Both halves of the split must keep the agent-visible surface clean:
+        # GitInfoTool (read ops) and GitWriteTool (write ops, a subclass).
+        for tool_cls in (GitInfoTool, GitWriteTool):
+            field_names = set(tool_cls.model_fields)
+            assert not (field_names & self.FORBIDDEN_KEYS)
+            assert not any(name.startswith("-") for name in field_names)
 
     def test_unknown_flag_kwargs_rejected(self):
         with pytest.raises(Exception):
-            GitInfoTool(operation="commit", message="x", no_verify=True)
+            GitWriteTool(operation="commit", message="x", no_verify=True)
         with pytest.raises(Exception):
-            GitInfoTool(operation="commit", message="x", **{"--no-verify": True})
+            GitWriteTool(operation="commit", message="x", **{"--no-verify": True})
 
     def test_write_categories_required(self):
         for op in ("branch_create", "checkout", "stage", "unstage", "commit"):
-            assert GitInfoTool.get_required_categories({"operation": op}) == ["git:write"]
+            assert GitWriteTool.get_required_categories({"operation": op}) == ["git:write"]
+        assert GitWriteTool.get_required_categories(
+            {"operation": "clone"}
+        ) == ["git:write", "network:outbound"]
         assert GitInfoTool.get_required_categories(
             {"operation": "diff_cached"}
         ) == ["git:read"]
@@ -672,7 +747,7 @@ class TestNoRawFlagsExposed:
 class TestLegacyOperationsTrailer:
     @pytest.mark.parametrize("op", ["status", "diff", "log", "branch"])
     def test_legacy_operations_report_trailer(self, tmp_path, fake_sandbox, op):
-        tool = _host_tool(tmp_path, operation=op)
+        tool = _read_host_tool(tmp_path, operation=op)
         result = getattr(tool, f"_git_{op}")(tmp_path)
 
         assert result.startswith("ok")

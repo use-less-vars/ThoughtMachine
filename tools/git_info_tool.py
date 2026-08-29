@@ -1,7 +1,6 @@
 # tools/git_info_tool.py
 import json
-import re
-from typing import Any, ClassVar, Literal, Optional, List, Union
+from typing import Any, Literal, Optional, List, Union
 from pydantic import Field
 import logging
 import subprocess
@@ -9,16 +8,6 @@ from pathlib import Path
 from .base import ToolBase
 from security.sandboxed_execution import SandboxedExecution
 
-
-# Clone URL protocol allowlist. ``git clone`` accepts arbitrary transport URLs
-# (including ``ext::`` shell executors and ``file://`` local access), so clone
-# URLs are restricted to these schemes plus scp-like ``user@host:path`` syntax.
-from agent.config.defaults import ALLOWED_GIT_PROTOCOLS
-
-# Branch-name validation for branch_create/checkout. Explicit allowlist so
-# names can never smuggle option-like arguments ('-'), path traversal
-# ('..'), or revision syntax ('@{') into git argv.
-_BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9._/\-]+$")
 
 logger = logging.getLogger(__name__)
 
@@ -55,33 +44,32 @@ def resolve_git_execution_mode(
 
 class GitInfoTool(ToolBase):
     """
-    Git repository tool. Read operations: status, diff, diff_cached, log,
-    branch, branch_list, show, remote, blame, config. Write operations:
-    commit, init, clone, branch_create, checkout, stage, unstage. Write
-    operations are subject to the agent's ask policy.
+    Read-only git repository inspection tool.
+
+    Operations: status, diff, diff_cached, log, branch, branch_list, show,
+    remote, blame, config. Write operations (commit, init, clone,
+    branch_create, checkout, stage, unstage) live in ``GitWriteTool``
+    (tools/git_write_tool.py), which gates every write on the operator flag
+    ``agent_config['git_allow_worktree_commits']`` and the agent's ask
+    policy; this tool intentionally exposes no write surface.
 
     Parameters:
         working_dir: repository root (defaults to workspace root).
         file_path: single path or list of paths, used by diff, diff_cached,
-            log, blame, stage, unstage and commit (selective commit).
-        message: commit message (required for commit).
-        branch: branch name for branch_create and checkout operations.
+            log, and blame.
         all_branches: include remote branches for branch / branch_list.
 
     Explicit surface: no raw git flags are accepted from the agent. Every
     invocation is assembled from fixed argv lists and hardened internally;
     --no-verify, -c/--config/core.hooksPath, credential/filter/textconv
     configuration and hooks are never taken from agent input (the execution
-    backends inject their own hardening flags). Commits in a source repo
-    checked out as an operator-managed worktree (a ``.git`` FILE pointing at
-    a gitdir) are blocked: they are performed host-side by the operator.
-    Execution mode and failure diagnostics are reported per call for EVERY
-    operation via three trailing lines: ``execution_mode: <mode>``
-    (containerized | host_fallback | unavailable), ``failure_reason: <reason>``
-    (why a containerized resource could not be used, or ``none``) and
-    ``fallback_used: <bool>`` (True when the call degraded to a host-side
-    operation). Argument-validation errors keep their historical byte-exact
-    form (no trailer).
+    backends inject their own hardening flags). Execution mode and failure
+    diagnostics are reported per call for EVERY operation via three trailing
+    lines: ``execution_mode: <mode>`` (containerized | host_fallback |
+    unavailable), ``failure_reason: <reason>`` (why a containerized resource
+    could not be used, or ``none``) and ``fallback_used: <bool>`` (True when
+    the call degraded to a host-side operation). Argument-validation errors
+    keep their historical byte-exact form (no trailer).
     """
 
     # ------------------------------------------------------------------
@@ -99,32 +87,26 @@ class GitInfoTool(ToolBase):
 
     @classmethod
     def get_required_categories(cls, params: dict | None = None) -> list[str]:
-        """Return dynamic permission categories based on the git operation."""
+        """Return dynamic permission categories based on the git operation.
+
+        This tool is read-only: every operation requires ``git:read``;
+        ``remote`` additionally needs network egress to query remotes.
+        """
         if params:
             op = params.get("operation", "")
-            if op in ("remote",):
+            if op == "remote":
                 return ["git:read", "network:outbound"]
-            if op in ("commit", "init", "branch_create", "checkout", "stage", "unstage"):
-                return ["git:write"]
-            if op in ("clone",):
-                return ["git:write", "network:outbound"]
-            if op in ("push", "pull", "fetch", "merge", "rebase"):
-                return ["git:write", "network:outbound"]
-        # All other operations (status, diff, diff_cached, log, branch,
-        # branch_list, show, blame, config) are read-only
         return ["git:read"]
 
     tool: Literal["GitInfoTool"] = "GitInfoTool"
 
     
     operation: Literal[
-        "status", "diff", "log", "branch", "show", "remote", "blame", "config",
-        "commit", "init", "clone", "diff_cached", "branch_list", "branch_create",
-        "checkout", "stage", "unstage",
+        "status", "diff", "diff_cached", "log", "branch", "branch_list",
+        "show", "remote", "blame", "config",
     ] = Field(
-        description="Git operation to perform: status, diff, diff_cached, log, branch, "
-        "branch_list, branch_create, checkout, show, remote, blame, config, stage, "
-        "unstage, commit, init, clone"
+        description="Git read operation to perform: status, diff, diff_cached, log, "
+        "branch, branch_list, show, remote, blame, config"
     )
     
     # Common parameters
@@ -228,48 +210,6 @@ class GitInfoTool(ToolBase):
         default=None,
         description="Config name to retrieve (if not specified, list all configs)"
     )
-    
-    @staticmethod
-    def _validate_clone_url(clone_url: str) -> bool:
-        """
-        Validate that a clone URL uses an allowed transport.
-
-        Returns ``True`` on success and raises ``ValueError`` (message
-        ``Unsupported git protocol: <clone_url>``) otherwise.
-
-        Rules:
-        - ``https://``, ``http://``, ``git://`` and ``ssh://`` are allowed;
-          scheme comparison is case-insensitive (RFC 3986).
-        - scp-like ``user@host:path`` is allowed when no ``://`` scheme is
-          present: the URL must contain ``@`` with a ``:`` after it and before
-          any ``/``.
-        - Empty strings and URLs with leading/trailing whitespace are rejected
-          (whitespace is deliberately *not* stripped — a padded URL is a
-          paste-injection red flag).
-        - Anything else (``ext::`` transports, ``file://``, ``ftp://``, local
-          paths, ...) is rejected.
-        """
-        if not clone_url or clone_url != clone_url.strip():
-            raise ValueError(f"Unsupported git protocol: {clone_url}")
-
-        # Scheme-based URLs. Only allowlisted schemes are permitted; the scheme
-        # prefix is compared case-insensitively.
-        if "://" in clone_url:
-            scheme = clone_url.split("://", 1)[0] + "://"
-            if scheme.lower() in ALLOWED_GIT_PROTOCOLS:
-                return True
-            raise ValueError(f"Unsupported git protocol: {clone_url}")
-
-        # scp-like syntax: user@host:path. Only reached when no '://' scheme
-        # was found, so 'https://user@host/repo.git' never hits this branch.
-        at_index = clone_url.find("@")
-        if at_index != -1:
-            colon_index = clone_url.find(":", at_index)
-            slash_index = clone_url.find("/")
-            if colon_index != -1 and (slash_index == -1 or colon_index < slash_index):
-                return True
-
-        raise ValueError(f"Unsupported git protocol: {clone_url}")
 
     def _validate_repo_root(self, repo_root: Path) -> Path:
         """
@@ -310,7 +250,7 @@ class GitInfoTool(ToolBase):
         # permissions still read 'ask'. Missing/banned/False stay fail-closed
         # (the atomic check runs and denies).
         operation = self.operation
-        network_ops = {"remote", "clone", "push", "pull", "fetch", "merge", "rebase"}
+        network_ops = {"remote"}
         if operation in network_ops:
             effective = self.effective_permissions or {}
             if effective.get("network") != "ask":
@@ -322,13 +262,6 @@ class GitInfoTool(ToolBase):
                     f"{operation} on remote"
                 ):
                     return json.dumps({"error": f"Atomic permission check failed: network:outbound required for {operation}"})
-
-        # Validate the clone URL protocol BEFORE any subprocess can run.
-        # This check sits outside the try/except below so the ValueError
-        # surfaces to the caller instead of being swallowed into an error
-        # string by the catch-all handler.
-        if operation == "clone" and self.clone_url:
-            self._validate_clone_url(self.clone_url)
 
         try:
             # Determine working directory
@@ -376,12 +309,6 @@ class GitInfoTool(ToolBase):
                 repo_root = self._validate_repo_root(repo_root)
             except ValueError as e:
                 return self._truncate_output(f"Error: {e}")
-
-            # Handle operations that don't require an existing repo
-            if self.operation == "init":
-                return self._git_init(repo_root)
-            elif self.operation == "clone":
-                return self._git_clone(repo_root)
 
             # Validate git repository. _git_repo_root() re-points repo_root to
             # the actual repository root (via `git rev-parse
@@ -437,14 +364,6 @@ class GitInfoTool(ToolBase):
                 return self._git_diff_cached(repo_root)
             elif self.operation == "branch_list":
                 return self._git_branch_list(repo_root)
-            elif self.operation == "branch_create":
-                return self._git_branch_create(repo_root)
-            elif self.operation == "checkout":
-                return self._git_checkout(repo_root)
-            elif self.operation == "stage":
-                return self._git_stage(repo_root)
-            elif self.operation == "unstage":
-                return self._git_unstage(repo_root)
             elif self.operation == "show":
                 return self._git_show(repo_root)
             elif self.operation == "remote":
@@ -453,8 +372,6 @@ class GitInfoTool(ToolBase):
                 return self._git_blame(repo_root)
             elif self.operation == "config":
                 return self._git_config(repo_root)
-            elif self.operation == "commit":
-                return self._git_commit(repo_root)
             else:
                 return self._truncate_output(f"Unknown operation: {self.operation}")
         
@@ -1056,93 +973,6 @@ class GitInfoTool(ToolBase):
         output = self._run_git(repo_root, args)
         return self._with_mode(self._truncate_output(output))
 
-    def _is_operator_managed_worktree(self, repo_root: Path) -> bool:
-        """True when ``repo_root`` is an operator-managed git worktree.
-
-        Git worktrees represent ``.git`` as a regular file whose contents
-        start with ``gitdir: <path>`` (instead of a directory). Such
-        workspaces are checked out by operator/host tooling and commits are
-        performed host-side, so in-workspace commits are blocked.
-        """
-        dot_git = repo_root / ".git"
-        if not dot_git.exists() or not dot_git.is_file():
-            return False
-        try:
-            content = dot_git.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            # Unreadable gitfile: treat as not operator-managed so read ops
-            # and staging keep working; a broken worktree surfaces the
-            # underlying git error at commit time instead.
-            return False
-        return content.startswith("gitdir:")
-
-    def _feature_branch_agent_commit_allowed(self, repo_root: Path) -> bool:
-        """Narrow allow for agent commits in operator-managed worktrees.
-
-        An agent commit is permitted in an operator-managed worktree only
-        when ALL of the following hold:
-
-        1. ``agent_config['git_allow_worktree_commits']`` is exactly True.
-        2. The current branch is ``feat/*`` or ``fix/*`` (dev, main, master,
-           release/*, hotfix/* and anything else are rejected).
-        3. Container git execution is active (``_use_container_mode()``).
-        4. Container execution is mandatory for the branch check too: no
-           host fallback may resolve the branch, because the host backend
-           injects ``--no-verify`` / ``core.hooksPath=/dev/null`` and would
-           bypass the QA gate.
-
-        Any violation returns False so the caller keeps the existing
-        operator-managed-worktree block.
-        """
-        config = getattr(self, "agent_config", None) or {}
-        if config.get("git_allow_worktree_commits") is not True:
-            return False
-        if not self._use_container_mode():
-            return False
-        try:
-            output = self._run_git(
-                repo_root,
-                ["rev-parse", "--abbrev-ref", "HEAD"],
-                allow_host_fallback=False,
-            )
-        except (RuntimeError, PermissionError):
-            # Container-mandatory branch resolution failed (container
-            # unavailable, policy denial): fail closed, never degrade.
-            return False
-        branch = (output or "").strip().splitlines()[0].strip() if (output or "").strip() else ""
-        # A bare prefix ("feat/", "fix/", "feat/   ") is NOT a valid feature
-        # branch: the branch name must have a non-whitespace suffix after the
-        # slash (e.g. "feat/foo"). startswith() alone would wrongly accept
-        # these, so match the full shape instead.
-        return bool(re.match(r"^(feat|fix)/.+$", branch))
-
-    @staticmethod
-    def _validate_branch_name(name: str) -> str:
-        """Validate a branch name against the tool's safe-name allowlist.
-
-        Only letters, digits, dots, slashes, underscores and hyphens are
-        allowed; names must not start with '-' or '.', must not contain
-        '..', '@{', whitespace or control characters. Returns the name
-        unchanged on success; raises ``ValueError`` otherwise.
-        """
-        if (
-            not isinstance(name, str)
-            or not name
-            or name != name.strip()
-            or not _BRANCH_NAME_RE.match(name)
-            or name.startswith(("-", "."))
-            or ".." in name
-            or "@{" in name
-            or "--" in name
-        ):
-            raise ValueError(
-                f"Invalid branch name: {name!r} - branch names may only contain "
-                "letters, digits, dots, slashes, underscores and hyphens; must "
-                "not start with '-' or '.', and must not contain '..', '@{', "
-                "whitespace or control characters"
-            )
-        return name
-
     def _validated_rel_paths(self, repo_root: Path, paths) -> List[str]:
         """Normalize and workspace-validate file path(s) into repo-relative paths.
 
@@ -1230,58 +1060,6 @@ class GitInfoTool(ToolBase):
         output = self._run_git(repo_root, args)
         return self._with_mode(self._truncate_output(output))
 
-    def _git_branch_create(self, repo_root: Path) -> str:
-        """Create a new branch (git branch <name>)."""
-        if not self.branch:
-            return "Error: branch is required for branch_create operation"
-        try:
-            name = self._validate_branch_name(self.branch)
-        except ValueError as e:
-            return self._truncate_output(f"Error: {e}")
-        output = self._run_git(repo_root, ["branch", name])
-        return self._with_mode(self._truncate_output(output))
-
-    def _git_checkout(self, repo_root: Path) -> str:
-        """Check out an existing branch (git checkout <name>)."""
-        if not self.branch:
-            return "Error: branch is required for checkout operation"
-        try:
-            name = self._validate_branch_name(self.branch)
-        except ValueError as e:
-            return self._truncate_output(f"Error: {e}")
-        # No -b: only existing branches may be checked out (creating branches
-        # is the branch_create operation). No '--' separator: the validated
-        # name can never look like an option.
-        output = self._run_git(repo_root, ["checkout", name])
-        return self._with_mode(self._truncate_output(output))
-
-    def _git_stage(self, repo_root: Path) -> str:
-        """Stage file path(s) (git add -- <paths>)."""
-        if not self.file_path:
-            return "Error: file_path is required for stage operation (at least one path)"
-        try:
-            rels = self._validated_rel_paths(repo_root, self.file_path)
-        except ValueError as e:
-            return self._truncate_output(f"Error: {e}")
-        if not rels:
-            return "Error: file_path is required for stage operation (at least one path)"
-        output = self._run_git(repo_root, ["add", "--"] + rels)
-        return self._with_mode(self._truncate_output(output))
-
-    def _git_unstage(self, repo_root: Path) -> str:
-        """Unstage file path(s) (git reset HEAD -- <paths>)."""
-        if not self.file_path:
-            return "Error: file_path is required for unstage operation (at least one path)"
-        try:
-            rels = self._validated_rel_paths(repo_root, self.file_path)
-        except ValueError as e:
-            return self._truncate_output(f"Error: {e}")
-        if not rels:
-            return "Error: file_path is required for unstage operation (at least one path)"
-        # Path-scoped reset only; a bare `git reset` is never issued.
-        output = self._run_git(repo_root, ["reset", "HEAD", "--"] + rels)
-        return self._with_mode(self._truncate_output(output))
-
     def _git_show(self, repo_root: Path) -> str:
         """Run git show."""
         args = ["show", "--no-ext-diff", "--no-textconv"]
@@ -1325,166 +1103,5 @@ class GitInfoTool(ToolBase):
         args = ["config", "--list"]
         if self.config_name:
             args = ["config", "--get", self.config_name]
-        output = self._run_git(repo_root, args)
-        return self._with_mode(self._truncate_output(output))
-
-    def _is_git_error_output(self, output: str) -> bool:
-        """True when a _run_git/_git_add result string signals failure.
-
-        _run_git returns error-shaped strings on failure: "Git command
-        failed ...", "Git command timed out", "Git command not found ..."
-        or "Error running git command: ..."; _git_add prepends "Error: ..."
-        for argument-validation failures. On success git add emits no
-        stdout, so prefixing on "Git command" / "Error" is unambiguous.
-        The commit flow uses this to short-circuit before running ``git
-        commit`` on an un-staged file (which would otherwise fail with a
-        confusing "pathspec did not match" error).
-        """
-        return output.startswith("Git command") or output.startswith("Error")
-
-    def _git_add(
-        self, repo_root: Path, allow_host_fallback: bool = True
-    ) -> str:
-        """Run git add. Accepts single file path (str) or multiple (list).
-
-        ``allow_host_fallback`` is forwarded to ``_run_git``; the commit
-        flow passes False so staging cannot degrade to the host backend
-        when a policy-allowed worktree commit mandates container execution.
-        """
-        args = ["add"]
-        if self.file_path:
-            # Same validation choke point as every other path consumer
-            # (_validated_rel_paths): rejects ".", "..", globs / pathspec
-            # magic and option-like "-" paths. "--" keeps option-like
-            # filenames from being parsed as git add flags.
-            try:
-                rels = self._validated_rel_paths(repo_root, self.file_path)
-            except ValueError as e:
-                return self._truncate_output(f"Error: {e}")
-            args.append("--")
-            args.extend(rels)
-        else:
-            # The full-worktree sweep (git add -A) is removed: every caller
-            # must name the paths to stage explicitly.
-            return "Error: file_path is required for stage operation (at least one path)"
-        output = self._run_git(repo_root, args, allow_host_fallback=allow_host_fallback)
-        return self._truncate_output(output)
-
-    def _git_commit(self, repo_root: Path) -> str:
-        """Run git commit (selective only).
-
-        ``file_path`` is REQUIRED: the commit is limited to the listed paths
-        (explicit ``git add -- <paths>`` staging + ``git commit -m <msg> --
-        <paths>``). There is no full-worktree mode -- the historical ``git
-        add -A`` auto-stage sweep is removed, so unvetted changes cannot be
-        swept into a commit past the review gate. The named paths are staged
-        explicitly (never ``-A``) before committing: ``git commit -- <paths>``
-        only commits files git already knows, so untracked files (e.g. the
-        first commit of a fresh repo) would otherwise fail with "pathspec ...
-        did not match any file(s) known to git". In the policy-allowed
-        worktree path the staging is container-mandatory
-        (allow_host_fallback=False); otherwise it uses the default fallback
-        policy.
-
-        Commit hook policy lives in the execution backends: container mode
-        runs the workspace-local .githooks dir (core.hooksPath override);
-        host mode neutralizes hooks entirely (core.hooksPath=/dev/null plus
-        --no-verify). No vault-backed hooks are consulted. No agent-visible
-        flags are added here.
-        """
-        # Operator-managed worktrees (a .git FILE pointing at a gitdir) are
-        # committed host-side by the operator; block in-workspace commits
-        # before any git subprocess can run. Narrow exception: agent commits
-        # on feat/* or fix/* branches with the explicit config flag and
-        # mandatory container execution (see
-        # _feature_branch_agent_commit_allowed). When the exception applies,
-        # container execution stays mandatory for the add/commit subprocesses
-        # themselves (allow_host_fallback=False).
-        worktree_commit_allowed = False
-        if self._is_operator_managed_worktree(repo_root):
-            if not self._feature_branch_agent_commit_allowed(repo_root):
-                return self._truncate_output(
-                    "Error: commits in this workspace are performed host-side by "
-                    "the operator (workspace is an operator-managed git worktree)"
-                )
-            worktree_commit_allowed = True
-
-        if not self.message or not self.message.strip():
-            return "Error: message is required for commit operation"
-
-        # Every commit must name its paths: the ``git add -A`` full-worktree
-        # sweep is removed, so a commit without explicit file_path(s) is
-        # rejected before any git subprocess runs.
-        if not self.file_path:
-            return self._truncate_output(
-                "Error: file_path is required for commit operation (at least one path)"
-            )
-
-        if worktree_commit_allowed:
-            # Policy-allowed agent commit: stage ONLY the named paths
-            # (never ``-A``; _git_add uses self.file_path) and commit,
-            # with mandatory container execution for both subprocesses.
-            add_output = self._git_add(
-                repo_root, allow_host_fallback=False
-            )
-            if self._is_git_error_output(add_output):
-                return self._truncate_output(add_output)
-            output = self._run_git(
-                repo_root,
-                ["commit", "-m", self.message],
-                allow_host_fallback=False,
-            )
-            return self._with_mode(self._truncate_output(output))
-
-        try:
-            rels = self._validated_rel_paths(repo_root, self.file_path)
-        except ValueError as e:
-            return self._truncate_output(f"Error: {e}")
-        if not rels:
-            return "Error: file_path is required for commit operation (at least one path)"
-        # Stage exactly the named paths first (never ``-A``): ``git commit --
-        # <paths>`` only works for files git already knows, so an untracked
-        # file (e.g. the first commit of a fresh repo) must be staged first.
-        add_output = self._git_add(repo_root)
-        if self._is_git_error_output(add_output):
-            return self._truncate_output(add_output)
-        args = ["commit", "-m", self.message, "--"] + rels
-        output = self._run_git(
-            repo_root, args, allow_host_fallback=not worktree_commit_allowed
-        )
-        return self._with_mode(self._truncate_output(output))
-
-    def _git_init(self, repo_root: Path) -> str:
-        """Initialize a new git repository in the target directory."""
-        # Ensure the directory exists
-        repo_root.mkdir(parents=True, exist_ok=True)
-        args = ["init"]
-        output = self._run_git(repo_root, args)
-        return self._with_mode(self._truncate_output(output))
-
-    def _git_clone(self, repo_root: Path) -> str:
-        """Clone a remote git repository into the workspace."""
-        if not self.clone_url:
-            return "Error: clone_url is required for clone operation"
-
-        # Protocol allowlist check — reject ext::/file:///unknown schemes
-        # before the URL is handed to a git subprocess. (execute() also
-        # validates pre-try; this is defense-in-depth for direct callers.)
-        self._validate_clone_url(self.clone_url)
-
-        args = ["clone", self.clone_url]
-        if self.clone_target:
-            # Validate target path is within workspace
-            try:
-                target_abs = (repo_root / self.clone_target).resolve()
-                validated_target = self._validate_path(str(target_abs))
-                # In container mode the target must be passed as the
-                # container-visible /workspace path.
-                if self._use_container_mode():
-                    validated_target = self._to_container_path(Path(validated_target))
-                args.append(validated_target)
-            except ValueError as e:
-                return self._truncate_output(f"Error: {e}")
-
         output = self._run_git(repo_root, args)
         return self._with_mode(self._truncate_output(output))

@@ -24,6 +24,7 @@ from agent.config.models import AgentConfig
 from agent.core.agent import Agent
 from thoughtmachine.security import SessionPermissions
 from tools.git_info_tool import GitInfoTool
+from tools.git_write_tool import GitWriteTool
 
 
 class FakeSandboxExecution:
@@ -72,7 +73,15 @@ def fake_sandbox(monkeypatch):
 
 
 def _tool(operation, session_perms=None, effective_perms=None, **kwargs):
-    return GitInfoTool(
+    # Write operations live on GitWriteTool (operation Literals are disjoint:
+    # GitInfoTool rejects commit/clone, GitWriteTool rejects status/remote).
+    tool_cls = (
+        GitWriteTool
+        if operation
+        in ("commit", "init", "clone", "branch_create", "checkout", "stage", "unstage")
+        else GitInfoTool
+    )
+    return tool_cls(
         operation=operation,
         session_permissions=session_perms,
         effective_permissions=effective_perms,
