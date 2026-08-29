@@ -90,4 +90,6 @@ jobs:
           # endpoint with urllib, validates the degraded payload, prints both
           # logs and cleans up on every path. Keep this step a one-liner.
           mkdir -p logs
-          python3 scripts/ci_doctor_poller.py
+          # -u (unbuffered) so the poller's flush=True lines are not lost from
+          # the step log when the step exits non-zero (CI runs without a tty).
+          python3 -u scripts/ci_doctor_poller.py

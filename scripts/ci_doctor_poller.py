@@ -128,6 +128,10 @@ def cleanup(proc: subprocess.Popen) -> None:
 
 
 def main() -> int:
+    # First output of the script, flushed immediately: CI runs this without -u
+    # in some paths, and the very first line must not sit in a buffer that is
+    # lost when the step exits non-zero.
+    print("ci_doctor_poller: starting", flush=True)
     parser = argparse.ArgumentParser(
         description="Run the --doctor wrapper and assert graceful degradation "
                     "without Docker.")
