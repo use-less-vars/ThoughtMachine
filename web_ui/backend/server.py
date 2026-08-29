@@ -441,6 +441,24 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log('WARNING', 'server', f'Could not initialise user defaults: {exc}')
 
+    # ── Vault drift check (read-only) ──────────────────────────────────────
+    # Report schema drift at startup without ever mutating the vault or
+    # crashing the server; repairable drift is listed in pending_repairs.
+    try:
+        from agent.config.vault_drift import VaultDriftChecker
+        from thoughtmachine.vault import vault_root
+        drift_report = VaultDriftChecker(vault_root=vault_root()).check()
+        if drift_report.get('status') == 'ok':
+            log('INFO', 'server',
+                f"Vault drift check: OK ({len(drift_report.get('files', {}))} files)")
+        else:
+            log('WARNING', 'server',
+                f"Vault drift check: {drift_report.get('status')} — "
+                f"{len(drift_report.get('pending_repairs', []))} pending repair(s), "
+                f"{len(drift_report.get('warnings', []))} warning(s)")
+    except Exception as exc:
+        log('WARNING', 'server', f'Vault drift check skipped: {exc}')
+
     # ── Migrate old-style workspaces ──
     try:
         migrated = _migrate_old_workspaces()

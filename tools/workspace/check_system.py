@@ -839,7 +839,12 @@ class CheckSystem(ToolBase):
             return f"[event_log] Error: {e}"
 
     def _query_vault_status(self) -> dict:
-        """Run VaultDriftChecker against the vault root; returns a structured, secret-free report."""
+        """Run VaultDriftChecker against the vault root; returns a structured, secret-free report.
+
+        Strictly read-only: repairable drift is reported (with
+        ``pending_repairs``) but never auto-fixed — repairs require
+        explicit operator approval via check(apply_repairs=True).
+        """
         checker = None
         try:
             from agent.config.vault_drift import VaultDriftChecker, DriftAbortError
@@ -848,7 +853,8 @@ class CheckSystem(ToolBase):
             return {"status": "error", "error": f"vault status unavailable: {exc}", "aborted": True}
         try:
             checker = VaultDriftChecker(vault_root=vault_root())
-            return checker.check()
+            # Read-only by design: never mutate the vault from a query tool.
+            return checker.check(apply_repairs=False)
         except DriftAbortError:
             partial = checker.report() if checker is not None else None
             if isinstance(partial, dict):
