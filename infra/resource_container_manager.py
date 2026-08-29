@@ -94,14 +94,14 @@ _LOG = logging.getLogger(__name__)
 # image. Every auto-built image carries a thoughtmachine.build_hash label
 # (sha256 of the exact bytes built) so a stale image — built from older
 # sources — is detected and rebuilt on drift.
-RUNTIME_IMAGE_TAG = "tm-workspace-runtime:latest"
-RESOURCE_IMAGE_TAG = "tm-resource-git"
-
-# Known hidden resources. Every entry runs inside the same hardened
-# ``RESOURCE_IMAGE_TAG`` image, so the build-hash drift check applies to all.
-RESOURCE_REGISTRY = {
-    "git": {"kind": "git", "permission": "git"},
-}
+# Centralized literal defaults (Phase A consolidation). Re-exported here so
+# existing importers/tests keep seeing the same names on this module.
+from agent.config.defaults import (
+    RUNTIME_IMAGE_TAG,
+    RESOURCE_IMAGE_TAG,
+    RESOURCE_REGISTRY,
+    RESOURCE_BUILD_HASH_LABEL,
+)
 
 # Global resource images are lifecycle-protected shared infrastructure:
 # conservative cleanup/prune NEVER removes them — only an explicit global
@@ -125,7 +125,6 @@ def is_global_resource_image(image_tag):
 # location (infra/ -> repo root); the repo-side files below are SEEDS only —
 # the vault's docker/resource/ copy is the single authoritative build source
 # (tests monkeypatch the module-level VAULT_* constants to a tmp vault).
-RESOURCE_BUILD_HASH_LABEL = "thoughtmachine.build_hash"
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO_REQUIREMENTS = os.path.join(_REPO_ROOT, "requirements.txt")
 REPO_RUNTIME_DOCKERFILE = os.path.join(

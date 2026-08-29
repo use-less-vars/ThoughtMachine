@@ -38,6 +38,14 @@ class ProviderConfig:
     def __post_init__(self):
         if self.extra_headers is None:
             self.extra_headers = {}
+        # Normalise explicit None back to the dataclass defaults so factory
+        # callers (e.g. ``config.get("timeout", 120)``) that pass None through
+        # never end up with a None timeout/max_retries on the provider.
+        # 0 is preserved (0 max_retries == no retries).
+        if self.timeout is None:
+            self.timeout = 120
+        if self.max_retries is None:
+            self.max_retries = 3
 
 class LLMProvider(ABC):
     """

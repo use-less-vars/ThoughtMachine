@@ -105,7 +105,7 @@ except ImportError:  # pragma: no cover - defensive
 
 
 # ── Output truncation (mirrors DockerCodeRunner._truncate_output) ──────────
-EXEC_OUTPUT_LIMIT_BYTES = 100 * 1024
+from agent.config.defaults import EXEC_OUTPUT_LIMIT_BYTES
 _TRUNCATION_NOTICE = "\n...[output truncated at 100KB]..."
 
 _docker_executor_module = None

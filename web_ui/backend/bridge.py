@@ -133,6 +133,7 @@ except ImportError:
     WORKER_BUS_AVAILABLE = False
 
 from agent.config.session_config import SessionConfig
+from agent.config.audit import log_config_audit, restart_required_for
 
 from web_ui.backend.event_forwarder import EventForwarder, _active_tab_bridges
 from web_ui.backend.config_manager import ConfigManager
@@ -225,6 +226,25 @@ def _resolve_workspace_id(workspace_path: str) -> Optional[str]:
         pass
 
     return None
+
+
+def _validate_workspace_id(workspace_id: Optional[str]) -> Optional[str]:
+    """Validate a workspace ID supplied by an external caller.
+
+    Raises ``ValueError`` for non-string, empty, path-like (``/``, ``\\``,
+    ``.``, ``..``) or NUL-containing values.  Returns the ID unchanged on
+    success.
+    """
+    if workspace_id is None:
+        return None
+    if not isinstance(workspace_id, str) or not workspace_id:
+        raise ValueError("workspace_id must be a non-empty string")
+    if workspace_id in ('/', '\\', '.', '..'):
+        raise ValueError(f"workspace_id {workspace_id!r} is not a valid workspace ID")
+    if '\x00' in workspace_id:
+        raise ValueError("workspace_id must not contain NUL bytes")
+    return workspace_id
+
 
 def _worker_is_running_async_job(thread: Any) -> bool:
     """Return True when *thread* is currently executing a submit_query (async) job.
@@ -1063,8 +1083,10 @@ class WebAgentBridge:
             return AgentConfig(**raw_config)
         except Exception as e:
             log('ERROR', 'server.bridge', f"Could not build global agent config: {e}")
-            # Fall back to minimal AgentConfig with env-var key
-            return AgentConfig(api_key='')
+            # A silent fallback (AgentConfig(api_key='')) hid config corruption
+            # and made callers start sessions with unusable defaults.  Surface
+            # the failure so load_session() can decide how to handle it.
+            raise RuntimeError(f"Could not build global agent config: {e}") from e
 
     def start(self, query: str, session_config: Optional[SessionConfig] = None) -> None:
         """Start a new agent session with the given SessionConfig."""
@@ -1088,25 +1110,24 @@ class WebAgentBridge:
         # Store the SessionConfig and derive AgentConfig
         self._session_config = session_config
 
-        # Resolve API key from provider profile if not already set
+        # Resolve API key from the full config chain if not already set
         if not session_config.api_key:
             try:
-                from agent.config.provider_profile import ProviderManager
-                manager = ProviderManager()
-                resolved = manager.resolve_config(session_config.model_dump(exclude_none=True))
-                if "api_key" in resolved and resolved["api_key"]:
+                resolved = self._config_manager.resolve_full_config(
+                    workspace_id=session_config.workspace_id or self._workspace_id,
+                    session_id=self._session_id or (
+                        self._loaded_session.session_id if self._loaded_session else None
+                    ),
+                    provider_id=session_config.provider_id,
+                )
+                if resolved.get("api_key"):
                     session_config.api_key = resolved["api_key"]
-                else:
-                    # Fallback: find ANY available provider with an API key
-                    for profile in manager.list_profiles():
-                        if profile.api_key:
-                            session_config.api_key = profile.api_key
-                            session_config.provider_id = profile.id
-                            break
+                if not session_config.base_url and resolved.get("base_url"):
+                    session_config.base_url = resolved["base_url"]
                 # Merge provider-specific config (timeout/max_retries) into session
-                resolved_pc = resolved.get('provider_config') or {}
+                resolved_pc = resolved.get("provider_config") or {}
                 if resolved_pc:
-                    merged = dict(getattr(session_config, 'provider_config', None) or {})
+                    merged = dict(getattr(session_config, "provider_config", None) or {})
                     merged.update(resolved_pc)
                     session_config.provider_config = merged
             except Exception:
@@ -1410,7 +1431,7 @@ class WebAgentBridge:
             log('WARNING', 'server.bridge',
                 f'Container re-sync skipped: {exc}')
 
-    def apply_config(self, config_dict: Dict[str, Any]) -> Dict[str, Any]:
+    def apply_config(self, config_dict: Dict[str, Any], source: str = 'user') -> Dict[str, Any]:
         """Apply partial config updates from the frontend.
 
         Delegates validation and mode enforcement to ``ConfigManager.apply_config``,
@@ -1427,6 +1448,9 @@ class WebAgentBridge:
             from agent.config.session_config import SessionConfig
             self._session_config = SessionConfig()
 
+        # Capture pre-application state for the old -> new diff log below
+        old_session_config = self._session_config
+
         # Step 1: Delegate validation and update to ConfigManager
         frontend_result, new_config = self._config_manager.apply_config(
             config_dict,
@@ -1439,6 +1463,27 @@ class WebAgentBridge:
         # Step 2: Update session config if ConfigManager returned a new one
         if new_config is not None:
             self._session_config = new_config
+
+        # Log an old -> new field diff for observability (None == '' treated
+        # as equivalent for string fields, mirroring Agent._configs_are_identical).
+        if old_session_config is not None and new_config is not None:
+            old_dump = old_session_config.model_dump(exclude={'api_key', 'stop_check'})
+            new_dump = new_config.model_dump(exclude={'api_key', 'stop_check'})
+            changes = []
+            for key in sorted(set(old_dump) | set(new_dump)):
+                old_val = old_dump.get(key)
+                new_val = new_dump.get(key)
+                if isinstance(old_val, str) and old_val == '':
+                    old_val = None
+                if isinstance(new_val, str) and new_val == '':
+                    new_val = None
+                if old_val != new_val:
+                    changes.append(f'{key}: {repr(old_val)[:80]} -> {repr(new_val)[:80]}')
+            if changes:
+                log('INFO', 'server.bridge',
+                    f'apply_config: {len(changes)} change(s): ' + '; '.join(changes))
+            else:
+                log('DEBUG', 'server.bridge', 'apply_config: no field changes detected')
 
         # Step 3: Convert to AgentConfig and apply to controller
         agent_config = self._session_config.to_agent_config()
@@ -1470,14 +1515,36 @@ class WebAgentBridge:
         settings = self._config_manager.extract_settings(frontend_result)
         permissions = self._config_manager.resolve_effective_permissions(self._session_config)
 
-        return {
+        result = {
             "config": frontend_result,
             "settings": settings,
             "permissions": permissions,
             "merged_config": frontend_result,
         }
 
-    def apply_config_queued(self, config_dict: Dict[str, Any]) -> Dict[str, Any]:
+        # Step 7: Audit the config change (redacted) and attach the effective
+        # (redacted) config for the frontend.
+        try:
+            log_config_audit(
+                source=source,
+                component='config.apply',
+                old=old_session_config,
+                new=self._session_config,
+                restart_required=restart_required_for(old_session_config, self._session_config),
+                injected=agent_config,
+            )
+            result["effective_config"] = ConfigManager.get_effective_config(
+                self,
+                workspace_id=self._workspace_id,
+                workspace_path=self._workspace_path,
+            )
+        except Exception:
+            # Audit/logging must never break the config apply path.
+            log('WARNING', 'server.bridge', 'apply_config: audit/effective_config step failed')
+
+        return result
+
+    def apply_config_queued(self, config_dict: Dict[str, Any], source: str = 'user') -> Dict[str, Any]:
         """Apply config now if the controller is idle, otherwise queue it.
 
         When the controller is busy (agent mid-turn, ``is_busy`` == RUNNING/
@@ -1494,7 +1561,7 @@ class WebAgentBridge:
             log('INFO', 'server.bridge',
                 "Controller busy — config queued for deferred apply")
             return {"status": "queued"}
-        return self.apply_config(config_dict)
+        return self.apply_config(config_dict, source=source)
 
     # ── Session persistence ──────────────────────────────────────────────────
 
@@ -1670,7 +1737,7 @@ class WebAgentBridge:
 
         return normalized
 
-    def create_session(self, mode: str = "custom") -> Tuple[str, Dict[str, Any]]:
+    def create_session(self, mode: str = "custom", workspace_id: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
         """
         Create a new empty session and return (session_id, frontend_config).
 
@@ -1678,7 +1745,12 @@ class WebAgentBridge:
         in-memory state (``_session``, ``_loaded_session``, ``_session_config``)
         WITHOUT broadcasting events — the caller (e.g. server.py) is responsible
         for sending session_loaded / state_changed to the frontend.
+
+        ``workspace_id`` (if given) is validated with ``_validate_workspace_id``
+        before session creation.
         """
+        if workspace_id is not None:
+            _validate_workspace_id(workspace_id)
         session_id, frontend_config = self._session_manager.create_session(
             mode=mode, workspace_path=self._workspace_path
         )
@@ -1758,6 +1830,11 @@ class WebAgentBridge:
                     f'provider={sc.provider_id}, model={sc.model}')
             else:
                 log('INFO', 'server.bridge', 'No session_config in session metadata — session will use defaults')
+                merged = self._config_manager.resolve_full_config(
+                    workspace_id=self._workspace_id,
+                    session_id=session_id,
+                )
+                self._session_config = self._config_manager.session_config_from_merged(merged)
 
             # ── Fallback: derive workspace_id from config if session has none ──
             if self._workspace_id is None and self._workspace_path:

@@ -66,7 +66,7 @@ class SessionConfig(BaseModel):
         and the frontend cannot override it.
     """
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     # ── Fields ──────────────────────────────────────────────────────────
 
@@ -94,6 +94,12 @@ class SessionConfig(BaseModel):
         default=None,
         ge=1,
         description='Maximum conversation turns for this session.',
+    )
+    timeout_seconds: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description='Agent soft budget in seconds (None = AgentConfig default 300). '
+                    'Distinct from provider_config.timeout (provider request timeout).',
     )
     token_monitor_warning_threshold: Optional[int] = Field(
         default=None,
@@ -276,6 +282,9 @@ class SessionConfig(BaseModel):
         kwargs['allow_host_resources'] = bool(self.allow_host_resources)
         if self.max_workers_per_session is not None:
             kwargs['max_workers_per_session'] = self.max_workers_per_session
+
+        if self.timeout_seconds is not None:
+            kwargs['timeout_seconds'] = self.timeout_seconds
 
         return AgentConfig(**kwargs)
 

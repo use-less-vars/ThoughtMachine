@@ -335,4 +335,4 @@ class AgentConfig(BaseModel):
 
         return self.model_copy(update=updates)
 
-    model_config = ConfigDict(extra='ignore')
+    model_config = ConfigDict(extra='forbid')

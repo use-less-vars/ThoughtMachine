@@ -217,6 +217,17 @@ def _get_server_revision() -> str:
 
 _SERVER_REVISION = _get_server_revision()
 
+
+def _session_config_dict(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Filter a (translated) frontend config dict to SessionConfig fields.
+
+    SessionConfig is strict (``extra='forbid'``), but the frontend payload may
+    carry auxiliary keys (``api_key_configured``, ``top_p``, ``max_tokens``,
+    ``stop_check``, ...) that are consumed elsewhere.  Drop them here so
+    ``SessionConfig(**cfg)`` never raises on unknown keys.
+    """
+    return {k: v for k, v in cfg.items() if k in SessionConfig.model_fields}
+
 # ── Monkey-patch websockets library race condition ──────────────────
 # websockets.legacy.protocol has a race condition: when send_json() is
 # called concurrently from multiple coroutines, two _drain_helper calls
@@ -749,6 +760,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # Global config from agent_config.json provides defaults;
                     # frontend fields become overrides.
                     config_dict = config_manager.translate_frontend_config(config_dict)
+                    config_dict = _session_config_dict(config_dict)
 
                     # Always create a fresh bridge + controller for start_session.
                     # Stop any existing bridge first to prevent resource leaks.
@@ -805,6 +817,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             config_dict = msg.get("config", {})
                             if config_dict:
                                 config_dict = config_manager.translate_frontend_config(config_dict)
+                                config_dict = _session_config_dict(config_dict)
                                 # 🛡️ Preserve mode from loaded session if frontend config doesn't specify it
                                 # Otherwise the frontend config (which may omit mode) would override
                                 # the correct mode loaded from session metadata with None → 'agent' default.
@@ -878,6 +891,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         "settings": settings,
                         "permissions": permissions,
                         "merged_config": fe_config,
+                        "effective_config": config_manager.get_effective_config(
+                            bridge,
+                            workspace_id=bridge._workspace_id if bridge else None,
+                            workspace_path=bridge._workspace_path if bridge else None,
+                        ),
                     })
 
                 elif command == "get_conversation":
@@ -1159,6 +1177,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                                     "settings": settings,
                                     "permissions": permissions,
                                     "merged_config": fe_config,
+                                    "effective_config": config_manager.get_effective_config(
+                                        bridge,
+                                        workspace_id=bridge._workspace_id if bridge else None,
+                                        workspace_path=bridge._workspace_path if bridge else None,
+                                    ),
                                 })
                                 err_msg = result.get('error', 'unknown error') if isinstance(result, dict) else 'unknown error'
                                 await ws.send_json({
@@ -1264,8 +1287,19 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             # Frontend sent the draft — translate to backend format
                             cfg_dict = config_manager.translate_frontend_config(config_dict)
                         elif bridge is not None:
-                            # Fallback: use bridge's currently applied config
-                            cfg_dict = bridge.get_config() or {}
+                            # Fallback: bridge's applied config, else full resolved chain
+                            cfg_dict = bridge.get_config() or config_manager.resolve_full_config(
+                                workspace_id=getattr(bridge, "workspace_id", None),
+                                session_id=getattr(bridge, "_session_id", None)
+                                or (
+                                    bridge._loaded_session.session_id
+                                    if getattr(bridge, "_loaded_session", None) else None
+                                ),
+                                provider_id=(
+                                    bridge._session_config.provider_id
+                                    if getattr(bridge, "_session_config", None) else None
+                                ),
+                            )
                         else:
                             await ws.send_json({
                                 "type": "default_config_saved",
@@ -1724,6 +1758,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             "settings": settings,
                             "permissions": permissions,
                             "merged_config": fe_config,
+                            "effective_config": config_manager.get_effective_config(
+                                bridge,
+                                workspace_id=bridge._workspace_id if bridge else None,
+                                workspace_path=bridge._workspace_path if bridge else None,
+                            ),
                         })
                         await ws.send_json({"type": "status_message", "text": f"Session {session_id} loaded. Click Run to continue."})
                         # Register/update in global session registry
@@ -1956,6 +1995,17 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # Extract optional workspace_id from the request
                     workspace_id = msg.get("workspace_id") or None
                     if workspace_id:
+                        try:
+                            from web_ui.backend.bridge import _validate_workspace_id
+                            workspace_id = _validate_workspace_id(workspace_id)
+                        except ValueError as exc:
+                            log('WARNING', 'server',
+                                f"new_session: invalid workspace_id rejected: {exc}")
+                            await ws.send_json({
+                                "type": "status_message",
+                                "text": f"⚠ Invalid workspace_id: {exc}",
+                            })
+                            continue
                         bridge._workspace_id = workspace_id
 
                     # ── Fallback: resolve workspace_id from the project path ──
@@ -2002,7 +2052,7 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     # Create a new empty session via SessionManager
                     # Use mode from the frontend payload if provided, fall back to 'custom'
                     mode = msg.get('mode', 'custom')
-                    session_id, frontend_config = bridge.create_session(mode=mode)
+                    session_id, frontend_config = bridge.create_session(mode=mode, workspace_id=workspace_id)
                     new_session = bridge._session
                     if workspace_id and new_session:
                         new_session.workspace_id = workspace_id
@@ -2065,6 +2115,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         "settings": settings,
                         "permissions": permissions,
                         "merged_config": fe_config,
+                        "effective_config": config_manager.get_effective_config(
+                            bridge,
+                            workspace_id=bridge._workspace_id if bridge else None,
+                            workspace_path=bridge._workspace_path if bridge else None,
+                        ),
                     })
                     await ws.send_json({"type": "status_message", "text": "Ready. Type a query to start."})
 
@@ -2202,6 +2257,11 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                         "settings": settings,
                         "permissions": permissions,
                         "merged_config": fe_config,
+                        "effective_config": config_manager.get_effective_config(
+                            bridge,
+                            workspace_id=bridge._workspace_id if bridge else None,
+                            workspace_path=bridge._workspace_path if bridge else None,
+                        ),
                     })
                     await ws.send_json({
                         "type": "status_message",

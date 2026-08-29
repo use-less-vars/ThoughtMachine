@@ -29,6 +29,7 @@ from thoughtmachine.workspace_capabilities import (
     load_workspace_capabilities,
 )
 from thoughtmachine.security import SessionPermissions, PERMISSION_SCHEMA, _pending_security_requests, _pending_requests_lock, resolve_security_prompt
+from agent.config.defaults import PROMPT_TIMEOUT
 from agent.events import SecurityPromptEvent, EventType, NullEventBus
 
 logger = logging.getLogger(__name__)
@@ -394,7 +395,6 @@ def check_required_categories(
         ``(True, "")`` if all checks pass.
         ``(False, error_message)`` if any check fails or the user denies.
     """
-    PROMPT_TIMEOUT = 120.0
 
     # ── Apply worker-level restrictions ─────────────────────────────────
     if permission_footprint is not None:

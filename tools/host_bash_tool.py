@@ -29,10 +29,9 @@ from pydantic import Field
 
 from .base import ToolBase
 
-# Execution timeout for the spawned shell (seconds).
-HOST_BASH_TIMEOUT = 120
-# How long to wait for the operator's approval decision (seconds).
-HOST_BASH_APPROVAL_TIMEOUT = 120.0
+# Centralized literal defaults (Phase A consolidation). Re-exported here so
+# existing importers/tests keep seeing the same names on this module.
+from agent.config.defaults import HOST_BASH_TIMEOUT, HOST_BASH_APPROVAL_TIMEOUT
 
 
 class HostBashTool(ToolBase):

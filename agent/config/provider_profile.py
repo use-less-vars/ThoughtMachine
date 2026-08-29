@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 THOUGHTMACHINE_DIR = Path.home() / '.thoughtmachine'
@@ -26,6 +26,8 @@ class ProviderProfile(BaseModel):
     models: List[str] = Field(default_factory=list)
     timeout: int = 120
     max_retries: Optional[int] = None
+
+    model_config = ConfigDict(extra='forbid')
 
 
 class ProviderManager:

@@ -20,33 +20,19 @@ try:
 except ImportError:  # pragma: no cover - defensive
     create_event = None  # type: ignore
 
-# Lifecycle event types this observer subscribes to (Phase 2A)
-WORKER_LIFECYCLE_EVENT_TYPES = (
-    "worker_spawned",
-    "worker_status",
-    "worker_running",
-    "worker_heartbeat",
-    "worker_stopping",
-    "worker_completed",
-    "worker_error",
-    "worker_timeout",
-    "worker_partial_result",
+# Centralized literal defaults (Phase A consolidation). Re-exported here so
+# existing importers/tests keep seeing the same names on this module.
+from agent.config.defaults import (
+    WORKER_LIFECYCLE_EVENT_TYPES,
+    PER_WORKER_RING_SIZE,
+    GLOBAL_RING_SIZE,
+    HEARTBEAT_STALE_AFTER_S,
+    HEARTBEAT_INTERVAL_S,
+    WORKER_HUNG_GRACE_S,
 )
 
-# Per-worker ring buffer size and global ring buffer size
-PER_WORKER_RING_SIZE = 50
-GLOBAL_RING_SIZE = 500
-
-# A worker whose last heartbeat is older than this is considered stale
-HEARTBEAT_STALE_AFTER_S = 600
-
-# Publisher-side heartbeat cadence (worker.py throttles heartbeats to this).
-HEARTBEAT_INTERVAL_S = 30
 # Alias used by consumers of the observer (tests, supervisor).
 STALE_AFTER_S = HEARTBEAT_STALE_AFTER_S
-# Extra time past staleness before a worker is reported as "hung". 0 means a
-# stale worker is immediately hung.
-WORKER_HUNG_GRACE_S = 0
 
 
 class WorkerLifecycleObserver:

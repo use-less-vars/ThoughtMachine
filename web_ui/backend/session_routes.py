@@ -99,6 +99,7 @@ async def create_session(body: CreateSessionBody) -> Dict[str, Any]:
         session_id, _frontend_config = session_manager.create_session(
             mode=mode,
             workspace_path=body.workspace_path,
+            audit_source='api',
         )
 
         # Reload the persisted session so we can layer workspace/name metadata

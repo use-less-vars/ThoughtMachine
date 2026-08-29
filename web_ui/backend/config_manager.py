@@ -15,6 +15,11 @@ Exported names (all public — no leading underscore):
     default_frontend_config
     config_to_dict
     atomic_replace
+    resolve_full_config
+    session_config_from_merged
+    agent_config_from_merged
+    CONFIG_LAYER_ORDER
+    CONFIG_LAYER_OWNERSHIP
 """
 
 from __future__ import annotations
@@ -29,6 +34,14 @@ from typing import Any, Dict, Optional
 
 from agent.config.presets import get_tools_for_mode
 from agent.logging import log
+
+from agent.config.config_manager import (
+    _factory_defaults_path as _get_factory_defaults_path,
+    _user_defaults_path as _get_user_defaults_path,
+    _workspace_defaults_path as _get_workspace_defaults_path,
+)
+from agent.config.deep_merge import deep_merge
+from agent.config.service import create_agent_config_service
 
 # ── Project-root discovery (same logic as server.py) ──────────────────────
 _project_root: str = os.path.dirname(
@@ -49,6 +62,7 @@ FALLBACK_FRONTEND_CONFIG: Dict[str, Any] = {
     "model_override": None,
     "temperature": 1.0,
     "max_turns": 200,
+    "timeout_seconds": None,
     "stop_check": None,
     "system_prompt": None,
     "api_key_configured": False,
@@ -107,6 +121,34 @@ GLOBAL_DEFAULT_KEYS = frozenset({
     "max_turns",
     "system_prompt",
 })
+
+
+# Full layer precedence for ``resolve_full_config`` (lowest → highest).
+# Each layer owns a documented key set (see CONFIG_LAYER_OWNERSHIP).
+CONFIG_LAYER_ORDER = (
+    "fallback",
+    "factory",
+    "global_defaults",
+    "agent_config",
+    "provider_profile",
+    "workspace_config",
+    "session_config",
+    "worker_overrides",
+)
+
+# Per-key ownership for the merge chain.  Layers may only contribute the
+# keys they own; ``resolve_full_config`` filters the global-defaults layer
+# to GLOBAL_DEFAULT_KEYS and passes every other layer through as-is.
+CONFIG_LAYER_OWNERSHIP: Dict[str, str] = {
+    "fallback": "all keys (frontend shape base)",
+    "factory": "all keys (base overrides)",
+    "global_defaults": "provider_id, model, base_url, temperature, max_turns, system_prompt (GLOBAL_DEFAULT_KEYS only)",
+    "agent_config": "legacy AgentConfig keys (read-compat only)",
+    "provider_profile": "provider_type, api_key, base_url, provider_config {timeout, max_retries}, default_model → model",
+    "workspace_config": "any flat config keys (vault workspaces/<id>/defaults.json)",
+    "session_config": "mode, enabled_tools, session_permissions, workspace_path, provider_id, model, api_key, base_url, temperature, max_turns, timeout_seconds, feature flags",
+    "worker_overrides": "model, temperature, max_turns, system_prompt, enabled_tools, timeout_seconds, token thresholds, session_permissions, workspace_path",
+}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -217,7 +259,7 @@ def frontend_config_from_bridge(bridge) -> Dict[str, Any]:
             or os.getenv("DEEPSEEK_API_KEY")
             or os.getenv("OPENAI_COMPATIBLE_API_KEY")
             or ""
-        )
+        ) or result.get('api_key_configured', False)
         return result
 
     # Check if API key is configured before stripping it
@@ -292,11 +334,19 @@ def backend_to_frontend_config(backend: Dict[str, Any]) -> Dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def default_frontend_config() -> Dict[str, Any]:
-    """Return config in frontend format, merged with global defaults."""
-    defaults = dict(FALLBACK_FRONTEND_CONFIG)
-    global_defaults = load_global_defaults()
-    defaults.update(global_defaults)
-    return backend_to_frontend_config(defaults)
+    """Return config in frontend format, resolved through the full layer chain."""
+    merged = resolve_full_config()
+    api_key = merged.pop("api_key", None) or ""
+    if not api_key:
+        api_key = (
+            os.getenv("OPENAI_API_KEY")
+            or os.getenv("DEEPSEEK_API_KEY")
+            or os.getenv("OPENAI_COMPATIBLE_API_KEY")
+            or ""
+        )
+    result = backend_to_frontend_config(merged)
+    result["api_key_configured"] = bool(api_key)
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -310,6 +360,74 @@ def config_to_dict(cfg) -> Dict[str, Any]:
     if hasattr(cfg, "dict"):
         return cfg.dict()
     return {k: str(v) for k, v in vars(cfg).items() if not k.startswith("_")}
+
+
+def get_effective_config(
+    bridge_or_config,
+    workspace_id: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Return the COMPLETE effective agent config as a plain dict (api_key redacted).
+
+    Accepts either a bridge (``_session_config`` attribute) or a config object
+    (``SessionConfig`` / ``AgentConfig`` / plain dict).  The api_key is never
+    included (``AgentConfig.api_key`` is ``exclude=True`` on dump); any other
+    sensitive key is redacted via ``redact_config``.
+
+    ``workspace_id`` / ``workspace_path`` arguments override the values derived
+    from the bridge/config so callers can reflect the authoritative source.
+    """
+    from agent.config.audit import redact_config
+
+    sc = None
+    if bridge_or_config is None:
+        return {}
+    if hasattr(bridge_or_config, "_session_config"):
+        sc = bridge_or_config._session_config
+        if sc is None:
+            return {}
+    elif hasattr(bridge_or_config, "to_agent_config"):
+        sc = bridge_or_config
+    elif hasattr(bridge_or_config, "model_dump"):
+        sc = bridge_or_config
+    elif isinstance(bridge_or_config, dict):
+        return redact_config(bridge_or_config)
+    else:
+        return {}
+
+    try:
+        if hasattr(sc, "to_agent_config"):
+            agent_cfg = sc.to_agent_config()
+        else:
+            agent_cfg = sc
+        if hasattr(agent_cfg, "model_dump"):
+            data = agent_cfg.model_dump()
+        elif isinstance(agent_cfg, dict):
+            data = dict(agent_cfg)
+        else:
+            data = {k: str(v) for k, v in vars(agent_cfg).items()
+                    if not k.startswith("_")}
+    except Exception:
+        return {}
+
+    # workspace_path: explicit arg > bridge attribute > config value
+    if workspace_path is None and bridge_or_config is not None:
+        workspace_path = getattr(bridge_or_config, "_workspace_path", None)
+    if workspace_path is None:
+        workspace_path = getattr(sc, "workspace_path", None)
+    if workspace_path is not None:
+        data["workspace_path"] = workspace_path
+
+    # workspace_id: explicit arg > bridge attribute > config value
+    if workspace_id is None and bridge_or_config is not None:
+        workspace_id = getattr(bridge_or_config, "_workspace_id", None)
+    if workspace_id is None:
+        workspace_id = getattr(sc, "workspace_id", None)
+    if workspace_id is not None:
+        data["workspace_id"] = workspace_id
+
+    return redact_config(data)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -359,6 +477,157 @@ def atomic_replace(data: dict, dst: str, work_dir: str, retries: int = 3) -> Non
 
             # Back off before retrying
             time.sleep(0.2 * attempt)
+
+
+# ── Full-config merger (single entry point) ─────────────────────────────────
+
+
+def _load_factory_defaults() -> Dict[str, Any]:
+    """Layer base: FALLBACK_FRONTEND_CONFIG + factory_defaults.json (if present)."""
+    merged = deep_merge({}, dict(FALLBACK_FRONTEND_CONFIG))
+    try:
+        path = Path(_get_factory_defaults_path())
+        if path.exists():
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and isinstance(raw.get("config"), dict):
+                raw = raw["config"]
+            if isinstance(raw, dict):
+                merged = deep_merge(merged, raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        log("WARNING", "server.config", f"Could not load factory defaults: {exc}")
+    return merged
+
+
+def _load_global_defaults_layer() -> Dict[str, Any]:
+    """Global-defaults layer — GLOBAL_DEFAULT_KEYS only, no auto-create side effect."""
+    try:
+        path = Path(_get_user_defaults_path())
+        if path.exists():
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                return {k: v for k, v in raw.items() if k in GLOBAL_DEFAULT_KEYS}
+    except (OSError, json.JSONDecodeError) as exc:
+        log("WARNING", "server.config", f"Could not load global defaults: {exc}")
+    return {}
+
+
+def _load_agent_config_layer() -> Dict[str, Any]:
+    """agent_config.json layer — legacy AgentConfig keys, read-compat only.
+
+    Contributes only when the agent_config.json file actually exists:
+    ``ConfigService.get_all()`` returns the full AgentConfig DEFAULTS dict
+    when the file is missing, and those defaults must not override the
+    factory/global layers.  Injected fakes without a ``config_path``
+    attribute are treated as present (their ``get_all`` is authoritative).
+    """
+    try:
+        service = create_agent_config_service()
+        config_path = getattr(service, "config_path", None)
+        if config_path is not None and not os.path.exists(config_path):
+            return {}
+        cfg = service.get_all()
+        if isinstance(cfg, dict):
+            return cfg
+    except Exception as exc:
+        log("WARNING", "server.config", f"Could not load agent_config.json: {exc}")
+    return {}
+
+
+def _resolve_provider_layer(
+    merged: Dict[str, Any],
+    provider_id: Optional[str] = None,
+    fallback_any: bool = True,
+) -> Dict[str, Any]:
+    """Provider-profile layer: api_key/base_url/provider_config/model from profile."""
+    from agent.config.provider_profile import ProviderManager
+
+    pid = provider_id or merged.get("provider_id")
+    try:
+        manager = ProviderManager()
+        resolved = manager.resolve_config(
+            {**merged, "provider_id": pid} if pid else dict(merged)
+        )
+        if fallback_any and not resolved.get("api_key"):
+            for profile in manager.list_profiles():
+                if profile.api_key:
+                    resolved["api_key"] = profile.api_key
+                    resolved["provider_id"] = profile.id
+                    break
+        return resolved
+    except Exception as exc:
+        log("WARNING", "server.config",
+            f"Provider resolution failed in resolve_full_config: {exc}")
+        return merged
+
+
+def resolve_full_config(
+    workspace_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    provider_id: Optional[str] = None,
+    worker_overrides: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Resolve the full config by merging every layer (lowest → highest).
+
+    Precedence (see CONFIG_LAYER_ORDER):
+        fallback < factory < global defaults < agent_config.json
+        < provider profile < workspace config < session config
+        < worker overrides
+
+    Never raises: every layer is guarded; missing files/layers are skipped.
+    Returns a plain dict (not a model).
+    """
+    merged = _load_factory_defaults()
+    merged = deep_merge(merged, _load_global_defaults_layer())
+    merged = deep_merge(merged, _load_agent_config_layer())
+    merged = _resolve_provider_layer(merged, provider_id=provider_id)
+
+    if workspace_id:
+        try:
+            path = Path(_get_workspace_defaults_path(workspace_id))
+            if path.exists():
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    merged = deep_merge(merged, raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            log("WARNING", "server.config", f"Could not load workspace config: {exc}")
+
+    if session_id:
+        try:
+            from session.store import FileSystemSessionStore
+            session = FileSystemSessionStore().load_session(
+                session_id, workspace_id=workspace_id
+            )
+            if session is not None:
+                raw = session.metadata.get("session_config") or session.metadata.get("agent_config")
+                if isinstance(raw, dict):
+                    raw = dict(raw)
+                    if "mode" not in raw:
+                        raw["mode"] = "agent"  # mirror repair_session legacy default
+                    merged = deep_merge(merged, raw)
+        except Exception as exc:
+            log("WARNING", "server.config", f"Could not load session config: {exc}")
+
+    if worker_overrides and isinstance(worker_overrides, dict):
+        merged = deep_merge(merged, worker_overrides)
+
+    return merged
+
+
+def _filter_model_fields(data: Dict[str, Any], model) -> Dict[str, Any]:
+    """Filter *data* to fields declared by *model* (strict-schema safe)."""
+    return {k: v for k, v in data.items() if k in model.model_fields and v is not None}
+
+
+def session_config_from_merged(merged: Dict[str, Any]):
+    """Build a ``SessionConfig`` from a merged dict (extra keys filtered)."""
+    from agent.config.session_config import SessionConfig
+    return SessionConfig(**_filter_model_fields(merged, SessionConfig))
+
+
+def agent_config_from_merged(merged: Dict[str, Any]):
+    """Build an ``AgentConfig`` from a merged dict (extra keys filtered)."""
+    from agent.config.models import AgentConfig
+    return AgentConfig(**_filter_model_fields(merged, AgentConfig))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -413,6 +682,31 @@ class ConfigManager:
         return default_frontend_config()
 
     @staticmethod
+    def resolve_full_config(
+        workspace_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        provider_id: Optional[str] = None,
+        worker_overrides: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Resolve the full config by merging all layers (module-level)."""
+        return resolve_full_config(
+            workspace_id=workspace_id,
+            session_id=session_id,
+            provider_id=provider_id,
+            worker_overrides=worker_overrides,
+        )
+
+    @staticmethod
+    def session_config_from_merged(merged: Dict[str, Any]):
+        """Build a ``SessionConfig`` from a merged dict (extra keys filtered)."""
+        return session_config_from_merged(merged)
+
+    @staticmethod
+    def agent_config_from_merged(merged: Dict[str, Any]):
+        """Build an ``AgentConfig`` from a merged dict (extra keys filtered)."""
+        return agent_config_from_merged(merged)
+
+    @staticmethod
     def config_to_dict(cfg) -> Dict[str, Any]:
         """Convert an ``AgentConfig`` to a plain dict for JSON serialization."""
         return config_to_dict(cfg)
@@ -434,6 +728,23 @@ class ConfigManager:
         bridge configuration.
         """
         return frontend_config_from_bridge(bridge)
+
+    @staticmethod
+    def get_effective_config(
+        bridge_or_config,
+        workspace_id: Optional[str] = None,
+        workspace_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Get the COMPLETE effective agent config (api_key redacted).
+
+        Wrapper around the module-level ``get_effective_config``.
+        """
+        return get_effective_config(
+            bridge_or_config,
+            workspace_id=workspace_id,
+            workspace_path=workspace_path,
+        )
 
     @staticmethod
     def session_config_to_frontend(
@@ -504,6 +815,7 @@ class ConfigManager:
             "top_p",
             "max_tokens",
             "max_turns",
+            "timeout_seconds",
             "system_prompt",
             "api_key_configured",
         )
@@ -577,6 +889,7 @@ class ConfigManager:
 
         # Mutable fields (always allowed regardless of mode)
         for field in ("provider_id", "model", "base_url", "temperature", "top_p", "max_turns",
+                      "timeout_seconds",
                       "token_monitor_warning_threshold", "token_monitor_critical_threshold"):
             if field in config_dict:
                 setattr(session_config, field, config_dict[field])
@@ -590,18 +903,17 @@ class ConfigManager:
         # If provider_id changed, resolve provider credentials
         if "provider_id" in config_dict and config_dict["provider_id"]:
             try:
-                manager = ProviderManager()
-                resolved = manager.resolve_config(session_config.model_dump(exclude_none=True))
-                if "api_key" in resolved:
-                    session_config.api_key = resolved["api_key"]
-                if "base_url" in resolved:
-                    session_config.base_url = resolved["base_url"]
+                merged = resolve_full_config(provider_id=config_dict["provider_id"])
+                if merged.get("api_key"):
+                    session_config.api_key = merged["api_key"]
+                if merged.get("base_url"):
+                    session_config.base_url = merged["base_url"]
                 # Merge provider-specific config (timeout/max_retries) into session
-                resolved_pc = resolved.get('provider_config') or {}
+                resolved_pc = merged.get("provider_config") or {}
                 if resolved_pc:
-                    merged = dict(getattr(session_config, 'provider_config', None) or {})
-                    merged.update(resolved_pc)
-                    session_config.provider_config = merged
+                    merged_pc = dict(getattr(session_config, "provider_config", None) or {})
+                    merged_pc.update(resolved_pc)
+                    session_config.provider_config = merged_pc
             except Exception as e:
                 log("WARNING", "server.bridge",
                     f"Provider resolution failed during apply_config: {e}")
@@ -669,6 +981,18 @@ class ConfigManager:
             except (ValueError, TypeError):
                 field_errors["max_turns"] = "Must be an integer"
                 errors.append("Invalid max_turns value")
+
+        # Check timeout_seconds
+        timeout_seconds = config.get("timeout_seconds")
+        if timeout_seconds is not None:
+            try:
+                ts = int(timeout_seconds)
+                if ts < 1:
+                    field_errors["timeout_seconds"] = "Must be at least 1"
+                    errors.append("timeout_seconds must be at least 1")
+            except (ValueError, TypeError):
+                field_errors["timeout_seconds"] = "Must be an integer"
+                errors.append("Invalid timeout_seconds value")
 
         # Check token monitor thresholds — warning must stay below critical
         warn_thr = config.get("token_monitor_warning_threshold")

@@ -284,6 +284,7 @@ class CheckSystem(ToolBase):
                     workspace_capabilities = {}
 
         effective = {}
+        permission_fetch_error = None
         if GATE_AVAILABLE and get_effective_permissions and self.session_permissions:
             # Build a simple SessionPermissions object or use raw dict
             try:
@@ -295,8 +296,13 @@ class CheckSystem(ToolBase):
                     if k in [f.name for f in __import__('dataclasses').fields(WorkspaceCapabilities)]
                 })
                 effective = get_effective_permissions(session_obj, caps_obj)
-            except Exception:
-                effective = dict(self.session_permissions)
+            except Exception as exc:
+                # Fail-closed: surface the error instead of silently returning
+                # the raw session permissions (which could overstate effective
+                # rights when capability computation fails).
+                logger.error("check_system: effective-permission computation failed: %s", exc)
+                effective = {}
+                permission_fetch_error = str(exc)
         elif self.session_permissions:
             effective = dict(self.session_permissions)
 
@@ -305,6 +311,7 @@ class CheckSystem(ToolBase):
             "workspace_capabilities": workspace_capabilities,
             "workspace_id": ws_id,
             "source": "gate" if GATE_AVAILABLE else "session_fallback",
+            "permission_fetch_error": permission_fetch_error,
         }
 
     def _query_container_status(self, ws_path: Optional[str]) -> dict:

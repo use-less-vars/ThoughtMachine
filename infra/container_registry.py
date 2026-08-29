@@ -57,53 +57,31 @@ from agent.logging.lifecycle import log_container_event
 # Constants
 # ---------------------------------------------------------------------------
 
-# Mirrors infra/resource_container_manager.py L96 (the resource git image tag).
-RESOURCE_IMAGE_TAG = "tm-resource-git"
-
-# Resource-container identity (mirrors infra/resource_container_manager.py
-# RESOURCE_LABEL / RESOURCE_KIND / _labels L374-421 and the deterministic
-# tm-res-<sha256(workspace_path)[:12]>-git name L404-413).
-RESOURCE_LABEL = "thoughtmachine.resource"
-RESOURCE_KIND = "git"
-WORKSPACE_ID_LABEL = "thoughtmachine.workspace_id"
-CONTAINER_NAME_LABEL = "thoughtmachine.container_name"
-RESOURCE_MEM_LIMIT = "512m"
-RESOURCE_CPU_QUOTA = 50000
-
-# Mirrors infra/container_manager.py's default image.
-DEFAULT_IMAGE = "agent-executor"
-
-# Workspace config.json default max_containers (container_manager.py L228/243).
-DEFAULT_MAX_CONTAINERS = 4
-
-# Valid container_type values ("git" is represented as "resource"; mcp/proxy
-# are future types reserved by the registry).
-CONTAINER_TYPES = ("user", "resource", "mcp", "proxy")
-
-# OOM score defaults by container type (None sentinel in ContainerProfile):
-#   user     -> 1000  first OOM-kill victims (container_manager.py L523)
-#   resource ->  500  moderate score (resource_container_manager.py L536)
-DEFAULT_USER_OOM_SCORE_ADJ = 1000
-DEFAULT_RESOURCE_OOM_SCORE_ADJ = 500
-
-# Hardening recipe — the union of the three create stacks (design doc §1.1).
-HARDENED_CAP_DROP = ["ALL"]
-HARDENED_SECURITY_OPT = ["no-new-privileges:true"]
-HARDENED_READ_ONLY = True
-HARDENED_USER = "1000:1000"
-
-# tmpfs recipe (design doc §1.1; dispatch spelling "256m").
-DEFAULT_TMPFS = {
-    "/tmp": "rw,noexec,nosuid,size=64m",
-    "/home/agent": "rw,exec,size=256m,uid=1000,gid=1000",
-}
-
-DEFAULT_COMMAND = ["tail", "-f", "/dev/null"]
-DEFAULT_MEM_LIMIT = "1g"
-DEFAULT_CPU_QUOTA = 100000
-
-# Graceful-stop timeout used by destroy_container / permission reconciliation.
-STOP_TIMEOUT = 10
+# Centralized literal defaults (Phase A consolidation). Re-exported here so
+# existing importers/tests keep seeing the same names on this module.
+from agent.config.defaults import (
+    RESOURCE_IMAGE_TAG,
+    RESOURCE_LABEL,
+    RESOURCE_KIND,
+    WORKSPACE_ID_LABEL,
+    CONTAINER_NAME_LABEL,
+    RESOURCE_MEM_LIMIT,
+    RESOURCE_CPU_QUOTA,
+    DEFAULT_IMAGE,
+    DEFAULT_MAX_CONTAINERS,
+    CONTAINER_TYPES,
+    DEFAULT_USER_OOM_SCORE_ADJ,
+    DEFAULT_RESOURCE_OOM_SCORE_ADJ,
+    HARDENED_CAP_DROP,
+    HARDENED_SECURITY_OPT,
+    HARDENED_READ_ONLY,
+    HARDENED_USER,
+    DEFAULT_TMPFS,
+    DEFAULT_COMMAND,
+    DEFAULT_MEM_LIMIT,
+    DEFAULT_CPU_QUOTA,
+    STOP_TIMEOUT,
+)
 
 
 @dataclass

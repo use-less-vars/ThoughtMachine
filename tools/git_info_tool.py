@@ -13,7 +13,7 @@ from security.sandboxed_execution import SandboxedExecution
 # Clone URL protocol allowlist. ``git clone`` accepts arbitrary transport URLs
 # (including ``ext::`` shell executors and ``file://`` local access), so clone
 # URLs are restricted to these schemes plus scp-like ``user@host:path`` syntax.
-ALLOWED_GIT_PROTOCOLS = ["https://", "http://", "git://", "ssh://"]
+from agent.config.defaults import ALLOWED_GIT_PROTOCOLS
 
 # Branch-name validation for branch_create/checkout. Explicit allowlist so
 # names can never smuggle option-like arguments ('-'), path traversal

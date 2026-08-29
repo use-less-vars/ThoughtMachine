@@ -45,11 +45,58 @@ if TYPE_CHECKING:
     from session.models import Session
 
 from .debug_context import PAUSE_DEBUG, pause_debug
+from agent.config.defaults import DEFAULT_RESPONSE_TOKENS
+from agent.config.audit import log_config_audit
+
+
+def _config_diff(old_config, new_config) -> List[str]:
+    """Return a list of ``'field: old -> new'`` strings for changed config fields.
+
+    Mirrors ``Agent._configs_are_identical`` semantics: excludes sensitive
+    (``api_key``) and non-comparable (``stop_check``) fields, and treats
+    ``None``/``''`` as equivalent for string fields so trivial normalisation
+    mismatches are not reported as changes.
+    """
+    excluded_fields = {'api_key', 'stop_check'}
+    diff = []
+    for field_name in type(old_config).model_fields:
+        if field_name in excluded_fields:
+            continue
+        old_val = getattr(old_config, field_name)
+        new_val = getattr(new_config, field_name)
+        if isinstance(old_val, str) and old_val == '':
+            old_val = None
+        if isinstance(new_val, str) and new_val == '':
+            new_val = None
+        if old_val != new_val:
+            diff.append(f'{field_name}: {repr(old_val)[:80]} -> {repr(new_val)[:80]}')
+    return diff
+
+
+def _audit_config_change(old_config, new_config, restart_required: bool) -> None:
+    """Audit a worker-side config change (redacted); never raises.
+
+    ``restart_required=True`` is used for full-restart applications
+    (component ``agent.restart``), ``False`` for hot-swaps
+    (component ``agent.hot_swap``).
+    """
+    try:
+        log_config_audit(
+            source='worker',
+            component='agent.restart' if restart_required else 'agent.hot_swap',
+            old=old_config,
+            new=new_config,
+            restart_required=restart_required,
+            injected=None,
+        )
+    except Exception:
+        pass
+
 
 class Agent:
     """Modular agent coordinating specialized components."""
     SAFETY_MARGIN = 1000
-    DEFAULT_RESPONSE_TOKENS = 4096
+    DEFAULT_RESPONSE_TOKENS = DEFAULT_RESPONSE_TOKENS
 
     def __init__(self, config: AgentConfig, session=None, session_id: str=None, event_bus=None):
         """
@@ -197,9 +244,13 @@ class Agent:
             return True
 
         if self._can_hot_swap(new_config):
+            diff = _config_diff(old_config, new_config)
+            log('INFO', 'core.config',
+                f'Hot-swapping config ({len(diff)} changed field(s)): ' + '; '.join(diff))
             self._hot_swap(new_config)
             self._pending_config = None
             self._notify_config_change(old_config, new_config)
+            _audit_config_change(old_config, new_config, restart_required=False)
             return True
         else:
 
@@ -228,10 +279,15 @@ class Agent:
                         'Applied session_permissions synchronously from preserved '
                         'pending config (restart deferred: no API key)')
                 return False
+            diff = _config_diff(old_config, new_config)
+            log('INFO', 'core.config',
+                f'Full restart required for config change '
+                f'({len(diff)} changed field(s)): ' + '; '.join(diff))
             success = self._restart_with_config(new_config)
             if success:
                 self._pending_config = None
                 self._notify_config_change(old_config, new_config)
+                _audit_config_change(old_config, new_config, restart_required=True)
             return success
 
     def _configs_are_identical(self, config_a: 'AgentConfig', config_b: 'AgentConfig') -> bool:
@@ -354,7 +410,7 @@ class Agent:
         # Update runtime params
         if new_config.temperature != self.config.temperature:
             self.runtime_params.temperature = new_config.temperature
-            changed.append(f'temperature={new_config.temperature}')
+            changed.append(f'temperature={self.config.temperature} -> {new_config.temperature}')
         # Update config reference
         old_config = self.config
         self.config = new_config

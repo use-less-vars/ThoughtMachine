@@ -26,12 +26,14 @@ except ImportError:  # pragma: no cover - event stack unavailable
     EventType = None
     global_event_bus = None
 
-# Maximum number of job records kept (bounded; oldest evicted when full).
-JOB_REGISTRY_MAX_JOBS = 200
-# Preview cap for completed-job results (full envelope stored separately).
-PREVIEW_CAP = 8000
-# Preview cap for partial/error/timeout snippets.
-PARTIAL_PREVIEW_CAP = 2000
+# Centralized literal defaults (Phase A consolidation). Re-exported here so
+# existing importers/tests keep seeing the same names on this module.
+from agent.config.defaults import (
+    JOB_REGISTRY_MAX_JOBS,
+    PREVIEW_CAP,
+    PARTIAL_PREVIEW_CAP,
+    TERMINAL_STATUSES,
+)
 
 # Worker event type names the registry mirrors into job status transitions.
 _JOB_EVENT_TYPES = (
@@ -41,10 +43,6 @@ _JOB_EVENT_TYPES = (
     "worker_timeout",
     "worker_error",
 )
-
-# Statuses that are final: once a job reaches one of these it must never
-# transition again (no overwriting a paused/timeout/completed job).
-TERMINAL_STATUSES = ("completed", "paused", "timeout", "error", "stopped", "interrupted")
 
 
 def _now_iso() -> str:

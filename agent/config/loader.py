@@ -327,6 +327,14 @@ def load_config(config_path: str) -> Dict[str, Any]:
         merged_config = _deep_merge_config(factory_config, saved_config)
         log('DEBUG', 'config.loader', f'Loaded config from {config_path} (overlay on factory)')
         merged_config = _backfill_nulls(merged_config)
+        # Drop stray keys (not in AgentConfig schema) before returning so that
+        # strict construction (AgentConfig(**config)) cannot raise.  Preserve
+        # agent_soft_budget_seconds: it is not a model field but is consumed
+        # by AgentConfig's before-validator (map_agent_soft_budget_seconds).
+        _soft_budget = merged_config.pop('agent_soft_budget_seconds', None)
+        _warn_stray_keys(merged_config)
+        if _soft_budget is not None:
+            merged_config['agent_soft_budget_seconds'] = _soft_budget
         return merged_config
     except json.JSONDecodeError as e:
         log('WARNING', 'config.loader',

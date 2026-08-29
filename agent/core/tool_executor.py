@@ -57,19 +57,9 @@ except ImportError:
     WorkspaceCapabilities = None
     resolve_workspace_id = None
 
-# ---------------------------------------------------------------------------
-# Default session permissions profile (seven categories)
-# ---------------------------------------------------------------------------
-# Fallback used when no live SessionPermissions model is available on config.
-DEFAULT_SESSION_PERMISSIONS = {
-    "container": False,
-    "network": "banned",
-    "filesystem": "read",
-    "system": "read",
-    "git": "read",
-    "mcp": "banned",
-    "execution": "banned",
-}
+# Fallback session-permissions profile (re-exported from
+# agent/config/defaults.py so existing importers keep seeing it here).
+from agent.config.defaults import DEFAULT_SESSION_PERMISSIONS
 
 class ToolExecutor:
     """Handles tool execution, JSON repair, and tool result processing."""
@@ -282,11 +272,21 @@ class ToolExecutor:
                 # Resolve workspace ID to load workspace capabilities
                 workspace_path = getattr(self.config, 'workspace_path', None)
                 ws_id = resolve_workspace_id(workspace_path) if (workspace_path and resolve_workspace_id) else None
+                required_categories = tool_class.get_required_categories(arguments)
+                # Fail-closed: when a workspace_path is configured but its
+                # workspace ID cannot be resolved, deny execution instead of
+                # silently falling back to (potentially permissive) default
+                # capabilities. Only tools that actually declare required
+                # capability categories are gated -- tools with no required
+                # categories have nothing to be permissive about and keep
+                # executing (e.g. introspection probes in tests).
+                if workspace_path and not ws_id and required_categories:
+                    return {'result': f"DENIED: could not resolve workspace_id for workspace_path={workspace_path}; tool execution denied (fail-closed).", 'tool_type': 'normal'}
                 caps = get_workspace_capabilities(ws_id) if ws_id else WorkspaceCapabilities()
                 effective = get_effective_permissions(session_perms_obj, caps)
 
                 ok, error_msg = check_required_categories(
-                    tool_class.get_required_categories(arguments),
+                    required_categories,
                     effective,
                     tool_name=tool_name,
                     tool_args=arguments,

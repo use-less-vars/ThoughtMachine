@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from agent.config.session_config import SessionConfig
 from agent.config.provider_profile import ProviderManager
+from agent.config.audit import log_config_audit
 from agent.core.message import SYSTEM_NOTIFICATION_PREFIX
 from agent.logging import log
 from session.models import Session
@@ -65,6 +66,7 @@ class SessionManager:
         self,
         mode: str = "custom",
         workspace_path: Optional[str] = None,
+        audit_source: str = 'user',
     ) -> Tuple[str, Dict[str, Any]]:
         """
         Create a new empty ``Session``, build a matching ``SessionConfig``,
@@ -96,16 +98,19 @@ class SessionManager:
             base_url="",
         )
 
-        # Merge global defaults so saved provider/model appear in new sessions
+        # Apply saved global defaults (user/defaults.json) to new sessions.
+        # Only the GLOBAL_DEFAULT_KEYS allowlist may flow into a new session,
+        # sourced from the global-defaults layer — the factory/system layers do
+        # NOT seed new session configs; SessionConfig constructor defaults are
+        # the base (docs/architecture/config_ownership.md §"Session application
+        # of global defaults").
         from web_ui.backend.config_manager import (
             GLOBAL_DEFAULT_KEYS,
             load_global_defaults,
             translate_frontend_config,
         )
         defaults_be = translate_frontend_config(load_global_defaults())
-        # Only copy the global-default allowlist (see docs/architecture/config_ownership.md)
-        session_config_keys = GLOBAL_DEFAULT_KEYS
-        for key in session_config_keys:
+        for key in GLOBAL_DEFAULT_KEYS:
             if key in defaults_be and defaults_be[key]:
                 setattr(session_config, key, defaults_be[key])
 
@@ -127,6 +132,17 @@ class SessionManager:
             "session_manager",
             f"Created session {new_session.session_id} (mode={mode})",
         )
+
+        # Audit the session creation (redacted); never raises.
+        log_config_audit(
+            source=audit_source,
+            component='session.create',
+            old=None,
+            new=session_config,
+            injected=None,
+            extra={'session_id': new_session.session_id},
+        )
+
         return new_session.session_id, frontend_config
 
     # ── Load ──────────────────────────────────────────────────────────────────
@@ -171,7 +187,6 @@ class SessionManager:
             return None
 
         from agent.config.session_config import SessionConfig
-        from agent.config.provider_profile import ProviderManager
 
         try:
             if "mode" not in session_config_raw:
@@ -182,20 +197,22 @@ class SessionManager:
             if not sc.mode:
                 sc.mode = "agent"
 
-            # Re-inject API key from provider resolution
+            # Re-inject API key / provider details from the merged config chain
             try:
-                manager = ProviderManager()
-                resolved = manager.resolve_config(
-                    {"provider_id": sc.provider_id}
+                merged = self._config_manager.resolve_full_config(
+                    workspace_id=session.workspace_id,
+                    session_id=session.session_id,
+                    provider_id=sc.provider_id,
                 )
-                if resolved.get("api_key"):
-                    sc.api_key = resolved["api_key"]
-                else:
-                    for profile in manager.list_profiles():
-                        if profile.api_key:
-                            sc.api_key = profile.api_key
-                            sc.provider_id = profile.id
-                            break
+                if not sc.api_key and merged.get("api_key"):
+                    sc.api_key = merged["api_key"]
+                if not sc.base_url and merged.get("base_url"):
+                    sc.base_url = merged["base_url"]
+                resolved_pc = merged.get("provider_config") or {}
+                if resolved_pc:
+                    pc = dict(sc.provider_config or {})
+                    pc.update(resolved_pc)
+                    sc.provider_config = pc
             except Exception as exc:
                 log(
                     "WARNING",
