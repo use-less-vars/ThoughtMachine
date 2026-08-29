@@ -31,14 +31,20 @@ PY_ERROR_TOKENS = ("ImportError", "ModuleNotFoundError", "Traceback")
 
 
 def print_logs() -> None:
-    """Always surface both logs, even when one is missing."""
+    """Always surface both logs, even when one is missing.
+
+    The banners make it unmistakable that what follows is a dump of the log
+    FILES (which is where the wrapper's stderr went), not leaked subprocess
+    output on the step's stdout/stderr.
+    """
     for label, path in (("doctor_ci.log", DOCTOR_LOG), ("backend_startup.log", BACKEND_LOG)):
-        print(f"--- full {path}: ---")
+        print(f"==================== full {path} (log file dump) ====================")
         try:
             with open(path, encoding="utf-8", errors="replace") as fh:
                 print(fh.read(), end="")
         except OSError as exc:
             print(f"(could not read {path}: {exc})")
+        print(f"==================== end {path} ====================")
 
 
 def scan_logs_for_python_errors() -> bool:
@@ -89,10 +95,30 @@ def validate_payload(body: str) -> str:
     return reason
 
 
+def _kill_by_cmdline(pattern: str) -> None:
+    """Kill matching processes via /proc when pkill is not installed."""
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(os.path.join("/proc", pid, "cmdline"), "rb") as fh:
+                cmdline = fh.read().decode("utf-8", errors="replace").replace("\x00", " ")
+        except OSError:
+            continue
+        if pattern in cmdline and int(pid) != os.getpid():
+            try:
+                os.kill(int(pid), 15)  # SIGTERM
+            except OSError:
+                pass
+
+
 def cleanup(proc: subprocess.Popen) -> None:
     """Stop the backend first (the --doctor wrapper waits on it), then the wrapper."""
-    subprocess.run(["pkill", "-f", "web_ui.backend.server"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if shutil.which("pkill") is not None:
+        subprocess.run(["pkill", "-f", "web_ui.backend.server"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        _kill_by_cmdline("web_ui.backend.server")
     proc.terminate()
     try:
         proc.wait(timeout=5)
@@ -121,24 +147,39 @@ def main() -> int:
 
     os.makedirs(LOG_DIR, exist_ok=True)
     with open(DOCTOR_LOG, "wb") as out:
+        # stdout AND stderr of the doctor wrapper both go to the log file, so
+        # no subprocess output (e.g. the "Cannot connect to the Docker daemon"
+        # message) can ever reach the step's stdout/stderr.
         proc = subprocess.Popen(shlex.split(args.doctor_cmd),
                                 stdout=out, stderr=subprocess.STDOUT)
     print(f"doctor wrapper pid: {proc.pid}")
 
     health_body = None
     wrapper_rc = None
-    deadline = time.monotonic() + args.timeout
+    start = time.monotonic()
+    deadline = start + args.timeout
+    last_progress = -1
     while time.monotonic() < deadline:
         if health_body is None:
             health_body = fetch_health(args.health_url, timeout=2.0)
         if health_body is not None:
             break
         rc = proc.poll()
-        if rc is not None:
+        if rc is not None and wrapper_rc is None:
             wrapper_rc = rc
-            print(f"doctor wrapper exited early (rc={wrapper_rc})")
-            break
+            # Early exit is NOT fatal by itself: the backend can outlive the
+            # wrapper, so keep polling for the rest of the window.
+            print(f"doctor wrapper exited early (rc={wrapper_rc}) - "
+                  f"continuing to poll for backend health until the deadline")
+        elapsed = int(time.monotonic() - start)
+        if elapsed > last_progress and elapsed % 5 == 0:
+            last_progress = elapsed
+            state = f"exited rc={wrapper_rc}" if wrapper_rc is not None else "running"
+            print(f"...polling health endpoint (elapsed {elapsed}s, wrapper {state})")
         time.sleep(1)
+
+    if wrapper_rc is not None:
+        print(f"doctor wrapper final rc: {wrapper_rc}")
 
     failed = False
     if health_body is not None:
@@ -157,6 +198,10 @@ def main() -> int:
         if wrapper_rc is None:
             print(f"::error::GET {args.health_url} never returned HTTP 200 "
                   f"within {args.timeout:g}s")
+        else:
+            print(f"::error::doctor wrapper exited early (rc={wrapper_rc}) and "
+                  f"GET {args.health_url} never returned HTTP 200 within "
+                  f"{args.timeout:g}s")
         failed = True
 
     # Always surface the doctor run, then stop everything we started.
