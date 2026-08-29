@@ -258,7 +258,7 @@ function ProviderEditModal({ provider, onSave, onCancel }) {
           <label style={LABEL_STYLE}>Timeout (seconds)</label>
           <input
             type="number"
-            min="10"
+            min="1"
             max="600"
             style={INPUT_STYLE}
             value={timeout}

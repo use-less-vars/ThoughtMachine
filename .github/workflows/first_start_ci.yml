@@ -9,13 +9,14 @@
 #       "degraded" payload instead of crashing the server.
 #
 # DESIGN NOTES (read before changing anything here):
-#   * --check-only REQUIRES a working Docker daemon. In start_thoughtmachine.sh
-#     the docker check ([2/7]) treats daemon_down / lib_missing as FATAL in
-#     every mode except --doctor. The job therefore runs in a debian:13
-#     container (GitHub Actions mounts the host's /var/run/docker.sock into
-#     job containers) and installs the docker.io CLI: `docker info` then
-#     succeeds against the host daemon, so --check-only passes.
-#   * The ~/.thoughtmachine check ([5/7]) is fatal in ALL modes, so the job
+#   * --check-only needs a working Docker daemon for a meaningful gate. In
+#     start_thoughtmachine.sh the docker check ([2/8]) treats daemon_down /
+#     lib_missing as WARNING + continue in --check-only and --doctor, and as
+#     FATAL in dev/prod. The job therefore runs in a debian:13 container
+#     (GitHub Actions mounts the host's /var/run/docker.sock into job
+#     containers) and installs the docker.io CLI: `docker info` then succeeds
+#     against the host daemon, so --check-only passes.
+#   * The ~/.thoughtmachine check ([6/8]) is fatal in ALL modes, so the job
 #     pre-creates $HOME/.thoughtmachine before running the launcher.
 #   * The final step deliberately sets DOCKER_HOST to a dead TCP endpoint.
 #     The backend's Docker SDK honors DOCKER_HOST, so the health endpoint
@@ -56,7 +57,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # start_thoughtmachine.sh check [5/7] (~/.thoughtmachine writable) is
+      # start_thoughtmachine.sh check [6/8] (~/.thoughtmachine writable) is
       # fatal in ALL modes - even --check-only - so it must exist up front.
       - name: Pre-create $HOME/.thoughtmachine
         run: mkdir -p "$HOME/.thoughtmachine"
@@ -83,6 +84,12 @@ jobs:
         env:
           DOCKER_HOST: tcp://127.0.0.1:2375
         run: |
+          # The step's default shell is `bash -e`: any failing command would
+          # kill the step before our diagnostics run. Turn that off - every
+          # failure below is handled explicitly (and set -e does not apply to
+          # background jobs anyway, so it only ever caused confusion here).
+          set +e
+
           # Graceful skip: if the docker CLI is missing there is no daemon to
           # connect to at all - skip the degraded-Docker doctor test instead of
           # hard-failing on "Cannot connect to the Docker daemon ...".
@@ -97,9 +104,9 @@ jobs:
           echo "doctor wrapper pid: $DOCTOR_PID"
 
           # Poll /api/health/containers (NOT /api/health - that route does not
-          # exist) for up to 30s. The backend writes logs/backend_startup.log.
+          # exist) for up to 45s. The backend writes logs/backend_startup.log.
           HEALTH_BODY=""
-          for _ in $(seq 1 30); do
+          for _ in $(seq 1 45); do
             HEALTH_BODY="$(curl -fsS --max-time 2 http://127.0.0.1:8000/api/health/containers 2>/dev/null || true)"
             if [ -n "$HEALTH_BODY" ]; then
               break
@@ -120,7 +127,7 @@ jobs:
           done
 
           if [ -z "$HEALTH_BODY" ]; then
-            echo "::error::GET /api/health/containers never returned HTTP 200 within 30s"
+            echo "::error::GET /api/health/containers never returned HTTP 200 within 45s"
             cat logs/doctor_ci.log || true
             echo "--- full logs/backend_startup.log: ---"
             cat logs/backend_startup.log || true
@@ -154,6 +161,13 @@ jobs:
             exit 1
           fi
           echo "OK: no import errors/tracebacks in backend startup logs"
+
+          # Always surface the doctor run so the step log shows what happened
+          # even when everything is green.
+          echo "--- full logs/doctor_ci.log: ---"
+          cat logs/doctor_ci.log || true
+          echo "--- full logs/backend_startup.log: ---"
+          cat logs/backend_startup.log || true
 
           # Cleanup: stop the backend first (the --doctor wrapper waits on it),
           # then the wrapper itself.

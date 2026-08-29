@@ -125,6 +125,10 @@ class SessionConfig(BaseModel):
         default=None,
         description='Model name override (e.g. "deepseek-v4-flash").',
     )
+    provider_config: Dict[str, Any] = Field(
+        default_factory=dict,
+        description='Extra provider-specific config (e.g. timeout, max_retries) forwarded to the LLM client.',
+    )
     temperature: float = Field(
         default=0.7,
         description='Temperature for LLM sampling.',
@@ -258,6 +262,9 @@ class SessionConfig(BaseModel):
 
         if self.session_permissions is not None:
             kwargs['session_permissions'] = dict(self.session_permissions)
+
+        if self.provider_config:
+            kwargs['provider_config'] = dict(self.provider_config)
 
         kwargs['use_workspace_lifecycle_manager'] = bool(self.use_workspace_lifecycle_manager)
         kwargs['use_container_registry'] = bool(self.use_container_registry)
