@@ -1103,6 +1103,12 @@ class WebAgentBridge:
                             session_config.api_key = profile.api_key
                             session_config.provider_id = profile.id
                             break
+                # Merge provider-specific config (timeout/max_retries) into session
+                resolved_pc = resolved.get('provider_config') or {}
+                if resolved_pc:
+                    merged = dict(getattr(session_config, 'provider_config', None) or {})
+                    merged.update(resolved_pc)
+                    session_config.provider_config = merged
             except Exception:
                 pass
 

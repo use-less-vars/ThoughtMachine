@@ -318,8 +318,8 @@ class Agent:
         
         Hot-swap is safe when only simple runtime parameters change
         (temperature, top_p, enabled_tools). Changes to
-        model, provider, system_prompt, tool_classes, api_key, base_url
-        etc. require a full restart.
+        model, provider, system_prompt, tool_classes, api_key, base_url,
+        provider_config etc. require a full restart.
         """
         if new_config.provider_type != self.config.provider_type:
             return False
@@ -334,6 +334,12 @@ class Agent:
 
         # Workspace path changes require a full restart
         if new_config.workspace_path != self.config.workspace_path:
+            return False
+
+        # Provider config changes (e.g. timeout/max_retries) require a full
+        # restart so the LLM provider is re-initialised with the new settings
+        # (AgentConfig.FIELD_CATEGORIES marks provider_config RESTART_REQUIRED).
+        if new_config.provider_config != self.config.provider_config:
             return False
         return True
 

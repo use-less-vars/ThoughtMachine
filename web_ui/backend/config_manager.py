@@ -596,6 +596,12 @@ class ConfigManager:
                     session_config.api_key = resolved["api_key"]
                 if "base_url" in resolved:
                     session_config.base_url = resolved["base_url"]
+                # Merge provider-specific config (timeout/max_retries) into session
+                resolved_pc = resolved.get('provider_config') or {}
+                if resolved_pc:
+                    merged = dict(getattr(session_config, 'provider_config', None) or {})
+                    merged.update(resolved_pc)
+                    session_config.provider_config = merged
             except Exception as e:
                 log("WARNING", "server.bridge",
                     f"Provider resolution failed during apply_config: {e}")
