@@ -84,96 +84,10 @@ jobs:
         env:
           DOCKER_HOST: tcp://127.0.0.1:2375
         run: |
-          # The step's default shell is `bash -e`: any failing command would
-          # kill the step before our diagnostics run. Turn that off - every
-          # failure below is handled explicitly (and set -e does not apply to
-          # background jobs anyway, so it only ever caused confusion here).
-          set +e
-
-          # Graceful skip: if the docker CLI is missing there is no daemon to
-          # connect to at all - skip the degraded-Docker doctor test instead of
-          # hard-failing on "Cannot connect to the Docker daemon ...".
-          if ! command -v docker >/dev/null 2>&1; then
-            echo "::notice::docker CLI not present - skipping degraded-Docker doctor test"
-            exit 0
-          fi
+          # All the shell backgrounding/quoting/`set -e` handling this step
+          # used to need lives in scripts/ci_doctor_poller.py (stdlib only):
+          # it starts the --doctor wrapper as a subprocess, polls the health
+          # endpoint with urllib, validates the degraded payload, prints both
+          # logs and cleans up on every path. Keep this step a one-liner.
           mkdir -p logs
-          bash start_thoughtmachine.sh --doctor > logs/doctor_ci.log 2>&1 &
-          DOCTOR_PID=$!
-          WRAPPER_RC=0
-          echo "doctor wrapper pid: $DOCTOR_PID"
-
-          # Poll /api/health/containers (NOT /api/health - that route does not
-          # exist) for up to 45s. The backend writes logs/backend_startup.log.
-          HEALTH_BODY=""
-          for _ in $(seq 1 45); do
-            HEALTH_BODY="$(curl -fsS --max-time 2 http://127.0.0.1:8000/api/health/containers 2>/dev/null || true)"
-            if [ -n "$HEALTH_BODY" ]; then
-              break
-            fi
-            if ! kill -0 "$DOCTOR_PID" 2>/dev/null; then
-              if wait "$DOCTOR_PID" 2>/dev/null; then
-                WRAPPER_RC=0
-              else
-                WRAPPER_RC=$?
-              fi
-              echo "doctor wrapper exited early (rc=$WRAPPER_RC) - full logs/doctor_ci.log:"
-              cat logs/doctor_ci.log || true
-              echo "--- full logs/backend_startup.log: ---"
-              cat logs/backend_startup.log || true
-              break
-            fi
-            sleep 1
-          done
-
-          if [ -z "$HEALTH_BODY" ]; then
-            echo "::error::GET /api/health/containers never returned HTTP 200 within 45s"
-            cat logs/doctor_ci.log || true
-            echo "--- full logs/backend_startup.log: ---"
-            cat logs/backend_startup.log || true
-            exit 1
-          fi
-
-          # Assert the degraded payload shape. exit 1 fails the step.
-          python3 - "$HEALTH_BODY" <<'PY' || exit 1
-          import json, sys
-          try:
-              data = json.loads(sys.argv[1])
-          except Exception as exc:
-              print(f"::error::health payload is not valid JSON: {exc}")
-              sys.exit(1)
-          assert isinstance(data, dict), "health payload is not a JSON object"
-          assert data.get("checked_at"), "checked_at missing from health payload"
-          docker_info = data.get("docker")
-          assert isinstance(docker_info, dict), "'docker' key missing from health payload"
-          assert docker_info.get("available") is False, \
-              "docker.available should be False (DOCKER_HOST deliberately broken)"
-          reason = docker_info.get("reason")
-          assert reason in {"daemon_down", "lib_missing", "permission_denied"}, \
-              f"unexpected degraded reason: {reason!r}"
-          print(f"OK: health degraded as expected (reason={reason})")
-          PY
-
-          # The backend must have started cleanly - no import errors/tracebacks.
-          if grep -nE 'ImportError|ModuleNotFoundError|Traceback' \
-              logs/backend_startup.log logs/doctor_ci.log; then
-            echo "::error::backend startup / doctor logs contain Python errors"
-            exit 1
-          fi
-          echo "OK: no import errors/tracebacks in backend startup logs"
-
-          # Always surface the doctor run so the step log shows what happened
-          # even when everything is green.
-          echo "--- full logs/doctor_ci.log: ---"
-          cat logs/doctor_ci.log || true
-          echo "--- full logs/backend_startup.log: ---"
-          cat logs/backend_startup.log || true
-
-          # Cleanup: stop the backend first (the --doctor wrapper waits on it),
-          # then the wrapper itself.
-          pkill -f 'web_ui.backend.server' 2>/dev/null || true
-          kill "$DOCTOR_PID" 2>/dev/null || true
-          sleep 1
-          if kill -0 "$DOCTOR_PID" 2>/dev/null; then
-            kill -9 "$DOCTOR_PID" 2>/dev/null || true
-          fi
+          python3 scripts/ci_doctor_poller.py
