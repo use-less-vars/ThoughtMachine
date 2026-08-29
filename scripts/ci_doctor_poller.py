@@ -38,13 +38,13 @@ def print_logs() -> None:
     output on the step's stdout/stderr.
     """
     for label, path in (("doctor_ci.log", DOCTOR_LOG), ("backend_startup.log", BACKEND_LOG)):
-        print(f"==================== full {path} (log file dump) ====================")
+        print(f"==================== full {path} (log file dump) ====================", flush=True)
         try:
             with open(path, encoding="utf-8", errors="replace") as fh:
-                print(fh.read(), end="")
+                print(fh.read(), end="", flush=True)
         except OSError as exc:
-            print(f"(could not read {path}: {exc})")
-        print(f"==================== end {path} ====================")
+            print(f"(could not read {path}: {exc})", flush=True)
+        print(f"==================== end {path} ====================", flush=True)
 
 
 def scan_logs_for_python_errors() -> bool:
@@ -59,9 +59,9 @@ def scan_logs_for_python_errors() -> bool:
         except OSError:
             pass
     if hits:
-        print("::error::backend startup / doctor logs contain Python errors")
+        print("::error::backend startup / doctor logs contain Python errors", flush=True)
         for hit in hits:
-            print(hit)
+            print(hit, flush=True)
         return True
     return False
 
@@ -142,7 +142,7 @@ def main() -> int:
     # Same semantics as the old shell `command -v docker` graceful skip: with
     # no docker CLI there is no daemon to connect to at all.
     if shutil.which("docker") is None:
-        print("::notice::docker CLI not present - skipping degraded-Docker doctor test")
+        print("::notice::docker CLI not present - skipping degraded-Docker doctor test", flush=True)
         return 0
 
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -152,7 +152,7 @@ def main() -> int:
         # message) can ever reach the step's stdout/stderr.
         proc = subprocess.Popen(shlex.split(args.doctor_cmd),
                                 stdout=out, stderr=subprocess.STDOUT)
-    print(f"doctor wrapper pid: {proc.pid}")
+    print(f"doctor wrapper pid: {proc.pid}", flush=True)
 
     health_body = None
     wrapper_rc = None
@@ -170,43 +170,49 @@ def main() -> int:
             # Early exit is NOT fatal by itself: the backend can outlive the
             # wrapper, so keep polling for the rest of the window.
             print(f"doctor wrapper exited early (rc={wrapper_rc}) - "
-                  f"continuing to poll for backend health until the deadline")
+                  f"continuing to poll for backend health until the deadline", flush=True)
         elapsed = int(time.monotonic() - start)
         if elapsed > last_progress and elapsed % 5 == 0:
             last_progress = elapsed
             state = f"exited rc={wrapper_rc}" if wrapper_rc is not None else "running"
-            print(f"...polling health endpoint (elapsed {elapsed}s, wrapper {state})")
+            print(f"...polling health endpoint (elapsed {elapsed}s, wrapper {state})", flush=True)
         time.sleep(1)
 
     if wrapper_rc is not None:
-        print(f"doctor wrapper final rc: {wrapper_rc}")
+        print(f"doctor wrapper final rc: {wrapper_rc}", flush=True)
 
     failed = False
     if health_body is not None:
         try:
             reason = validate_payload(health_body)
         except (json.JSONDecodeError, AssertionError) as exc:
-            print(f"::error::degraded payload assertion failed: {exc}")
+            # Always show the exact payload the endpoint returned so the
+            # failing field (e.g. docker.available / reason) is visible in
+            # the step log without having to re-run with curl.
+            print("health payload received from endpoint:", flush=True)
+            print(health_body, flush=True)
+            print(f"::error::degraded payload assertion failed: {exc}", flush=True)
             failed = True
         else:
-            print(f"OK: health degraded as expected (reason={reason})")
+            print(f"OK: health degraded as expected (reason={reason})", flush=True)
             if scan_logs_for_python_errors():
                 failed = True
             else:
-                print("OK: no import errors/tracebacks in backend startup logs")
+                print("OK: no import errors/tracebacks in backend startup logs", flush=True)
     else:
         if wrapper_rc is None:
             print(f"::error::GET {args.health_url} never returned HTTP 200 "
-                  f"within {args.timeout:g}s")
+                  f"within {args.timeout:g}s", flush=True)
         else:
             print(f"::error::doctor wrapper exited early (rc={wrapper_rc}) and "
                   f"GET {args.health_url} never returned HTTP 200 within "
-                  f"{args.timeout:g}s")
+                  f"{args.timeout:g}s", flush=True)
         failed = True
 
     # Always surface the doctor run, then stop everything we started.
     print_logs()
     cleanup(proc)
+    sys.stdout.flush()
     return 1 if failed else 0
 
 

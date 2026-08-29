@@ -2908,6 +2908,11 @@ def health_containers():
     try:
         import docker as _docker
         client = _docker.from_env()
+        # Log exactly what endpoint the SDK resolved so CI/doctor runs can
+        # prove DOCKER_HOST was honored (no silent socket fallback).
+        log("INFO", "server.health_containers",
+            f"docker client resolved base_url={client.api.base_url} "
+            f"(DOCKER_HOST={os.environ.get('DOCKER_HOST')!r})")
         client.ping()
         version = None
         try:
