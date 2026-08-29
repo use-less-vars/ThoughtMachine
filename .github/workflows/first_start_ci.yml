@@ -3,10 +3,10 @@
 #
 # Proves on a pristine Debian 13 container that:
 #   (1) ./install.sh completes successfully (exit 0);
-#   (2) ./start_thoughtmachine.sh --check-only passes every pre-launch check;
-#   (3) ./start_thoughtmachine.sh --doctor boots the backend even when Docker
-#       is unavailable, and GET /api/health/containers answers with a clean
-#       "degraded" payload instead of crashing the server.
+#   (2) ./start_thoughtmachine.sh --check-only passes every pre-launch check.
+#
+# The degraded-Docker health payload is covered by unit tests
+# (tests/test_health_endpoint_robustness.py), not by this workflow.
 #
 # DESIGN NOTES (read before changing anything here):
 #   * --check-only needs a working Docker daemon for a meaningful gate. In
@@ -18,11 +18,6 @@
 #     against the host daemon, so --check-only passes.
 #   * The ~/.thoughtmachine check ([6/8]) is fatal in ALL modes, so the job
 #     pre-creates $HOME/.thoughtmachine before running the launcher.
-#   * The final step deliberately sets DOCKER_HOST to a dead TCP endpoint.
-#     The backend's Docker SDK honors DOCKER_HOST, so the health endpoint
-#     deterministically reports degraded/daemon_down - this exercises the
-#     "no Docker available" path a real first start can hit, and proves the
-#     UI/health layer degrades gracefully instead of failing hard.
 #===============================================================================
 name: First-Start CI
 
@@ -36,7 +31,7 @@ concurrency:
 
 jobs:
   first-start:
-    name: Install + check-only + degraded health
+    name: Install + check-only
     runs-on: ubuntu-latest
     container: debian:13
     steps:
@@ -73,23 +68,4 @@ jobs:
       - name: Run ./start_thoughtmachine.sh --check-only
         run: bash start_thoughtmachine.sh --check-only
 
-      #-------------------------------------------------------------------------
-      # Doctor mode with Docker UNAVAILABLE: DOCKER_HOST points at a dead TCP
-      # endpoint, so the doctor's docker check reports daemon_down (WARNING +
-      # continue in --doctor mode) and the backend's Docker SDK fails the same
-      # way -> /api/health/containers must answer HTTP 200 with
-      # docker.available=false and a degraded reason from the taxonomy.
-      #-------------------------------------------------------------------------
-      - name: Doctor mode degrades gracefully without Docker
-        env:
-          DOCKER_HOST: tcp://127.0.0.1:2375
-        run: |
-          # All the shell backgrounding/quoting/`set -e` handling this step
-          # used to need lives in scripts/ci_doctor_poller.py (stdlib only):
-          # it starts the --doctor wrapper as a subprocess, polls the health
-          # endpoint with urllib, validates the degraded payload, prints both
-          # logs and cleans up on every path. Keep this step a one-liner.
-          mkdir -p logs
-          # -u (unbuffered) so the poller's flush=True lines are not lost from
-          # the step log when the step exits non-zero (CI runs without a tty).
-          python3 -u scripts/ci_doctor_poller.py
+
