@@ -25,6 +25,7 @@ from types import SimpleNamespace
 import pytest
 
 from tools.git_info_tool import GitInfoTool, resolve_git_execution_mode
+from tools.git_write_tool import GitWriteTool
 from thoughtmachine.security import PathOutsideWorkspaceError, validate_path
 
 
@@ -100,7 +101,7 @@ class _FakeManager:
 
 class TestContainerCommitArgs:
     def _tool(self, tmp_path):
-        tool = GitInfoTool(operation="commit", message="x")
+        tool = GitWriteTool(operation="commit", message="x")
         object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
         object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
         return tool
@@ -150,7 +151,7 @@ class TestHostCommitArgs:
     def test_host_commit_keeps_no_verify_and_hooks_neutralized(self, tmp_path, monkeypatch):
         _FakeSandbox.instances.clear()
         monkeypatch.setattr("tools.git_info_tool.SandboxedExecution", _FakeSandbox)
-        tool = GitInfoTool(operation="commit", message="x")
+        tool = GitWriteTool(operation="commit", message="x")
 
         tool._exec_host_raw(tmp_path, ["commit", "-m", "x"])
 
@@ -194,8 +195,18 @@ class TestSelfHealingModeRouting:
     )
 
     def _container_tool(self, tmp_path, operation="commit"):
-        """Tool configured for container mode with a registry workspace."""
-        tool = GitInfoTool(operation=operation, message="x")
+        """Tool configured for container mode with a registry workspace.
+
+        Write operations live in GitWriteTool; read operations (status) stay
+        on GitInfoTool. Both inherit the same ``_run_git_raw`` routing.
+        """
+        tool_cls = (
+            GitWriteTool
+            if operation
+            in ("commit", "init", "clone", "branch_create", "checkout", "stage", "unstage")
+            else GitInfoTool
+        )
+        tool = tool_cls(operation=operation, message="x")
         object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
         object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
         return tool

@@ -235,21 +235,22 @@ class TestWorkerFlagForwarding:
         assert acfg.allow_host_resources is True
 
 
-class TestGitInfoToolFlagGate:
+class TestGitWriteToolFlagGate:
+    """_unprotected_branch_agent_commit_allowed lives on GitWriteTool."""
 
     @staticmethod
     def _tool(**kwargs):
-        from tools.git_info_tool import GitInfoTool
-        return GitInfoTool(operation="status", **kwargs)
+        from tools.git_write_tool import GitWriteTool
+        return GitWriteTool(operation="commit", **kwargs)
 
     def test_blocked_when_flag_absent(self):
-        assert self._tool()._feature_branch_agent_commit_allowed(
+        assert self._tool()._unprotected_branch_agent_commit_allowed(
             Path("/tmp")) is False
 
     def test_blocked_when_flag_not_exactly_true(self):
         for bad_value in (1, "true", "True", None):
             tool = self._tool(agent_config={"git_allow_worktree_commits": bad_value})
-            assert tool._feature_branch_agent_commit_allowed(Path("/tmp")) is False, bad_value
+            assert tool._unprotected_branch_agent_commit_allowed(Path("/tmp")) is False, bad_value
 
     def test_true_flag_proceeds_past_gate(self, monkeypatch):
         tool = self._tool(agent_config={"git_allow_worktree_commits": True})
@@ -257,7 +258,50 @@ class TestGitInfoToolFlagGate:
         # decides. Patch it to False so the method returns False without
         # needing a real git repo — proving the exact-True check passed.
         monkeypatch.setattr(tool, "_use_container_mode", lambda: False)
-        assert tool._feature_branch_agent_commit_allowed(Path("/tmp")) is False
+        assert tool._unprotected_branch_agent_commit_allowed(Path("/tmp")) is False
+
+    def test_protected_branch_names_denied(self, monkeypatch):
+        """dev/master/main are protected: commits stay host-side."""
+        for branch in ("dev", "master", "main"):
+            tool = self._tool(agent_config={"git_allow_worktree_commits": True})
+            monkeypatch.setattr(tool, "_use_container_mode", lambda: True)
+            monkeypatch.setattr(
+                tool, "_run_git",
+                lambda *args, **kwargs: f"{branch}\n",
+            )
+            assert tool._unprotected_branch_agent_commit_allowed(
+                Path("/tmp")) is False, branch
+
+    def test_unprotected_branch_allowed(self, monkeypatch):
+        """feat/fix/refactor branches may be committed agent-side."""
+        tool = self._tool(agent_config={"git_allow_worktree_commits": True})
+        monkeypatch.setattr(tool, "_use_container_mode", lambda: True)
+        monkeypatch.setattr(
+            tool, "_run_git",
+            lambda *args, **kwargs: "refactor/foo\n",
+        )
+        assert tool._unprotected_branch_agent_commit_allowed(Path("/tmp")) is True
+
+    def test_empty_branch_output_fails_closed(self, monkeypatch):
+        """Blank branch resolution must deny, never allow."""
+        tool = self._tool(agent_config={"git_allow_worktree_commits": True})
+        monkeypatch.setattr(tool, "_use_container_mode", lambda: True)
+        monkeypatch.setattr(
+            tool, "_run_git",
+            lambda *args, **kwargs: "\n",
+        )
+        assert tool._unprotected_branch_agent_commit_allowed(Path("/tmp")) is False
+
+    def test_branch_check_runtime_error_fails_closed(self, monkeypatch):
+        """Container-mandatory branch resolution failure must deny."""
+        tool = self._tool(agent_config={"git_allow_worktree_commits": True})
+        monkeypatch.setattr(tool, "_use_container_mode", lambda: True)
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("container unavailable")
+
+        monkeypatch.setattr(tool, "_run_git", _boom)
+        assert tool._unprotected_branch_agent_commit_allowed(Path("/tmp")) is False
 
 
 class TestHostBashFlagGate:

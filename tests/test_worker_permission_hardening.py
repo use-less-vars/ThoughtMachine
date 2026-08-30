@@ -81,6 +81,7 @@ from agent.models.worker_definition import WorkerDefinition
 from tools.base import ToolBase
 from tools.file_preview_tool import FilePreviewTool
 from tools.git_info_tool import GitInfoTool
+from tools.git_write_tool import GitWriteTool as _ProductionGitWriteTool
 from web_ui.backend.bridge import WebAgentBridge
 from session.store import FileSystemSessionStore
 
@@ -919,7 +920,12 @@ def fake_sandbox(monkeypatch):
 
 
 def _git_tool(operation, session_perms=None, effective_perms=None, **kwargs):
-    return GitInfoTool(
+    tool_cls = (
+        _ProductionGitWriteTool
+        if operation in ("commit", "init", "clone", "branch_create", "checkout", "stage", "unstage")
+        else GitInfoTool
+    )
+    return tool_cls(
         operation=operation,
         session_permissions=session_perms,
         effective_permissions=effective_perms,

@@ -194,6 +194,12 @@ except ImportError as e:
     _record_import_failure("GitInfoTool", e)
 
 try:
+    from .git_write_tool import GitWriteTool
+    TOOL_CLASSES.append(GitWriteTool)
+except ImportError as e:
+    _record_import_failure("GitWriteTool", e)
+
+try:
     from .host_bash_tool import HostBashTool
     TOOL_CLASSES.append(HostBashTool)
 except ImportError as e:
