@@ -1299,3 +1299,240 @@ async def resume_worker(
 
 
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Workspace config backbone: purpose / permissions / risk (Phase 1)
+#  New routes: POST /api/workspace (create with purpose preset),
+#  GET/PUT /api/workspace/{ws_id}/permissions, GET /api/workspace/{ws_id}.
+#  Persisted in vault workspaces/<id>/config.json alongside the existing
+#  capabilities / domain_allowlist keys (see agent/config/schema_manifest.json).
+#  Registered last so the more specific /list, /templates, /{ws_id}/... routes
+#  keep route-matching precedence.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class WorkspacePermissionsBody(BaseModel):
+    """Body for PUT /api/workspace/{ws_id}/permissions."""
+
+    permissions: Dict[str, str]
+
+
+class WorkspaceCreateBody(BaseModel):
+    """Body for POST /api/workspace (create workspace with a purpose preset)."""
+
+    path: str
+    purpose: Optional[str] = "general"
+    settings: Optional[Dict[str, Any]] = {}
+
+
+def _load_workspace_config(ws_id: str) -> Dict[str, Any]:
+    """Load vault ``workspaces/<id>/config.json`` (``{}`` if missing/unparsable)."""
+    cfg_path = _workspace_dir(ws_id) / "config.json"
+    if not cfg_path.exists():
+        return {}
+    try:
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def _save_workspace_config(ws_id: str, data: Dict[str, Any]) -> None:
+    """Atomically write vault ``workspaces/<id>/config.json``."""
+    _atomic_write_json(data, _workspace_dir(ws_id) / "config.json")
+
+
+def _resolve_workspace_permissions(cfg: Dict[str, Any], purpose: str) -> Dict[str, str]:
+    """Return the saved permission map, or the purpose preset as fallback."""
+    from agent.config.workspace_purpose import apply_purpose_preset
+
+    saved = cfg.get("permissions")
+    if isinstance(saved, dict) and saved:
+        return {str(k): str(v) for k, v in saved.items()}
+    return apply_purpose_preset(purpose)
+
+
+# ── GET /api/workspace/{ws_id}/permissions ─────────────────────────────────────
+
+
+@router.get("/{ws_id}/permissions")
+async def get_workspace_permissions(ws_id: str) -> Dict[str, Any]:
+    """Return the workspace's resource permission map, purpose and host flag.
+
+    Falls back to the purpose preset (or catalog defaults) when the
+    workspace has no saved permission map in ``config.json`` yet.
+    """
+    ensure_workspace_dirs(ws_id)
+    cfg = _load_workspace_config(ws_id)
+    purpose = cfg.get("purpose", "general")
+    allow_host_resources = bool(cfg.get("allow_host_resources", False))
+    permissions = _resolve_workspace_permissions(cfg, purpose)
+    return {
+        "workspace_id": ws_id,
+        "purpose": purpose,
+        "permissions": permissions,
+        "allow_host_resources": allow_host_resources,
+    }
+
+
+# ── PUT /api/workspace/{ws_id}/permissions ─────────────────────────────────────
+
+
+@router.put("/{ws_id}/permissions")
+async def put_workspace_permissions(
+    ws_id: str,
+    body: WorkspacePermissionsBody,
+) -> Dict[str, Any]:
+    """Persist a workspace resource permission map (validated against the catalog).
+
+    422 on unknown resource names or invalid permission levels; otherwise
+    merges into ``config.json`` (preserving purpose / allow_host_resources /
+    capabilities / domain_allowlist) and returns the updated map with its
+    runtime risk assessment.
+    """
+    from agent.config.resource_catalog import validate_workspace_permissions
+    from agent.config.risk_model import compute_workspace_risk
+
+    ensure_workspace_dirs(ws_id)
+    normalized, errors = validate_workspace_permissions(body.permissions)
+    if errors:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"errors": errors},
+        )
+
+    cfg = _load_workspace_config(ws_id)
+    cfg["permissions"] = normalized
+    _save_workspace_config(ws_id, cfg)
+
+    purpose = cfg.get("purpose", "general")
+    allow_host_resources = bool(cfg.get("allow_host_resources", False))
+    risk = compute_workspace_risk(
+        permissions=normalized,
+        allow_host_resources=allow_host_resources,
+        purpose=purpose,
+    )
+    return {
+        "workspace_id": ws_id,
+        "purpose": purpose,
+        "permissions": normalized,
+        "allow_host_resources": allow_host_resources,
+        "risk": risk,
+    }
+
+
+# ── POST /api/workspace (create) ───────────────────────────────────────────────
+
+
+@router.post("", status_code=status.HTTP_201_CREATED)
+async def create_workspace(body: WorkspaceCreateBody) -> Dict[str, Any]:
+    """Register a new workspace rooted at *path* with a purpose preset.
+
+    Validates the purpose (422), confines the path to $HOME minus the vault
+    root (403), registers the workspace, creates the vault workspace dirs
+    and writes ``config.json`` with ``{purpose, permissions,
+    allow_host_resources}``.  ``settings.permissions`` (dict of
+    resource→level overrides) and ``settings.allow_host_resources`` (bool)
+    are layered on top of the purpose preset.
+    """
+    from agent.config.workspace_purpose import WORKSPACE_PURPOSES, apply_purpose_preset
+    from agent.config.risk_model import compute_workspace_risk
+
+    if body.purpose not in WORKSPACE_PURPOSES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "errors": [
+                    f"unknown purpose '{body.purpose}' "
+                    f"(expected one of {WORKSPACE_PURPOSES})"
+                ]
+            },
+        )
+
+    try:
+        confined = _confine_to_home(body.path)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        )
+    if not os.path.isdir(confined):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Path '{body.path}' does not exist or is not a directory",
+        )
+
+    registry = WorkspaceRegistry.get_default()
+    entry = registry.register_by_root(confined)
+    ensure_workspace_dirs(entry.id)
+
+    settings = body.settings or {}
+    custom_permissions = settings.get("permissions")
+    if not isinstance(custom_permissions, dict):
+        custom_permissions = None
+    permissions = apply_purpose_preset(body.purpose, custom_permissions)
+    allow_host_resources = bool(settings.get("allow_host_resources", False))
+
+    cfg = _load_workspace_config(entry.id)
+    cfg["purpose"] = body.purpose
+    cfg["permissions"] = permissions
+    cfg["allow_host_resources"] = allow_host_resources
+    _save_workspace_config(entry.id, cfg)
+
+    risk = compute_workspace_risk(
+        permissions=permissions,
+        allow_host_resources=allow_host_resources,
+        purpose=body.purpose,
+    )
+    return {
+        "workspace_id": entry.id,
+        "root": entry.root_path,
+        "purpose": body.purpose,
+        "permissions": permissions,
+        "allow_host_resources": allow_host_resources,
+        "risk": risk,
+    }
+
+
+# ── GET /api/workspace/{ws_id} (summary) ───────────────────────────────────────
+
+
+@router.get("/{ws_id}")
+async def get_workspace_summary(ws_id: str) -> Dict[str, Any]:
+    """Return the workspace summary: root, purpose, permissions, risk.
+
+    Registered after the more specific ``/{ws_id}/...`` routes so they keep
+    precedence.  404 when the workspace ID is not in the registry.
+    """
+    from agent.config.risk_model import compute_workspace_risk
+
+    registry = WorkspaceRegistry.get_default()
+    entry = registry.get_workspace(ws_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workspace '{ws_id}' not found",
+        )
+
+    cfg = _load_workspace_config(ws_id)
+    purpose = cfg.get("purpose", "general")
+    allow_host_resources = bool(cfg.get("allow_host_resources", False))
+    permissions = _resolve_workspace_permissions(cfg, purpose)
+
+    risk = compute_workspace_risk(
+        permissions=permissions,
+        allow_host_resources=allow_host_resources,
+        purpose=purpose,
+    )
+    return {
+        "workspace_id": ws_id,
+        "root": entry.root_path,
+        "purpose": purpose,
+        "permissions": permissions,
+        "allow_host_resources": allow_host_resources,
+        "risk": risk,
+    }
+
