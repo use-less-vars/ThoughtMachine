@@ -306,7 +306,7 @@
       "fields": {}
     },
     "workspaces/*/config.json": {
-      "description": "Per-workspace config (capabilities, domain_allowlist, ...). Pattern entry: validated for every matching workspace.",
+      "description": "Per-workspace config (purpose, permissions, capabilities, domain_allowlist, ...). Pattern entry: validated for every matching workspace.",
       "required": false,
       "pattern": true,
       "root_type": "dict",
@@ -326,6 +326,16 @@
           "type": "list",
           "required": false,
           "description": "Allowed network domains."
+        },
+        "purpose": {
+          "type": "string",
+          "required": false,
+          "description": "Workspace purpose preset (coding, research, or general)."
+        },
+        "permissions": {
+          "type": "dict",
+          "required": false,
+          "description": "Workspace resource permission map (resource name -> banned/ask/read/write), validated against agent/config/resource_catalog.json."
         }
       }
     },

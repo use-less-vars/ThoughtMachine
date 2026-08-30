@@ -1052,3 +1052,64 @@ class ConfigManager:
             "warnings": warnings,
             "field_errors": field_errors,
         }
+
+        return {
+            "valid": len(errors) == 0,
+            "errors": errors,
+            "warnings": warnings,
+            "field_errors": field_errors,
+        }
+
+    @staticmethod
+    def workspace_metadata(workspace_id: str) -> Dict[str, Any]:
+        """Return workspace metadata (purpose, permissions, host flag, risk).
+
+        Reads ``vault workspaces/<id>/config.json``; missing files degrade to
+        the ``general`` purpose with catalog-default permissions.  The risk
+        score is computed at runtime by ``agent.config.risk_model``.  Pure
+        read path — does not touch the config merge chain.
+        """
+        from agent.config.workspace_purpose import apply_purpose_preset
+        from agent.config.risk_model import compute_workspace_risk
+
+        cfg_path = (
+            Path.home()
+            / ".thoughtmachine"
+            / "workspaces"
+            / workspace_id
+            / "config.json"
+        )
+        cfg: Dict[str, Any] = {}
+        try:
+            if cfg_path.exists():
+                raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    cfg = raw
+        except (OSError, json.JSONDecodeError):
+            cfg = {}
+
+        purpose = cfg.get("purpose", "general")
+        allow_host_resources = bool(cfg.get("allow_host_resources", False))
+        saved = cfg.get("permissions")
+        if isinstance(saved, dict) and saved:
+            permissions = {str(k): str(v) for k, v in saved.items()}
+        else:
+            permissions = apply_purpose_preset(purpose)
+
+        try:
+            risk = compute_workspace_risk(
+                permissions=permissions,
+                allow_host_resources=allow_host_resources,
+                purpose=purpose,
+            )
+        except ImportError:
+            risk = {"level": "low", "error": "risk_model unavailable"}
+
+        return {
+            "workspace_id": workspace_id,
+            "purpose": purpose,
+            "permissions": permissions,
+            "allow_host_resources": allow_host_resources,
+            "risk": risk,
+        }
+

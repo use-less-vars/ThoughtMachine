@@ -389,11 +389,14 @@ class CheckSystem(ToolBase):
         return {"containers": containers, "count": len(containers), "status": "ok"}
 
     def _query_workspace_info(self, ws_id: Optional[str]) -> dict:
-        """Return workspace info including workers and MCP tools."""
+        """Return workspace info including workers, MCP tools and risk."""
         capabilities = {}
         domain_allowlist = []
         workers = []
         mcp_tools = []
+        purpose = None
+        permissions = {}
+        allow_host_resources = False
 
         if CAPABILITIES_AVAILABLE and _workspace_dir and ws_id:
             ws_dir = _workspace_dir(ws_id)
@@ -405,6 +408,13 @@ class CheckSystem(ToolBase):
                     config_data = json.loads(config_path.read_text(encoding="utf-8"))
                     capabilities = config_data.get("capabilities", {})
                     domain_allowlist = config_data.get("domain_allowlist", [])
+                    purpose = config_data.get("purpose")
+                    saved_permissions = config_data.get("permissions")
+                    if isinstance(saved_permissions, dict):
+                        permissions = saved_permissions
+                    allow_host_resources = bool(
+                        config_data.get("allow_host_resources", False)
+                    )
                 except (json.JSONDecodeError, OSError):
                     pass
 
@@ -424,12 +434,29 @@ class CheckSystem(ToolBase):
                 except (json.JSONDecodeError, OSError):
                     mcp_tools = []
 
+        # Runtime risk assessment (lazy import; degraded response on ImportError)
+        risk = {"level": "low", "error": "risk_model unavailable"}
+        try:
+            from agent.config.risk_model import compute_workspace_risk
+
+            risk = compute_workspace_risk(
+                permissions=permissions,
+                allow_host_resources=allow_host_resources,
+                purpose=purpose,
+            )
+        except ImportError:
+            risk = {"level": "low", "error": "risk_model unavailable"}
+
         return {
             "workspace_id": ws_id,
             "capabilities": capabilities,
             "domain_allowlist": domain_allowlist,
             "workers": workers,
             "mcp_tools": mcp_tools,
+            "purpose": purpose,
+            "permissions": permissions,
+            "allow_host_resources": allow_host_resources,
+            "risk": risk,
         }
 
     def _query_my_config(self) -> dict:
