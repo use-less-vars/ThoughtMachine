@@ -241,11 +241,12 @@
           "my_config",
           "network_diagnostics",
           "running_workers",
+          "runtime_state",
           "vault_status",
           "workers",
           "workspace_info"
         ],
-        "sha256": "af42fb7423f30c3445a47ffc7b37cf9b35162548aecea8dda19803921fceb9a0"
+        "sha256": "201f3e9839ceaca5e3241bd914d2343c0059c6efbe35f49594650686b6ec335f"
       },
       "root_type": "dict",
       "fields": {
@@ -561,6 +562,97 @@
           "description": "Session-level git write grain override: banned, ask, read, or write. \"write\" replaces the removed git_allow_worktree_commits flag."
         }
       }
+    },
+    "default_system_prompt.txt": {
+      "description": "Default system prompt text file (seeded from resources/default_system_prompt.txt; read by agent/config/loader.py).",
+      "required": false,
+      "backfill_on_missing": false,
+      "root_type": "string",
+      "fields": {}
+    },
+    "engineer_system_prompt.txt": {
+      "description": "Engineer-mode system prompt text file (seeded from resources/engineer_system_prompt.txt).",
+      "required": false,
+      "backfill_on_missing": false,
+      "root_type": "string",
+      "fields": {}
+    },
+    "system/default_system_prompt.txt": {
+      "description": "Default system prompt in the system layout (seeded from resources/default_system_prompt.txt).",
+      "required": false,
+      "backfill_on_missing": false,
+      "root_type": "string",
+      "fields": {}
+    },
+    "system/engineer_system_prompt.txt": {
+      "description": "Engineer-mode system prompt in the system layout (seeded from resources/engineer_system_prompt.txt).",
+      "required": false,
+      "backfill_on_missing": false,
+      "root_type": "string",
+      "fields": {}
+    },
+    "state/open_sessions.json": {
+      "description": "Open session IDs (JSON list) lazily created by FileSystemSessionStore under the state dir.",
+      "required": false,
+      "backfill_on_missing": false,
+      "root_type": "list",
+      "fields": {}
+    },
+    "state/.current_session": {
+      "description": "Current session marker file (string session ID written by the session store).",
+      "required": false,
+      "backfill_on_missing": false,
+      "root_type": "string",
+      "fields": {}
+    },
+    "logs/event_log.jsonl": {
+      "description": "EventLogger JSONL output (event_log.jsonl under the vault root; also covered by the logs/* pattern).",
+      "required": false,
+      "backfill_on_missing": false,
+      "root_type": "string",
+      "fields": {}
+    },
+    "workspaces/*/Dockerfile": {
+      "description": "Per-workspace container image Dockerfile (GET/PUT /api/workspace/{ws_id}/dockerfile). Pattern entry.",
+      "required": false,
+      "pattern": true,
+      "root_type": "string",
+      "fields": {}
+    },
+    "workspaces/*/domain_allowlist.json": {
+      "description": "Per-workspace allowed network domains (JSON array of domain strings; GET/PUT /api/workspace/{ws_id}/domain_allowlist). Pattern entry.",
+      "required": false,
+      "pattern": true,
+      "root_type": "list",
+      "fields": {}
+    },
+    "workspaces/*/sessions/*.json": {
+      "description": "Per-workspace session state files (session files carry many fields; deliberately NOT field-checked). Pattern entry.",
+      "required": false,
+      "pattern": true,
+      "root_type": "dict",
+      "fields": {}
+    },
+    "global/.version": {
+      "description": "Global knowledge base version marker (written by ensure_global_kb).",
+      "required": false,
+      "backfill_on_missing": false,
+      "root_type": "string",
+      "fields": {}
+    },
+    "global/system/*.md": {
+      "description": "Global knowledge base system docs (markdown files written by ensure_global_kb). Pattern entry.",
+      "required": false,
+      "pattern": true,
+      "root_type": "string",
+      "fields": {}
+    },
+    "global/user/my_notes.md": {
+      "description": "User notes markdown in the global knowledge base (written by ensure_global_kb).",
+      "required": false,
+      "backfill_on_missing": false,
+      "root_type": "string",
+      "fields": {}
     }
   }
 }
