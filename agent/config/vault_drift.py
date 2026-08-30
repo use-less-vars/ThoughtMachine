@@ -6,12 +6,19 @@ schema manifest (``agent/config/schema_manifest.json``).
 
 The checker is intentionally conservative:
 
+* Checks are **read-only by default**: :meth:`check` reports repairable
+  drift (missing file with ``safe_default``, missing field with ``default``,
+  coercible type mismatch) as warnings and records it in
+  ``report["pending_repairs"]``.  Pass ``apply_repairs=True`` to actually
+  apply those repairs — the checker never writes without operator approval.
 * Missing files with a declared ``safe_default`` (and ``backfill_on_missing``)
-  are re-created from that default.
+  are re-created from that default when repairs are applied.
 * Missing **fields** with a declared ``default`` are backfilled; everything
   else is reported as a warning with an actionable hint.
 * Type mismatches are CRITICAL: unless the manifest entry declares
-  auto-coercion the checker raises :class:`DriftAbortError` and stops.
+  auto-coercion the checker raises :class:`DriftAbortError` and stops (in
+  read-only mode a *coercible* mismatch is only reported as pending — an
+  uncoercible one still aborts).
 * Whenever an existing file is rewritten (field backfill / coercion), the
   original is first copied to a timestamped ``.bak`` sibling.
 * Secret-bearing fields (``api_key``, ``secret``, ``token``, ...) are
@@ -99,8 +106,20 @@ class VaultDriftChecker:
     # Public API
     # ------------------------------------------------------------------
 
-    def check(self) -> dict:
+    def check(self, apply_repairs: bool = False) -> dict:
         """Run the drift check and return the structured report.
+
+        Args:
+            apply_repairs: When False (default) the check is strictly
+                read-only — no files are created, rewritten or backed up.
+                Repairable drift (missing file with ``safe_default``,
+                missing field with ``default``, coercible type mismatch)
+                is reported as warnings and recorded in
+                ``report["pending_repairs"]`` so the operator can apply
+                it with ``check(apply_repairs=True)``.  Non-repairable
+                drift (type mismatch without auto-coercion, unparseable
+                JSON, invalid manifest) still raises
+                :class:`DriftAbortError` in both modes.
 
         Raises:
             DriftAbortError: on CRITICAL drift (type mismatch without
@@ -111,7 +130,7 @@ class VaultDriftChecker:
         manifest = self._load_manifest()
         report = self._new_report(manifest)
         try:
-            self._check_files(manifest, report)
+            self._check_files(manifest, report, apply_repairs)
         except DriftAbortError:
             report["status"] = "error"
             report["aborted"] = True
@@ -159,6 +178,7 @@ class VaultDriftChecker:
             "checked_at": _utcnow_iso(),
             "files": {},
             "warnings": [],
+            "pending_repairs": [],
             "aborted": False,
         }
 
@@ -166,7 +186,7 @@ class VaultDriftChecker:
     # Per-file checks
     # ------------------------------------------------------------------
 
-    def _check_files(self, manifest: dict, report: dict) -> None:
+    def _check_files(self, manifest: dict, report: dict, apply_repairs: bool = False) -> None:
         for relpath, spec in manifest["files"].items():
             if spec.get("pattern"):
                 matches = sorted(self.vault_root.glob(relpath))
@@ -193,13 +213,35 @@ class VaultDriftChecker:
                     continue
                 for match in matches:
                     key = str(match.relative_to(self.vault_root))
-                    self._check_file(spec, key, match, report)
+                    self._check_file(spec, key, match, report, apply_repairs)
             else:
-                self._check_file(spec, relpath, self.vault_root / relpath, report)
+                self._check_file(spec, relpath, self.vault_root / relpath, report,
+                                 apply_repairs)
 
-    def _check_file(self, spec: dict, relpath: str, path: Path, report: dict) -> None:
+    def _check_file(self, spec: dict, relpath: str, path: Path, report: dict,
+                    apply_repairs: bool = False) -> None:
         if not path.exists():
             if spec.get("backfill_on_missing") and "safe_default" in spec:
+                if not apply_repairs:
+                    hint = (
+                        f"Missing vault file '{relpath}' has a schema safe_default; "
+                        "run check(apply_repairs=True) to re-create it."
+                    )
+                    report["files"][relpath] = {
+                        "status": "backfill_pending",
+                        "missing": True,
+                        "drifts": [
+                            {"field": "*", "issue": "file missing",
+                             "action": "run check(apply_repairs=True)", "hint": hint}
+                        ],
+                        "hint": hint,
+                    }
+                    report["warnings"].append(hint)
+                    report["pending_repairs"].append({
+                        "file": relpath, "action": "backfill_safe_default",
+                    })
+                    self._log("INFO", "backfill_pending", relpath=relpath, detail=hint)
+                    return
                 try:
                     self._write_safe_default(spec, path)
                 except OSError as exc:
@@ -261,7 +303,8 @@ class VaultDriftChecker:
         rewritten = False
         for field_name, fspec in spec.get("fields", {}).items():
             repaired = self._check_field(
-                relpath, path, data, field_name, fspec, spec, drifts, report
+                relpath, path, data, field_name, fspec, spec, drifts, report,
+                apply_repairs,
             )
             if repaired:
                 rewritten = True
@@ -329,12 +372,15 @@ class VaultDriftChecker:
         file_spec: dict,
         drifts: List[dict],
         report: dict,
+        apply_repairs: bool = False,
     ) -> bool:
         """Check one manifest field; returns True when auto-repaired.
 
-        Auto-repair covers backfilling a missing field from its declared
-        default and coercing a value to the declared type when the manifest
-        opts in. Everything else is a warning drift or a raised
+        Auto-repair (only when ``apply_repairs`` is True) covers backfilling
+        a missing field from its declared default and coercing a value to
+        the declared type when the manifest opts in. In read-only mode
+        repairable drift is reported as warnings + ``pending_repairs``;
+        everything else is a warning drift or a raised
         :class:`DriftAbortError`.
         """
         fspec = dict(fspec)
@@ -343,6 +389,26 @@ class VaultDriftChecker:
 
         if field_name not in data:
             if "default" in fspec:
+                if not apply_repairs:
+                    hint = (
+                        f"Field '{field_name}' missing from {relpath} "
+                        f"(declared default available); "
+                        "run check(apply_repairs=True) to backfill."
+                    )
+                    drifts.append({
+                        "field": field_name,
+                        "issue": "missing field (repair pending)",
+                        "action": "run check(apply_repairs=True)",
+                        "hint": hint,
+                    })
+                    report["warnings"].append(hint)
+                    report["pending_repairs"].append({
+                        "file": relpath, "field": field_name,
+                        "action": "backfill_default",
+                    })
+                    self._log("INFO", "backfill_pending", relpath=relpath,
+                              field=field_name, detail=hint)
+                    return False
                 data[field_name] = fspec["default"]
                 self._log(
                     "INFO", "field_backfilled", relpath=relpath, field=field_name,
@@ -377,6 +443,25 @@ class VaultDriftChecker:
                         f"Vault file {relpath}: field '{field_name}' value {value_label} "
                         f"cannot be coerced to '{declared_type}'"
                     )
+                if not apply_repairs:
+                    hint = (
+                        f"Field '{field_name}' in {relpath} has type "
+                        f"{type(value).__name__}, expected '{declared_type}' "
+                        "(coercible); run check(apply_repairs=True) to fix."
+                    )
+                    drifts.append({
+                        "field": field_name,
+                        "issue": "type mismatch (repair pending)",
+                        "action": "run check(apply_repairs=True)",
+                        "hint": hint,
+                    })
+                    report["warnings"].append(hint)
+                    report["pending_repairs"].append({
+                        "file": relpath, "field": field_name, "action": "coerce",
+                    })
+                    self._log("INFO", "coerce_pending", relpath=relpath,
+                              field=field_name, detail=hint)
+                    return False
                 data[field_name] = coerced
                 self._log(
                     "INFO", "field_coerced", relpath=relpath, field=field_name,
@@ -565,7 +650,8 @@ class VaultDriftChecker:
         file_statuses = [f.get("status") for f in report["files"].values()]
         if report["aborted"] or "error" in file_statuses:
             report["status"] = "error"
-        elif report["warnings"] or "backfilled" in file_statuses:
+        elif (report["warnings"] or "backfilled" in file_statuses
+              or "backfill_pending" in file_statuses):
             report["status"] = "warnings"
         else:
             report["status"] = "ok"

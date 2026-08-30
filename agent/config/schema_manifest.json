@@ -241,10 +241,11 @@
           "my_config",
           "network_diagnostics",
           "running_workers",
+          "vault_status",
           "workers",
           "workspace_info"
         ],
-        "sha256": "697c326308135db2b508b16261e849bb79dd75b1d529748a5f8d88e799afa2d8"
+        "sha256": "af42fb7423f30c3445a47ffc7b37cf9b35162548aecea8dda19803921fceb9a0"
       },
       "root_type": "dict",
       "fields": {
@@ -409,6 +410,132 @@
           "type": "string",
           "required": false,
           "description": "Workspace default system prompt."
+        }
+      }
+    },
+    "sessions/*/config.json": {
+      "description": "Per-session config (SessionConfig subset; covers sessions/{id}/config.json). Pattern entry: validated for every matching session.",
+      "required": false,
+      "pattern": true,
+      "root_type": "dict",
+      "fields": {
+        "enabled_tools": {
+          "type": "list",
+          "required": false,
+          "description": "List of enabled tool names for this session."
+        },
+        "workspace_path": {
+          "type": "string",
+          "required": false,
+          "description": "Workspace/project directory path for this session."
+        },
+        "workspace_id": {
+          "type": "string",
+          "required": false,
+          "description": "Workspace/project identifier for this session."
+        },
+        "system_prompt": {
+          "type": "string",
+          "required": false,
+          "description": "Custom system prompt for this session."
+        },
+        "mode": {
+          "type": "string",
+          "required": false,
+          "description": "Session mode - e.g. engineer, architect, or custom."
+        },
+        "max_turns": {
+          "type": "int",
+          "required": false,
+          "min": 1,
+          "description": "Maximum conversation turns for this session."
+        },
+        "timeout_seconds": {
+          "type": "int",
+          "required": false,
+          "min": 1,
+          "description": "Agent soft budget in seconds."
+        },
+        "token_monitor_warning_threshold": {
+          "type": "int",
+          "required": false,
+          "min": 0,
+          "description": "Token count threshold for warning state."
+        },
+        "token_monitor_critical_threshold": {
+          "type": "int",
+          "required": false,
+          "min": 0,
+          "description": "Token count threshold for critical state."
+        },
+        "provider_id": {
+          "type": "string",
+          "required": false,
+          "description": "Provider identifier for the LLM."
+        },
+        "model": {
+          "type": "string",
+          "required": false,
+          "description": "Model name for this session."
+        },
+        "api_key": {
+          "type": "string",
+          "required": false,
+          "redact": true,
+          "description": "API key for the provider. Redacted everywhere."
+        },
+        "base_url": {
+          "type": "string",
+          "required": false,
+          "description": "Base URL override for the LLM provider."
+        },
+        "model_override": {
+          "type": "string",
+          "required": false,
+          "description": "Model name override."
+        },
+        "provider_config": {
+          "type": "dict",
+          "required": false,
+          "description": "Extra provider-specific config forwarded to the LLM client."
+        },
+        "temperature": {
+          "type": "number",
+          "required": false,
+          "min": 0,
+          "max": 2,
+          "description": "Temperature for LLM sampling."
+        },
+        "session_permissions": {
+          "type": "dict",
+          "required": false,
+          "description": "Session-level permission overrides."
+        },
+        "use_workspace_lifecycle_manager": {
+          "type": "bool",
+          "required": false,
+          "description": "Enable Workspace Lifecycle Manager for worker queries (feature flag)."
+        },
+        "use_container_registry": {
+          "type": "bool",
+          "required": false,
+          "description": "Enable ContainerRegistry delegation for container lifecycle (feature flag)."
+        },
+        "git_allow_worktree_commits": {
+          "type": "bool",
+          "required": false,
+          "description": "Allow agent commits in operator-managed git worktrees on feat/* or fix/* branches (feature flag)."
+        },
+        "allow_host_resources": {
+          "type": "bool",
+          "required": false,
+          "description": "Allow supervised host-shell commands via the host_bash tool in this session (feature flag)."
+        },
+        "max_workers_per_session": {
+          "type": "int",
+          "required": false,
+          "min": 1,
+          "description": "Maximum number of live worker threads this session may run at once."
         }
       }
     }
