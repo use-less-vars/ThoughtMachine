@@ -55,6 +55,26 @@ _TYPE_CHECKERS = {
     "any": (),
 }
 
+# Manifest relpath -> resources/ filename for files deployed from seeds during
+# bootstrap. When a seeded file exists in the vault but differs from the seed,
+# the checker reports a warning drift (never auto-fixes — the operator may have
+# deliberately customised it).
+_SEED_MAP = {
+    "system/checksystem_allowlist.json": "checksystem_allowlist.json",
+    "system/providers.json": "default_providers.json",
+    "providers.json": "default_providers.json",
+    "system/factory_defaults.json": "factory_defaults.json",
+    "system/default_system_prompt.txt": "default_system_prompt.txt",
+    "system/engineer_system_prompt.txt": "engineer_system_prompt.txt",
+    "default_system_prompt.txt": "default_system_prompt.txt",
+    "engineer_system_prompt.txt": "engineer_system_prompt.txt",
+}
+
+
+def _resources_dir() -> Path:
+    """Absolute path of the repository resources directory (seed files)."""
+    return Path(__file__).resolve().parent.parent.parent / "resources"
+
 
 class DriftAbortError(Exception):
     """Raised when vault drift is severe enough that automated backfill must stop."""
@@ -134,6 +154,14 @@ class VaultDriftChecker:
         except DriftAbortError:
             report["status"] = "error"
             report["aborted"] = True
+            report["issues"] = [
+                {
+                    "file": None,
+                    "severity": "error",
+                    "message": "Drift check aborted due to critical drift",
+                    "action": "inspect the vault and fix the critical drift",
+                }
+            ]
             self._last_report = report
             raise
         self._check_unknown_root_files(manifest, report)
@@ -281,8 +309,9 @@ class VaultDriftChecker:
             return
 
         # File exists.
+        seed_drift = self._check_seeded_file(relpath, path, report)
         if spec.get("root_type") == "string":
-            self._check_text_file(spec, relpath, path, report)
+            self._check_text_file(spec, relpath, path, report, seed_drift)
             return
 
         try:
@@ -300,6 +329,8 @@ class VaultDriftChecker:
             return
 
         drifts: List[dict] = []
+        if seed_drift is not None:
+            drifts.append(seed_drift)
         rewritten = False
         for field_name, fspec in spec.get("fields", {}).items():
             repaired = self._check_field(
@@ -308,6 +339,26 @@ class VaultDriftChecker:
             )
             if repaired:
                 rewritten = True
+
+        # Undeclared top-level fields (dict files with a declared schema):
+        # warning drift, never auto-fixed.
+        declared_fields = set(spec.get("fields", {}).keys())
+        if declared_fields:
+            for key in data:
+                if key not in declared_fields:
+                    hint = (
+                        f"Field '{key}' in {relpath} is not declared in the "
+                        "schema manifest; it will not be validated or repaired."
+                    )
+                    drifts.append({
+                        "field": key,
+                        "issue": "undeclared field",
+                        "action": "remove the field or declare it in the schema manifest",
+                        "hint": hint,
+                    })
+                    report["warnings"].append(hint)
+                    self._log("WARNING", "undeclared_field", relpath=relpath,
+                              field=key, detail=hint)
 
         if rewritten:
             self._backup_and_write_json(path, data)
@@ -328,12 +379,62 @@ class VaultDriftChecker:
         if rewritten:
             report["warnings"].append(f"Backfilled missing fields in {relpath}")
 
-    def _check_text_file(self, spec: dict, relpath: str, path: Path, report: dict) -> None:
+    def _check_seeded_file(self, relpath: str, path: Path, report: dict) -> Optional[dict]:
+        """Compare an existing file against its resources/ seed, if any.
+
+        Seeded files are deployed from ``resources/`` during bootstrap (see
+        ``_SEED_MAP``). A vault copy that differs from the seed is reported as
+        a warning drift — never auto-fixed, because the operator may have
+        deliberately customised it.
+
+        Returns the drift dict to merge into the per-file ``drifts`` list, or
+        None when the file is not seeded / matches its seed.
+        """
+        seed_name = _SEED_MAP.get(relpath)
+        if seed_name is None:
+            return None
+        seed_path = _resources_dir() / seed_name
+        if not seed_path.is_file():
+            return None
+        try:
+            vault_bytes = path.read_bytes()
+            seed_bytes = seed_path.read_bytes()
+        except OSError:
+            return None
+        if seed_name.endswith(".json"):
+            # JSON: compare parsed content (formatting/indent differences are
+            # not drift).
+            try:
+                same = json.loads(vault_bytes) == json.loads(seed_bytes)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                same = False
+        else:
+            same = vault_bytes == seed_bytes
+        if same:
+            return None
+        hint = (
+            f"Seeded file '{relpath}' differs from resources/{seed_name}; "
+            "it was modified after bootstrap."
+        )
+        report["warnings"].append(hint)
+        self._log("WARNING", "seeded_file_modified", relpath=relpath,
+                  detail=hint)
+        return {
+            "field": relpath,
+            "issue": "seeded file modified",
+            "action": f"restore from resources/{seed_name} or accept drift",
+            "hint": hint,
+        }
+
+    def _check_text_file(self, spec: dict, relpath: str, path: Path, report: dict,
+                         seed_drift: Optional[dict] = None) -> None:
         try:
             content = path.read_text(encoding="utf-8")
         except OSError as exc:
             raise DriftAbortError(f"Cannot read text file {relpath}: {exc}") from exc
         drifts: List[dict] = []
+        if seed_drift is not None:
+            drifts.append(seed_drift)
         if spec.get("required") and not content.strip():
             drifts.append({
                 "field": "*",
@@ -655,6 +756,65 @@ class VaultDriftChecker:
             report["status"] = "warnings"
         else:
             report["status"] = "ok"
+        report["issues"] = self._build_issues(report)
+
+    def _build_issues(self, report: dict) -> List[dict]:
+        """Flatten the report into a top-level ``issues`` list.
+
+        Each issue is ``{file, severity, message, action}`` with severity one
+        of ``error`` / ``warning`` / ``info``:
+
+        * files in ``error`` state (or an aborted check) -> ``error``;
+        * files with warning drifts (missing required file/field, type
+          mismatch, undeclared field, seeded-file modified) -> ``warning``;
+        * ``backfill_pending`` / ``backfilled`` files -> ``info``;
+        * unknown root files -> ``info`` (they do not flip the status);
+        * every other top-level warning -> ``warning``.
+        """
+        issues: List[dict] = []
+        seen_messages: set = set()
+
+        for relpath in sorted(report["files"]):
+            finfo = report["files"][relpath]
+            status = finfo.get("status")
+            if status == "ok":
+                continue
+            if status in ("backfill_pending", "backfilled"):
+                severity = "info"
+            elif status == "warning":
+                severity = "warning"
+            else:
+                severity = "error"
+            drifts = finfo.get("drifts") or []
+            for d in drifts:
+                message = d.get("hint") or d.get("issue", status)
+                action = d.get("action", "")
+                seen_messages.add(message)
+                issues.append({
+                    "file": relpath,
+                    "severity": severity,
+                    "message": message,
+                    "action": action,
+                })
+
+        for w in report["warnings"]:
+            if w in seen_messages:
+                continue
+            if "Unknown file" in w:
+                issues.append({
+                    "file": None,
+                    "severity": "info",
+                    "message": w,
+                    "action": "declare the file in the schema manifest or ignore",
+                })
+            else:
+                issues.append({
+                    "file": None,
+                    "severity": "warning",
+                    "message": w,
+                    "action": "",
+                })
+        return issues
 
     def _log(self, level: str, event: str, **payload: Any) -> None:
         """Emit one JSON line per event. Secret values are never included."""

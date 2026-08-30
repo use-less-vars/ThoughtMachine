@@ -11,9 +11,10 @@
     "my_config",
     "network_diagnostics",
     "running_workers",
+    "runtime_state",
     "vault_status",
     "workers",
     "workspace_info"
   ],
-  "sha256": "af42fb7423f30c3445a47ffc7b37cf9b35162548aecea8dda19803921fceb9a0"
+  "sha256": "201f3e9839ceaca5e3241bd914d2343c0059c6efbe35f49594650686b6ec335f"
 }

@@ -2631,6 +2631,40 @@ async def api_health():
     return await health()
 
 
+@app.get("/api/vault/status")
+def vault_status_endpoint():
+    """Run the vault drift check (read-only) and return a structured report.
+
+    Severity mapping: ``error``/``warning`` issues flip ``ok`` to False;
+    ``info`` issues (e.g. unknown files) do not. On abort or unexpected
+    failure the endpoint returns ``ok: False, status: "error"``.
+    """
+    try:
+        from agent.config.vault_drift import VaultDriftChecker, DriftAbortError
+        from thoughtmachine.vault import vault_root
+
+        checker = VaultDriftChecker(vault_root=vault_root())
+        report = checker.check(apply_repairs=False)
+    except DriftAbortError as exc:
+        return {"ok": False, "status": "error", "error": str(exc), "issues": []}
+    except Exception as exc:
+        return {"ok": False, "status": "error", "error": str(exc), "issues": []}
+    issues = report.get("issues", [])
+    ok = all(i.get("severity") not in ("error", "warning") for i in issues)
+    return {
+        "ok": ok,
+        "status": report.get("status"),
+        "issues": issues,
+        "checked_at": report.get("checked_at"),
+        "vault_root": report.get("vault_root"),
+        "summary": {
+            "error": sum(1 for i in issues if i.get("severity") == "error"),
+            "warning": sum(1 for i in issues if i.get("severity") == "warning"),
+            "info": sum(1 for i in issues if i.get("severity") == "info"),
+        },
+    }
+
+
 @app.get("/api/container/integrity")
 def container_integrity(workspace: str = "", permissions: str = ""):
     """Return container integrity status for the given workspace.

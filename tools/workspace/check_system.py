@@ -137,7 +137,9 @@ class CheckSystem(ToolBase):
                       "'network_diagnostics' (connectivity checks), "
                       "'event_bus_status' (EventBus subscriber info), "
                       "'event_log' (tail recent EventLogger entries), "
-                      "'vault_status' (vault drift vs schema manifest).",
+                      "'vault_status' (vault drift vs schema manifest), "
+                      "'runtime_state' (redacted runtime snapshot — token limits, worker caps, "
+                      "container status, permissions, allowlist).",
     )
 
     skip_output_truncation: ClassVar[bool] = True
@@ -250,6 +252,7 @@ class CheckSystem(ToolBase):
                 "event_bus_status": lambda: self._query_event_bus_status(),
                 "event_log": lambda: self._query_event_log(),
                 "vault_status": lambda: self._query_vault_status(),
+                "runtime_state": lambda: self._query_runtime_state(ws_id, workspace_path),
             }
 
             handler = handler_map.get(query)
@@ -860,6 +863,73 @@ class CheckSystem(ToolBase):
             if isinstance(partial, dict):
                 return partial
             return {"status": "error", "aborted": True, "error": "vault drift check aborted"}
+
+    def _query_runtime_state(self, ws_id: Optional[str], workspace_path: Optional[str] = None) -> dict:
+        """Return a REDACTED runtime snapshot: token limits, worker caps,
+        container status, effective permission levels, allowlist, vault status.
+
+        Never exposes api_key, raw_config or secret material; every sub-probe
+        is best-effort and failures degrade to explicit status values.
+        """
+        try:
+            cfg = dict(self.agent_config) if self.agent_config else {}
+            token_limits = {
+                "warning_threshold": cfg.get("token_monitor_warning_threshold"),
+                "critical_threshold": cfg.get("token_monitor_critical_threshold"),
+                "context_limit": None,
+            }
+            try:
+                caps = self._query_capabilities(ws_id, workspace_path)
+                token_limits["context_limit"] = (caps.get("token_limits") or {}).get("max_context_length")
+            except Exception:
+                token_limits["context_limit"] = None
+
+            worker_limits = {
+                "max_workers_per_session": cfg.get("max_workers_per_session"),
+                "worker_timeout_seconds": cfg.get("worker_timeout_seconds"),
+                "worker_max_retries": cfg.get("worker_max_retries"),
+            }
+
+            container_status = {"status": "unavailable"}
+            try:
+                cstatus = self._query_container_status(workspace_path)
+                if isinstance(cstatus, dict):
+                    container_status = {k: cstatus.get(k) for k in ("status", "reason", "error")}
+            except Exception as exc:
+                container_status = {"status": "error", "error": str(exc)}
+
+            effective_permission_levels = {}
+            try:
+                perms = self._query_permissions(ws_id)
+                if isinstance(perms, dict):
+                    effective_permission_levels = perms.get("effective_permissions", {}) or {}
+            except Exception:
+                effective_permission_levels = {}
+
+            allowlist_count = len(self.allowlist) if self.allowlist is not None else 0
+            enabled_tools = getattr(self, "enabled_tools", None) or []
+            enabled_tools_count = len(enabled_tools)
+
+            vault_status = {"status": "error"}
+            try:
+                vs = self._query_vault_status()
+                if isinstance(vs, dict):
+                    vault_status = {"status": vs.get("status"), "aborted": vs.get("aborted", False)}
+            except Exception:
+                vault_status = {"status": "error"}
+
+            return {
+                "status": "ok",
+                "token_limits": token_limits,
+                "worker_limits": worker_limits,
+                "container_status": container_status,
+                "effective_permission_levels": effective_permission_levels,
+                "allowlist_count": allowlist_count,
+                "enabled_tools_count": enabled_tools_count,
+                "vault_status": vault_status,
+            }
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
 
     def _query_mcp_servers(self, ws_id: Optional[str]) -> dict:
         """Return list of configured MCP servers."""
