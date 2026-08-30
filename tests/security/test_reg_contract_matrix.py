@@ -33,6 +33,7 @@ import pytest
 
 import tools.mcp_server_connect as mcp_server_connect
 from tools.git_info_tool import GitInfoTool
+from tools.git_write_tool import GitWriteTool
 
 
 # ---------------------------------------------------------------------------
@@ -144,12 +145,13 @@ def test_post_commit_hook_never_executes(tmp_path):
     _write_hook(repo / ".git" / "hooks" / "post-commit", marker)
 
     (repo / "hello.txt").write_text("hi\n")
-    tool = GitInfoTool(
+    tool = GitWriteTool(
         operation="commit",
         message="add hello",
         file_path="hello.txt",
         working_dir=str(repo),
         session_permissions=FULL_PERMISSIONS,
+        agent_config={"git_allow_worktree_commits": True},
     )
     result = tool.execute()
     assert "Git command failed" not in result
@@ -227,16 +229,17 @@ def test_clone_ext_transport_rejected(tmp_path):
     """
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True)
-    tool = GitInfoTool(
+    tool = GitWriteTool(
         operation="clone",
         clone_url="ext::sh -c 'touch /tmp/pwned'",
         working_dir=str(workspace),
         session_permissions=FULL_PERMISSIONS,
         effective_permissions=FULL_PERMISSIONS,
+        agent_config={"git_allow_worktree_commits": True},
     )
-    with pytest.raises(ValueError) as excinfo:
-        tool.execute()
-    assert "Unsupported git protocol" in str(excinfo.value)
+    result = tool.execute()
+    assert isinstance(result, str)
+    assert "Unsupported git protocol" in result
 
 
 @pytest.mark.usefixtures("git_available")
@@ -254,12 +257,13 @@ def test_host_file_write_to_hooks_then_commit_hook_ignored(tmp_path):
     _write_hook(repo / ".git" / "hooks" / "pre-commit", marker)
 
     (repo / "hello.txt").write_text("hi\n")
-    tool = GitInfoTool(
+    tool = GitWriteTool(
         operation="commit",
         message="add hello",
         file_path="hello.txt",
         working_dir=str(repo),
         session_permissions=FULL_PERMISSIONS,
+        agent_config={"git_allow_worktree_commits": True},
     )
     result = tool.execute()
     assert "Git command failed" not in result
@@ -291,7 +295,7 @@ def test_container_commit_does_not_skip_hooks(tmp_path):
     is injected instead.
     """
     manager = _FakeManager()
-    tool = GitInfoTool(operation="commit", message="x")
+    tool = GitWriteTool(operation="commit", message="x")
     object.__setattr__(tool, "_resolved_workspace_path", str(tmp_path))
     object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
     object.__setattr__(tool, "_ensure_resource_container", lambda: manager)
@@ -318,12 +322,13 @@ def test_git_add_status_diff_log_work(tmp_path):
     _init_repo(repo)
 
     (repo / "base.txt").write_text("base\n")
-    tool = GitInfoTool(
+    tool = GitWriteTool(
         operation="commit",
         message="base",
         file_path="base.txt",
         working_dir=str(repo),
         session_permissions=FULL_PERMISSIONS,
+        agent_config={"git_allow_worktree_commits": True},
     )
     result = tool.execute()
     assert "Git command failed" not in result
