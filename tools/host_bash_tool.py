@@ -62,6 +62,10 @@ HOST_BASH_APPROVAL_TIMEOUT = 120.0
 class HostBashTool(ToolBase):
     """Run a supervised shell command on the host machine."""
 
+    # Stable tool identifier: matches the internal ``tool`` Literal and is
+    # used in LLM schemas, preset lists and the /api/tools endpoint.
+    name: ClassVar[str] = "host_bash"
+
     tool: Literal["host_bash"] = "host_bash"
     command: str = Field(description="Shell command to execute on the host machine.")
     audit_log_path: Optional[str] = Field(

@@ -116,7 +116,7 @@ class AgentConfig(BaseModel):
     kb_path: Optional[str] = Field(default=None, description="Path to knowledge base directory (None = default .thoughtmachine/knowledge/)")
     tool_output_token_limit: int = Field(default=10000, description='Maximum token limit for tool outputs (default 10,000 tokens)')
     detail: Literal['minimal', 'normal', 'verbose'] = Field(default='normal', description='Detail level for event display')
-    enabled_tools: List[str] = Field(default_factory=lambda: [cls.__name__ for cls in SIMPLIFIED_TOOL_CLASSES], description='List of enabled tool class names')
+    enabled_tools: List[str] = Field(default_factory=lambda: [cls.tool_name() for cls in SIMPLIFIED_TOOL_CLASSES], description='List of enabled tool names (stable tool_name(); legacy class names also accepted)')
     timeout_seconds: int = Field(default=SOFT_BUDGET_FALLBACK_SECONDS, description='Maximum runtime in seconds before timeout')
     time_monitor_enabled: bool = Field(default=False, description='Enable time-based execution monitoring')
     time_warning_threshold: int = Field(default=240, description='Elapsed seconds at which a time warning is issued (default 80% of timeout)')
@@ -285,7 +285,21 @@ class AgentConfig(BaseModel):
             tool_classes = [cls for cls in tool_classes if cls.__name__ != 'KnowledgeBaseTool']
         active_tools = enabled_tools if enabled_tools is not None else self.enabled_tools
         if active_tools is not None:
-            tool_classes = [cls for cls in tool_classes if cls.__name__ in active_tools]
+            # Legacy class names (configs written before the naming cleanup,
+            # e.g. enabled_tools: ["GitInfoTool"]) map onto the stable tool
+            # names so they keep working after GitInfoTool -> GitReadTool.
+            _LEGACY_TOOL_NAMES = {
+                "GitInfoTool": "git_read",
+                "GitWriteTool": "git_write",
+            }
+            active_tools = [_LEGACY_TOOL_NAMES.get(name, name) for name in active_tools]
+            # Match by stable tool name first, then legacy class name, so
+            # presets/configs written with either identifier keep working.
+            tool_classes = [
+                cls
+                for cls in tool_classes
+                if cls.tool_name() in active_tools or cls.__name__ in active_tools
+            ]
         return tool_classes
 
     def resolve_from_profile(self, manager) -> 'AgentConfig':

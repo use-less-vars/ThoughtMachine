@@ -303,25 +303,60 @@ def backend_to_frontend_config(backend: Dict[str, Any]) -> Dict[str, Any]:
 
     # Map enabled_tools → tools list (bidirectional with translate_frontend_config)
     if "enabled_tools" in cfg:
-        enabled_set = set(cfg.pop("enabled_tools"))
+        # Legacy class names → stable tool names: configs written before the
+        # naming cleanup (e.g. enabled_tools: ["GitInfoTool"]) keep working.
+        _LEGACY_TOOL_NAMES = {
+            "GitInfoTool": "git_read",
+            "GitWriteTool": "git_write",
+        }
+
+        def _normalize(name: str) -> str:
+            return _LEGACY_TOOL_NAMES.get(name, name)
+
+        enabled_set = set(_normalize(n) for n in cfg.pop("enabled_tools"))
         mode = cfg.get("mode", "custom")
         from tools import SIMPLIFIED_TOOL_CLASSES
 
         if mode != "custom":
-            mode_tool_names = set(get_tools_for_mode(mode))
+            mode_tool_names = set(_normalize(n) for n in get_tools_for_mode(mode))
         else:
             mode_tool_names = None
 
+        allow_host_resources = bool(cfg.get("allow_host_resources", False))
+        session_perms = cfg.get("session_permissions") or {}
+        if hasattr(session_perms, "model_dump"):
+            session_perms = session_perms.model_dump()
+        elif not isinstance(session_perms, dict):
+            session_perms = {}
+
         cfg["tools"] = [
             {
-                "name": cls.__name__,
-                "enabled": cls.__name__ in enabled_set,
+                "name": cls.tool_name(),
+                "enabled": cls.tool_name() in enabled_set
+                or cls.__name__ in enabled_set,
                 # Keep tool descriptions so the frontend can show them without
                 # a separate /api/tools round-trip (session_loaded tools fix).
                 "description": (cls.__doc__ or "").strip(),
+                # host_bash is gated on the allow_host_resources feature flag;
+                # expose why it is off so the UI can explain it.
+                "disabled_reason": (
+                    "requires allow_host_resources: true"
+                    if cls.tool_name() == "host_bash"
+                    and not allow_host_resources
+                    else None
+                ),
+                # host_bash has no outer-gate category (permission checks are
+                # in-tool); surface the configured grain for the UI.
+                "permission_level": (
+                    session_perms.get("host_bash")
+                    if cls.tool_name() == "host_bash"
+                    else None
+                ),
             }
             for cls in SIMPLIFIED_TOOL_CLASSES
-            if mode_tool_names is None or cls.__name__ in mode_tool_names
+            if mode_tool_names is None
+            or cls.tool_name() in mode_tool_names
+            or cls.__name__ in mode_tool_names
         ]
 
     # Ensure workspace_path is always present

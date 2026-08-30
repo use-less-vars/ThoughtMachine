@@ -188,10 +188,10 @@ except ImportError as e:
 # Final/FinalReport removed in Phase B — use Respond instead
 
 try:
-    from .git_info_tool import GitInfoTool
-    TOOL_CLASSES.append(GitInfoTool)
+    from .git_info_tool import GitReadTool
+    TOOL_CLASSES.append(GitReadTool)
 except ImportError as e:
-    _record_import_failure("GitInfoTool", e)
+    _record_import_failure("GitReadTool", e)
 
 try:
     from .git_write_tool import GitWriteTool

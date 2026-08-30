@@ -25,7 +25,7 @@ FULL_CONFIG_KWARGS = dict(
     max_turns=100,
     base_url="https://test.api.com",
     session_permissions={"container": False, "network": False},
-    enabled_tools=["Respond", "CheckSystem", "GitInfoTool"],
+    enabled_tools=["Respond", "CheckSystem", "git_read"],
 )
 
 
@@ -89,7 +89,7 @@ class TestConfigRoundtrip:
 
     def test_custom_mode_respects_explicit_values(self, output_dir: Path) -> None:
         """In custom mode the validator does *not* override tools/prompt."""
-        explicit_tools = ["Respond", "CheckSystem", "GitInfoTool"]
+        explicit_tools = ["Respond", "CheckSystem", "git_read"]
         config = SessionConfig(
             mode="custom",
             enabled_tools=list(explicit_tools),

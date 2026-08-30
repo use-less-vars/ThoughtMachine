@@ -75,6 +75,16 @@ class ToolBase(BaseModel):
     # Empty list means no special permissions needed.
     required_categories: ClassVar[List[str]] = []
 
+    # Stable registry/display name for this tool: used in LLM schemas
+    # (model_to_openai_tool), preset lists, and the /api/tools endpoint.
+    # Defaults to the class name when unset (legacy behavior).
+    name: ClassVar[str] = ""
+
+    @classmethod
+    def tool_name(cls) -> str:
+        """Return the stable tool identifier (``name`` ClassVar or class name)."""
+        return cls.name or cls.__name__
+
     # If True, framework-level output truncation is skipped for this tool.
     # Use this for tools whose output must always be complete (e.g., Respond, SummarizeTool).
     skip_output_truncation: ClassVar[bool] = False

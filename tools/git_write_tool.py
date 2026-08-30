@@ -3,10 +3,10 @@ import json
 import re
 import logging
 import subprocess
-from typing import Any, Literal, Optional, List, Union
+from typing import Any, ClassVar, Literal, Optional, List, Union
 from pathlib import Path
 from pydantic import Field
-from .git_info_tool import GitInfoTool, resolve_git_execution_mode
+from .git_info_tool import GitReadTool, resolve_git_execution_mode
 from agent.config.defaults import ALLOWED_GIT_PROTOCOLS
 
 logger = logging.getLogger(__name__)
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 _BRANCH_NAME_RE = re.compile(r'^[A-Za-z0-9._/\-]+$')
 
 
-class GitWriteTool(GitInfoTool):
+class GitWriteTool(GitReadTool):
     """
     Git write operations tool (commit, init, clone, branch_create, checkout,
     stage, unstage).
@@ -24,7 +24,7 @@ class GitWriteTool(GitInfoTool):
     ``agent_config['git_allow_worktree_commits']`` being exactly True, and on
     the agent's ask policy enforced by the ToolExecutor / security gate. The
     read surface (status, diff, diff_cached, log, branch, branch_list, show,
-    remote, blame, config) lives in ``GitInfoTool`` (tools/git_info_tool.py);
+    remote, blame, config) lives in ``GitReadTool`` (tools/git_info_tool.py);
     this subclass inherits the hardened execution backends, path validation,
     the operator-managed-worktree detection and the per-call execution-mode
     trailer, and adds the write dispatch.
@@ -47,6 +47,12 @@ class GitWriteTool(GitInfoTool):
     the call degraded to a host-side operation). Argument-validation errors
     keep their historical byte-exact form (no trailer).
     """
+
+    # Stable tool identifier: used in LLM schemas, preset lists and the
+    # /api/tools endpoint. The internal ``tool`` Literal field below is
+    # excluded from the LLM schema and kept unchanged for backward
+    # compatibility with legacy callers.
+    name: ClassVar[str] = "git_write"
 
     @classmethod
     def get_required_categories(cls, params: dict | None = None) -> list[str]:

@@ -110,10 +110,16 @@ def model_to_openai_tool(model: Type[BaseModel]) -> Dict[str, Any]:
     parameters = {k: v for k, v in schema.items() if k not in ("title", "description")}
     # Simplify the parameters schema
     parameters = _simplify_schema(parameters)
+    # Stable tool name: prefer the tool's ``name`` ClassVar (tool_name());
+    # fall back to the class name for legacy/non-tool models.
+    if hasattr(model, "tool_name"):
+        tool_name = model.tool_name()
+    else:
+        tool_name = model.__name__
     return {
         "type": "function",
         "function": {
-            "name": model.__name__,
+            "name": tool_name,
             "description": schema.get("description", ""),
             "parameters": parameters,
         }

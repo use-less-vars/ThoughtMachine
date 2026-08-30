@@ -1,6 +1,6 @@
 # tools/git_info_tool.py
 import json
-from typing import Any, Literal, Optional, List, Union
+from typing import Any, ClassVar, Literal, Optional, List, Union
 from pydantic import Field
 import logging
 import subprocess
@@ -21,7 +21,7 @@ def resolve_git_execution_mode(
 ) -> str:
     """Resolve the effective git execution mode for diagnostics.
 
-    Mirrors ``GitInfoTool._git_execution_mode`` / ``_use_container_mode`` so
+    Mirrors ``GitReadTool._git_execution_mode`` / ``_use_container_mode`` so
     the decision is observable outside the tool (e.g. CheckSystem).
 
     Returns:
@@ -43,7 +43,7 @@ def resolve_git_execution_mode(
     return "containerized"
 
 
-class GitInfoTool(ToolBase):
+class GitReadTool(ToolBase):
     """
     Read-only git repository inspection tool.
 
@@ -72,6 +72,12 @@ class GitInfoTool(ToolBase):
     the call degraded to a host-side operation). Argument-validation errors
     keep their historical byte-exact form (no trailer).
     """
+
+    # Stable tool identifier: used in LLM schemas, preset lists and the
+    # /api/tools endpoint. The internal ``tool`` Literal field below is
+    # excluded from the LLM schema and kept unchanged for backward
+    # compatibility with legacy callers.
+    name: ClassVar[str] = "git_read"
 
     # ------------------------------------------------------------------
     # Private runtime state. Leading-underscore attributes are assignable in
@@ -259,7 +265,7 @@ class GitInfoTool(ToolBase):
                 if not check_atomic_operation(
                     "network:outbound",
                     effective,
-                    "GitInfoTool",
+                    "GitReadTool",
                     f"{operation} on remote"
                 ):
                     return json.dumps({"error": f"Atomic permission check failed: network:outbound required for {operation}"})
@@ -294,7 +300,7 @@ class GitInfoTool(ToolBase):
                     ws_path = getattr(self, 'workspace_path', None)
                     if ws_path:
                         logging.warning(
-                            "GitInfoTool falling back to deprecated AgentConfig.workspace_path")
+                            "GitReadTool falling back to deprecated AgentConfig.workspace_path")
 
                 if ws_path:
                     repo_root = Path(ws_path).expanduser().resolve()
@@ -342,7 +348,7 @@ class GitInfoTool(ToolBase):
             )
             if mode != getattr(self, "_last_mode", None):
                 logger.info(
-                    "GitInfoTool git execution mode: %s (operation=%s, workspace_id=%s)",
+                    "GitReadTool git execution mode: %s (operation=%s, workspace_id=%s)",
                     mode,
                     self.operation,
                     self._resolved_workspace_id or "none",
@@ -458,7 +464,7 @@ class GitInfoTool(ToolBase):
         if not self._use_container_mode():
             if not allow_host_fallback:
                 raise RuntimeError(
-                    "GitInfoTool: containerized git execution is mandatory "
+                    "GitReadTool: containerized git execution is mandatory "
                     "for this operation but container mode is not active "
                     "(host backend would bypass the commit QA gate)"
                 )
@@ -474,7 +480,7 @@ class GitInfoTool(ToolBase):
         fallback_used = bool(mode.get("fallback_used", False))
         if effective == "containerized" and manager is not None:
             logger.info(
-                "GitInfoTool effective git execution mode: containerized "
+                "GitReadTool effective git execution mode: containerized "
                 "(operation=%s, workspace_id=%s)",
                 self.operation,
                 self._resolved_workspace_id or "none",
@@ -487,7 +493,7 @@ class GitInfoTool(ToolBase):
             )
         if effective == "unavailable":
             logger.error(
-                "GitInfoTool containerized git execution unavailable: %s "
+                "GitReadTool containerized git execution unavailable: %s "
                 "(operation=%s)",
                 detail,
                 self.operation,
@@ -497,21 +503,21 @@ class GitInfoTool(ToolBase):
             self._last_fallback_used = fallback_used
             if failure_reason:
                 raise RuntimeError(
-                    f"GitInfoTool: containerized git execution unavailable: "
+                    f"GitReadTool: containerized git execution unavailable: "
                     f"{detail} (failure_reason: {failure_reason})"
                 )
             raise RuntimeError(
-                f"GitInfoTool: containerized git execution unavailable: {detail}"
+                f"GitReadTool: containerized git execution unavailable: {detail}"
             )
         # host_fallback: graceful degradation to the hardened host path --
         # unless container execution is mandatory for this call.
         if not allow_host_fallback:
             raise RuntimeError(
-                "GitInfoTool: containerized git execution is mandatory for "
+                "GitReadTool: containerized git execution is mandatory for "
                 f"this operation but execution degraded to host: {detail}"
             )
         logger.warning(
-            "GitInfoTool degraded containerized git execution to hardened "
+            "GitReadTool degraded containerized git execution to hardened "
             "host git: %s (operation=%s)",
             detail,
             self.operation,
@@ -629,7 +635,7 @@ class GitInfoTool(ToolBase):
                 if not check_atomic_operation(
                     f"git:{level}",
                     effective,
-                    "GitInfoTool",
+                    "GitReadTool",
                     f"git {' '.join(args)}",
                 ):
                     raise PermissionError(
@@ -815,7 +821,7 @@ class GitInfoTool(ToolBase):
         mode, manager = self._resolve_resource_execution()
         if mode.get("mode") != "containerized" or manager is None:
             raise RuntimeError(
-                "GitInfoTool: git resource container unavailable: "
+                "GitReadTool: git resource container unavailable: "
                 f"{mode.get('detail', 'unknown reason')}"
             )
         return manager
@@ -1106,3 +1112,8 @@ class GitInfoTool(ToolBase):
             args = ["config", "--get", self.config_name]
         output = self._run_git(repo_root, args)
         return self._with_mode(self._truncate_output(output))
+
+# Backward-compatible alias: legacy code, imports and tests reference the old
+# class name; the canonical identifier is now ``GitReadTool`` with the stable
+# tool name ``git_read``.
+GitInfoTool = GitReadTool
