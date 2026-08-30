@@ -21,7 +21,7 @@ Each test maps to one architecture requirement:
    the web UI (SessionConfig -> AgentConfig -> ConfigManager.apply_config
    -> bridge.apply_config) must propagate end-to-end.
 7. ``test_operator_flags_inherited_consistently`` — operator feature flags
-   (git_allow_worktree_commits, allow_host_resources) survive
+   (session git_write permission, allow_host_resources) survive
    SessionConfig -> AgentConfig -> WorkerThread._build_agent_config.
 8. ``test_hot_swap_provider_config_restarts_and_applies`` — a provider_config
    change is not hot-swappable: the agent takes the full-restart branch,
@@ -367,7 +367,7 @@ def test_operator_flags_inherited_consistently(tmp_path):
         git_allow_worktree_commits=True,
         allow_host_resources=True,
     ).to_agent_config()
-    assert acfg.git_allow_worktree_commits is True
+    assert acfg.session_permissions.git_write == 'write'
     assert acfg.allow_host_resources is True
 
     wt = worker_module.WorkerThread(
@@ -385,7 +385,7 @@ def test_operator_flags_inherited_consistently(tmp_path):
     )
     worker_acfg = wt._build_agent_config()
     assert worker_acfg is not None
-    assert worker_acfg.git_allow_worktree_commits is True
+    assert worker_acfg.session_permissions.git_write == 'write'
     assert worker_acfg.allow_host_resources is True
 
 

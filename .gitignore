@@ -141,6 +141,7 @@ docs/container_registry_design.md
 !docs/operational_unknowns_2026_08_15.md
 !docs/resource_execution_contract.md
 !docs/git_resource_execution_audit.md
+!docs/param_ownership_map.md
 
 # Hygiene cleanup (2026-08-28): vendored pytest site-packages + pytest cache
 pytest_install/

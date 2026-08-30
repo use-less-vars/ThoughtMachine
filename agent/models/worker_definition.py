@@ -49,6 +49,14 @@ class WorkerDefinition(BaseModel):
         default=None,
         description="Maximum wall-clock time for a single worker turn."
     )
+    max_retries: Optional[int] = Field(
+        default=None,
+        description=(
+            'Per-worker retry limit for a single worker turn. '
+            'None means the value is inherited from the spawning session '
+            '(session_config.worker_max_retries, default WORKER_MAX_RETRIES).'
+        )
+    )
     max_turns: Optional[int] = Field(
         default=None,
         description="Maximum number of turns before the worker stops."

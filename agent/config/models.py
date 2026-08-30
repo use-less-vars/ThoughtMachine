@@ -63,9 +63,10 @@ class AgentConfig(BaseModel):
         'time_warning_threshold': HOT_SWAPPABLE,
         'worker_mode': HOT_SWAPPABLE,
         'max_workers_per_session': HOT_SWAPPABLE,
+        'worker_timeout_seconds': HOT_SWAPPABLE,
+        'worker_max_retries': HOT_SWAPPABLE,
         'use_workspace_lifecycle_manager': HOT_SWAPPABLE,
         'use_container_registry': HOT_SWAPPABLE,
-        'git_allow_worktree_commits': HOT_SWAPPABLE,
         'allow_host_resources': HOT_SWAPPABLE,
         'mode': RESTART_REQUIRED,
     }
@@ -88,6 +89,16 @@ class AgentConfig(BaseModel):
         default=None,
         ge=1,
         description='Maximum number of live worker threads a session may run at once (None = factory default 3)',
+    )
+    worker_timeout_seconds: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description='Per-worker query timeout in seconds (None = factory default WORKER_TIMEOUT_SECONDS)',
+    )
+    worker_max_retries: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description='Maximum number of retries for a worker query (None = factory default WORKER_MAX_RETRIES)',
     )
     stop_check: Optional[Callable[[], bool]] = Field(default=None, description='Runtime stop-check callback. Called periodically during agent execution to check if processing should be aborted. Return True to signal stop. Not serialised to/from JSON config.')
     mode: str = Field(default="agent", description='Session mode: "agent", "engineer", or "custom". Determines the default system prompt used when no explicit system prompt is provided.')
@@ -131,10 +142,6 @@ class AgentConfig(BaseModel):
     use_container_registry: bool = Field(
         default=False,
         description='Enable ContainerRegistry delegation for container lifecycle in worker queries (feature flag).',
-    )
-    git_allow_worktree_commits: bool = Field(
-        default=False,
-        description='Allow agent commits in operator-managed git worktrees on feat/* or fix/* branches (feature flag).',
     )
     allow_host_resources: bool = Field(
         default=False,
@@ -197,6 +204,30 @@ class AgentConfig(BaseModel):
             budget = values.pop('agent_soft_budget_seconds', None)
             if budget is not None and 'timeout_seconds' not in values:
                 values['timeout_seconds'] = budget
+        return values
+
+    @model_validator(mode='before')
+    def migrate_git_allow_worktree_commits(cls, values):
+        """Migrate the removed ``git_allow_worktree_commits`` flag.
+
+        The legacy operator flag is folded into the session permission
+        ``git_write``: ``True`` -> ``session_permissions['git_write'] =
+        'write'`` (the flag only ever enabled the ``write`` level).
+        ``False`` / absent -> no change (default remains fail-closed).
+        Handles ``session_permissions`` already being a
+        :class:`~thoughtmachine.security.SessionPermissions` instance by
+        round-tripping through ``to_dict()``.
+        """
+        if isinstance(values, dict):
+            legacy = values.pop('git_allow_worktree_commits', None)
+            if legacy is True:
+                sp = values.get('session_permissions')
+                if isinstance(sp, SessionPermissions):
+                    sp = sp.to_dict()
+                if not isinstance(sp, dict):
+                    sp = {}
+                sp['git_write'] = 'write'
+                values['session_permissions'] = sp
         return values
 
     @model_validator(mode='after')

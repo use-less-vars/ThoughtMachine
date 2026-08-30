@@ -50,9 +50,10 @@ class GitReadTool(ToolBase):
     Operations: status, diff, diff_cached, log, branch, branch_list, show,
     remote, blame, config. Write operations (commit, init, clone,
     branch_create, checkout, stage, unstage) live in ``GitWriteTool``
-    (tools/git_write_tool.py), which gates every write on the operator flag
-    ``agent_config['git_allow_worktree_commits']`` and the agent's ask
-    policy; this tool intentionally exposes no write surface.
+    (tools/git_write_tool.py), which gates every write on the session
+    ``git_write`` permission (``session_permissions['git_write']`` / the
+    effective ``git_write`` grain) and the agent's ask policy; this tool
+    intentionally exposes no write surface.
 
     Parameters:
         working_dir: repository root (defaults to workspace root).

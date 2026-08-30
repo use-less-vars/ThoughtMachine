@@ -173,8 +173,10 @@ def get_effective_permissions(
     Each value is either a boolean (``True`` / ``False``) for hard allow/deny,
     a string level (``"write"``, ``"read"``, ``"none"``, ``"banned"``, ``"ask"``, ``"outbound"``),
     or ``False`` if the workspace forbids the operation.  ``git_read`` /
-    ``git_write`` are derived from the merged ``git`` value via
-    :func:`split_git_permission` (kept for backward compatibility).
+    ``git_write`` are taken from the session's explicit grains when set
+    (merged with ``workspace.git_available`` via ``_min_permission``), and
+    otherwise derived from the merged ``git`` value via
+    :func:`split_git_permission` (backward compatibility).
     """
     # ── Filesystem ──────────────────────────────────────────────────────
     # Workspace filesystem_write caps write access; if False, downgrade to read.
@@ -190,8 +192,19 @@ def get_effective_permissions(
     container: Any = session.container and workspace.allow_docker
 
     # ── Git ─────────────────────────────────────────────────────────────
+    # Explicit session grains (git_read/git_write) take precedence over the
+    # single ``git`` level; each grain is still capped by the workspace
+    # capability.  When a grain is None it falls back to split_git_permission
+    # so legacy ``git``-only configs keep their exact historical behaviour.
     git: Any = _min_permission(session.git, workspace.git_available)
-    git_read, git_write = split_git_permission(git)
+    if session.git_read is not None:
+        git_read: Any = _min_permission(session.git_read, workspace.git_available)
+    else:
+        git_read = split_git_permission(git)[0]
+    if session.git_write is not None:
+        git_write: Any = _min_permission(session.git_write, workspace.git_available)
+    else:
+        git_write = split_git_permission(git)[1]
 
     # ── System ──────────────────────────────────────────────────────────
     system: Any = session.system  # no workspace cap yet

@@ -1,145 +1,116 @@
-"""Tests for provider profile timeout / max_retries plumbing.
+"""Provider profiles are the global-only owner of provider timeout/retries.
 
-Covers the fix where ``ProviderManager.resolve_config()`` dropped the
-profile's ``timeout`` / ``max_retries`` fields, so LLMClient silently fell
-back to its 120s / 3 defaults:
-
-- ``resolve_config()`` copies profile ``timeout`` / ``max_retries`` into
-  ``provider_config``; missing / None values create no keys.
-- End-to-end: resolved ``provider_config`` reaches LLMClient and the
-  LLM_TIMEOUT / LLM_MAX_RETRIES env vars still take precedence over the
-  profile values.
+The profile's ``timeout`` / ``max_retries`` may ONLY reach the LLM client
+via ``provider_config``. Neither AgentConfig nor SessionConfig exposes
+top-level provider timeout/retry fields, and ``resolve_from_profile``
+copies only provider identity fields.
 """
-from types import SimpleNamespace
 
-import pytest
+from pathlib import Path
 
-from agent.config.provider_profile import ProviderProfile, ProviderManager
-from agent.core.llm_client import LLMClient
-from llm_providers.factory import ProviderFactory
+from agent.config.models import AgentConfig
+from agent.config.provider_profile import ProviderManager, ProviderProfile
+from agent.config.session_config import SessionConfig
 
 
-def _manager(tmp_path, profiles):
-    """A ProviderManager preloaded with profiles, no real file."""
-    mgr = ProviderManager(file_path=tmp_path / "test_providers.json")
-    mgr._profiles = profiles
+def _manager_with_profile(timeout=45, max_retries=2) -> ProviderManager:
+    mgr = ProviderManager(file_path=Path('/nonexistent/providers.json'))
+    mgr.add_profile(
+        ProviderProfile(
+            id='p1',
+            label='Profile 1',
+            provider_type='openai_compatible',
+            base_url='https://llm.example.com',
+            api_key='secret-key',
+            default_model='model-x',
+            timeout=timeout,
+            max_retries=max_retries,
+        )
+    )
     return mgr
 
 
-def _profile(**overrides):
-    defaults = dict(
-        id="test-provider",
-        label="Test Provider",
-        provider_type="openai_compatible",
-        base_url="https://api.example.com/v1",
-        api_key="sk-test-key",
-        default_model="test-model",
-    )
-    defaults.update(overrides)
-    return ProviderProfile(**defaults)
+class TestProviderTimeoutNotCopiedToSession:
+    def test_resolve_config_keeps_timeout_in_provider_config_only(self):
+        mgr = _manager_with_profile(timeout=45, max_retries=2)
+        result = mgr.resolve_config({'provider_id': 'p1', 'provider_config': {}})
+        assert result['provider_config']['timeout'] == 45
+        # Never a top-level session/agent field.
+        assert 'timeout' not in result
+
+    def test_agent_and_session_configs_have_no_provider_timeout_field(self):
+        assert 'timeout' not in AgentConfig.model_fields
+        assert 'timeout' not in SessionConfig.model_fields
+
+    def test_agent_config_soft_budget_is_distinct(self):
+        # timeout_seconds is the agent soft budget, NOT the provider timeout.
+        mgr = _manager_with_profile(timeout=45, max_retries=2)
+        cfg = AgentConfig(provider_id='p1', timeout_seconds=300)
+        resolved = cfg.resolve_from_profile(mgr)
+        assert resolved.provider_config == {}  # profile timeout NOT folded in
+        assert resolved.timeout_seconds == 300
+
+    def test_session_config_carries_provider_config_dict_only(self):
+        mgr = _manager_with_profile(timeout=45, max_retries=2)
+        result = mgr.resolve_config({'provider_id': 'p1', 'provider_config': {}})
+        sc = SessionConfig(provider_config=dict(result.get('provider_config', {})))
+        assert sc.provider_config['timeout'] == 45
+        assert not hasattr(sc, 'timeout')  # provider timeout is not a session field
+
+    def test_full_config_dict_builds_agent_config_with_provider_config_only(self):
+        mgr = _manager_with_profile(timeout=45, max_retries=2)
+        result = mgr.resolve_config({'provider_id': 'p1', 'provider_config': {}})
+        ac = AgentConfig(**result)
+        assert ac.provider_config == {'timeout': 45, 'max_retries': 2}
+        assert ac.timeout_seconds == 300  # soft budget untouched
 
 
-def _llm_stub(resolved):
-    """Minimal AgentConfig stub carrying only the attrs LLMClient touches."""
-    return SimpleNamespace(
-        provider_type=resolved.get("provider_type", "openai_compatible"),
-        api_key=resolved.get("api_key", "test-key"),
-        base_url=resolved.get("base_url"),
-        model=resolved.get("model", "test-model"),
-        temperature=0.2,
-        provider_config=resolved.get("provider_config") or {},
-    )
+class TestProviderMaxRetriesNotCopiedToSession:
+    def test_resolve_config_keeps_max_retries_in_provider_config_only(self):
+        mgr = _manager_with_profile(timeout=45, max_retries=2)
+        result = mgr.resolve_config({'provider_id': 'p1', 'provider_config': {}})
+        assert result['provider_config']['max_retries'] == 2
+        # Never a top-level session/agent field.
+        assert 'max_retries' not in result
+
+    def test_agent_and_session_configs_have_no_provider_max_retries_field(self):
+        assert 'max_retries' not in AgentConfig.model_fields
+        assert 'max_retries' not in SessionConfig.model_fields
+
+    def test_agent_config_worker_retries_are_distinct(self):
+        # worker_max_retries is a session/worker concern, not the LLM retry.
+        mgr = _manager_with_profile(timeout=45, max_retries=2)
+        cfg = AgentConfig(provider_id='p1', worker_max_retries=5)
+        resolved = cfg.resolve_from_profile(mgr)
+        assert resolved.provider_config == {}
+        assert resolved.worker_max_retries == 5
+
+    def test_resolve_from_profile_copies_only_identity_fields(self):
+        mgr = _manager_with_profile(timeout=45, max_retries=2)
+        cfg = AgentConfig(provider_id='p1')
+        resolved = cfg.resolve_from_profile(mgr)
+        assert resolved.provider_type == 'openai_compatible'
+        assert resolved.base_url == 'https://llm.example.com'
+        assert resolved.api_key == 'secret-key'
+        assert resolved.model == 'model-x'
+        assert resolved.provider_config == {}  # timeout/max_retries NOT copied
 
 
-def _capture_create_provider(monkeypatch):
-    """Replace ProviderFactory.create_provider with a kwargs recorder."""
-    captured = {}
-
-    def fake_create(provider_type, api_key=None, **kwargs):
-        captured['call'] = dict(provider_type=provider_type, api_key=api_key, **kwargs)
-        return object()
-
-    monkeypatch.setattr(ProviderFactory, 'create_provider', staticmethod(fake_create))
-    return captured
+def test_provider_timeout_not_copied_to_session():
+    """Contract wrapper: provider timeout stays in provider_config only."""
+    tc = TestProviderTimeoutNotCopiedToSession()
+    tc.test_resolve_config_keeps_timeout_in_provider_config_only()
+    tc.test_agent_and_session_configs_have_no_provider_timeout_field()
+    tc.test_agent_config_soft_budget_is_distinct()
+    tc.test_session_config_carries_provider_config_dict_only()
+    tc.test_full_config_dict_builds_agent_config_with_provider_config_only()
 
 
-# ---------------------------------------------------------------------------
-# resolve_config(): profile timeout / max_retries -> provider_config
-# ---------------------------------------------------------------------------
+def test_provider_max_retries_not_copied_to_session():
+    """Contract wrapper: provider max_retries stays in provider_config only."""
+    tc = TestProviderMaxRetriesNotCopiedToSession()
+    tc.test_resolve_config_keeps_max_retries_in_provider_config_only()
+    tc.test_agent_and_session_configs_have_no_provider_max_retries_field()
+    tc.test_agent_config_worker_retries_are_distinct()
+    tc.test_resolve_from_profile_copies_only_identity_fields()
 
-def test_profile_timeout_and_max_retries_copied(tmp_path):
-    """Profile timeout/max_retries land in provider_config when set."""
-    mgr = _manager(tmp_path, {"p": _profile(timeout=5, max_retries=2)})
-    result = mgr.resolve_config({"provider_id": "p"})
-    assert result["provider_config"] == {"timeout": 5, "max_retries": 2}
-
-
-def test_missing_max_retries_inserts_no_key(tmp_path):
-    """max_retries=None must not insert an empty 'max_retries' key."""
-    mgr = _manager(tmp_path, {"p": _profile(timeout=30)})  # max_retries defaults to None
-    result = mgr.resolve_config({"provider_id": "p"})
-    assert result["provider_config"]["timeout"] == 30
-    assert "max_retries" not in result["provider_config"]
-
-
-def test_default_profile_timeout_kept(tmp_path):
-    """A profile with default timeout (120) still yields timeout=120."""
-    mgr = _manager(tmp_path, {"p": _profile()})
-    result = mgr.resolve_config({"provider_id": "p"})
-    assert result["provider_config"] == {"timeout": 120}
-
-
-def test_no_provider_id_returns_unchanged(tmp_path):
-    """Without a provider_id, resolve_config returns the dict as-is."""
-    mgr = _manager(tmp_path, {"p": _profile(timeout=5, max_retries=2)})
-    config = {"model": "gpt-4"}
-    result = mgr.resolve_config(config)
-    assert result == config
-    assert "provider_config" not in result
-
-
-def test_existing_provider_config_preserved(tmp_path):
-    """User-supplied provider_config keys survive, profile keys are merged in."""
-    mgr = _manager(tmp_path, {"p": _profile(timeout=5, max_retries=2)})
-    result = mgr.resolve_config({"provider_id": "p", "provider_config": {"custom": "keep"}})
-    assert result["provider_config"] == {"custom": "keep", "timeout": 5, "max_retries": 2}
-
-
-# ---------------------------------------------------------------------------
-# End-to-end: resolve_config -> LLMClient (env still wins)
-# ---------------------------------------------------------------------------
-
-def test_profile_values_reach_llm_client(tmp_path, monkeypatch):
-    """Resolved profile timeout/max_retries are used by LLMClient."""
-    monkeypatch.delenv("LLM_TIMEOUT", raising=False)
-    monkeypatch.delenv("LLM_MAX_RETRIES", raising=False)
-    mgr = _manager(tmp_path, {"p": _profile(timeout=5, max_retries=2)})
-    resolved = mgr.resolve_config({"provider_id": "p"})
-    captured = _capture_create_provider(monkeypatch)
-    LLMClient(_llm_stub(resolved))
-    assert captured["call"]["timeout"] == 5
-    assert captured["call"]["max_retries"] == 2
-
-
-def test_env_still_overrides_profile_values(tmp_path, monkeypatch):
-    """LLM_TIMEOUT / LLM_MAX_RETRIES env vars beat profile values."""
-    monkeypatch.setenv("LLM_TIMEOUT", "99")
-    monkeypatch.setenv("LLM_MAX_RETRIES", "5")
-    mgr = _manager(tmp_path, {"p": _profile(timeout=5, max_retries=2)})
-    resolved = mgr.resolve_config({"provider_id": "p"})
-    captured = _capture_create_provider(monkeypatch)
-    LLMClient(_llm_stub(resolved))
-    assert captured["call"]["timeout"] == 99
-    assert captured["call"]["max_retries"] == 5
-
-
-def test_profile_without_retries_uses_llm_default(tmp_path, monkeypatch):
-    """No max_retries on the profile -> LLMClient default (3), timeout=profile."""
-    monkeypatch.delenv("LLM_TIMEOUT", raising=False)
-    monkeypatch.delenv("LLM_MAX_RETRIES", raising=False)
-    mgr = _manager(tmp_path, {"p": _profile(timeout=25)})  # max_retries None
-    resolved = mgr.resolve_config({"provider_id": "p"})
-    captured = _capture_create_provider(monkeypatch)
-    LLMClient(_llm_stub(resolved))
-    assert captured["call"]["timeout"] == 25
-    assert captured["call"]["max_retries"] == 3

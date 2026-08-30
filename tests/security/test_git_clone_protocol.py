@@ -94,7 +94,7 @@ class TestExecuteSurfacesProtocolErrorBeforeSubprocess:
             operation="clone",
             clone_url=clone_url,
             effective_permissions={"network": "write"},
-            agent_config={"git_allow_worktree_commits": True},
+            agent_config={"session_permissions": {"git_write": "write"}},
         )
         result = tool.execute()
         assert isinstance(result, str)
@@ -106,7 +106,7 @@ class TestExecuteSurfacesProtocolErrorBeforeSubprocess:
             operation="clone",
             clone_url='ext::sh -c "echo pwned"',
             effective_permissions={"network": "banned"},
-            agent_config={"git_allow_worktree_commits": True},
+            agent_config={"session_permissions": {"git_write": "write"}},
         )
         result = tool.execute()
         assert isinstance(result, str)

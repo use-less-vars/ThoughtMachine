@@ -45,6 +45,19 @@
       "description": "Maximum wall-clock time for a single worker turn.",
       "title": "Timeout Seconds"
     },
+    "max_retries": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Per-worker retry limit for a single worker turn. None means the value is inherited from the spawning session (session_config.worker_max_retries, default WORKER_MAX_RETRIES).",
+      "title": "Max Retries"
+    },
     "max_turns": {
       "anyOf": [
         {

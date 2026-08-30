@@ -20,9 +20,10 @@ class GitWriteTool(GitReadTool):
     """
     Git write operations tool (commit, init, clone, branch_create, checkout,
     stage, unstage).
-    Every write is gated (fail closed) on the operator flag
-    ``agent_config['git_allow_worktree_commits']`` being exactly True, and on
-    the agent's ask policy enforced by the ToolExecutor / security gate. The
+    Every write is gated (fail closed) on the session git_write permission
+    (``session_permissions['git_write']`` / effective ``git_write`` grain)
+    being ``write`` (or the outer ask gate having run), and on the agent's
+    ask policy enforced by the ToolExecutor / security gate. The
     read surface (status, diff, diff_cached, log, branch, branch_list, show,
     remote, blame, config) lives in ``GitReadTool`` (tools/git_info_tool.py);
     this subclass inherits the hardened execution backends, path validation,
@@ -77,8 +78,30 @@ class GitWriteTool(GitReadTool):
     )
 
     def _flag_gate_error(self) -> str:
-        """Return the operator-flag denial message (fail-closed gate)."""
-        return "Error: git:write requires the operator flag"
+        """Return the git_write permission denial message (fail-closed gate)."""
+        return 'Error: git:write denied: session git_write permission is not "write"'
+
+    def _git_write_allowed(self) -> bool:
+        """Fail-closed check that this write call may proceed.
+
+        True when any of the following hold:
+        - effective permissions carry ``git_write`` of ``write`` or ``full``;
+        - effective permissions carry ``git_write`` of ``ask`` (the outer
+          ToolExecutor gate already prompted and approved this call);
+        - the session_permissions dict explicitly sets ``git_write`` to
+          ``write`` or ``full`` (direct-call defense-in-depth).
+        """
+        effective = self.effective_permissions or {}
+        if effective:
+            gw = effective.get("git_write")
+            if gw in ("write", "full"):
+                return True
+            if gw == "ask":
+                return True
+        sp = (getattr(self, "agent_config", None) or {}).get("session_permissions") or {}
+        if isinstance(sp, dict) and sp.get("git_write") in ("write", "full"):
+            return True
+        return False
 
     def execute(self) -> str:
         # Reset per-call runtime state (tool instances may be reused).
@@ -89,12 +112,11 @@ class GitWriteTool(GitReadTool):
         self._last_failure_reason = None
         self._last_fallback_used = False
 
-        # Operator flag gate (fail closed): every write requires the explicit
-        # operator flag ``agent_config['git_allow_worktree_commits']`` to be
-        # exactly True. Also enforced at the top of each _git_* write method
-        # as defense-in-depth for direct callers.
-        config = getattr(self, "agent_config", None) or {}
-        if config.get("git_allow_worktree_commits") is not True:
+        # git_write permission gate (fail closed): every write requires the
+        # session git_write permission (effective or session_permissions).
+        # Also enforced at the top of each _git_* write method as
+        # defense-in-depth for direct callers.
+        if not self._git_write_allowed():
             return self._flag_gate_error()
 
         # Atomic permission re-check for network operations. An 'ask' level
@@ -235,7 +257,7 @@ class GitWriteTool(GitReadTool):
         """Narrow allow for agent commits in operator-managed worktrees.
         An agent commit is permitted in an operator-managed worktree only
         when ALL of the following hold:
-        1. ``agent_config['git_allow_worktree_commits']`` is exactly True.
+        1. The session git_write permission is ``write`` (``_git_write_allowed()``).
         2. Container git execution is active (``_use_container_mode()``).
         3. Container execution is mandatory for the branch check too: no
            host fallback may resolve the branch, because the host backend
@@ -247,8 +269,7 @@ class GitWriteTool(GitReadTool):
         Any violation returns False so the caller keeps the existing
         operator-managed-worktree block.
         """
-        config = getattr(self, "agent_config", None) or {}
-        if config.get("git_allow_worktree_commits") is not True:
+        if not self._git_write_allowed():
             return False
         if not self._use_container_mode():
             return False
@@ -359,10 +380,9 @@ class GitWriteTool(GitReadTool):
 
     def _git_branch_create(self, repo_root: Path) -> str:
         """Create a new branch (git branch <name>)."""
-        # Operator flag gate (fail closed): direct callers must also pass the
-        # exact-True operator flag check.
-        config = getattr(self, "agent_config", None) or {}
-        if config.get("git_allow_worktree_commits") is not True:
+        # git_write permission gate (fail closed): direct callers must also
+        # pass the session git_write permission check.
+        if not self._git_write_allowed():
             return self._flag_gate_error()
         if not self.branch:
             return "Error: branch is required for branch_create operation"
@@ -375,10 +395,9 @@ class GitWriteTool(GitReadTool):
 
     def _git_checkout(self, repo_root: Path) -> str:
         """Check out an existing branch (git checkout <name>)."""
-        # Operator flag gate (fail closed): direct callers must also pass the
-        # exact-True operator flag check.
-        config = getattr(self, "agent_config", None) or {}
-        if config.get("git_allow_worktree_commits") is not True:
+        # git_write permission gate (fail closed): direct callers must also
+        # pass the session git_write permission check.
+        if not self._git_write_allowed():
             return self._flag_gate_error()
         if not self.branch:
             return "Error: branch is required for checkout operation"
@@ -394,10 +413,9 @@ class GitWriteTool(GitReadTool):
 
     def _git_stage(self, repo_root: Path) -> str:
         """Stage file path(s) (git add -- <paths>)."""
-        # Operator flag gate (fail closed): direct callers must also pass the
-        # exact-True operator flag check.
-        config = getattr(self, "agent_config", None) or {}
-        if config.get("git_allow_worktree_commits") is not True:
+        # git_write permission gate (fail closed): direct callers must also
+        # pass the session git_write permission check.
+        if not self._git_write_allowed():
             return self._flag_gate_error()
         if not self.file_path:
             return "Error: file_path is required for stage operation (at least one path)"
@@ -412,10 +430,9 @@ class GitWriteTool(GitReadTool):
 
     def _git_unstage(self, repo_root: Path) -> str:
         """Unstage file path(s) (git reset HEAD -- <paths>)."""
-        # Operator flag gate (fail closed): direct callers must also pass the
-        # exact-True operator flag check.
-        config = getattr(self, "agent_config", None) or {}
-        if config.get("git_allow_worktree_commits") is not True:
+        # git_write permission gate (fail closed): direct callers must also
+        # pass the session git_write permission check.
+        if not self._git_write_allowed():
             return self._flag_gate_error()
         if not self.file_path:
             return "Error: file_path is required for unstage operation (at least one path)"
@@ -493,10 +510,9 @@ class GitWriteTool(GitReadTool):
         --no-verify). No vault-backed hooks are consulted. No agent-visible
         flags are added here.
         """
-        # Operator flag gate (fail closed): direct callers must also pass the
-        # exact-True operator flag check.
-        config = getattr(self, "agent_config", None) or {}
-        if config.get("git_allow_worktree_commits") is not True:
+        # git_write permission gate (fail closed): direct callers must also
+        # pass the session git_write permission check.
+        if not self._git_write_allowed():
             return self._flag_gate_error()
         # Operator-managed worktrees (a .git FILE pointing at a gitdir) are
         # committed host-side by the operator; block in-workspace commits
@@ -562,10 +578,9 @@ class GitWriteTool(GitReadTool):
 
     def _git_init(self, repo_root: Path) -> str:
         """Initialize a new git repository in the target directory."""
-        # Operator flag gate (fail closed): direct callers must also pass the
-        # exact-True operator flag check.
-        config = getattr(self, "agent_config", None) or {}
-        if config.get("git_allow_worktree_commits") is not True:
+        # git_write permission gate (fail closed): direct callers must also
+        # pass the session git_write permission check.
+        if not self._git_write_allowed():
             return self._flag_gate_error()
         # Ensure the directory exists
         repo_root.mkdir(parents=True, exist_ok=True)
@@ -575,10 +590,9 @@ class GitWriteTool(GitReadTool):
 
     def _git_clone(self, repo_root: Path) -> str:
         """Clone a remote git repository into the workspace."""
-        # Operator flag gate (fail closed): direct callers must also pass the
-        # exact-True operator flag check.
-        config = getattr(self, "agent_config", None) or {}
-        if config.get("git_allow_worktree_commits") is not True:
+        # git_write permission gate (fail closed): direct callers must also
+        # pass the session git_write permission check.
+        if not self._git_write_allowed():
             return self._flag_gate_error()
         if not self.clone_url:
             return "Error: clone_url is required for clone operation"

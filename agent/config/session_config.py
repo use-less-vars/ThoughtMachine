@@ -11,7 +11,7 @@ The ``to_agent_config()`` method injects it back when constructing the full
 """
 
 from __future__ import annotations
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal
 from pydantic import BaseModel, Field, model_validator, ConfigDict
 
 
@@ -67,6 +67,20 @@ class SessionConfig(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode='before')
+    def migrate_git_allow_worktree_commits(cls, values):
+        """Migrate the removed ``git_allow_worktree_commits`` session flag.
+
+        ``extra='forbid'`` would otherwise reject the legacy key. ``True``
+        folds into ``git_write='write'``; ``False`` / absent is dropped
+        (fail-closed default).
+        """
+        if isinstance(values, dict):
+            legacy = values.pop('git_allow_worktree_commits', None)
+            if legacy is True:
+                values['git_write'] = 'write'
+        return values
 
     # ── Fields ──────────────────────────────────────────────────────────
 
@@ -151,9 +165,24 @@ class SessionConfig(BaseModel):
         default=False,
         description='Enable the ContainerRegistry delegation for container lifecycle in this session (feature flag).',
     )
-    git_allow_worktree_commits: bool = Field(
-        default=False,
-        description='Allow agent commits in operator-managed git worktrees on feat/* or fix/* branches (feature flag).',
+    git_read: Optional[Literal['banned', 'ask', 'read', 'write']] = Field(
+        default=None,
+        description='Session-level git read grain override (None = derived from the git permission).',
+    )
+    git_write: Optional[Literal['banned', 'ask', 'read', 'write']] = Field(
+        default=None,
+        description='Session-level git write grain override (None = derived from the git permission). '
+                    'git_write="write" replaces the removed git_allow_worktree_commits flag.',
+    )
+    worker_timeout_seconds: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description='Per-worker query timeout in seconds for sessions spawned from this session (None = factory default 600).',
+    )
+    worker_max_retries: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description='Per-worker retry limit for sessions spawned from this session (None = factory default 3).',
     )
     allow_host_resources: bool = Field(
         default=False,
@@ -271,17 +300,28 @@ class SessionConfig(BaseModel):
             kwargs['workspace_path'] = workspace_path
 
         if self.session_permissions is not None:
-            kwargs['session_permissions'] = dict(self.session_permissions)
+            sp_copy = dict(self.session_permissions)
+        else:
+            sp_copy = {}
+        if self.git_read is not None:
+            sp_copy['git_read'] = self.git_read
+        if self.git_write is not None:
+            sp_copy['git_write'] = self.git_write
+        if sp_copy:
+            kwargs['session_permissions'] = sp_copy
 
         if self.provider_config:
             kwargs['provider_config'] = dict(self.provider_config)
 
         kwargs['use_workspace_lifecycle_manager'] = bool(self.use_workspace_lifecycle_manager)
         kwargs['use_container_registry'] = bool(self.use_container_registry)
-        kwargs['git_allow_worktree_commits'] = bool(self.git_allow_worktree_commits)
         kwargs['allow_host_resources'] = bool(self.allow_host_resources)
         if self.max_workers_per_session is not None:
             kwargs['max_workers_per_session'] = self.max_workers_per_session
+        if self.worker_timeout_seconds is not None:
+            kwargs['worker_timeout_seconds'] = self.worker_timeout_seconds
+        if self.worker_max_retries is not None:
+            kwargs['worker_max_retries'] = self.worker_max_retries
 
         if self.timeout_seconds is not None:
             kwargs['timeout_seconds'] = self.timeout_seconds

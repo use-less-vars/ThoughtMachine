@@ -50,6 +50,8 @@ from agent.config.defaults import (
     WORKER_DEFAULT_MAX_CONTAINERS,
     DEFAULT_WORKER_SYSTEM_PROMPT,
     WORKER_DEFAULT_TEMPERATURE,
+    WORKER_TIMEOUT_SECONDS,
+    WORKER_MAX_RETRIES,
 )
 
 # Module constants that live in worker.py's import section; duplicated here so
@@ -838,25 +840,49 @@ class WorkerThread(threading.Thread):
         # Project root from the session (resolved from workspace config)
         self._project_root: Optional[str] = project_root
 
-        # Override timeout (from spawn parameter, else from definition, else 600)
-        # NOTE: definition.get("timeout_seconds", 600) would return None if the
-        # key exists with a null value, so we use "or 600" to catch that case.
+        # Session-scoped configuration (the nested
+        # ``agent_config["session_config"]`` dict) is read once here so the
+        # timeout, retry and resource-budget chains below all share it.
+        _session_cfg = (agent_config or {}).get("session_config") or {}
+        if not isinstance(_session_cfg, dict):
+            _session_cfg = {}
+
+        # Override timeout (SESSION-owned chain; see docs/param_ownership_map.md):
+        # explicit constructor param > worker definition ("timeout_seconds") >
+        # agent_config ("worker_timeout_seconds") > session_config
+        # ("worker_timeout_seconds") > WORKER_TIMEOUT_SECONDS module default.
+        # NOTE: definition.get("timeout_seconds", WORKER_TIMEOUT_SECONDS) would
+        # return None if the key exists with a null value, so each hop checks
+        # for None explicitly.
         _def_timeout = definition.get("timeout_seconds")
         if _def_timeout is None:
-            _def_timeout = 600
+            _def_timeout = (agent_config or {}).get("worker_timeout_seconds")
+        if _def_timeout is None:
+            _def_timeout = _session_cfg.get("worker_timeout_seconds")
+        if _def_timeout is None:
+            _def_timeout = WORKER_TIMEOUT_SECONDS
         self._timeout_seconds: int = (
             timeout_seconds
             if timeout_seconds is not None
             else _def_timeout
         )
 
+        # Worker query retry budget (SESSION-owned chain): worker definition
+        # ("max_retries") > agent_config ("worker_max_retries") >
+        # session_config ("worker_max_retries") > WORKER_MAX_RETRIES default.
+        _retries = definition.get("max_retries")
+        if _retries is None:
+            _retries = (agent_config or {}).get("worker_max_retries")
+        if _retries is None:
+            _retries = _session_cfg.get("worker_max_retries")
+        if _retries is None:
+            _retries = WORKER_MAX_RETRIES
+        self._worker_max_retries: int = _retries
+
         # Per-worker resource budgets (Phase 3, item 6).  Resolution order:
         # explicit constructor param → session_config (the nested
         # ``agent_config["session_config"]`` dict) → module defaults
         # (containers=4, tokens/runtime=unlimited).
-        _session_cfg = (agent_config or {}).get("session_config") or {}
-        if not isinstance(_session_cfg, dict):
-            _session_cfg = {}
 
         self._max_container_count: int = WORKER_DEFAULT_MAX_CONTAINERS
         if max_container_count is not None:
@@ -1583,7 +1609,11 @@ class WorkerThread(threading.Thread):
         worker_cfg["timeout_seconds"] = self._timeout_seconds
         # Warn at 80% of timeout (minimum 5s) so CRITICAL triggers before
         # the hard cutoff when using the worker tool's timeout window.
-        _timeout_for_warning = self._timeout_seconds if self._timeout_seconds is not None else 600
+        _timeout_for_warning = (
+            self._timeout_seconds
+            if self._timeout_seconds is not None
+            else WORKER_TIMEOUT_SECONDS
+        )
         worker_cfg["time_warning_threshold"] = max(
             5, int(_timeout_for_warning * 0.8)
         )
@@ -3986,11 +4016,13 @@ class Worker(ToolBase):
             except (FileNotFoundError, json.JSONDecodeError, OSError):
                 project_root = None
 
-        # Compute effective timeout: spawn override > definition > 600
+        # Compute effective timeout: explicit tool override, otherwise None so
+        # WorkerThread.__init__ applies its SESSION-owned resolution chain
+        # (definition > agent_config > session_config > WORKER_TIMEOUT_SECONDS).
         effective_timeout = (
             self.timeout_seconds
             if self.timeout_seconds is not None
-            else definition.get("timeout_seconds", 600)
+            else definition.get("timeout_seconds")
         )
 
         # Build a ContainerManager bound to this session/workspace so the
@@ -4276,10 +4308,10 @@ class Worker(ToolBase):
         # The thread may be a test double (or otherwise lack a numeric
         # ``_timeout_seconds``); fall back to the module default so the join
         # budget stays a bounded number.
-        _timeout_seconds = getattr(thread, "_timeout_seconds", 600)
+        _timeout_seconds = getattr(thread, "_timeout_seconds", WORKER_TIMEOUT_SECONDS)
         if not isinstance(_timeout_seconds, (int, float)):
-            _timeout_seconds = 600
-        _join_budget = max(30, int(_timeout_seconds or 600))
+            _timeout_seconds = WORKER_TIMEOUT_SECONDS
+        _join_budget = max(30, int(_timeout_seconds or WORKER_TIMEOUT_SECONDS))
         _join_elapsed = 0.0
         _join_step = 2.0
         while _join_elapsed < _join_budget:

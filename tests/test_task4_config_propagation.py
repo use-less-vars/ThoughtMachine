@@ -151,14 +151,14 @@ class TestOperatorFlagPropagation:
             use_workspace_lifecycle_manager=True,
             use_container_registry=True,
         ).to_agent_config()
-        assert acfg.git_allow_worktree_commits is True
+        assert acfg.session_permissions.git_write == 'write'
         assert acfg.allow_host_resources is True
         assert acfg.use_workspace_lifecycle_manager is True
         assert acfg.use_container_registry is True
 
     def test_flags_default_to_false(self):
         acfg = SessionConfig().to_agent_config()
-        assert acfg.git_allow_worktree_commits is False
+        assert acfg.session_permissions.git_write is None
         assert acfg.allow_host_resources is False
 
 
@@ -205,7 +205,7 @@ class TestToolExecutorFlagInjection:
         )
         assert result['result'] == "OK"
         injected = captured['agent_config']
-        assert injected['git_allow_worktree_commits'] is True
+        assert 'git_allow_worktree_commits' not in injected
         assert injected['allow_host_resources'] is True
         assert injected['use_workspace_lifecycle_manager'] is True
         assert injected['use_container_registry'] is True
@@ -231,7 +231,7 @@ class TestWorkerFlagForwarding:
         )
         acfg = wt._build_agent_config()
         assert acfg is not None
-        assert acfg.git_allow_worktree_commits is True
+        assert acfg.session_permissions.git_write == 'write'
         assert acfg.allow_host_resources is True
 
 
@@ -248,12 +248,17 @@ class TestGitWriteToolFlagGate:
             Path("/tmp")) is False
 
     def test_blocked_when_flag_not_exactly_true(self):
-        for bad_value in (1, "true", "True", None):
-            tool = self._tool(agent_config={"git_allow_worktree_commits": bad_value})
-            assert tool._unprotected_branch_agent_commit_allowed(Path("/tmp")) is False, bad_value
+        # Any session git_write value other than 'write'/'full' must fail
+        # closed (effective_permissions is None on the direct-call path, so
+        # even 'ask' resolves to False here).
+        for bad_value in ("read", "ask", "banned", None):
+            tool = self._tool(agent_config={
+                "session_permissions": {"git_write": bad_value}})
+            assert tool._unprotected_branch_agent_commit_allowed(
+                Path("/tmp")) is False, bad_value
 
     def test_true_flag_proceeds_past_gate(self, monkeypatch):
-        tool = self._tool(agent_config={"git_allow_worktree_commits": True})
+        tool = self._tool(agent_config={"session_permissions": {"git_write": "write"}})
         # Exactly True passes the operator gate; the container-mode gate then
         # decides. Patch it to False so the method returns False without
         # needing a real git repo — proving the exact-True check passed.
@@ -263,7 +268,7 @@ class TestGitWriteToolFlagGate:
     def test_protected_branch_names_denied(self, monkeypatch):
         """dev/master/main are protected: commits stay host-side."""
         for branch in ("dev", "master", "main"):
-            tool = self._tool(agent_config={"git_allow_worktree_commits": True})
+            tool = self._tool(agent_config={"session_permissions": {"git_write": "write"}})
             monkeypatch.setattr(tool, "_use_container_mode", lambda: True)
             monkeypatch.setattr(
                 tool, "_run_git",
@@ -274,7 +279,7 @@ class TestGitWriteToolFlagGate:
 
     def test_unprotected_branch_allowed(self, monkeypatch):
         """feat/fix/refactor branches may be committed agent-side."""
-        tool = self._tool(agent_config={"git_allow_worktree_commits": True})
+        tool = self._tool(agent_config={"session_permissions": {"git_write": "write"}})
         monkeypatch.setattr(tool, "_use_container_mode", lambda: True)
         monkeypatch.setattr(
             tool, "_run_git",
@@ -284,7 +289,7 @@ class TestGitWriteToolFlagGate:
 
     def test_empty_branch_output_fails_closed(self, monkeypatch):
         """Blank branch resolution must deny, never allow."""
-        tool = self._tool(agent_config={"git_allow_worktree_commits": True})
+        tool = self._tool(agent_config={"session_permissions": {"git_write": "write"}})
         monkeypatch.setattr(tool, "_use_container_mode", lambda: True)
         monkeypatch.setattr(
             tool, "_run_git",
@@ -294,7 +299,7 @@ class TestGitWriteToolFlagGate:
 
     def test_branch_check_runtime_error_fails_closed(self, monkeypatch):
         """Container-mandatory branch resolution failure must deny."""
-        tool = self._tool(agent_config={"git_allow_worktree_commits": True})
+        tool = self._tool(agent_config={"session_permissions": {"git_write": "write"}})
         monkeypatch.setattr(tool, "_use_container_mode", lambda: True)
 
         def _boom(*args, **kwargs):

@@ -86,7 +86,7 @@ def _commit_tool(workspace, repo, message="test commit", file_path="hello.txt"):
         file_path=file_path,
         working_dir=str(repo),
         workspace_path=str(workspace),
-        agent_config={"git_allow_worktree_commits": True},
+        agent_config={"session_permissions": {"git_write": "write"}},
     )
 
 
@@ -238,7 +238,7 @@ def _vault_commit_tool(workspace, repo, ws_id, message="vault hook commit", file
         workspace_path=str(workspace),
         workspace_id=ws_id,
         session_permissions=dict(FULL_PERMISSIONS),
-        agent_config={"git_allow_worktree_commits": True},
+        agent_config={"session_permissions": {"git_write": "write"}},
     )
 
 
@@ -366,7 +366,7 @@ def test_commit_denied_without_git_write_permission(hardened_repo):
             "system": "read",
             "execution": "banned",
         },
-        agent_config={"git_allow_worktree_commits": True},
+        agent_config={"session_permissions": {"git_write": "write"}},
     )
     with pytest.raises(PermissionError):
         tool.execute()
