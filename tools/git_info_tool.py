@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 from .base import ToolBase
 from security.sandboxed_execution import SandboxedExecution
+from agent.config.defaults import ALLOWED_GIT_PROTOCOLS
 
 
 logger = logging.getLogger(__name__)
