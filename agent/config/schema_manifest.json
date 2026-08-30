@@ -310,6 +310,12 @@
       "pattern": true,
       "root_type": "dict",
       "fields": {
+        "allow_host_resources": {
+          "type": "bool",
+          "required": false,
+          "default": false,
+          "description": "Allow supervised host-shell commands via the host_bash tool in this workspace (feature flag)."
+        },
         "capabilities": {
           "type": "dict",
           "required": false,
