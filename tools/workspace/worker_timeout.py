@@ -20,7 +20,7 @@ import numbers
 import time
 from typing import Any, Dict, Optional
 
-from agent.config.defaults import EXEC_KILL_GRACE, QUERY_WAIT_GRACE_SECONDS
+from agent.config.defaults import EXEC_KILL_GRACE, QUERY_WAIT_GRACE_SECONDS, WORKER_TIMEOUT_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -111,10 +111,10 @@ def wait_for_worker_exit(thread: Any, worker_name: str) -> bool:
     # The thread may be a test double (or otherwise lack a numeric
     # ``_timeout_seconds``); fall back to the module default so the join
     # budget stays a bounded number.
-    _timeout_seconds = getattr(thread, "_timeout_seconds", 600)
+    _timeout_seconds = getattr(thread, "_timeout_seconds", WORKER_TIMEOUT_SECONDS)
     if not isinstance(_timeout_seconds, (int, float)):
-        _timeout_seconds = 600
-    _join_budget = max(30, int(_timeout_seconds or 600))
+        _timeout_seconds = WORKER_TIMEOUT_SECONDS
+    _join_budget = max(30, int(_timeout_seconds or WORKER_TIMEOUT_SECONDS))
     _join_elapsed = 0.0
     _join_step = 2.0
     while _join_elapsed < _join_budget:

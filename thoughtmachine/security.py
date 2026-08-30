@@ -138,6 +138,20 @@ class SessionPermissions(BaseModel):
         default='read',
         description='Git operations access level for the session.',
     )
+    git_read: Optional[Literal['banned', 'ask', 'read', 'write']] = Field(
+        default=None,
+        description=(
+            'Explicit git READ grain. None means \"derive from git\" via '
+            'split_git_permission at the security gate.'
+        ),
+    )
+    git_write: Optional[Literal['banned', 'ask', 'read', 'write']] = Field(
+        default=None,
+        description=(
+            'Explicit git WRITE grain. None means \"derive from git\" via '
+            'split_git_permission at the security gate.'
+        ),
+    )
     execution: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
         default='banned',
         description='Code execution access level for the session.',

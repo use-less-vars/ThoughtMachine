@@ -53,6 +53,13 @@ DEFAULT_WORKER_SYSTEM_PROMPT = (
 )
 # Default worker LLM sampling temperature.
 WORKER_DEFAULT_TEMPERATURE = 0.7
+# Default per-worker query timeout (seconds) when nothing is configured at
+# the tool-definition, agent-config or session level (SESSION-owned chain;
+# see docs/param_ownership_map.md).
+WORKER_TIMEOUT_SECONDS = 600
+# Default per-worker retry limit when nothing is configured at the
+# tool-definition, agent-config or session level (SESSION-owned chain).
+WORKER_MAX_RETRIES = 3
 
 # ── tools/workspace/worker_lifecycle.py ──────────────────────────────────────
 # Lifecycle event types the observer subscribes to (Phase 2A).

@@ -336,10 +336,11 @@ class ToolExecutor:
                     'token_monitor_critical_threshold': getattr(self.config, 'token_monitor_critical_threshold', None),
                     'use_workspace_lifecycle_manager': getattr(self.config, 'use_workspace_lifecycle_manager', False),
                     'use_container_registry': getattr(self.config, 'use_container_registry', False),
-                    'git_allow_worktree_commits': getattr(self.config, 'git_allow_worktree_commits', False),
                     'allow_host_resources': getattr(self.config, 'allow_host_resources', False),
                     'log_dir': getattr(self.config, 'log_dir', None),
                     'max_workers_per_session': getattr(self.config, 'max_workers_per_session', None),
+                    'worker_timeout_seconds': getattr(self.config, 'worker_timeout_seconds', None),
+                    'worker_max_retries': getattr(self.config, 'worker_max_retries', None),
                 }
             else:
                 tool_args['agent_config'] = None

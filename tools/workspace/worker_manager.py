@@ -495,7 +495,10 @@ class WorkerManager:
         new worker is spawned through the zero-arg *spawner* callable. A
         full live cap raises ``WorkerCapExceeded``; a missing spawner raises
         ``ValueError``. Delivery BLOCKS via ``deliver_query_and_block`` and
-        the returned envelope carries a ``delivery`` marker.
+        the returned envelope carries a ``delivery`` marker. When *timeout*
+        is None the thread's resolved ``_timeout_seconds`` (the session-owned
+        worker timeout chain) is propagated as the query wait, so the block
+        always matches the worker's own soft-timeout deadline.
         """
         force_replaced = False
         if force:
@@ -512,8 +515,16 @@ class WorkerManager:
                     continue
                 if pref_tag is not None and getattr(thread, "context_tag", None) != pref_tag:
                     continue
+                # No explicit timeout → propagate the thread's resolved
+                # session-owned ``_timeout_seconds`` so the query wait matches
+                # the worker's own soft-timeout deadline (+ grace).
+                _timeout = (
+                    timeout
+                    if timeout is not None
+                    else getattr(thread, "_timeout_seconds", None)
+                )
                 envelope = deliver_query_and_block(
-                    thread, query, timeout=timeout, grace=grace, worker_name=pref_name
+                    thread, query, timeout=_timeout, grace=grace, worker_name=pref_name
                 )
                 envelope["delivery"] = {
                     "reused": True,
@@ -532,8 +543,15 @@ class WorkerManager:
         name = getattr(thread, "worker_name", None) or "worker"
         iid = int(getattr(thread, "instance_id", 1) or 1)
         self.register_worker(session_id, name, thread, instance_id=iid)
+        # No explicit timeout → propagate the thread's resolved
+        # session-owned ``_timeout_seconds`` (see reuse branch above).
+        _timeout = (
+            timeout
+            if timeout is not None
+            else getattr(thread, "_timeout_seconds", None)
+        )
         envelope = deliver_query_and_block(
-            thread, query, timeout=timeout, grace=grace, worker_name=name
+            thread, query, timeout=_timeout, grace=grace, worker_name=name
         )
         envelope["delivery"] = {
             "reused": False,

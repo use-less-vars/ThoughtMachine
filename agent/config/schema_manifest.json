@@ -527,11 +527,6 @@
           "required": false,
           "description": "Enable ContainerRegistry delegation for container lifecycle (feature flag)."
         },
-        "git_allow_worktree_commits": {
-          "type": "bool",
-          "required": false,
-          "description": "Allow agent commits in operator-managed git worktrees on feat/* or fix/* branches (feature flag)."
-        },
         "allow_host_resources": {
           "type": "bool",
           "required": false,
@@ -542,6 +537,28 @@
           "required": false,
           "min": 1,
           "description": "Maximum number of live worker threads this session may run at once."
+        },
+        "worker_timeout_seconds": {
+          "type": "int",
+          "required": false,
+          "min": 1,
+          "description": "Per-worker query timeout in seconds for sessions spawned from this session (None = factory default 600)."
+        },
+        "worker_max_retries": {
+          "type": "int",
+          "required": false,
+          "min": 0,
+          "description": "Per-worker retry limit for sessions spawned from this session (None = factory default 3)."
+        },
+        "git_read": {
+          "type": "string",
+          "required": false,
+          "description": "Session-level git read grain override: banned, ask, read, or write."
+        },
+        "git_write": {
+          "type": "string",
+          "required": false,
+          "description": "Session-level git write grain override: banned, ask, read, or write. \"write\" replaces the removed git_allow_worktree_commits flag."
         }
       }
     }
