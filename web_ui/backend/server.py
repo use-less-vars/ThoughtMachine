@@ -1505,9 +1505,13 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                             mode_tool_names = None
                         tool_defs = []
                         for cls in SIMPLIFIED_TOOL_CLASSES:
-                            if mode_tool_names is None or cls.__name__ in mode_tool_names:
+                            if (
+                                mode_tool_names is None
+                                or cls.tool_name() in mode_tool_names
+                                or cls.__name__ in mode_tool_names
+                            ):
                                 tool_defs.append({
-                                    "name": cls.__name__,
+                                    "name": cls.tool_name(),
                                     "description": (cls.__doc__ or "").strip(),
                                 })
                         await ws.send_json({
@@ -2537,17 +2541,44 @@ async def browse_directory(path: str = ""):
 
 @app.get("/api/tools")
 async def api_get_tools():
-    """Return the complete list of all available tool names."""
+    """Return the complete list of all available tools with UI metadata.
+
+    Each entry carries the tool's canonical name plus UI hints:
+    ``disabled_reason`` (why a tool may be gated, e.g. host_bash without
+    the allow_host_resources feature flag) and ``permission_level`` (the
+    configured session-permission grain for gated tools).
+    """
     try:
         from session.tool_presets import _ALL_TOOLS
-        return {"tools": _ALL_TOOLS}
     except ImportError:
         # Fallback: try alternate import path
         try:
             from agent.config.presets import _ALL_TOOLS
-            return {"tools": _ALL_TOOLS}
         except ImportError:
             return {"tools": [], "error": "Could not load tool list"}
+    defaults = load_global_defaults()
+    allow_host_resources = bool(defaults.get("allow_host_resources", False))
+    session_perms = defaults.get("session_permissions") or {}
+    if hasattr(session_perms, "model_dump"):
+        session_perms = session_perms.model_dump()
+    elif not isinstance(session_perms, dict):
+        session_perms = {}
+    tools = [
+        {
+            "name": name,
+            "enabled": True,
+            "disabled_reason": (
+                "requires allow_host_resources: true"
+                if name == "host_bash" and not allow_host_resources
+                else None
+            ),
+            "permission_level": (
+                session_perms.get("host_bash") if name == "host_bash" else None
+            ),
+        }
+        for name in _ALL_TOOLS
+    ]
+    return {"tools": tools}
 
 
 @app.post("/api/browse/create")

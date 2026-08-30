@@ -839,7 +839,7 @@ class TestOldRegionNewSemantics:
         """prompt, cycle 0 (3 tool calls incl. Respond), S1, cycle 1, S2,
         Q2/A2. Summaries at indices 6 and 10 -> old region = [0:6]."""
         _reset_seq()
-        g0 = _tool_call('GitInfoTool', 'g0')
+        g0 = _tool_call('git_read', 'g0')
         w0 = _tool_call('Worker', 'w0')
         r0 = _tool_call('Respond', 'r0')
         r1 = _tool_call('Respond', 'r1')

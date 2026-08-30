@@ -75,7 +75,18 @@ def _fake_docker_available():
     fake = types.ModuleType("docker")
     fake.errors = types.ModuleType("docker.errors")
 
+    class _APIClient:
+        """Minimal stand-in for docker.APIClient (DockerClient.api)."""
+
+        base_url = "http+docker://localhost"
+
     class _Client:
+        def __init__(self):
+            # The real docker SDK exposes the low-level APIClient as
+            # ``DockerClient.api``; the health handler logs
+            # ``client.api.base_url`` before pinging.
+            self.api = _APIClient()
+
         def ping(self):
             return True
 

@@ -177,7 +177,16 @@ class ToolExecutor:
             log_tool_call_raw(tool_name=tool_name, tool_call_id=tool_call['id'], arguments_raw=arguments_str, json_repair_needed=json_repair_needed, session_id=session_id)
             if self.logger:
                 self.logger.log_tool_call(tool_name, arguments, tool_call['id'])
-            tool_class = next((cls for cls in self.tool_classes if cls.__name__ == tool_name), None)
+            # Resolve by stable tool name first (tool_name()); fall back to the
+            # class name so legacy/worker-internal callers keep working.
+            tool_class = next(
+                (
+                    cls
+                    for cls in self.tool_classes
+                    if cls.tool_name() == tool_name or cls.__name__ == tool_name
+                ),
+                None,
+            )
             if not tool_class:
                 error_msg = f'Unknown tool: {tool_name}'
                 tool_result = error_msg

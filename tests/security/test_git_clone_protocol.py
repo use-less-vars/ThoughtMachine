@@ -1,5 +1,5 @@
 """
-Contract tests for the GitInfoTool clone-URL protocol allowlist (Task 2).
+Contract tests for the GitWriteTool clone-URL protocol allowlist (Task 2).
 
 Verifies:
 1.  Disallowed transports (``ext::`` shell executors, ``file://`` local
@@ -8,8 +8,9 @@ Verifies:
 2.  Allowed transports (``https://``, ``http://``, ``git://``, ``ssh://``,
     scp-like ``user@host:path``) pass validation without raising.
 3.  ``execute(operation='clone', ...)`` surfaces the protocol ``ValueError``
-    *before* any git subprocess would run (the atomic ``network:outbound``
-    gate is pre-approved via ``effective_permissions``).
+    (returned as the error string) *before* any git subprocess would run
+    (the atomic ``network:outbound`` gate is pre-approved via
+    ``effective_permissions``).
 
 **Docker note:** ``tests/security/conftest.py`` fixes ``sys.path`` so the
 real ``tools/`` and ``security/`` packages are imported instead of the
@@ -18,7 +19,7 @@ pytest-injected ``tests/`` directory.
 
 import pytest
 
-from tools.git_info_tool import ALLOWED_GIT_PROTOCOLS, GitInfoTool
+from tools.git_write_tool import ALLOWED_GIT_PROTOCOLS, GitWriteTool
 
 # URLs that must be rejected. Every one of these would either be interpreted
 # by `git clone` as a non-allowlisted transport (ext::, file://, ftp://) or
@@ -54,13 +55,13 @@ class TestValidateCloneUrlRejects:
     @pytest.mark.parametrize("clone_url", INVALID_CLONE_URLS)
     def test_raises_value_error(self, clone_url):
         with pytest.raises(ValueError, match="Unsupported git protocol"):
-            GitInfoTool._validate_clone_url(clone_url)
+            GitWriteTool._validate_clone_url(clone_url)
 
     def test_error_message_contains_url(self):
         """The ValueError message carries the offending URL."""
         url = "file:///etc/passwd"
         with pytest.raises(ValueError) as exc_info:
-            GitInfoTool._validate_clone_url(url)
+            GitWriteTool._validate_clone_url(url)
         assert str(exc_info.value) == f"Unsupported git protocol: {url}"
 
 
@@ -68,7 +69,7 @@ class TestValidateCloneUrlAccepts:
     @pytest.mark.parametrize("clone_url", VALID_CLONE_URLS)
     def test_returns_true(self, clone_url):
         """Accepted URLs return True instead of raising (no git subprocess)."""
-        assert GitInfoTool._validate_clone_url(clone_url) is True
+        assert GitWriteTool._validate_clone_url(clone_url) is True
 
 
 class TestExecuteSurfacesProtocolErrorBeforeSubprocess:
@@ -81,26 +82,31 @@ class TestExecuteSurfacesProtocolErrorBeforeSubprocess:
         ],
     )
     def test_execute_raises_value_error(self, clone_url):
-        """execute() propagates the protocol ValueError before any git clone.
+        """execute() returns the protocol error before any git clone.
 
-        The atomic network:outbound check is pre-approved, so execution
-        reaches the clone-URL validation, which must raise instead of
-        handing the URL to a git subprocess.
+        The atomic network:outbound check is pre-approved (effective
+        permissions "write"), so execution reaches the clone-URL validation,
+        which must reject instead of handing the URL to a git subprocess.
+        GitWriteTool.execute() catches the ValueError and returns it as the
+        error string ("Error: Unsupported git protocol: <url>").
         """
-        tool = GitInfoTool(
+        tool = GitWriteTool(
             operation="clone",
             clone_url=clone_url,
             effective_permissions={"network": "write"},
+            agent_config={"git_allow_worktree_commits": True},
         )
-        with pytest.raises(ValueError, match="Unsupported git protocol"):
-            tool.execute()
+        result = tool.execute()
+        assert isinstance(result, str)
+        assert "Unsupported git protocol" in result
 
     def test_execute_without_network_permission_denied_by_gate(self):
         """Without network:outbound the atomic gate denies before validation."""
-        tool = GitInfoTool(
+        tool = GitWriteTool(
             operation="clone",
             clone_url='ext::sh -c "echo pwned"',
             effective_permissions={"network": "banned"},
+            agent_config={"git_allow_worktree_commits": True},
         )
         result = tool.execute()
         assert isinstance(result, str)

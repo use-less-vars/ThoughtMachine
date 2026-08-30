@@ -38,8 +38,10 @@ _ALL_TOOLS = [
     "FileSearchTool",
     "SearchCodebaseTool",
     # Git
-    "GitInfoTool",
-    "GitWriteTool",
+    "git_read",
+    "git_write",
+    # Host execution (gated by the allow_host_resources feature flag)
+    "host_bash",
     # Execution
     "DockerCodeRunner",
     "ContainerStartTool",
@@ -64,7 +66,7 @@ _ALL_TOOLS = [
 
 # ── Tool Lists ────────────────────────────────────────────────────────────
 
-# Agent mode — 25 tools focused on code editing, research, and user interaction
+# Agent mode — 30 tools focused on code editing, research, and user interaction
 AGENT_TOOLS = [
     "ApplyEdits",
     "CheckSystem",
@@ -86,9 +88,10 @@ AGENT_TOOLS = [
     "FilePreviewTool",
     "FileSearchTool",
     "FileSummaryTool",
-    "GitInfoTool",
-    "GitWriteTool",
+    "git_read",
+    "git_write",
     "GlobTool",
+    "host_bash",
     "KnowledgeBaseTool",
     "MCPValidator",
     "PaginateTool",
@@ -97,19 +100,19 @@ AGENT_TOOLS = [
     "SummarizeTool",
 ]
 
-# Engineer mode — 7 tools focused on worker orchestration and agent introspection
+# Engineer mode — 8 tools focused on worker orchestration and agent introspection
 ENGINEER_TOOLS = [
     "Worker",
     "CheckSystem",
     "Respond",
     "SummarizeTool",
     "KnowledgeBaseTool",
-    "GitInfoTool",
-    "GitWriteTool",
+    "git_read",
+    "git_write",
     "WorkingDocument",
 ]
 
-# Custom mode — all 29 tools (unrestricted)
+# Custom mode — all 33 tools (unrestricted)
 CUSTOM_TOOLS = list(_ALL_TOOLS)
 
 

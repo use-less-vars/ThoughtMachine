@@ -180,6 +180,11 @@ PERMISSION_SCHEMA: Dict[str, tuple] = {
     "container":  (True, False),
     "execution":  ("banned", "ask", "read", "write"),
     "git":        VALID_PERMISSION_LEVELS,
+    # Split git sub-categories (derived from ``git`` by the security gate;
+    # declared here so worker permission footprints and config validation
+    # accept them).
+    "git_read":   VALID_PERMISSION_LEVELS,
+    "git_write":  VALID_PERMISSION_LEVELS,
     "mcp":        ("banned", "connect", "full"),
     "system":     VALID_PERMISSION_LEVELS,
 }
@@ -188,6 +193,8 @@ SAFE_DEFAULTS: Dict[str, Any] = {
     "execution": "banned",
     "filesystem": "read",
     "git": "read",
+    "git_read": "read",
+    "git_write": "banned",
     "mcp": "banned",
     "network": "banned",
     "system": "read",

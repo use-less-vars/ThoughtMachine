@@ -121,6 +121,42 @@ def _min_permission(
     return override_val if _level(override_val) < _level(effective_val) else effective_val
 
 
+def split_git_permission(level: Any) -> tuple:
+    """Split a merged git permission level into ``(read, write)`` sub-levels.
+
+    Tools declare their needs as ``git:read`` / ``git:write``; the merged
+    ``git`` level is a single value.  This helper derives the two sub-levels
+    so read-only git tools can run on a ``read`` session while write tools
+    stay denied:
+
+    ===================  ===================  ====================
+    merged ``git``       git_read             git_write
+    ===================  ===================  ====================
+    ``False``/``None``   ``False``            ``False``
+    ``banned``           ``banned``           ``banned``
+    ``ask``              ``ask``              ``ask``
+    ``read``             ``read``             ``banned``
+    ``write``            ``write``            ``write``
+    ``full``             ``full``             ``full``
+    ===================  ===================  ====================
+
+    ``ask`` maps to ``ask`` on both sub-levels so the interactive prompt
+    flow for ``git:write`` is preserved (an ``ask`` write is prompted
+    exactly as before).
+    """
+    if level is False or level is None:
+        return (False, False)
+    s = str(level).lower()
+    if s in ("banned", "ask"):
+        return (s, s)
+    if s == "read":
+        return ("read", "banned")
+    if s in ("write", "full"):
+        return (s, s)
+    # Unknown level: fail closed on both sub-levels.
+    return (False, False)
+
+
 def get_effective_permissions(
     session: SessionPermissions,
     workspace: WorkspaceCapabilities,
@@ -128,13 +164,17 @@ def get_effective_permissions(
     """
     Merge the session's permission profile with the workspace's capabilities.
 
-    Returns a flat dict with keys matching the seven permission categories::
+    Returns a flat dict with keys matching the seven permission categories,
+    plus the split git sub-categories::
 
         {"filesystem": ..., "network": ..., "container": ..., "git": ..., "system": ..., "mcp": ..., "execution": ...}
+        {"git_read": ..., "git_write": ...}
 
     Each value is either a boolean (``True`` / ``False``) for hard allow/deny,
     a string level (``"write"``, ``"read"``, ``"none"``, ``"banned"``, ``"ask"``, ``"outbound"``),
-    or ``False`` if the workspace forbids the operation.
+    or ``False`` if the workspace forbids the operation.  ``git_read`` /
+    ``git_write`` are derived from the merged ``git`` value via
+    :func:`split_git_permission` (kept for backward compatibility).
     """
     # ── Filesystem ──────────────────────────────────────────────────────
     # Workspace filesystem_write caps write access; if False, downgrade to read.
@@ -151,6 +191,7 @@ def get_effective_permissions(
 
     # ── Git ─────────────────────────────────────────────────────────────
     git: Any = _min_permission(session.git, workspace.git_available)
+    git_read, git_write = split_git_permission(git)
 
     # ── System ──────────────────────────────────────────────────────────
     system: Any = session.system  # no workspace cap yet
@@ -160,6 +201,8 @@ def get_effective_permissions(
         "network": net,
         "container": container,
         "git": git,
+        "git_read": git_read,
+        "git_write": git_write,
         "system": system,
         "mcp": session.mcp,
         "execution": session.execution,

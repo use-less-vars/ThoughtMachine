@@ -92,7 +92,7 @@ class TestPresetEnforcement:
         """Custom mode: removing a tool persists through round-trip."""
         config = SessionConfig(
             mode="custom",
-            enabled_tools=["Respond", "CheckSystem", "GitInfoTool"],
+            enabled_tools=["Respond", "CheckSystem", "git_read"],
         )
 
         # Remove a tool manually
@@ -105,7 +105,7 @@ class TestPresetEnforcement:
 
         assert "CheckSystem" not in restored.enabled_tools
         assert "Respond" in restored.enabled_tools
-        assert "GitInfoTool" in restored.enabled_tools
+        assert "git_read" in restored.enabled_tools
 
     def test_custom_update_tools_works(self) -> None:
         """update_tools() replaces the tool list in custom mode."""
@@ -114,7 +114,7 @@ class TestPresetEnforcement:
             enabled_tools=["Respond"],
         )
 
-        new_tools = ["Worker", "CheckSystem", "GitInfoTool"]
+        new_tools = ["Worker", "CheckSystem", "git_read"]
         config.update_tools(new_tools)
         assert config.enabled_tools == new_tools
 
