@@ -136,9 +136,14 @@ $env:PYTHONIOENCODING = "utf-8"
 Push-Location $Root
 try {
     $importCode = "import fastapi, uvicorn, pydantic, web_ui.backend.server; print('IMPORTS_OK')"
-    $importOut = (& $VenvPython -c $importCode 2>&1 | Out-String)
-    if ($LASTEXITCODE -ne 0 -or $importOut -notmatch "IMPORTS_OK") {
-        Write-Fail "Import check failed:`n$importOut"
+    # Capture stderr separately so warnings on stderr do NOT fail the check;
+    # only a non-zero exit code (or a missing IMPORTS_OK marker) is fatal.
+    $importErrFile = Join-Path $Root "smoke_import.err.log"
+    $importOut = & $VenvPython -c $importCode 2>$importErrFile
+    $importExit = $LASTEXITCODE
+    $importErr = if (Test-Path $importErrFile) { Get-Content $importErrFile -Raw } else { "" }
+    if ($importExit -ne 0 -or $importOut -notmatch "IMPORTS_OK") {
+        Write-Fail "Import check failed:`n$importOut`n$importErr"
         exit 1
     }
     Write-Host "OK: critical modules import cleanly"
