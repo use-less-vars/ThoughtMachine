@@ -1,3 +1,4 @@
+// --- ORPHANED — replaced by WorkspaceDetailPage; do not import in new code ---
 // --- tabs/PermissionsTab.jsx ---
 // Moved verbatim from WorkspacePanel.jsx (Phase 4 structural split).
 // The ceiling dropdown lists PERMISSION_CEILINGS, which includes 'enabled'

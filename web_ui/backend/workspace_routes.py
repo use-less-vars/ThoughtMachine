@@ -1290,6 +1290,7 @@ class WorkspacePermissionsBody(BaseModel):
     """Body for PUT /api/workspace/{ws_id}/permissions."""
 
     permissions: Dict[str, str]
+    allow_host_resources: Optional[bool] = None
 
 
 class WorkspaceCreateBody(BaseModel):
@@ -1363,9 +1364,10 @@ async def put_workspace_permissions(
     """Persist a workspace resource permission map (validated against the catalog).
 
     422 on unknown resource names or invalid permission levels; otherwise
-    merges into ``config.json`` (preserving purpose / allow_host_resources /
-    capabilities / domain_allowlist) and returns the updated map with its
-    runtime risk assessment.
+    merges into ``config.json`` (preserving purpose / capabilities /
+    domain_allowlist) and returns the updated map with its runtime risk
+    assessment. ``allow_host_resources`` is updated only when explicitly
+    provided in the body (None leaves the saved value untouched).
     """
     from agent.config.resource_catalog import validate_workspace_permissions
     from agent.config.risk_model import compute_workspace_risk
@@ -1379,6 +1381,8 @@ async def put_workspace_permissions(
         )
 
     cfg = _load_workspace_config(ws_id)
+    if body.allow_host_resources is not None:
+        cfg["allow_host_resources"] = bool(body.allow_host_resources)
     cfg["permissions"] = normalized
     _save_workspace_config(ws_id, cfg)
 

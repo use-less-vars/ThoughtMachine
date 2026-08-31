@@ -1,3 +1,4 @@
+// --- ORPHANED — replaced by WorkspaceDetailPage; do not import in new code ---
 // --- WorkspacePanel.jsx ---
 // Phase 3: the /workspace/:id page — a single-page "office blueprint" with
 // tabbed sections (Resources, Permissions, Tools, Credentials, Containers,

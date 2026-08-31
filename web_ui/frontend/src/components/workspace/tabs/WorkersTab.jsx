@@ -1,3 +1,4 @@
+// --- ORPHANED — replaced by WorkspaceDetailPage; do not import in new code ---
 // --- tabs/WorkersTab.jsx ---
 // Moved verbatim from WorkspacePanel.jsx (Phase 4 structural split).
 // The worker editor modal now lives at modals/WorkerEditorModal.jsx.

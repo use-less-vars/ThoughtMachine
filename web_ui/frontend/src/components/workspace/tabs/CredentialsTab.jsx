@@ -1,3 +1,4 @@
+// --- ORPHANED — replaced by WorkspaceDetailPage; do not import in new code ---
 // --- tabs/CredentialsTab.jsx ---
 // Moved verbatim from WorkspacePanel.jsx (Phase 4 structural split).
 // The vault-picker modal now lives at modals/CredentialPickerModal.jsx.

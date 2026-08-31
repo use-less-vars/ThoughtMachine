@@ -43,7 +43,7 @@ import { routeEventsToPanels } from './components/chat/workerEventRouting'
 import LoggingPanel from './components/LoggingPanel'
 import OnboardingWizard from './components/OnboardingWizard'
 import WorkspaceSelector from './components/WorkspaceSelector'
-import WorkspacePanel from './components/workspace/WorkspacePanel'
+import WorkspaceDetailPage from './components/workspace/WorkspaceDetailPage'
 import { useRoute, useNavigate } from './router'
 import './styles.css'
 
@@ -1154,7 +1154,7 @@ export default function App() {
           )}
 
           {/* Route views */}
-          {route?.view === 'workspace' && <WorkspacePanel />}
+          {route?.view === 'workspace' && <WorkspaceDetailPage workspaceId={route.id} />}
           {route?.view === 'selector' && <WorkspaceSelector />}
           {route?.view === 'session' && !tabs.some((t) => t.sessionId === route.id) && (
             <div className="session-loading-placeholder">Loading session…</div>

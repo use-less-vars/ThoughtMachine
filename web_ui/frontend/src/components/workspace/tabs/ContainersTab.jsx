@@ -1,3 +1,4 @@
+// --- ORPHANED — replaced by WorkspaceDetailPage; do not import in new code ---
 // --- tabs/ContainersTab.jsx ---
 // Moved verbatim from WorkspacePanel.jsx (Phase 4 structural split).
 // The "Container logs" placeholder now lives at modals/ContainerLogsModal.jsx.

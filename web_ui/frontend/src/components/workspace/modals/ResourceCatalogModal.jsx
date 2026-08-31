@@ -1,3 +1,4 @@
+// --- ORPHANED — replaced by WorkspaceDetailPage; do not import in new code ---
 // --- modals/ResourceCatalogModal.jsx ---
 // Moved verbatim from WorkspacePanel.jsx (Phase 4 structural split).
 // Add Resource: checklist of available resources. The server catalog
