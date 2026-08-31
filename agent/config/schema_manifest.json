@@ -338,19 +338,19 @@
       }
     },
     "state/session_registry.json": {
-      "description": "Session registry (JSON list of session records).",
+      "description": "Session registry (JSON dict keyed by session_id).",
       "required": true,
       "backfill_on_missing": true,
-      "safe_default": [],
-      "root_type": "list",
+      "safe_default": {},
+      "root_type": "dict",
       "fields": {}
     },
     "state/workspace_registry.json": {
-      "description": "Workspace registry (JSON list of workspace records).",
+      "description": "Workspace registry (JSON dict keyed by workspace_id).",
       "required": true,
       "backfill_on_missing": true,
-      "safe_default": [],
-      "root_type": "list",
+      "safe_default": {},
+      "root_type": "dict",
       "fields": {}
     },
     "custom_system_prompt.txt": {

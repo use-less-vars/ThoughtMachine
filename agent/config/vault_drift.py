@@ -629,12 +629,13 @@ class VaultDriftChecker:
             # Ignore dotfiles, backup siblings, and the version marker.
             if name.startswith(".") or name.endswith(".bak") or name.endswith(".tmp"):
                 continue
-            hint = (
+            message = f"Unknown file: {name}"
+            detail = (
                 f"Unknown file '{name}' in vault root is not declared in the "
                 "schema manifest; it will be ignored by the checker."
             )
-            report["warnings"].append(hint)
-            self._log("WARNING", "unknown_root_file", relpath=name, detail=hint)
+            report["warnings"].append(message)
+            self._log("WARNING", "unknown_root_file", relpath=name, detail=detail)
 
     # ------------------------------------------------------------------
     # Type helpers
@@ -768,7 +769,7 @@ class VaultDriftChecker:
         * files with warning drifts (missing required file/field, type
           mismatch, undeclared field, seeded-file modified) -> ``warning``;
         * ``backfill_pending`` / ``backfilled`` files -> ``info``;
-        * unknown root files -> ``info`` (they do not flip the status);
+        * unknown root files -> ``warning`` (they flip the status);
         * every other top-level warning -> ``warning``.
         """
         issues: List[dict] = []
@@ -800,12 +801,13 @@ class VaultDriftChecker:
         for w in report["warnings"]:
             if w in seen_messages:
                 continue
-            if "Unknown file" in w:
+            if w.startswith("Unknown file: "):
+                name = w[len("Unknown file: "):]
                 issues.append({
-                    "file": None,
-                    "severity": "info",
+                    "file": name,
+                    "severity": "warning",
                     "message": w,
-                    "action": "declare the file in the schema manifest or ignore",
+                    "action": "Review and remove if not needed",
                 })
             else:
                 issues.append({

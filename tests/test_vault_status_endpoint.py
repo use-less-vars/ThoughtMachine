@@ -122,17 +122,20 @@ def test_vault_status_endpoint_returns_issues(client, monkeypatch, tmp_path):
 
 
 def test_vault_status_endpoint_only_info_is_ok(client, monkeypatch, tmp_path):
-    """Unknown-file (info) drift does not flip ok."""
+    """Info-only drift (pending safe-default backfill) does not flip ok."""
     report = {
         "status": "warnings",
         "checked_at": "2026-01-01T00:00:00Z",
         "vault_root": str(tmp_path / "vault"),
         "issues": [
             {
-                "file": "agent_config.json",
+                "file": "data.json",
                 "severity": "info",
-                "message": "Unknown file 'agent_config.json' in vault root",
-                "action": "ignore",
+                "message": (
+                    "Missing vault file 'data.json' has a schema safe_default; "
+                    "run check(apply_repairs=True) to re-create it."
+                ),
+                "action": "run check(apply_repairs=True)",
             }
         ],
     }
@@ -144,6 +147,28 @@ def test_vault_status_endpoint_only_info_is_ok(client, monkeypatch, tmp_path):
     body = resp.json()
     assert body["ok"] is True
     assert body["summary"] == {"error": 0, "warning": 0, "info": 1}
+
+
+def test_vault_status_endpoint_unknown_file_is_warning(client, monkeypatch, tmp_path):
+    """Real checker: an unknown vault-root file is a warning and flips ok."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "stray.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr("thoughtmachine.vault.vault_root", lambda: vault)
+
+    resp = client.get("/api/vault/status")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["status"] == "warnings"
+    assert {
+        "file": "stray.json",
+        "severity": "warning",
+        "message": "Unknown file: stray.json",
+        "action": "Review and remove if not needed",
+    } in body["issues"]
+    assert body["summary"]["warning"] >= 1
 
 
 def test_vault_status_endpoint_no_secrets(client, monkeypatch, tmp_path):

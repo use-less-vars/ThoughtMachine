@@ -100,12 +100,25 @@ def test_vault_drift_warns_unknown_file(tmp_path):
     vault = tmp_path / "vault"
     vault.mkdir()
     (vault / "stray.json").write_text("{}", encoding="utf-8")
-    checker = _make_checker(tmp_path, {})
+    checker = _make_checker(tmp_path, {
+        "data.json": {"required": True, "root_type": "dict", "fields": {}},
+    })
     report = checker.check()
 
-    assert any("stray.json" in w for w in report["warnings"])
+    assert any(w == "Unknown file: stray.json" for w in report["warnings"])
     assert report["status"] == "warnings"
     assert report["aborted"] is False
+    assert {
+        "file": "stray.json",
+        "severity": "warning",
+        "message": "Unknown file: stray.json",
+        "action": "Review and remove if not needed",
+    } in report["issues"]
+    # Checking continues: declared-file drift is still reported alongside.
+    assert any(
+        i["file"] == "data.json" and i["severity"] == "warning"
+        for i in report["issues"]
+    )
 
 
 def test_vault_drift_backfills_safe_default(tmp_path):

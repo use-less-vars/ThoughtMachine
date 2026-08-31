@@ -2607,8 +2607,10 @@ def vault_status_endpoint():
     """Run the vault drift check (read-only) and return a structured report.
 
     Severity mapping: ``error``/``warning`` issues flip ``ok`` to False;
-    ``info`` issues (e.g. unknown files) do not. On abort or unexpected
-    failure the endpoint returns ``ok: False, status: "error"``.
+    unknown files in the vault root are reported as warnings. ``info``
+    issues (e.g. pending safe-default backfills) do not flip ``ok``.
+    On abort or unexpected failure the endpoint returns
+    ``ok: False, status: "error"``.
     """
     checker = None
     try:
