@@ -127,9 +127,15 @@ def test_drift_detects_unknown_file(tmp_path):
     checker = _make_checker(tmp_path, {})
     report = checker.check()
 
-    assert any("stray.json" in w for w in report["warnings"])
+    assert any(w == "Unknown file: stray.json" for w in report["warnings"])
     assert report["status"] == "warnings"
     assert report["aborted"] is False
+    assert {
+        "file": "stray.json",
+        "severity": "warning",
+        "message": "Unknown file: stray.json",
+        "action": "Review and remove if not needed",
+    } in report["issues"]
 
 
 def test_drift_detects_seeded_file_altered(tmp_path):
