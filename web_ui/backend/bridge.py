@@ -1822,6 +1822,26 @@ class WebAgentBridge:
             # ── Extract session config from session metadata via SessionManager ──
             sc = self._session_manager.extract_session_config(session)
             if sc is not None:
+                # Re-cap the stored session permissions through the current
+                # workspace permission ceiling — exactly like a fresh config
+                # apply (see config_manager.resolve_full_config) — so a
+                # restored session can never exceed the workspace ceiling
+                # until the next config change.
+                if self._workspace_id:
+                    try:
+                        from web_ui.backend.config_manager import _load_workspace_permission_ceiling
+
+                        ceiling = _load_workspace_permission_ceiling(self._workspace_id)
+                        stored_perms = getattr(sc, 'session_permissions', None)
+                        if ceiling and isinstance(stored_perms, dict):
+                            from security.security_gate import apply_workspace_ceiling
+
+                            sc.session_permissions = apply_workspace_ceiling(
+                                ceiling, stored_perms
+                            )
+                    except Exception as exc:
+                        log('WARNING', 'server.bridge',
+                            f"Could not apply workspace permission ceiling to session config: {exc}")
                 self._session_config = sc
                 # Migrate saved config to new format (exclude api_key)
                 self._session_manager.save_config_to_session(session, sc)
