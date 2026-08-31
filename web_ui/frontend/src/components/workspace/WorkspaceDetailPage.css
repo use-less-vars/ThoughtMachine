@@ -1,0 +1,671 @@
+/* --- WorkspaceDetailPage.css ---
+   Workspace Detail page (Layer 2 core). Own wdp-* prefix; mirrors the
+   Catppuccin Mocha palette used by WorkspacePanel.css without modifying it. */
+
+.wdp-panel {
+  background: #1e1e2e;
+  border: 1px solid #313244;
+  border-radius: 12px;
+  color: #cdd6f4;
+  font-size: 0.85rem;
+  overflow: hidden;
+}
+
+/* ── Header ──────────────────────────────────────────────────────────────── */
+
+.wdp-header {
+  background: #181825;
+  border-bottom: 1px solid #313244;
+  padding: 0.9rem 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.wdp-title-block {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.wdp-title {
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: #cdd6f4;
+}
+
+.wdp-ws-id {
+  font-size: 0.75rem;
+  color: #6c7086;
+  font-family: monospace;
+  background: #1e1e2e;
+  border: 1px solid #313244;
+  border-radius: 999px;
+  padding: 0.1rem 0.55rem;
+}
+
+.wdp-header-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+}
+
+.wdp-counts {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.wdp-count {
+  background: #1e1e2e;
+  border: 1px solid #313244;
+  border-radius: 999px;
+  padding: 0.15rem 0.6rem;
+  font-size: 0.72rem;
+  color: #a6adc8;
+}
+
+/* ── Host-execution toggle ───────────────────────────────────────────────── */
+
+.wdp-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.wdp-toggle-label {
+  font-size: 0.78rem;
+  color: #a6adc8;
+}
+
+.wdp-toggle {
+  position: relative;
+  width: 2.4rem;
+  height: 1.3rem;
+  border-radius: 999px;
+  border: 1px solid #45475a;
+  background: #313244;
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.wdp-toggle-on {
+  background: #89b4fa;
+  border-color: #89b4fa;
+}
+
+.wdp-toggle-knob {
+  position: absolute;
+  top: 0.15rem;
+  left: 0.18rem;
+  width: 0.95rem;
+  height: 0.95rem;
+  border-radius: 50%;
+  background: #cdd6f4;
+  transition: left 0.15s ease;
+}
+
+.wdp-toggle-on .wdp-toggle-knob {
+  left: 1.28rem;
+}
+
+.wdp-toggle-state {
+  font-size: 0.75rem;
+  color: #cdd6f4;
+  min-width: 1.6rem;
+}
+
+.wdp-pending-hint {
+  font-size: 0.72rem;
+  color: #f9e2af;
+  background: rgba(249, 226, 175, 0.12);
+  border: 1px solid rgba(249, 226, 175, 0.35);
+  border-radius: 999px;
+  padding: 0.12rem 0.55rem;
+}
+
+.wdp-apply {
+  background: #89b4fa;
+  color: #11111b;
+  border: none;
+  border-radius: 999px;
+  padding: 0.32rem 0.95rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+
+.wdp-apply:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.wdp-apply-error {
+  font-size: 0.78rem;
+  color: #f38ba8;
+  background: rgba(243, 139, 168, 0.1);
+  border: 1px solid rgba(243, 139, 168, 0.4);
+  border-radius: 8px;
+  padding: 0.4rem 0.7rem;
+}
+
+/* ── Tabs ────────────────────────────────────────────────────────────────── */
+
+.wdp-tabs {
+  display: flex;
+  gap: 0.25rem;
+  padding: 0.55rem 1.1rem 0;
+  border-bottom: 1px solid #313244;
+  flex-wrap: wrap;
+}
+
+.wdp-tab {
+  background: transparent;
+  border: none;
+  color: #6c7086;
+  font-size: 0.78rem;
+  padding: 0.4rem 0.75rem;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.wdp-tab:hover {
+  color: #cdd6f4;
+}
+
+.wdp-tab-active {
+  background: rgba(137, 180, 250, 0.15);
+  color: #89b4fa;
+}
+
+/* ── Body / overview ─────────────────────────────────────────────────────── */
+
+.wdp-body {
+  padding: 1.1rem;
+}
+
+.wdp-overview {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+}
+
+.wdp-card {
+  background: #181825;
+  border: 1px solid #313244;
+  border-radius: 10px;
+  padding: 0.8rem 0.95rem;
+}
+
+.wdp-card-row {
+  display: flex;
+  gap: 1.5rem;
+}
+
+.wdp-card-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #6c7086;
+  margin-bottom: 0.35rem;
+}
+
+.wdp-root-path {
+  font-family: monospace;
+  font-size: 0.8rem;
+  color: #a6e3a1;
+  word-break: break-all;
+}
+
+.wdp-posture {
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.wdp-posture-safe {
+  color: #a6e3a1;
+}
+
+.wdp-posture-host {
+  color: #f9e2af;
+}
+
+.wdp-host-on {
+  color: #f9e2af;
+  font-size: 0.82rem;
+}
+
+.wdp-host-off {
+  color: #a6adc8;
+  font-size: 0.82rem;
+}
+
+.wdp-stat {
+  flex: 1;
+}
+
+.wdp-stat-value {
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: #89b4fa;
+}
+
+.wdp-stat-label {
+  font-size: 0.72rem;
+  color: #6c7086;
+  margin-top: 0.15rem;
+}
+
+/* ── Placeholder tabs ────────────────────────────────────────────────────── */
+
+.wdp-placeholder {
+  background: #181825;
+  border: 1px dashed #45475a;
+  border-radius: 10px;
+  padding: 2.2rem 1.2rem;
+  text-align: center;
+}
+
+.wdp-placeholder-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #cdd6f4;
+  margin-bottom: 0.4rem;
+}
+
+.wdp-placeholder-text {
+  font-size: 0.8rem;
+  color: #6c7086;
+}
+
+/* ── Warning modal ───────────────────────────────────────────────────────── */
+
+.wdp-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(17, 17, 27, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.wdp-modal {
+  background: #1e1e2e;
+  border: 1px solid #45475a;
+  border-radius: 12px;
+  padding: 1.2rem 1.3rem;
+  max-width: 26rem;
+  width: 90%;
+}
+
+.wdp-modal-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #f9e2af;
+  margin-bottom: 0.55rem;
+}
+
+.wdp-modal-text {
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: #cdd6f4;
+  margin-bottom: 1rem;
+}
+
+.wdp-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+}
+
+.wdp-modal-cancel {
+  background: #313244;
+  color: #cdd6f4;
+  border: none;
+  border-radius: 999px;
+  padding: 0.35rem 0.95rem;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+
+.wdp-modal-confirm {
+  background: #f38ba8;
+  color: #11111b;
+  border: none;
+  border-radius: 999px;
+  padding: 0.35rem 0.95rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* ── Loading / error / empty states ──────────────────────────────────────── */
+
+.wdp-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3rem 1rem;
+}
+
+.wdp-spinner {
+  width: 1.6rem;
+  height: 1.6rem;
+  border: 3px solid #313244;
+  border-top-color: #89b4fa;
+  border-radius: 50%;
+  animation: wdp-spin 0.8s linear infinite;
+}
+
+@keyframes wdp-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.wdp-error {
+  padding: 2.5rem 1.2rem;
+  text-align: center;
+}
+
+.wdp-error-text {
+  color: #f38ba8;
+  font-size: 0.85rem;
+  margin-bottom: 0.9rem;
+}
+
+.wdp-retry {
+  background: #89b4fa;
+  color: #11111b;
+  border: none;
+  border-radius: 999px;
+  padding: 0.35rem 1rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.wdp-empty {
+  padding: 2.5rem 1.2rem;
+  text-align: center;
+  color: #6c7086;
+  font-size: 0.85rem;
+}
+
+/* ── Tab content (Permissions & Resources, Containers, Workers, Tools) ─────── */
+
+.wdp-tab-content {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+}
+
+.wdp-section-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #cdd6f4;
+}
+
+.wdp-note {
+  font-size: 0.75rem;
+  color: #6c7086;
+  background: rgba(108, 112, 134, 0.12);
+  border: 1px solid #313244;
+  border-radius: 8px;
+  padding: 0.4rem 0.7rem;
+}
+
+.wdp-resource-card {
+  background: #181825;
+  border: 1px solid #313244;
+  border-radius: 10px;
+  padding: 0.8rem 0.95rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.wdp-resource-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.wdp-resource-name {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #cdd6f4;
+}
+
+.wdp-resource-desc {
+  font-size: 0.78rem;
+  color: #a6adc8;
+  line-height: 1.45;
+}
+
+.wdp-resource-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.wdp-perm-label {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.75rem;
+  color: #6c7086;
+}
+
+.wdp-perm-select {
+  background: #1e1e2e;
+  color: #cdd6f4;
+  border: 1px solid #45475a;
+  border-radius: 6px;
+  padding: 0.22rem 0.4rem;
+  font-size: 0.75rem;
+}
+
+.wdp-badge {
+  font-size: 0.68rem;
+  border-radius: 999px;
+  padding: 0.1rem 0.5rem;
+  border: 1px solid #313244;
+  color: #a6adc8;
+}
+
+.wdp-badge-enabled {
+  color: #a6e3a1;
+  border-color: rgba(166, 227, 161, 0.35);
+  background: rgba(166, 227, 161, 0.1);
+}
+
+.wdp-badge-disabled {
+  color: #f38ba8;
+  border-color: rgba(243, 139, 168, 0.35);
+  background: rgba(243, 139, 168, 0.1);
+}
+
+.wdp-context-badge {
+  color: #89b4fa;
+  border-color: rgba(137, 180, 250, 0.35);
+  background: rgba(137, 180, 250, 0.08);
+}
+
+.wdp-tools-list {
+  font-size: 0.75rem;
+  color: #a6adc8;
+}
+
+.wdp-tools-label {
+  color: #6c7086;
+  margin-right: 0.3rem;
+}
+
+.wdp-tools-none {
+  color: #6c7086;
+  font-style: italic;
+}
+
+.wdp-perm-apply-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.6rem;
+}
+
+.wdp-dockerfile-path {
+  font-family: monospace;
+  font-size: 0.78rem;
+  color: #a6e3a1;
+  word-break: break-all;
+  margin-bottom: 0.3rem;
+}
+
+.wdp-dockerfile-note {
+  font-size: 0.75rem;
+  color: #6c7086;
+}
+
+.wdp-container-list,
+.wdp-worker-list,
+.wdp-tool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.wdp-container-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.6rem;
+  background: #1e1e2e;
+  border: 1px solid #313244;
+  border-radius: 8px;
+  padding: 0.5rem 0.7rem;
+  flex-wrap: wrap;
+}
+
+.wdp-container-main {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.wdp-container-name {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #cdd6f4;
+}
+
+.wdp-container-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.wdp-container-status {
+  font-size: 0.72rem;
+  color: #f9e2af;
+}
+
+.wdp-container-id,
+.wdp-container-ws {
+  font-family: monospace;
+  font-size: 0.68rem;
+  color: #6c7086;
+}
+
+.wdp-worker-template {
+  background: #1e1e2e;
+  border: 1px solid #313244;
+  border-radius: 8px;
+  padding: 0.55rem 0.7rem;
+}
+
+.wdp-worker-template .wdp-tools-list {
+  margin-top: 0.35rem;
+}
+
+.wdp-worker-name {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #cdd6f4;
+}
+
+.wdp-worker-desc {
+  font-size: 0.75rem;
+  color: #a6adc8;
+  margin-top: 0.2rem;
+}
+
+.wdp-active-worker {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  background: #1e1e2e;
+  border: 1px solid #313244;
+  border-radius: 8px;
+  padding: 0.5rem 0.7rem;
+  flex-wrap: wrap;
+}
+
+.wdp-worker-instance {
+  font-family: monospace;
+  font-size: 0.72rem;
+  color: #6c7086;
+}
+
+.wdp-elapsed {
+  font-size: 0.72rem;
+  color: #6c7086;
+  margin-left: auto;
+}
+
+.wdp-tool-row {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  background: #1e1e2e;
+  border: 1px solid #313244;
+  border-radius: 8px;
+  padding: 0.5rem 0.7rem;
+  flex-wrap: wrap;
+}
+
+.wdp-tool-name {
+  font-family: monospace;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #cdd6f4;
+}
+
+.wdp-tool-perm {
+  font-size: 0.7rem;
+  color: #89b4fa;
+}
+
+.wdp-tool-ceiling {
+  font-size: 0.7rem;
+  color: #f9e2af;
+  background: rgba(249, 226, 175, 0.1);
+  border: 1px solid rgba(249, 226, 175, 0.3);
+  border-radius: 999px;
+  padding: 0.08rem 0.5rem;
+}
+
+.wdp-tool-reason {
+  font-size: 0.72rem;
+  color: #f38ba8;
+  width: 100%;
+}
+
