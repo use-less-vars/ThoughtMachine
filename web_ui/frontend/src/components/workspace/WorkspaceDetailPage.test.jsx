@@ -152,7 +152,7 @@ function summaryRoute(summary) {
 
 function routesFor(summary, extra = {}) {
   return {
-    '/api/workspace/' + WORKSPACE_ID + '/summary': summaryRoute(summary),
+    [`/api/workspace/${WORKSPACE_ID}/summary`]: summaryRoute(summary),
     '/api/tools': jsonOk({ tools: [] }),
     ...extra,
   }
@@ -199,7 +199,7 @@ describe('WorkspaceDetailPage', () => {
     })
     const summary = makeSummary()
     stubFetchByUrl({
-      '/api/workspace/' + WORKSPACE_ID + '/summary': {
+      [`/api/workspace/${WORKSPACE_ID}/summary`]: {
         ok: true,
         status: 200,
         json: async () => {
@@ -223,7 +223,7 @@ describe('WorkspaceDetailPage', () => {
 
   it('shows an error with a Retry button on summary fetch failure and recovers on retry', async () => {
     const routes = {
-      '/api/workspace/' + WORKSPACE_ID + '/summary': jsonErr('Backend exploded', 500),
+      [`/api/workspace/${WORKSPACE_ID}/summary`]: jsonErr('Backend exploded', 500),
     }
     const fetchMock = stubFetchByUrl(routes)
     render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
@@ -246,7 +246,7 @@ describe('WorkspaceDetailPage', () => {
     const putBodies = []
     stubFetchByUrl(
       routesFor(summary, {
-        '/api/workspace/' + WORKSPACE_ID + '/permissions': (url, init) => {
+        [`/api/workspace/${WORKSPACE_ID}/permissions`]: (url, init) => {
           putBodies.push(JSON.parse(init.body))
           return jsonOk({ ok: true })
         },
@@ -291,7 +291,7 @@ describe('WorkspaceDetailPage', () => {
   it('keeps the host toggle pending and shows an inline error when the permission PUT fails', async () => {
     stubFetchByUrl(
       routesFor(makeSummary(), {
-        '/api/workspace/' + WORKSPACE_ID + '/permissions': jsonErr('Permission denied', 403),
+        [`/api/workspace/${WORKSPACE_ID}/permissions`]: jsonErr('Permission denied', 403),
       })
     )
     render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
@@ -316,7 +316,7 @@ describe('WorkspaceDetailPage', () => {
     const putBodies = []
     stubFetchByUrl(
       routesFor(summary, {
-        '/api/workspace/' + WORKSPACE_ID + '/permissions': (url, init) => {
+        [`/api/workspace/${WORKSPACE_ID}/permissions`]: (url, init) => {
           putBodies.push(JSON.parse(init.body))
           return jsonOk({ ok: true })
         },
@@ -334,8 +334,12 @@ describe('WorkspaceDetailPage', () => {
     expect(screen.getByText('Read and write access to workspace files.')).toBeInTheDocument()
     expect(screen.getByText('Host shell')).toBeInTheDocument()
     expect(screen.getAllByText('containerized')).toHaveLength(3)
-    expect(screen.getByText('git_read, git_write')).toBeInTheDocument()
-    expect(screen.getByText('read_file, file_editor, apply_edits')).toBeInTheDocument()
+    // Tools render as individual chips (not a comma-joined string).
+    expect(screen.getByText('git_read')).toBeInTheDocument()
+    expect(screen.getByText('git_write')).toBeInTheDocument()
+    expect(screen.getByText('read_file')).toBeInTheDocument()
+    expect(screen.getByText('file_editor')).toBeInTheDocument()
+    expect(screen.getByText('apply_edits')).toBeInTheDocument()
     expect(screen.getAllByText('Enabled')).toHaveLength(2)
     expect(screen.getByText('Disabled')).toBeInTheDocument()
 
@@ -351,6 +355,8 @@ describe('WorkspaceDetailPage', () => {
     fireEvent.click(applyButton)
 
     await waitFor(() => expect(putBodies.length).toBe(1))
+    // allow_host_resources is sent ONLY when the host toggle changed; a pure
+    // permission edit omits it (the backend treats an absent key as unchanged).
     expect(putBodies[0]).toEqual({
       permissions: {
         git: 'write',
@@ -360,7 +366,6 @@ describe('WorkspaceDetailPage', () => {
         tty: 'banned',
         jtag: 'banned',
       },
-      allow_host_resources: false,
     })
 
     // After the refetch the dropdown reflects the applied ceiling.
@@ -411,7 +416,8 @@ describe('WorkspaceDetailPage', () => {
     expect(screen.getByText('git')).toBeInTheDocument()
     expect(screen.getByText('requires allow_host_resources: true')).toBeInTheDocument()
     expect(screen.getByText('permission: banned')).toBeInTheDocument()
-    expect(screen.getByText('Controlled by permission ceiling')).toBeInTheDocument()
+    // Both fixture tools carry a permission_level, so the ceiling note appears twice.
+    expect(screen.getAllByText('Controlled by permission ceiling')).toHaveLength(2)
     expect(screen.getByText('Disabled')).toBeInTheDocument()
     expect(screen.getByText('Enabled')).toBeInTheDocument()
     // CRITICAL: no false empty-state string while tools exist.

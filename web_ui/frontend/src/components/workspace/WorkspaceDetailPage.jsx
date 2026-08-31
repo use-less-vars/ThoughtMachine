@@ -9,6 +9,7 @@
 import React, { useEffect, useState } from 'react'
 import useWorkspaceSummary from './useWorkspaceSummary'
 import { fetchTools, updateWorkspacePermissions } from './workspaceApi'
+import VaultHealthBanner from '../VaultHealthBanner'
 import './WorkspaceDetailPage.css'
 
 const TABS = [
@@ -23,6 +24,20 @@ const TABS = [
 
 const HOST_ENABLE_WARNING =
   'This allows resources to run on the host. Only enable for trusted, supervised workspaces.'
+
+// Inline styles for visuals the stylesheet does not define (CSS files are out
+// of scope this pass): the success message and the per-tool chips.
+const SUCCESS_STYLE = { color: '#a6e3a1', fontSize: '0.78rem' }
+const TOOL_CHIP_STYLE = {
+  display: 'inline-block',
+  background: '#313244',
+  border: '1px solid #45475a',
+  borderRadius: '10px',
+  padding: '0.05rem 0.5rem',
+  marginRight: '0.3rem',
+  fontSize: '0.72rem',
+  color: '#a6adc8',
+}
 
 function placeholderMessage(tab) {
   if (tab === 'Session Defaults') return 'Session defaults will be configurable here soon.'
@@ -55,6 +70,7 @@ function PermissionsResourcesTab({
   onApply,
   saving,
   applyError,
+  applySuccess,
   dirty,
 }) {
   const catalog = Array.isArray(summary.resource_catalog) ? summary.resource_catalog : []
@@ -75,10 +91,7 @@ function PermissionsResourcesTab({
         const grains = Array.isArray(entry.permission_grain_set)
           ? entry.permission_grain_set
           : []
-        const current =
-          localPermissions && name in localPermissions
-            ? localPermissions[name]
-            : grains[0] || 'banned'
+        const current = localPermissions?.[name] ?? 'banned'
         const disabled = current === 'banned'
         return (
           <div className="wdp-resource-card" key={name}>
@@ -130,7 +143,11 @@ function PermissionsResourcesTab({
             <div className="wdp-tools-list">
               <span className="wdp-tools-label">Tools:</span>
               {Array.isArray(entry.tools) && entry.tools.length > 0 ? (
-                entry.tools.join(', ')
+                entry.tools.map((tool) => (
+                  <span className="wdp-tools-chip" style={TOOL_CHIP_STYLE} key={tool}>
+                    {tool}
+                  </span>
+                ))
               ) : (
                 <span className="wdp-tools-none">none</span>
               )}
@@ -141,6 +158,11 @@ function PermissionsResourcesTab({
 
       <div className="wdp-perm-apply-row">
         {applyError && <div className="wdp-apply-error">{applyError}</div>}
+        {applySuccess && (
+          <div className="wdp-apply-success" style={SUCCESS_STYLE}>
+            {applySuccess}
+          </div>
+        )}
         <button type="button" className="wdp-apply" disabled={!dirty || saving} onClick={onApply}>
           {saving ? 'Saving…' : 'Apply Permissions'}
         </button>
@@ -385,6 +407,7 @@ export default function WorkspaceDetailPage({ workspaceId }) {
   const [localPermissions, setLocalPermissions] = useState(null)
   const [saving, setSaving] = useState(false)
   const [applyError, setApplyError] = useState(null)
+  const [applySuccess, setApplySuccess] = useState(null)
   const [activeTab, setActiveTab] = useState('Overview')
 
   // Keep the toggle and the permissions editor in sync with the persisted
@@ -417,6 +440,7 @@ export default function WorkspaceDetailPage({ workspaceId }) {
       // Turning OFF is safe — apply immediately to the pending state.
       setHostAllowed(false)
       setApplyError(null)
+      setApplySuccess(null)
     } else {
       // Turning ON requires explicit confirmation.
       setShowWarning(true)
@@ -427,29 +451,33 @@ export default function WorkspaceDetailPage({ workspaceId }) {
     setHostAllowed(true)
     setShowWarning(false)
     setApplyError(null)
+    setApplySuccess(null)
   }
 
   const handlePermissionChange = (resourceName, level) => {
     setLocalPermissions((prev) => ({ ...(prev || {}), [resourceName]: level }))
     setApplyError(null)
+    setApplySuccess(null)
   }
 
   // Shared by the header Apply button and the tab's "Apply Permissions"
-  // button. Both send the merged permission state plus the current host
-  // toggle state (the backend treats an absent allow_host_resources key as
-  // "unchanged", so sending the current value is a no-op when untouched).
+  // button. Both send the merged permission state; allow_host_resources is
+  // included ONLY when the host toggle actually changed (the backend treats
+  // an absent key as "unchanged").
   const handleApply = async () => {
     if (!summary || !pendingChanges || saving) return
     setSaving(true)
     setApplyError(null)
+    setApplySuccess(null)
     try {
       const payload = {
         permissions: localPermissions || summary.permissions || {},
-        allow_host_resources: hostAllowed,
+        ...(hostChanged ? { allow_host_resources: hostAllowed } : {}),
       }
       await updateWorkspacePermissions(workspaceId, payload)
       setShowWarning(false)
       await refetch()
+      setApplySuccess('Permissions updated')
     } catch (err) {
       // Keep the local pending state — the editor must NOT be reset on failure.
       setApplyError((err && err.message) || 'Failed to update workspace permissions')
@@ -527,7 +555,14 @@ export default function WorkspaceDetailPage({ workspaceId }) {
           </button>
         </div>
         {applyError && <div className="wdp-apply-error">{applyError}</div>}
+        {applySuccess && (
+          <div className="wdp-apply-success" style={SUCCESS_STYLE}>
+            {applySuccess}
+          </div>
+        )}
       </div>
+
+      <VaultHealthBanner />
 
       <div className="wdp-tabs" role="tablist">
         {TABS.map((tab) => (
@@ -589,6 +624,7 @@ export default function WorkspaceDetailPage({ workspaceId }) {
             onApply={handleApply}
             saving={saving}
             applyError={applyError}
+            applySuccess={applySuccess}
             dirty={permissionsDirty}
           />
         ) : activeTab === 'Containers' ? (
