@@ -595,6 +595,42 @@ def _resolve_provider_layer(
         return merged
 
 
+def _load_workspace_permission_ceiling(workspace_id: str) -> Dict[str, Any]:
+    """Load the workspace permission ceiling for *workspace_id*.
+
+    Mirrors ``workspace_routes._resolve_workspace_permissions`` without
+    importing that module (which pulls in the worker registry at import
+    time): the saved ``permissions`` map in the vault workspace
+    ``config.json`` wins; otherwise the workspace's purpose preset is the
+    ceiling.  Returns ``{}`` when the workspace has no config (no ceiling)
+    or on any failure.
+    """
+    from agent.config.workspace_purpose import apply_purpose_preset
+    from thoughtmachine.workspace_capabilities import _workspace_dir
+
+    cfg: Dict[str, Any] = {}
+    cfg_path = _workspace_dir(workspace_id) / "config.json"
+    try:
+        if cfg_path.exists():
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                cfg = data
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    saved = cfg.get("permissions")
+    if isinstance(saved, dict) and saved:
+        return {str(k): str(v) for k, v in saved.items()}
+
+    try:
+        preset = apply_purpose_preset(cfg.get("purpose", "general"))
+        if isinstance(preset, dict):
+            return preset
+    except Exception:
+        pass
+    return {}
+
+
 def resolve_full_config(
     workspace_id: Optional[str] = None,
     session_id: Optional[str] = None,
@@ -626,6 +662,21 @@ def resolve_full_config(
         except (OSError, json.JSONDecodeError) as exc:
             log("WARNING", "server.config", f"Could not load workspace config: {exc}")
 
+        # ── Workspace permission ceiling ────────────────────────────────
+        # The workspace's saved permission map (config.json "permissions",
+        # purpose preset as fallback) is a hard ceiling on session permission
+        # levels.  Loaded after the workspace layer so it reflects the
+        # workspace's own config; applied to the final merged
+        # session_permissions at the end of this function so no later layer
+        # (session config / worker overrides) can exceed it.
+        try:
+            _workspace_ceiling = _load_workspace_permission_ceiling(workspace_id)
+        except Exception as exc:
+            log("WARNING", "server.config",
+                f"Could not load workspace permission ceiling: {exc}")
+    else:
+        _workspace_ceiling = {}
+
     if session_id:
         try:
             from session.store import FileSystemSessionStore
@@ -644,6 +695,23 @@ def resolve_full_config(
 
     if worker_overrides and isinstance(worker_overrides, dict):
         merged = deep_merge(merged, worker_overrides)
+
+    # ── Apply the workspace permission ceiling last ─────────────────────
+    # The workspace is the hard ceiling for its sessions: whatever the
+    # session layer / worker overrides asked for, the effective level is the
+    # more restrictive of the two.
+    if _workspace_ceiling:
+        session_perms = merged.get("session_permissions")
+        if isinstance(session_perms, dict):
+            try:
+                from security.security_gate import apply_workspace_ceiling
+
+                merged["session_permissions"] = apply_workspace_ceiling(
+                    _workspace_ceiling, session_perms
+                )
+            except Exception as exc:
+                log("WARNING", "server.config",
+                    f"Could not apply workspace permission ceiling: {exc}")
 
     return merged
 

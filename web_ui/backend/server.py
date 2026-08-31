@@ -2641,6 +2641,7 @@ def vault_status_endpoint():
     ``info`` issues (e.g. unknown files) do not. On abort or unexpected
     failure the endpoint returns ``ok: False, status: "error"``.
     """
+    checker = None
     try:
         from agent.config.vault_drift import VaultDriftChecker, DriftAbortError
         from thoughtmachine.vault import vault_root
@@ -2648,7 +2649,24 @@ def vault_status_endpoint():
         checker = VaultDriftChecker(vault_root=vault_root())
         report = checker.check(apply_repairs=False)
     except DriftAbortError as exc:
-        return {"ok": False, "status": "error", "error": str(exc), "issues": []}
+        # The checker records a partial report (with the abort issue
+        # populated) before re-raising; surface those issues so the client
+        # sees WHY the check aborted instead of an empty list.
+        issues = []
+        try:
+            partial = checker.report()
+            if isinstance(partial, dict) and isinstance(partial.get("issues"), list):
+                issues = partial["issues"]
+        except Exception:
+            issues = []
+        if not issues:
+            issues = [{
+                "file": None,
+                "severity": "error",
+                "message": "Drift check aborted due to critical drift",
+                "action": "inspect the vault and fix the critical drift",
+            }]
+        return {"ok": False, "status": "error", "error": str(exc), "issues": issues}
     except Exception as exc:
         return {"ok": False, "status": "error", "error": str(exc), "issues": []}
     issues = report.get("issues", [])

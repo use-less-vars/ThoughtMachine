@@ -165,3 +165,75 @@ def test_vault_status_endpoint_no_secrets(client, monkeypatch, tmp_path):
     assert body["status"] == "warnings"
     assert "sk-secret" not in resp.text
     assert '"api_key"' not in resp.text
+
+
+def test_vault_status_endpoint_abort_drifts(client, monkeypatch, tmp_path):
+    """A DriftAbortError surfaces the partial report issues to the client."""
+    from agent.config.vault_drift import DriftAbortError
+
+    vault = tmp_path / "vault"
+    vault.mkdir(exist_ok=True)
+
+    class _AbortingChecker:
+        """VaultDriftChecker stand-in that aborts inside check()."""
+
+        def __init__(self, vault_root):
+            self.vault_root = vault_root
+
+        def check(self, apply_repairs=False):
+            raise DriftAbortError("manifest is invalid JSON")
+
+        def report(self):
+            return {
+                "status": "error",
+                "aborted": True,
+                "issues": [
+                    {
+                        "file": None,
+                        "severity": "error",
+                        "message": "Drift check aborted due to critical drift",
+                        "action": "inspect the vault and fix the critical drift",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr("agent.config.vault_drift.VaultDriftChecker", _AbortingChecker)
+    monkeypatch.setattr("thoughtmachine.vault.vault_root", lambda: vault)
+
+    resp = client.get("/api/vault/status")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["status"] == "error"
+    assert "manifest" in body["error"]
+    assert len(body["issues"]) >= 1
+    for issue in body["issues"]:
+        assert {"file", "severity", "message", "action"} <= set(issue.keys())
+
+
+def test_vault_status_endpoint_unexpected_error(client, monkeypatch, tmp_path):
+    """An unexpected checker failure returns ok=False with an empty issue list."""
+    vault = tmp_path / "vault"
+    vault.mkdir(exist_ok=True)
+
+    class _ExplodingChecker:
+        """VaultDriftChecker stand-in that raises a non-drift exception."""
+
+        def __init__(self, vault_root):
+            self.vault_root = vault_root
+
+        def check(self, apply_repairs=False):
+            raise ValueError("boom")
+
+    monkeypatch.setattr("agent.config.vault_drift.VaultDriftChecker", _ExplodingChecker)
+    monkeypatch.setattr("thoughtmachine.vault.vault_root", lambda: vault)
+
+    resp = client.get("/api/vault/status")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["status"] == "error"
+    assert body["issues"] == []
+
