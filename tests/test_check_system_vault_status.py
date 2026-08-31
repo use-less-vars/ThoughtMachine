@@ -54,8 +54,8 @@ def _make_clean_vault(root):
             "allowlist": ALLOWLIST_12,
             "sha256": ALLOWLIST_SHA256,
         },
-        "state/session_registry.json": [],
-        "state/workspace_registry.json": [],
+        "state/session_registry.json": {},
+        "state/workspace_registry.json": {},
         "user/defaults.json": {
             "provider_id": "",
             "model": "",
