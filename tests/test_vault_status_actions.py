@@ -105,7 +105,11 @@ def test_vault_status_warnings_with_actions_and_no_secrets(
 
 
 def test_vault_status_aborts_on_invalid_json(client, monkeypatch, tmp_path):
-    """Invalid JSON in a declared file aborts to the error shape, no secrets."""
+    """Invalid JSON in a declared file aborts to the error shape, no secrets.
+
+    A DriftAbortError surfaces the partial report issues (never empty) in
+    addition to the error message.
+    """
     vault = tmp_path / "vault"
     _seed_vault(vault)
     (vault / "agent_config.json").write_text("{not json{{", encoding="utf-8")
@@ -118,6 +122,9 @@ def test_vault_status_aborts_on_invalid_json(client, monkeypatch, tmp_path):
     assert body["ok"] is False
     assert body["status"] == "error"
     assert body["error"]
-    assert body["issues"] == []
+    # DriftAbortError surfaces the partial report issues (never empty).
+    assert len(body["issues"]) >= 1
+    for issue in body["issues"]:
+        assert {"file", "severity", "message", "action"} <= set(issue.keys())
     for fragment in _FORBIDDEN_FRAGMENTS:
         assert fragment not in resp.text, fragment
