@@ -6,9 +6,11 @@ Covers the split between worker config templates and live runtime state:
   only (one row per ``workers.json`` entry, no runtime/instance fields);
   the ``?name=`` filter narrows to a single template and 404s on unknown.
 * ``GET /api/workspace/{ws_id}/workers/active`` returns compact runtime
-  handles ``{worker_name, instance_id, status, elapsed}`` for the live
-  threads of the workspace's open sessions (falling back to a full-registry
-  scan when no open session maps to the workspace).
+  handles ``{worker_name, instance_id, status, elapsed, name, session_id,
+  last_heartbeat, container_id}`` for the live threads of the workspace's
+  open sessions (falling back to a full-registry scan when no open session
+  maps to the workspace); the optional ``?session_id=`` query param narrows
+  the result to the threads of a single session.
 
 All workspace filesystem access is redirected to the pytest tmp_path.
 """
@@ -137,8 +139,9 @@ def test_get_workers_name_filter_and_404(tmp_path, monkeypatch):
 
 def test_get_active_workers_session_scoped(tmp_path, monkeypatch):
     """Active workers come from the open sessions of this workspace only:
-    each handle carries exactly {worker_name, instance_id, status, elapsed},
-    duplicates are deduped, and the rows are sorted by name then instance."""
+    each handle carries exactly {worker_name, instance_id, status, elapsed,
+    name, session_id, last_heartbeat, container_id}, duplicates are deduped,
+    and the rows are sorted by name then instance."""
     _use_tmp_workspace(monkeypatch, tmp_path)
     started = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
 
@@ -164,9 +167,14 @@ def test_get_active_workers_session_scoped(tmp_path, monkeypatch):
     for entry in rows:
         assert set(entry.keys()) == {
             "worker_name", "instance_id", "status", "elapsed",
+            "name", "session_id", "last_heartbeat", "container_id",
         }, entry
 
     by_key = {(e["worker_name"], e["instance_id"]): e for e in rows}
+    assert by_key[("w1", 1)]["name"] == "w1"
+    assert by_key[("w1", 1)]["session_id"] == "s1"
+    assert by_key[("w1", 1)]["last_heartbeat"] is None
+    assert by_key[("w1", 1)]["container_id"] is None
     assert by_key[("w1", 1)]["status"] == "ready"
     assert abs(by_key[("w1", 1)]["elapsed"] - 10.0) < 3.0
     assert by_key[("w2", 2)]["status"] == "busy"
@@ -210,6 +218,7 @@ def test_get_active_workers_fallback_all_registry(tmp_path, monkeypatch):
     for entry in rows:
         assert set(entry.keys()) == {
             "worker_name", "instance_id", "status", "elapsed",
+            "name", "session_id", "last_heartbeat", "container_id",
         }, entry
 
 

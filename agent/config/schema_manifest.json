@@ -200,6 +200,34 @@
           "required": false,
           "redact": true,
           "description": "Provider API key. REDACTED in all checker output."
+        },
+        "mode": {
+          "type": "string",
+          "required": false,
+          "description": "Agent mode (e.g. agent, architect, engineer). Consumed by web_ui/backend/session_manager.py:67 and config_manager.py:91,277-278."
+        },
+        "workspace_path": {
+          "type": "string",
+          "required": false,
+          "description": "Workspace/project directory path. Consumed by startup_health_check, tool_executor, and the agent core."
+        },
+        "tool_output_token_limit": {
+          "type": "int",
+          "required": false,
+          "min": 0,
+          "description": "Cap on tool output tokens. Consumed by tool_executor.py and agent.py."
+        },
+        "token_monitor_warning_threshold": {
+          "type": "int",
+          "required": false,
+          "min": 0,
+          "description": "Token count threshold for warning state (agent/core/state.py, tool_executor.py)."
+        },
+        "token_monitor_critical_threshold": {
+          "type": "int",
+          "required": false,
+          "min": 0,
+          "description": "Token count threshold for critical state."
         }
       }
     },
@@ -255,6 +283,30 @@
           "required": false,
           "default": "",
           "description": "Global default system prompt."
+        },
+        "provider_type": {
+          "type": "string",
+          "required": false,
+          "default": "openai_compatible",
+          "description": "Provider type (e.g. openai_compatible)."
+        },
+        "provider_config": {
+          "type": "dict",
+          "required": false,
+          "default": {},
+          "description": "Provider-specific config (timeout, max_retries, ...)."
+        },
+        "model_override": {
+          "type": "string",
+          "required": false,
+          "default": null,
+          "description": "Model name override (null = use provider default)."
+        },
+        "stop_check": {
+          "type": "bool",
+          "required": false,
+          "default": null,
+          "description": "Whether to stop after first response (null = unset)."
         }
       }
     },
