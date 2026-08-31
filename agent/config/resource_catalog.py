@@ -6,6 +6,13 @@ controllable resource grains (``git_read``, ``git_write``, ``host_bash``,
 ``container``, ...), their permission levels (``banned|ask|read|write``),
 defaults, required workspace feature switches, and risk ratings.
 
+NOTE: the catalog FILE now carries the new resource-level array shape
+(``git`` / ``filesystem`` / ``docker`` / ``host_bash`` / ``tty`` / ``jtag``)
+and is the source of truth for the ``/api/resource-catalog`` endpoint.  This
+loader exposes a LEGACY tool-level view (the permission grains in
+``_LEGACY_RESOURCES``) for the permission machinery (workspace permission
+validation, purpose presets, risk model) so their behavior stays unchanged.
+
 Consumers: workspace permission endpoints (``web_ui/backend/workspace_routes.py``),
 the workspace purpose presets (``agent/config/workspace_purpose.py``) and the
 risk model (``agent/config/risk_model.py``).
@@ -20,11 +27,111 @@ from typing import Any, Dict, List, Optional, Tuple
 
 _CATALOG_PATH = Path(__file__).resolve().parent / "resource_catalog.json"
 
+#: Legacy tool-level resource grains exposed to the permission machinery.
+#: The on-disk catalog file is the NEW resource-level array; this constant is
+#: the authoritative legacy view so validation / presets / risk keep working.
+_LEGACY_RESOURCES = {
+    "git_read": {
+        "name": "Git Read",
+        "description": "Read-only git repository inspection (status, diff, log, branch).",
+        "default_permission": "read",
+        "required_workspace_switch": None,
+        "risk_level": "low",
+        "ui_category": "git",
+    },
+    "git_write": {
+        "name": "Git Write",
+        "description": "Git write operations (commit, init, clone, checkout, stage).",
+        "default_permission": "ask",
+        "required_workspace_switch": None,
+        "risk_level": "medium",
+        "ui_category": "git",
+    },
+    "host_bash": {
+        "name": "Host Bash",
+        "description": "Supervised shell command execution on the host machine.",
+        "default_permission": "banned",
+        "required_workspace_switch": "allow_host_resources",
+        "risk_level": "high",
+        "ui_category": "host",
+    },
+    "container": {
+        "name": "Container",
+        "description": "Docker container lifecycle and code execution in sandboxes.",
+        "default_permission": "ask",
+        "required_workspace_switch": "allow_docker",
+        "risk_level": "medium",
+        "ui_category": "sandbox",
+    },
+    "network": {
+        "name": "Network",
+        "description": "Outbound network access (HTTP requests, downloads, API calls).",
+        "default_permission": "ask",
+        "required_workspace_switch": None,
+        "risk_level": "medium",
+        "ui_category": "network",
+    },
+    "filesystem": {
+        "name": "Filesystem",
+        "description": "File read/write access to the workspace tree.",
+        "default_permission": "read",
+        "required_workspace_switch": None,
+        "risk_level": "low",
+        "ui_category": "filesystem",
+    },
+    "system": {
+        "name": "System",
+        "description": "Read-only system inspection (environment, processes, vault state).",
+        "default_permission": "read",
+        "required_workspace_switch": None,
+        "risk_level": "low",
+        "ui_category": "system",
+    },
+    "git": {
+        "name": "Git",
+        "description": "Legacy git permission grain (superseded by git_read / git_write).",
+        "default_permission": "read",
+        "required_workspace_switch": None,
+        "risk_level": "low",
+        "ui_category": "git",
+    },
+    "execution": {
+        "name": "Execution",
+        "description": "Arbitrary code execution outside sandboxes (high blast radius).",
+        "default_permission": "banned",
+        "required_workspace_switch": None,
+        "risk_level": "high",
+        "ui_category": "execution",
+    },
+    "mcp": {
+        "name": "MCP Integrations",
+        "description": "External MCP server tool integrations.",
+        "default_permission": "banned",
+        "required_workspace_switch": None,
+        "risk_level": "high",
+        "ui_category": "integrations",
+    },
+}
+
 
 def load_resource_catalog() -> Dict[str, Any]:
-    """Load the raw resource catalog JSON (uncached, always re-read)."""
+    """Load the resource catalog JSON (uncached, always re-read).
+
+    Shim: if the file still carries the legacy dict shape it is returned
+    as-is; if it carries the NEW array shape, the legacy dict view
+    ``{"schema_version": 1, "permission_levels": ["banned", "ask", "read",
+    "write"], "resources": _LEGACY_RESOURCES}`` is returned so the permission
+    machinery keeps its legacy tool-level semantics.
+    """
     with open(_CATALOG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    if isinstance(data, dict):
+        return data
+    return {
+        "schema_version": 1,
+        "permission_levels": ["banned", "ask", "read", "write"],
+        "resources": _LEGACY_RESOURCES,
+    }
 
 
 @lru_cache(maxsize=1)
@@ -34,12 +141,12 @@ def get_resource_catalog() -> Dict[str, Any]:
 
 
 def catalog_permission_levels() -> List[str]:
-    """Return the valid permission levels, e.g. ``["banned", "ask", "read", "write"]``."""
+    """Return the valid permission levels in canonical order."""
     return list(get_resource_catalog().get("permission_levels", []))
 
 
 def catalog_resource_names() -> List[str]:
-    """Return the canonical resource names (stable insertion order)."""
+    """Return the canonical resource names (legacy tool-level grains)."""
     return list(get_resource_catalog().get("resources", {}).keys())
 
 
@@ -49,7 +156,7 @@ def catalog_entry(name: str) -> Optional[Dict[str, Any]]:
 
 
 def catalog_default_permissions() -> Dict[str, str]:
-    """Return ``{resource_name: default_permission}`` for every catalog resource."""
+    """Return ``{resource_name: default_permission}`` for every resource."""
     defaults: Dict[str, str] = {}
     for name, entry in get_resource_catalog().get("resources", {}).items():
         defaults[name] = entry.get("default_permission", "banned")

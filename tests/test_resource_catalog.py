@@ -41,13 +41,44 @@ def test_resource_catalog_default_permissions():
 
 
 def test_resource_catalog_json_matches_loader():
-    """The on-disk JSON is the source of truth for the loader."""
+    """The on-disk file (new array shape) and the loader's legacy view agree.
+
+    The raw file is the new resource-level array (git / filesystem / docker /
+    host_bash / tty / jtag); the loader shims it into the legacy tool-level
+    dict view so the permission machinery keeps working unchanged.
+    """
     catalog_path = Path(__file__).resolve().parent.parent / "agent/config/resource_catalog.json"
     raw = json.loads(catalog_path.read_text(encoding="utf-8"))
-    assert raw["schema_version"] == 1
+
+    # New array shape: 6 resources, each with exactly the 8 canonical keys.
+    assert isinstance(raw, list)
+    assert len(raw) == 6
+    assert {entry["name"] for entry in raw} == {
+        "git", "filesystem", "docker", "host_bash", "tty", "jtag",
+    }
+    for entry in raw:
+        assert set(entry.keys()) == {
+            "name", "display_name", "description", "permission_grain_set",
+            "default_execution_context", "container_image",
+            "dockerfile_reference", "tools",
+        }
+    git_entry = next(e for e in raw if e["name"] == "git")
+    assert git_entry["dockerfile_reference"] == "docker/resource/git_overlay.Dockerfile"
+    assert git_entry["tools"] == ["git_read", "git_write"]
+
+    # Loader still exposes the legacy dict view for list-shaped files.
     loaded = get_resource_catalog()
-    assert loaded["schema_version"] == raw["schema_version"]
-    assert loaded["permission_levels"] == raw["permission_levels"]
-    assert loaded["resources"].keys() == raw["resources"].keys()
-    for name, entry in raw["resources"].items():
-        assert loaded["resources"][name] == entry
+    assert loaded["schema_version"] == 1
+    assert loaded["permission_levels"] == ["banned", "ask", "read", "write"]
+    assert list(loaded["resources"].keys()) == [
+        "git_read", "git_write", "host_bash", "container", "network",
+        "filesystem", "system", "git", "execution", "mcp",
+    ]
+    legacy_defaults = {
+        "git_read": "read", "git_write": "ask", "host_bash": "banned",
+        "container": "ask", "network": "ask", "filesystem": "read",
+        "system": "read", "git": "read", "execution": "banned",
+        "mcp": "banned",
+    }
+    for name, level in legacy_defaults.items():
+        assert loaded["resources"][name]["default_permission"] == level

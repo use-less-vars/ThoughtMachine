@@ -1,91 +1,106 @@
-{
-  "schema_version": 1,
-  "permission_levels": [
-    "banned",
-    "ask",
-    "read",
-    "write"
-  ],
-  "resources": {
-    "git_read": {
-      "name": "Git Read",
-      "description": "Read-only git repository inspection (status, diff, log, branch).",
-      "default_permission": "read",
-      "required_workspace_switch": null,
-      "risk_level": "low",
-      "ui_category": "git"
-    },
-    "git_write": {
-      "name": "Git Write",
-      "description": "Git write operations (commit, init, clone, checkout, stage).",
-      "default_permission": "ask",
-      "required_workspace_switch": null,
-      "risk_level": "medium",
-      "ui_category": "git"
-    },
-    "host_bash": {
-      "name": "Host Bash",
-      "description": "Supervised shell command execution on the host machine.",
-      "default_permission": "banned",
-      "required_workspace_switch": "allow_host_resources",
-      "risk_level": "high",
-      "ui_category": "host"
-    },
-    "container": {
-      "name": "Container",
-      "description": "Docker container lifecycle and code execution in sandboxes.",
-      "default_permission": "ask",
-      "required_workspace_switch": "allow_docker",
-      "risk_level": "medium",
-      "ui_category": "sandbox"
-    },
-    "network": {
-      "name": "Network",
-      "description": "Outbound network access (HTTP requests, downloads, API calls).",
-      "default_permission": "ask",
-      "required_workspace_switch": null,
-      "risk_level": "medium",
-      "ui_category": "network"
-    },
-    "filesystem": {
-      "name": "Filesystem",
-      "description": "File read/write access to the workspace tree.",
-      "default_permission": "read",
-      "required_workspace_switch": null,
-      "risk_level": "low",
-      "ui_category": "filesystem"
-    },
-    "system": {
-      "name": "System",
-      "description": "Read-only system inspection (environment, processes, vault state).",
-      "default_permission": "read",
-      "required_workspace_switch": null,
-      "risk_level": "low",
-      "ui_category": "system"
-    },
-    "git": {
-      "name": "Git",
-      "description": "Legacy git permission grain (superseded by git_read / git_write).",
-      "default_permission": "read",
-      "required_workspace_switch": null,
-      "risk_level": "low",
-      "ui_category": "git"
-    },
-    "execution": {
-      "name": "Execution",
-      "description": "Arbitrary code execution outside sandboxes (high blast radius).",
-      "default_permission": "banned",
-      "required_workspace_switch": null,
-      "risk_level": "high",
-      "ui_category": "execution"
-    },
-    "mcp": {
-      "name": "MCP Integrations",
-      "description": "External MCP server tool integrations.",
-      "default_permission": "banned",
-      "required_workspace_switch": null,
-      "risk_level": "high",
-      "ui_category": "integrations"
-    }
+[
+  {
+    "name": "git",
+    "display_name": "Git",
+    "description": "Git repository operations (read and write) via the git tools.",
+    "permission_grain_set": [
+      "banned",
+      "read",
+      "ask",
+      "write"
+    ],
+    "default_execution_context": "containerized",
+    "container_image": null,
+    "dockerfile_reference": "docker/resource/git_overlay.Dockerfile",
+    "tools": [
+      "git_read",
+      "git_write"
+    ]
+  },
+  {
+    "name": "filesystem",
+    "display_name": "Filesystem",
+    "description": "File read/write access to the workspace tree.",
+    "permission_grain_set": [
+      "banned",
+      "read",
+      "ask",
+      "write"
+    ],
+    "default_execution_context": "containerized",
+    "container_image": null,
+    "dockerfile_reference": null,
+    "tools": [
+      "read_file",
+      "file_editor",
+      "apply_edits",
+      "file_search",
+      "glob"
+    ]
+  },
+  {
+    "name": "docker",
+    "display_name": "Docker",
+    "description": "Docker container lifecycle and sandboxed code execution.",
+    "permission_grain_set": [
+      "banned",
+      "read",
+      "ask",
+      "write"
+    ],
+    "default_execution_context": "containerized",
+    "container_image": null,
+    "dockerfile_reference": "docker/resource/default_runtime.Dockerfile",
+    "tools": [
+      "docker_code_runner",
+      "container_control"
+    ]
+  },
+  {
+    "name": "host_bash",
+    "display_name": "Host Bash",
+    "description": "Supervised shell command execution on the host machine.",
+    "permission_grain_set": [
+      "banned",
+      "read",
+      "ask",
+      "write"
+    ],
+    "default_execution_context": "containerized",
+    "container_image": null,
+    "dockerfile_reference": null,
+    "tools": [
+      "host_bash"
+    ]
+  },
+  {
+    "name": "tty",
+    "display_name": "TTY",
+    "description": "Interactive terminal sessions.",
+    "permission_grain_set": [
+      "banned",
+      "read",
+      "ask",
+      "write"
+    ],
+    "default_execution_context": "containerized",
+    "container_image": null,
+    "dockerfile_reference": null,
+    "tools": []
+  },
+  {
+    "name": "jtag",
+    "display_name": "JTAG",
+    "description": "JTAG hardware debug probe access.",
+    "permission_grain_set": [
+      "banned",
+      "read",
+      "ask",
+      "write"
+    ],
+    "default_execution_context": "containerized",
+    "container_image": null,
+    "dockerfile_reference": null,
+    "tools": []
   }
-}
+]
