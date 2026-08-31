@@ -152,6 +152,7 @@ from web_ui.backend.logging_routes import router as logging_router
 from web_ui.backend.health_routes import router as health_router
 from web_ui.backend.session_routes import router as session_router
 from web_ui.backend.prompt_routes import router as prompt_router
+from web_ui.backend.global_routes import router as global_router
 
 # ── ConfigManager (facade for all config operations) ────────────────────────
 from web_ui.backend.config_manager import (
@@ -2452,6 +2453,7 @@ app.include_router(logging_router)
 
 app.include_router(session_router)
 app.include_router(prompt_router)
+app.include_router(global_router)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2663,6 +2665,33 @@ def vault_status_endpoint():
             "info": sum(1 for i in issues if i.get("severity") == "info"),
         },
     }
+
+
+# Source of truth for the resource catalog (repo-relative).
+_RESOURCE_CATALOG_PATH = Path(_project_root) / "agent" / "config" / "resource_catalog.json"
+
+
+@app.get("/api/resource-catalog")
+def resource_catalog_endpoint():
+    """Return the resource catalog as a bare JSON array.
+
+    Source of truth: ``agent/config/resource_catalog.json`` at the repo root
+    (the same file seeded into ``~/.thoughtmachine/system/resource_catalog.json``
+    by ``thoughtmachine.vault.ensure_vault_defaults``).  The response body IS
+    the array (no ``{items: [...]}`` wrapper): the frontend store only consumes
+    responses shaped ``{items: [...]}`` and otherwise falls back to its bundled
+    placeholder catalog, so the bare array keeps old clients safe while
+    exposing the repo source of truth to new consumers.  If the file cannot be
+    read (packaged build / partial checkout) an empty in-memory fallback is
+    returned instead of failing.
+    """
+    try:
+        data = json.loads(_RESOURCE_CATALOG_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+    return []
 
 
 @app.get("/api/container/integrity")

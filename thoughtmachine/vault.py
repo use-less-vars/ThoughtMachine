@@ -122,6 +122,7 @@ def ensure_vault_defaults(
     * ``system/factory_defaults.json``          — from ``resources/factory_defaults.json``
     * ``system/checksystem_allowlist.json``     — from ``resources/checksystem_allowlist.json``
     * ``system/providers.json``                 — from ``resources/default_providers.json``
+    * ``system/resource_catalog.json``          — from ``agent/config/resource_catalog.json``
     * ``system/default_system_prompt.txt``      — from ``resources/default_system_prompt.txt``
     * ``system/engineer_system_prompt.txt``     — from ``resources/engineer_system_prompt.txt``
     * ``system/.vault_version``                 — from ``get_version()``
@@ -161,7 +162,14 @@ def ensure_vault_defaults(
         overwrite_existing, created,
     )
 
-    # 4–5. Copy system prompt files
+    # 4. Copy resource_catalog.json (from agent/config/resource_catalog.json)
+    _copy_resource(
+        resources_dir.parent / "agent" / "config" / "resource_catalog.json",
+        root / "system" / "resource_catalog.json",
+        overwrite_existing, created,
+    )
+
+    # 5–6. Copy system prompt files
     _copy_resource(
         resources_dir / "default_system_prompt.txt",
         root / "system" / "default_system_prompt.txt",
@@ -173,14 +181,14 @@ def ensure_vault_defaults(
         overwrite_existing, created,
     )
 
-    # 6. Write .vault_version marker
+    # 7. Write .vault_version marker
     _write_file(
         get_version(),
         root / "system" / ".vault_version",
         overwrite_existing, created,
     )
 
-    # 7–8. Write empty state registry files
+    # 8–9. Write empty state registry files
     _write_file(
         "[]\n",
         root / "state" / "session_registry.json",

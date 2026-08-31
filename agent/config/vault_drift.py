@@ -788,7 +788,7 @@ class VaultDriftChecker:
             drifts = finfo.get("drifts") or []
             for d in drifts:
                 message = d.get("hint") or d.get("issue", status)
-                action = d.get("action", "")
+                action = d.get("action")
                 seen_messages.add(message)
                 issues.append({
                     "file": relpath,
@@ -812,7 +812,7 @@ class VaultDriftChecker:
                     "file": None,
                     "severity": "warning",
                     "message": w,
-                    "action": "",
+                    "action": None,
                 })
         return issues
 
