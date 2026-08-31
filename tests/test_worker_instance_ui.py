@@ -3,10 +3,10 @@
 Covers the instance-aware worker UI upgrade end to end at the backend
 boundary:
 
-* ``GET /api/workspace/{ws_id}/workers`` returns one row per worker
-  INSTANCE (``instance_id`` / ``instance_label``), merging runtime status,
-  persisted-context markers and per-instance token counts; the ``?name=``
-  filter narrows to a single worker.
+* ``GET /api/workspace/{ws_id}/workers`` returns the raw worker config
+  templates only (one row per template, no runtime fields); live worker
+  threads are exposed separately via ``GET .../workers/active``. The
+  ``?name=`` filter narrows to a single template.
 * ``POST .../workers/{name}/stop|pause|resume`` accept an optional
   ``instance_id`` query param: with it, the command.json / status.json files
   are written to the instance directory (``<name>#<N>``) and the registry
@@ -95,11 +95,11 @@ def _write_json(path, data):
 # ── GET /api/workspace/{ws_id}/workers ──────────────────────────────────────
 
 
-def test_get_workers_returns_one_row_per_instance(tmp_path, monkeypatch):
-    """workers.json configs merge with per-instance status dirs: legacy
-    ``w1``/``w2`` plus instance dir ``w2#2`` yields 4 rows (w1/1, w2/1,
-    w2/2, w3/1), each carrying instance_id/instance_label and the right
-    runtime/persisted-context fields."""
+def test_get_workers_returns_templates_only(tmp_path, monkeypatch):
+    """GET /workers returns raw config templates only: one row per
+    workers.json entry, with NO runtime/instance fields merged in even when
+    per-instance status dirs exist (runtime state lives on
+    ``/workers/active``). Legacy bare-string entries become {"name": ...}."""
     now = datetime.now(timezone.utc)
     _use_tmp_workspace(monkeypatch, tmp_path)
     _write_json(tmp_path / "workers.json", [
@@ -107,6 +107,8 @@ def test_get_workers_returns_one_row_per_instance(tmp_path, monkeypatch):
         {"name": "w2", "system_prompt": "p2"},
         {"name": "w3", "system_prompt": "p3"},
     ])
+    # Per-instance status/context dirs that the old merged endpoint would
+    # have folded into the rows - they must now be ignored entirely.
     _write_json(tmp_path / "workers" / "w1" / "status.json", {
         "runtime_status": "busy",
         "current_task": "task",
@@ -139,41 +141,30 @@ def test_get_workers_returns_one_row_per_instance(tmp_path, monkeypatch):
     })
 
     rows = asyncio.run(workspace_routes.get_workers("ws-1"))
-    assert len(rows) == 4, f"expected 4 rows, got {len(rows)}: {rows}"
-    by_key = {(e["name"], e["instance_id"]): e for e in rows}
+    assert len(rows) == 3, f"expected 3 template rows, got {len(rows)}: {rows}"
+    by_name = {e["name"]: e for e in rows}
 
-    w1 = by_key[("w1", 1)]
-    assert w1["instance_label"] == "w1"
-    assert w1["runtime_status"] == "busy"
-    assert w1["pruned_since_last_query"] == 2
-    assert w1["has_persisted_context"] is True
-    assert abs(w1["time_since_last_query"] - 5.0) < 3.0, w1["time_since_last_query"]
-    assert w1["current_context_tokens"] == 123
-    assert w1["max_context_tokens"] == 456
+    w1 = by_name["w1"]
+    assert w1 == {"name": "w1", "system_prompt": "p1"}
+    # No instance/runtime fields are merged into templates.
+    assert "instance_id" not in w1
+    assert "instance_label" not in w1
+    assert "runtime_status" not in w1
+    assert "current_context_tokens" not in w1
+    assert "has_persisted_context" not in w1
 
-    w2_1 = by_key[("w2", 1)]
-    assert w2_1["instance_label"] == "w2"
-    assert w2_1["runtime_status"] == "ready"
+    assert by_name["w2"] == {"name": "w2", "system_prompt": "p2"}
+    assert by_name["w3"] == {"name": "w3", "system_prompt": "p3"}
 
-    w2_2 = by_key[("w2", 2)]
-    assert w2_2["instance_id"] == 2
-    assert w2_2["instance_label"] == "w2#2"
-    assert w2_2["runtime_status"] == "busy"
-    assert w2_2["current_task"] == "t2"
-    assert w2_2["current_context_tokens"] == 30
-    assert w2_2["max_context_tokens"] == 40
-
-    w3 = by_key[("w3", 1)]
-    assert w3["instance_label"] == "w3"
-    assert w3["runtime_status"] is None
-    assert w3["session_id"] is None
-    assert w3["has_persisted_context"] is False
-    assert w3["time_since_last_query"] is None
+    # Legacy bare-string entry -> {"name": ...}.
+    _write_json(tmp_path / "workers.json", ["legacy-w"])
+    rows = asyncio.run(workspace_routes.get_workers("ws-1"))
+    assert rows == [{"name": "legacy-w"}]
 
 
 def test_get_workers_name_filter(tmp_path, monkeypatch):
-    """?name= returns a single dict for a matching worker (with instance
-    fields) and 404s for an unknown name."""
+    """?name= returns the single raw template dict for a matching worker
+    (no instance fields) and 404s for an unknown name."""
     _use_tmp_workspace(monkeypatch, tmp_path)
     _write_json(tmp_path / "workers.json", [
         {"name": "w1", "system_prompt": "p1"},
@@ -181,9 +172,9 @@ def test_get_workers_name_filter(tmp_path, monkeypatch):
     ])
     entry = asyncio.run(workspace_routes.get_workers("ws-1", name="w1"))
     assert isinstance(entry, dict)
-    assert entry["name"] == "w1"
-    assert entry["instance_id"] == 1
-    assert entry["instance_label"] == "w1"
+    assert entry == {"name": "w1", "system_prompt": "p1"}
+    assert "instance_id" not in entry
+    assert "instance_label" not in entry
 
     with pytest.raises(HTTPException) as exc:
         asyncio.run(workspace_routes.get_workers("ws-1", name="nope"))

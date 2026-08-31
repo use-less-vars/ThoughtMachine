@@ -336,9 +336,10 @@ class TestGetWorkerByName:
         assert data["description"] == body["description"]
         assert data["system_prompt"] == body["system_prompt"]
         assert data["tools"] == body["tools"]
-        # Runtime fields may be None if the worker was never started
-        assert "runtime_status" in data
-        assert "has_persisted_context" in data
+        # Templates-only contract: live runtime state is NOT merged into this
+        # endpoint (it is served by GET /api/workspace/{ws_id}/workers/active).
+        assert "runtime_status" not in data
+        assert "has_persisted_context" not in data
 
     def test_get_worker_by_name_missing(self, client, tmp_path):
         """GET ?name=nonexistent → 404."""
