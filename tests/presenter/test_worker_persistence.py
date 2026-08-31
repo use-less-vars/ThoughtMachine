@@ -210,8 +210,31 @@ class TestResumeWorker:
 #  Workspace routes — get_workers (persisted context flag)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestGetWorkersPersistedContextFlag:
-    """The ``get_workers`` endpoint detects persisted contexts on disk."""
+class TestGetWorkersTemplatesOnly:
+    """The ``get_workers`` endpoint returns raw worker templates only.
+
+    Runtime/instance state is deliberately NOT merged into the rows: on-disk
+    ``workers/<name>/context.json`` and ``status.json`` files are ignored
+    (live state is served separately by ``/workers/active``). Mirrors
+    ``test_worker_instance_ui.py::test_get_workers_returns_templates_only``.
+    """
+
+    _RUNTIME_KEYS = (
+        "instance_id", "instance_label", "runtime_status",
+        "has_persisted_context", "pruned_since_last_query",
+        "time_since_last_query", "started_at", "last_query_at",
+        "paused_manually", "current_task", "current_context_tokens",
+        "max_context_tokens", "session_id", "error", "last_heartbeat",
+    )
+
+    def _assert_raw_templates(self, result, configs):
+        """Rows must equal the raw workers.json configs, no runtime keys."""
+        assert len(result) == len(configs)
+        by_name = {e["name"]: e for e in result}
+        assert by_name == {c["name"]: c for c in configs}
+        for entry in result:
+            for key in self._RUNTIME_KEYS:
+                assert key not in entry, f"runtime key {key!r} leaked into template row"
 
     def _make_workers_json(self, ws_dir: Path, configs: list[dict]) -> None:
         """Write a workers.json config file."""
@@ -219,68 +242,63 @@ class TestGetWorkersPersistedContextFlag:
 
     @patch("tools.workspace.worker._worker_registry", {})
     @patch("tools.workspace.worker._registry_lock", MagicMock())
-    def test_has_persisted_context_flag(self, ws_dir: Path):
-        """Workers with context.json on disk get has_persisted_context=True."""
+    def test_on_disk_context_is_ignored(self, ws_dir: Path):
+        """context.json on disk is NOT reflected in the template rows."""
         from web_ui.backend.workspace_routes import get_workers
 
-        self._make_workers_json(ws_dir, [
+        configs = [
             {"name": "alpha", "system_prompt": "you are alpha"},
             {"name": "beta", "system_prompt": "you are beta"},
-        ])
-        # Create persisted context for alpha only
+        ]
+        self._make_workers_json(ws_dir, configs)
+        # Create persisted context for alpha only - it must be ignored.
         _make_context(ws_dir / "workers", "alpha", {"msg": "persisted"})
 
         import asyncio
         result = asyncio.run(get_workers("ws_test", name=None))
 
-        alpha_entry = next(e for e in result if e["name"] == "alpha")
-        beta_entry = next(e for e in result if e["name"] == "beta")
-        assert alpha_entry["has_persisted_context"] is True
-        assert beta_entry["has_persisted_context"] is False
+        self._assert_raw_templates(result, configs)
 
     @patch("tools.workspace.worker._worker_registry", {})
     @patch("tools.workspace.worker._registry_lock", MagicMock())
-    def test_all_false_when_no_workers_dir(self, ws_dir: Path):
-        """When no workers/ directory exists, all workers have has_persisted_context=False."""
+    def test_no_workers_dir_returns_raw_template(self, ws_dir: Path):
+        """With no workers/ dir on disk, the row is the raw config template."""
         from web_ui.backend.workspace_routes import get_workers
 
-        self._make_workers_json(ws_dir, [
-            {"name": "gamma"},
-        ])
+        configs = [{"name": "gamma"}]
+        self._make_workers_json(ws_dir, configs)
         import asyncio
         result = asyncio.run(get_workers("ws_test", name=None))
-        assert result[0]["has_persisted_context"] is False
+        self._assert_raw_templates(result, configs)
 
     @patch("tools.workspace.worker._worker_registry", {})
     @patch("tools.workspace.worker._registry_lock", MagicMock())
-    def test_all_false_when_empty_workers_dir(self, ws_dir: Path):
-        """When workers/ dir exists but empty, has_persisted_context is False."""
+    def test_empty_workers_dir_returns_raw_template(self, ws_dir: Path):
+        """An empty workers/ dir on disk does not change the template row."""
         from web_ui.backend.workspace_routes import get_workers
 
-        self._make_workers_json(ws_dir, [{"name": "delta"}])
+        configs = [{"name": "delta"}]
+        self._make_workers_json(ws_dir, configs)
         (ws_dir / "workers").mkdir(parents=True)
 
         import asyncio
         result = asyncio.run(get_workers("ws_test", name=None))
-        assert result[0]["has_persisted_context"] is False
+        self._assert_raw_templates(result, configs)
 
     @patch("tools.workspace.worker._worker_registry", {})
     @patch("tools.workspace.worker._registry_lock", MagicMock())
-    def test_true_for_multiple_persisted_workers(self, ws_dir: Path):
-        """Multiple workers with context.json all get has_persisted_context=True."""
+    def test_multiple_persisted_workers_still_templates_only(self, ws_dir: Path):
+        """Multiple context.json dirs are ignored; rows stay raw templates."""
         from web_ui.backend.workspace_routes import get_workers
 
-        self._make_workers_json(ws_dir, [
-            {"name": "one"},
-            {"name": "two"},
-        ])
+        configs = [{"name": "one"}, {"name": "two"}]
+        self._make_workers_json(ws_dir, configs)
         _make_context(ws_dir / "workers", "one", {})
         _make_context(ws_dir / "workers", "two", {})
 
         import asyncio
         result = asyncio.run(get_workers("ws_test", name=None))
-        flags = {e["name"]: e["has_persisted_context"] for e in result}
-        assert flags == {"one": True, "two": True}
+        self._assert_raw_templates(result, configs)
 
     @patch("tools.workspace.worker._worker_registry", {})
     @patch("tools.workspace.worker._registry_lock", MagicMock())

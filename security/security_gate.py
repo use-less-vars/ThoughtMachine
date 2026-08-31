@@ -121,6 +121,118 @@ def _min_permission(
     return override_val if _level(override_val) < _level(effective_val) else effective_val
 
 
+# ── Workspace permission ceiling ──────────────────────────────────────────
+# The workspace's saved permission map (vault ``workspaces/<id>/config.json``
+# ``permissions`` key, with the purpose preset as fallback) declares the
+# maximum each resource may be used at inside that workspace.  The ceiling
+# ordering below is the workspace contract:
+#     banned(0) < read(1) < ask(2) < write(3) < write_feature_branches(4)
+# ``write_feature_branches`` is a workspace-only level meaning "unlimited"
+# (it does not exist as a session level).  Note this ordering is NOT the same
+# as ``_min_permission``'s internal level map (where ask < read); ceiling
+# comparisons follow the workspace contract above.
+
+_WORKSPACE_CEILING_LEVELS: Dict[str, float] = {
+    "banned": 0.0,
+    "read": 1.0,
+    "ask": 2.0,
+    "write": 3.0,
+    "full": 3.0,  # session-side alias for write-level
+    "none": 1.0,  # alias used by some purpose presets
+    "outbound": 2.5,  # session-side network level
+    "write_feature_branches": 4.0,  # unlimited ceiling
+}
+
+# Workspace permission-map resource names -> session-permissions keys they cap.
+# Accepts both the NEW workspace map names (filesystem, docker, host_bash, git,
+# network, git_read, git_write) and the OLD purpose-preset names (container,
+# git_read, git_write, host_bash, network, filesystem).
+_WORKSPACE_RESOURCE_MAP: Dict[str, str] = {
+    "filesystem": "filesystem",
+    "docker": "container",
+    "container": "container",
+    "host_bash": "host_bash",
+    "git": "git",
+    "network": "network",
+    "git_read": "git_read",
+    "git_write": "git_write",
+}
+
+
+def apply_workspace_ceiling(
+    workspace_permissions: Dict[str, Any],
+    session_permissions: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Cap session permission levels at the workspace permission ceiling.
+
+    Returns a NEW dict; ``session_permissions`` is not mutated.  For every
+    resource present in ``workspace_permissions`` the result is the more
+    restrictive of the workspace ceiling and the session value, following the
+    workspace ordering::
+
+        banned(0) < read(1) < ask(2) < write(3) < write_feature_branches(4)
+
+    Rules:
+        * A resource missing from ``workspace_permissions`` has no ceiling —
+          the session value stands.
+        * A ``write_feature_branches`` ceiling means "unlimited" — the
+          session value stands.
+        * An unknown ceiling level is treated as no ceiling (fail-open), so
+          forward-compatible workspace maps never break session resolution.
+        * Boolean session values (``container``) survive only when the
+          ceiling is write-level or unlimited; any stricter ceiling forces
+          ``False``.  The ``container`` key is always emitted as a boolean.
+        * Unknown session keys are passed through untouched.
+    """
+    if not workspace_permissions:
+        return dict(session_permissions)
+
+    result = dict(session_permissions)
+    for resource, ceiling in workspace_permissions.items():
+        key = _WORKSPACE_RESOURCE_MAP.get(resource)
+        if key is None or key not in result:
+            continue  # unknown resource / not a session key: no ceiling
+        session_val = result[key]
+
+        # Normalise the ceiling to a rank; unknown ceilings are fail-open.
+        if isinstance(ceiling, bool):
+            ceiling_rank = 3.0 if ceiling else 0.0
+        elif isinstance(ceiling, str):
+            ceiling_rank = _WORKSPACE_CEILING_LEVELS.get(ceiling.lower())
+        else:
+            ceiling_rank = None
+        if ceiling_rank is None:
+            continue
+        if ceiling_rank >= 4.0:
+            continue  # write_feature_branches -> unlimited
+
+        # Container is a boolean in SessionPermissions; always emit a bool.
+        if key == "container":
+            if isinstance(session_val, bool):
+                result[key] = session_val and ceiling_rank >= 3.0
+            else:
+                session_rank = _WORKSPACE_CEILING_LEVELS.get(str(session_val).lower())
+                session_rank = session_rank if session_rank is not None else 0.0
+                result[key] = min(session_rank, ceiling_rank) >= 3.0
+            continue
+
+        if isinstance(session_val, bool):
+            # Non-container boolean — hard allow survives only write-level
+            # ceilings.
+            if session_val and ceiling_rank < 3.0:
+                result[key] = False
+            continue
+
+        # String session values: the more restrictive (lower) rank wins.
+        session_rank = _WORKSPACE_CEILING_LEVELS.get(str(session_val).lower())
+        if session_rank is None:
+            continue
+        if ceiling_rank < session_rank:
+            result[key] = ceiling if isinstance(ceiling, bool) else str(ceiling).lower()
+    return result
+
+
 def split_git_permission(level: Any) -> tuple:
     """Split a merged git permission level into ``(read, write)`` sub-levels.
 
@@ -160,6 +272,7 @@ def split_git_permission(level: Any) -> tuple:
 def get_effective_permissions(
     session: SessionPermissions,
     workspace: WorkspaceCapabilities,
+    workspace_permissions: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Merge the session's permission profile with the workspace's capabilities.
@@ -177,7 +290,30 @@ def get_effective_permissions(
     (merged with ``workspace.git_available`` via ``_min_permission``), and
     otherwise derived from the merged ``git`` value via
     :func:`split_git_permission` (backward compatibility).
+
+    Args:
+        workspace_permissions:
+            Optional workspace-level permission ceilings — a dict mapping
+            workspace resource names (``filesystem``, ``docker``, ``host_bash``,
+            ``git``, ``network``, ``git_read``, ``git_write``) to their maximum
+            allowed level (e.g. ``{"filesystem": "read", "docker": "banned"}``).
+            Applied to the session profile BEFORE the workspace-capability merge
+            via :func:`apply_workspace_ceiling`, so a session can never exceed
+            the workspace's declared ceiling for this workspace.
     """
+    # ── Workspace permission ceiling ────────────────────────────────────
+    # The workspace's permission map is a hard ceiling on the session's
+    # permission levels; apply it to the raw session profile first.  The
+    # workspace-capability merge below can then only make the result more
+    # restrictive, never raise the session back above the ceiling.
+    if workspace_permissions:
+        raw = session.model_dump() if hasattr(session, "model_dump") else dict(session.__dict__)
+        capped = apply_workspace_ceiling(workspace_permissions, raw)
+        try:
+            session = SessionPermissions(**capped)
+        except Exception:
+            pass  # keep the original session if the capped profile is not schema-valid
+
     # ── Filesystem ──────────────────────────────────────────────────────
     # Workspace filesystem_write caps write access; if False, downgrade to read.
     fs = session.filesystem

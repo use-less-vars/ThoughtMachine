@@ -38,6 +38,16 @@ _registry_lock = _WorkerRegistry.get_instance()._registry_lock
 
 from agent.models.worker_definition import WorkerDefinition
 
+# Module-level reference for monkeypatchability in tests; the import is
+# guarded so a failing worker module can never break router import.
+try:
+    from tools.workspace.worker_manager import get_manager as _get_worker_manager
+except Exception:  # pragma: no cover - defensive
+    _get_worker_manager = None
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_RESOURCE_CATALOG_PATH = _PROJECT_ROOT / "agent" / "config" / "resource_catalog.json"
+
 # ── Router ───────────────────────────────────────────────────────────────────
 
 router = APIRouter(prefix="/api/workspace")
@@ -386,23 +396,6 @@ async def put_domain_allowlist(ws_id: str, body: DomainAllowlistBody):
 # ── GET /api/workspace/{ws_id}/workers ───────────────────────────────────────
 
 
-def _seconds_since_heartbeat(iso_ts: Optional[str]) -> Optional[float]:
-    """Seconds elapsed since an ISO-8601 heartbeat timestamp.
-
-    Returns None when the timestamp is absent or unparseable. Naive
-    timestamps are treated as UTC; negative deltas (clock skew) clamp to 0.
-    """
-    if not iso_ts:
-        return None
-    try:
-        parsed = datetime.fromisoformat(str(iso_ts).replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
-
-
 def _worker_instance_key(label: str):
     """Split a worker directory label into (base_name, instance_id).
 
@@ -436,29 +429,19 @@ async def get_workers(
     ws_id: str,
     name: Optional[str] = Query(None, description="Filter to a single worker by name"),
 ):
-    """Return worker configs merged with runtime status and persisted context.
+    """Return the worker config templates defined for this workspace.
 
-    Each worker entry includes:
-      - Config fields from workers.json (name, system_prompt, tool_classes, etc.)
-      - instance_id:     1 for the legacy/default instance, N for N>1
-      - instance_label:  "<name>" for instance 1, "<name>#<N>" for N>1
-      - runtime_status:  "ready" | "busy" | "completed" | "error" | None
-      - current_task:    current activity description (if running)
-      - last_heartbeat:  ISO-8601 timestamp of last activity
-      - started_at:      ISO-8601 timestamp when the worker thread started
-      - last_query_at:   ISO-8601 timestamp of the last query accepted
-      - paused_manually: True only while the worker is manual-only paused
-      - error:           error message (if failed)
-      - has_persisted_context: whether the worker has saved conversation on disk
-
-    One entry is emitted per live on-disk instance of each config; configs
-    without any on-disk instance keep a single entry at instance 1.
+    This endpoint is intentionally configuration-only: each entry is a raw
+    template from ``workers.json`` (name, system_prompt, tool_classes, ...).
+    Live runtime state is exposed separately via
+    ``GET /api/workspace/{ws_id}/workers/active``, so the frontend can render
+    template CRUD and runtime monitoring independently.
     """
     name = _query_default(name)
     ensure_workspace_dirs(ws_id)
     ws_dir = _workspace_dir(ws_id)
 
-    # 1. Load worker configurations from workers.json
+    # Load worker configurations from workers.json
     config_path = ws_dir / "workers.json"
     if config_path.exists():
         try:
@@ -468,169 +451,160 @@ async def get_workers(
     else:
         configs = []
 
-    # 2. Read runtime status from status.json written by the worker thread.
-    #    This bridges the agent process and the backend API server process.
-    #    Supports both structures:
-    #      - workers/<name>/status.json (no session)
-    #      - workers/<session_id>/<name>/status.json (session-scoped)
-    workers_dir = ws_dir / "workers"
-    runtime_statuses = {}
-    if workers_dir.is_dir():
-        for subdir in workers_dir.iterdir():
-            if not subdir.is_dir():
-                continue
-            # Check if this is a session directory (contains sub-worker dirs)
-            first_child = next(subdir.iterdir(), None) if subdir.is_dir() else None
-            if first_child is not None and first_child.is_dir():
-                # Session-scoped: workers/<session_id>/<name>/
-                session_id = subdir.name
-                for worker_subdir in subdir.iterdir():
-                    if worker_subdir.is_dir():
-                        status_path = worker_subdir / "status.json"
-                        if status_path.exists():
-                            try:
-                                data = json.loads(status_path.read_text(encoding="utf-8"))
-                                runtime_statuses[worker_subdir.name] = {
-                                    "runtime_status": data.get("runtime_status"),
-                                    "current_task": data.get("current_task"),
-                                    "last_heartbeat": data.get("last_heartbeat"),
-                                    "error": data.get("error"),
-                                    "session_id": data.get("session_id") or session_id,
-                                    "current_context_tokens": data.get("current_context_tokens"),
-                                    "max_context_tokens": data.get("max_context_tokens"),
-                                    "started_at": data.get("started_at"),
-                                    "last_query_at": data.get("last_query_at"),
-                                    "paused_manually": data.get("paused_manually"),
-                                }
-                            except (json.JSONDecodeError, OSError):
-                                pass
-            else:
-                # Legacy: workers/<name>/
-                status_path = subdir / "status.json"
-                if status_path.exists():
-                    try:
-                        data = json.loads(status_path.read_text(encoding="utf-8"))
-                        runtime_statuses[subdir.name] = {
-                            "runtime_status": data.get("runtime_status"),
-                            "current_task": data.get("current_task"),
-                            "last_heartbeat": data.get("last_heartbeat"),
-                            "error": data.get("error"),
-                            "session_id": data.get("session_id"),
-                            "current_context_tokens": data.get("current_context_tokens"),
-                            "max_context_tokens": data.get("max_context_tokens"),
-                            "started_at": data.get("started_at"),
-                            "last_query_at": data.get("last_query_at"),
-                            "paused_manually": data.get("paused_manually"),
-                        }
-                    except (json.JSONDecodeError, OSError):
-                        pass
-
-    # 3. Check for persisted contexts on disk
-    #    Supports both legacy and session-scoped structures. Also collects the
-    #    worker's ``pruned_since_last_query`` counter from context.json (the
-    #    stale/abandoned-attempt prune tally persisted by the worker thread).
-    persisted_names = set()
-    pruned_since_last_query: Dict[str, int] = {}
-    if workers_dir.is_dir():
-        for subdir in workers_dir.iterdir():
-            if not subdir.is_dir():
-                continue
-            first_child = next(subdir.iterdir(), None) if subdir.is_dir() else None
-            if first_child is not None and first_child.is_dir():
-                # Session-scoped: workers/<session_id>/<name>/context.json
-                for worker_subdir in subdir.iterdir():
-                    if worker_subdir.is_dir() and (worker_subdir / "context.json").exists():
-                        persisted_names.add(worker_subdir.name)
-                        try:
-                            ctx = json.loads(
-                                (worker_subdir / "context.json").read_text(encoding="utf-8")
-                            )
-                            count = int(ctx.get("pruned_since_last_query") or 0)
-                            pruned_since_last_query[worker_subdir.name] = max(
-                                pruned_since_last_query.get(worker_subdir.name, 0), count
-                            )
-                        except (json.JSONDecodeError, OSError, TypeError, ValueError):
-                            pass
-            else:
-                # Legacy: workers/<name>/context.json
-                if (subdir / "context.json").exists():
-                    persisted_names.add(subdir.name)
-                    try:
-                        ctx = json.loads(
-                            (subdir / "context.json").read_text(encoding="utf-8")
-                        )
-                        count = int(ctx.get("pruned_since_last_query") or 0)
-                        pruned_since_last_query[subdir.name] = max(
-                            pruned_since_last_query.get(subdir.name, 0), count
-                        )
-                    except (json.JSONDecodeError, OSError, TypeError, ValueError):
-                        pass
-
-    # 4. Merge everything — one entry per runtime/persisted instance per config.
-    #    Worker dirs are keyed by instance label ("<name>" for instance 1,
-    #    "<name>#<N>" for N>1), so a single config may back several live
-    #    instances.  Configs with no on-disk instance keep the legacy single
-    #    entry (instance_id 1, all runtime fields None).
-    instances_by_name: Dict[str, set] = {}
-    for label in set(runtime_statuses) | set(persisted_names):
-        base, iid = _worker_instance_key(label)
-        instances_by_name.setdefault(base, set()).add(iid)
-
-    result = []
+    result: List[Dict[str, Any]] = []
     for cfg in configs:
         if isinstance(cfg, str):
-            # Entry is just a string name — promote to a minimal dict
-            worker_name = cfg
-            cfg = {"name": cfg}
-        else:
-            worker_name = cfg.get("name", "")
-        iids = sorted(instances_by_name.get(worker_name, set()) or {1})
-        for iid in iids:
-            label = _WorkerRegistry.instance_label(worker_name, iid)
-            entry = dict(cfg)
-            entry["instance_id"] = iid
-            entry["instance_label"] = label
-            rt = runtime_statuses.get(label)
-            if rt is not None:
-                entry["runtime_status"] = rt["runtime_status"]
-                entry["current_task"] = rt["current_task"]
-                entry["last_heartbeat"] = rt["last_heartbeat"]
-                entry["error"] = rt["error"]
-                entry["session_id"] = rt["session_id"]
-                entry["current_context_tokens"] = rt["current_context_tokens"]
-                entry["max_context_tokens"] = rt["max_context_tokens"]
-                entry["started_at"] = rt["started_at"]
-                entry["last_query_at"] = rt["last_query_at"]
-                entry["paused_manually"] = rt["paused_manually"]
-            else:
-                entry["runtime_status"] = None
-                entry["current_task"] = None
-                entry["last_heartbeat"] = None
-                entry["error"] = None
-                entry["session_id"] = None
-                entry["current_context_tokens"] = None
-                entry["max_context_tokens"] = None
-                entry["started_at"] = None
-                entry["last_query_at"] = None
-                entry["paused_manually"] = None
-            entry["has_persisted_context"] = label in persisted_names
-            entry["pruned_since_last_query"] = pruned_since_last_query.get(label, 0)
-            entry["time_since_last_query"] = _seconds_since_heartbeat(
-                entry.get("last_heartbeat")
-            )
-            result.append(entry)
+            # Legacy shorthand: a bare name with no config fields.
+            result.append({"name": cfg})
+        elif isinstance(cfg, dict):
+            result.append(cfg)
 
-    # 5. Optional ?name= filter — return single worker entry or 404
     if name is not None:
-        for entry in result:
-            if entry.get("name") == name:
-                return entry
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Worker '{name}' not found",
-        )
+        match = [cfg for cfg in result if cfg.get("name") == name]
+        if not match:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Worker '{name}' not found",
+            )
+        return match[0]
 
     return result
+
+
+# ── GET /api/workspace/{ws_id}/workers/active ─────────────────────────────────
+
+
+def _resolve_worker_manager():
+    """Return the live WorkerManager singleton, or None if unavailable."""
+    if _get_worker_manager is None:
+        return None
+    try:
+        return _get_worker_manager()
+    except Exception:
+        return None
+
+
+def _worker_elapsed_seconds(started_at: Optional[str]) -> Optional[float]:
+    """Seconds since *started_at* (ISO-8601), rounded to 1 decimal place.
+
+    Returns ``None`` when the timestamp is missing or unparseable, and never
+    returns a negative value (a clock skew between the worker thread and this
+    process is clamped to zero).
+    """
+    if not started_at:
+        return None
+    try:
+        parsed = started_at.replace("Z", "+00:00")
+        started = datetime.fromisoformat(parsed)
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        delta = (datetime.now(timezone.utc) - started).total_seconds()
+        return round(max(0.0, delta), 1)
+    except (ValueError, TypeError):
+        return None
+
+
+def _worker_active_entry(thread) -> Dict[str, Any]:
+    """Map a live WorkerThread to its compact runtime handle."""
+    return {
+        "worker_name": getattr(thread, "worker_name", ""),
+        "instance_id": getattr(thread, "instance_id", 1),
+        "status": getattr(thread, "status", "unknown"),
+        "elapsed": _worker_elapsed_seconds(getattr(thread, "started_at", None)),
+    }
+
+
+def _collect_active_workers(ws_id: str) -> List[Dict[str, Any]]:
+    """Collect live worker threads belonging to *ws_id*.
+
+    Resolution order:
+      1. Sessions registered for this workspace (``SessionRegistry``); worker
+         threads are looked up per session via the WorkerManager.
+      2. Fallback when no open session maps to the workspace: scan the entire
+         worker registry and keep threads whose session id is empty or whose
+         thread cannot be attributed to another workspace.
+    """
+    manager = _resolve_worker_manager()
+    if manager is None:
+        return []
+
+    entries: List[Dict[str, Any]] = []
+    seen = set()
+
+    session_ids: List[str] = []
+    try:
+        from session.session_registry import SessionRegistry
+
+        sessions = SessionRegistry.get_default().get_all()
+        if isinstance(sessions, dict):
+            for s in sessions.values():
+                if not isinstance(s, dict):
+                    continue
+                if s.get("workspace_id") == ws_id and s.get("is_open"):
+                    sid = str(s.get("session_id") or "")
+                    if sid:
+                        session_ids.append(sid)
+    except Exception:
+        session_ids = []
+
+    def _append(thread) -> None:
+        key = (
+            getattr(thread, "session_id", "") or "",
+            getattr(thread, "worker_name", "") or "",
+            getattr(thread, "instance_id", 1),
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        entries.append(_worker_active_entry(thread))
+
+    if session_ids:
+        for sid in session_ids:
+            try:
+                threads = manager.list_workers(sid) or []
+            except Exception:
+                threads = []
+            for thread in threads:
+                _append(thread)
+    else:
+        # No open session maps to this workspace: fall back to a full-registry
+        # scan and keep threads that are not attributable to another workspace.
+        try:
+            registry = getattr(manager, "_registry", None)
+            all_workers = getattr(registry, "get_all_workers", lambda: {})() or {}
+        except Exception:
+            all_workers = {}
+        for (sid, _wname, _iid), thread in all_workers.items():
+            try:
+                from session.session_registry import SessionRegistry
+
+                sessions = SessionRegistry.get_default().get_all()
+                owner_ws = None
+                if isinstance(sessions, dict):
+                    s = sessions.get(str(sid))
+                    if isinstance(s, dict):
+                        owner_ws = s.get("workspace_id")
+                if sid and owner_ws != ws_id:
+                    continue
+            except Exception:
+                pass
+            _append(thread)
+
+    entries.sort(key=lambda e: (e["worker_name"], e["instance_id"]))
+    return entries
+
+
+@router.get("/{ws_id}/workers/active")
+async def get_active_workers(ws_id: str) -> List[Dict[str, Any]]:
+    """Return live worker threads for the workspace (runtime handles only).
+
+    Each handle carries exactly ``{worker_name, instance_id, status, elapsed}``
+    where ``elapsed`` is the seconds since the thread started (None when the
+    start timestamp is missing). Template definitions are served by
+    ``GET /api/workspace/{ws_id}/workers`` instead.
+    """
+    return _collect_active_workers(ws_id)
+
 
 # ── POST /api/workspace/{ws_id}/workers ───────────────────────────────────────
 
@@ -1494,6 +1468,189 @@ async def create_workspace(body: WorkspaceCreateBody) -> Dict[str, Any]:
         "permissions": permissions,
         "allow_host_resources": allow_host_resources,
         "risk": risk,
+    }
+
+
+# ── GET /api/workspace/{ws_id}/summary ────────────────────────────────────────
+
+
+def _workspace_root_mountable(entry) -> bool:
+    """True when the workspace root exists and is outside the vault.
+
+    The vault root (~/.thoughtmachine) is the trust anchor and must never be
+    mounted into a container; the registry should never contain it, but a
+    defensive check keeps this invariant cheap to enforce.
+    """
+    try:
+        root = os.path.abspath(os.path.expanduser(entry.root_path))
+        vault = str(_vault_root_path())
+        if root == vault or root.startswith(vault + os.sep):
+            return False
+        return bool(root)
+    except Exception:
+        return False
+
+
+def _containers_for_workspace(entry) -> Optional[List[Dict[str, Any]]]:
+    """List the docker containers provisioned for this workspace.
+
+    Returns ``None`` when the workspace root is not mountable or the container
+    manager cannot be reached (e.g. no docker daemon) - callers treat None as
+    "unknown" and fall back to an empty list. Mirrors global_routes.py.
+    """
+    if not _workspace_root_mountable(entry):
+        return None
+    try:
+        from infra.container_manager import ContainerManager
+
+        manager = ContainerManager(
+            workspace_path=entry.root_path,
+            workspace_id=entry.id,
+            session_id=None,
+            session_permissions=None,
+        )
+        raw = manager.list_containers() or []
+        handles = []
+        for c in raw:
+            name = c.get("name") or ""
+            handles.append(
+                {
+                    "id": c.get("container_id") or "",
+                    "name": name,
+                    "type": "resource" if name.startswith("tm-res-") else "free_use",
+                    "workspace_id": c.get("workspace_id") or entry.id,
+                    "status": c.get("status") or "unknown",
+                }
+            )
+        handles.sort(key=lambda h: h["name"])
+        return handles
+    except Exception:
+        return None
+
+
+@router.get("/{ws_id}/summary")
+async def get_workspace_overview(ws_id: str) -> Dict[str, Any]:
+    """Return a full read-only overview of a workspace for the UI dashboard.
+
+    Combines configuration (permissions ceiling, capabilities, dockerfile,
+    worker templates) with live state (active worker threads, open sessions,
+    provisioned containers) and global registries (tool list, resource
+    catalog). No secrets are included: file contents are limited to the
+    workspace Dockerfile.
+    """
+    registry = WorkspaceRegistry.get_default()
+    entry = registry.get_workspace(ws_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workspace '{ws_id}' not found",
+        )
+
+    # Permissions ceiling (saved config wins, else purpose preset, else {}).
+    try:
+        from web_ui.backend.config_manager import _load_workspace_permission_ceiling
+
+        permissions = _load_workspace_permission_ceiling(ws_id)
+    except Exception:
+        permissions = {}
+    if not isinstance(permissions, dict):
+        permissions = {}
+
+    # Capability flags (default = fully permissive when nothing saved).
+    try:
+        capabilities = WorkspaceCapabilities.default()
+        caps = load_workspace_capabilities(ws_id)
+        if caps is not None:
+            capabilities = caps
+    except Exception:
+        capabilities = WorkspaceCapabilities.default()
+
+    # Workspace Dockerfile (content is safe - it is user-authored build config).
+    dockerfile_path = _workspace_dir(ws_id) / "Dockerfile"
+    try:
+        dockerfile = {
+            "path": str(dockerfile_path),
+            "content": dockerfile_path.read_text(encoding="utf-8"),
+        }
+    except OSError:
+        dockerfile = {"path": str(dockerfile_path), "content": None}
+
+    # Worker templates (config only) + live worker threads.
+    try:
+        worker_templates = await get_workers(ws_id)
+    except Exception:
+        worker_templates = []
+    try:
+        active_workers = _collect_active_workers(ws_id)
+    except Exception:
+        active_workers = []
+
+    # Open sessions for this workspace.
+    active_sessions: List[Dict[str, Any]] = []
+    try:
+        from session.session_registry import SessionRegistry
+
+        sessions = SessionRegistry.get_default().get_all()
+        if isinstance(sessions, dict):
+            for s in sessions.values():
+                if not isinstance(s, dict):
+                    continue
+                if s.get("workspace_id") != ws_id or not s.get("is_open"):
+                    continue
+                active_sessions.append(
+                    {
+                        "session_id": str(s.get("session_id") or ""),
+                        "workspace_id": ws_id,
+                        "name": s.get("name") or "",
+                        "mode": s.get("mode") or "",
+                        "started_at": s.get("created_at") or "",
+                    }
+                )
+            active_sessions.sort(key=lambda s: s["session_id"])
+    except Exception:
+        active_sessions = []
+
+    # Provisioned containers for this workspace.
+    try:
+        active_containers = _containers_for_workspace(entry) or []
+    except Exception:
+        active_containers = []
+
+    # Tool registry + resource catalog.
+    try:
+        from session.tool_presets import _ALL_TOOLS
+    except ImportError:
+        try:
+            from agent.config.presets import _ALL_TOOLS
+        except ImportError:
+            _ALL_TOOLS = []
+    tools = sorted(_ALL_TOOLS) if isinstance(_ALL_TOOLS, (list, tuple)) else []
+
+    resource_catalog: List[Any] = []
+    try:
+        if _RESOURCE_CATALOG_PATH.is_file():
+            data = json.loads(_RESOURCE_CATALOG_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                resource_catalog = data
+    except (OSError, ValueError):
+        resource_catalog = []
+
+    return {
+        "workspace_id": ws_id,
+        "label": entry.label or entry.id,
+        "root_path": entry.root_path,
+        "allow_host_resources": bool(
+            _load_workspace_config(ws_id).get("allow_host_resources", False)
+        ),
+        "permissions": permissions,
+        "capabilities": capabilities.to_dict(),
+        "dockerfile": dockerfile,
+        "worker_templates": worker_templates,
+        "active_workers": active_workers,
+        "active_sessions": active_sessions,
+        "active_containers": active_containers,
+        "tools": tools,
+        "resource_catalog": resource_catalog,
     }
 
 

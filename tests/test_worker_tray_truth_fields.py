@@ -1,11 +1,14 @@
 """Worker tray truth-field tests.
 
 Verifies that ``WorkerThread`` publishes started_at / last_query_at /
-paused_manually truth to both ``status.json`` and the ``get_workers``
-REST endpoint: the thread stamps ``started_at`` at birth, ``last_query_at``
-when a query is dequeued, and ``paused_manually`` exactly while the worker
-is manual-only paused (``worker_query="manual_only"``), never for a plain
-pause.
+paused_manually truth to ``status.json``: the thread stamps ``started_at``
+at birth, ``last_query_at`` when a query is dequeued, and ``paused_manually``
+exactly while the worker is manual-only paused
+(``worker_query="manual_only"``), never for a plain pause.
+
+The ``get_workers`` REST endpoint is deliberately untouched by tray
+state — it returns raw worker templates without any runtime keys, so no
+tray truth-field assertions live here for it.
 """
 
 import asyncio
@@ -151,7 +154,7 @@ def test_paused_manually_true_only_for_manual_only_pause(tmp_path, monkeypatch):
     assert _wait_until(lambda: _status()["paused_manually"] is False)
 
 
-def test_get_workers_returns_all_three_fields(tmp_path, monkeypatch):
+def test_get_workers_returns_templates_without_tray_fields(tmp_path, monkeypatch):
     def _use_tmp_workspace(monkeypatch, tmp_path):
         monkeypatch.setattr(workspace_routes, "_workspace_dir", lambda ws_id: tmp_path)
         monkeypatch.setattr(workspace_routes, "ensure_workspace_dirs", lambda ws_id: None)
@@ -199,19 +202,24 @@ def test_get_workers_returns_all_three_fields(tmp_path, monkeypatch):
     # w3 deliberately has no status.json -> all three fields None.
 
     result = asyncio.run(workspace_routes.get_workers("ws-1"))
+    # get_workers is TEMPLATES-ONLY: entries are the raw workers.json
+    # entries verbatim, and no runtime/tray state key is ever merged in,
+    # even when a status.json exists on disk for that worker.
+    assert len(result) == 3
     by_name = {e["name"]: e for e in result}
+    assert by_name == {c["name"]: c for c in [
+        {"name": "w1"}, {"name": "w2"}, {"name": "w3"},
+    ]}
 
-    w1 = by_name["w1"]
-    assert w1["started_at"] == (now - timedelta(minutes=10)).isoformat()
-    assert w1["last_query_at"] == (now - timedelta(minutes=1)).isoformat()
-    assert w1["paused_manually"] is True
-
-    w2 = by_name["w2"]
-    assert w2["started_at"] == (now - timedelta(hours=1)).isoformat()
-    assert w2["last_query_at"] == (now - timedelta(minutes=5)).isoformat()
-    assert w2["paused_manually"] is False
-
-    w3 = by_name["w3"]
-    assert w3["started_at"] is None
-    assert w3["last_query_at"] is None
-    assert w3["paused_manually"] is None
+    runtime_keys = (
+        "started_at",
+        "last_query_at",
+        "paused_manually",
+        "runtime_status",
+        "instance_id",
+        "instance_label",
+        "has_persisted_context",
+    )
+    for entry in result:
+        for key in runtime_keys:
+            assert key not in entry, f"{key} leaked into template: {entry}"

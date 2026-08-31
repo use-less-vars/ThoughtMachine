@@ -153,6 +153,7 @@ from web_ui.backend.health_routes import router as health_router
 from web_ui.backend.session_routes import router as session_router
 from web_ui.backend.prompt_routes import router as prompt_router
 from web_ui.backend.global_routes import router as global_router
+from web_ui.backend.provider_routes import router as provider_router
 
 # ── ConfigManager (facade for all config operations) ────────────────────────
 from web_ui.backend.config_manager import (
@@ -538,9 +539,9 @@ async def lifespan(app: FastAPI):
         log('WARNING', 'server', f'EventLogger shutdown error: {exc}')
 
 
-# ── Graceful shutdown: save open sessions on Ctrl+C / SIGTERM ───────────────
-# When the server terminates (Ctrl+C / SIGINT / SIGTERM), we need to ensure
-# open sessions are saved before the process exits.
+# ── Graceful shutdown: save open sessions on normal process exit ─────────────
+# When the server terminates, we need to ensure open sessions are saved
+# before the process exits.
 #
 # Approach:
 # 1. _session_bridges — dict mapping session_id → WebAgentBridge (warm cache).
@@ -550,10 +551,12 @@ async def lifespan(app: FastAPI):
 # 4. asyncio.Event — the WebSocket handler checks this event between
 #    messages and exits promptly, letting its ``finally`` block run.
 #
-# Note: atexit handlers do *not* run on SIGKILL or hard crashes, but they
-# do run on normal Ctrl+C (SIGINT -> KeyboardInterrupt -> sys.exit).
+# IMPORTANT: signal handlers are deliberately NOT installed at import time.
+# uvicorn overwrites the process signal handlers (SIGINT/SIGTERM) when its
+# event loop starts, so handlers registered here would be clobbered before
+# serving begins. The atexit hook is the import-time side effect that
+# survives — uvicorn's Ctrl+C handling leads to a normal interpreter exit.
 
-import signal
 import atexit
 
 _session_bridges: Dict[str, Any] = {}  # session_id → WebAgentBridge (warm cache)
@@ -590,43 +593,8 @@ def _shutdown_save() -> None:
     _session_bridges.clear()
 
 
-def _trigger_shutdown() -> None:
-    """Called by the signal handler — sets the shutdown event.
-
-    If an asyncio loop is running (uvicorn), sets the event for graceful
-    shutdown.  Otherwise, raises ``KeyboardInterrupt`` so the process
-    actually stops even outside an event loop (e.g. during tests).
-    """
-    event = _get_shutdown_event()
-    no_loop = False
-    try:
-        import asyncio
-        try:
-            loop = asyncio.get_running_loop()
-            if loop.is_running():
-                loop.call_soon_threadsafe(event.set)
-                log('INFO', 'server', 'Shutdown signal received — finishing in-flight work...')
-                return
-        except RuntimeError:
-            pass
-        event.set()
-        no_loop = True
-    except Exception:
-        pass
-
-    log('INFO', 'server', 'Shutdown signal received — finishing in-flight work...')
-    if no_loop:
-        # No asyncio loop — likely running outside uvicorn (e.g. tests).
-        # The event set above won't be checked by anyone, so we need to
-        # actually stop execution.
-        raise KeyboardInterrupt()
-
-
 # Register atexit handler to save sessions on normal exit (Ctrl+C etc.)
 atexit.register(_shutdown_save)
-# Signal handlers (also set the asyncio event so the WS loop can detect shutdown)
-_orig_sigint = signal.signal(signal.SIGINT, lambda sig, frame: _trigger_shutdown())
-_orig_sigterm = signal.signal(signal.SIGTERM, lambda sig, frame: _trigger_shutdown())
 
 
 app = FastAPI(
@@ -2454,6 +2422,7 @@ app.include_router(logging_router)
 app.include_router(session_router)
 app.include_router(prompt_router)
 app.include_router(global_router)
+app.include_router(provider_router)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2641,6 +2610,7 @@ def vault_status_endpoint():
     ``info`` issues (e.g. unknown files) do not. On abort or unexpected
     failure the endpoint returns ``ok: False, status: "error"``.
     """
+    checker = None
     try:
         from agent.config.vault_drift import VaultDriftChecker, DriftAbortError
         from thoughtmachine.vault import vault_root
@@ -2648,7 +2618,24 @@ def vault_status_endpoint():
         checker = VaultDriftChecker(vault_root=vault_root())
         report = checker.check(apply_repairs=False)
     except DriftAbortError as exc:
-        return {"ok": False, "status": "error", "error": str(exc), "issues": []}
+        # The checker records a partial report (with the abort issue
+        # populated) before re-raising; surface those issues so the client
+        # sees WHY the check aborted instead of an empty list.
+        issues = []
+        try:
+            partial = checker.report()
+            if isinstance(partial, dict) and isinstance(partial.get("issues"), list):
+                issues = partial["issues"]
+        except Exception:
+            issues = []
+        if not issues:
+            issues = [{
+                "file": None,
+                "severity": "error",
+                "message": "Drift check aborted due to critical drift",
+                "action": "inspect the vault and fix the critical drift",
+            }]
+        return {"ok": False, "status": "error", "error": str(exc), "issues": issues}
     except Exception as exc:
         return {"ok": False, "status": "error", "error": str(exc), "issues": []}
     issues = report.get("issues", [])
