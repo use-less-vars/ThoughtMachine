@@ -1,31 +1,115 @@
 // @vitest-environment jsdom
-/*
- * WorkspaceSelector.test.jsx — landing selector tests (Phase 1).
- *
- * Tests the REAL WorkspaceSelector (src/components/WorkspaceSelector.jsx)
- * against the real workspaceStore. Navigation goes through the hash router
- * (../router.js), so after create/click the hash is `#/workspace/<id>`.
- * The selector does NOT fetch on mount — only the Refresh button does.
- */
+// --- WorkspaceSelector.test.jsx ---
+// Global Management landing view: summary-driven sections, host risk tags,
+// session navigation, vault health banner, credentials/resources rendering,
+// refresh and the custom-workspace modal flow.
 
 import React from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
 import '@testing-library/jest-dom/vitest'
 import WorkspaceSelector from '../WorkspaceSelector'
 import useWorkspaceStore from '../../store/workspaceStore'
-import purposeDefinitions from '../../data/purposeDefinitions.json'
 
-// ---------------------------------------------------------------------------
-// fetch stub (only used by the Refresh test)
-// ---------------------------------------------------------------------------
 function jsonOk(data, status = 200) {
   return { ok: true, status, json: async () => data, text: async () => JSON.stringify(data) }
 }
 
-// ---------------------------------------------------------------------------
-// Setup / teardown
-// ---------------------------------------------------------------------------
+function stubFetchByUrl(routes) {
+  const calls = []
+  const fetchMock = vi.fn(async (input, init) => {
+    const url = typeof input === 'string' ? input : String(input)
+    calls.push(url)
+    const func = routes.find((r) => typeof r.match === 'function' && r.match(url, init))
+    const str = routes
+      .filter((r) => typeof r.match === 'string' && url.includes(r.match))
+      .sort((a, b) => b.match.length - a.match.length)[0]
+    const route = func || str
+    if (!route) return { ok: true, status: 200, json: async () => ({}), text: async () => '' }
+    const value = typeof route.value === 'function' ? route.value(url, init) : route.value
+    return value
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  return { fetchMock, calls }
+}
+
+const SUMMARY = {
+  workspaces: [
+    {
+      id: 'ws-a',
+      label: 'Alpha Workspace',
+      active_sessions_count: 2,
+      total_workers: 3,
+      last_active: '2026-08-01T10:00:00Z',
+      status: 'running',
+      allow_host_resources: true,
+    },
+    {
+      id: 'ws-b',
+      label: 'Beta Workspace',
+      active_sessions_count: 0,
+      total_workers: 0,
+      last_active: null,
+      status: 'idle',
+      allow_host_resources: false,
+    },
+  ],
+  active_sessions: [
+    {
+      session_id: 'sess-1',
+      workspace_id: 'ws-a',
+      name: 'Refactor Session',
+      mode: 'engineer',
+      worker_count: 2,
+      started_at: '2026-08-30T12:00:00Z',
+    },
+    {
+      session_id: 'sess-2',
+      workspace_id: 'ws-b',
+      name: 'Research Session',
+      mode: 'research',
+      worker_count: 1,
+      started_at: '2026-08-29T08:00:00Z',
+    },
+  ],
+  active_containers: [
+    { name: 'alpha-ctr', type: 'free_use', workspace_id: 'ws-a', status: 'running' },
+    { name: 'beta-ctr', type: 'resource', workspace_id: 'ws-b', status: 'stopped' },
+  ],
+  providers: [],
+}
+
+const RESOURCE = {
+  id: 'npm_cache',
+  display_name: 'npm cache',
+  description: 'Shared npm cache',
+  permission_grain_set: ['read', 'write'],
+  default_execution_context: 'container',
+  tools: ['npm'],
+  dockerfile_reference: 'cache.Dockerfile',
+}
+
+const ROUTES = [
+  { match: '/api/global/summary', value: jsonOk(SUMMARY) },
+  { match: '/api/vault/status', value: jsonOk({ ok: true }) },
+  { match: '/api/credentials', value: jsonOk({ credentials: [{ name: 'github_token' }, { name: 'openai_api_key' }] }) },
+  { match: '/api/resource-catalog', value: jsonOk({ items: [RESOURCE] }) },
+  { match: '/api/prompts', value: jsonOk([]) },
+]
+
+const MODAL_ROUTES = [
+  ...ROUTES,
+  { match: '/api/user-home', value: jsonOk({ home: '/home/test' }) },
+  {
+    match: (url) => url.startsWith('/api/browse'),
+    value: (url) => {
+      const p = new URL(url, 'http://x').searchParams.get('path')
+      return jsonOk({ success: true, current_path: p, entries: p === '/home/test' ? [{ name: 'project-a', is_dir: true }] : [] })
+    },
+  },
+  { match: '/api/workspace/resolve', value: jsonOk({ workspace_id: 'ws-custom', root: '/home/test/project-a' }) },
+]
+
 beforeEach(() => {
   localStorage.clear()
   window.location.hash = ''
@@ -38,144 +122,112 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
-// ===========================================================================
-// Structure
-// ===========================================================================
-describe('WorkspaceSelector — structure', () => {
-  it('renders the sidebar title and the main heading', () => {
+describe('WorkspaceSelector', () => {
+  it('renders all global management sections and fetches the summary', async () => {
+    const { calls } = stubFetchByUrl(ROUTES)
     render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
     expect(screen.getByRole('heading', { name: 'Workspaces' })).toBeInTheDocument()
-    expect(
-      screen.getByRole('heading', { name: 'What kind of work do you want to do today?' })
-    ).toBeInTheDocument()
-  }, 20000)
+    expect(screen.getByRole('heading', { name: 'Active Sessions' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Active Containers' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Global Resources' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Global Credentials' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Global Sysprompts' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Providers' })).toBeInTheDocument()
 
-  it('renders a purpose card for every entry in purposeDefinitions', () => {
-    render(<WorkspaceSelector />)
-    purposeDefinitions.forEach((p) => {
-      expect(screen.getByRole('heading', { level: 4, name: p.label })).toBeInTheDocument()
-    })
-    expect(screen.getAllByRole('heading', { level: 4 })).toHaveLength(purposeDefinitions.length)
+    expect(calls.some((u) => u.includes('/api/global/summary'))).toBe(true)
   })
 
-  it('renders full card contents: risk, icon, description, settings, docker requirement', () => {
-    render(<WorkspaceSelector />)
-    purposeDefinitions.forEach((p) => {
-      const card = screen.getByRole('heading', { level: 4, name: p.label }).closest('.ws-card')
-      expect(within(card).getByText(p.risk)).toBeInTheDocument()
-      expect(within(card).getByRole('img', { name: p.label })).toBeInTheDocument()
-      expect(within(card).getByText(p.description)).toBeInTheDocument()
-      expect(within(card).getByText(p.recommendedSettings)).toBeInTheDocument()
-      expect(
-        within(card).getByText(`Requires Docker: ${p.requiresDocker ? 'yes' : 'no'}`)
-      ).toBeInTheDocument()
-    })
+  it('shows host allow/forbid tags', async () => {
+    stubFetchByUrl(ROUTES)
+    const { container } = render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    expect(screen.getByText('Host: allowed')).toBeInTheDocument()
+    expect(screen.getByText('Host: forbidden')).toBeInTheDocument()
+    expect(container.querySelector('.ws-card .ws-risk.allow').textContent).toBe('Host: allowed')
+    expect(container.querySelector('.ws-card .ws-risk.forbid').textContent).toBe('Host: forbidden')
   })
 
-  it('shows the correct Requires Docker yes/no counts across cards', () => {
+  it('navigates to a workspace when a card is clicked', async () => {
+    stubFetchByUrl(ROUTES)
     render(<WorkspaceSelector />)
-    const yes = purposeDefinitions.filter((p) => p.requiresDocker).length
-    const no = purposeDefinitions.length - yes
-    expect(screen.getAllByText('Requires Docker: yes')).toHaveLength(yes)
-    expect(screen.getAllByText('Requires Docker: no')).toHaveLength(no)
-  })
-})
 
-// ===========================================================================
-// Purpose card selection (create + navigate)
-// ===========================================================================
-describe('WorkspaceSelector — purpose selection', () => {
-  it('creates a workspace and navigates when a card is clicked', () => {
-    render(<WorkspaceSelector />)
-    fireEvent.click(screen.getByRole('heading', { level: 4, name: 'Code Development' }).closest('.ws-card'))
-    const list = useWorkspaceStore.getState().workspaceList
-    const created = list.find((w) => w.purposeId === 'code-development')
-    expect(created).toBeTruthy()
-    expect(window.location.hash).toBe(`#/workspace/${created.id}`)
-  })
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
 
-  it('creates a workspace on Enter keydown', () => {
-    render(<WorkspaceSelector />)
-    fireEvent.keyDown(
-      screen.getByRole('heading', { level: 4, name: 'Writing & Research' }).closest('.ws-card'),
-      { key: 'Enter' }
-    )
-    const created = useWorkspaceStore.getState().workspaceList.find(
-      (w) => w.purposeId === 'writing-research'
-    )
-    expect(created).toBeTruthy()
-    expect(window.location.hash).toBe(`#/workspace/${created.id}`)
-  })
-
-  it('creates a workspace on Space keydown', () => {
-    render(<WorkspaceSelector />)
-    fireEvent.keyDown(
-      screen.getByRole('heading', { level: 4, name: 'Blank Workspace' }).closest('.ws-card'),
-      { key: ' ' }
-    )
-    const created = useWorkspaceStore.getState().workspaceList.find((w) => w.purposeId === 'blank')
-    expect(created).toBeTruthy()
-    expect(window.location.hash).toBe(`#/workspace/${created.id}`)
-  })
-})
-
-// ===========================================================================
-// Sidebar workspace list
-// ===========================================================================
-describe('WorkspaceSelector — sidebar', () => {
-  it('renders seeded workspaces with name, risk and path, and navigates on click', () => {
-    useWorkspaceStore.setState({
-      workspaceList: [
-        { id: 'ws-a', name: 'Alpha Workspace', risk: 'Low', path: '/alpha' },
-        { id: 'ws-b', name: 'Beta Workspace', risk: 'Critical', path: '/beta' },
-      ],
-    })
-    render(<WorkspaceSelector />)
-    expect(screen.getByText('Alpha Workspace')).toBeInTheDocument()
-    expect(screen.getByText('Beta Workspace')).toBeInTheDocument()
-    expect(screen.getByText('/alpha')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: /Alpha Workspace/ }))
+    fireEvent.click(screen.getByRole('heading', { level: 4, name: 'Alpha Workspace' }).closest('.ws-card'))
     expect(window.location.hash).toBe('#/workspace/ws-a')
-  }, 20000)
-
-  it('applies the low/high risk classes in the sidebar', () => {
-    useWorkspaceStore.setState({
-      workspaceList: [
-        { id: 'ws-a', name: 'Alpha Workspace', risk: 'Low', path: '' },
-        { id: 'ws-b', name: 'Beta Workspace', risk: 'High', path: '' },
-      ],
-    })
-    const { container } = render(<WorkspaceSelector />)
-    expect(container.querySelector('.ws-sidebar .ws-risk.low')).toHaveTextContent('Low')
-    expect(container.querySelector('.ws-sidebar .ws-risk.high')).toHaveTextContent('High')
   })
 
-  it('applies the critical risk class to the Security Research purpose card', () => {
-    const { container } = render(<WorkspaceSelector />)
-    const critical = [...container.querySelectorAll('.ws-card .ws-risk.critical')]
-    expect(critical).toHaveLength(1)
-    expect(critical[0]).toHaveTextContent('Critical')
-  })
-
-  it('shows the empty message when no workspaces exist', () => {
-    useWorkspaceStore.setState({ workspaceList: [] })
+  it('navigates to a session when a session row is clicked', async () => {
+    stubFetchByUrl(ROUTES)
     render(<WorkspaceSelector />)
-    expect(screen.getByText('No workspaces yet. Create one to get started.')).toBeInTheDocument()
+
+    await screen.findByText('Refactor Session')
+
+    fireEvent.click(screen.getByRole('button', { name: /Refactor Session/ }))
+    expect(window.location.hash).toBe('#/session/sess-1')
   })
 
-  it('does not fetch on mount', () => {
-    const fetchMock = vi.fn()
-    vi.stubGlobal('fetch', fetchMock)
+  it('shows vault healthy banner', async () => {
+    stubFetchByUrl(ROUTES)
     render(<WorkspaceSelector />)
-    expect(fetchMock).not.toHaveBeenCalled()
+
+    await screen.findByText('✓ Vault healthy')
   })
 
-  it('refreshes the workspace list from the backend when Refresh is clicked', async () => {
-    const fetchMock = vi.fn(async () => jsonOk([{ id: 'ws-x', label: 'Fresh Workspace', root: '/fresh' }]))
-    vi.stubGlobal('fetch', fetchMock)
+  it('masks credentials and renders resources', async () => {
+    stubFetchByUrl(ROUTES)
     render(<WorkspaceSelector />)
+
+    await screen.findByText('github_token')
+    expect(screen.getByText('openai_api_key')).toBeInTheDocument()
+    expect(screen.getAllByText('••••••••').length).toBe(2)
+    expect(screen.queryByText(/sk-secret|abc123/)).toBeNull()
+
+    await screen.findByText('npm cache')
+    expect(screen.getByText('Shared npm cache')).toBeInTheDocument()
+    expect(screen.getByText('Containerized')).toBeInTheDocument()
+    expect(screen.getByText('Context: container')).toBeInTheDocument()
+  })
+
+  it('Refresh refetches the summary', async () => {
+    const { calls } = stubFetchByUrl(ROUTES)
+    render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
-    await waitFor(() => expect(screen.getByText('Fresh Workspace')).toBeInTheDocument())
-    expect(fetchMock).toHaveBeenCalledWith('/api/workspace/list')
+    await waitFor(() => expect(calls.filter((u) => u.includes('/api/global/summary')).length).toBe(2))
+  })
+
+  it('opens the custom workspace modal', async () => {
+    stubFetchByUrl(MODAL_ROUTES)
+    render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    fireEvent.click(screen.getByRole('button', { name: '+ New Workspace' }))
+    expect(screen.getByRole('dialog', { name: 'Create custom workspace' })).toBeInTheDocument()
+  })
+
+  it('custom modal resolves a folder and navigates', async () => {
+    stubFetchByUrl(MODAL_ROUTES)
+    render(<WorkspaceSelector />)
+
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    fireEvent.click(screen.getByRole('button', { name: '+ New Workspace' }))
+    await screen.findByText('Select This Folder')
+
+    fireEvent.click(screen.getByText(/project-a/))
+    await waitFor(() => expect(screen.getByText('Select This Folder')).toBeInTheDocument())
+
+    fireEvent.click(screen.getByText('Select This Folder'))
+    await waitFor(() => expect(window.location.hash).toBe('#/workspace/ws-custom'))
+    expect(localStorage.getItem('thoughtmachine_last_workspace')).toBe('/home/test/project-a')
   })
 })
