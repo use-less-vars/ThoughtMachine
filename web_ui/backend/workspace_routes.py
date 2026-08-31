@@ -505,12 +505,24 @@ def _worker_elapsed_seconds(started_at: Optional[str]) -> Optional[float]:
 
 
 def _worker_active_entry(thread) -> Dict[str, Any]:
-    """Map a live WorkerThread to its compact runtime handle."""
+    """Map a live WorkerThread to its compact runtime handle.
+
+    Carries the instance identity (``name``/``worker_name``, ``instance_id``),
+    its owning session, runtime status and heartbeat freshness.  ``elapsed``
+    is seconds since start (None when the start timestamp is missing);
+    ``container_id`` is the thread's provisioned container when attributable
+    (None otherwise).  ``worker_name``/``instance_id``/``status``/``elapsed``
+    are kept for backward compatibility with existing consumers.
+    """
     return {
         "worker_name": getattr(thread, "worker_name", ""),
         "instance_id": getattr(thread, "instance_id", 1),
         "status": getattr(thread, "status", "unknown"),
         "elapsed": _worker_elapsed_seconds(getattr(thread, "started_at", None)),
+        "name": getattr(thread, "worker_name", ""),
+        "session_id": getattr(thread, "session_id", "") or "",
+        "last_heartbeat": getattr(thread, "last_heartbeat", None),
+        "container_id": getattr(thread, "container_id", None),
     }
 
 
@@ -595,15 +607,27 @@ def _collect_active_workers(ws_id: str) -> List[Dict[str, Any]]:
 
 
 @router.get("/{ws_id}/workers/active")
-async def get_active_workers(ws_id: str) -> List[Dict[str, Any]]:
+async def get_active_workers(
+    ws_id: str,
+    session_id: Optional[str] = Query(None, description="Filter to a single session id"),
+) -> List[Dict[str, Any]]:
     """Return live worker threads for the workspace (runtime handles only).
 
-    Each handle carries exactly ``{worker_name, instance_id, status, elapsed}``
-    where ``elapsed`` is the seconds since the thread started (None when the
-    start timestamp is missing). Template definitions are served by
+    Each handle carries ``{worker_name, instance_id, status, elapsed, name,
+    session_id, last_heartbeat, container_id}`` where ``elapsed`` is the
+    seconds since the thread started (None when the start timestamp is
+    missing), ``last_heartbeat`` is the thread's last heartbeat ISO timestamp
+    (None when the thread has not heartbeated yet) and ``container_id`` is the
+    thread's provisioned container (None when not attributable).  The
+    optional ``?session_id=`` query param narrows the result to the threads of
+    a single session.  Template definitions are served by
     ``GET /api/workspace/{ws_id}/workers`` instead.
     """
-    return _collect_active_workers(ws_id)
+    session_id = _query_default(session_id)
+    entries = _collect_active_workers(ws_id)
+    if session_id is not None:
+        entries = [e for e in entries if e.get("session_id") == session_id]
+    return entries
 
 
 # ── POST /api/workspace/{ws_id}/workers ───────────────────────────────────────
