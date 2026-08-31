@@ -139,7 +139,17 @@ try {
     # Capture stderr separately so warnings on stderr do NOT fail the check;
     # only a non-zero exit code (or a missing IMPORTS_OK marker) is fatal.
     $importErrFile = Join-Path $Root "smoke_import.err.log"
-    $importOut = & $VenvPython -c $importCode 2>$importErrFile
+    # Relax $ErrorActionPreference around the invocation: under "Stop" (set
+    # at the top of this script) PowerShell promotes the redirected stderr
+    # record to a terminating NativeCommandError BEFORE it reaches the file,
+    # so Python warnings on stderr would abort the script.
+    $previousEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $importOut = & $VenvPython -c $importCode 2>$importErrFile
+    } finally {
+        $ErrorActionPreference = $previousEAP
+    }
     $importExit = $LASTEXITCODE
     $importErr = if (Test-Path $importErrFile) { Get-Content $importErrFile -Raw } else { "" }
     if ($importExit -ne 0 -or $importOut -notmatch "IMPORTS_OK") {
