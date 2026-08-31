@@ -39,6 +39,14 @@ def _post(client, name, value):
     return client.post("/api/credentials", json={"name": name, "value": value})
 
 
+def test_credentials_list_empty_initial_no_dummy_seed(client):
+    """A fresh vault starts with zero credentials (no hardcoded dummy seeds)."""
+    resp = client.get("/api/credentials")
+
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
 def test_credentials_post_create_writes_file(client, tmp_path):
     resp = _post(client, "alpha", "v1")
 
