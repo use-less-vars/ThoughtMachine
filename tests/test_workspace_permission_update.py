@@ -146,6 +146,34 @@ def test_update_workspace_permissions_rejects_unknown_resource(
     assert _read_config(tmp_path) == {"purpose": "general"}
 
 
+def test_workspace_permissions_survive_restart(tmp_path, monkeypatch):
+    """Gap A regression: the saved map round-trips through a fresh (restart)
+    config read, the GET route, and the permission-ceiling loader used by
+    config resolution — no in-memory state is required."""
+    _use_tmp_workspace(monkeypatch, tmp_path)
+    _write_json(tmp_path / "config.json", {"purpose": "general"})
+
+    saved = {"git": "write", "filesystem": "ask", "network": "banned"}
+    result = _put("ws-1", saved)
+    assert result["permissions"] == saved
+
+    # ── simulated restart: fresh reads only (no module-level state) ──
+    cfg = workspace_routes._load_workspace_config("ws-1")
+    assert cfg["permissions"] == saved
+    assert cfg["purpose"] == "general"
+
+    got = asyncio.run(workspace_routes.get_workspace_permissions("ws-1"))
+    assert got["permissions"] == saved
+    assert got["allow_host_resources"] is False
+
+    # The saved map is the ceiling config resolution applies to sessions.
+    import thoughtmachine.workspace_capabilities as wcap
+    from web_ui.backend import config_manager as cm
+
+    monkeypatch.setattr(wcap, "_workspace_dir", lambda ws_id: tmp_path)
+    assert cm._load_workspace_permission_ceiling("ws-1") == saved
+
+
 def test_update_workspace_permissions_rejects_invalid_level(tmp_path, monkeypatch):
     """An invalid permission level for a known resource is a 422 and nothing
     is persisted."""

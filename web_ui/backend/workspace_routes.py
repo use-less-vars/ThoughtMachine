@@ -347,9 +347,15 @@ def _load_session_permissions(session_id: str) -> Optional[Dict[str, Any]]:
             return None
 
         # Check workspace_id against this session's workspace
-        agent_config_data = session.metadata.get("agent_config", {})
-        if isinstance(agent_config_data, dict):
-            return agent_config_data.get("session_permissions")
+        #
+        # Session permissions are persisted under ``metadata["session_config"]``
+        # (written by SessionManager.save_config_to_session / Bridge.save_session),
+        # so read that key first.  Fall back to the legacy ``agent_config`` key
+        # for sessions saved by older versions of the backend.
+        for key in ("session_config", "agent_config"):
+            data = session.metadata.get(key)
+            if isinstance(data, dict) and data.get("session_permissions") is not None:
+                return data.get("session_permissions")
         return None
     except Exception:
         return None
