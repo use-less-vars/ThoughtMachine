@@ -105,7 +105,11 @@ except ImportError:  # pragma: no cover - defensive
 
 
 # ── Output truncation (mirrors DockerCodeRunner._truncate_output) ──────────
-from agent.config.defaults import EXEC_OUTPUT_LIMIT_BYTES
+from agent.config.defaults import (
+    CONTAINER_TYPE_FREE_USE,
+    CONTAINER_TYPE_LABEL,
+    EXEC_OUTPUT_LIMIT_BYTES,
+)
 _TRUNCATION_NOTICE = "\n...[output truncated at 100KB]..."
 
 _docker_executor_module = None
@@ -593,6 +597,7 @@ class ContainerManager:
         labels = {
             "thoughtmachine.container_name": name,
             "thoughtmachine.workspace_id": self.workspace_id,
+            CONTAINER_TYPE_LABEL: CONTAINER_TYPE_FREE_USE,
         }
         if worker_name:
             # Ownership label: lets a worker reclaim the containers it created

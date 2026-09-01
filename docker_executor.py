@@ -24,6 +24,7 @@ between integrity checks and container creation/recreation.
 
 from thoughtmachine.timeout_constants import IDLE_TIMEOUT_SECONDS
 from agent.logging import log
+from agent.config.defaults import CONTAINER_TYPE_FREE_USE, CONTAINER_TYPE_LABEL
 import docker
 import docker.types
 import hashlib
@@ -677,6 +678,7 @@ class DockerExecutor:
                 "thoughtmachine.workspace_id": str(self.workspace_id)
                 if self.workspace_id is not None else "default",
                 "thoughtmachine.note": "",
+                CONTAINER_TYPE_LABEL: CONTAINER_TYPE_FREE_USE,
             },
         )
         # Workspace bind mount already has correct UID (matches host)

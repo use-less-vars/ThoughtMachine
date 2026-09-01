@@ -43,6 +43,7 @@ try:
         get_workspace_capabilities,
         get_effective_permissions,
         check_required_categories,
+        check_requires_resource,
     )
     from thoughtmachine.workspace_capabilities import (
         WorkspaceCapabilities,
@@ -54,6 +55,7 @@ except ImportError:
     get_workspace_capabilities = None
     get_effective_permissions = None
     check_required_categories = None
+    check_requires_resource = None
     WorkspaceCapabilities = None
     resolve_workspace_id = None
 
@@ -307,6 +309,20 @@ class ToolExecutor:
                 )
                 if not ok:
                     return {'result': error_msg, 'tool_type': 'normal'}
+
+                # Resource binding check: tools bound to a hidden resource
+                # (requires_resource, e.g. git) may only run when the session
+                # holds the resource's read grain.
+                requires_resource = getattr(tool_class, 'requires_resource', None)
+                if requires_resource:
+                    ok2, err2 = check_requires_resource(
+                        requires_resource,
+                        effective,
+                        tool_name=tool_name,
+                        description=getattr(tool_class, 'describe_action', lambda a: '')(arguments),
+                    )
+                    if not ok2:
+                        return {'result': err2, 'tool_type': 'normal'}
             # Inject session permissions dict so the tool can apply
             # fine-grained security (e.g., DockerCodeRunner uses it
             # to decide container network/filesystem modes).

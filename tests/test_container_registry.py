@@ -361,7 +361,10 @@ class TestRequestContainer:
         assert kwargs["mem_limit"] == "512m"
         assert kwargs["cpu_quota"] == 50000
         assert kwargs["oom_score_adj"] == 500
-        assert kwargs["labels"] == {"a": "b"}
+        assert kwargs["labels"] == {
+            "a": "b",
+            "thoughtmachine.container_type": "free_use",
+        }
         assert kwargs["environment"] == {"X": "1"}
         assert kwargs["tmpfs"] == {"/tmp": "rw,size=4m"}
         assert kwargs["extra_hosts"] == {"h": "1.2.3.4"}

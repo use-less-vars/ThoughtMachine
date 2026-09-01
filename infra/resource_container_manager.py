@@ -101,6 +101,9 @@ from agent.config.defaults import (
     RESOURCE_IMAGE_TAG,
     RESOURCE_REGISTRY,
     RESOURCE_BUILD_HASH_LABEL,
+    CONTAINER_TYPE_LABEL,
+    CONTAINER_TYPE_RESOURCE,
+    RESOURCE_NAME_LABEL,
 )
 
 # Global resource images are lifecycle-protected shared infrastructure:
@@ -277,6 +280,38 @@ def compute_git_overlay_build_hash(
     )
 
 
+def _resolve_vault_build_source(path):
+    """Resolve a vault build source, or None when it escapes the vault directory.
+
+    Resource-image builds must read ONLY from the vault's
+    ``docker/resource`` directory (``VAULT_RESOURCE_DIR``). This helper
+    realpaths ``path`` and rejects anything that resolves outside that
+    directory (e.g. a tampered module constant or symlink), so a build can
+    never ingest files from elsewhere on the host. Missing files are left to
+    the caller's ``open()`` (OSError -> logged None), mirroring the legacy
+    behavior.
+
+    Returns:
+        str: realpath of ``path`` when it is inside ``VAULT_RESOURCE_DIR``,
+        else None (already logged).
+    """
+    resolved = os.path.realpath(str(path))
+    base = os.path.realpath(VAULT_RESOURCE_DIR)
+    try:
+        within = os.path.commonpath([resolved, base]) == base
+    except ValueError:  # pragma: no cover - different drives (windows)
+        within = False
+    if not within:
+        _LOG.warning(
+            "Refusing to use resource image build source outside the vault "
+            "build directory (%s): %s",
+            VAULT_RESOURCE_DIR,
+            path,
+        )
+        return None
+    return resolved
+
+
 def _prepare_resource_build_context():
     """Stage the RUNTIME image build sources into a fresh temp directory.
 
@@ -291,10 +326,23 @@ def _prepare_resource_build_context():
         (context_dir: str, build_hash: str) on success, or None when the
         vault sources are missing/unreadable (already logged).
     """
+    requirements_path = _resolve_vault_build_source(VAULT_REQUIREMENTS)
+    dockerfile_path = _resolve_vault_build_source(VAULT_RUNTIME_DOCKERFILE)
+    if requirements_path is None or dockerfile_path is None:
+        _LOG.warning(
+            "Cannot stage resource image build sources (%s, %s): a source "
+            "resolved outside the vault build directory %s. Seed the vault "
+            "by running 'python -m thoughtmachine.bootstrap' "
+            "(or ensure_user_defaults()).",
+            VAULT_REQUIREMENTS,
+            VAULT_RUNTIME_DOCKERFILE,
+            VAULT_RESOURCE_DIR,
+        )
+        return None
     try:
-        with open(VAULT_REQUIREMENTS, "rb") as fh:
+        with open(requirements_path, "rb") as fh:
             requirements_bytes = fh.read()
-        with open(VAULT_RUNTIME_DOCKERFILE, "rb") as fh:
+        with open(dockerfile_path, "rb") as fh:
             dockerfile_bytes = fh.read()
     except OSError as exc:
         _LOG.warning(
@@ -335,8 +383,18 @@ def _prepare_git_overlay_build_context():
         str: context dir on success, or None when the overlay dockerfile is
         missing/unreadable (already logged).
     """
+    overlay_dockerfile_path = _resolve_vault_build_source(VAULT_OVERLAY_DOCKERFILE)
+    if overlay_dockerfile_path is None:
+        _LOG.warning(
+            "Cannot stage git overlay dockerfile %s: it resolved outside the "
+            "vault build directory %s. Seed the vault by running "
+            "'python -m thoughtmachine.bootstrap' (or ensure_user_defaults()).",
+            VAULT_OVERLAY_DOCKERFILE,
+            VAULT_RESOURCE_DIR,
+        )
+        return None
     try:
-        with open(VAULT_OVERLAY_DOCKERFILE, "rb") as fh:
+        with open(overlay_dockerfile_path, "rb") as fh:
             overlay_bytes = fh.read()
     except OSError as exc:
         _LOG.warning(
@@ -892,6 +950,8 @@ class ResourceContainerManager:
             self.WORKSPACE_LABEL: self.workspace_id,
             self.RESOURCE_LABEL: self.RESOURCE_KIND,
             self.CONTAINER_NAME_LABEL: name or self.container_name,
+            CONTAINER_TYPE_LABEL: CONTAINER_TYPE_RESOURCE,
+            RESOURCE_NAME_LABEL: self.RESOURCE_KIND,
         }
 
     # ------------------------------------------------------------ lifecycle

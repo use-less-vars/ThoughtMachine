@@ -80,6 +80,11 @@ class GitReadTool(ToolBase):
     # compatibility with legacy callers.
     name: ClassVar[str] = "git_read"
 
+    # Bound resource: git operations run inside the hidden git resource
+    # container, so execution requires the ``git:read`` grain (checked by
+    # security_gate.check_requires_resource against RESOURCE_REGISTRY).
+    requires_resource: ClassVar[Optional[str]] = "git"
+
     # ------------------------------------------------------------------
     # Private runtime state. Leading-underscore attributes are assignable in
     # Pydantic v2 (same pattern as ToolBase._logger): they are not validated

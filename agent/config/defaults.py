@@ -119,6 +119,14 @@ RESOURCE_LABEL = "thoughtmachine.resource"
 RESOURCE_KIND = "git"
 WORKSPACE_ID_LABEL = "thoughtmachine.workspace_id"
 CONTAINER_NAME_LABEL = "thoughtmachine.container_name"
+# Container-type labeling standard (container & resource access control):
+# every thoughtmachine container carries a ``container_type`` label with
+# value ``free_use`` (worker/user containers) or ``resource`` (hidden
+# resource containers, which additionally carry ``resource_name``).
+CONTAINER_TYPE_LABEL = "thoughtmachine.container_type"
+CONTAINER_TYPE_FREE_USE = "free_use"
+CONTAINER_TYPE_RESOURCE = "resource"
+RESOURCE_NAME_LABEL = "thoughtmachine.resource_name"
 RESOURCE_MEM_LIMIT = "512m"
 RESOURCE_CPU_QUOTA = 50000
 # Default image used by container_manager.
