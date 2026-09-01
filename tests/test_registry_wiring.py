@@ -232,6 +232,7 @@ def test_container_manager_start_delegates_fresh_create_to_registry(monkeypatch)
     assert kwargs["labels"] == {
         "thoughtmachine.container_name": "my-box",
         "thoughtmachine.workspace_id": "w1",
+        "thoughtmachine.container_type": "free_use",
     }
     assert kwargs["environment"] == {"PYTHONUSERBASE": "/home/agent/.local"}
     assert kwargs["mounts"] == [

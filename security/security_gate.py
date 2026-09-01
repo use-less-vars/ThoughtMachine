@@ -29,7 +29,7 @@ from thoughtmachine.workspace_capabilities import (
     load_workspace_capabilities,
 )
 from thoughtmachine.security import SessionPermissions, PERMISSION_SCHEMA, _pending_security_requests, _pending_requests_lock, resolve_security_prompt
-from agent.config.defaults import PROMPT_TIMEOUT
+from agent.config.defaults import PROMPT_TIMEOUT, RESOURCE_REGISTRY
 from agent.events import SecurityPromptEvent, EventType, NullEventBus
 
 logger = logging.getLogger(__name__)
@@ -526,6 +526,48 @@ def check_atomic_operation(
         )
         return False
     return bool(result)
+
+
+def check_requires_resource(
+    requires_resource: str,
+    effective_permissions: dict,
+    tool_name: str,
+    description: str = "",
+) -> tuple:
+    """Check that the session is allowed to use the resource a tool is bound to.
+
+    Tools bound to a hidden resource (``requires_resource`` set, e.g. git)
+    may only execute when the effective session permissions grant the
+    resource's read grain (``RESOURCE_REGISTRY[resource]["permission"]:read``).
+    Unknown resources fail closed.
+
+    Returns:
+        (bool, str): (True, "") when allowed; (False, denial message) otherwise.
+    """
+    entry = RESOURCE_REGISTRY.get(requires_resource)
+    if entry is None:
+        logger.warning(
+            "check_requires_resource: unknown resource '%s' required by %s",
+            requires_resource, tool_name,
+        )
+        return (
+            False,
+            f"Permission denied: unknown resource '{requires_resource}' required by tool '{tool_name}'.",
+        )
+    permission = entry["permission"]
+    allowed = check_atomic_operation(
+        f"{permission}:read",
+        effective_permissions,
+        tool_name,
+        description=description,
+    )
+    if not allowed:
+        return (
+            False,
+            f"Permission denied: Tool requires resource '{requires_resource}' "
+            f"(permission {permission}:read), but session does not allow it.",
+        )
+    return (True, "")
 
 
 # ══════════════════════════════════════════════════════════════════════════

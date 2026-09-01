@@ -75,6 +75,13 @@ class ToolBase(BaseModel):
     # Empty list means no special permissions needed.
     required_categories: ClassVar[List[str]] = []
 
+    # Name of the hidden resource (see agent/config/defaults.RESOURCE_REGISTRY)
+    # this tool must execute inside, or None for tools that need no resource
+    # container. When set, tool execution is denied unless the session holds
+    # the matching ``<resource>:read`` permission (see
+    # security_gate.check_requires_resource).
+    requires_resource: ClassVar[Optional[str]] = None
+
     # Stable registry/display name for this tool: used in LLM schemas
     # (model_to_openai_tool), preset lists, and the /api/tools endpoint.
     # Defaults to the class name when unset (legacy behavior).

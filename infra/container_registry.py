@@ -65,6 +65,10 @@ from agent.config.defaults import (
     RESOURCE_KIND,
     WORKSPACE_ID_LABEL,
     CONTAINER_NAME_LABEL,
+    CONTAINER_TYPE_LABEL,
+    CONTAINER_TYPE_FREE_USE,
+    CONTAINER_TYPE_RESOURCE,
+    RESOURCE_NAME_LABEL,
     RESOURCE_MEM_LIMIT,
     RESOURCE_CPU_QUOTA,
     DEFAULT_IMAGE,
@@ -310,6 +314,13 @@ class ContainerRegistry:
             if value is not None:
                 profile_kwargs[field_name] = value
 
+        # Labeling standard: every free-use (worker/user) container carries
+        # ``thoughtmachine.container_type=free_use`` (the resource variant is
+        # stamped by create_resource_container). Caller labels are preserved.
+        labels = dict(profile_kwargs.get("labels") or {})
+        labels[CONTAINER_TYPE_LABEL] = CONTAINER_TYPE_FREE_USE
+        profile_kwargs["labels"] = labels
+
         profile = ContainerProfile(
             image=image or DEFAULT_IMAGE,
             command=command,
@@ -411,6 +422,8 @@ class ContainerRegistry:
                 RESOURCE_LABEL: RESOURCE_KIND,
                 WORKSPACE_ID_LABEL: str(workspace_id),
                 CONTAINER_NAME_LABEL: name,
+                CONTAINER_TYPE_LABEL: CONTAINER_TYPE_RESOURCE,
+                RESOURCE_NAME_LABEL: RESOURCE_KIND,
             },
             mounts=profile_mounts,
         )
