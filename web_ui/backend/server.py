@@ -1701,6 +1701,32 @@ async def websocket_endpoint(ws: WebSocket, project: Optional[str] = None):
                     except Exception:
                         fe_config = None
 
+                    # Cached-bridge path only: the cached bridge skipped
+                    # bridge.load_session(), so its live session config was never
+                    # re-ceiled against the workspace permission ceiling. Re-apply
+                    # the ceiling to session_permissions inside fe_config so the
+                    # session_loaded / config_changed payloads sent to THIS websocket
+                    # match fresh-load behavior (idempotent if already ceiled).
+                    if existing is not None and existing._controller is not None:
+                        if isinstance(fe_config, dict):
+                            try:
+                                _ceiling_ws_id = bridge.workspace_id
+                                if _ceiling_ws_id:
+                                    from web_ui.backend.config_manager import (
+                                        _load_workspace_permission_ceiling as _load_ws_ceiling,
+                                    )
+                                    from security.security_gate import apply_workspace_ceiling
+
+                                    _ceiling = _load_ws_ceiling(_ceiling_ws_id) or {}
+                                    _raw_perms = fe_config.get("session_permissions")
+                                    if isinstance(_raw_perms, dict):
+                                        fe_config["session_permissions"] = apply_workspace_ceiling(
+                                            _ceiling, _raw_perms
+                                        )
+                            except Exception as exc:
+                                log('WARNING', 'server',
+                                    f"load_session: cached-path ceiling re-apply failed: {exc}")
+
                     if not _bridge_loaded_session:
                         _loaded_meta = bridge._session or bridge._loaded_session
                         if _loaded_meta is None:

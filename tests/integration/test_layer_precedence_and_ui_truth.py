@@ -11,17 +11,17 @@ Five tests verify the truthfulness of the UI-facing surfaces: the WS
 ceiling applied (read-only); a restart + ``load_session`` re-applies the
 workspace permission ceiling; the REST
 ``GET /api/workspace/{ws_id}/effective_permissions`` endpoint serves
-read-only defaults without a session id and the raw grant with one (no
-ceiling); the workspace summary reflects the UI permission state; and
+read-only defaults without a session id and the ceiling-applied grant
+with one; the workspace summary reflects the UI permission state; and
 the frontend<->backend config translation round-trips tool toggles.
 
 Two genuine findings locked into assertions below:
 
 * The WS ``config_changed`` event's ``permissions`` and
   ``effective_config`` DO apply the workspace permission ceiling - the raw
-  write grant stays in the session store - whereas the REST
-  ``effective_permissions`` endpoint does NOT apply the ceiling: it
-  serves read-only defaults without a session id and the raw stored
+  write grant stays in the session store - and the REST
+  ``effective_permissions`` endpoint NOW also applies the ceiling: it
+  serves read-only defaults without a session id and the ceiling-applied
   grant with one.
 * An explicit ``model`` in agent_config.json wins over a provider
   profile's ``default_model``.
@@ -323,7 +323,7 @@ def test_restart_reapplies_workspace_permission_ceiling_on_session_load(env):
         assert perms["filesystem"] == "read", perms
 
 
-def test_rest_effective_permissions_serve_defaults_then_raw_grant(env):
+def test_rest_effective_permissions_serve_defaults_then_ceiled_grant(env):
     client, tmp_home, stop_fn = env
     ws = harness.create_workspace(client, tmp_home, name="t8")
     harness.put_permissions(
@@ -351,7 +351,10 @@ def test_rest_effective_permissions_serve_defaults_then_raw_grant(env):
         harness.receive_until_type(wsock, "config_changed")
 
     ep2 = harness.get_effective_permissions(client, ws["workspace_id"], session_id=sid)
-    assert ep2["effective_permissions"]["git"] == "write", ep2
+    # The workspace ceiling (git=read, filesystem=write) now caps the raw
+    # write grant: git write -> read; filesystem write stays write.
+    assert ep2["effective_permissions"]["git"] == "read", ep2
+    assert ep2["effective_permissions"]["filesystem"] == "write", ep2
 
 
 def test_workspace_summary_reflects_ui_permission_state(env):
