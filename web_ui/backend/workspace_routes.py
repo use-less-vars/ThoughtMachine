@@ -813,11 +813,24 @@ async def get_effective_permissions(
             execution="banned",
         )
 
+    # ── Load the workspace permission ceiling. Only explicitly saved
+    # workspace permissions (config.json "permissions") act as the ceiling
+    # for this endpoint; a workspace with no saved permissions has NO
+    # ceiling (restored session grants pass through raw). The purpose-preset
+    # fallback is intentionally NOT applied here (it remains /summary-only).
+    try:
+        raw_cfg = _load_workspace_config(ws_id)
+        ceiling = raw_cfg.get("permissions") if isinstance(raw_cfg, dict) else None
+    except Exception:
+        ceiling = None
+    if not isinstance(ceiling, dict):
+        ceiling = {}
+
     # ── Merge via security gate (lazy import, with fallback) ──────────────
     try:
         from security.security_gate import get_effective_permissions as _gate_effective
 
-        effective = _gate_effective(session_perms, caps)
+        effective = _gate_effective(session_perms, caps, ceiling)
     except ImportError:
         # Fallback when security gate dependencies are not available
         # (e.g., in minimal test environments)
