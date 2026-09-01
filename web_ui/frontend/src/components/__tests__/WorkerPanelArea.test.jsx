@@ -431,7 +431,8 @@ async function selectWorker(name) {
 
 describe('multi-panel area in the real App', () => {
   beforeEach(() => {
-    window.location.hash = `#/workspace/${ENTRY.id}`
+    // Nested route: SessionTab body mounts only on session routes.
+    window.location.hash = `#/workspace/${ENTRY.id}/session/sess-1`
     useWorkspaceStore.getState().reset()
     useWorkspaceStore.setState({ workspaceList: [{ ...ENTRY }] })
     useSessionTabsStore.getState().reset()
