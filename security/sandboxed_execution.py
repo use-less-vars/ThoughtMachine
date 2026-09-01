@@ -25,7 +25,7 @@ import os
 import subprocess
 from typing import Any, Dict, List, Optional
 
-from security.security_gate import _value_satisfies
+from security.gate_helpers import _value_satisfies
 
 # Shell metacharacters rejected when allow_shell=False.
 # '&&'/'||' are matched before their single-character components so an
