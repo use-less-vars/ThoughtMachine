@@ -253,12 +253,14 @@ const useWorkspaceStore = create((set, get) => ({
   // Clears the store-level error message (error banner Dismiss / Retry).
   clearError: () => set({ error: '' }),
 
-  // GET /api/resource-catalog — the endpoint does NOT exist in the backend yet
-  // (see apiContracts.js pending section); on failure (tryGet returns null)
-  // fall back to the bundled placeholder catalog so the Resources 'Add
+  // GET /api/resource-catalog — the backend now serves a bare array of
+  // resource definitions; accept it directly. Older clients wrapped the
+  // response in {items: [...]} — still supported. On failure (tryGet returns
+  // null) fall back to the bundled placeholder catalog so the Resources 'Add
   // Resource' modal always has items to offer.
   fetchResourceCatalog: async () => {
     const data = await tryGet(`${API_BASE}/api/resource-catalog`)
+    if (Array.isArray(data)) return data
     if (data && Array.isArray(data.items)) return data.items
     return [
       { name: 'workspace_files', description: 'Workspace file access' },

@@ -144,7 +144,8 @@ const TWO_SESSIONS = [
 
 beforeEach(() => {
   localStorage.clear()
-  window.location.hash = `#/workspace/${ENTRY.id}`
+  // Nested route: the session view lives at #/workspace/:wsId/session/:sid.
+  window.location.hash = `#/workspace/${ENTRY.id}/session/sess-1`
   useStore.getState().reset()
   useWorkspaceStore.getState().reset()
   useWorkspaceStore.setState({ workspaceList: [{ ...ENTRY }] })
@@ -252,9 +253,9 @@ describe('App session tab strip — open_sessions restore', () => {
     })
     // Frontend-only close: the session survives in the sessions list.
     expect(useStore.getState().sessions.some((s) => s.session_id === 'sess-2')).toBe(true)
-    // The route follows the neighbor tab.
+    // The route follows the neighbor tab (nested session route).
     await waitFor(() => {
-      expect(window.location.hash).toBe('#/session/sess-1')
+      expect(window.location.hash).toBe(`#/workspace/${ENTRY.id}/session/sess-1`)
       expect(activeTabLabel()).toBe('S1')
     })
   })
@@ -321,8 +322,9 @@ describe('App session tab strip — open_sessions restore', () => {
         activeSessionId: 'sess-2',
       })
     )
-    // Fresh mount = simulated reload; landing on the workspace route.
-    window.location.hash = `#/workspace/${ENTRY.id}`
+    // Fresh mount = simulated reload; landing directly on the session route
+    // (the canonical URL for a session view).
+    window.location.hash = `#/workspace/${ENTRY.id}/session/sess-2`
     render(<App />)
     const hub = await connectHub()
     await act(async () =>

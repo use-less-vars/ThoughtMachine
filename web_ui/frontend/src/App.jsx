@@ -92,7 +92,7 @@ export default function App() {
   const currentWs = route?.view === 'workspace'
     ? route.id
     : route?.view === 'session'
-      ? (sessionWorkspacesRef.current[route.id] || lastKnownWorkspaceRef.current || null)
+      ? (route.workspaceId || sessionWorkspacesRef.current[route.id] || lastKnownWorkspaceRef.current || null)
       : (lastKnownWorkspaceRef.current || null)
   currentWsRef.current = currentWs
 
@@ -384,6 +384,12 @@ export default function App() {
             const entry = st.byWorkspace[ws]
             if (!entry?.tabs.some(t => t.sessionId === s.session_id)) {
               st.openTab(ws, { sessionId: s.session_id, title: s.name || '' })
+            } else if (s.name) {
+              // Tab already exists (e.g. opened early by route-driven
+              // activation before the hub knew its name) — fill an EMPTY
+              // title, but never clobber a persisted/user-set one.
+              const existing = entry.tabs.find(t => t.sessionId === s.session_id)
+              if (existing && !existing.title) st.setTabTitle(ws, s.session_id, s.name)
             }
           })
           // Legacy migration: no persisted tm.sessionTabs.<ws> state, but a
@@ -478,14 +484,14 @@ export default function App() {
       // Tab already exists — only activate when nothing is active yet.
       if ((!preferredSessionId || sessionId === preferredSessionId) && !st.byWorkspace[ws].activeSessionId) {
         st.setActiveTab(ws, sessionId)
-        navigate(`/session/${encodeURIComponent(sessionId)}`)
+        navigate(`/workspace/${ws}/session/${encodeURIComponent(sessionId)}`)
       }
       return
     }
     st.openTab(ws, { sessionId, title: nameFromStore(sessionId) })
     if (!preferredSessionId || sessionId === preferredSessionId) {
       st.setActiveTab(ws, sessionId)
-      navigate(`/session/${encodeURIComponent(sessionId)}`)
+      navigate(`/workspace/${ws}/session/${encodeURIComponent(sessionId)}`)
     }
   }, [navigate])
 
@@ -504,7 +510,7 @@ export default function App() {
       // active tab (the one just closed).
       const newActive = useSessionTabsStore.getState().byWorkspace[ws]?.activeSessionId
       if (newActive) {
-        navigate(`/session/${encodeURIComponent(newActive)}`)
+        navigate(`/workspace/${ws}/session/${encodeURIComponent(newActive)}`)
       } else if (routeRef.current?.view === 'session') {
         navigate('/workspaces')
       }
@@ -703,7 +709,7 @@ export default function App() {
     }
     // Refresh the sidebar so the new session appears in the list.
     hubSend('list_sessions')
-    navigate(`/session/${encodeURIComponent(sessionId)}`)
+    navigate(`/workspace/${ws}/session/${encodeURIComponent(sessionId)}`)
   }, [hubSend, navigate])
 
   // ── Handle tab session adoption (intentional replacement) ─────────────
@@ -721,7 +727,7 @@ export default function App() {
     }
     st.setActiveTab(ws, newSessionId)
     hubSend('list_sessions')
-    navigate(`/session/${encodeURIComponent(newSessionId)}`)
+    navigate(`/workspace/${ws}/session/${encodeURIComponent(newSessionId)}`)
   }, [hubSend, navigate])
 
   const handleOpenNewTab = useCallback((sessionId, sessionName) => {
@@ -742,7 +748,7 @@ export default function App() {
       useStore.getState().updateSessionName(sessionId, sessionName)
     }
     hubSend('list_sessions')
-    navigate(`/session/${encodeURIComponent(sessionId)}`)
+    navigate(`/workspace/${ws}/session/${encodeURIComponent(sessionId)}`)
   }, [hubSend, navigate])
 
   // ── Tab action registry (for save from SessionTab) ────────────────────
@@ -760,24 +766,30 @@ export default function App() {
       bootWs = initialRoute.id
     } else if (initialRoute?.view === 'session') {
       const target = initialRoute.id
-      try {
-        const keys = Object.keys(localStorage)
-        const findWs = (sid) => {
-          for (const key of keys) {
-            if (!key.startsWith(TABS_PREFIX)) continue
-            const parsed = JSON.parse(localStorage.getItem(key) || 'null')
-            if (parsed?.tabs?.some(t => t.sessionId === sid)) return key.slice(TABS_PREFIX.length)
+      // Nested route (#/workspace/:wsId/session/:sid) carries the workspace
+      // explicitly — use it directly instead of searching persisted strips.
+      if (initialRoute.workspaceId) {
+        bootWs = initialRoute.workspaceId
+      } else {
+        try {
+          const keys = Object.keys(localStorage)
+          const findWs = (sid) => {
+            for (const key of keys) {
+              if (!key.startsWith(TABS_PREFIX)) continue
+              const parsed = JSON.parse(localStorage.getItem(key) || 'null')
+              if (parsed?.tabs?.some(t => t.sessionId === sid)) return key.slice(TABS_PREFIX.length)
+            }
+            return null
           }
-          return null
+          bootWs = findWs(target)
+          if (!bootWs) {
+            // Legacy migration source: old global activeSessionId key
+            const legacy = localStorage.getItem('activeSessionId')
+            if (legacy === target) bootWs = findWs(legacy)
+          }
+        } catch {
+          // malformed localStorage — fall through to open_sessions flow
         }
-        bootWs = findWs(target)
-        if (!bootWs) {
-          // Legacy migration source: old global activeSessionId key
-          const legacy = localStorage.getItem('activeSessionId')
-          if (legacy === target) bootWs = findWs(legacy)
-        }
-      } catch {
-        // malformed localStorage — fall through to open_sessions flow
       }
     }
     if (bootWs) {
@@ -1115,7 +1127,7 @@ export default function App() {
               activeTabId={activeSessionId}
               onSelectTab={(id) => {
                 useSessionTabsStore.getState().setActiveTab(currentWs, id)
-                navigate(`/session/${encodeURIComponent(id)}`)
+                navigate(`/workspace/${currentWs}/session/${encodeURIComponent(id)}`)
               }}
               onCloseTab={(id) => handleCloseTab(currentWs, id)}
               onNewTab={() => navigate(`/workspace/${encodeURIComponent(currentWs)}`)}
@@ -1124,9 +1136,11 @@ export default function App() {
             />
           )}
 
-          {/* ONLY the active session tab is mounted (own WebSocket, own load).
+          {/* ONLY the active session tab is mounted (own WebSocket, own load),
+              and only while actually ON a session route — on the workspace
+              route the strip is visible but no session body mounts.
               Inactive tabs are strip entries only — no mount, no WS. */}
-          {activeTab && (
+          {route?.view === 'session' && activeTab && (
             <div className="tab-wrapper" key={activeTab.sessionId}>
               <SessionTab
                 sessionId={activeTab.sessionId}

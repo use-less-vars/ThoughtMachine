@@ -16,9 +16,20 @@ export function parseHash(hash) {
   if (match) {
     return { view: 'workspace', id: decodeURIComponent(match[1]) }
   }
+  // Nested route: #/workspace/:wsId/session/:sid — the canonical location of a
+  // session view (the workspace is explicit, so no lookup is needed).
+  const nestedSession = path.match(/^\/workspace\/([^/]+)\/session\/([^/]+)$/)
+  if (nestedSession) {
+    return {
+      view: 'session',
+      id: decodeURIComponent(nestedSession[2]),
+      workspaceId: decodeURIComponent(nestedSession[1]),
+    }
+  }
+  // Legacy route: #/session/:id (workspace resolved from learned mappings).
   const sessionMatch = path.match(/^\/session\/([^/]+)$/)
   if (sessionMatch) {
-    return { view: 'session', id: decodeURIComponent(sessionMatch[1]) }
+    return { view: 'session', id: decodeURIComponent(sessionMatch[1]), workspaceId: null }
   }
   return null
 }

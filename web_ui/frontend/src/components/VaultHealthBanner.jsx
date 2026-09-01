@@ -5,10 +5,16 @@
 import React, { useEffect, useState } from 'react'
 import { fetchVaultStatus } from '../globalApi'
 
+// Maps backend severity labels onto the existing stylesheet classes. The
+// stylesheet only defines critical/high (red), medium (amber) and low (green);
+// error/warning are the legacy labels for those same severities. Unknown
+// severities fall back to 'medium' (amber) via the `|| 'medium'` below.
 const SEVERITY_CLASS = {
   critical: 'critical',
   high: 'high',
+  error: 'critical',
   medium: 'medium',
+  warning: 'medium',
   low: 'low',
 }
 
@@ -55,7 +61,10 @@ export default function VaultHealthBanner() {
     <div className="vault-health-banner vault-health-error" role="alert">
       <div className="vault-health-title">⚠ Vault integrity issues detected</div>
       {issues.length === 0 ? (
-        <p className="gms-empty">Vault reported unhealthy but no issues were listed.</p>
+        <>
+          <p className="gms-empty">Vault unhealthy — see logs.</p>
+          <p className="gms-empty">Vault reported unhealthy but no issues were listed.</p>
+        </>
       ) : (
         <ul className="vault-health-list">
           {issues.map((issue, idx) => (

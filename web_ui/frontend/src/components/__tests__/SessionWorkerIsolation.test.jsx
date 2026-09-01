@@ -249,7 +249,8 @@ const ctxEvt = (ts, context_length) => ({
 // ── Setup / teardown ────────────────────────────────────────────────────────
 beforeEach(() => {
   localStorage.clear()
-  window.location.hash = `#/workspace/${ENTRY.id}`
+  // Nested route: the session view lives at #/workspace/:wsId/session/:sid.
+  window.location.hash = `#/workspace/${ENTRY.id}/session/sess-1`
   useStore.getState().reset()
   useWorkspaceStore.getState().reset()
   useWorkspaceStore.setState({ workspaceList: [{ ...ENTRY }] })

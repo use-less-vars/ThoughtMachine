@@ -527,7 +527,7 @@ export default function WorkerManagementPanel({
   isActive,
 }) {
   // ── State ────────────────────────────────────────────────────────────────
-  const [workers, setWorkers] = useState([]);        // from GET /api/workspace/{ws_id}/workers (config + runtime)
+  const [workers, setWorkers] = useState([]);        // from GET /api/workspace/{ws_id}/workers/active (runtime instances)
   const [loading, setLoading] = useState(true);
   const [stopErrors, setStopErrors] = useState({});
 
@@ -580,18 +580,44 @@ export default function WorkerManagementPanel({
     prevStatusMapRef.current = currentMap;
   }, [workers, workspaceId, onSelectWorker]);
 
-  // ── Fetch workers (with runtime status) ──────────────────────────────────
+  // ── Fetch workers (active instances with runtime status) ────────────────
   const fetchWorkers = useCallback(() => {
     if (!workspaceId) return;
-    fetch(`/api/workspace/${workspaceId}/workers`)
+    const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
+    fetch(`/api/workspace/${workspaceId}/workers/active${query}`)
       .then(async (res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        setWorkers(Array.isArray(data) ? data : []);
+        const rows = Array.isArray(data) ? data : [];
+        // Normalize active-instance entries into the row shape used by the
+        // rest of this panel (name/instance_id/runtime_status/…).
+        setWorkers(rows.map((e) => {
+          const name = e.worker_name ?? e.name ?? '';
+          const instanceId = e.instance_id ?? 1;
+          return {
+            name,
+            instance_id: instanceId,
+            instance_label: e.instance_label ?? (instanceId > 1 ? `${name}#${instanceId}` : name),
+            runtime_status: e.status ?? e.runtime_status,
+            status: e.status,
+            elapsed: e.elapsed,
+            session_id: e.session_id,
+            last_heartbeat: e.last_heartbeat,
+            container_id: e.container_id,
+            description: e.description ?? '',
+            tools: e.tools ?? [],
+            permission_footprint: e.permission_footprint ?? {},
+            current_context_tokens: e.current_context_tokens,
+            max_context_tokens: e.max_context_tokens,
+            paused_manually: e.paused_manually,
+            time_since_last_query: e.time_since_last_query,
+            current_task: e.current_task,
+          };
+        }));
       })
       .catch(() => setWorkers([]))
       .finally(() => setLoading(false));
-  }, [workspaceId]);
+  }, [workspaceId, sessionId]);
 
   useEffect(() => {
     fetchWorkers();
@@ -1008,6 +1034,14 @@ export default function WorkerManagementPanel({
                             ? 'Paused'
                             : w.runtime_status}
                       </span>
+                      {w.elapsed != null && (
+                        <span
+                          style={{ color: '#6c7086', fontSize: '0.68rem', whiteSpace: 'nowrap' }}
+                          title={`Uptime ${formatDuration(w.elapsed)}`}
+                        >
+                          {formatDuration(w.elapsed)}
+                        </span>
+                      )}
                       {/* Pause / Resume toggle */}
                       {w.runtime_status === 'paused' ? (
                         <button
