@@ -64,11 +64,26 @@ def _save_grants(manager, session, grants):
 
 def _patch_store_factory(monkeypatch, tmp_path):
     """Point every no-arg ``FileSystemSessionStore()`` constructed inside
-    ``workspace_routes`` / ``config_manager`` at the tmp_path store."""
+    ``workspace_routes`` / ``config_manager`` at the tmp_path store.
+
+    Patches the class on BOTH the module object this file imported at
+    collection time and the module currently registered under
+    ``sys.modules["session.store"]``.  Integration fixtures (e.g. the
+    contract-server hermetic bootstrap) purge ``session.store`` from
+    ``sys.modules`` and re-import it without restoring the original, and
+    ``workspace_routes._load_session_permissions`` resolves the class via a
+    function-local ``from session.store import ...`` at call time, so it sees
+    whichever module object is registered *then*.  Patching only the imported
+    module leaves the real (default-dir) class in the live module, which
+    silently resolves to the hermetic vault and returns None."""
+    import sys as _sys
+
     store = _make_store(tmp_path)
-    monkeypatch.setattr(
-        session_store_mod, "FileSystemSessionStore", lambda *a, **k: store
-    )
+    factory = lambda *a, **k: store
+    monkeypatch.setattr(session_store_mod, "FileSystemSessionStore", factory)
+    current = _sys.modules.get("session.store")
+    if current is not None and current is not session_store_mod:
+        monkeypatch.setattr(current, "FileSystemSessionStore", factory)
     return store
 
 
