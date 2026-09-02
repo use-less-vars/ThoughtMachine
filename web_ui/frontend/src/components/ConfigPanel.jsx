@@ -4,6 +4,7 @@ import ContainerPanelContent from './ContainerPanel';
 import WorkspacePanel from './WorkspacePanel';
 import PromptLibrary from './PromptLibrary';
 import { PERMISSION_DEFAULTS } from '../store/useStore';
+import useStore from '../store/useStore';
 
 const BACKEND_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
 const API_BASE = `http://${window.location.hostname}:${BACKEND_PORT}`;
@@ -45,7 +46,19 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   });
 
   const [activeTab, setActiveTab] = useState('workspace');
-  const [draft, setDraft] = useState(getSafeDraft(config));
+  // Draft persistence: the draft lives in the Zustand store (sessionDrafts)
+  // while sessionId is known, so unsaved edits survive tab switches that
+  // unmount this panel. localDraft is a fallback for the brief window where
+  // sessionId is still null (fresh tab, pre-load) but config already exists.
+  const storeDraft = useStore((s) => (sessionId ? s.sessionDrafts[sessionId] : undefined))
+  const setSessionDraft = useStore((s) => s.setSessionDraft)
+  const clearSessionDraft = useStore((s) => s.clearSessionDraft)
+  const [localDraft, setLocalDraft] = useState(null)
+  const draft = storeDraft ?? localDraft ?? getSafeDraft(config)
+  const updateDraft = (next) => {
+    if (sessionId) setSessionDraft(sessionId, next)
+    else setLocalDraft(next)
+  }
 
   // ── Directory browser state ────────────────────────────────────────
   // ── Dirty tracking & apply feedback ────────────────────────────────
@@ -73,11 +86,17 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   }, [defaultConfigSaveStatus, onClearDefaultSaveStatus]);
 
   useEffect(() => {
-    setDraft(getSafeDraft(config));
-    setLastAppliedConfig(getSafeDraft(config));
-    // Clear applying state when config arrives (apply succeeded)
+    const seeded = getSafeDraft(config)
+    setLastAppliedConfig(seeded)
+    // When an apply is in flight, the incoming config is the applied truth:
+    // drop any pending draft so the panel re-seeds from it. Otherwise a
+    // store-backed draft is the user's unsaved work and must NOT be clobbered
+    // by this config update — it only falls back to getSafeDraft(config) when
+    // no draft is pending.
     if (isApplying) {
-      setIsApplying(false);
+      if (sessionId) clearSessionDraft(sessionId)
+      setLocalDraft(null)
+      setIsApplying(false)
     }
     setApplyError(null);
   }, [config]);
@@ -163,7 +182,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
     const providerId = e.target.value
     const provider = providers.find((p) => p.id === providerId)
     // Reset model when provider changes; prefer default_model
-    setDraft({
+    updateDraft({
       ...draft,
       provider_id: providerId,
       model: provider?.default_model || (provider?.models?.[0]) || '',
@@ -171,7 +190,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   }
 
   const handleModelChange = (e) => {
-    setDraft({ ...draft, model: e.target.value })
+    updateDraft({ ...draft, model: e.target.value })
   }
 
   // ── Load prompt from library and switch to system_prompt tab ──
@@ -181,12 +200,14 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
       const res = await fetch(`${API_BASE}/api/prompts/${promptName}`);
       if (!res.ok) return;
       const text = await res.text();
-      setDraft(prev => ({ ...prev, system_prompt: text }));
+      const base = useStore.getState().sessionDrafts[sessionId] ?? getSafeDraft(config);
+      if (sessionId) setSessionDraft(sessionId, { ...base, system_prompt: text });
+      else setLocalDraft({ ...base, system_prompt: text });
       setActiveTab('system_prompt');
     } catch (e) {
       // silent
     }
-  }, []);
+  }, [sessionId, config]);
 
   if (!config) {
     return (
@@ -315,7 +336,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
             <input
               type="range" min="0" max="2" step="0.1"
               value={draft.temperature}
-              onChange={(e) => setDraft({ ...draft, temperature: parseFloat(e.target.value) })}
+              onChange={(e) => updateDraft({ ...draft, temperature: parseFloat(e.target.value) })}
               style={{ width: '100%' }}
             />
           </div>
@@ -325,7 +346,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
             <input
               type="number" min="1" max="150"
               value={draft.max_turns}
-              onChange={(e) => setDraft({ ...draft, max_turns: parseInt(e.target.value, 10) || 1 })}
+              onChange={(e) => updateDraft({ ...draft, max_turns: parseInt(e.target.value, 10) || 1 })}
               style={inputStyle}
             />
           </div>
@@ -339,7 +360,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               value={draft.token_monitor_critical_threshold}
               onChange={(e) => {
                 const critical = parseInt(e.target.value, 10) || 0;
-                setDraft({
+                updateDraft({
                   ...draft,
                   token_monitor_critical_threshold: critical,
                   token_monitor_warning_threshold: Math.max(critical - 15000, 0),
@@ -457,7 +478,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               value={draft.tool_output_token_limit ?? 10000}
               onChange={(e) => {
                 const val = e.target.value === '' ? null : parseInt(e.target.value, 10);
-                setDraft({ ...draft, tool_output_token_limit: val });
+                updateDraft({ ...draft, tool_output_token_limit: val });
               }}
               placeholder="Default: 10000"
             />
@@ -491,7 +512,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
                           if (!updatedTools.find(t => t.name === toolName)) {
                             updatedTools.push({ name: toolName, enabled: e.target.checked });
                           }
-                          setDraft({ ...draft, tools: updatedTools });
+                          updateDraft({ ...draft, tools: updatedTools });
                         }}
                       />
                       {toolName}
@@ -519,7 +540,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
             <label style={labelStyle}><strong>Filesystem</strong></label>
             <select
               value={draft.session_permissions?.filesystem ?? PERMISSION_DEFAULTS.filesystem}
-              onChange={(e) => setDraft({
+              onChange={(e) => updateDraft({
                 ...draft,
                 session_permissions: { ...draft.session_permissions, filesystem: e.target.value }
               })}
@@ -540,7 +561,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
             <label style={labelStyle}><strong>Network</strong></label>
             <select
               value={draft.session_permissions?.network ?? PERMISSION_DEFAULTS.network}
-              onChange={(e) => setDraft({
+              onChange={(e) => updateDraft({
                 ...draft,
                 session_permissions: { ...draft.session_permissions, network: e.target.value }
               })}
@@ -562,7 +583,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
                 <input
                   type="checkbox"
                   checked={draft.session_permissions?.container ?? PERMISSION_DEFAULTS.container}
-                  onChange={(e) => setDraft({
+                  onChange={(e) => updateDraft({
                     ...draft,
                     session_permissions: { ...draft.session_permissions, container: e.target.checked }
                   })}
@@ -582,7 +603,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
             <label style={labelStyle}><strong>Git</strong></label>
             <select
               value={draft.session_permissions?.git ?? PERMISSION_DEFAULTS.git}
-              onChange={(e) => setDraft({
+              onChange={(e) => updateDraft({
                 ...draft,
                 session_permissions: { ...draft.session_permissions, git: e.target.value }
               })}
@@ -603,7 +624,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
             <label style={labelStyle}><strong>System</strong></label>
             <select
               value={draft.session_permissions?.system ?? PERMISSION_DEFAULTS.system}
-              onChange={(e) => setDraft({
+              onChange={(e) => updateDraft({
                 ...draft,
                 session_permissions: { ...draft.session_permissions, system: e.target.value }
               })}
@@ -624,7 +645,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
             <label style={labelStyle}><strong>Execution</strong></label>
             <select
               value={draft.session_permissions?.execution ?? PERMISSION_DEFAULTS.execution}
-              onChange={(e) => setDraft({
+              onChange={(e) => updateDraft({
                 ...draft,
                 session_permissions: { ...draft.session_permissions, execution: e.target.value }
               })}
@@ -719,7 +740,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
                   rows={6}
                   style={{ ...inputStyle, fontFamily: 'monospace', resize: 'vertical' }}
                   value={draft.system_prompt || ''}
-                  onChange={(e) => setDraft({ ...draft, system_prompt: e.target.value })}
+                  onChange={(e) => updateDraft({ ...draft, system_prompt: e.target.value })}
                   placeholder="Optional system-level instructions for the agent..."
                 />
               </div>

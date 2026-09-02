@@ -20,6 +20,9 @@
  *   - sessionErrors: per-session last error message string
  *     ({ [sessionId]: '...' }), written by SessionTab on 'error' / abnormal
  *     'session_stop' events and cleared on dismiss or session close.
+ *   - sessionDrafts: per-session ConfigPanel draft with unsaved edits
+ *     ({ [sessionId]: draft }), written by ConfigPanel so unsaved changes
+ *     survive tab switches that unmount the panel.
  *
  * SessionTab does not keep status/history/tokens/config in local useState —
  * it subscribes via useStore selectors, and the WS event handlers in this
@@ -57,6 +60,7 @@ const initialState = {
   sessionMessages: {},     // { [sessionId]: [messages] }
   sessionStates: {},       // { [sessionId]: { isRunning, state, contextLength, tokensIn, tokensOut } }
   sessionErrors: {},        // { [sessionId]: last error message string }
+  sessionDrafts: {},        // { [sessionId]: ConfigPanel draft with unsaved edits (survives tab unmount) }
 }
 
 const useStore = create((set) => ({
@@ -82,6 +86,17 @@ const useStore = create((set) => ({
   setTabRunningState: (sessionId, status) =>
     set((state) => ({ tabRunningStates: { ...state.tabRunningStates, [sessionId]: status } })),
 
+  // Persist ConfigPanel's in-progress draft so unsaved edits survive tab
+  // switches (the panel unmounts when the user leaves the Config tab).
+  setSessionDraft: (sessionId, draft) =>
+    set((state) => ({ sessionDrafts: { ...state.sessionDrafts, [sessionId]: draft } })),
+
+  clearSessionDraft: (sessionId) =>
+    set((state) => {
+      const { [sessionId]: _removedDraft, ...sessionDrafts } = state.sessionDrafts
+      return { sessionDrafts }
+    }),
+
   registerSession: (sessionId) =>
     set((state) => {
       // Create per-session entries if missing; never overwrite existing data.
@@ -95,7 +110,7 @@ const useStore = create((set) => ({
       }
     }),
 
-  // Full purge — must touch all 7 slices defined in initialState.
+  // Full purge — must touch all 8 slices defined in initialState.
   removeSession: (sessionId) =>
     set((state) => {
       // Destructure-rest: drop the session's entries from ALL per-session slices
@@ -106,6 +121,7 @@ const useStore = create((set) => ({
       const { [sessionId]: _removedErrors, ...sessionErrors } = state.sessionErrors
       const { [sessionId]: _removedMode, ...sessionModes } = state.sessionModes
       const { [sessionId]: _removedRunning, ...tabRunningStates } = state.tabRunningStates
+      const { [sessionId]: _removedDraft, ...sessionDrafts } = state.sessionDrafts
       return {
         sessionConfigs,
         sessionMessages,
@@ -113,6 +129,7 @@ const useStore = create((set) => ({
         sessionErrors,
         sessionModes,
         tabRunningStates,
+        sessionDrafts,
         sessions: state.sessions.filter((s) => s.session_id !== sessionId),
       }
     }),
