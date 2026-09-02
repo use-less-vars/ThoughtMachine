@@ -46,6 +46,7 @@ markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",
     "docker: marks tests that require a real Docker daemon",
+    "e2e: marks Playwright end-to-end browser tests (run with '--run-e2e')",
 ]
 
 [project.urls]
