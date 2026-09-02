@@ -10,7 +10,9 @@ ceiling after the workspace had been tightened.
 Fix: ``load_session`` re-caps the stored session permissions through the current
 workspace permission ceiling — exactly like a fresh config apply
 (``config_manager.resolve_full_config``) — before the restored config becomes
-live, and persists the capped config back into the session metadata.
+live.  The cap is applied to the live config only and is never persisted:
+the stored full grants must survive reloads untouched (a persisted cap would
+permanently collapse them after a single restart).
 
 These tests cover the three relevant scenarios:
 1.  save with a permissive ceiling -> tighten ceiling -> load -> permissions capped
@@ -102,10 +104,10 @@ class TestSessionLoadCeiling:
             f"expected filesystem=banned after load, got {cfg['session_permissions']}"
         )
 
-        # the capped config is persisted back into the session metadata
+        # the cap is in-memory only: the stored config keeps the full grant
         disk_perms = _disk_permissions(temp_store, session_id)
-        assert disk_perms.get("filesystem") == "banned", (
-            f"expected capped filesystem=banned on disk, got {disk_perms}"
+        assert disk_perms.get("filesystem") == "write", (
+            f"expected filesystem=write preserved on disk after a capped load, got {disk_perms}"
         )
 
     def test_load_without_ceiling_preserves_permissions(self, temp_store, monkeypatch):

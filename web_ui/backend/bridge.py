@@ -1841,6 +1841,12 @@ class WebAgentBridge:
             # ── Extract session config from session metadata via SessionManager ──
             sc = self._session_manager.extract_session_config(session)
             if sc is not None:
+                # Snapshot the serialised config BEFORE the ceiling cap below.
+                # The cap is applied to the live config only — persisting it
+                # would permanently collapse the stored full grants after a
+                # single reload, so the comparison/rewrite below must use the
+                # uncapped dump (restart-safe persistence).
+                uncapped_dump = sc.model_dump(exclude={"api_key"}, exclude_none=True)
                 # Re-cap the stored session permissions through the current
                 # workspace permission ceiling — exactly like a fresh config
                 # apply (see config_manager.resolve_full_config) — so a
@@ -1869,9 +1875,13 @@ class WebAgentBridge:
                 # what let a partial in-memory config collapse the stored
                 # permission set.
                 stored_raw = session.metadata.get("session_config")
-                new_raw = sc.model_dump(exclude={"api_key"}, exclude_none=True)
-                if stored_raw != new_raw:
-                    self._session_manager.save_config_to_session(session, sc)
+                # Compare against the UNCAPPED dump so the conditional rewrite
+                # below never persists the in-memory ceiling cap (which would
+                # collapse full stored grants after a single restart).
+                if stored_raw != uncapped_dump:
+                    self._session_manager.save_config_to_session(
+                        session, sc, config_dump=uncapped_dump
+                    )
                 log('INFO', 'server.bridge',
                     f'Loaded session_config from metadata: mode={sc.mode}, '
                     f'provider={sc.provider_id}, model={sc.model}')

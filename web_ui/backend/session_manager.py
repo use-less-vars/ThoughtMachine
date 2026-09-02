@@ -267,11 +267,22 @@ class SessionManager:
         self,
         session: Session,
         session_config: SessionConfig,
+        config_dump: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Persist session_config into session metadata and save."""
-        dump = session_config.model_dump(
-            exclude={"api_key"}, exclude_none=True
-        )
+        """Persist session_config into session metadata and save.
+
+        ``config_dump`` (optional) overrides the serialised form written to
+        storage — e.g. the pre-ceiling dump captured by callers that apply an
+        in-memory workspace permission cap while loading, so the cap is never
+        persisted.  When omitted, ``session_config.model_dump(...)`` is used
+        as before.
+        """
+        if config_dump is not None:
+            dump = dict(config_dump)
+        else:
+            dump = session_config.model_dump(
+                exclude={"api_key"}, exclude_none=True
+            )
         # Never let a partial session_permissions dict clobber a fuller
         # stored one (see merge_session_permissions).
         dump = merge_session_permissions(
