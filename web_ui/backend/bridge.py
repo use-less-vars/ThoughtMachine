@@ -353,6 +353,16 @@ class WebAgentBridge:
         # in stop() so a torn-down bridge never leaks a pending config.
         self._pending_config = None
 
+        # Uncapped persistence snapshot of the session config.  load_session()
+        # caps the LIVE config through the workspace permission ceiling, and
+        # persisting that capped dump would permanently collapse stored full
+        # grants on the next switch-away / shutdown save (see save_session and
+        # merge_session_permissions: explicit new values win, so a capped dump
+        # overrides stored write/true/ask grants with read/false/banned).  This
+        # snapshot keeps the uncapped operator view for STORAGE only; the live
+        # capped config is never touched.
+        self._session_config_persist_dump: Optional[Dict[str, Any]] = None
+
         # Persisted worker contexts loaded from workspace on session load
         self._persisted_workers: Dict[str, Dict[str, Any]] = {}
         # Track session conversation version for efficient history sync
@@ -1466,6 +1476,10 @@ class WebAgentBridge:
         # Step 2: Update session config if ConfigManager returned a new one
         if new_config is not None:
             self._session_config = new_config
+            # Refresh the uncapped persistence snapshot (grants are only
+            # overlaid when the payload explicitly carries session_permissions
+            # — never folded from the possibly ceiling-capped live config).
+            self._refresh_persistence_dump(new_config, config_dict)
 
         # Log an old -> new field diff for observability (None == '' treated
         # as equivalent for string fields, mirroring Agent._configs_are_identical).
@@ -1576,6 +1590,58 @@ class WebAgentBridge:
             log('ERROR', 'server.bridge', f"list_sessions error: {e}")
             return []
 
+    # ── Uncapped persistence snapshot ──────────────────────────────────────
+
+    def _refresh_persistence_dump(self, new_config, payload: Optional[Dict[str, Any]]) -> None:
+        """Update the uncapped persistence snapshot after a config change.
+
+        The live ``_session_config`` may be ceiling-capped in memory
+        (``load_session`` applies the workspace ceiling to the EFFECTIVE
+        config), and persisting that capped dump would collapse stored full
+        grants on the next switch-away / shutdown save.  This snapshot keeps
+        the uncapped operator view for STORAGE only: non-permission fields are
+        refreshed from ``new_config``, while ``session_permissions`` only
+        changes when the payload explicitly carries a ``session_permissions``
+        block (an operator grant/revoke) — capped live values are never folded
+        into it.
+        """
+        if new_config is None:
+            return
+        new_dump = new_config.model_dump(exclude={'api_key'}, exclude_none=True)
+        payload_perms = payload.get('session_permissions') if isinstance(payload, dict) else None
+        prior = self._session_config_persist_dump
+        if isinstance(payload_perms, dict) and payload_perms:
+            # Explicit operator grant/revoke: overlay on the prior grant set.
+            if isinstance(prior, dict) and isinstance(prior.get('session_permissions'), dict):
+                merged_perms = dict(prior['session_permissions'])
+            else:
+                merged_perms = {}
+            merged_perms.update(payload_perms)
+            new_dump['session_permissions'] = merged_perms
+            self._session_config_persist_dump = new_dump
+        elif isinstance(prior, dict):
+            # No permission change: keep prior (uncapped) grants, refresh fields.
+            refreshed = dict(prior)
+            for key, value in new_dump.items():
+                if key != 'session_permissions':
+                    refreshed[key] = value
+            self._session_config_persist_dump = refreshed
+        else:
+            self._session_config_persist_dump = new_dump
+
+    def _config_dump_for_persistence(self) -> Optional[Dict[str, Any]]:
+        """Serialised config used for persistence.
+
+        Prefers the uncapped persistence snapshot so switch-away / shutdown
+        saves never collapse stored full permission grants; falls back to the
+        live config dump when no snapshot exists yet (fresh bridge / defaults).
+        """
+        if self._session_config_persist_dump is not None:
+            return dict(self._session_config_persist_dump)
+        if self._session_config is not None:
+            return self._session_config.model_dump(exclude={'api_key'}, exclude_none=True)
+        return None
+
     def save_session(self, name: Optional[str] = None) -> Optional[Session]:
         """
         Save current conversation as a session to the store.
@@ -1584,6 +1650,10 @@ class WebAgentBridge:
         try:
             # Use the active session if available (standalone or controller path)
             session = getattr(self, '_session', None)
+            # Persist the UNCAPPED snapshot (see _config_dump_for_persistence)
+            # so a switch-away / shutdown save can never collapse the stored
+            # full grants with the ceiling-capped live config.
+            persist_dump = self._config_dump_for_persistence()
             if session is None:
                 # Fallback when no session is active — build from existing session data
                 session_id = self._loaded_session.session_id if self._loaded_session else str(uuid.uuid4())
@@ -1596,11 +1666,9 @@ class WebAgentBridge:
                             merge_session_permissions(
                                 self._loaded_session.metadata.get('session_config')
                                 if self._loaded_session else None,
-                                self._session_config.model_dump(
-                                    exclude={'api_key'}, exclude_none=True
-                                ),
+                                persist_dump,
                             )
-                            if self._session_config
+                            if persist_dump
                             else {}
                         ),
                         'source': 'web_ui',
@@ -1609,15 +1677,15 @@ class WebAgentBridge:
             else:
                 # Update existing session metadata
                 session.metadata.setdefault('session_config', {})
-                if self._session_config:
+                if persist_dump:
                     # Fold stored session_permissions under the new dump so a
                     # partial frontend payload can never collapse the stored
-                    # permission set (see merge_session_permissions).
+                    # permission set (see merge_session_permissions).  The dump
+                    # is the uncapped snapshot, so explicit operator grants are
+                    # preserved and the in-memory ceiling cap is never written.
                     session.metadata['session_config'] = merge_session_permissions(
                         session.metadata.get('session_config'),
-                        self._session_config.model_dump(
-                            exclude={'api_key'}, exclude_none=True
-                        ),
+                        persist_dump,
                     )
                 session.metadata.setdefault('source', 'web_ui')
 
@@ -1847,6 +1915,10 @@ class WebAgentBridge:
                 # single reload, so the comparison/rewrite below must use the
                 # uncapped dump (restart-safe persistence).
                 uncapped_dump = sc.model_dump(exclude={"api_key"}, exclude_none=True)
+                # Keep this uncapped snapshot as the persistence source so a
+                # later switch-away / shutdown save_session never collapses the
+                # stored grants with the ceiling-capped live config below.
+                self._session_config_persist_dump = uncapped_dump
                 # Re-cap the stored session permissions through the current
                 # workspace permission ceiling — exactly like a fresh config
                 # apply (see config_manager.resolve_full_config) — so a
@@ -1892,6 +1964,9 @@ class WebAgentBridge:
                     session_id=session_id,
                 )
                 self._session_config = self._config_manager.session_config_from_merged(merged)
+                self._session_config_persist_dump = self._session_config.model_dump(
+                    exclude={"api_key"}, exclude_none=True
+                )
 
             # ── Fallback: derive workspace_id from config if session has none ──
             if self._workspace_id is None and self._workspace_path:
