@@ -1001,7 +1001,16 @@ class ConfigManager:
         if "session_permissions" in config_dict:
             sp = config_dict["session_permissions"]
             if sp is not None and isinstance(sp, dict):
-                session_config.session_permissions = sp
+                # Merge, don't replace: the frontend payload may carry only a
+                # partial set (e.g. grains it renders), so a wholesale replace
+                # would collapse the stored permission set and drop keys that
+                # were granted elsewhere (operator-granted grains, workspace
+                # ceiling survivors). Stored keys not present in the payload
+                # are preserved; explicit payload values still win.
+                existing = session_config.session_permissions
+                merged_sp = dict(existing) if isinstance(existing, dict) else {}
+                merged_sp.update(sp)
+                session_config.session_permissions = merged_sp
 
         # If provider_id changed, resolve provider credentials
         if "provider_id" in config_dict and config_dict["provider_id"]:

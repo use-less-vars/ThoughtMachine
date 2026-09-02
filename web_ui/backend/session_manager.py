@@ -40,6 +40,40 @@ ALL_RESPOND_NAMES = FINAL_TOOL_NAMES | set(LEGACY_TO_RESPOND.keys())
 SUMMARY_TOOL_NAMES = {"SummarizeTool", "summarize", "Summarize"}
 
 
+def merge_session_permissions(stored_raw: Any, new_dump: Dict[str, Any]) -> Dict[str, Any]:
+    """Fold stored ``session_permissions`` under a new config dump.
+
+    Persistence-layer defense against permission collapse: a config dump
+    (``SessionConfig.model_dump``) may carry only a partial
+    ``session_permissions`` dict (e.g. the grains the frontend renders), so
+    writing it verbatim would silently drop stored keys that were granted
+    elsewhere (operator-granted grains, workspace-ceiling survivors, legacy
+    migrations).
+
+    ``stored_raw`` is the previously persisted ``session_config`` metadata
+    dict (or ``None``/non-dict when there is nothing stored).  Returns a new
+    dump with ``session_permissions`` = stored keys merged under the new
+    keys (explicit new values win).  When the stored raw has no dict
+    ``session_permissions`` the new dump is returned unchanged; when the new
+    dump omits ``session_permissions`` entirely but stored keys exist, the
+    stored dict is preserved verbatim.
+    """
+    if not isinstance(stored_raw, dict):
+        return new_dump
+    stored_sp = stored_raw.get("session_permissions")
+    if not isinstance(stored_sp, dict):
+        return new_dump
+    new_sp = new_dump.get("session_permissions")
+    result = dict(new_dump)
+    if isinstance(new_sp, dict):
+        merged_sp = dict(stored_sp)
+        merged_sp.update(new_sp)
+        result["session_permissions"] = merged_sp
+    else:
+        result["session_permissions"] = dict(stored_sp)
+    return result
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SessionManager
 # ══════════════════════════════════════════════════════════════════════════════
@@ -235,9 +269,15 @@ class SessionManager:
         session_config: SessionConfig,
     ) -> None:
         """Persist session_config into session metadata and save."""
-        session.metadata["session_config"] = session_config.model_dump(
+        dump = session_config.model_dump(
             exclude={"api_key"}, exclude_none=True
         )
+        # Never let a partial session_permissions dict clobber a fuller
+        # stored one (see merge_session_permissions).
+        dump = merge_session_permissions(
+            session.metadata.get("session_config"), dump
+        )
+        session.metadata["session_config"] = dump
         if "agent_config" in session.metadata:
             del session.metadata["agent_config"]
         self._session_store.save_session(
@@ -259,9 +299,15 @@ class SessionManager:
         ``session.metadata["session_config"]``.
         """
         if session_config is not None:
-            session.metadata["session_config"] = session_config.model_dump(
+            dump = session_config.model_dump(
                 exclude={"api_key"}, exclude_none=True
             )
+            # Never let a partial session_permissions dict clobber a fuller
+            # stored one (see merge_session_permissions).
+            dump = merge_session_permissions(
+                session.metadata.get("session_config"), dump
+            )
+            session.metadata["session_config"] = dump
         session.metadata.setdefault("source", "web_ui")
         if name:
             session.metadata["name"] = name

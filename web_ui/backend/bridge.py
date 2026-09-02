@@ -137,7 +137,10 @@ from agent.config.audit import log_config_audit, restart_required_for
 
 from web_ui.backend.event_forwarder import EventForwarder, _active_tab_bridges
 from web_ui.backend.config_manager import ConfigManager
-from web_ui.backend.session_manager import SessionManager
+from web_ui.backend.session_manager import (
+    SessionManager,
+    merge_session_permissions,
+)
 
 # ── Workspace ID cache ──────────────────────────────────────────────────────
 # Cache mapping workspace path → workspace ID, built once and reused across
@@ -1589,7 +1592,17 @@ class WebAgentBridge:
                     user_history=list(self._loaded_session.user_history) if self._loaded_session else [],
                     workspace_id=self._workspace_id,
                     metadata={
-                        'session_config': self._session_config.model_dump(exclude={'api_key'}, exclude_none=True) if self._session_config else {},
+                        'session_config': (
+                            merge_session_permissions(
+                                self._loaded_session.metadata.get('session_config')
+                                if self._loaded_session else None,
+                                self._session_config.model_dump(
+                                    exclude={'api_key'}, exclude_none=True
+                                ),
+                            )
+                            if self._session_config
+                            else {}
+                        ),
                         'source': 'web_ui',
                     }
                 )
@@ -1597,8 +1610,14 @@ class WebAgentBridge:
                 # Update existing session metadata
                 session.metadata.setdefault('session_config', {})
                 if self._session_config:
-                    session.metadata['session_config'] = self._session_config.model_dump(
-                        exclude={'api_key'}, exclude_none=True
+                    # Fold stored session_permissions under the new dump so a
+                    # partial frontend payload can never collapse the stored
+                    # permission set (see merge_session_permissions).
+                    session.metadata['session_config'] = merge_session_permissions(
+                        session.metadata.get('session_config'),
+                        self._session_config.model_dump(
+                            exclude={'api_key'}, exclude_none=True
+                        ),
                     )
                 session.metadata.setdefault('source', 'web_ui')
 
@@ -1843,8 +1862,16 @@ class WebAgentBridge:
                         log('WARNING', 'server.bridge',
                             f"Could not apply workspace permission ceiling to session config: {exc}")
                 self._session_config = sc
-                # Migrate saved config to new format (exclude api_key)
-                self._session_manager.save_config_to_session(session, sc)
+                # Migrate saved config to new format (exclude api_key).
+                # Only write when something actually changed (stored raw vs
+                # capped/merged dump) so loading a session never rewrites an
+                # identical stored config — an unconditional rewrite here is
+                # what let a partial in-memory config collapse the stored
+                # permission set.
+                stored_raw = session.metadata.get("session_config")
+                new_raw = sc.model_dump(exclude={"api_key"}, exclude_none=True)
+                if stored_raw != new_raw:
+                    self._session_manager.save_config_to_session(session, sc)
                 log('INFO', 'server.bridge',
                     f'Loaded session_config from metadata: mode={sc.mode}, '
                     f'provider={sc.provider_id}, model={sc.model}')
