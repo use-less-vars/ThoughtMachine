@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { getPill } from '../data/permissionVocab';
 
 // ── Inline Catppuccin palette (matching WorkspacePanel) ────────────────────
 const inputStyle = {
@@ -154,17 +155,7 @@ function WorkerDot({ status }) {
 
 // ── Permission pill ────────────────────────────────────────────────────────
 function PermissionPill({ name, value }) {
-  const key = String(value);
-  const PILL_COLORS = {
-    full:   { bg: '#a6e3a1', fg: '#1e1e2e', label: 'Full' },
-    write:  { bg: '#a6e3a1', fg: '#1e1e2e', label: 'Write' },
-    read:   { bg: '#89b4fa', fg: '#1e1e2e', label: 'Read' },
-    ask:    { bg: '#f9e2af', fg: '#1e1e2e', label: 'Ask' },
-    banned: { bg: '#f38ba8', fg: '#1e1e2e', label: 'Banned' },
-    true:   { bg: '#a6e3a1', fg: '#1e1e2e', label: 'Enabled' },
-    false:  { bg: '#f38ba8', fg: '#1e1e2e', label: 'Disabled' },
-  };
-  const pill = PILL_COLORS[key] || { bg: '#6c7086', fg: '#cdd6f4', label: key };
+  const pill = getPill(value);
   return (
     <span
       style={{

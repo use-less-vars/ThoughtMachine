@@ -5,6 +5,24 @@ import WorkspacePanel from './WorkspacePanel';
 import PromptLibrary from './PromptLibrary';
 import { PERMISSION_DEFAULTS } from '../store/useStore';
 import useStore from '../store/useStore';
+import { SESSION_RESOURCE_VOCAB, PERMISSION_RANK_ORDER } from '../data/permissionVocab';
+
+const SESSION_PERMISSION_OPTION_ORDER = (() => {
+  const rankDesc = (a, b) => PERMISSION_RANK_ORDER[b] - PERMISSION_RANK_ORDER[a]
+  return {
+    // SESSION_RESOURCE_VOCAB entries are ARRAYS of canonical values (ascending by rank) —
+    // spread each array, then sort rank-descending for permissive-first option lists.
+    filesystem: [...SESSION_RESOURCE_VOCAB.filesystem].sort(rankDesc),
+    network: [...SESSION_RESOURCE_VOCAB.network].sort(rankDesc),
+    system: [...SESSION_RESOURCE_VOCAB.system].sort(rankDesc),
+    execution: [...SESSION_RESOURCE_VOCAB.execution].sort(rankDesc),
+    // git keeps its legacy UI order (full > write > read > banned > ask) — do NOT
+    // rank-sort; just filter the literal list through the canonical vocab.
+    git: ['full', 'write', 'read', 'banned', 'ask'].filter((v) => SESSION_RESOURCE_VOCAB.git.includes(v)),
+  }
+})()
+const permissionOptionStyle = { background: '#1e1e2e', color: '#cdd6f4' }
+const permissionOptionLabel = (value) => value.charAt(0).toUpperCase() + value.slice(1)
 
 const BACKEND_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
 const API_BASE = `http://${window.location.hostname}:${BACKEND_PORT}`;
@@ -546,11 +564,9 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               })}
               style={inputStyle}
             >
-              <option value="full" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Full</option>
-              <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
-              <option value="read" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Read</option>
-              <option value="ask" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Ask</option>
-              <option value="banned" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Banned</option>
+              {SESSION_PERMISSION_OPTION_ORDER.filesystem.map((value) => (
+                <option key={value} value={value} style={permissionOptionStyle}>{permissionOptionLabel(value)}</option>
+              ))}
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
               Read/write access to the workspace filesystem. "Ask" prompts for approval on each write.
@@ -567,9 +583,9 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               })}
               style={inputStyle}
             >
-              <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
-              <option value="ask" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Ask</option>
-              <option value="banned" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Banned</option>
+              {SESSION_PERMISSION_OPTION_ORDER.network.map((value) => (
+                <option key={value} value={value} style={permissionOptionStyle}>{permissionOptionLabel(value)}</option>
+              ))}
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
               Allow the agent to make network requests.
@@ -609,11 +625,9 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               })}
               style={inputStyle}
             >
-              <option value="full" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Full</option>
-              <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
-              <option value="read" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Read</option>
-              <option value="banned" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Banned</option>
-              <option value="ask" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Ask</option>
+              {SESSION_PERMISSION_OPTION_ORDER.git.map((value) => (
+                <option key={value} value={value} style={permissionOptionStyle}>{permissionOptionLabel(value)}</option>
+              ))}
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
               Access level for Git operations. "Ask" prompts for approval on each write operation (commit, push, pull, etc.).
@@ -630,11 +644,9 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               })}
               style={inputStyle}
             >
-              <option value="full" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Full</option>
-              <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
-              <option value="read" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Read</option>
-              <option value="ask" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Ask</option>
-              <option value="banned" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Banned</option>
+              {SESSION_PERMISSION_OPTION_ORDER.system.map((value) => (
+                <option key={value} value={value} style={permissionOptionStyle}>{permissionOptionLabel(value)}</option>
+              ))}
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
               Controls access to system-level operations (environment inspection, process management). "Ask" prompts for approval on each write operation.
@@ -651,11 +663,9 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               })}
               style={inputStyle}
             >
-              <option value="full" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Full</option>
-              <option value="write" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Write</option>
-              <option value="read" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Read</option>
-              <option value="ask" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Ask</option>
-              <option value="banned" style={{ background: '#1e1e2e', color: '#cdd6f4' }}>Banned</option>
+              {SESSION_PERMISSION_OPTION_ORDER.execution.map((value) => (
+                <option key={value} value={value} style={permissionOptionStyle}>{permissionOptionLabel(value)}</option>
+              ))}
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
               Allow the agent to spawn background/child processes (experimental).

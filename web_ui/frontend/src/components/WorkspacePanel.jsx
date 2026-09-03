@@ -3,6 +3,7 @@ import useStore, { PERMISSION_DEFAULTS } from '../store/useStore';
 import WorkerManagementPanel from './WorkerManagementPanel';
 import DockerfileEditor from './DockerfileEditor';
 import DomainAllowlistEditor from './DomainAllowlistEditor';
+import { getPill } from '../data/permissionVocab';
 
 // ── Catppuccin palette matching ConfigPanel ──────────────────────────────
 const inputStyle = {
@@ -27,22 +28,6 @@ const labelStyle = {
 const sectionStyle = {
   marginBottom: '1.25rem',
 };
-
-// ── Permission pill color map ────────────────────────────────────────────
-const PILL_COLORS = {
-  full:   { bg: '#a6e3a1', fg: '#1e1e2e', label: 'Full' },
-  write:  { bg: '#a6e3a1', fg: '#1e1e2e', label: 'Write' },
-  read:   { bg: '#89b4fa', fg: '#1e1e2e', label: 'Read' },
-  ask:    { bg: '#f9e2af', fg: '#1e1e2e', label: 'Ask' },
-  banned: { bg: '#f38ba8', fg: '#1e1e2e', label: 'Banned' },
-  true:   { bg: '#a6e3a1', fg: '#1e1e2e', label: 'Enabled' },
-  false:  { bg: '#f38ba8', fg: '#1e1e2e', label: 'Disabled' },
-};
-
-function getPill(value) {
-  const key = String(value);
-  return PILL_COLORS[key] || { bg: '#6c7086', fg: '#cdd6f4', label: key };
-}
 
 function PermissionPill({ name, value }) {
   const p = getPill(value);
