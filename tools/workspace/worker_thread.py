@@ -3954,7 +3954,7 @@ class Worker(ToolBase):
         # explicitly exposes.  A footprint that requests a category absent
         # from the session profile is rejected outright: the worker can never
         # grant itself access to a category the session does not expose.
-        session_perms = self.session_permissions or {}
+        session_perms = self.effective_permissions or self.session_permissions or {}
         denied_categories = sorted(set(worker_perms) - set(session_perms))
         if denied_categories:
             return {
@@ -4043,7 +4043,7 @@ class Worker(ToolBase):
                     workspace_path=ws_dir,
                     session_id=self.session_id,
                     workspace_id=workspace_id or ws_id or "default",
-                    session_permissions=self.session_permissions,
+                    session_permissions=self.effective_permissions or self.session_permissions,
                 )
             except Exception:
                 container_manager = None
@@ -4055,7 +4055,7 @@ class Worker(ToolBase):
             agent_config=agent_config,
             workspace_dir=ws_dir,
             tool_classes=tool_classes if tool_classes else None,
-            session_permissions=self.session_permissions,
+            session_permissions=self.effective_permissions or self.session_permissions,
             project_root=project_root,
             timeout_seconds=effective_timeout,
             session_id=self.session_id,
