@@ -60,6 +60,33 @@ _FAIL_CLOSED_CAPABILITIES = WorkspaceCapabilities(
     git_available=False,
 )
 
+# ── Fail-closed disk-mode constants ──────────────────────────────────────────────────────────────────────
+# Used when ``get_effective_permissions()`` runs in disk mode (both
+# ``session_id`` and ``workspace_id`` supplied, no in-memory
+# ``workspace_permissions``) and the vault permission store cannot be read
+# (missing/corrupt sidecar or config, I/O error, unexpected exception).  The
+# deny-all session plus deny-all ceiling flow through the SAME merge below
+# and yield the all-banned 9-key result shape — a disk-mode caller never
+# receives default grants because the store was unreadable.
+_DISK_FAIL_CLOSED_SESSION = SessionPermissions(
+    container=False,
+    network="banned",
+    filesystem="banned",
+    system="banned",
+    git="banned",
+    execution="banned",
+    mcp="banned",
+)
+_DISK_FAIL_CLOSED_CEILING: Dict[str, str] = {
+    "filesystem": "banned",
+    "docker": "banned",
+    "host_bash": "banned",
+    "git": "banned",
+    "git_read": "banned",
+    "git_write": "banned",
+    "network": "banned",
+}
+
 
 def get_workspace_capabilities(workspace_id: str) -> WorkspaceCapabilities:
     """
@@ -274,6 +301,9 @@ def get_effective_permissions(
     session: SessionPermissions,
     workspace: WorkspaceCapabilities,
     workspace_permissions: Optional[Dict[str, Any]] = None,
+    *,
+    session_id: Optional[str] = None,
+    workspace_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Merge the session's permission profile with the workspace's capabilities.
@@ -301,7 +331,61 @@ def get_effective_permissions(
             Applied to the session profile BEFORE the workspace-capability merge
             via :func:`apply_workspace_ceiling`, so a session can never exceed
             the workspace's declared ceiling for this workspace.
+        session_id / workspace_id:
+            Keyword-only arguments enabling **disk mode**.  When BOTH are
+            supplied AND *workspace_permissions* is None, the session grant
+            profile and the workspace permission ceiling are loaded from the
+            vault permission store (``thoughtmachine.permission_store``)
+            under ``<vault>/workspaces/<workspace_id>/sessions/<session_id>``
+            and ``<vault>/workspaces/<workspace_id>/config.json``
+            respectively, instead of being taken from the *session* and
+            *workspace_permissions* arguments.  The stored grants replace the
+            *session* argument; the stored ceiling replaces
+            *workspace_permissions*; the *workspace* capabilities argument
+            is still merged below.
+
+    Precedence rule:
+        An explicit in-memory ``workspace_permissions`` dict always wins.
+        Disk mode engages ONLY when both ``session_id`` and ``workspace_id``
+        are supplied AND ``workspace_permissions`` is None; supplying just
+        one of the ids keeps the legacy behaviour unchanged.
+
+    Fail-closed contract:
+        Disk mode never fabricates permissive defaults.  If the store is
+        missing, corrupt, or raises for any reason, the session resolves to
+        a deny-all profile (every category ``banned`` / ``False``) and the
+        ceiling to a deny-all ceiling, so the merged result is the
+        all-denied shape rather than an accidental grant.
     """
+    # ── Disk-mode dispatch ──────────────────────────────────────────────────────────────────────────────────────────────────
+    # Both ids supplied and no explicit in-memory ceiling: the grant profile
+    # and the ceiling come from the vault permission store.  Imports are
+    # lazy so the legacy in-memory path never depends on permission_store /
+    # vault.  Any store error fails CLOSED (deny-all session + deny-all
+    # ceiling); the merged result below can then only be restrictive.
+    if workspace_permissions is None and session_id is not None and workspace_id is not None:
+        import thoughtmachine.vault as _vault_module
+        from thoughtmachine.permission_store import (
+            read_session_permissions,
+            workspace_ceiling,
+        )
+
+        try:
+            _vault_root = _vault_module.vault_root()
+            disk_grants = read_session_permissions(_vault_root, workspace_id, session_id)
+            disk_ceiling = workspace_ceiling(_vault_root, workspace_id)
+        except Exception:
+            session = _DISK_FAIL_CLOSED_SESSION
+            workspace_permissions = _DISK_FAIL_CLOSED_CEILING
+        else:
+            try:
+                session = SessionPermissions(**disk_grants)
+            except Exception:
+                # Unreadable grant record -> deny-all session; the disk
+                # ceiling still applies on top of it.
+                session = _DISK_FAIL_CLOSED_SESSION
+            workspace_permissions = disk_ceiling
+
     # ── Workspace permission ceiling ────────────────────────────────────
     # The workspace's permission map is a hard ceiling on the session's
     # permission levels; apply it to the raw session profile first.  The
