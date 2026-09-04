@@ -124,17 +124,17 @@ function WorkerDot({ status }) {
 
 
 // ── Section: Effective Permissions ───────────────────────────────────────
-function EffectivePermissionsSection({ sessionId }) {
-  // Permissions now come straight from the store: the WS 'config_changed' /
-  // 'session_loaded' events carry the exact payload the old REST endpoint
-  // (/api/workspace/<id>/effective_permissions) wrapped as
-  // { effective_permissions: ... } — server.py get_config calls
-  // config_manager.resolve_effective_permissions(bridge._session_config) and
-  // the store saves it verbatim in sessionConfigs[sessionId].permissions.
-  // Reading from the store keeps the pills live after apply_config and drops
-  // the one-shot fetch plus the loading/failed states.
+function EffectivePermissionsSection({ sessionId, effectivePermissions }) {
+  // Preferred source: the session GET/PUT effective dict passed down by
+  // ConfigPanel (sessionPerms.effective from /api/session/{id}/permissions),
+  // which is authoritative for the currently loaded session.
+  // Fallback (prop null): the store copy saved verbatim by the WS
+  // 'config_changed' / 'session_loaded' events from
+  // config_manager.resolve_effective_permissions(bridge._session_config)
+  // (sessionConfigs[sessionId].permissions). Reading from the store keeps the
+  // pills live after apply_config when no REST session profile is loaded.
   const permissions = useStore((s) => (sessionId ? (s.sessionConfigs[sessionId]?.permissions ?? null) : null));
-  const ep = permissions || PERMISSION_DEFAULTS;
+  const ep = effectivePermissions || permissions || PERMISSION_DEFAULTS;
   const categories = ['filesystem', 'network', 'git', 'system', 'container'];
 
   return (
@@ -150,7 +150,7 @@ function EffectivePermissionsSection({ sessionId }) {
 }
 
 // ── Main WorkspacePanel ──────────────────────────────────────────────────
-export default function WorkspacePanel({ workspaceId, sessionId, onSelectWorker, selectedWorker, isActive }) {
+export default function WorkspacePanel({ workspaceId, sessionId, onSelectWorker, selectedWorker, isActive, effectivePermissions }) {
   if (!workspaceId) {
     return (
       <div style={{ color: '#6c7086', fontSize: '0.85rem', padding: '1rem 0', textAlign: 'center' }}>
@@ -188,7 +188,7 @@ export default function WorkspacePanel({ workspaceId, sessionId, onSelectWorker,
         <small style={{ color: '#6c7086', fontSize: '0.75rem', display: 'block', marginBottom: '0.3rem' }}>
           Merged session + workspace capabilities.
         </small>
-        <EffectivePermissionsSection sessionId={sessionId} />
+        <EffectivePermissionsSection sessionId={sessionId} effectivePermissions={effectivePermissions} />
       </div>
     </div>
   );

@@ -24,6 +24,16 @@ const SESSION_PERMISSION_OPTION_ORDER = (() => {
 const permissionOptionStyle = { background: '#1e1e2e', color: '#cdd6f4' }
 const permissionOptionLabel = (value) => value.charAt(0).toUpperCase() + value.slice(1)
 
+// Flat-map deep equality for the permissions raw maps (string/bool values).
+const isEqualRaw = (a, b) => {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  if (keysA.length !== keysB.length) return false;
+  return keysA.every((k) => a[k] === b[k]);
+}
+
 const BACKEND_PORT = import.meta.env.VITE_BACKEND_PORT || '8000';
 const API_BASE = `http://${window.location.hostname}:${BACKEND_PORT}`;
 
@@ -55,7 +65,9 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
     model: cfg?.model,
     system_prompt: cfg?.system_prompt ?? '',
     tools: cfg?.tools ?? [],
-    session_permissions: normalizeSessionPermissions(cfg?.session_permissions),
+    // NOTE: session_permissions deliberately NOT included — permissions now live
+    // in the disk-pure session endpoint (/api/session/{id}/permissions) and the
+    // draft / apply_config payload must never carry them again.
 
     token_monitor_warning_threshold: cfg?.token_monitor_warning_threshold ?? 65000,
     token_monitor_critical_threshold: cfg?.token_monitor_critical_threshold ?? 80000,
@@ -167,6 +179,51 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
       });
   }, []);
 
+  // ── Permissions tab: disk-pure REST state ──────────────────────────
+  // Tab-LOCAL: raw (editable grant map), effective (read-only enforced
+  // profile) and resolved_at come from GET/PUT /api/session/{id}/permissions.
+  // Permission edits NEVER enter the draft.
+  const [sessionPerms, setSessionPerms] = useState(null);    // { raw, effective, resolved_at } | null
+  const [lastAppliedRaw, setLastAppliedRaw] = useState(null); // raw from the last GET/PUT response
+  const [permsLoadError, setPermsLoadError] = useState(null); // muted tab note when GET fails
+
+  // Load the session's permission profile whenever the session changes.
+  useEffect(() => {
+    let cancelled = false;
+    setPermsLoadError(null);
+    if (!sessionId) {
+      setSessionPerms(null);
+      setLastAppliedRaw(null);
+      return () => { cancelled = true; };
+    }
+    fetch(`${API_BASE}/api/session/${encodeURIComponent(sessionId)}/permissions`)
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (cancelled) return;
+        const raw = data && typeof data.raw === 'object' && data.raw !== null ? data.raw : {};
+        setSessionPerms({
+          raw,
+          effective: data && typeof data.effective === 'object' && data.effective !== null ? data.effective : null,
+          resolved_at: data?.resolved_at ?? null,
+        });
+        setLastAppliedRaw(raw);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        // No permission source for this session (or server unreachable): the
+        // tab falls back to display-only values; Apply skips the PUT.
+        setSessionPerms(null);
+        setLastAppliedRaw(null);
+        setPermsLoadError('Session permissions unavailable — showing stored values');
+      });
+    return () => { cancelled = true; };
+  }, [sessionId]);
+
+  // Display map for the Permissions tab: REST raw once loaded, otherwise a
+  // normalized seed from config.session_permissions (DISPLAY ONLY).
+  const permsRaw = sessionPerms?.raw ?? normalizeSessionPermissions(config?.session_permissions);
+
   // ── Derived: selected provider object ──────────────────────────────
   // Backend sends 'provider' in config_changed; fall back if 'provider_id' not set.
   // Try matching by UUID id first, then by legacy provider_type string.
@@ -196,6 +253,13 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
     return JSON.stringify(draft) !== JSON.stringify(lastAppliedConfig);
   }, [draft, lastAppliedConfig]);
 
+  // Permissions-tab dirty: JSON-diff of the tab raw edits vs the raw returned
+  // by the last GET/PUT response. Only meaningful while a REST source is loaded.
+  const permsDirty = useMemo(() => {
+    if (!sessionPerms || !lastAppliedRaw) return false;
+    return !isEqualRaw(permsRaw, lastAppliedRaw);
+  }, [sessionPerms, lastAppliedRaw, permsRaw]);
+
   const handleProviderChange = (e) => {
     const providerId = e.target.value
     const provider = providers.find((p) => p.id === providerId)
@@ -209,6 +273,59 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
 
   const handleModelChange = (e) => {
     updateDraft({ ...draft, model: e.target.value })
+  }
+
+  // ── Permissions tab: raw-map edits (tab-local state only) ──────────
+  const handlePermissionChange = (key, value) => {
+    if (!sessionPerms) return; // display-only fallback (no session REST source)
+    setSessionPerms({ ...sessionPerms, raw: { ...(sessionPerms.raw ?? {}), [key]: value } });
+  }
+
+  // ── Apply: PUT permissions first (when a session REST source is loaded),
+  // then apply_config for the rest of the draft (never carrying permissions).
+  const handleApply = async () => {
+    setIsApplying(true);
+    setApplyError(null);
+    setProviderVersion(0);
+
+    if (sessionId && sessionPerms) {
+      try {
+        const res = await fetch(`${API_BASE}/api/session/${encodeURIComponent(sessionId)}/permissions`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(sessionPerms.raw ?? {}),
+        });
+        if (!res.ok) {
+          let message = `HTTP ${res.status}`;
+          try {
+            const errData = await res.json();
+            if (errData?.detail?.errors?.length) message = errData.detail.errors.join('; ');
+            else if (typeof errData?.detail === 'string') message = errData.detail;
+            else if (errData?.detail) message = JSON.stringify(errData.detail);
+          } catch { /* non-JSON error body */ }
+          throw new Error(message);
+        }
+        const data = await res.json();
+        const raw = data && typeof data.raw === 'object' && data.raw !== null ? data.raw : {};
+        // Adopt the server's canonical response; lastAppliedRaw refresh clears permsDirty.
+        setSessionPerms({
+          raw,
+          effective: data && typeof data.effective === 'object' && data.effective !== null ? data.effective : (sessionPerms.effective ?? null),
+          resolved_at: data?.resolved_at ?? null,
+        });
+        setLastAppliedRaw(raw);
+      } catch (err) {
+        // PUT failed: surface the error, re-enable Apply, DO NOT touch apply_config.
+        setIsApplying(false);
+        setApplyError(`Failed to save permissions: ${err.message}`);
+        return;
+      }
+    }
+
+    // Strip session_permissions defensively (stale store drafts may still hold
+    // the legacy key); the apply_config payload must never carry permissions.
+    const { session_permissions, ...configPayload } = draft;
+    sendCommand('apply_config', { config: configPayload });
   }
 
   // ── Load prompt from library and switch to system_prompt tab ──
@@ -301,7 +418,9 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           className="btn btn-accent"
           style={{ fontSize: '0.8rem', padding: '0.25rem 0.75rem' }}
           onClick={() => {
-            sendCommand('set_default_config', { config: draft });
+            // Save-as-Default never carries session_permissions (disk-pure split).
+            const { session_permissions, ...defaultsPayload } = draft;
+            sendCommand('set_default_config', { config: defaultsPayload });
             setDefaultSaved('pending');
           }}
         >
@@ -340,7 +459,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
             </div>
           </div>
 
-          <WorkspacePanel workspaceId={workspaceId} sessionId={sessionId} selectedWorker={selectedWorker} onSelectWorker={onSelectWorker} isActive={isActive} />
+          <WorkspacePanel workspaceId={workspaceId} sessionId={sessionId} selectedWorker={selectedWorker} onSelectWorker={onSelectWorker} isActive={isActive} effectivePermissions={sessionPerms?.effective ?? null} />
         </div>
       )}
 
@@ -554,14 +673,36 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
       {/* ── Permissions Tab ───────────────────────────────────────────── */}
       {activeTab === 'permissions' && (
         <div>
+          {permsLoadError && (
+            <div style={{ color: '#f9e2af', fontSize: '0.75rem', fontStyle: 'italic', marginBottom: '0.5rem' }}>
+              ⚠ {permsLoadError}
+            </div>
+          )}
+          {sessionPerms?.effective && (
+            <div style={{ marginBottom: '0.75rem', padding: '0.4rem 0.6rem', background: '#1e1e2e', border: '1px solid #45475a', borderRadius: '4px', fontSize: '0.75rem', color: '#a6adc8' }}>
+              <strong>Effective profile (enforced):</strong>{' '}
+              {(() => {
+                const e = sessionPerms.effective;
+                const pairs = [
+                  ['filesystem', e.filesystem],
+                  ['network', e.network],
+                  ['container', e.container],
+                  ['git', e.git],
+                  ['system', e.system],
+                  ['execution', e.execution],
+                ];
+                return pairs
+                  .filter(([, v]) => v !== undefined && v !== null)
+                  .map(([k, v]) => `${k}: ${typeof v === 'boolean' ? (v ? 'Enabled' : 'Disabled') : permissionOptionLabel(String(v))}`)
+                  .join(' · ');
+              })()}
+            </div>
+          )}
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>Filesystem</strong></label>
             <select
-              value={draft.session_permissions?.filesystem ?? PERMISSION_DEFAULTS.filesystem}
-              onChange={(e) => updateDraft({
-                ...draft,
-                session_permissions: { ...draft.session_permissions, filesystem: e.target.value }
-              })}
+              value={permsRaw.filesystem ?? PERMISSION_DEFAULTS.filesystem}
+              onChange={(e) => handlePermissionChange('filesystem', e.target.value)}
               style={inputStyle}
             >
               {SESSION_PERMISSION_OPTION_ORDER.filesystem.map((value) => (
@@ -576,11 +717,8 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>Network</strong></label>
             <select
-              value={draft.session_permissions?.network ?? PERMISSION_DEFAULTS.network}
-              onChange={(e) => updateDraft({
-                ...draft,
-                session_permissions: { ...draft.session_permissions, network: e.target.value }
-              })}
+              value={permsRaw.network ?? PERMISSION_DEFAULTS.network}
+              onChange={(e) => handlePermissionChange('network', e.target.value)}
               style={inputStyle}
             >
               {SESSION_PERMISSION_OPTION_ORDER.network.map((value) => (
@@ -598,16 +736,13 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               <label className="toggle-switch">
                 <input
                   type="checkbox"
-                  checked={draft.session_permissions?.container ?? PERMISSION_DEFAULTS.container}
-                  onChange={(e) => updateDraft({
-                    ...draft,
-                    session_permissions: { ...draft.session_permissions, container: e.target.checked }
-                  })}
+                  checked={permsRaw.container ?? PERMISSION_DEFAULTS.container}
+                  onChange={(e) => handlePermissionChange('container', e.target.checked)}
                 />
                 <span className="toggle-slider"></span>
               </label>
-              <span style={{ fontSize: '0.85rem', color: draft.session_permissions?.container ? '#a6e3a1' : '#f38ba8' }}>
-                {draft.session_permissions?.container ? 'Enabled' : 'Disabled'}
+              <span style={{ fontSize: '0.85rem', color: permsRaw.container ? '#a6e3a1' : '#f38ba8' }}>
+                {permsRaw.container ? 'Enabled' : 'Disabled'}
               </span>
             </div>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
@@ -618,11 +753,8 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>Git</strong></label>
             <select
-              value={draft.session_permissions?.git ?? PERMISSION_DEFAULTS.git}
-              onChange={(e) => updateDraft({
-                ...draft,
-                session_permissions: { ...draft.session_permissions, git: e.target.value }
-              })}
+              value={permsRaw.git ?? PERMISSION_DEFAULTS.git}
+              onChange={(e) => handlePermissionChange('git', e.target.value)}
               style={inputStyle}
             >
               {SESSION_PERMISSION_OPTION_ORDER.git.map((value) => (
@@ -637,11 +769,8 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>System</strong></label>
             <select
-              value={draft.session_permissions?.system ?? PERMISSION_DEFAULTS.system}
-              onChange={(e) => updateDraft({
-                ...draft,
-                session_permissions: { ...draft.session_permissions, system: e.target.value }
-              })}
+              value={permsRaw.system ?? PERMISSION_DEFAULTS.system}
+              onChange={(e) => handlePermissionChange('system', e.target.value)}
               style={inputStyle}
             >
               {SESSION_PERMISSION_OPTION_ORDER.system.map((value) => (
@@ -656,11 +785,8 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>Execution</strong></label>
             <select
-              value={draft.session_permissions?.execution ?? PERMISSION_DEFAULTS.execution}
-              onChange={(e) => updateDraft({
-                ...draft,
-                session_permissions: { ...draft.session_permissions, execution: e.target.value }
-              })}
+              value={permsRaw.execution ?? PERMISSION_DEFAULTS.execution}
+              onChange={(e) => handlePermissionChange('execution', e.target.value)}
               style={inputStyle}
             >
               {SESSION_PERMISSION_OPTION_ORDER.execution.map((value) => (
@@ -673,7 +799,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           </div>
 
           <p style={{ color: '#6c7086', fontSize: '0.8rem', fontStyle: 'italic', borderTop: '1px solid #45475a', paddingTop: '0.75rem' }}>
-            Changes take effect on the next tool call. No restart required.
+            Changes take effect on the next tool call.
           </p>
         </div>
       )}
@@ -777,17 +903,12 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
       <div style={{ marginTop: '1rem', display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
         <button
           onClick={() => {
-            setIsApplying(true);
-            setApplyError(null);
-            setProviderVersion(0);
-            // Just send apply_config — the backend detects workspace_path changes
-            // and handles the full project switch internally.
-            sendCommand('apply_config', { config: draft });
+            handleApply();
           }}
           disabled={!wsConnected || isApplying}
           style={{
-            background: !wsConnected ? '#585b70' : isApplying ? '#585b70' : (isDirty || providerVersion > 0) ? '#89b4fa' : '#45475a',
-            color: !wsConnected || (!isDirty && !isApplying && providerVersion === 0) ? '#6c7086' : '#1e1e2e',
+            background: !wsConnected ? '#585b70' : isApplying ? '#585b70' : (isDirty || permsDirty || providerVersion > 0) ? '#89b4fa' : '#45475a',
+            color: !wsConnected || (!isDirty && !permsDirty && !isApplying && providerVersion === 0) ? '#6c7086' : '#1e1e2e',
             border: 'none',
             borderRadius: '4px',
             padding: '0.5rem 1.5rem',
@@ -808,9 +929,9 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
             ⚠ Reconnecting...
           </span>
         )}
-        {(isDirty || providerVersion > 0) && !isApplying && wsConnected && (
+        {(isDirty || permsDirty || providerVersion > 0) && !isApplying && wsConnected && (
           <span style={{ color: '#f9e2af', fontSize: '0.75rem', fontStyle: 'italic' }}>
-            {isDirty ? 'Unsaved changes' : 'Provider credentials updated'}
+            {isDirty ? 'Unsaved changes' : permsDirty ? 'Unsaved permission changes' : 'Provider credentials updated'}
           </span>
         )}
         {applyError && (
