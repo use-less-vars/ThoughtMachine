@@ -529,6 +529,7 @@ class CheckSystem(ToolBase):
             manager = _ContainerManager(
                 workspace_path=ws_path,
                 session_permissions=self.session_permissions or {},
+                session_id=getattr(self, "session_id", None),
             )
             # Daemon reachability + image presence in one API call. No pull:
             # a missing image is reported and the probe is skipped.

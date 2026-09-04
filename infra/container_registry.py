@@ -353,7 +353,8 @@ class ContainerRegistry:
         }
 
     def create_resource_container(self, session_id, workspace_id, network_mode, *,
-                                  workspace_path=None, mounts=None, name=None) -> dict:
+                                  workspace_path=None, mounts=None, name=None,
+                                  environment=None) -> dict:
         """Create + register the workspace's hidden git resource container.
 
         The privileged counterpart to ``request_container`` for the
@@ -372,6 +373,10 @@ class ContainerRegistry:
                      + caller-supplied extras (linked-worktree main repo rw,
                      resolved by the caller)
           no package volume / no PYTHONUSERBASE (absent by design, §6.2)
+        ``environment`` (optional) is forwarded verbatim into the container
+        profile (callers inject the THOUGHTMACHINE_SESSION_ID /
+        THOUGHTMACHINE_WORKSPACE_ID identity here); ``None`` keeps the empty
+        default.
         ``network_mode`` defaults to "none" when falsy (fail closed, §6.3).
 
         The image is ensured via ``resource_container_manager._ensure_resource_image``
@@ -426,6 +431,9 @@ class ContainerRegistry:
                 RESOURCE_NAME_LABEL: RESOURCE_KIND,
             },
             mounts=profile_mounts,
+            **(
+                {"environment": dict(environment)} if environment is not None else {}
+            ),
         )
         container = create_hardened_container(self._docker_client, profile, name)
         container_id = getattr(container, "id", "") or ""

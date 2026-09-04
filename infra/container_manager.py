@@ -104,6 +104,8 @@ except ImportError:  # pragma: no cover - defensive
         return False
 
 
+from infra.container_env import merge_container_identity_env
+
 # ── Output truncation (mirrors DockerCodeRunner._truncate_output) ──────────
 from agent.config.defaults import (
     CONTAINER_TYPE_FREE_USE,
@@ -636,7 +638,11 @@ class ContainerManager:
                     cpu_quota=self.cpu_quota,
                     oom_score_adj=1000,
                     labels=labels,
-                    environment={"PYTHONUSERBASE": "/home/agent/.local"},
+                    environment=merge_container_identity_env(
+                        {"PYTHONUSERBASE": "/home/agent/.local"},
+                        session_id=self.session_id,
+                        workspace_id=self.workspace_id,
+                    ),
                     mounts=[{
                         "source": self.workspace_path,
                         "target": "/workspace",
@@ -683,7 +689,11 @@ class ContainerManager:
             command=["tail", "-f", "/dev/null"],
             mem_limit=self.mem_limit,
             cpu_quota=self.cpu_quota,
-            environment={"PYTHONUSERBASE": "/home/agent/.local"},
+            environment=merge_container_identity_env(
+                {"PYTHONUSERBASE": "/home/agent/.local"},
+                session_id=self.session_id,
+                workspace_id=self.workspace_id,
+            ),
             labels=labels,
         )
         try:
@@ -727,8 +737,13 @@ class ContainerManager:
             "demux": True,
             "workdir": workdir,
         }
-        if environment:
-            exec_kwargs["environment"] = environment
+        merged_env = merge_container_identity_env(
+            environment,
+            session_id=self.session_id,
+            workspace_id=self.workspace_id,
+        )
+        if merged_env:
+            exec_kwargs["environment"] = merged_env
 
         result_queue = queue.Queue()
 

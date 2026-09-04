@@ -801,6 +801,7 @@ class GitReadTool(ToolBase):
                 workspace_path=self._resolved_workspace_path,
                 network_mode=network_mode,
                 session_permissions=self.session_permissions,
+                session_id=getattr(self, "session_id", None),
             )
 
         try:

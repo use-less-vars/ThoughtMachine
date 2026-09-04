@@ -183,6 +183,8 @@ except Exception:  # pragma: no cover - registry not wired
     get_active_registry = None
     is_registry_active = lambda session_config: False  # noqa: E731
 
+from infra.container_env import merge_container_identity_env
+
 # Module-level image-readiness cache + single-flight lock. Only SUCCESS is
 # cached (_RESOURCE_IMAGE_READY=True); a failed check/build is retried on the
 # next call.
@@ -1078,6 +1080,15 @@ class ResourceContainerManager:
             "/home/agent": "rw,exec,size=256M,uid=1000,gid=1000",
         }
         try:
+            # Phase 2 identity env: session/workspace ids are injected into
+            # the resource container at create time on BOTH paths (registry
+            # facade and legacy direct create) so in-container git tooling
+            # can attribute its work to the owning session/workspace.
+            identity_env = merge_container_identity_env(
+                None,
+                session_id=self.session_id,
+                workspace_id=self.workspace_id,
+            )
             if self._registry_active:
                 # Phase 3: the registry facade owns the hardened create
                 # (design doc §6.2). The /workspace bind is always added by
@@ -1099,6 +1110,7 @@ class ResourceContainerManager:
                         }
                         for m in mounts[1:]
                     ],
+                    environment=identity_env,
                 )
                 return _ResourceContainerHandle(handle["id"])
             container = self.client.containers.run(
@@ -1118,6 +1130,7 @@ class ResourceContainerManager:
                 command=["tail", "-f", "/dev/null"],
                 mem_limit=self.mem_limit,
                 cpu_quota=self.cpu_quota,
+                environment=identity_env,
                 labels=self._labels(name),
             )
         except Exception as e:
@@ -1392,8 +1405,13 @@ class ResourceContainerManager:
             "demux": True,
             "workdir": workdir,
         }
-        if environment:
-            exec_kwargs["environment"] = environment
+        merged_env = merge_container_identity_env(
+            environment,
+            session_id=self.session_id,
+            workspace_id=self.workspace_id,
+        )
+        if merged_env:
+            exec_kwargs["environment"] = merged_env
 
         result_queue = queue.Queue()
 
