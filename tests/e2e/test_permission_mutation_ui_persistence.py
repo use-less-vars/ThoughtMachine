@@ -162,7 +162,7 @@ def test_permission_mutation_ui_persistence(page, e2e_frontend, e2e_backend):
 
     fs_sel.select_option("write")
     expect(fs_sel).to_have_value("write")  # dirty draft
-    expect(page.get_by_text("Unsaved changes")).to_have_count(1, timeout=5000)
+    expect(page.get_by_text("Unsaved permission changes")).to_have_count(1, timeout=5000)
 
     # ── 4. Apply — NO backend restart anywhere in this test ──
     page.get_by_role("button", name="Apply", exact=True).click()
@@ -173,7 +173,7 @@ def test_permission_mutation_ui_persistence(page, e2e_frontend, e2e_backend):
         print("[ui-persist] REST effective filesystem after Apply: write (no restart)", flush=True)
 
         # 4b. The applied-config echo clears the draft; the select re-seeds to write.
-        expect(page.get_by_text("Unsaved changes")).to_have_count(0, timeout=15000)
+        expect(page.get_by_text("Unsaved permission changes")).to_have_count(0, timeout=15000)
         expect(fs_sel).to_have_value("write", timeout=15000)
 
     # 4c. No "restart required" hint: dev's ConfigPanel documents that changes

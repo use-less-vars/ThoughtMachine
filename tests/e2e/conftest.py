@@ -155,17 +155,28 @@ def _resolve_node() -> str:
 
 @pytest.fixture(scope="session")
 def e2e_backend():
-    """Boot the real FastAPI backend as a subprocess against a temp vault."""
+    """Boot the real FastAPI backend as a subprocess against a temp vault.
+
+    Process state is held in a mutable local ``state`` dict that is yielded
+    to tests.  ``restart_backend`` may replace ``state["proc"]`` with a
+    fresh process; teardown always stops the process currently recorded in
+    the dict, so a restarted backend is cleaned up at session end instead
+    of being leaked.
+    """
     vault = tempfile.mkdtemp(prefix="e2e_vault_")
     (Path(vault) / ".thoughtmachine").mkdir(parents=True, exist_ok=True)
     port = _free_port(8000)
-    proc = _start_backend(vault, port)
-    base_url = f"http://127.0.0.1:{port}"
+    state = {
+        "base_url": f"http://127.0.0.1:{port}",
+        "port": port,
+        "vault": vault,
+        "proc": _start_backend(vault, port),
+    }
     try:
-        _wait_http_ok(f"{base_url}/health")
-        yield {"base_url": base_url, "port": port, "vault": vault, "proc": proc}
+        _wait_http_ok(f"{state['base_url']}/health")
+        yield state
     finally:
-        _stop_proc(proc)
+        _stop_proc(state["proc"])
 
 
 @pytest.fixture(scope="session")
@@ -217,6 +228,12 @@ def restart_backend(e2e_backend):
 
     The Vite dev server proxies to the backend by port, so restarting on the
     same port keeps the frontend working without a frontend restart.
+
+    The replacement process is written back into ``e2e_backend``'s mutable
+    state, and the session-scoped ``e2e_backend`` fixture owns final
+    cleanup: this fixture deliberately has NO teardown of its own, so a
+    restart never kills the shared session-scoped backend out from under
+    later tests.
     """
 
     def _restart():
@@ -227,7 +244,6 @@ def restart_backend(e2e_backend):
         return new_proc
 
     yield _restart
-    _stop_proc(e2e_backend["proc"])
 
 
 @pytest.fixture(scope="session")
