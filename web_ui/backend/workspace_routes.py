@@ -1388,11 +1388,20 @@ async def get_workspace_permissions(ws_id: str) -> Dict[str, Any]:
     purpose = cfg.get("purpose", "general")
     allow_host_resources = bool(cfg.get("allow_host_resources", False))
     permissions = _resolve_workspace_permissions(cfg, purpose)
+    raw_cfg_permissions = cfg.get("permissions")
+    raw = (
+        dict(raw_cfg_permissions)
+        if isinstance(raw_cfg_permissions, dict) and raw_cfg_permissions
+        else {}
+    )
     return {
         "workspace_id": ws_id,
         "purpose": purpose,
         "permissions": permissions,
         "allow_host_resources": allow_host_resources,
+        "raw": raw,
+        "effective": permissions,
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -1442,6 +1451,9 @@ async def put_workspace_permissions(
         "permissions": normalized,
         "allow_host_resources": allow_host_resources,
         "risk": risk,
+        "raw": normalized,
+        "effective": normalized,
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
     }
 
 

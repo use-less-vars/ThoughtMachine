@@ -7,19 +7,41 @@ Provides:
 - GET    /api/session/{session_id}    — get session details
 - DELETE /api/session/{session_id}    — delete a session
 - POST   /api/session/{session_id}/rename — rename a session
+- GET    /api/session/{session_id}/permissions  — stored raw + computed effective session permissions
+- PUT    /api/session/{session_id}/permissions  — atomically replace the stored raw session permissions
 """
 
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from session.store import FileSystemSessionStore
 from session.session_registry import SessionRegistry
+from thoughtmachine.permission_store import (
+    PermissionStoreError,
+    read_session_permissions,
+    session_grants_path,
+    workspace_ceiling,
+    write_session_permissions,
+)
+from thoughtmachine.security import (
+    PERMISSION_SCHEMA,
+    SessionPermissions,
+    coerce_session_permissions,
+)
+from thoughtmachine.vault import vault_root
 from thoughtmachine.workspace_registry import WorkspaceRegistry
-from thoughtmachine.workspace_capabilities import ensure_workspace_dirs
+from thoughtmachine.workspace_capabilities import (
+    WorkspaceCapabilities,
+    ensure_workspace_dirs,
+    load_workspace_capabilities,
+)
 
 from web_ui.backend.config_manager import ConfigManager
 from web_ui.backend.session_manager import SessionManager
@@ -333,4 +355,202 @@ async def delete_session(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete session: {exc}",
+        )
+
+
+# ── GET/PUT /api/session/{session_id}/permissions ─────────────────────
+# Step-5 disk-pure session permission endpoints: raw = stored uncapped grants
+# (vault permission-store sidecar first, legacy session-record
+# metadata.session_config.session_permissions fallback); effective = raw
+# coerced to the full session profile, capped by the workspace ceiling
+# (config.json['permissions']) and merged with workspace capabilities in the
+# security gate (same computation as GET /api/workspace/{ws_id}/effective_permissions);
+# resolved_at = UTC ISO-8601 timestamp of this resolution.
+
+
+def _session_record_exists(vault_root_path, workspace_id: str, session_id: str) -> bool:
+    """True when a legacy session-record JSON under
+    <vault>/workspaces/<ws>/sessions carries this session_id.
+
+    Content scan mirroring thoughtmachine.permission_store._session_record_path
+    (files named _meta_* are skipped; unparseable / non-matching files are
+    skipped silently).  Duplicated here so the 404-vs-500 distinction for a
+    missing permission source does not depend on the store's private helpers.
+    """
+    sessions_dir = (
+        Path(vault_root_path) / "workspaces" / workspace_id / "sessions"
+    )
+    if not sessions_dir.is_dir():
+        return False
+    for file_path in sorted(sessions_dir.glob("*.json")):
+        if file_path.name.startswith("_meta_"):
+            continue
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if isinstance(data, dict) and data.get("session_id") == session_id:
+            return True
+    return False
+
+
+def _load_permission_session(session_id: str):
+    """Load a session for the permission endpoints; 404 when unknown
+    (mirrors the GET /{session_id} detail handler)."""
+    store = _get_store()
+    session = store.load_session(session_id)
+    if session is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session not found: {session_id}",
+        )
+    return store, session
+
+
+def _compute_effective_session_permissions(
+    vault, workspace_id: str, session_id: str, raw_perms: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Compute effective session permissions enforced at runtime.
+
+    Pipeline (mirrors GET /api/workspace/{ws_id}/effective_permissions):
+    coerce raw grants to the full 9-key session profile (safe defaults when
+    empty) -> build SessionPermissions -> apply the workspace ceiling from
+    config.json['permissions'] (via the permission store) -> merge with
+    workspace capabilities in the security gate.  A corrupt/missing workspace
+    config is treated as "no ceiling" ({}) so a broken ceiling never nukes the
+    session permission read.  The gate import is lazy (import precedent:
+    workspace_routes.py effective_permissions handler).
+    """
+    from security.security_gate import get_effective_permissions as _gate_effective
+
+    caps = load_workspace_capabilities(workspace_id)
+    if caps is None:
+        caps = WorkspaceCapabilities.default()
+
+    raw = coerce_session_permissions(raw_perms) if raw_perms else {}
+    session_obj = SessionPermissions(**raw) if raw else SessionPermissions()
+
+    try:
+        ceiling = workspace_ceiling(vault, workspace_id)
+    except PermissionStoreError:
+        # Unreadable/missing workspace ceiling must not fail the session read;
+        # no ceiling == raw session grants pass through capability merge.
+        ceiling = {}
+    return _gate_effective(session_obj, caps, ceiling)
+
+
+@router.get("/{session_id}/permissions")
+async def get_session_permissions(session_id: str) -> Dict[str, Any]:
+    """Return the session's stored (raw) and computed (effective) permissions:
+    {"raw": <dict>, "effective": <dict>, "resolved_at": <ISO-8601 UTC>}.
+
+    raw is the uncapped grant map read from the vault permission-store sidecar
+    <vault>/workspaces/<ws>/sessions/<sid>/permissions.json with legacy
+    fallback to metadata.session_config.session_permissions in the session
+    record; {} is a valid raw value (record exists but carries no grants).
+    404 when the session has no permission source at all (no sidecar and no
+    matching legacy record); 500 when a present source is corrupt/unreadable
+    (unparseable non-matching legacy records are skipped by the content scan,
+    mirroring the permission store, and therefore count as "no source").
+    """
+    try:
+        _store, session = _load_permission_session(session_id)
+        ws_id = session.workspace_id or ""
+        vault = vault_root()
+
+        sidecar = session_grants_path(vault, ws_id, session_id)
+        if not sidecar.exists() and not _session_record_exists(vault, ws_id, session_id):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"no session permissions stored for session {session_id}",
+            )
+        try:
+            raw = read_session_permissions(vault, ws_id, session_id)
+        except PermissionStoreError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"permission store read failed: {exc}",
+            )
+        effective = _compute_effective_session_permissions(
+            vault, ws_id, session_id, raw
+        )
+        return {
+            "raw": raw,
+            "effective": effective,
+            "resolved_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get session permissions: {exc}",
+        )
+
+
+@router.put("/{session_id}/permissions")
+async def put_session_permissions(
+    session_id: str,
+    body: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Atomically replace the session's stored raw permission grants.
+
+    The request body IS the raw permissions JSON object (full-replace
+    semantics).  Order: (1) object body (FastAPI-enforced by the Dict
+    annotation); (2) unknown keys (not in PERMISSION_SCHEMA) -> 422
+    {"detail": {"errors": ["unknown session permission key: <k>"]}};
+    (3) strict value validation via SessionPermissions(**body) ->
+    pydantic.ValidationError -> 422 {"detail": {"errors": ["<loc>: <msg>"]}};
+    (4) normalized = coerce_session_permissions(body) (invalid values that
+    the wider model accepts but the store schema does not, e.g.
+    filesystem:"full" or a legacy network bool, fall back to safe defaults);
+    (5) atomic write via permission_store.write_session_permissions (same-dir
+    temp file + fsync + os.replace); (6) recompute effective exactly like GET
+    and return {"raw": normalized, "effective": ..., "resolved_at": ...}.
+    An empty object {} clears explicit grants (all-defaults profile).
+    """
+    try:
+        _store, session = _load_permission_session(session_id)
+        ws_id = session.workspace_id or ""
+        vault = vault_root()
+
+        unknown = sorted(set(body.keys()) - set(PERMISSION_SCHEMA.keys()))
+        if unknown:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "errors": [
+                        f"unknown session permission key: {k}" for k in unknown
+                    ]
+                },
+            )
+        try:
+            SessionPermissions(**body)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "errors": [
+                        f"{'.'.join(str(part) for part in err.get('loc', ()))}: {err.get('msg', '')}"
+                        for err in exc.errors()
+                    ]
+                },
+            ) from None
+        normalized = coerce_session_permissions(body)
+        write_session_permissions(vault, ws_id, session_id, normalized)
+        effective = _compute_effective_session_permissions(
+            vault, ws_id, session_id, normalized
+        )
+        return {
+            "raw": normalized,
+            "effective": effective,
+            "resolved_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to save session permissions: {exc}",
         )
