@@ -87,8 +87,9 @@ class ToolExecutor:
         self.agent = agent
         self._event_bus = event_bus
         self._is_worker_context = is_worker_context
+        self._session_workspace_id_cache = {}
 
-    def execute_tool_calls(self, tool_calls: List[Dict[str, Any]], add_to_conversation_func, update_token_func=None, agent_id: int = 0, session_id: str = "", turn_transaction: Optional[TurnTransaction]=None) -> Tuple[List[Dict[str, Any]], bool, Optional[Dict[str, Any]], Optional[str], Optional[int]]:
+    def execute_tool_calls(self, tool_calls: List[Dict[str, Any]], add_to_conversation_func, update_token_func=None, agent_id: int = 0, session_id: str = "", workspace_id: str = "", turn_transaction: Optional[TurnTransaction]=None) -> Tuple[List[Dict[str, Any]], bool, Optional[Dict[str, Any]], Optional[str], Optional[int]]:
         """
         Execute multiple tool calls from an assistant message.
         
@@ -195,7 +196,7 @@ class ToolExecutor:
                 tool_execution_result = {'result': tool_result, 'tool_type': 'normal'}
                 tool_type = 'normal'
             else:
-                tool_execution_result = self._execute_single_tool(tool_class, arguments, tool_name, agent_id, lambda: summary_requested, lambda: summary_text, lambda: summary_keep_recent_turns, session_id=session_id)
+                tool_execution_result = self._execute_single_tool(tool_class, arguments, tool_name, agent_id, lambda: summary_requested, lambda: summary_text, lambda: summary_keep_recent_turns, session_id=session_id, workspace_id=workspace_id)
                 tool_result = tool_execution_result['result']
                 tool_type = tool_execution_result.get('tool_type', 'normal')
                 if tool_type == 'respond':
@@ -225,7 +226,7 @@ class ToolExecutor:
             executed_tools.append({'name': tool_name, 'arguments': arguments, 'result': tool_result})
         return (executed_tools, final_detected, respond_result, summary_text if summary_requested else None, summary_keep_recent_turns if summary_requested else None)
 
-    def _execute_single_tool(self, tool_class, arguments: Dict[str, Any], tool_name: str, agent_id: int, get_summary_requested, get_summary_text, get_summary_keep_recent_turns, session_id: str = "") -> Dict[str, Any]:
+    def _execute_single_tool(self, tool_class, arguments: Dict[str, Any], tool_name: str, agent_id: int, get_summary_requested, get_summary_text, get_summary_keep_recent_turns, session_id: str = "", workspace_id: str = "") -> Dict[str, Any]:
         """
         Execute a single tool instance.
 
@@ -293,8 +294,30 @@ class ToolExecutor:
                 # executing (e.g. introspection probes in tests).
                 if workspace_path and not ws_id and required_categories:
                     return {'result': f"DENIED: could not resolve workspace_id for workspace_path={workspace_path}; tool execution denied (fail-closed).", 'tool_type': 'normal'}
+                # Fallback workspace-id resolution when no workspace_path is
+                # configured: prefer the explicitly passed workspace_id (agent
+                # session context), then a cached best-effort lookup of the
+                # persisted session record's top-level 'workspace_id'.
+                if not ws_id:
+                    ws_id = workspace_id or self._resolve_workspace_id_from_session(session_id)
                 caps = get_workspace_capabilities(ws_id) if ws_id else WorkspaceCapabilities()
-                effective = get_effective_permissions(session_perms_obj, caps)
+                # Disk-authoritative permissions mode: when BOTH a session id
+                # and a workspace id are available, ask the gate to read the
+                # session's on-disk permissions record (vault sidecar,
+                # fail-closed on any store error) instead of trusting the
+                # in-memory mirror.  Otherwise fall back to the legacy 2-arg
+                # merge (mirror-only), keeping behaviour byte-identical for
+                # callers that resolve neither id (direct executor
+                # construction, legacy paths, empty session_id).
+                if session_id and ws_id:
+                    effective = get_effective_permissions(
+                        session_perms_obj,
+                        caps,
+                        session_id=session_id,
+                        workspace_id=ws_id,
+                    )
+                else:
+                    effective = get_effective_permissions(session_perms_obj, caps)
 
                 ok, error_msg = check_required_categories(
                     required_categories,
@@ -435,6 +458,31 @@ class ToolExecutor:
             return {'result': f'Invalid arguments: {e}', 'tool_type': 'normal'}
         except Exception as e:
             return {'result': f'Error executing tool: {e}', 'tool_type': 'normal'}
+
+    def _resolve_workspace_id_from_session(self, session_id: str) -> Optional[str]:
+        """Best-effort resolve a session's workspace_id from its persisted
+        session record (top-level 'workspace_id' field).  Never raises and
+        never fails closed: any lookup error simply yields None, letting the
+        caller fall back to legacy mirror behaviour."""
+        if not session_id:
+            return None
+        cached = self._session_workspace_id_cache.get(session_id)
+        if cached:
+            return cached
+        try:
+            from session.store import FileSystemSessionStore
+            store = FileSystemSessionStore()
+            path = store._find_session_path(session_id)
+            if path is None:
+                return None
+            raw = json.loads(path.read_text(encoding='utf-8'))
+            ws_id = raw.get('workspace_id') if isinstance(raw, dict) else None
+            if ws_id:
+                self._session_workspace_id_cache[session_id] = ws_id
+                return ws_id
+        except Exception:
+            pass
+        return None
 
     def close(self):
         """Close and release any resources held by this executor."""
