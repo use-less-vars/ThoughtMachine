@@ -32,6 +32,7 @@ from thoughtmachine.security import SessionPermissions, PERMISSION_SCHEMA, _pend
 from agent.config.defaults import PROMPT_TIMEOUT, RESOURCE_REGISTRY
 from agent.events import SecurityPromptEvent, EventType, NullEventBus
 from security.gate_helpers import _value_satisfies
+from security.resource_catalog import RESOURCE_CATALOG, coerce_resource_permissions
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +138,11 @@ def _min_permission(
     _LEVEL_MAP: dict[str, float] = {
         "banned": 0.0, "ask": 1.0, "none": 1.0,
         "read": 2.0, "outbound": 2.5, "write": 3.0, "full": 4.0,
+        # Session git level (branch-restricted writes) ranks at write level,
+        # so a worker footprint restricting git to read caps it to read
+        # instead of keeping branch-write silently (the 2.0 unknown default
+        # below would let it slip through the comparison otherwise).
+        "write_on_feature_branch": 3.0,
     }
 
     def _level(v: Any) -> float:
@@ -165,6 +171,11 @@ _WORKSPACE_CEILING_LEVELS: Dict[str, float] = {
     "read": 1.0,
     "ask": 2.0,
     "write": 3.0,
+    # Session git level (branch-restricted writes) ranks at write level so
+    # a stricter ceiling (read/ask/banned) caps it like plain write while a
+    # write ceiling leaves it standing.  As a ceiling value it means
+    # write-rank (3.0) -- never unlimited.
+    "write_on_feature_branch": 3.0,
     "full": 3.0,  # session-side alias for write-level
     "none": 1.0,  # alias used by some purpose presets
     "outbound": 2.5,  # session-side network level
@@ -184,6 +195,19 @@ _WORKSPACE_RESOURCE_MAP: Dict[str, str] = {
     "network": "network",
     "git_read": "git_read",
     "git_write": "git_write",
+}
+
+#: Recognised workspace-ceiling resource names: the canonical catalog
+#: resources (session-grant keys git/filesystem/container/network/mcp plus
+#: the ceiling-only grain host_bash -- see security/resource_catalog.py)
+#: extended with the legacy workspace grains (docker, git_read, git_write).
+#: A ceiling key outside this set is an unknown resource: it is logged and
+#: ignored (fail-open), so forward-compatible workspace maps never break
+#: session resolution.
+_WORKSPACE_CEILING_KEYS = frozenset(RESOURCE_CATALOG) | {
+    "docker",
+    "git_read",
+    "git_write",
 }
 
 
@@ -208,6 +232,9 @@ def apply_workspace_ceiling(
           session value stands.
         * An unknown ceiling level is treated as no ceiling (fail-open), so
           forward-compatible workspace maps never break session resolution.
+        * An unknown ceiling resource (outside ``RESOURCE_CATALOG`` and the
+          legacy workspace grains ``docker``/``git_read``/``git_write``) is
+          logged and ignored (fail-open) -- the session value stands.
         * Boolean session values (``container``) survive only when the
           ceiling is write-level or unlimited; any stricter ceiling forces
           ``False``.  The ``container`` key is always emitted as a boolean.
@@ -218,6 +245,14 @@ def apply_workspace_ceiling(
 
     result = dict(session_permissions)
     for resource, ceiling in workspace_permissions.items():
+        if resource not in _WORKSPACE_CEILING_KEYS:
+            logger.warning(
+                "ignoring workspace ceiling for unknown resource %r "
+                "(not a catalog resource or legacy workspace grain); "
+                "fail-open: no ceiling applied",
+                resource,
+            )
+            continue
         key = _WORKSPACE_RESOURCE_MAP.get(resource)
         if key is None or key not in result:
             continue  # unknown resource / not a session key: no ceiling
@@ -231,6 +266,12 @@ def apply_workspace_ceiling(
         else:
             ceiling_rank = None
         if ceiling_rank is None:
+            logger.warning(
+                "ignoring workspace ceiling level %r for resource %r "
+                "(not a known ceiling level); fail-open: no ceiling applied",
+                ceiling,
+                resource,
+            )
             continue
         if ceiling_rank >= 4.0:
             continue  # write_feature_branches -> unlimited
@@ -280,6 +321,13 @@ def split_git_permission(level: Any) -> tuple:
     ``full``             ``full``             ``full``
     ===================  ===================  ====================
 
+    ``write_on_feature_branch`` (session git level, branch-restricted
+    writes) splits into git_read ``read`` + git_write
+    ``write_on_feature_branch``: reads are allowed on any branch, while the
+    write grain carries the verbatim branch-aware level so the Phase-3 git
+    write tool gate can admit feature-branch commits and deny plain
+    ``git:write`` requests.
+
     ``ask`` maps to ``ask`` on both sub-levels so the interactive prompt
     flow for ``git:write`` is preserved (an ``ask`` write is prompted
     exactly as before).
@@ -293,6 +341,12 @@ def split_git_permission(level: Any) -> tuple:
         return ("read", "banned")
     if s in ("write", "full"):
         return (s, s)
+    if s == "write_on_feature_branch":
+        # Feature-branch write grant: reads are allowed everywhere; the
+        # write grain keeps the verbatim level so the branch-aware git
+        # write tool (Phase 3) can allow feature-branch commits while the
+        # gate denies plain git:write requests (fail closed until then).
+        return ("read", "write_on_feature_branch")
     # Unknown level: fail closed on both sub-levels.
     return (False, False)
 
@@ -356,6 +410,16 @@ def get_effective_permissions(
         a deny-all profile (every category ``banned`` / ``False``) and the
         ceiling to a deny-all ceiling, so the merged result is the
         all-denied shape rather than an accidental grant.
+
+    Absent-grant rule:
+        ``SessionPermissions`` carries safe pydantic defaults (filesystem
+        ``read``, git ``read``, system ``read``; network / mcp / execution
+        ``banned``; container ``False``).  A grant set that is missing a
+        key resolves to that key's default -- never an accidental denial of
+        a default.  Ceilings and workspace capabilities only ever lower
+        those values further; a ceiling-only passthrough that would lift a
+        default-banned key (e.g. ``network``) into a grant would be a
+        regression, which is why the full default-filled profile is kept.
     """
     # ── Disk-mode dispatch ──────────────────────────────────────────────────────────────────────────────────────────────────
     # Both ids supplied and no explicit in-memory ceiling: the grant profile
@@ -379,7 +443,15 @@ def get_effective_permissions(
             workspace_permissions = _DISK_FAIL_CLOSED_CEILING
         else:
             try:
-                session = SessionPermissions(**disk_grants)
+                # Belt-and-braces: read_session_permissions already returns
+                # catalog-clean grants (the store coerces on every read and
+                # write), but re-coercing at the gate boundary keeps a
+                # non-catalog key from ever reaching SessionPermissions.
+                # coerce_resource_permissions never raises; the except below
+                # still guards the constructor.
+                session = SessionPermissions(
+                    **coerce_resource_permissions(disk_grants)
+                )
             except Exception:
                 # Unreadable grant record -> deny-all session; the disk
                 # ceiling still applies on top of it.

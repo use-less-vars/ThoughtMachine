@@ -26,6 +26,10 @@ def _value_satisfies(required: str, allowed: object) -> bool | str:
         * ``False`` if permission is denied.
         * ``"ASK"`` if the allowed value is ``'ask'`` and the required access
           is above the read level.
+
+    ``write_on_feature_branch`` on the allowed side ranks at the read level
+    (2): it satisfies ``read`` requirements but denies ``write`` requirements
+    (branch-restricted writes never pass the outer gate for write-level ops).
     """
     sentinel_ask = "ASK"
     required_lower = str(required).lower()
@@ -60,7 +64,10 @@ def _value_satisfies(required: str, allowed: object) -> bool | str:
     aliases = {"deny": "banned", "denied": "banned", "all": "full"}
     level_map = {"banned": 0, "ask": 1, "read": 2, "connect": 3, "write": 3, "full": 4}
     allowed_level_name = aliases.get(allowed_str, allowed_str)
-    allowed_level = level_map.get(allowed_level_name)
+    if allowed_level_name == "write_on_feature_branch":
+        allowed_level = 2  # branch-restricted write: satisfies read-level (rank 2), denies write-level (2 < 3)
+    else:
+        allowed_level = level_map.get(allowed_level_name)
 
     if required_level is None or allowed_level is None:
         # Fall back to exact match
