@@ -443,3 +443,78 @@ class TestWorkspacePermissionsRoutes:
         assert data["raw"] == {}
         assert data["permissions"] == CODING_PRESET
         assert data["effective"] == CODING_PRESET
+
+
+class TestWorkspaceEffectivePermissionsRoutes:
+    """GET /api/workspace/{ws_id}/effective_permissions session resolution.
+
+    The effective-permissions endpoint resolves a session's grants sidecar
+    first (``permission_store.read_session_permissions``), then falls back to
+    the saved session's embedded metadata; an unknown session (or one with no
+    stored source) yields the read-only default rather than a 404.
+    """
+
+    SID = "sess-eff-001"
+    WS = "ws-eff-a"
+
+    def test_effective_reads_sidecar_after_session_put(self, vault, stub_store):
+        stub_store.register(self.SID, self.WS)
+        put = client.put(
+            f"/api/session/{self.SID}/permissions", json={"filesystem": "write"}
+        )
+        assert put.status_code == 200, put.text
+        sidecar = session_grants_path(vault, self.WS, self.SID)
+        assert sidecar.exists()
+
+        resp = client.get(
+            f"/api/workspace/{self.WS}/effective_permissions",
+            params={"session_id": self.SID},
+        )
+        assert resp.status_code == 200, resp.text
+        effective = resp.json()["effective_permissions"]
+        assert effective["filesystem"] == "write"
+
+    def test_effective_sidecar_supersedes_stale_metadata(self, vault):
+        # Legacy record on disk says "read"; the sidecar (written later) says
+        # "write".  The sidecar must win while it exists, and the legacy
+        # metadata must take over once the sidecar is gone.
+        _write_json(
+            vault / "workspaces" / self.WS / "sessions" / f"{self.SID}.json",
+            {
+                "session_id": self.SID,
+                "metadata": {
+                    "session_config": {
+                        "session_permissions": {"filesystem": "read"}
+                    }
+                },
+            },
+        )
+        sidecar = session_grants_path(vault, self.WS, self.SID)
+        _write_json(sidecar, {"filesystem": "write"})
+
+        resp = client.get(
+            f"/api/workspace/{self.WS}/effective_permissions",
+            params={"session_id": self.SID},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["effective_permissions"]["filesystem"] == "write"
+
+        sidecar.unlink()
+        resp = client.get(
+            f"/api/workspace/{self.WS}/effective_permissions",
+            params={"session_id": self.SID},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["effective_permissions"]["filesystem"] == "read"
+
+    def test_effective_unknown_session_returns_read_only_default(self, vault):
+        resp = client.get(
+            f"/api/workspace/{self.WS}/effective_permissions",
+            params={"session_id": "no-such-session"},
+        )
+        assert resp.status_code == 200, resp.text
+        effective = resp.json()["effective_permissions"]
+        assert effective["filesystem"] == "read"
+        assert effective["network"] == "banned"
+        assert effective["container"] is False
+

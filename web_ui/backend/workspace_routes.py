@@ -32,6 +32,12 @@ from thoughtmachine.workspace_capabilities import (
     load_workspace_capabilities,
 )
 
+from thoughtmachine.permission_store import (
+    PermissionStoreError,
+    read_session_permissions,
+)
+from thoughtmachine.vault import vault_root
+
 from tools.workspace.worker_registry import WorkerRegistry as _WorkerRegistry
 _worker_registry = _WorkerRegistry.get_instance()._worker_registry
 _registry_lock = _WorkerRegistry.get_instance()._registry_lock
@@ -779,9 +785,10 @@ async def get_effective_permissions(
     """Return the effective (merged) permissions for this workspace.
 
     Merges the session-level permissions with workspace-level capabilities.
-    If *session_id* is provided, the session is loaded and its embedded
-    ``session_permissions`` are used; otherwise a read-only, no-network
-    default is assumed.
+    If *session_id* is provided, session permissions are resolved sidecar
+    first (``permission_store.read_session_permissions``), falling back to
+    the saved session's embedded ``session_permissions`` metadata; otherwise
+    a read-only, no-network default is assumed.
     """
     ensure_workspace_dirs(ws_id)
 
@@ -795,7 +802,14 @@ async def get_effective_permissions(
 
     session_perms = None
     if session_id:
-        raw_perms = _load_session_permissions(session_id)
+        raw_perms = None
+        try:
+            raw_perms = read_session_permissions(vault_root(), ws_id, session_id)
+        except PermissionStoreError:
+            # No sidecar / legacy record (or unreadable source) for this
+            # session: fall back to the metadata-based loader.  The read-only
+            # default below still applies if that finds nothing.
+            raw_perms = _load_session_permissions(session_id)
         if raw_perms is not None and isinstance(raw_perms, dict):
             try:
                 session_perms = SessionPermissions(**raw_perms)
