@@ -60,6 +60,20 @@ class FilesystemWriteTool(ToolBase):
         return "FS OK"
 
 
+class GitWriteProbeTool(ToolBase):
+    """A tool that requires git write access.
+
+    git is the canonical ask carrier in the current model: filesystem's
+    session vocabulary is banned|read|write (no ask), while git still
+    accepts ask -- so an ask-level grant is only representable via git.
+    """
+    tool: str = "GitWriteProbeTool"
+    required_categories: ClassVar[List[str]] = ["git:write"]
+
+    def execute(self) -> str:
+        return "GIT OK"
+
+
 class FakeConfig:
     """Minimal config stub (no workspace_path -> ws_id comes from the arg)."""
     workspace_path = None
@@ -121,6 +135,24 @@ def _seed_vault(monkeypatch, tmp_path, ws_id, session_id, filesystem_level):
         json.dumps(
             {"permissions": {"filesystem": filesystem_level, "network": "banned"}}
         ),
+        encoding="utf-8",
+    )
+
+
+def _seed_git_ask_vault(monkeypatch, tmp_path, ws_id, session_id):
+    """Seed a canonical vault record granting git:'ask' + a git:'ask' ceiling.
+
+    filesystem no longer has an ask level (session vocabulary is
+    banned|read|write), so git -- whose vocabulary still carries ask -- is
+    used to exercise the live ASK path for a main agent.
+    """
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(tmp_path))
+    root = vault_root()
+    ws_dir = root / "workspaces" / ws_id
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    write_session_permissions(root, ws_id, session_id, {"git": "ask"})
+    (ws_dir / "config.json").write_text(
+        json.dumps({"permissions": {"git": "ask"}}),
         encoding="utf-8",
     )
 
@@ -228,20 +260,26 @@ class TestWorkerDiskPureGate:
     ):
         """Sanity leg: for a MAIN agent (is_worker_context=False) the ask path
         is live -- a SecurityPromptEvent is published to the bus and the tool
-        is denied once the (shortened) prompt wait times out."""
+        is denied once the (shortened) prompt wait times out.
+
+        filesystem's session vocabulary is banned|read|write (no ask), so
+        git -- whose vocabulary still carries ask -- is the canonical ask
+        carrier: a git:write request against a git:ask grant must hit the
+        prompt path."""
         import security.security_gate as security_gate_module
 
         monkeypatch.setattr(security_gate_module, "PROMPT_TIMEOUT", 0.05)
-        _seed_vault(monkeypatch, tmp_path, WORKSPACE, SESSION, "ask")
+        _seed_git_ask_vault(monkeypatch, tmp_path, WORKSPACE, SESSION)
         bus = RecordingBus()
-        perms = SessionPermissions(filesystem="ask")
+        perms = SessionPermissions(git="ask")
         executor = _make_executor(perms, is_worker_context=False, event_bus=bus)
-        result = _run_write_tool(
-            executor,
+        result = executor._execute_single_tool(
+            GitWriteProbeTool, {}, "GitWriteProbeTool", 0,
+            lambda: False, lambda: None, lambda: 0,
             session_id=SESSION,
             workspace_id=WORKSPACE,
         )
-        assert result["result"] != "FS OK"
+        assert result["result"] != "GIT OK"
         assert "Permission denied" in result["result"], result["result"]
         assert len(bus.published) >= 1, (
             "main-agent ask path must publish a SecurityPromptEvent"

@@ -1,84 +1,116 @@
 """
-Tests for the resource catalog (agent/config/resource_catalog.json + loader).
+Hermetic unit tests for the canonical resource permission catalog
+(security/resource_catalog.py).
+
+The catalog is the single source of truth for the resource keys and levels a
+session permission grant may carry.  ``coerce_resource_permissions`` is
+applied by ``thoughtmachine/permission_store`` on every session-grant write
+and read; these tests pin the catalog contents and the coercion rules
+(unknown-key and invalid-value dropping, the container bool-only rule, and
+warning logging).
 """
 
-from __future__ import annotations
-
-import json
+import logging
+import sys
 from pathlib import Path
 
-from agent.config.resource_catalog import (
-    catalog_default_permissions,
-    catalog_entry,
-    catalog_permission_levels,
-    catalog_resource_names,
-    get_resource_catalog,
+# Add project root so that imports work (same pattern as sibling tests).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import pytest  # noqa: E402  (import order forced by the sys.path shim)
+
+from security.resource_catalog import (  # noqa: E402
+    RESOURCE_CATALOG,
+    canonical_resource_keys,
+    coerce_resource_permissions,
 )
 
 
-def test_resource_catalog_contains_required_tools():
-    """The catalog covers git_read/git_write/host_bash and all three are real tools."""
-    from session.tool_presets import _ALL_TOOLS
-
-    names = catalog_resource_names()
-    for required in ("git_read", "git_write", "host_bash"):
-        assert required in names, f"catalog missing resource '{required}'"
-        assert catalog_entry(required) is not None
-        assert required in _ALL_TOOLS, f"'{required}' missing from session tool presets"
+# ---------------------------------------------------------------------------
+# Catalog contents
+# ---------------------------------------------------------------------------
 
 
-def test_resource_catalog_default_permissions():
-    """Default permission map covers every resource with a valid level."""
-    defaults = catalog_default_permissions()
-    levels = catalog_permission_levels()
-    assert list(defaults.keys()) == catalog_resource_names()
-    for name, level in defaults.items():
-        assert level in levels, f"resource '{name}' has invalid default level '{level}'"
-    assert defaults["git_read"] == "read"
-    assert defaults["git_write"] == "ask"
-    assert defaults["host_bash"] == "banned"
-    assert levels == ["banned", "ask", "read", "write"]
-
-
-def test_resource_catalog_json_matches_loader():
-    """The on-disk file (new array shape) and the loader's legacy view agree.
-
-    The raw file is the new resource-level array (git / filesystem / docker /
-    host_bash / tty / jtag); the loader shims it into the legacy tool-level
-    dict view so the permission machinery keeps working unchanged.
-    """
-    catalog_path = Path(__file__).resolve().parent.parent / "agent/config/resource_catalog.json"
-    raw = json.loads(catalog_path.read_text(encoding="utf-8"))
-
-    # New array shape: 6 resources, each with exactly the 8 canonical keys.
-    assert isinstance(raw, list)
-    assert len(raw) == 6
-    assert {entry["name"] for entry in raw} == {
-        "git", "filesystem", "docker", "host_bash", "tty", "jtag",
+def test_canonical_resource_keys_match_catalog():
+    assert canonical_resource_keys == set(RESOURCE_CATALOG)
+    assert canonical_resource_keys == {
+        "git", "filesystem", "container", "network", "mcp", "host_bash",
     }
-    for entry in raw:
-        assert set(entry.keys()) == {
-            "name", "display_name", "description", "permission_grain_set",
-            "default_execution_context", "container_image",
-            "dockerfile_reference", "tools",
-        }
-    git_entry = next(e for e in raw if e["name"] == "git")
-    assert git_entry["dockerfile_reference"] == "docker/resource/git_overlay.Dockerfile"
-    assert git_entry["tools"] == ["git_read", "git_write"]
 
-    # Loader still exposes the legacy dict view for list-shaped files.
-    loaded = get_resource_catalog()
-    assert loaded["schema_version"] == 1
-    assert loaded["permission_levels"] == ["banned", "ask", "read", "write"]
-    assert list(loaded["resources"].keys()) == [
-        "git_read", "git_write", "host_bash", "container", "network",
-        "filesystem", "system", "git", "execution", "mcp",
+
+def test_catalog_expected_shape():
+    assert RESOURCE_CATALOG["git"] == [
+        "banned", "ask", "read", "write", "write_on_feature_branch",
     ]
-    legacy_defaults = {
-        "git_read": "read", "git_write": "ask", "host_bash": "banned",
-        "container": "ask", "network": "ask", "filesystem": "read",
-        "system": "read", "git": "read", "execution": "banned",
-        "mcp": "banned",
+    assert RESOURCE_CATALOG["filesystem"] == ["banned", "read", "write"]
+    assert RESOURCE_CATALOG["container"] == [True, False]
+    assert RESOURCE_CATALOG["network"] == ["banned", "ask", "write", "outbound"]
+    assert RESOURCE_CATALOG["mcp"] == ["banned", "connect", "full"]
+    assert RESOURCE_CATALOG["host_bash"] == ["banned", "ask", "allow"]
+
+
+# ---------------------------------------------------------------------------
+# Coercion: unknown keys / invalid values
+# ---------------------------------------------------------------------------
+
+
+def test_coerce_drops_unknown_key_and_logs_warning(caplog):
+    # network/mcp are now valid session-grant keys; system is not in the catalog.
+    raw = {"system": "read", "filesystem": "read"}
+    with caplog.at_level(logging.WARNING, logger="security.resource_catalog"):
+        clean = coerce_resource_permissions(raw)
+    assert clean == {"filesystem": "read"}
+    assert any("system" in record.message for record in caplog.records)
+
+
+def test_coerce_logs_one_warning_per_unknown_key(caplog):
+    raw = {"system": "read", "execution": "banned", "git": "read"}
+    with caplog.at_level(logging.WARNING, logger="security.resource_catalog"):
+        clean = coerce_resource_permissions(raw)
+    assert clean == {"git": "read"}
+    messages = [record.message for record in caplog.records]
+    assert sum("system" in m for m in messages) == 1
+    assert sum("execution" in m for m in messages) == 1
+
+
+def test_coerce_drops_invalid_level_and_logs_warning(caplog):
+    raw = {"filesystem": "full", "git": "read"}
+    with caplog.at_level(logging.WARNING, logger="security.resource_catalog"):
+        clean = coerce_resource_permissions(raw)
+    assert clean == {"git": "read"}
+    assert any("full" in record.message for record in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Coercion: container boolean-only rule
+# ---------------------------------------------------------------------------
+
+
+def test_coerce_container_accepts_only_real_bools():
+    assert coerce_resource_permissions({"container": True}) == {"container": True}
+    assert coerce_resource_permissions({"container": False}) == {"container": False}
+    # Non-bool ints are invalid (False == 0 / True == 1 membership pitfall).
+    assert coerce_resource_permissions({"container": 1}) == {}
+    assert coerce_resource_permissions({"container": 0}) == {}
+    assert coerce_resource_permissions({"container": "ask"}) == {}
+
+
+# ---------------------------------------------------------------------------
+# Coercion: valid entries preserved
+# ---------------------------------------------------------------------------
+
+
+def test_coerce_preserves_valid_entries_in_order():
+    raw = {
+        "git": "write_on_feature_branch",
+        "filesystem": "banned",
+        "container": True,
+        "network": "outbound",
+        "mcp": "connect",
+        "host_bash": "allow",
     }
-    for name, level in legacy_defaults.items():
-        assert loaded["resources"][name]["default_permission"] == level
+    assert coerce_resource_permissions(raw) == raw
+
+
+def test_coerce_empty_dict_returns_empty():
+    assert coerce_resource_permissions({}) == {}

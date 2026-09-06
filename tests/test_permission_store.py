@@ -2,8 +2,10 @@
 Hermetic unit tests for the disk-pure session permission store
 (thoughtmachine/permission_store.py).
 
-The store is the storage half of the permission-simplification effort: raw,
-uncapped per-session grants live in a sidecar
+The store is the storage half of the permission-simplification effort:
+per-session grants live in a sidecar in canonical resource-catalog shape
+(``security/resource_catalog.py``; legacy grains are migrated on write and
+read)
 ``<vault_root>/workspaces/<ws_id>/sessions/<sid>/permissions.json``, with a
 legacy fallback to ``metadata.session_config.session_permissions`` inside the
 session record (located by content scan), and the workspace ceiling is read
@@ -86,9 +88,9 @@ def test_sidecar_read_round_trip_sparse_dict(tmp_path):
     assert read_session_permissions(vault, "ws-a", "sess-1") == grants
 
 
-def test_raw_dict_stored_verbatim_with_optional_grains(tmp_path):
-    """Unknown/optional keys (container bool, git grains) pass through
-    untouched: the store never validates or coerces."""
+def test_raw_dict_stored_normalized_to_canonical_shape(tmp_path):
+    """Legacy optional grains are normalised on write: with ``git`` present,
+    ``git_read`` is dropped and only canonical keys survive."""
     vault = tmp_path / "vault"
     grants = {
         "container": True,
@@ -97,20 +99,31 @@ def test_raw_dict_stored_verbatim_with_optional_grains(tmp_path):
         "git_read": "read",
     }
     write_session_permissions(vault, "ws-a", "sess-1", grants)
-    assert read_session_permissions(vault, "ws-a", "sess-1") == grants
+    assert read_session_permissions(vault, "ws-a", "sess-1") == {
+        "container": True,
+        "filesystem": "write",
+        "git": "read",
+    }
 
 
 def test_session_permissions_object_input_round_trip(tmp_path):
-    """A SessionPermissions instance is stored as model_dump() and reads back
-    to the same full-shape dict."""
+    """A SessionPermissions instance is stored in canonical shape: the
+    non-catalog keys (system/execution) and None-valued legacy git grains
+    are dropped, while the container bool and valid session-grant grains
+    survive -- including the network/mcp defaults, now storable grants."""
     vault = tmp_path / "vault"
     sp = SessionPermissions(filesystem="read", git="write")
     target = write_session_permissions(vault, "ws-a", "sess-1", sp)
 
-    assert json.loads(target.read_text(encoding="utf-8")) == sp.model_dump()
-    assert read_session_permissions(vault, "ws-a", "sess-1") == sp.model_dump()
-    assert read_session_permissions(vault, "ws-a", "sess-1")["filesystem"] == "read"
-    assert read_session_permissions(vault, "ws-a", "sess-1")["git"] == "write"
+    expected = {
+        "container": False,
+        "filesystem": "read",
+        "git": "write",
+        "network": "banned",
+        "mcp": "banned",
+    }
+    assert json.loads(target.read_text(encoding="utf-8")) == expected
+    assert read_session_permissions(vault, "ws-a", "sess-1") == expected
 
 
 def test_invalid_permissions_type_rejected(tmp_path):
@@ -183,6 +196,129 @@ def test_migrate_missing_record_raises(tmp_path):
     _sessions_dir(vault, "ws-a")  # empty sessions dir
     with pytest.raises(PermissionStoreError):
         migrate_session_permissions(vault, "ws-a", "sess-ghost")
+
+
+# ---------------------------------------------------------------------------
+# Canonical normalisation (legacy grain migration on write + read)
+# ---------------------------------------------------------------------------
+
+
+def test_git_read_alone_migrates_to_git_read(tmp_path):
+    vault = tmp_path / "vault"
+    write_session_permissions(vault, "ws-a", "sess-1", {"git_read": "read"})
+    assert read_session_permissions(vault, "ws-a", "sess-1") == {"git": "read"}
+
+
+def test_git_write_migrates_to_git_write(tmp_path):
+    vault = tmp_path / "vault"
+    write_session_permissions(vault, "ws-a", "sess-1", {"git_write": "write"})
+    assert read_session_permissions(vault, "ws-a", "sess-1") == {"git": "write"}
+
+
+def test_git_write_ask_migrates_to_git_ask(tmp_path):
+    vault = tmp_path / "vault"
+    write_session_permissions(vault, "ws-a", "sess-1", {"git_write": "ask"})
+    assert read_session_permissions(vault, "ws-a", "sess-1") == {"git": "ask"}
+
+
+def test_git_write_unknown_value_fails_closed(tmp_path):
+    """A git_write value outside the documented mapping (write/ask/read/
+    banned) fails closed to git: banned."""
+    vault = tmp_path / "vault"
+    write_session_permissions(vault, "ws-a", "sess-1", {"git_write": "full"})
+    assert read_session_permissions(vault, "ws-a", "sess-1") == {"git": "banned"}
+
+
+def test_git_write_overwrites_git_read_when_git_absent(tmp_path):
+    """Both grains present and git absent: git_write (write) wins over the
+    git_read (read) step-1 result."""
+    vault = tmp_path / "vault"
+    write_session_permissions(
+        vault, "ws-a", "sess-1",
+        {"git_read": "read", "git_write": "write"},
+    )
+    assert read_session_permissions(vault, "ws-a", "sess-1") == {"git": "write"}
+
+
+def test_present_git_untouched_and_grains_dropped(tmp_path):
+    """git present -> git untouched; git_read/git_write never stored."""
+    vault = tmp_path / "vault"
+    write_session_permissions(
+        vault, "ws-a", "sess-1",
+        {"git": "read", "git_read": "write", "git_write": "write"},
+    )
+    assert read_session_permissions(vault, "ws-a", "sess-1") == {"git": "read"}
+
+
+def test_write_stores_only_cleaned_canonical_payload(tmp_path):
+    """Legacy grains, ceiling-only keys (host_bash) and non-catalog keys
+    never appear in the stored sidecar JSON; network/mcp are storable
+    session grants and survive."""
+    vault = tmp_path / "vault"
+    write_session_permissions(
+        vault, "ws-a", "sess-1",
+        {
+            "git": "write",
+            "git_read": "read",
+            "git_write": "ask",
+            "network": "write",
+            "system": "read",
+            "execution": "banned",
+            "mcp": "connect",
+            "host_bash": "ask",
+            "git_allow_worktree_commits": True,
+        },
+    )
+    stored = json.loads(
+        session_grants_path(vault, "ws-a", "sess-1").read_text(encoding="utf-8")
+    )
+    assert stored == {"git": "write", "network": "write", "mcp": "connect"}
+    assert read_session_permissions(vault, "ws-a", "sess-1") == {
+        "git": "write", "network": "write", "mcp": "connect",
+    }
+
+
+def test_read_never_surfaces_legacy_junk(tmp_path):
+    """The legacy fallback read path normalises too: record junk keys
+    (legacy git grains, non-bool container) never reach the caller, while
+    network -- now a valid session grant -- survives."""
+    vault = tmp_path / "vault"
+    legacy = {
+        "git": "read",
+        "git_read": "write",
+        "git_write": "write",
+        "network": "write",
+        "container": "ask",
+    }
+    _write_session_record(vault, "ws-a", "sess-1", legacy=legacy)
+    assert read_session_permissions(vault, "ws-a", "sess-1") == {
+        "git": "read", "network": "write",
+    }
+
+
+def test_session_permissions_accepts_git_write_on_feature_branch(tmp_path):
+    """SessionPermissions accepts the new git level and the store round-trips
+    it verbatim: the object form stores it alongside the valid defaults, and
+    a raw dict input stays tight to the git grant alone."""
+    vault = tmp_path / "vault"
+    sp = SessionPermissions(git="write_on_feature_branch")
+    assert sp.git == "write_on_feature_branch"
+
+    write_session_permissions(vault, "ws-a", "sess-1", sp)
+    assert read_session_permissions(vault, "ws-a", "sess-1") == {
+        "container": False,
+        "filesystem": "read",
+        "git": "write_on_feature_branch",
+        "network": "banned",
+        "mcp": "banned",
+    }
+
+    write_session_permissions(
+        vault, "ws-a", "sess-2", {"git": "write_on_feature_branch"},
+    )
+    assert read_session_permissions(vault, "ws-a", "sess-2") == {
+        "git": "write_on_feature_branch",
+    }
 
 
 # ---------------------------------------------------------------------------

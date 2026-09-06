@@ -39,19 +39,41 @@ A read that cannot positively establish grants must never silently grant:
   returns ``{}`` (no grants recorded; the gate applies defaults afterwards
   -- an empty grant set is neutral, it grants nothing).
 
-Values are stored and returned verbatim (lowercase grain names such as
-``filesystem`` / ``git`` and their levels); no validation or ceiling math
-happens here (ceiling application stays in the security gate).
+Canonical session-grant shape
+-----------------------------
+Grants are stored and returned in the canonical resource-catalog shape
+(``security/resource_catalog.py``): only the session-grant catalog keys
+(``git``, ``filesystem``, ``container``, ``network`` and ``mcp``) survive at
+the session level.  Every write AND read normalises the payload
+(:func:`_normalize_session_permissions`):
+
+* legacy explicit grains ``git_read`` / ``git_write`` collapse onto ``git``
+  when no ``git`` key is present (``git_read`` -> ``git: 'read'``;
+  ``git_write`` maps ``write`` / ``ask`` / ``read`` / ``banned`` to the same
+  ``git`` level and anything else fails closed to ``banned``; ``git_write``
+  overwrites the ``git_read`` result), then the grains are always dropped --
+  a present ``git`` key is left untouched;
+* session-level ``host_bash`` (a workspace-ceiling-only grain) and
+  ``git_allow_worktree_commits`` are dropped;
+* remaining keys are coerced via ``coerce_resource_permissions``: keys
+  outside the catalog (``system``, ``execution``, ...) and invalid
+  values are dropped with a warning each.
+
+The workspace ceiling (``workspace_ceiling``) is deliberately NOT coerced:
+it keeps the wider workspace vocabulary (``docker``, ``host_bash``,
+``git_read``, ``git_write``, ...) and is applied by the security gate.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from security.resource_catalog import coerce_resource_permissions
 from thoughtmachine.security import SessionPermissions
 
 __all__ = [
@@ -62,6 +84,8 @@ __all__ = [
     "migrate_session_permissions",
     "workspace_ceiling",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 class PermissionStoreError(Exception):
@@ -147,6 +171,52 @@ def _read_json_strict(path: Path, what: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Canonical normalisation (legacy migration + catalog coercion)
+# ---------------------------------------------------------------------------
+
+
+def _normalize_session_permissions(permissions: Dict[str, Any]) -> Dict[str, Any]:
+    """Map legacy session grants onto the canonical resource catalog.
+
+    Returns a NEW dict; ``permissions`` is not mutated.  Applied on every
+    session-grant write and read so the disk never carries -- and callers
+    never see -- pre-catalog junk.  Migration order (permission-simplification
+    blueprint, Phase 1):
+
+    1. ``git_read`` present and ``git`` absent -> ``git: 'read'``;
+    2. ``git_write`` present and ``git`` absent -> ``git`` set from the
+       grain's value (``'write'`` -> ``'write'``, ``'ask'`` -> ``'ask'``,
+       ``'read'`` -> ``'read'``, ``'banned'`` -> ``'banned'``; any other
+       value fails closed to ``'banned'``).  When both grains are present
+       and ``git`` is absent, ``git_write`` overwrites the ``git_read``
+       result;
+    3. ``git_read`` / ``git_write`` are always dropped afterwards (a present
+       ``git`` key is never overwritten by the grains);
+    4. session-level ``host_bash`` (workspace-ceiling-only grain) and
+       ``git_allow_worktree_commits`` are dropped;
+    5. the result is coerced via ``security.resource_catalog.
+       coerce_resource_permissions``: keys outside the catalog
+       (``system``, ``execution``, ...) and invalid values are dropped
+       with a warning each.
+    """
+    result = dict(permissions)
+    if "git" not in result:
+        if "git_read" in result:
+            result["git"] = "read"
+        if "git_write" in result:
+            grain = result["git_write"]
+            if grain in ("write", "ask", "read", "banned"):
+                result["git"] = grain
+            else:
+                result["git"] = "banned"  # fail closed
+    result.pop("git_read", None)
+    result.pop("git_write", None)
+    result.pop("host_bash", None)
+    result.pop("git_allow_worktree_commits", None)
+    return coerce_resource_permissions(result)
+
+
+# ---------------------------------------------------------------------------
 # Read paths
 # ---------------------------------------------------------------------------
 
@@ -154,14 +224,19 @@ def _read_json_strict(path: Path, what: str) -> Dict[str, Any]:
 def read_session_permissions(
     vault_root, workspace_id: str, session_id: str
 ) -> Dict[str, Any]:
-    """Return the raw, uncapped session permission grants for a session.
+    """Return the session grants in canonical resource-catalog shape.
 
     Sidecar first; legacy ``metadata.session_config.session_permissions``
-    fallback when the sidecar is absent.  Fail closed -- see module docstring.
+    fallback when the sidecar is absent.  Both sources are normalised on the
+    way out (see :func:`_normalize_session_permissions`): legacy git grains
+    are migrated and unknown/invalid entries are dropped, so callers never
+    see pre-catalog junk.  Fail closed -- see module docstring.
     """
     sidecar = session_grants_path(vault_root, workspace_id, session_id)
     if sidecar.exists():
-        return dict(_read_json_strict(sidecar, "permissions sidecar"))
+        return _normalize_session_permissions(
+            _read_json_strict(sidecar, "permissions sidecar")
+        )
 
     record = _session_record_path(vault_root, workspace_id, session_id)
     if record is None:
@@ -185,7 +260,7 @@ def read_session_permissions(
             f"session record {record} has non-object "
             "metadata.session_config.session_permissions"
         )
-    return dict(legacy)
+    return _normalize_session_permissions(legacy)
 
 
 def workspace_ceiling(vault_root, workspace_id: str) -> Dict[str, Any]:
@@ -237,16 +312,20 @@ def write_session_permissions(
     *,
     fsync: bool = True,
 ) -> Path:
-    """Atomically write raw grants to the session sidecar.
+    """Atomically write session grants to the sidecar in canonical shape.
 
-    Accepts a raw ``dict`` (stored verbatim, e.g. ``{'filesystem': 'read',
-    'git': 'write'}``) or a :class:`SessionPermissions` instance (stored as
-    ``model_dump()``).  Writes via a temp file in the same directory +
+    Accepts a raw ``dict`` (e.g. ``{'filesystem': 'read', 'git': 'write'}``)
+    or a :class:`SessionPermissions` instance.  The payload is normalised
+    before writing (see :func:`_normalize_session_permissions`): legacy
+    ``git_read`` / ``git_write`` grains collapse onto ``git``, session-level
+    ``host_bash`` / ``git_allow_worktree_commits`` are dropped, and only
+    canonical resource-catalog keys with valid values survive -- the sidecar
+    never stores ``system`` / ``execution`` or keys outside the catalog.  Writes via a temp file in the same directory +
     ``os.replace`` (with optional fsync of file and directory), so a crash or
     failure never leaves a partial ``permissions.json``.  Returns the sidecar
     path.
     """
-    perms = _coerce_permissions_dict(permissions)
+    perms = _normalize_session_permissions(_coerce_permissions_dict(permissions))
     target = session_grants_path(vault_root, workspace_id, session_id)
     target_dir = target.parent
     target_dir.mkdir(parents=True, exist_ok=True)

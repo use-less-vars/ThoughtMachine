@@ -113,7 +113,7 @@ class SessionPermissions(BaseModel):
     - **network**:    ``'banned' | 'ask' | 'write' | 'outbound'`` (legacy booleans are accepted)
     - **filesystem**: ``'banned' | 'read' | 'write' | 'full' | 'ask'``
     - **system**:   ``'banned' | 'read' | 'write' | 'full' | 'ask'``
-    - **git**:        ``'banned' | 'read' | 'write' | 'full' | 'ask'``
+    - **git**:        ``'banned' | 'read' | 'write' | 'full' | 'ask' | 'write_on_feature_branch'``
     - **execution**:  ``'banned' | 'read' | 'write' | 'full' | 'ask'``
     - **mcp**:        ``'banned' | 'connect' | 'full'``
     """
@@ -134,7 +134,9 @@ class SessionPermissions(BaseModel):
         default='read',
         description='System operations access level.',
     )
-    git: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
+    git: Literal[
+        'banned', 'read', 'write', 'full', 'ask', 'write_on_feature_branch',
+    ] = Field(
         default='read',
         description='Git operations access level for the session.',
     )
