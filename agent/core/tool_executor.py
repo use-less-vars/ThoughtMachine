@@ -305,9 +305,14 @@ class ToolExecutor:
                 # and a workspace id are available, ask the gate to read the
                 # session's on-disk permissions record (vault sidecar,
                 # fail-closed on any store error) instead of trusting the
-                # in-memory mirror.  Otherwise fall back to the legacy 2-arg
-                # merge (mirror-only), keeping behaviour byte-identical for
-                # callers that resolve neither id (direct executor
+                # in-memory mirror.  Workers now carry the REAL parent
+                # session/workspace ids (propagated at spawn through
+                # WorkerContext), so their vault sidecar record exists and
+                # disk-pure mode applies uniformly to main agents AND worker
+                # sub-agents: grants/revocations made to the parent session
+                # are re-read on every tool call, so stale in-memory mirrors
+                # no longer outlive the vault.  The legacy 2-arg merge below
+                # is kept only for genuinely id-less executors (direct
                 # construction, legacy paths, empty session_id).
                 if session_id and ws_id:
                     effective = get_effective_permissions(
@@ -328,6 +333,17 @@ class ToolExecutor:
                     event_bus=self._event_bus or global_event_bus,
                     agent_id=str(agent_id),
                     session_id=session_id,
+                    # Worker context: cap the disk-effective permissions with
+                    # the spawn-time restrictive-merge footprint (parent
+                    # session x worker footprint).  The gate applies the cap
+                    # in place, so the capped dict is what gets injected into
+                    # the tool below (in-tool atomic re-checks stay
+                    # consistent with the gate decision).
+                    permission_footprint=(
+                        session_perms_obj.to_dict()
+                        if self._is_worker_context
+                        else None
+                    ),
                     is_worker_context=self._is_worker_context,
                 )
                 if not ok:

@@ -804,6 +804,7 @@ class WorkerThread(threading.Thread):
         project_root: Optional[str] = None,
         timeout_seconds: Optional[int] = None,
         session_id: Optional[str] = None,
+        workspace_id: Optional[str] = None,
         instance_id: int = 1,
         container_manager: Optional[Any] = None,
         *,
@@ -818,6 +819,7 @@ class WorkerThread(threading.Thread):
         self.definition = definition
         self._agent_config_dict = agent_config
         self.session_id = session_id
+        self.workspace_id: Optional[str] = workspace_id
         # Container manager used to stop/remove containers owned by this
         # worker at teardown (see _cleanup_worker_containers).
         self._container_manager: Optional[Any] = container_manager
@@ -2065,6 +2067,16 @@ class WorkerThread(threading.Thread):
             # ── Load persisted context or create fresh ────────────────
             self._worker_ctx = self._load_context()
 
+            # The live thread ids (real parent session/workspace resolved at
+            # spawn) are authoritative over any ids persisted in context.json
+            # (an older run may have stored a phantom worker-<uuid> session id
+            # or no workspace id at all).
+            if self._worker_ctx is not None:
+                if self.session_id:
+                    self._worker_ctx.session_id = self.session_id
+                if self.workspace_id:
+                    self._worker_ctx.workspace_id = self.workspace_id
+
             # Override persisted status/error with live thread state
             self.status = "ready"
             self.error = None
@@ -2119,6 +2131,8 @@ class WorkerThread(threading.Thread):
                 # Reset cached token count for a fresh run
                 self._cached_context_tokens = None
                 self._worker_ctx = WorkerContext(
+                    session_id=self.session_id,
+                    workspace_id=self.workspace_id,
                     worker_name=self.worker_name,
                     user_history=user_history,
                 )
@@ -4059,6 +4073,7 @@ class Worker(ToolBase):
             project_root=project_root,
             timeout_seconds=effective_timeout,
             session_id=self.session_id,
+            workspace_id=ws_id,
             instance_id=spawn_iid,
             container_manager=container_manager,
         )
