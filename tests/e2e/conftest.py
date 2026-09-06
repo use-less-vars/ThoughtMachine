@@ -101,7 +101,16 @@ def _backend_env(vault: str, port: int) -> dict:
 
 
 def _start_backend(vault: str, port: int) -> subprocess.Popen:
-    return subprocess.Popen(
+    """Boot the backend with stdout/stderr redirected to a log file.
+
+    Child output is written straight to a file descriptor (``stdout=PIPE``
+    would leave the pipe undrained and wedge the backend once ~64KB of log
+    output accumulates).  The log handle is attached to the Popen object and
+    closed by ``_stop_proc`` so restarts can re-append to the same file.
+    """
+    log_path = Path(vault) / f"backend-{port}.log"
+    log_handle = open(log_path, "ab", buffering=0)
+    proc = subprocess.Popen(
         [
             sys.executable,
             "-m",
@@ -113,21 +122,30 @@ def _start_backend(vault: str, port: int) -> subprocess.Popen:
         ],
         cwd=REPO_ROOT,
         env=_backend_env(vault, port),
-        stdout=subprocess.PIPE,
+        stdout=log_handle,
         stderr=subprocess.STDOUT,
-        text=True,
     )
+    proc._log_handle = log_handle
+    proc._log_path = log_path
+    return proc
 
 
 def _stop_proc(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
-    proc.terminate()
-    try:
-        proc.wait(timeout=15)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=15)
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=15)
+    # Close the attached log handle even when the child already exited (e.g.
+    # a crash mid-test) so a restart can safely re-open the same log file.
+    handle = getattr(proc, "_log_handle", None)
+    if handle is not None:
+        try:
+            handle.close()
+        except OSError:
+            pass
 
 
 def _resolve_node() -> str:
@@ -171,6 +189,7 @@ def e2e_backend():
         "port": port,
         "vault": vault,
         "proc": _start_backend(vault, port),
+        "log_path": str(Path(vault) / f"backend-{port}.log"),
     }
     try:
         _wait_http_ok(f"{state['base_url']}/health")
@@ -189,18 +208,28 @@ def e2e_frontend(e2e_backend):
             f"{FRONTEND_DIR} first"
         )
     port = _free_port(5173)
+    # Same stdout=PIPE-wedge guard as the backend: redirect to a log file so
+    # an undrained pipe can never stall the dev server.
+    log_path = Path(e2e_backend["vault"]) / f"vite-{port}.log"
+    log_handle = open(log_path, "ab", buffering=0)
     proc = subprocess.Popen(
         [node, str(VITE_BIN), "--host", "127.0.0.1", "--port", str(port)],
         cwd=FRONTEND_DIR,
         env={**os.environ, "VITE_BACKEND_PORT": str(e2e_backend["port"])},
-        stdout=subprocess.PIPE,
+        stdout=log_handle,
         stderr=subprocess.STDOUT,
-        text=True,
     )
+    proc._log_handle = log_handle
+    proc._log_path = log_path
     base_url = f"http://127.0.0.1:{port}"
     try:
         _wait_http_ok(f"{base_url}/")
-        yield {"base_url": base_url, "port": port, "proc": proc}
+        yield {
+            "base_url": base_url,
+            "port": port,
+            "proc": proc,
+            "log_path": str(log_path),
+        }
     finally:
         _stop_proc(proc)
 
