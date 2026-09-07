@@ -764,6 +764,40 @@ def _restrictive_merge(
             result[key] = s_val if s_rank <= w_rank else w_val
     return result
 
+
+_WOFB_GRAIN = "write_on_feature_branch"
+
+
+def _canonicalize_session_permissions(
+    permissions: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Fold derived ``write_on_feature_branch`` split grains onto the canonical
+    ``git`` channel (worker AgentConfig boundary).
+
+    The permission gate mirrors canonical ``git='write_on_feature_branch'``
+    into the derived ``git_read`` / ``git_write`` split grains of the
+    effective-permissions dict (a plain-dict convenience for the tools layer
+    — see bca9663).  The config-bound ``SessionPermissions`` schema accepts
+    ``write_on_feature_branch`` ONLY on ``git``: the ``git_read`` /
+    ``git_write`` fields deliberately stay 4-value literals so the wofb value
+    must never reach them.  When a split grain carries the wofb echo we drop
+    it (absent means the gate re-derives it from ``git``); when the dict is
+    internally inconsistent (wofb grain without a canonical ``git`` wofb) we
+    fall back fail-closed to the category's safe default.
+    """
+    if not isinstance(permissions, dict):
+        return permissions
+    canonical_wofb = permissions.get("git") == _WOFB_GRAIN
+    result = dict(permissions)
+    for grain in ("git_read", "git_write"):
+        if result.get(grain) == _WOFB_GRAIN:
+            if canonical_wofb:
+                result.pop(grain, None)
+            else:
+                result[grain] = _load_safe_defaults().get(grain) or "banned"
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Worker-scoped container cleanup helpers
 # ---------------------------------------------------------------------------
@@ -1624,7 +1658,11 @@ class WorkerThread(threading.Thread):
 
         # ── Inject session permissions (restrictive merge — session is ceiling) ──
         merged = _restrictive_merge(self._session_permissions, self._permission_footprint)
-        worker_cfg["session_permissions"] = merged
+        # Fold derived ``write_on_feature_branch`` split grains back onto the
+        # canonical ``git`` channel: SessionPermissions validates git_read /
+        # git_write against 4-value literals only (bca9663 invariant), so the
+        # AgentConfig-bound dict must never carry the wofb echo on a grain.
+        worker_cfg["session_permissions"] = _canonicalize_session_permissions(merged)
 
         # ── Safety net: inject workspace_path if missing ────────────────
         # Worker._build_agent_config (the Tool-class method) now injects

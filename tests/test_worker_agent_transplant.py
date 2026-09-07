@@ -1302,6 +1302,57 @@ class TestWorkerConfigForwarding:
         assert perms.network == 'banned'
         assert perms.execution == 'banned'
 
+    def test_worker_session_permissions_accepts_wofb_effective_dict(
+        self, tmp_path: Path
+    ) -> None:
+        """A worker must build a valid AgentConfig when the session's effective
+        git grain is write_on_feature_branch.
+
+        The gate mirrors canonical git='write_on_feature_branch' into the
+        derived git_write split grain of the effective dict, and the spawn
+        path forwards that dict as the worker's session_permissions.  The
+        config-bound SessionPermissions schema accepts wofb ONLY on 'git'
+        (git_write stays a 4-value literal — bca9663 invariant), so
+        _build_agent_config must fold the derived grain back onto the
+        canonical channel instead of raising a ValidationError.
+        """
+        from tools.workspace.worker import WorkerThread
+
+        wt = WorkerThread(
+            name="test-wofb-worker",
+            definition={"system_prompt": "Test worker."},
+            agent_config={
+                "provider": "scripted",
+                "model": "mock-model",
+                "api_key": "sk-test",
+            },
+            workspace_dir=tmp_path,
+            tool_classes={},
+            # Effective-permissions shape: git canonical wofb plus the derived
+            # git_write split grain carrying the wofb echo (see
+            # tests/test_git_write_wofb.py get_effective_permissions contract).
+            session_permissions={
+                "git": "write_on_feature_branch",
+                "git_read": "read",
+                "git_write": "write_on_feature_branch",
+                "filesystem": "read",
+                "network": "banned",
+                "execution": "banned",
+                "container": False,
+            },
+            project_root=None,
+            timeout_seconds=30,
+        )
+        agent_cfg = wt._build_agent_config()
+        assert agent_cfg is not None
+        perms = agent_cfg.session_permissions
+        assert perms is not None
+        # Canonical wofb survives on 'git'; the derived split grain is folded
+        # away so SessionPermissions validation succeeds.
+        assert perms.git == "write_on_feature_branch"
+        assert perms.git_write != "write_on_feature_branch"
+        assert perms.git_read == "read"
+
     def test_worker_overrides_warning_threshold(
         self, tmp_path: Path
     ) -> None:
