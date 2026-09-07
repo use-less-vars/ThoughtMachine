@@ -110,7 +110,8 @@ def test_session_permissions_object_input_round_trip(tmp_path):
     """A SessionPermissions instance is stored in canonical shape: the
     non-catalog keys (system/execution) and None-valued legacy git grains
     are dropped, while the container bool and valid session-grant grains
-    survive -- including the network/mcp defaults, now storable grants."""
+    survive -- including the network/mcp defaults and the banned host_bash
+    default, now storable grants."""
     vault = tmp_path / "vault"
     sp = SessionPermissions(filesystem="read", git="write")
     target = write_session_permissions(vault, "ws-a", "sess-1", sp)
@@ -121,6 +122,7 @@ def test_session_permissions_object_input_round_trip(tmp_path):
         "git": "write",
         "network": "banned",
         "mcp": "banned",
+        "host_bash": "banned",
     }
     assert json.loads(target.read_text(encoding="utf-8")) == expected
     assert read_session_permissions(vault, "ws-a", "sess-1") == expected
@@ -250,10 +252,10 @@ def test_present_git_untouched_and_grains_dropped(tmp_path):
     assert read_session_permissions(vault, "ws-a", "sess-1") == {"git": "read"}
 
 
-def test_write_stores_only_cleaned_canonical_payload(tmp_path):
-    """Legacy grains, ceiling-only keys (host_bash) and non-catalog keys
-    never appear in the stored sidecar JSON; network/mcp are storable
-    session grants and survive."""
+def test_write_stores_cleaned_canonical_payload_keeps_host_bash(tmp_path):
+    """Legacy git grains and non-catalog keys never appear in the stored
+    sidecar JSON; network/mcp and the now session-storable host_bash grain
+    (banned/ask/allow) are valid grants and survive."""
     vault = tmp_path / "vault"
     write_session_permissions(
         vault, "ws-a", "sess-1",
@@ -272,10 +274,27 @@ def test_write_stores_only_cleaned_canonical_payload(tmp_path):
     stored = json.loads(
         session_grants_path(vault, "ws-a", "sess-1").read_text(encoding="utf-8")
     )
-    assert stored == {"git": "write", "network": "write", "mcp": "connect"}
-    assert read_session_permissions(vault, "ws-a", "sess-1") == {
-        "git": "write", "network": "write", "mcp": "connect",
+    assert stored == {
+        "git": "write", "network": "write", "mcp": "connect", "host_bash": "ask",
     }
+    assert read_session_permissions(vault, "ws-a", "sess-1") == {
+        "git": "write", "network": "write", "mcp": "connect", "host_bash": "ask",
+    }
+
+
+def test_write_drops_invalid_host_bash_value(tmp_path):
+    """A host_bash value outside the banned/ask/allow vocabulary is not a
+    storable grant: it is dropped while valid grants survive."""
+    vault = tmp_path / "vault"
+    write_session_permissions(
+        vault, "ws-a", "sess-1",
+        {"network": "write", "host_bash": "write"},
+    )
+    stored = json.loads(
+        session_grants_path(vault, "ws-a", "sess-1").read_text(encoding="utf-8")
+    )
+    assert stored == {"network": "write"}
+    assert read_session_permissions(vault, "ws-a", "sess-1") == {"network": "write"}
 
 
 def test_read_never_surfaces_legacy_junk(tmp_path):
@@ -311,6 +330,7 @@ def test_session_permissions_accepts_git_write_on_feature_branch(tmp_path):
         "git": "write_on_feature_branch",
         "network": "banned",
         "mcp": "banned",
+        "host_bash": "banned",
     }
 
     write_session_permissions(

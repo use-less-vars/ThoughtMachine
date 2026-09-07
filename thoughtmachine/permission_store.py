@@ -43,9 +43,9 @@ Canonical session-grant shape
 -----------------------------
 Grants are stored and returned in the canonical resource-catalog shape
 (``security/resource_catalog.py``): only the session-grant catalog keys
-(``git``, ``filesystem``, ``container``, ``network`` and ``mcp``) survive at
-the session level.  Every write AND read normalises the payload
-(:func:`_normalize_session_permissions`):
+(``git``, ``filesystem``, ``container``, ``network``, ``mcp`` and
+``host_bash``) survive at the session level.  Every write AND read
+normalises the payload (:func:`_normalize_session_permissions`):
 
 * legacy explicit grains ``git_read`` / ``git_write`` collapse onto ``git``
   when no ``git`` key is present (``git_read`` -> ``git: 'read'``;
@@ -53,8 +53,10 @@ the session level.  Every write AND read normalises the payload
   ``git`` level and anything else fails closed to ``banned``; ``git_write``
   overwrites the ``git_read`` result), then the grains are always dropped --
   a present ``git`` key is left untouched;
-* session-level ``host_bash`` (a workspace-ceiling-only grain) and
-  ``git_allow_worktree_commits`` are dropped;
+* ``host_bash`` is a regular catalog session grain (``banned`` /
+  ``ask`` / ``allow``) and is preserved; the security gate additionally
+  caps the session value by the workspace ceiling.  Non-catalog
+  ``git_allow_worktree_commits`` is dropped;
 * remaining keys are coerced via ``coerce_resource_permissions``: keys
   outside the catalog (``system``, ``execution``, ...) and invalid
   values are dropped with a warning each.
@@ -192,8 +194,9 @@ def _normalize_session_permissions(permissions: Dict[str, Any]) -> Dict[str, Any
        result;
     3. ``git_read`` / ``git_write`` are always dropped afterwards (a present
        ``git`` key is never overwritten by the grains);
-    4. session-level ``host_bash`` (workspace-ceiling-only grain) and
-       ``git_allow_worktree_commits`` are dropped;
+    4. ``host_bash`` is kept when its value is a valid catalog level
+       (``banned`` / ``ask`` / ``allow``); ``git_allow_worktree_commits``
+       is dropped;
     5. the result is coerced via ``security.resource_catalog.
        coerce_resource_permissions``: keys outside the catalog
        (``system``, ``execution``, ...) and invalid values are dropped
@@ -211,7 +214,6 @@ def _normalize_session_permissions(permissions: Dict[str, Any]) -> Dict[str, Any
                 result["git"] = "banned"  # fail closed
     result.pop("git_read", None)
     result.pop("git_write", None)
-    result.pop("host_bash", None)
     result.pop("git_allow_worktree_commits", None)
     return coerce_resource_permissions(result)
 
@@ -317,10 +319,12 @@ def write_session_permissions(
     Accepts a raw ``dict`` (e.g. ``{'filesystem': 'read', 'git': 'write'}``)
     or a :class:`SessionPermissions` instance.  The payload is normalised
     before writing (see :func:`_normalize_session_permissions`): legacy
-    ``git_read`` / ``git_write`` grains collapse onto ``git``, session-level
-    ``host_bash`` / ``git_allow_worktree_commits`` are dropped, and only
-    canonical resource-catalog keys with valid values survive -- the sidecar
-    never stores ``system`` / ``execution`` or keys outside the catalog.  Writes via a temp file in the same directory +
+    ``git_read`` / ``git_write`` grains collapse onto ``git``,
+    ``git_allow_worktree_commits`` is dropped, and only canonical
+    resource-catalog keys with valid values survive (``host_bash`` is a
+    catalog key and is preserved, to be ceiling-capped by the gate at
+    enforcement time) -- the sidecar never stores ``system`` / ``execution``
+    or keys outside the catalog.  Writes via a temp file in the same directory +
     ``os.replace`` (with optional fsync of file and directory), so a crash or
     failure never leaves a partial ``permissions.json``.  Returns the sidecar
     path.

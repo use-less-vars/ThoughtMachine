@@ -67,7 +67,7 @@ _FAIL_CLOSED_CAPABILITIES = WorkspaceCapabilities(
 # ``workspace_permissions``) and the vault permission store cannot be read
 # (missing/corrupt sidecar or config, I/O error, unexpected exception).  The
 # deny-all session plus deny-all ceiling flow through the SAME merge below
-# and yield the all-banned 9-key result shape — a disk-mode caller never
+# and yield the all-banned 10-key result shape — a disk-mode caller never
 # receives default grants because the store was unreadable.
 _DISK_FAIL_CLOSED_SESSION = SessionPermissions(
     container=False,
@@ -198,9 +198,9 @@ _WORKSPACE_RESOURCE_MAP: Dict[str, str] = {
 }
 
 #: Recognised workspace-ceiling resource names: the canonical catalog
-#: resources (session-grant keys git/filesystem/container/network/mcp plus
-#: the ceiling-only grain host_bash -- see security/resource_catalog.py)
-#: extended with the legacy workspace grains (docker, git_read, git_write).
+#: resources (session-grant keys git/filesystem/container/network/mcp/
+#: host_bash -- see security/resource_catalog.py) extended with the legacy
+#: workspace grains (docker, git_read, git_write).
 #: A ceiling key outside this set is an unknown resource: it is logged and
 #: ignored (fail-open), so forward-compatible workspace maps never break
 #: session resolution.
@@ -238,6 +238,11 @@ def apply_workspace_ceiling(
         * Boolean session values (``container``) survive only when the
           ceiling is write-level or unlimited; any stricter ceiling forces
           ``False``.  The ``container`` key is always emitted as a boolean.
+        * ``host_bash`` is capped on its own scale -- ``banned < ask <
+          allow`` -- so a workspace ceiling of ``banned``/``ask``/``allow``
+          (or a boolean, ``True`` ~ ``allow``, ``False`` ~ ``banned``) caps
+          the session value accordingly.  The ``host_bash`` key is always
+          emitted as one of ``banned``/``ask``/``allow``.
         * Unknown session keys are passed through untouched.
     """
     if not workspace_permissions:
@@ -257,6 +262,51 @@ def apply_workspace_ceiling(
         if key is None or key not in result:
             continue  # unknown resource / not a session key: no ceiling
         session_val = result[key]
+
+        # host_bash ranks on its own scale -- banned < ask < allow -- which
+        # is NOT part of _WORKSPACE_CEILING_LEVELS ('allow' is not a generic
+        # ceiling level there, and 'ask' means something else).  It must be
+        # intercepted before the generic rank normalisation below, or a
+        # host_bash 'allow' ceiling would hit the unknown-level fail-open
+        # path and never cap the session value.  Legacy ceiling values like
+        # 'read'/'write' are not part of the host_bash vocabulary and are
+        # treated as unknown (warn + fail-open).
+        if key == "host_bash":
+            _HOST_BASH_RANKS = {"banned": 0.0, "ask": 1.0, "allow": 2.0}
+            if isinstance(ceiling, bool):
+                # Boolean host_bash ceiling: True ~ allow-level (2.0),
+                # False ~ banned (0.0, caps any session grant to banned).
+                ceiling_rank = 2.0 if ceiling else 0.0
+            elif isinstance(ceiling, str):
+                ceiling_rank = _HOST_BASH_RANKS.get(ceiling.lower())
+            else:
+                ceiling_rank = None
+            if ceiling_rank is None:
+                logger.warning(
+                    "ignoring workspace ceiling level %r for host_bash "
+                    "(not a host_bash level: banned/ask/allow); "
+                    "fail-open: no ceiling applied",
+                    ceiling,
+                )
+                continue
+            if isinstance(session_val, bool):
+                # Boolean session host_bash: True ~ allow (2.0).
+                session_rank = 2.0 if session_val else 0.0
+            else:
+                session_rank = _HOST_BASH_RANKS.get(
+                    str(session_val).lower()
+                )
+            if session_rank is None:
+                continue  # unknown session value: leave untouched
+            if ceiling_rank < session_rank:
+                # Only ever emit host_bash vocabulary values; a boolean
+                # ceiling caps to 'banned' (never a bare bool/"true").
+                result[key] = (
+                    "banned"
+                    if isinstance(ceiling, bool)
+                    else str(ceiling).lower()
+                )
+            continue
 
         # Normalise the ceiling to a rank; unknown ceilings are fail-open.
         if isinstance(ceiling, bool):
@@ -362,11 +412,15 @@ def get_effective_permissions(
     """
     Merge the session's permission profile with the workspace's capabilities.
 
-    Returns a flat dict with keys matching the seven permission categories,
-    plus the split git sub-categories::
+    Returns a flat dict with keys matching the eight permission categories
+    (including ``host_bash``), plus the split git sub-categories::
 
-        {"filesystem": ..., "network": ..., "container": ..., "git": ..., "system": ..., "mcp": ..., "execution": ...}
+        {"filesystem": ..., "network": ..., "container": ..., "git": ..., "system": ..., "mcp": ..., "execution": ..., "host_bash": ...}
         {"git_read": ..., "git_write": ...}
+
+    ``host_bash`` is capped by the workspace ceiling inside
+    :func:`apply_workspace_ceiling` (its own ``banned < ask < allow``
+    scale) and is otherwise the session value directly.
 
     Each value is either a boolean (``True`` / ``False``) for hard allow/deny,
     a string level (``"write"``, ``"read"``, ``"none"``, ``"banned"``, ``"ask"``, ``"outbound"``),
@@ -512,6 +566,7 @@ def get_effective_permissions(
         "system": system,
         "mcp": session.mcp,
         "execution": session.execution,
+        "host_bash": session.host_bash,
     }
 
 

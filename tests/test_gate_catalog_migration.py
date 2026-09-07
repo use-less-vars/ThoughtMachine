@@ -105,7 +105,7 @@ def test_catalog_ceiling_keys_recognised_no_warning(caplog):
         "container": True,
         "network": "write",
         "mcp": "connect",
-        "host_bash": "write",
+        "host_bash": "allow",
         "execution": "read",
         "system": "read",
     }
@@ -119,6 +119,79 @@ def test_catalog_ceiling_keys_recognised_no_warning(caplog):
     assert result["host_bash"] == "banned"
     # session keys with no ceiling pass through untouched
     assert result["execution"] == "read"
+
+
+# ── host_bash ceiling semantics (banned < ask < allow) ─────────────────────
+
+
+def test_host_bash_ceiling_allow_keeps_ask_grant():
+    """An 'allow' host_bash ceiling never caps a lower session grant: an
+    'ask' session grant stands (banned < ask < allow)."""
+    assert apply_workspace_ceiling(
+        {"host_bash": "allow"}, {"host_bash": "ask"}
+    ) == {"host_bash": "ask"}
+
+
+def test_host_bash_ceiling_ask_keeps_banned_grant():
+    """An 'ask' host_bash ceiling leaves an already-banned session grant
+    untouched (banned is below the ceiling)."""
+    assert apply_workspace_ceiling(
+        {"host_bash": "ask"}, {"host_bash": "banned"}
+    ) == {"host_bash": "banned"}
+
+
+def test_host_bash_ceiling_allow_without_grant_stays_banned():
+    """A host_bash ceiling never fabricates a grant: with no session value
+    the key stays absent after the ceiling pass, and the effective profile
+    resolves to the pydantic default 'banned'."""
+    assert apply_workspace_ceiling({"host_bash": "allow"}, {}) == {}
+    eff = get_effective_permissions(
+        SessionPermissions(), _FULL_CAPS, {"host_bash": "allow"}
+    )
+    assert eff["host_bash"] == "banned"
+
+
+def test_host_bash_grant_allow_without_ceiling_passes():
+    """With no host_bash ceiling, an 'allow' session grant stands both in
+    the raw ceiling pass and in the effective profile."""
+    assert apply_workspace_ceiling({}, {"host_bash": "allow"}) == {
+        "host_bash": "allow"
+    }
+    eff = get_effective_permissions(
+        SessionPermissions(host_bash="allow"), _FULL_CAPS
+    )
+    assert eff["host_bash"] == "allow"
+
+
+def test_default_session_effective_contains_host_bash_banned():
+    """A default session carries host_bash 'banned' in its effective
+    profile (safe pydantic default: no accidental host-shell grant)."""
+    eff = get_effective_permissions(SessionPermissions(), _FULL_CAPS)
+    assert eff["host_bash"] == "banned"
+
+
+def test_disk_mode_host_bash_grant_capped_by_ceiling(hermetic_vault):
+    """Disk mode: a stored 'ask' host_bash grant survives an 'allow'
+    ceiling and is capped to 'banned' by a 'banned' ceiling (control)."""
+    ws_id, sid = "ws-a", "sess-1"
+    write_session_permissions(hermetic_vault, ws_id, sid, {"host_bash": "ask"})
+    _write_config(hermetic_vault, ws_id, {"host_bash": "allow"})
+    eff = get_effective_permissions(
+        SessionPermissions(),  # ignored in disk mode
+        _FULL_CAPS,
+        session_id=sid,
+        workspace_id=ws_id,
+    )
+    assert eff["host_bash"] == "ask"
+
+    _write_config(hermetic_vault, ws_id, {"host_bash": "banned"})
+    eff2 = get_effective_permissions(
+        SessionPermissions(),  # ignored in disk mode
+        _FULL_CAPS,
+        session_id=sid,
+        workspace_id=ws_id,
+    )
+    assert eff2["host_bash"] == "banned"
 
 
 # ── write_on_feature_branch vs ceilings (E3/E4 gap #2 fix) ───────────────

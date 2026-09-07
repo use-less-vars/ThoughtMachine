@@ -147,8 +147,10 @@ class TestApplyWorkspaceCeiling:
         result = apply_workspace_ceiling({"docker": "write"}, {"container": "write"})
         assert result == {"container": True}
 
-    def test_host_bash_banned_caps_write(self):
-        result = apply_workspace_ceiling({"host_bash": "banned"}, {"host_bash": "write"})
+    def test_host_bash_banned_caps_allow(self):
+        # host_bash session vocabulary is banned/ask/allow (no legacy "write"
+        # grain); a banned ceiling caps the strongest session grant (allow).
+        result = apply_workspace_ceiling({"host_bash": "banned"}, {"host_bash": "allow"})
         assert result == {"host_bash": "banned"}
 
     def test_git_read_read_caps_write(self):

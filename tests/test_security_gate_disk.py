@@ -11,7 +11,8 @@ Dual-mode contract (security/security_gate.py):
   (``<vault>/workspaces/<ws>/sessions/<sid>/permissions.json``) and the
   workspace ceiling from ``<vault>/workspaces/<ws>/config.json``.  Disk
   mode fails CLOSED: missing/corrupt store state yields the all-banned
-  9-key result shape, never default grants.
+  10-key result shape (including ``host_bash: "banned"``), never default
+  grants.
 
 The ``hermetic_vault`` fixture (tests/conftest.py) monkeypatches
 ``thoughtmachine.vault.vault_root()`` to a temp vault, which the gate's
@@ -29,7 +30,7 @@ from security.security_gate import get_effective_permissions
 # merge below never downgrades beyond what the disk ceiling/grants dictate.
 _FULL_CAPS = WorkspaceCapabilities()
 
-# The fail-closed 9-key shape produced by a deny-all session + deny-all
+# The fail-closed 10-key shape produced by a deny-all session + deny-all
 # ceiling merged with the fully-permissive workspace caps.
 ALL_BANNED = {
     "filesystem": "banned",
@@ -41,6 +42,7 @@ ALL_BANNED = {
     "system": "banned",
     "mcp": "banned",
     "execution": "banned",
+    "host_bash": "banned",
 }
 
 
@@ -125,7 +127,7 @@ def test_disk_mode_compatible_grants_pass_ceiling(hermetic_vault):
 
 def test_disk_mode_missing_session_record_fails_closed(hermetic_vault):
     """(c) Missing session record (no sidecar, no legacy fallback) -> the
-    all-banned 9-key shape, no exception — even with a permissive ceiling."""
+    all-banned 10-key shape, no exception — even with a permissive ceiling."""
     ws_id = "ws-c"
     _write_config(
         hermetic_vault, ws_id,

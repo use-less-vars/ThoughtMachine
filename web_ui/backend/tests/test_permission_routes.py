@@ -32,6 +32,7 @@ import web_ui.backend.workspace_routes as workspace_routes
 from web_ui.backend.server import app
 from thoughtmachine.permission_store import session_grants_path
 from thoughtmachine.security import PERMISSION_SCHEMA, SAFE_DEFAULTS
+from security.resource_catalog import coerce_resource_permissions
 
 client = TestClient(app)
 
@@ -194,6 +195,7 @@ class TestSessionPermissionsRoutes:
 
         expected_raw = dict(SAFE_DEFAULTS)
         expected_raw.update(body)
+        expected_canonical = coerce_resource_permissions(dict(expected_raw))
         assert sorted(put_data["raw"].keys()) == SESSION_SCHEMA_KEYS
         assert put_data["raw"] == expected_raw
         assert put_data["effective"] == expected_raw
@@ -205,14 +207,97 @@ class TestSessionPermissionsRoutes:
         # Sidecar persisted atomically under the temp vault.
         sidecar = session_grants_path(vault, self.WS, self.SID)
         assert sidecar.exists()
-        assert json.loads(sidecar.read_text(encoding="utf-8")) == expected_raw
+        assert (
+            json.loads(sidecar.read_text(encoding="utf-8")) == expected_canonical
+        )
 
         get = client.get(f"/api/session/{self.SID}/permissions")
         assert get.status_code == 200, get.text
         get_data = get.json()
-        assert get_data["raw"] == expected_raw
+        assert get_data["raw"] == expected_canonical
         assert get_data["effective"] == expected_raw
         _assert_iso_utc(get_data["resolved_at"])
+
+    def test_put_get_permissions_host_bash_ask_roundtrip(self, vault, stub_store):
+        self._register(stub_store)
+        body = {"host_bash": "ask"}
+        put = client.put(f"/api/session/{self.SID}/permissions", json=body)
+        assert put.status_code == 200, put.text
+        put_data = put.json()
+
+        expected_raw = dict(SAFE_DEFAULTS)
+        expected_raw.update(body)
+        expected_canonical = coerce_resource_permissions(dict(expected_raw))
+        assert sorted(put_data["raw"].keys()) == SESSION_SCHEMA_KEYS
+        assert put_data["raw"] == expected_raw
+        assert put_data["effective"] == expected_raw
+        assert put_data["effective"]["host_bash"] == "ask"
+
+        # Sidecar holds the canonical 6-grain map with the new host_bash level.
+        sidecar = session_grants_path(vault, self.WS, self.SID)
+        assert sidecar.exists()
+        assert (
+            json.loads(sidecar.read_text(encoding="utf-8")) == expected_canonical
+        )
+        assert json.loads(sidecar.read_text(encoding="utf-8"))["host_bash"] == "ask"
+
+        get = client.get(f"/api/session/{self.SID}/permissions")
+        assert get.status_code == 200, get.text
+        get_data = get.json()
+        assert get_data["raw"] == expected_canonical
+        assert get_data["effective"] == expected_raw
+
+    def test_put_get_permissions_host_bash_allow_roundtrip(self, vault, stub_store):
+        self._register(stub_store)
+        body = {"host_bash": "allow"}
+        put = client.put(f"/api/session/{self.SID}/permissions", json=body)
+        assert put.status_code == 200, put.text
+        put_data = put.json()
+
+        expected_raw = dict(SAFE_DEFAULTS)
+        expected_raw.update(body)
+        expected_canonical = coerce_resource_permissions(dict(expected_raw))
+        assert sorted(put_data["raw"].keys()) == SESSION_SCHEMA_KEYS
+        assert put_data["raw"] == expected_raw
+        assert put_data["effective"] == expected_raw
+        assert put_data["effective"]["host_bash"] == "allow"
+
+        # Sidecar holds the canonical 6-grain map with the new host_bash level.
+        sidecar = session_grants_path(vault, self.WS, self.SID)
+        assert sidecar.exists()
+        assert (
+            json.loads(sidecar.read_text(encoding="utf-8")) == expected_canonical
+        )
+        assert (
+            json.loads(sidecar.read_text(encoding="utf-8"))["host_bash"]
+            == "allow"
+        )
+
+        get = client.get(f"/api/session/{self.SID}/permissions")
+        assert get.status_code == 200, get.text
+        get_data = get.json()
+        assert get_data["raw"] == expected_canonical
+        assert get_data["effective"] == expected_raw
+
+    def test_put_host_bash_write_422(self, vault, stub_store):
+        # host_bash is a session-storable grain with its own banned/ask/allow
+        # vocabulary; the legacy 'write' level must be rejected.
+        self._register(stub_store)
+        resp = client.put(
+            f"/api/session/{self.SID}/permissions",
+            json={"host_bash": "write"},
+        )
+        assert resp.status_code == 422
+        errors = resp.json().get("detail", {}).get("errors", [])
+        assert errors and any("host_bash" in err for err in errors)
+
+    def test_put_non_object_body_422(self, vault, stub_store):
+        self._register(stub_store)
+        resp = client.put(
+            f"/api/session/{self.SID}/permissions",
+            json=["host_bash", "ask"],
+        )
+        assert resp.status_code == 422
 
     def test_put_empty_body_resets_to_safe_defaults(self, vault, stub_store):
         self._register(stub_store)
@@ -394,6 +479,31 @@ class TestWorkspacePermissionsRoutes:
         assert resp.status_code == 422
         errors = resp.json().get("detail", {}).get("errors", [])
         assert errors and "invalid level 'superuser' for resource 'network'" in errors[0]
+
+    def test_put_ceiling_host_bash_levels_accepted(self, vault):
+        # The workspace ceiling stores host_bash as a session-storable grain
+        # with its own banned/ask/allow vocabulary.
+        for level in ("banned", "ask", "allow"):
+            put = client.put(
+                f"/api/workspace/{self.WS}/permissions",
+                json={"permissions": {"host_bash": level}},
+            )
+            assert put.status_code == 200, put.text
+            data = put.json()
+            assert data["permissions"] == {"host_bash": level}
+            assert data["raw"] == {"host_bash": level}
+            get = client.get(f"/api/workspace/{self.WS}/permissions")
+            assert get.status_code == 200, get.text
+            assert get.json()["permissions"] == {"host_bash": level}
+
+    def test_put_ceiling_host_bash_write_422(self, vault):
+        resp = client.put(
+            f"/api/workspace/{self.WS}/permissions",
+            json={"permissions": {"host_bash": "write"}},
+        )
+        assert resp.status_code == 422
+        errors = resp.json().get("detail", {}).get("errors", [])
+        assert errors and "invalid level 'write' for resource 'host_bash'" in errors[0]
 
     def test_put_empty_permissions_then_get_falls_back_to_preset(self, vault):
         put = client.put(

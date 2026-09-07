@@ -5,12 +5,14 @@ Single source of truth for the resource keys and allowed values a session
 permission grant set may carry (permission-simplification effort, see
 ``.thoughtmachine/working_docs/impl_plan_permission_simplification.md``).
 
-Session-grant keys are ``git``, ``filesystem``, ``container``, ``network``
-and ``mcp`` -- every session-grant write AND read goes through
-:func:`coerce_resource_permissions`.  ``host_bash`` remains in the catalog
-as the vocabulary for workspace ceilings: it is a ceiling-only grain (the
-session store pops it before coercion) and is never stored at the session
-level.  ``system`` and ``execution`` are deliberately NOT catalog keys -- no
+Session-grant keys are ``git``, ``filesystem``, ``container``, ``network``,
+``mcp`` and ``host_bash`` -- every session-grant write AND read goes
+through :func:`coerce_resource_permissions`.  ``host_bash`` is the
+supervised host-shell grain: it is storable at the session level like any
+catalog key, its ``allow`` level doubles as the workspace-ceiling
+vocabulary, and the security gate always caps the session value by the
+workspace ceiling at enforcement time.  ``system`` and ``execution`` are
+deliberately NOT catalog keys -- no
 tool consumer sits above their safe defaults (``system: read``,
 ``execution: banned`` on ``SessionPermissions``), which the security gate
 applies.  The workspace ceiling keeps the rest of the workspace vocabulary
@@ -25,7 +27,7 @@ The canonical catalog::
     container    True | False
     network      banned | ask | write | outbound
     mcp          banned | connect | full
-    host_bash    banned | ask | allow     (workspace-ceiling-only)
+    host_bash    banned | ask | allow     (host shell; ceiling-capped by the gate)
 """
 
 import logging

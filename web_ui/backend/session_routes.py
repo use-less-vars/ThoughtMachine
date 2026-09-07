@@ -414,7 +414,7 @@ def _compute_effective_session_permissions(
     """Compute effective session permissions enforced at runtime.
 
     Pipeline (mirrors GET /api/workspace/{ws_id}/effective_permissions):
-    coerce raw grants to the full 9-key session profile (safe defaults when
+    coerce raw grants to the full 10-key session profile (safe defaults when
     empty) -> build SessionPermissions -> apply the workspace ceiling from
     config.json['permissions'] (via the permission store) -> merge with
     workspace capabilities in the security gate.  A corrupt/missing workspace

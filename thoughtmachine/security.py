@@ -116,6 +116,7 @@ class SessionPermissions(BaseModel):
     - **git**:        ``'banned' | 'read' | 'write' | 'full' | 'ask' | 'write_on_feature_branch'``
     - **execution**:  ``'banned' | 'read' | 'write' | 'full' | 'ask'``
     - **mcp**:        ``'banned' | 'connect' | 'full'``
+    - **host_bash**:  ``'banned' | 'ask' | 'allow'`` (supervised host shell access level; the security gate caps the session value by the workspace ceiling)
     """
 
     container: bool = Field(
@@ -162,6 +163,10 @@ class SessionPermissions(BaseModel):
         default='banned',
         description='MCP server connection access level.',
     )
+    host_bash: Literal['banned', 'ask', 'allow'] = Field(
+        default='banned',
+        description='Supervised host shell access level.',
+    )
 
     @field_validator('network', mode='before')
     @classmethod
@@ -202,6 +207,7 @@ PERMISSION_SCHEMA: Dict[str, tuple] = {
     "git_read":   VALID_PERMISSION_LEVELS,
     "git_write":  VALID_PERMISSION_LEVELS,
     "mcp":        ("banned", "connect", "full"),
+    "host_bash":  ("banned", "ask", "allow"),
     "system":     VALID_PERMISSION_LEVELS,
 }
 SAFE_DEFAULTS: Dict[str, Any] = {
@@ -211,6 +217,7 @@ SAFE_DEFAULTS: Dict[str, Any] = {
     "git": "read",
     "git_read": "read",
     "git_write": "banned",
+    "host_bash": "banned",
     "mcp": "banned",
     "network": "banned",
     "system": "read",

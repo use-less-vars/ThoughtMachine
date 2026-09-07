@@ -176,6 +176,10 @@ def validate_workspace_permissions(
 
     Callers should treat any non-empty ``errors`` as a hard rejection
     (HTTP 422) rather than silently persisting the partial map.
+
+    ``host_bash`` accepts its own vocabulary ``banned|ask|allow`` (the
+    session-grant grain; ``allow`` doubles as the ceiling value, so it
+    must pass validation even though it is not a global legacy level).
     """
     errors: List[str] = []
     normalized: Dict[str, str] = {}
@@ -188,6 +192,17 @@ def validate_workspace_permissions(
     for name, level in permissions.items():
         if name not in known:
             errors.append(f"unknown resource '{name}'")
+            continue
+        if name == "host_bash":
+            # host_bash is a session-storable grain capped by this ceiling;
+            # its vocabulary is banned/ask/allow (not the global legacy set).
+            if level in ("banned", "ask", "allow"):
+                normalized[name] = str(level)
+                continue
+            errors.append(
+                f"invalid level '{level}' for resource 'host_bash' "
+                f"(expected one of {sorted(('banned', 'ask', 'allow'))})"
+            )
             continue
         if level not in valid_levels:
             errors.append(
