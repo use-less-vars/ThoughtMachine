@@ -518,4 +518,73 @@ describe('WorkspaceDetailPage', () => {
     expect(screen.queryByText('← Back to workspaces')).toBeNull()
     expect(screen.queryByText('Workspace not found.')).toBeNull()
   })
+
+  it('opens the New Session modal from the header button', async () => {
+    stubFetchByUrl(
+      routesFor(makeSummary(), {
+        '/api/session/list?workspace_id=ws-1': jsonOk([]),
+      })
+    )
+    render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
+    await screen.findByText('Research Sandbox')
+
+    const newSessionBtn = screen.getByRole('button', { name: '+ New Session' })
+    expect(newSessionBtn).toBeInTheDocument()
+    expect(screen.queryByRole('dialog', { name: /^New session$/ })).toBeNull()
+
+    fireEvent.click(newSessionBtn)
+    expect(screen.getByRole('dialog', { name: /^New session$/ })).toBeInTheDocument()
+    expect(screen.getByText('Sessions in this workspace')).toBeInTheDocument()
+  })
+
+  it('creates a session sending the absolute root path as workspace_path', async () => {
+    const createBodies = []
+    stubFetchByUrl(
+      routesFor(makeSummary(), {
+        '/api/session/list?workspace_id=ws-1': jsonOk([]),
+        '/api/session/create': (url, init) => {
+          createBodies.push(JSON.parse(init.body))
+          return jsonOk({ session_id: 's-new-1', mode: 'engineer' })
+        },
+      })
+    )
+    render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
+    await screen.findByText('Research Sandbox')
+
+    fireEvent.click(screen.getByRole('button', { name: '+ New Session' }))
+    await screen.findByRole('dialog', { name: /^New session$/ })
+    fireEvent.click(screen.getByRole('button', { name: 'Create Session' }))
+
+    await waitFor(() => expect(createBodies.length).toBe(1))
+    // The store has no list entry for ws-1, so the summary's absolute
+    // root_path must be forwarded verbatim as workspace_path.
+    expect(createBodies[0]).toEqual({
+      mode: 'engineer',
+      workspace_id: WORKSPACE_ID,
+      workspace_path: '/home/jojo/workspaces/research',
+    })
+    expect(await screen.findByText('Session created.')).toBeInTheDocument()
+  })
+
+  it('closes the New Session modal via Cancel without creating a session', async () => {
+    const createBodies = []
+    stubFetchByUrl(
+      routesFor(makeSummary(), {
+        '/api/session/list?workspace_id=ws-1': jsonOk([]),
+        '/api/session/create': (url, init) => {
+          createBodies.push(JSON.parse(init.body))
+          return jsonOk({ session_id: 's-cancel-1', mode: 'engineer' })
+        },
+      })
+    )
+    render(<WorkspaceDetailPage workspaceId={WORKSPACE_ID} />)
+    await screen.findByText('Research Sandbox')
+
+    fireEvent.click(screen.getByRole('button', { name: '+ New Session' }))
+    expect(screen.getByRole('dialog', { name: /^New session$/ })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByRole('dialog', { name: /^New session$/ })).toBeNull()
+    expect(createBodies.length).toBe(0)
+  })
 })

@@ -248,4 +248,27 @@ describe('WorkspaceDetailPage \u2014 Permissions & Resources', () => {
     expect(cardFor('Git').getByRole('combobox')).toHaveValue('write')
     expect(screen.getByRole('button', { name: 'Apply Permissions' })).toBeEnabled()
   })
+
+  it('omits workspace_path when the workspace root is a tilde path', async () => {
+    const createBodies = []
+    stubBackend(makeSummary(), {
+      '/api/session/list?workspace_id=ws-test-1': jsonOk([]),
+      '/api/session/create': (url, init) => {
+        createBodies.push(JSON.parse(init.body))
+        return jsonOk({ session_id: 's-tilde-1', mode: 'engineer' })
+      },
+    })
+    render(<WorkspaceDetailPage workspaceId="ws-test-1" />)
+    await screen.findByText('Code Development')
+
+    fireEvent.click(screen.getByRole('button', { name: '+ New Session' }))
+    await screen.findByRole('dialog', { name: /^New session$/ })
+    fireEvent.click(screen.getByRole('button', { name: 'Create Session' }))
+
+    await waitFor(() => expect(createBodies.length).toBe(1))
+    // '~/workspaces/ws-test-1' is not an absolute path, so workspace_path must
+    // be omitted and the backend resolves the root on its own.
+    expect(createBodies[0]).toEqual({ mode: 'engineer', workspace_id: 'ws-test-1' })
+    expect(createBodies[0]).not.toHaveProperty('workspace_path')
+  })
 })

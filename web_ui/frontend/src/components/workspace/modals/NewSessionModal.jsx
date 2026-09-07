@@ -9,6 +9,13 @@ import React, { useEffect, useState } from 'react'
 import useWorkspaceStore from '../../../store/workspaceStore'
 import '../WorkspacePanel.css'
 
+// True when a path is absolute: Windows drive (C:\/C:/) or POSIX (/) root.
+// Tilde ('~') and relative paths are NOT absolute — for those we omit
+// workspace_path and let the backend resolve against its own conventions.
+function isAbsolutePath(p) {
+  return typeof p === 'string' && /^([a-zA-Z]:[\\/]|\/)/.test(p)
+}
+
 const MODES = [
   { id: 'agent', label: 'Agent', desc: 'Full tools, no worker' },
   { id: 'engineer', label: 'Engineer', desc: 'Delegation only' },
@@ -47,10 +54,18 @@ export default function NewSessionModal({ workspace, onClose }) {
     setCreating(true)
     setError('')
     try {
-      const data = await createSession(workspace.id, {
-        name: name.trim() || undefined,
-        mode,
-      })
+      const data = await createSession(
+        workspace.id,
+        {
+          name: name.trim() || undefined,
+          mode,
+        },
+        isAbsolutePath(workspace.path)
+          ? workspace.path
+          : isAbsolutePath(workspace.root)
+            ? workspace.root
+            : undefined
+      )
       localStorage.setItem('thoughtmachine_last_mode', mode)
       setCreated(data)
       fetchSessions(workspace.id).catch(() => {})
