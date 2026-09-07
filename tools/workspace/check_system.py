@@ -112,7 +112,79 @@ except ImportError:
     GIT_MODE_RESOLVER_AVAILABLE = False
 
 
+# Resource catalog (canonical session-resource keys used for display folding)
+try:
+    from security.resource_catalog import RESOURCE_CATALOG, canonical_resource_keys
+    RESOURCE_CATALOG_AVAILABLE = True
+except ImportError:
+    RESOURCE_CATALOG = {}
+    canonical_resource_keys = ()
+    RESOURCE_CATALOG_AVAILABLE = False
+
+
 logger = logging.getLogger(__name__)
+
+
+# Canonical git permission levels (display fold order, most permissive last) —
+# DISPLAY-ONLY; never feeds gating.
+_CANONICAL_GIT_LEVELS = ('banned', 'ask', 'read', 'write', 'write_on_feature_branch')
+
+
+def _canonical_git_level(effective):
+    """Fold the gate's git grains (git / git_read / git_write) into one canonical level.
+
+    DISPLAY-ONLY: this fold is for human-readable output (CheckSystem
+    'effective_permissions'). Gating always consumes the individual grains from
+    the security gate — nothing here feeds authorization.
+    """
+    if not isinstance(effective, dict):
+        return None
+    # git_write is the strongest signal of what git operations are allowed.
+    gw = effective.get('git_write')
+    if gw not in (None, False):
+        gw = str(gw).lower()
+        if gw == 'full':
+            gw = 'write'
+        if gw in ('write', 'write_on_feature_branch'):
+            return gw
+    # The stored session git level (if present) is the next best signal.
+    git = effective.get('git')
+    if git not in (None, False):
+        git = str(git).lower()
+        if git == 'full':
+            git = 'write'
+        if git == 'write_feature_branches':
+            git = 'write_on_feature_branch'
+        if git in _CANONICAL_GIT_LEVELS:
+            return git
+    # git_read only ever implies read-level access (never write).
+    gr = effective.get('git_read')
+    if gr not in (None, False):
+        gr = str(gr).lower()
+        if gr == 'banned':
+            return 'banned'
+        if gr in ('ask', 'read', 'write', 'full'):
+            return 'read'
+    return None
+
+
+def _canonical_permission_display(effective):
+    """Return the canonical session-resource view of an effective-permissions dict.
+
+    DISPLAY-ONLY (see _canonical_git_level): legacy/gate-only keys such as
+    system, execution, git_read and git_write are hidden or folded, so what the
+    operator sees matches the session-resource vocabulary the ConfigPanel edits.
+    """
+    if not isinstance(effective, dict):
+        return {}
+    reported = {k: v for k, v in effective.items() if k in canonical_resource_keys}
+    if 'git' in effective or 'git_read' in effective or 'git_write' in effective:
+        level = _canonical_git_level(effective)
+        if level is not None:
+            reported['git'] = level
+        elif 'git' in reported:
+            del reported['git']
+    return reported
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +403,10 @@ class CheckSystem(ToolBase):
             permission_origin = "session-mirror"
 
         return {
-            "effective_permissions": effective,
+            # DISPLAY-ONLY fold: gate grain keys (git_read/git_write/system/
+            # execution) are hidden/folded so the report matches the canonical
+            # session-resource vocabulary the ConfigPanel edits.
+            "effective_permissions": _canonical_permission_display(effective),
             "workspace_capabilities": workspace_capabilities,
             "workspace_id": ws_id,
             "source": "gate" if GATE_AVAILABLE else "session_fallback",

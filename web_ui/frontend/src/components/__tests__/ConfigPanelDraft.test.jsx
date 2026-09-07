@@ -17,7 +17,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, act, waitFor } from '@testing-library/react'
 import '@testing-library/jest-dom/vitest'
 import ConfigPanel from '../ConfigPanel'
-import useStore, { PERMISSION_DEFAULTS } from '../../store/useStore'
+import useStore from '../../store/useStore'
 
 function jsonOk(data, status = 200) {
   return { ok: true, status, json: async () => data, text: async () => JSON.stringify(data) }
@@ -48,8 +48,17 @@ const DEFAULT_ROUTES = {
   '/api/workspace/list': jsonOk([{ id: 'ws-1', label: 'Code Development', root: '/root' }]),
 }
 
-// Raw grant map the backend stores for session s1 (PERMISSION_DEFAULTS values).
-const RAW_PROFILE = { ...PERMISSION_DEFAULTS }
+// Raw grant map the backend stores for session s1. Canonical safe-default grant
+// map — useStore's legacy PERMISSION_DEFAULTS still carries system/execution and
+// lacks mcp/host_bash, so it cannot describe the session profile.
+const RAW_PROFILE = {
+  filesystem: 'read',
+  network: 'banned',
+  container: false,
+  git: 'read',
+  mcp: 'banned',
+  host_bash: 'banned',
+}
 
 // Error body the stub returns for refused permission PUTs (mirrors the real
 // backend envelope: { detail: { errors: [...] } } — joined with '; ' by

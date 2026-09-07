@@ -131,3 +131,49 @@ def test_runtime_state_returns_no_secrets(tmp_path):
     assert result["worker_limits"]["worker_max_retries"] == 3
     assert "sk-secret" not in text
     assert '"api_key"' not in text
+
+
+def test_effective_permissions_reports_canonical_git_only():
+    """executor-disk dict folds the git grains into a single canonical git level."""
+    with patch.object(
+        CheckSystem, "_load_allowlist_from_vault", return_value=["effective_permissions"]
+    ):
+        tool = CheckSystem(
+            query="effective_permissions",
+            effective_permissions={
+                "filesystem": "read",
+                "network": "banned",
+                "git": "write",
+                "git_read": "write",
+                "git_write": "write",
+            },
+        )
+        result = _parse_result(tool.execute())
+    assert result["effective_permissions"] == {
+        "filesystem": "read",
+        "network": "banned",
+        "git": "write",
+    }
+    assert result["permission_origin"] == "executor-disk"
+
+
+def test_effective_permissions_folds_session_mirror_git_grains_without_gate():
+    """session-mirror fallback still reports a canonical git level (display-only)."""
+    with patch.object(
+        CheckSystem, "_load_allowlist_from_vault", return_value=["effective_permissions"]
+    ), patch("tools.workspace.check_system.GATE_AVAILABLE", False):
+        tool = CheckSystem(
+            query="effective_permissions",
+            session_permissions={
+                "filesystem": "read",
+                "git_read": "write",
+                "git_write": "write_on_feature_branch",
+            },
+        )
+        result = _parse_result(tool.execute())
+    assert result["effective_permissions"] == {
+        "filesystem": "read",
+        "git": "write_on_feature_branch",
+    }
+    assert result["permission_origin"] == "session-mirror"
+

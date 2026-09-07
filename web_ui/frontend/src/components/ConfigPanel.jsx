@@ -3,26 +3,36 @@ import ManageProvidersModal from './ManageProvidersModal';
 import ContainerPanelContent from './ContainerPanel';
 import WorkspacePanel from './WorkspacePanel';
 import PromptLibrary from './PromptLibrary';
-import { PERMISSION_DEFAULTS } from '../store/useStore';
 import useStore from '../store/useStore';
-import { SESSION_RESOURCE_VOCAB, PERMISSION_RANK_ORDER } from '../data/permissionVocab';
 
-const SESSION_PERMISSION_OPTION_ORDER = (() => {
-  const rankDesc = (a, b) => PERMISSION_RANK_ORDER[b] - PERMISSION_RANK_ORDER[a]
-  return {
-    // SESSION_RESOURCE_VOCAB entries are ARRAYS of canonical values (ascending by rank) —
-    // spread each array, then sort rank-descending for permissive-first option lists.
-    filesystem: [...SESSION_RESOURCE_VOCAB.filesystem].sort(rankDesc),
-    network: [...SESSION_RESOURCE_VOCAB.network].sort(rankDesc),
-    system: [...SESSION_RESOURCE_VOCAB.system].sort(rankDesc),
-    execution: [...SESSION_RESOURCE_VOCAB.execution].sort(rankDesc),
-    // git keeps its legacy UI order (full > write > read > banned > ask) — do NOT
-    // rank-sort; just filter the literal list through the canonical vocab.
-    git: ['full', 'write', 'read', 'banned', 'ask'].filter((v) => SESSION_RESOURCE_VOCAB.git.includes(v)),
-  }
-})()
+// Canonical-only option lists, permissive-first; no rank map needed — some
+// canonical levels share a rank (write_on_feature_branch is a write-tier grant).
+// Container is a boolean toggle, so it has no option list here.
+const SESSION_PERMISSION_OPTION_ORDER = {
+  git: ['write', 'write_on_feature_branch', 'read', 'ask', 'banned'],
+  filesystem: ['write', 'read', 'banned'],
+  network: ['write', 'outbound', 'ask', 'banned'],
+  mcp: ['full', 'connect', 'banned'],
+  host_bash: ['allow', 'ask', 'banned'],
+}
+// Mirrors backend SAFE_DEFAULTS for the canonical session resources. The legacy
+// useStore PERMISSION_DEFAULTS still carries system/execution and lacks
+// mcp/host_bash, so it cannot seed the session-permissions tab.
+const CANONICAL_PERMISSION_DEFAULTS = {
+  git: 'read',
+  filesystem: 'read',
+  container: false,
+  network: 'banned',
+  mcp: 'banned',
+  host_bash: 'banned',
+}
+// Only these keys may be PUT to /api/session/{id}/permissions (mirrors the
+// backend session-permission store schema).
+const CANONICAL_SESSION_PERMISSION_KEYS = ['git', 'filesystem', 'container', 'network', 'mcp', 'host_bash']
 const permissionOptionStyle = { background: '#1e1e2e', color: '#cdd6f4' }
-const permissionOptionLabel = (value) => value.charAt(0).toUpperCase() + value.slice(1)
+const permissionOptionLabel = (value) => value === 'write_on_feature_branch'
+  ? 'Write on feature branches'
+  : String(value).charAt(0).toUpperCase() + String(value).slice(1)
 
 // Flat-map deep equality for the permissions raw maps (string/bool values).
 const isEqualRaw = (a, b) => {
@@ -44,7 +54,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
   const [allTools, setAllTools] = useState([]);
   const normalizeSessionPermissions = (permissions) => {
     const normalized = {
-      ...PERMISSION_DEFAULTS,
+      ...CANONICAL_PERMISSION_DEFAULTS,
       ...(permissions ?? {}),
     };
 
@@ -290,10 +300,16 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
 
     if (sessionId && sessionPerms) {
       try {
+        // PUT only canonical session-permission keys — legacy frontend keys
+        // (system/execution/git_read/git_write) are rejected by the backend schema.
+        const rawPerms = sessionPerms.raw ?? {};
+        const payload = Object.fromEntries(
+          CANONICAL_SESSION_PERMISSION_KEYS.filter((k) => k in rawPerms).map((k) => [k, rawPerms[k]])
+        );
         const res = await fetch(`${API_BASE}/api/session/${encodeURIComponent(sessionId)}/permissions`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(sessionPerms.raw ?? {}),
+          body: JSON.stringify(payload),
         });
         if (!res.ok) {
           let message = `HTTP ${res.status}`;
@@ -684,12 +700,12 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               {(() => {
                 const e = sessionPerms.effective;
                 const pairs = [
-                  ['filesystem', e.filesystem],
-                  ['network', e.network],
-                  ['container', e.container],
                   ['git', e.git],
-                  ['system', e.system],
-                  ['execution', e.execution],
+                  ['filesystem', e.filesystem],
+                  ['container', e.container],
+                  ['network', e.network],
+                  ['mcp', e.mcp],
+                  ['host_bash', e.host_bash],
                 ];
                 return pairs
                   .filter(([, v]) => v !== undefined && v !== null)
@@ -699,9 +715,25 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
             </div>
           )}
           <div style={{ marginBottom: '1rem' }}>
+            <label style={labelStyle}><strong>Git</strong></label>
+            <select
+              value={permsRaw.git ?? CANONICAL_PERMISSION_DEFAULTS.git}
+              onChange={(e) => handlePermissionChange('git', e.target.value)}
+              style={inputStyle}
+            >
+              {SESSION_PERMISSION_OPTION_ORDER.git.map((value) => (
+                <option key={value} value={value} style={permissionOptionStyle}>{permissionOptionLabel(value)}</option>
+              ))}
+            </select>
+            <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
+              Access level for Git operations. "Ask" prompts for approval on each write operation (commit, push, pull, etc.); "Write on feature branches" restricts writes to feature branches.
+            </small>
+          </div>
+
+          <div style={{ marginBottom: '1rem' }}>
             <label style={labelStyle}><strong>Filesystem</strong></label>
             <select
-              value={permsRaw.filesystem ?? PERMISSION_DEFAULTS.filesystem}
+              value={permsRaw.filesystem ?? CANONICAL_PERMISSION_DEFAULTS.filesystem}
               onChange={(e) => handlePermissionChange('filesystem', e.target.value)}
               style={inputStyle}
             >
@@ -710,23 +742,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               ))}
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
-              Read/write access to the workspace filesystem. "Ask" prompts for approval on each write.
-            </small>
-          </div>
-
-          <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Network</strong></label>
-            <select
-              value={permsRaw.network ?? PERMISSION_DEFAULTS.network}
-              onChange={(e) => handlePermissionChange('network', e.target.value)}
-              style={inputStyle}
-            >
-              {SESSION_PERMISSION_OPTION_ORDER.network.map((value) => (
-                <option key={value} value={value} style={permissionOptionStyle}>{permissionOptionLabel(value)}</option>
-              ))}
-            </select>
-            <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
-              Allow the agent to make network requests.
+              Read/write access to the workspace filesystem.
             </small>
           </div>
 
@@ -736,7 +752,7 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
               <label className="toggle-switch">
                 <input
                   type="checkbox"
-                  checked={permsRaw.container ?? PERMISSION_DEFAULTS.container}
+                  checked={permsRaw.container ?? CANONICAL_PERMISSION_DEFAULTS.container}
                   onChange={(e) => handlePermissionChange('container', e.target.checked)}
                 />
                 <span className="toggle-slider"></span>
@@ -751,50 +767,50 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           </div>
 
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Git</strong></label>
+            <label style={labelStyle}><strong>Network</strong></label>
             <select
-              value={permsRaw.git ?? PERMISSION_DEFAULTS.git}
-              onChange={(e) => handlePermissionChange('git', e.target.value)}
+              value={permsRaw.network ?? CANONICAL_PERMISSION_DEFAULTS.network}
+              onChange={(e) => handlePermissionChange('network', e.target.value)}
               style={inputStyle}
             >
-              {SESSION_PERMISSION_OPTION_ORDER.git.map((value) => (
+              {SESSION_PERMISSION_OPTION_ORDER.network.map((value) => (
                 <option key={value} value={value} style={permissionOptionStyle}>{permissionOptionLabel(value)}</option>
               ))}
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
-              Access level for Git operations. "Ask" prompts for approval on each write operation (commit, push, pull, etc.).
+              Allow the agent to make network requests.
             </small>
           </div>
 
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>System</strong></label>
+            <label style={labelStyle}><strong>MCP</strong></label>
             <select
-              value={permsRaw.system ?? PERMISSION_DEFAULTS.system}
-              onChange={(e) => handlePermissionChange('system', e.target.value)}
+              value={permsRaw.mcp ?? CANONICAL_PERMISSION_DEFAULTS.mcp}
+              onChange={(e) => handlePermissionChange('mcp', e.target.value)}
               style={inputStyle}
             >
-              {SESSION_PERMISSION_OPTION_ORDER.system.map((value) => (
+              {SESSION_PERMISSION_OPTION_ORDER.mcp.map((value) => (
                 <option key={value} value={value} style={permissionOptionStyle}>{permissionOptionLabel(value)}</option>
               ))}
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
-              Controls access to system-level operations (environment inspection, process management). "Ask" prompts for approval on each write operation.
+              Allow the agent to connect to external MCP servers.
             </small>
           </div>
 
           <div style={{ marginBottom: '1rem' }}>
-            <label style={labelStyle}><strong>Execution</strong></label>
+            <label style={labelStyle}><strong>Host Bash</strong></label>
             <select
-              value={permsRaw.execution ?? PERMISSION_DEFAULTS.execution}
-              onChange={(e) => handlePermissionChange('execution', e.target.value)}
+              value={permsRaw.host_bash ?? CANONICAL_PERMISSION_DEFAULTS.host_bash}
+              onChange={(e) => handlePermissionChange('host_bash', e.target.value)}
               style={inputStyle}
             >
-              {SESSION_PERMISSION_OPTION_ORDER.execution.map((value) => (
+              {SESSION_PERMISSION_OPTION_ORDER.host_bash.map((value) => (
                 <option key={value} value={value} style={permissionOptionStyle}>{permissionOptionLabel(value)}</option>
               ))}
             </select>
             <small style={{ color: '#6c7086', fontSize: '0.75rem', marginTop: '0.25rem', display: 'block' }}>
-              Allow the agent to spawn background/child processes (experimental).
+              Supervised host-shell access outside the sandbox. "Ask" prompts for approval before each command.
             </small>
           </div>
 
