@@ -21,6 +21,7 @@ const SEVERITY_CLASS = {
 export default function VaultHealthBanner() {
   const [status, setStatus] = useState(null)
   const [loaded, setLoaded] = useState(false)
+  const [expanded, setExpanded] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -57,6 +58,10 @@ export default function VaultHealthBanner() {
   }
 
   const issues = Array.isArray(status.issues) ? status.issues : []
+  const criticalCount = issues.filter(
+    (issue) =>
+      issue.severity === 'critical' || issue.severity === 'high' || issue.severity === 'error'
+  ).length
   return (
     <div className="vault-health-banner vault-health-error" role="alert">
       <div className="vault-health-title">⚠ Vault integrity issues detected</div>
@@ -66,18 +71,36 @@ export default function VaultHealthBanner() {
           <p className="gms-empty">Vault reported unhealthy but no issues were listed.</p>
         </>
       ) : (
-        <ul className="vault-health-list">
-          {issues.map((issue, idx) => (
-            <li className="vault-health-issue" key={issue.file || idx}>
-              <span className={`vault-health-severity ${SEVERITY_CLASS[issue.severity] || 'medium'}`}>
-                {issue.severity || 'unknown'}
-              </span>
-              <span className="vault-health-file">{issue.file || 'unknown file'}</span>
-              <span className="vault-health-message">{issue.message || ''}</span>
-              {issue.action ? <span className="vault-health-action">→ {issue.action}</span> : null}
-            </li>
-          ))}
-        </ul>
+        <>
+          <button
+            type="button"
+            className="vault-health-toggle"
+            aria-expanded={expanded}
+            onClick={() => setExpanded((prev) => !prev)}
+          >
+            <span className="vault-health-summary">
+              {issues.length} issue{issues.length === 1 ? '' : 's'} found
+              {criticalCount > 0 ? ` — ${criticalCount} critical` : ''}
+            </span>
+            <span className="vault-health-chevron" aria-hidden="true">
+              {expanded ? '▾' : '▸'}
+            </span>
+          </button>
+          {expanded && (
+            <ul className="vault-health-list">
+              {issues.map((issue, idx) => (
+                <li className="vault-health-issue" key={issue.file || idx}>
+                  <span className={`vault-health-severity ${SEVERITY_CLASS[issue.severity] || 'medium'}`}>
+                    {issue.severity || 'unknown'}
+                  </span>
+                  <span className="vault-health-file">{issue.file || 'unknown file'}</span>
+                  <span className="vault-health-message">{issue.message || ''}</span>
+                  {issue.action ? <span className="vault-health-action">→ {issue.action}</span> : null}
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
       )}
     </div>
   )

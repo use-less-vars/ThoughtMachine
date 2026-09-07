@@ -103,15 +103,25 @@ describe('VaultHealthBanner', () => {
     render(<VaultHealthBanner />)
     const alert = await screen.findByRole('alert')
     expect(alert).toHaveClass('vault-health-error')
-    expect(screen.getByText('\u26a0 Vault integrity issues detected')).toBeInTheDocument()
+    expect(screen.getByText('⚠ Vault integrity issues detected')).toBeInTheDocument()
+    // Issue list is collapsed by default so the page content stays visible.
+    const toggle = screen.getByRole('button', { name: /issues? found/i })
+    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByText('/vault/config.json')).not.toBeInTheDocument()
+    // Expanding the banner reveals the full issue list.
+    fireEvent.click(toggle)
+    expect(toggle).toHaveAttribute('aria-expanded', 'true')
     expect(screen.getByText('critical')).toBeInTheDocument()
     expect(screen.getByText('/vault/config.json')).toBeInTheDocument()
     expect(screen.getByText('checksum mismatch')).toBeInTheDocument()
-    expect(screen.getByText('\u2192 re-run integrity check')).toBeInTheDocument()
+    expect(screen.getByText('→ re-run integrity check')).toBeInTheDocument()
     // Unknown severity falls back to the medium class.
     expect(alert.querySelector('.vault-health-severity.medium')).toBeInTheDocument()
     // Missing file falls back to "unknown file".
     expect(screen.getByText('unknown file')).toBeInTheDocument()
+    // Collapsing again hides the details.
+    fireEvent.click(toggle)
+    expect(screen.queryByText('/vault/config.json')).not.toBeInTheDocument()
   })
 
   it('shows the empty-issues message when unhealthy without issues', async () => {
