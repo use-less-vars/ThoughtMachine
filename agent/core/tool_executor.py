@@ -59,6 +59,59 @@ except ImportError:
     WorkspaceCapabilities = None
     resolve_workspace_id = None
 
+
+def _ensure_gate_imported() -> bool:
+    """Rebind gate functions after a circular-import interruption.
+
+    The module-level import above can execute while ``security.security_gate``
+    is still mid-initialisation (its first import triggered from inside a
+    circular chain), which makes the ``from``-import fail and latches
+    ``GATE_AVAILABLE`` to False even though the gate is perfectly importable
+    once module import has settled.  This helper re-attempts the binding at
+    first gate entry; if the gate genuinely cannot be imported, the caller
+    denies (fail closed) -- the gate is never silently skipped.
+
+    Bindings are written as module globals so gate calls below keep reading
+    them at call time (late binding): a monkeypatched
+    ``tool_executor_module.get_workspace_capabilities`` (e.g. test fixtures)
+    is preserved instead of being clobbered by the rebind.
+    """
+    global GATE_AVAILABLE  # noqa: PLW0603
+    global get_workspace_capabilities  # noqa: PLW0603
+    global get_effective_permissions  # noqa: PLW0603
+    global check_required_categories  # noqa: PLW0603
+    global check_requires_resource  # noqa: PLW0603
+    global WorkspaceCapabilities  # noqa: PLW0603
+    global resolve_workspace_id  # noqa: PLW0603
+    try:
+        from security.security_gate import (
+            get_workspace_capabilities as _new_get_workspace_capabilities,
+            get_effective_permissions as _new_get_effective_permissions,
+            check_required_categories as _new_check_required_categories,
+            check_requires_resource as _new_check_requires_resource,
+        )
+        from thoughtmachine.workspace_capabilities import (
+            WorkspaceCapabilities as _new_WorkspaceCapabilities,
+            resolve_workspace_id as _new_resolve_workspace_id,
+        )
+        if get_workspace_capabilities is None:
+            get_workspace_capabilities = _new_get_workspace_capabilities
+        if get_effective_permissions is None:
+            get_effective_permissions = _new_get_effective_permissions
+        if check_required_categories is None:
+            check_required_categories = _new_check_required_categories
+        if check_requires_resource is None:
+            check_requires_resource = _new_check_requires_resource
+        if WorkspaceCapabilities is None:
+            WorkspaceCapabilities = _new_WorkspaceCapabilities
+        if resolve_workspace_id is None:
+            resolve_workspace_id = _new_resolve_workspace_id
+        GATE_AVAILABLE = True
+        return True
+    except ImportError:
+        return False
+
+
 # Fallback session-permissions profile (re-exported from
 # agent/config/defaults.py so existing importers keep seeing it here).
 from agent.config.defaults import DEFAULT_SESSION_PERMISSIONS
@@ -279,6 +332,16 @@ class ToolExecutor:
             session_perms_obj = self.config.session_permissions
             if session_perms_obj is None:
                 session_perms_obj = SessionPermissions() if SessionPermissions else None
+
+            # A circular import can interrupt the module-level gate import
+            # above (security.security_gate caught mid-initialisation), leaving
+            # GATE_AVAILABLE False even though the gate is importable now that
+            # module import has settled.  Re-attempt the binding at first gate
+            # entry -- and if the gate genuinely cannot be resolved, deny
+            # (fail closed) rather than silently executing the tool ungated.
+            if session_perms_obj is not None and not GATE_AVAILABLE:
+                if not _ensure_gate_imported():
+                    return {'result': 'Permission denied: security gate unavailable; tool execution denied (fail-closed).', 'tool_type': 'normal'}
 
             if GATE_AVAILABLE and session_perms_obj is not None:
                 # Resolve workspace ID to load workspace capabilities
