@@ -55,6 +55,12 @@ class GitWriteTool(GitReadTool):
     # compatibility with legacy callers.
     name: ClassVar[str] = "git_write"
 
+    # Branches on which a ``write_on_feature_branch`` session may never
+    # commit. Shared by the commit-time feature-branch restriction and the
+    # operator-managed-worktree agent-commit narrow allow, so the protected
+    # set stays in one place.
+    _PROTECTED_BRANCHES: ClassVar[tuple] = ("dev", "master", "main")
+
     @classmethod
     def get_required_categories(cls, params: dict | None = None) -> list[str]:
         """Return dynamic permission categories based on the git operation.
@@ -85,22 +91,52 @@ class GitWriteTool(GitReadTool):
         """Fail-closed check that this write call may proceed.
 
         True when any of the following hold:
-        - effective permissions carry ``git_write`` of ``write`` or ``full``;
+        - effective permissions carry ``git_write`` of ``write``, ``full``
+          or ``write_on_feature_branch``;
         - effective permissions carry ``git_write`` of ``ask`` (the outer
           ToolExecutor gate already prompted and approved this call);
         - the session_permissions dict explicitly sets ``git_write`` to
-          ``write`` or ``full`` (direct-call defense-in-depth).
+          ``write``, ``full`` or ``write_on_feature_branch`` (direct-call
+          defense-in-depth).
+
+        A ``write_on_feature_branch`` grant passes this gate (the outer
+        category gate admits it too); the feature-branch-only restriction
+        is enforced separately at commit time (see
+        ``_git_write_restricted_to_feature_branch``).
         """
         effective = self.effective_permissions or {}
         if effective:
             gw = effective.get("git_write")
-            if gw in ("write", "full"):
+            if gw in ("write", "full", "write_on_feature_branch"):
                 return True
             if gw == "ask":
                 return True
         sp = (getattr(self, "agent_config", None) or {}).get("session_permissions") or {}
-        if isinstance(sp, dict) and sp.get("git_write") in ("write", "full"):
+        if isinstance(sp, dict) and sp.get("git_write") in (
+            "write", "full", "write_on_feature_branch",
+        ):
             return True
+        return False
+
+    def _git_write_restricted_to_feature_branch(self) -> bool:
+        """True when this write call is governed by the
+        ``write_on_feature_branch`` grain (effective ``git_write`` when
+        present, else the session_permissions dict for direct callers).
+
+        ``write`` / ``full`` / ``ask`` grants are never branch-restricted by
+        this tool: an effective ``git_write`` that is present but not
+        ``write_on_feature_branch`` is authoritative and returns False.
+        """
+        effective = self.effective_permissions or {}
+        if effective:
+            gw = effective.get("git_write")
+            if gw == "write_on_feature_branch":
+                return True
+            if gw is not None:
+                return False
+        sp = (getattr(self, "agent_config", None) or {}).get("session_permissions") or {}
+        if isinstance(sp, dict):
+            return sp.get("git_write") == "write_on_feature_branch"
         return False
 
     def execute(self) -> str:
@@ -287,7 +323,7 @@ class GitWriteTool(GitReadTool):
         if not branch:
             # Fail closed on empty/blank branch output.
             return False
-        return branch not in ("dev", "master", "main")
+        return branch not in self._PROTECTED_BRANCHES
 
     @staticmethod
     def _validate_clone_url(clone_url: str) -> bool:
@@ -514,6 +550,33 @@ class GitWriteTool(GitReadTool):
         # pass the session git_write permission check.
         if not self._git_write_allowed():
             return self._flag_gate_error()
+        # write_on_feature_branch grants: the outer git:write category gate
+        # passes, so the branch restriction is enforced HERE, at commit time
+        # (mirroring _unprotected_branch_agent_commit_allowed, which also
+        # gates commits only). Commits are allowed only on non-protected
+        # branches; resolving the current branch fails closed (empty /
+        # unresolved output -> denied). Full write/full/ask grains are not
+        # branch-restricted by this tool.
+        if self._git_write_restricted_to_feature_branch():
+            try:
+                branch_output = self._run_git(
+                    repo_root, ["rev-parse", "--abbrev-ref", "HEAD"]
+                )
+            except (RuntimeError, PermissionError):
+                branch_output = ""
+            branch = (
+                branch_output.strip().splitlines()[0].strip()
+                if (branch_output or "").strip()
+                else ""
+            )
+            if not branch or branch in self._PROTECTED_BRANCHES:
+                branch_label = branch or "unknown"
+                return self._truncate_output(
+                    "Error: git:write denied: write_on_feature_branch "
+                    "permission only allows commits on non-protected branches; "
+                    f"current branch is '{branch_label}' (protected branches: "
+                    "dev, master, main)"
+                )
         # Operator-managed worktrees (a .git FILE pointing at a gitdir) are
         # committed host-side by the operator; block in-workspace commits
         # before any git subprocess can run. Narrow exception: agent commits

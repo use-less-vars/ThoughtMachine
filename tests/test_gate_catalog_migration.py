@@ -11,9 +11,11 @@ Phase-2 migration contract (security/security_gate.py now consumes
   value stands (forward-compatible workspace maps never break resolution).
 * **write_on_feature_branch is a first-class git level:** it splits into
   git_read ``read`` + git_write ``write_on_feature_branch``, ranks at write
-  level in ``_min_permission`` and ceiling comparisons, survives disk-mode
-  coercion (catalog-valid), and satisfies ``git:read`` while denying
-  ``git:write`` at the outer gate (Phase-2.5 helper edit).
+  level in ``_min_permission``, ceiling comparisons AND ``_value_satisfies``
+  (Phase-3 helper edit: the outer ``git:write`` category gate passes and the
+  feature-branch-only restriction is enforced inside the git write tool at
+  commit time), survives disk-mode coercion (catalog-valid), and satisfies
+  ``git:read``.
 * **Worker footprints** capping git to ``read`` also cap a
   branch-write session git level down to ``read``.
 * **Disk mode** (``hermetic_vault`` fixture) coerces stored grants through
@@ -253,23 +255,22 @@ def test_effective_branch_write_session_grains():
     assert eff["git_write"] == "write_on_feature_branch"
 
 
-def test_outer_gate_branch_write_denies_write_allows_read():
-    """Phase-2.5 helper edit: 'write_on_feature_branch' ranks at the read
-    level in _value_satisfies — git:read passes, git:write is denied."""
+def test_outer_gate_branch_write_allows_write_and_read():
+    """Phase-3 helper edit: 'write_on_feature_branch' ranks at the write
+    level in _value_satisfies — git:read AND git:write pass the outer gate
+    (the tool-side commit gate enforces the branch restriction)."""
     eff = _branch_write_eff()
     assert check_atomic_operation("git:read", eff, "GitReadTool") is True
-    assert check_atomic_operation("git:write", eff, "GitWriteTool") is False
+    assert check_atomic_operation("git:write", eff, "GitWriteTool") is True
 
     ok, msg = check_required_categories(
         ["git:read"], dict(eff), "GitReadTool", {}, "read git", event_bus=None
     )
     assert ok is True and msg == ""
-    denied, deny_msg = check_required_categories(
+    ok, msg = check_required_categories(
         ["git:write"], dict(eff), "GitWriteTool", {}, "write git", event_bus=None
     )
-    assert denied is False
-    assert "git:write" in deny_msg
-    assert "write_on_feature_branch" in deny_msg
+    assert ok is True and msg == ""
 
 
 def test_worker_footprint_read_caps_branch_write():

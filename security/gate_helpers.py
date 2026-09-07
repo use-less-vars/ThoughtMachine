@@ -27,9 +27,12 @@ def _value_satisfies(required: str, allowed: object) -> bool | str:
         * ``"ASK"`` if the allowed value is ``'ask'`` and the required access
           is above the read level.
 
-    ``write_on_feature_branch`` on the allowed side ranks at the read level
-    (2): it satisfies ``read`` requirements but denies ``write`` requirements
-    (branch-restricted writes never pass the outer gate for write-level ops).
+    ``write_on_feature_branch`` on the allowed side ranks at the write
+    level (3): it satisfies ``read`` and ``write`` requirements (the
+    ``git:write`` category gate passes) while denying ``full`` requirements
+    (rank 4).  The feature-branch-only restriction itself is enforced inside
+    the branch-aware git write tool, which permits commits only on
+    non-protected branches.
     """
     sentinel_ask = "ASK"
     required_lower = str(required).lower()
@@ -65,7 +68,11 @@ def _value_satisfies(required: str, allowed: object) -> bool | str:
     level_map = {"banned": 0, "ask": 1, "read": 2, "connect": 3, "write": 3, "full": 4}
     allowed_level_name = aliases.get(allowed_str, allowed_str)
     if allowed_level_name == "write_on_feature_branch":
-        allowed_level = 2  # branch-restricted write: satisfies read-level (rank 2), denies write-level (2 < 3)
+        # Branch-restricted write: ranks at the write tier (3) so it satisfies
+        # git:write requirements while staying rank-distinguishable from full
+        # write (rank 4); the branch-aware git write tool enforces the
+        # feature-branch-only restriction on commits.
+        allowed_level = 3
     else:
         allowed_level = level_map.get(allowed_level_name)
 
