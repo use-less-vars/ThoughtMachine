@@ -195,12 +195,18 @@ class SessionPermissions(BaseModel):
 VALID_PERMISSION_LEVELS = ("banned", "ask", "read", "write")
 # "full" is intentionally excluded — it is not a valid mode for
 # the Docker security gate and should not be settable from the UI.
+# ``write_on_feature_branch`` is a git-only level ("commit only on feature
+# branches"; the security gate splits it into git_read=read +
+# git_write=write_on_feature_branch). It must NOT leak into the other
+# VALID_PERMISSION_LEVELS consumers (filesystem/system/git_read/git_write),
+# so ``git`` gets its own dedicated tuple below.
+GIT_PERMISSION_LEVELS = VALID_PERMISSION_LEVELS + ("write_on_feature_branch",)
 PERMISSION_SCHEMA: Dict[str, tuple] = {
     "network":   ("banned", "ask", "write", "outbound"),
     "filesystem": VALID_PERMISSION_LEVELS,   # banned, ask, read, write (no "full")
     "container":  (True, False),
     "execution":  ("banned", "ask", "read", "write"),
-    "git":        VALID_PERMISSION_LEVELS,
+    "git":        GIT_PERMISSION_LEVELS,   # + write_on_feature_branch (git-only)
     # Split git sub-categories (derived from ``git`` by the security gate;
     # declared here so worker permission footprints and config validation
     # accept them).

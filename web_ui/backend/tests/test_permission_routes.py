@@ -372,6 +372,24 @@ class TestSessionPermissionsRoutes:
         assert data["raw"]["git"] == "write"
         assert data["effective"]["git"] == "write"
 
+    def test_put_git_write_on_feature_branch_persists(self, vault, stub_store):
+        # Regression: git="write_on_feature_branch" is a git-only level that the
+        # PUT validation must persist verbatim instead of clamping to "read".
+        self._register(stub_store)
+        put = client.put(
+            f"/api/session/{self.SID}/permissions",
+            json={"git": "write_on_feature_branch"},
+        )
+        assert put.status_code == 200, put.text
+        data = put.json()
+        assert data["raw"]["git"] == "write_on_feature_branch"
+        assert data["effective"]["git"] == "write_on_feature_branch"
+
+        get = client.get(f"/api/session/{self.SID}/permissions")
+        assert get.status_code == 200, get.text
+        assert get.json()["raw"]["git"] == "write_on_feature_branch"
+        assert get.json()["effective"]["git"] == "write_on_feature_branch"
+
     # --- legacy record fallback / corruption ------------------------------
 
     def test_get_falls_back_to_legacy_record_permissions(self, vault, stub_store):
