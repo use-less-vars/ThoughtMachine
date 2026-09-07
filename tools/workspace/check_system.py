@@ -275,7 +275,19 @@ class CheckSystem(ToolBase):
     # -- query implementations -------------------------------------------
 
     def _query_permissions(self, ws_id: Optional[str]) -> dict:
-        """Return effective permissions (session × workspace)."""
+        """Return effective permissions (session × workspace).
+
+        Source-of-truth precedence:
+        1. ``self.effective_permissions`` (when a non-empty dict) — injected by
+           ToolExecutor, computed FRESH THIS CALL from the disk grants + ceiling
+           via the session_id + workspace_id 4-arg gate. Authoritative over the
+           session-start mirror in ``self.session_permissions``, which is never
+           refreshed when the operator changes permissions on disk.
+        2. Legacy 2-arg merge of the in-memory session mirror against the
+           workspace capabilities file — kept only for id-less executors /
+           direct construction, where the disk 4-arg mode cannot engage.
+        3. Raw session mirror when the gate module is unavailable.
+        """
         # Load workspace capabilities from file
         workspace_capabilities = {}
         if CAPABILITIES_AVAILABLE and _workspace_dir and ws_id:
@@ -288,8 +300,15 @@ class CheckSystem(ToolBase):
 
         effective = {}
         permission_fetch_error = None
-        if GATE_AVAILABLE and get_effective_permissions and self.session_permissions:
-            # Build a simple SessionPermissions object or use raw dict
+        permission_origin = "none"
+        injected = getattr(self, "effective_permissions", None)
+        if isinstance(injected, dict) and injected:
+            # Executor's per-call disk-authoritative merge (see docstring).
+            effective = dict(injected)
+            permission_origin = "executor-disk"
+        elif GATE_AVAILABLE and get_effective_permissions and self.session_permissions:
+            # Id-less / direct-construction fallback: 2-arg merge of the
+            # in-memory session mirror with the workspace capabilities file.
             try:
                 from thoughtmachine.security import SessionPermissions
                 session_obj = SessionPermissions(**self.session_permissions)
@@ -299,6 +318,7 @@ class CheckSystem(ToolBase):
                     if k in [f.name for f in __import__('dataclasses').fields(WorkspaceCapabilities)]
                 })
                 effective = get_effective_permissions(session_obj, caps_obj)
+                permission_origin = "mirror-merge"
             except Exception as exc:
                 # Fail-closed: surface the error instead of silently returning
                 # the raw session permissions (which could overstate effective
@@ -308,12 +328,14 @@ class CheckSystem(ToolBase):
                 permission_fetch_error = str(exc)
         elif self.session_permissions:
             effective = dict(self.session_permissions)
+            permission_origin = "session-mirror"
 
         return {
             "effective_permissions": effective,
             "workspace_capabilities": workspace_capabilities,
             "workspace_id": ws_id,
             "source": "gate" if GATE_AVAILABLE else "session_fallback",
+            "permission_origin": permission_origin,
             "permission_fetch_error": permission_fetch_error,
         }
 
