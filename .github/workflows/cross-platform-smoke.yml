@@ -115,6 +115,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Regression guard for LF-only .bat files: cmd.exe REQUIRES CRLF line
+      # endings (an LF-only install_thoughtmachine.bat mis-parses multi-line
+      # blocks and crashed with '".' is not recognized as an internal or
+      # external command' / 'kann syntaktisch an dieser Stelle nicht
+      # verarbeitet werden' on the first parenthesized block). With every
+      # Python removed from PATH the installer must abort CLEANLY (exit 1 +
+      # '[x] Python not found.') and never reach venv creation.
+      - name: install_thoughtmachine.bat aborts cleanly without Python
+        run: |
+          $env:Path = ($env:Path -split ';' | Where-Object { $_ -notmatch 'Python' }) -join ';'
+          $out = & cmd.exe /c "install_thoughtmachine.bat <nul" 2>&1 | Out-String
+          $rc = $LASTEXITCODE
+          Write-Output "install_thoughtmachine.bat (no Python) exit code: $rc"
+          Write-Output "----- output -----"
+          Write-Output $out
+          Write-Output "------------------"
+          $failed = $false
+          if ($rc -ne 1) {
+            Write-Output "::error::expected exit code 1 when Python is missing, got $rc"
+            $failed = $true
+          }
+          if ($out -notmatch 'Python not found') {
+            Write-Output "::error::expected '[x] Python not found.' in install output"
+            $failed = $true
+          }
+          if ($out -match 'unexpected at this time|syntaktisch|Creating virtual environment') {
+            Write-Output "::error::LF-only .bat regression: cmd mis-parsed the script or install proceeded without Python"
+            $failed = $true
+          }
+          if ($failed) { exit 1 }
+          Write-Output "OK: cmd.exe parsed the .bat and aborted on missing Python (exit 1)"
+
       # Python 3.14: the newest supported release line (the installers accept
       # 3.11+ with no ceiling). This job proves the full Windows stack - venv
       # creation, pip cp314 wheel resolution, critical import and the smoke

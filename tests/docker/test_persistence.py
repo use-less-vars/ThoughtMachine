@@ -65,6 +65,9 @@ class TestVolumePersistence:
         """Create a temporary workspace dir and build a minimal image."""
         self.workspace_dir = tmp_path / "ws"
         self.workspace_dir.mkdir()
+        # GHA runner uid 1001 owns tmp_path; the container runs as uid 1000 and
+        # must be able to write into the bind-mounted workspace at /workspace.
+        os.chmod(self.workspace_dir, 0o777)
 
         # Write a minimal Dockerfile
         dockerfile = self.workspace_dir / "Dockerfile"

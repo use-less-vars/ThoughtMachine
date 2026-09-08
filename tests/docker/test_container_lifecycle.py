@@ -118,6 +118,10 @@ class TestContainerLifecycle:
         self.client = docker.from_env()
         self.workspace_dir = tmp_path / "ws"
         self.workspace_dir.mkdir()
+        # GHA runner uid 1001 owns tmp_path; the container runs as uid 1000 and
+        # must be able to write into the bind-mounted workspace (Phase-2 mounts
+        # this dir at /workspace rw).
+        os.chmod(self.workspace_dir, 0o777)
         self.hello_text = f"hello-{uuid.uuid4()}"
         hello_file = self.workspace_dir / "hello.txt"
         hello_file.write_text(self.hello_text)

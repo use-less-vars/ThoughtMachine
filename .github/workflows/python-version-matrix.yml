@@ -126,6 +126,28 @@ jobs:
             exit 1
           fi
 
+      - name: Windows .bat files must keep CRLF line endings
+        run: |
+          # cmd.exe REQUIRES CRLF: an LF-only .bat mis-parses multi-line
+          # blocks ("... was unexpected at this time" crashes). .gitattributes
+          # marks *.bat -text, so the CRLF bytes are stored as-is in the repo
+          # and every checkout delivers them - this guard proves they never
+          # drift back to LF.
+          bad=0
+          for f in \
+            install_thoughtmachine.bat start_thoughtmachine.bat check_tm.bat \
+            kill_thoughtmachine.bat build_thoughtmachine_exe.bat; do
+            if [ "$(wc -c < "$f")" -eq "$(tr -d '\r' < "$f" | wc -c)" ]; then
+              echo "::error::$f has NO CRLF bytes - LF-only .bat files crash cmd.exe"
+              bad=1
+            fi
+          done
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::run: git add --renormalize on the .bat files (or fix the editor EOL setting)"
+            exit 1
+          fi
+          echo "OK: all 5 .bat files carry CRLF line endings"
+
   windows-python-314:
     name: Windows Python 3.14 gate proof
     runs-on: windows-latest

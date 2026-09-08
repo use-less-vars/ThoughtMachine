@@ -322,7 +322,14 @@ def test_install_ci_mode_skips_docker_checks(exec_tmp):
 
 def test_install_normal_mode_still_aborts_without_docker(exec_tmp):
     repo = _make_install_repo(exec_tmp)
-    result = _run_install_script(repo, exec_tmp, "lib_missing", fake_sudo=True)
+    # Pin CI="" rather than unsetting it: GitHub Actions exports CI=true for
+    # every step, which would flip install.sh into CI mode (docker checks
+    # skipped, rc 0) and make this test pass vacuously there. install.sh's
+    # `CI="${CI:-}"; [ -n "$CI" ]` treats the empty string as "not CI", so
+    # the real normal-machine abort path is exercised everywhere.
+    result = _run_install_script(
+        repo, exec_tmp, "lib_missing", fake_sudo=True, extra_env={"CI": ""}
+    )
     assert result.returncode == 1
     assert "NOTE: CI environment detected" not in result.stdout
     assert "FAILED: Docker is not installed and this installer needs sudo to install it." in result.stdout

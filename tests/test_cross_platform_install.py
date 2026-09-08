@@ -157,18 +157,22 @@ def _run_installer_platform(base, kernel, machine, distro_id):
 
 
 def test_install_sh_is_idempotent(exec_tmp):
+    # Under CI, install.sh skips the Docker steps (CI="${CI:-}" + [ -n "$CI" ]),
+    # so fewer [ok] banners are emitted than on a normal machine; GitHub
+    # Actions exports CI=true, so accept the CI count when it is set.
+    min_ok = 3 if os.environ.get("CI") else 4
     first = _run_installer(exec_tmp)
     assert first.returncode == 0, first.stdout + first.stderr
     assert "Next step: ./start_thoughtmachine.sh" in first.stdout
     assert "created and populated" in first.stdout
-    assert first.stdout.count("[ok]") >= 4, first.stdout
+    assert first.stdout.count("[ok]") >= min_ok, first.stdout
 
     second = _run_installer(exec_tmp)
     assert second.returncode == 0, second.stdout + second.stderr
     assert "Next step: ./start_thoughtmachine.sh" in second.stdout
     assert "up to date" in second.stdout
     assert "created and populated" not in second.stdout
-    assert second.stdout.count("[ok]") >= 4, second.stdout
+    assert second.stdout.count("[ok]") >= min_ok, second.stdout
 
 
 def test_install_sh_rejects_macos(exec_tmp):

@@ -282,9 +282,22 @@ def test_real_thread_pause_resume_and_query_envelope(tmp_path, monkeypatch):
     # above; its content is covered deterministically by the fake-thread
     # tests), but the live thread consumes and DELETES it on pickup, so
     # asserting the file after pause_worker returns is inherently racy.
-    # status.json is route-written and never deleted — the durable artifact.
-    status = json.loads((tmp_path / "workers" / "w1" / "status.json").read_text())
-    assert status["runtime_status"] in ("pausing", "paused")
+    # status.json is route-written and never deleted — the durable artifact;
+    # poll briefly for the pausing/paused write instead of reading it once
+    # (the registry fast-path may let the thread advance between the route
+    # write and this read on a loaded runner).
+    def _pause_visible():
+        try:
+            payload = json.loads(
+                (tmp_path / "workers" / "w1" / "status.json").read_text()
+            )
+        except (OSError, json.JSONDecodeError):
+            return False
+        return payload.get("runtime_status") in ("pausing", "paused")
+
+    assert _wait_until(_pause_visible, timeout=5.0), (
+        "status.json never showed pausing/paused after pause_worker"
+    )
     assert _wait_until(lambda: thread.status == "paused", timeout=10.0), (
         f"worker did not reach paused (status={thread.status}, error={thread.error})"
     )
