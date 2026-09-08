@@ -62,8 +62,12 @@ normalises the payload (:func:`_normalize_session_permissions`):
   values are dropped with a warning each.
 
 The workspace ceiling (``workspace_ceiling``) is deliberately NOT coerced:
-it keeps the wider workspace vocabulary (``docker``, ``host_bash``,
-``git_read``, ``git_write``, ...) and is applied by the security gate.
+its canonical key for sandboxed execution is ``container`` (boolean); the
+legacy alias ``docker`` is accepted and normalised onto ``container`` by the
+security gate at enforcement time (write-level allows the container grant,
+banned/read/ask denies it).  The ceiling keeps the wider workspace
+vocabulary (``container``, ``host_bash``, ``git_read``, ``git_write``, ...)
+and is applied by the security gate.
 """
 
 from __future__ import annotations

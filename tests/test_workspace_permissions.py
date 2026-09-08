@@ -35,6 +35,44 @@ def test_workspace_permissions_validation_rejects_unknown():
     assert any("invalid level 'banana' for resource 'git_write'" in e for e in errors)
 
 
+def test_workspace_permissions_validation_docker_alias_write():
+    """docker 'write' (legacy alias of container) normalises to container True
+    with no errors and never survives into the result as a docker key."""
+    normalized, errors = validate_workspace_permissions({"docker": "write"})
+    assert errors == []
+    assert normalized == {"container": True}
+    assert "docker" not in normalized
+
+
+def test_workspace_permissions_validation_docker_alias_non_write():
+    """docker banned/read/ask map to container False (never a grant)."""
+    for level in ("banned", "read", "ask"):
+        normalized, errors = validate_workspace_permissions({"docker": level})
+        assert errors == [], level
+        assert normalized == {"container": False}, level
+
+
+def test_workspace_permissions_validation_docker_alias_invalid_level():
+    """docker with an invalid level errors naming the container alias -- it is
+    NEVER reported as 'unknown resource docker'."""
+    normalized, errors = validate_workspace_permissions({"docker": "banana"})
+    assert normalized == {}
+    assert len(errors) == 1
+    assert "for resource 'docker'" in errors[0]
+    assert "legacy alias of 'container'" in errors[0]
+    assert "unknown resource" not in errors[0]
+
+
+def test_workspace_permissions_validation_canonical_container_bool():
+    """Canonical container booleans pass through verbatim."""
+    normalized, errors = validate_workspace_permissions({"container": True})
+    assert errors == []
+    assert normalized == {"container": True}
+    normalized, errors = validate_workspace_permissions({"container": False})
+    assert errors == []
+    assert normalized == {"container": False}
+
+
 def test_workspace_permissions_persist_and_load(tmp_path, monkeypatch):
     """PUT /permissions validates, persists to config.json, and GET reloads it."""
     vault = tmp_path / "vault"

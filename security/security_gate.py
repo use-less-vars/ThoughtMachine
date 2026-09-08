@@ -78,9 +78,9 @@ _DISK_FAIL_CLOSED_SESSION = SessionPermissions(
     execution="banned",
     mcp="banned",
 )
-_DISK_FAIL_CLOSED_CEILING: Dict[str, str] = {
+_DISK_FAIL_CLOSED_CEILING: Dict[str, Any] = {
     "filesystem": "banned",
-    "docker": "banned",
+    "container": False,
     "host_bash": "banned",
     "git": "banned",
     "git_read": "banned",
@@ -183,9 +183,12 @@ _WORKSPACE_CEILING_LEVELS: Dict[str, float] = {
 }
 
 # Workspace permission-map resource names -> session-permissions keys they cap.
-# Accepts both the NEW workspace map names (filesystem, docker, host_bash, git,
-# network, git_read, git_write) and the OLD purpose-preset names (container,
-# git_read, git_write, host_bash, network, filesystem).
+# The canonical workspace resource for sandboxed execution is ``container``
+# (boolean ceiling); the legacy alias ``docker`` maps onto it here, so a
+# docker ceiling of write-rank allows the container session grant while
+# anything stricter (banned/read/ask) denies it.  Also accepts the OLD
+# purpose-preset names (container, git_read, git_write, host_bash, network,
+# filesystem).
 _WORKSPACE_RESOURCE_MAP: Dict[str, str] = {
     "filesystem": "filesystem",
     "docker": "container",
@@ -199,8 +202,10 @@ _WORKSPACE_RESOURCE_MAP: Dict[str, str] = {
 
 #: Recognised workspace-ceiling resource names: the canonical catalog
 #: resources (session-grant keys git/filesystem/container/network/mcp/
-#: host_bash -- see security/resource_catalog.py) extended with the legacy
-#: workspace grains (docker, git_read, git_write).
+#: host_bash -- see security/resource_catalog.py) plus the legacy alias
+#: ``docker`` (kept recognised -- normalised onto ``container`` by
+#: _WORKSPACE_RESOURCE_MAP so legacy disk ceilings never fail open) and the
+#: legacy git grains (git_read, git_write).
 #: A ceiling key outside this set is an unknown resource: it is logged and
 #: ignored (fail-open), so forward-compatible workspace maps never break
 #: session resolution.
@@ -235,6 +240,11 @@ def apply_workspace_ceiling(
         * An unknown ceiling resource (outside ``RESOURCE_CATALOG`` and the
           legacy workspace grains ``docker``/``git_read``/``git_write``) is
           logged and ignored (fail-open) -- the session value stands.
+        * ``docker`` is a legacy alias for ``container``: it is normalised
+          onto ``container`` by ``_WORKSPACE_RESOURCE_MAP`` before ranking,
+          so a docker ceiling of ``write`` (or ``full``/``True``) allows the
+          container session grant, while ``banned``/``read``/``ask`` (or
+          ``False``) deny it.
         * Boolean session values (``container``) survive only when the
           ceiling is write-level or unlimited; any stricter ceiling forces
           ``False``.  The ``container`` key is always emitted as a boolean.
@@ -433,12 +443,16 @@ def get_effective_permissions(
     Args:
         workspace_permissions:
             Optional workspace-level permission ceilings — a dict mapping
-            workspace resource names (``filesystem``, ``docker``, ``host_bash``,
-            ``git``, ``network``, ``git_read``, ``git_write``) to their maximum
-            allowed level (e.g. ``{"filesystem": "read", "docker": "banned"}``).
-            Applied to the session profile BEFORE the workspace-capability merge
-            via :func:`apply_workspace_ceiling`, so a session can never exceed
-            the workspace's declared ceiling for this workspace.
+            workspace resource names (``filesystem``, ``container``,
+            ``host_bash``, ``git``, ``network``, ``git_read``,
+            ``git_write``) to their maximum allowed level (e.g.
+            ``{"filesystem": "read", "container": False}``).  ``container``
+            is the canonical boolean ceiling; the legacy alias ``docker`` is
+            also accepted and normalised onto ``container`` (write-level
+            allows the container session grant, anything stricter denies it).
+            Applied to the session profile BEFORE the workspace-capability
+            merge via :func:`apply_workspace_ceiling`, so a session can never
+            exceed the workspace's declared ceiling for this workspace.
         session_id / workspace_id:
             Keyword-only arguments enabling **disk mode**.  When BOTH are
             supplied AND *workspace_permissions* is None, the session grant

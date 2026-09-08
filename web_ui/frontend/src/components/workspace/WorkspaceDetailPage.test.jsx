@@ -70,7 +70,7 @@ function makeSummary(overrides = {}) {
     permissions: {
       git: 'read',
       filesystem: 'read',
-      docker: 'ask',
+      container: 'ask',
       host_bash: 'banned',
       tty: 'banned',
       jtag: 'banned',
@@ -361,7 +361,7 @@ describe('WorkspaceDetailPage', () => {
       permissions: {
         git: 'write',
         filesystem: 'read',
-        docker: 'ask',
+        container: 'ask',
         host_bash: 'banned',
         tty: 'banned',
         jtag: 'banned',

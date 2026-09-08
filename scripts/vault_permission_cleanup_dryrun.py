@@ -53,9 +53,11 @@ VOCABULARIES
 ------------
 session vocab : git, filesystem, container, network, mcp, host_bash
                 (applies to every role=session and role=agent dict)
-ceiling vocab : session vocab + docker, system  (valid ONLY inside a
+ceiling vocab : session vocab + system  (valid ONLY inside a
                 workspaces/<id>/config.json 'permissions' dict)
-  - docker in a ceiling dict is canonical: kept silently.
+  - docker is a LEGACY ceiling alias for container: converted to the
+    canonical container bool ('write' -> true, any other value -> false)
+    and the docker key removed ('~ docker: <v> -> container: <target>').
   - system  in a ceiling dict is KEPT but FLAGGED for human review
     ('? system ... (ceiling resource \u2014 KEPT, review later)') \u2014 never
     silently dropped, never silently accepted.
@@ -125,9 +127,10 @@ import sys
 SESSION_VOCAB = ("git", "filesystem", "container", "network", "mcp", "host_bash")
 SESSION_VOCAB_SET = frozenset(SESSION_VOCAB)
 
-# docker (canonical) and system (kept + flagged for review) are valid ONLY
-# inside workspaces/<id>/config.json 'permissions' dicts.
-CEILING_EXTRA = ("docker", "system")
+# system (kept + flagged for review) is valid ONLY inside
+# workspaces/<id>/config.json 'permissions' dicts.  docker was a legacy
+# ceiling alias for container and is CONVERTED (not kept) by simulate().
+CEILING_EXTRA = ("system",)
 CEILING_VOCAB = SESSION_VOCAB_SET | frozenset(CEILING_EXTRA)
 
 # Removed from EVERY permission dict regardless of role.
@@ -278,10 +281,13 @@ def simulate(perm_dict, vocab, lines, st):
     - in a SESSION/agent dict, any key outside the session vocab (and not
       legacy) is DROPPED and logged ('- k: v (unknown key — would drop)')
       — a change;
-    - in a CEILING dict, docker is canonical (silent), 'system' is KEPT
+    - in a CEILING dict, docker is CONVERTED to its canonical container
+      value ('~ docker: v -> container: bool' — write => enabled True,
+      anything else => False) and removed — a change; 'system' is KEPT
       but FLAGGED ('? system: v (ceiling resource — KEPT, review
       later)'), and any other unknown key is KEPT + logged ('? k: v
       (workspace-only — KEPT, review later)') — neither is a change.
+
     """
     keys = sorted(perm_dict)
     after = dict(perm_dict)
@@ -337,7 +343,19 @@ def simulate(perm_dict, vocab, lines, st):
             continue
         v = perm_dict[k]
         if ceiling:
-            if k in SESSION_VOCAB_SET or k == "docker":
+            if k == "docker":
+                # Legacy alias of the canonical container ceiling:
+                # write-rank maps to container True, every other level to
+                # False.  The docker key is removed so a re-run reports no
+                # changes.
+                target = str(v).strip().lower() == "write"
+                lines.append("~ docker: %s -> container: %s (legacy alias "
+                             "\u2014 write => enabled)" % (json.dumps(v), target))
+                del after["docker"]
+                if "container" not in after:
+                    after["container"] = target
+                continue
+            if k in SESSION_VOCAB_SET:
                 continue  # canonical session/ceiling keys: silent
             if k == "system":
                 lines.append("? system: %s (ceiling resource — KEPT, review later)"

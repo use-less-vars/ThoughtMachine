@@ -43,9 +43,9 @@ def test_resource_catalog_default_permissions():
 def test_resource_catalog_json_matches_loader():
     """The on-disk file (new array shape) and the loader's legacy view agree.
 
-    The raw file is the new resource-level array (git / filesystem / docker /
-    host_bash / tty / jtag); the loader shims it into the legacy tool-level
-    dict view so the permission machinery keeps working unchanged.
+    The raw file is the new resource-level array (git / filesystem /
+    container / host_bash / tty / jtag); the loader shims it into the legacy
+    tool-level dict view so the permission machinery keeps working unchanged.
     """
     catalog_path = Path(__file__).resolve().parent.parent / "agent/config/resource_catalog.json"
     raw = json.loads(catalog_path.read_text(encoding="utf-8"))
@@ -54,7 +54,7 @@ def test_resource_catalog_json_matches_loader():
     assert isinstance(raw, list)
     assert len(raw) == 6
     assert {entry["name"] for entry in raw} == {
-        "git", "filesystem", "docker", "host_bash", "tty", "jtag",
+        "git", "filesystem", "container", "host_bash", "tty", "jtag",
     }
     for entry in raw:
         assert set(entry.keys()) == {

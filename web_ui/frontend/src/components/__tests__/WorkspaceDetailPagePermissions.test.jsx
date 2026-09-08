@@ -56,9 +56,9 @@ const CATALOG = [
     tools: ['read_file', 'file_editor', 'apply_edits', 'file_search', 'glob'],
   },
   {
-    name: 'docker',
-    display_name: 'Docker',
-    description: 'Docker container execution',
+    name: 'container',
+    display_name: 'Container',
+    description: 'Container sandboxed code execution (Docker runtime)',
     permission_grain_set: ['banned', 'read', 'ask', 'write'],
     default_execution_context: 'containerized',
     container_image: null,
@@ -106,7 +106,7 @@ function makeSummary(overrides = {}) {
     permissions: {
       git: 'read',
       filesystem: 'read',
-      docker: 'banned',
+      container: 'banned',
       host_bash: 'banned',
       tty: 'read',
       jtag: 'banned',
@@ -168,13 +168,13 @@ describe('WorkspaceDetailPage \u2014 Permissions & Resources', () => {
     expect(document.querySelectorAll('.wdp-resource-card').length).toBe(6)
     expect(cardFor('Git').getByRole('combobox')).toHaveValue('read')
     expect(cardFor('Filesystem').getByRole('combobox')).toHaveValue('read')
-    expect(cardFor('Docker').getByRole('combobox')).toHaveValue('banned')
+    expect(cardFor('Container').getByRole('combobox')).toHaveValue('banned')
     expect(cardFor('Host bash').getByRole('combobox')).toHaveValue('banned')
     expect(cardFor('TTY').getByRole('combobox')).toHaveValue('read')
     expect(cardFor('JTAG').getByRole('combobox')).toHaveValue('banned')
     // Banned resources render as Disabled with an Off switch.
-    expect(cardFor('Docker').getByText('Disabled')).toBeInTheDocument()
-    expect(cardFor('Docker').getByText('Off')).toBeInTheDocument()
+    expect(cardFor('Container').getByText('Disabled')).toBeInTheDocument()
+    expect(cardFor('Container').getByText('Off')).toBeInTheDocument()
     expect(cardFor('Git').getByText('Enabled')).toBeInTheDocument()
   })
 

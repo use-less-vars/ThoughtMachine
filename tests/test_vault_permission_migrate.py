@@ -107,7 +107,7 @@ def build_ceiling_vault(root):
                 "git_read": "read",
                 "git_write": "ask",
                 "execution": "shell",
-                "docker": "allow",
+                "docker": "write",
                 "system": {"halt": True},
             }
         },
@@ -176,19 +176,26 @@ def test_02_apply_migrates_session_permissions_file(tmp_path):
 
 
 def test_03_apply_ceiling_conflict_keeps_existing_git(tmp_path):
-    """Ceiling config.json: execution dropped, git conflict keeps existing git."""
+    """Ceiling config.json: execution dropped, git conflict keeps existing git,
+    docker converted to canonical container True (write => enabled)."""
     vault = tmp_path / "vault"
     build_ceiling_vault(vault)
     target = vault / "workspaces/w1/config.json"
     before = target.read_bytes()
 
     result = run_migrate(vault, "--apply")
-    assert_ok(result, "CONFLICT", "KEEPING existing git", "1 file(s) migrated")
+    assert_ok(
+        result,
+        "CONFLICT",
+        "KEEPING existing git",
+        '~ docker: "write" -> container: True',
+        "1 file(s) migrated",
+    )
 
     doc = json.loads(target.read_text(encoding="utf-8"))
     assert doc["permissions"] == {
         "git": "write",  # existing value kept over merged 'ask'
-        "docker": "allow",  # ceiling key untouched
+        "container": True,  # docker 'write' converted to canonical container
         "system": {"halt": True},  # ceiling key untouched (kept, review later)
     }, doc
     bak = vault / "workspaces/w1/config.json.bak"
@@ -307,3 +314,75 @@ def test_09_nonexistent_vault_root_exits_2(tmp_path):
     result = run_migrate(tmp_path / "no-such-vault")
     assert result.returncode == 2, (result.returncode, result.stdout, result.stderr)
     assert "VAULT ROOT ERROR" in result.stdout + result.stderr
+
+
+def test_10_docker_non_write_ceiling_converts_to_container_false(tmp_path):
+    """A banned/read docker ceiling converts to container False, the docker key
+    is removed, --apply succeeds, and a re-run reports 0 WOULD-change files."""
+    vault = tmp_path / "vault"
+    for ws, level in (("w1", "banned"), ("w2", "read")):
+        write_json(
+            vault / ("workspaces/%s/config.json" % ws),
+            {"permissions": {"docker": level}},
+        )
+
+    result = run_migrate(vault, "--apply")
+    assert_ok(
+        result,
+        '~ docker: "banned" -> container: False',
+        '~ docker: "read" -> container: False',
+        "2 file(s) migrated",
+    )
+
+    for ws in ("w1", "w2"):
+        doc = json.loads(
+            (vault / ("workspaces/%s/config.json" % ws)).read_text(encoding="utf-8")
+        )
+        assert doc["permissions"] == {"container": False}, doc
+        assert "docker" not in doc["permissions"]
+
+    rerun = run_migrate(vault)
+    assert rerun.returncode == 0, rerun.stderr
+    assert "files that WOULD change: 0" in rerun.stdout, rerun.stdout
+
+
+def test_11_canonical_container_ceiling_is_untouched(tmp_path):
+    """A canonical container True/False ceiling is already clean: dry run
+    reports NO CHANGE and --apply migrates 0 files with no .bak created."""
+    vault = tmp_path / "vault"
+    write_json(
+        vault / "workspaces/w1/config.json", {"permissions": {"container": True}}
+    )
+    write_json(
+        vault / "workspaces/w2/config.json", {"permissions": {"container": False}}
+    )
+
+    dry = run_migrate(vault)
+    assert dry.returncode == 0, dry.stderr
+    assert "files that WOULD change: 0" in dry.stdout, dry.stdout
+    assert "=> NO CHANGE" in dry.stdout
+
+    result = run_migrate(vault, "--apply")
+    assert_ok(result, "0 file(s) migrated")
+    assert "backup: " not in result.stdout, "clean ceilings must not be re-backed up"
+    assert not list(vault.rglob("*.bak")), "no .bak files should exist"
+
+
+def test_12_dry_run_prints_docker_conversion_lines(tmp_path):
+    """Dry-run stdout shows exact docker->container conversion lines
+    (write => true, banned/read => false) for every affected ceiling."""
+    vault = tmp_path / "vault"
+    write_json(
+        vault / "workspaces/w1/config.json",
+        {"permissions": {"docker": "write", "git": "read"}},
+    )
+    write_json(
+        vault / "workspaces/w2/config.json",
+        {"permissions": {"docker": "banned", "git": "read"}},
+    )
+
+    dry = run_migrate(vault)  # no --apply
+    assert dry.returncode == 0, dry.stderr
+    assert '~ docker: "write" -> container: True' in dry.stdout, dry.stdout
+    assert '~ docker: "banned" -> container: False' in dry.stdout, dry.stdout
+    assert "files that WOULD change: 2" in dry.stdout, dry.stdout

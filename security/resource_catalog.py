@@ -15,10 +15,15 @@ workspace ceiling at enforcement time.  ``system`` and ``execution`` are
 deliberately NOT catalog keys -- no
 tool consumer sits above their safe defaults (``system: read``,
 ``execution: banned`` on ``SessionPermissions``), which the security gate
-applies.  The workspace ceiling keeps the rest of the workspace vocabulary
-(``docker``, ``git_read``, ``git_write``, ...) and is enforced separately by
-the security gate; ``thoughtmachine/permission_store.workspace_ceiling`` is
-therefore NOT coerced.
+applies.  The workspace ceiling's canonical key for sandboxed execution is
+``container`` (boolean); the legacy alias ``docker`` is accepted by the
+security gate and normalised onto ``container`` at enforcement time (a
+write-level docker ceiling allows the container grant, banned/read/ask
+denies it).  The ceiling keeps the wider workspace vocabulary
+(``container``, ``host_bash``, ``git_read``, ``git_write``, ...) and is
+enforced separately by the security gate;
+``thoughtmachine/permission_store.workspace_ceiling`` is therefore NOT
+coerced.
 
 The canonical catalog::
 
