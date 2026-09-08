@@ -2456,10 +2456,13 @@ app.include_router(provider_router)
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Host path confinement (path browser + container lifecycle) ──────────────
-# The browser and the container lifecycle endpoints accept arbitrary host
-# paths. Confine them to $HOME minus the vault root (~/.thoughtmachine) so a
-# malicious or buggy client cannot read/create directories or mount host
-# paths outside the user's home directory.
+# The browser, create-directory and container lifecycle endpoints accept
+# arbitrary host paths. They must resolve to an ABSOLUTE path OUTSIDE the
+# vault root (~/.thoughtmachine) — the trust anchor holding credentials,
+# config and session state. The old "must stay under $HOME" confinement was
+# a Unix-centric assumption that blocked legitimate workspaces on other
+# drives (e.g. D:\Coding on Windows), so paths anywhere else on the machine
+# are now allowed.
 
 def _vault_root_path() -> str:
     """Absolute, normalized vault root (~/.thoughtmachine)."""
@@ -2478,19 +2481,26 @@ def _path_is_within(path: str, prefix: str) -> bool:
 
 
 def _confine_to_home(path: str) -> str:
-    """Resolve *path* (empty → $HOME) and require it to be under $HOME and
-    outside the vault root (~/.thoughtmachine).
+    """Resolve *path* (empty → $HOME) to an absolute path outside the vault.
+
+    TRUST ANCHOR: ``~/.thoughtmachine`` holds the workspace registry,
+    credentials, config and session state, so user-reachable endpoints
+    (browse, create, container lifecycle) must never resolve INTO it. Paths
+    may live anywhere else on the machine (e.g. ``D:\\Coding`` on Windows) —
+    the legacy $HOME-only confinement wrongly blocked other drives.
 
     Returns the absolute, normalized, symlink-resolved path. Raises ValueError
-    when the path escapes those bounds.
+    when the path is not absolute (including drive-relative forms such as
+    ``C:``) or resolves into the vault root.  The function name is retained
+    for backwards compatibility (tests patch it by name); the $HOME-only
+    confinement has been removed.
     """
     raw = os.path.expanduser(path or "~")
     resolved = os.path.realpath(os.path.abspath(raw))
-    home = os.path.realpath(os.path.expanduser("~"))
-    if not _path_is_within(resolved, home):
+    if not os.path.isabs(resolved):
         raise ValueError(
-            f"Path '{path}' resolves to '{resolved}', which is outside the "
-            f"allowed home directory '{home}'"
+            f"Path '{path}' resolves to '{resolved}', which is not an "
+            f"absolute path"
         )
     vault = _vault_root_path()
     if _path_is_within(resolved, vault):
@@ -2504,8 +2514,9 @@ def _confine_to_home(path: str) -> str:
 async def browse_directory(path: str = ""):
     """List directory contents for the workspace path browser.
 
-    Confined to $HOME minus the vault root (~/.thoughtmachine): paths that
-    resolve outside the home directory or into the vault are rejected.
+    The path must resolve to an absolute directory outside the vault root
+    (~/.thoughtmachine); paths that resolve into the vault are rejected.
+    Directories on other drives (e.g. ``D:\\`` on Windows) are allowed.
     """
     try:
         base_path = _confine_to_home(path)
@@ -2582,9 +2593,12 @@ async def api_get_tools():
 async def create_directory(body: dict):
     """Create a new directory for the workspace path browser.
 
-    The parent path is confined to $HOME minus the vault root
-    (~/.thoughtmachine), and the resulting path is checked to stay within the
-    parent (blocking ``../`` traversal and absolute-name escapes).
+    The parent path may be any absolute directory outside the vault root
+    (~/.thoughtmachine). A relative ``name`` is joined to the parent and must
+    stay inside it (blocking ``../`` traversal). An absolute ``name`` (e.g.
+    ``D:\\Coding`` pasted into the New Folder prompt when the browser cannot
+    navigate to another drive) is treated as the full target path and is
+    validated like any other host path: absolute and outside the vault.
     """
     try:
         parent_path = body.get("parent_path", "")
@@ -2594,9 +2608,18 @@ async def create_directory(body: dict):
         parent = _confine_to_home(parent_path)
         if not os.path.isdir(parent):
             return {"success": False, "error": f"Not a directory: {parent}"}
-        new_path = os.path.normpath(os.path.join(parent, dir_name))
-        if not _path_is_within(new_path, parent):
-            return {"success": False, "error": f"Invalid directory name: {dir_name}"}
+        if os.path.isabs(dir_name):
+            # Full absolute path (e.g. a Windows path pasted into the new
+            # folder prompt) — use it directly as the target. Confinement
+            # (absolute + outside the vault) is enforced by _confine_to_home.
+            try:
+                new_path = _confine_to_home(dir_name)
+            except ValueError as exc:
+                return {"success": False, "error": str(exc)}
+        else:
+            new_path = os.path.normpath(os.path.join(parent, dir_name))
+            if not _path_is_within(new_path, parent):
+                return {"success": False, "error": f"Invalid directory name: {dir_name}"}
         if os.path.exists(new_path):
             return {"success": False, "error": f"Already exists: {dir_name}"}
         os.makedirs(new_path, exist_ok=True)
@@ -2794,11 +2817,12 @@ def _validate_workspace_path(workspace_path: str, workspace_id: str) -> str:
     """Validate an explicit container ``workspace_path`` query parameter.
 
     The path must resolve (after ~ expansion and symlink resolution) to an
-    existing directory under $HOME and outside the vault root
-    (~/.thoughtmachine), AND it must lie within the registered workspace root
-    for *workspace_id*. This keeps the container lifecycle endpoints from
-    mounting arbitrary host paths (e.g. /, /etc, another user's home, the
-    vault, or a non-registered home directory) into a container.
+    existing ABSOLUTE directory outside the vault root (~/.thoughtmachine),
+    AND it must lie within the registered workspace root for *workspace_id*.
+    This keeps the container lifecycle endpoints from mounting arbitrary host
+    paths (e.g. /etc, another user's home, the vault, or any non-registered
+    directory) into a container — workspaces registered on other drives
+    (e.g. ``D:\\Coding`` on Windows) are legitimate.
 
     Returns the resolved absolute path. Raises WorkspacePathError (HTTP 400)
     for invalid input or an unregistered workspace, and
@@ -2839,10 +2863,10 @@ def _validate_workspace_path(workspace_path: str, workspace_id: str) -> str:
 def _resolve_workspace_path(workspace_id: str, workspace_path: str = ""):
     """Resolve the workspace root path for a container manager.
 
-    The explicit ``workspace_path`` query param wins and is validated against
-    $HOME minus the vault root (raises WorkspacePathError); otherwise fall
-    back to the workspace registry. Returns None when the workspace is
-    unknown or the path cannot be resolved.
+    The explicit ``workspace_path`` query param wins and is validated to be
+    an existing absolute directory outside the vault root (raises
+    WorkspacePathError); otherwise fall back to the workspace registry.
+    Returns None when the workspace is unknown or the path cannot be resolved.
     """
     if workspace_path:
         return _validate_workspace_path(workspace_path, workspace_id)

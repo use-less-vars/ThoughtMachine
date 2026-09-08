@@ -83,20 +83,26 @@ def _path_is_within(path: str, prefix: str) -> bool:
 
 
 def _confine_to_home(path: str) -> str:
-    """Resolve *path* and confine it to $HOME minus the vault root.
+    """Resolve *path* to an absolute path outside the vault root.
 
     TRUST ANCHOR: ``~/.thoughtmachine`` is the trust anchor for this server —
     it holds the workspace registry, credentials, configuration and session
     state.  User-reachable endpoints (browse, create, workspace registration)
     must never resolve into it: a workspace rooted there would hand the agent
-    the trust anchor and everything inside it.  Raises ``ValueError`` when the
-    resolved path is outside $HOME or inside the vault root.
+    the trust anchor and everything inside it.  Paths OUTSIDE $HOME are fine
+    (e.g. ``D:\\Coding`` on Windows) — the legacy $HOME-only confinement
+    blocked legitimate workspaces on other drives.
+
+    Raises ``ValueError`` when the resolved path is not absolute (including
+    drive-relative forms such as ``C:``) or resolves inside the vault root.
+    The function name is retained for backwards compatibility (tests patch it
+    by name); the $HOME-only confinement has been removed.
     """
     resolved = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
-    home = os.path.realpath(os.path.expanduser("~"))
-    if not _path_is_within(resolved, home):
+    if not os.path.isabs(resolved):
         raise ValueError(
-            f"Path '{path}' resolves outside the allowed home directory '{home}'"
+            f"Path '{path}' resolves to '{resolved}', which is not an "
+            f"absolute path"
         )
     vault = os.path.realpath(str(_vault_root_path()))
     if _path_is_within(resolved, vault):
@@ -114,12 +120,13 @@ async def resolve_workspace_path(body: ResolvePathBody) -> Dict[str, Any]:
     Otherwise, registers it as a new workspace and returns the new ID.
 
     TRUST ANCHOR: ``~/.thoughtmachine`` is the trust anchor for this server.
-    New registrations are confined to $HOME minus the vault root: a path that
-    resolves outside the home directory or into ``~/.thoughtmachine`` is
-    rejected with HTTP 403 Forbidden, and a non-existent path with HTTP 400.
-    Already-registered paths are returned as-is — their entries were written
-    only by trusted code (bootstrap, server startup, or this same confined
-    endpoint), so they are trusted.
+    New registrations may be any ABSOLUTE path that does not resolve into
+    ``~/.thoughtmachine`` (workspaces on other drives, e.g. ``D:\\Coding``
+    on Windows, are legitimate); vault paths are rejected with HTTP 403
+    Forbidden, and a non-existent path with HTTP 400. Already-registered
+    paths are returned as-is — their entries were written only by trusted
+    code (bootstrap, server startup, or this same confined endpoint), so they
+    are trusted.
     """
     try:
         if not body.path or not body.path.strip():
@@ -135,7 +142,7 @@ async def resolve_workspace_path(body: ResolvePathBody) -> Dict[str, Any]:
         if existing is not None:
             return {"workspace_id": existing.id, "root": existing.root_path}
 
-        # New registration: confine to $HOME minus the vault root.
+        # New registration: must be absolute and outside the vault root.
         try:
             confined = _confine_to_home(body.path)
         except ValueError as exc:

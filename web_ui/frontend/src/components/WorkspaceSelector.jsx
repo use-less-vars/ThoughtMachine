@@ -310,8 +310,8 @@ export default function WorkspaceSelector() {
             >
               <h3 className="ws-modal-title">Create Custom Workspace</h3>
               <p className="ws-modal-hint">
-                Pick an existing folder on this machine to use as the workspace root. It must be inside
-                your home directory.
+                Pick an existing folder on this machine to use as the workspace root. It can be anywhere
+                outside the protected vault (~/.thoughtmachine).
               </p>
               <div className="ws-modal-label">Workspace Folder</div>
               <FolderBrowser
