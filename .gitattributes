@@ -1,0 +1,7 @@
+# Windows batch files: cmd.exe REQUIRES CRLF line endings (LF-only .bat files
+# mis-parse multi-line if/for blocks -> "was unexpected at this time" crashes).
+# Marked -text so the CRLF bytes are stored AS-IS in the repo: every checkout,
+# ZIP export and file copy then delivers CRLF to cmd.exe, regardless of the
+# consumer's core.autocrlf setting.
+*.bat -text
+*.cmd -text
