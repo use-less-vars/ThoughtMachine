@@ -350,11 +350,15 @@ def write_session_permissions(
                 os.fsync(f.fileno())
         if fsync:
             try:
-                dir_fd = os.open(target_dir, os.O_DIRECTORY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
+                # os.O_DIRECTORY exists only on POSIX; on Windows directory
+                # handles cannot be fsynced via os.open at all. os.replace()
+                # below is still atomic; skip dir fsync where unsupported.
+                if hasattr(os, "O_DIRECTORY"):
+                    dir_fd = os.open(target_dir, os.O_DIRECTORY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
             except OSError:
                 # Directory fsync is best-effort (some platforms disallow it).
                 pass
