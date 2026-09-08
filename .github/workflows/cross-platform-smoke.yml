@@ -115,50 +115,76 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Windows-user bug guard - REAL cause (LF/CRLF theory overturned):
-      # cmd.exe deterministically mis-parses parenthesized content (REM
-      # comment text with parens, quoted python -c one-liners with parens)
-      # INSIDE multi-line IF blocks: '". was unexpected at this time.' /
-      # 'kann syntaktisch an dieser Stelle nicht verarbeitet werden' right
-      # after the '--- Python ---' banner. Line endings were NOT the bug:
-      # the .bat already reached Windows as CRLF (blob LF, but checkout and
-      # GitHub ZIP both deliver CRLF via .gitattributes 'text eol=crlf',
-      # 17518d5). The installer rewrite (a9ee26e) removed every
-      # parens-inside-block in the Python check. With all Python removed
-      # from PATH the installer must still abort CLEANLY (exit 1 + '[x]
-      # Python not found.') and never reach venv creation.
-      - name: install_thoughtmachine.bat aborts cleanly without Python
+      # Guard for the cmd.exe parser bug that crashed the installer for real
+      # Windows users AND this job, right after the '--- Python ---' banner.
+      # ROOT CAUSE (line endings exonerated - the .bat already arrived CRLF):
+      # cmd.exe mis-parses parenthesized content - REM comment text, quoted
+      # python -c one-liners - INSIDE multi-line IF blocks, emitting
+      # '". was unexpected at this time.' / 'kann syntaktisch an dieser
+      # Stelle nicht verarbeitet werden'. a9ee26e rewrote the Python check
+      # with flat single-line probes + goto labels: zero parenthesized
+      # blocks. This guard stops the installer the moment it echoes the
+      # Node.js banner - reaching it proves the whole Python section parsed
+      # and executed under real cmd.exe.
+      #
+      # NOTE: we run with Python PRESENT, i.e. the exact user scenario.
+      # Simulating 'no Python' by stripping PATH is impossible on these
+      # runners: the py launcher resolves installed interpreters via the
+      # registry, so 'py --version' still succeeds, the installer runs the
+      # full install and exits 0 (observed). A reintroduced parens-in-block
+      # dies here with the parse-error text BEFORE the Node.js marker.
+      - name: install_thoughtmachine.bat Python section parses under cmd.exe
         run: |
-          $env:Path = ($env:Path -split ';' | Where-Object { $_ -notmatch 'Python' }) -join ';'
-          # 2>&1 must stay INSIDE the cmd /c string: cmd then merges its own
-          # stderr into stdout before PowerShell sees it (avoids
-          # NativeCommandError noise corrupting the captured output).
-          $out = & cmd.exe /c "install_thoughtmachine.bat <nul 2>&1" | Out-String
-          $rc = $LASTEXITCODE
-          Write-Output "install_thoughtmachine.bat (no Python) exit code: $rc"
-          Write-Output "----- output -----"
+          # Run the real installer under real cmd.exe, kill it once it
+          # reaches the Node.js section - that is all this guard needs.
+          $outLog = Join-Path $env:RUNNER_TEMP 'tm_install_guard_out.log'
+          $errLog = Join-Path $env:RUNNER_TEMP 'tm_install_guard_err.log'
+          $empty = Join-Path $env:RUNNER_TEMP 'tm_install_guard_empty.txt'
+          Remove-Item $outLog, $errLog, $empty -ErrorAction SilentlyContinue
+          Set-Content -Path $empty -Value ''
+          $p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c install_thoughtmachine.bat' -RedirectStandardInput $empty -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru -NoNewWindow
+          if ($null -eq $p) {
+            Write-Output '::error::could not start cmd.exe'
+            exit 1
+          }
+          $deadline = (Get-Date).AddSeconds(45)
+          $reachedNode = $false
+          while ((Get-Date) -lt $deadline) {
+            if (Test-Path $outLog) {
+              $partial = Get-Content $outLog -Raw -ErrorAction SilentlyContinue
+              if ($partial -match '--- Node\.js ---') { $reachedNode = $true; break }
+            }
+            if ($p.HasExited) { break }
+            Start-Sleep -Milliseconds 250
+          }
+          if (-not $p.HasExited) { try { $p.Kill() } catch { } }
+          $p.WaitForExit()
+          $out = Get-Content $outLog -Raw -ErrorAction SilentlyContinue
+          $err = Get-Content $errLog -Raw -ErrorAction SilentlyContinue
+          Write-Output 'install_thoughtmachine.bat (Python present, stopped after Node.js banner):'
+          Write-Output '----- output -----'
           Write-Output $out
-          Write-Output "------------------"
+          if ($err) { Write-Output '----- stderr -----'; Write-Output $err }
+          Write-Output '------------------'
+          $all = $out + "`n" + $err
           $failed = $false
-          if ($rc -ne 1) {
-            Write-Output "::error::expected exit code 1 when Python is missing, got $rc"
+          if ($all -notmatch '--- Python ---') {
+            Write-Output '::error::installer never reached the --- Python --- banner'
             $failed = $true
           }
-          if ($out -notmatch 'Python not found') {
-            Write-Output "::error::expected '[x] Python not found.' in install output"
+          if ($all -match 'unexpected at this time|kann syntaktisch|is not recognized as an internal') {
+            Write-Output '::error::cmd.exe mis-parsed the .bat (parenthesized content inside a block) - see output above'
             $failed = $true
           }
-          if ($out -match 'unexpected at this time|syntaktisch|Creating virtual environment') {
-            Write-Output "::error::cmd mis-parsed the .bat or install proceeded without Python"
+          if (-not $reachedNode) {
+            Write-Output '::error::installer never reached the Node.js section - Python check crashed or hung'
             $failed = $true
           }
           if ($failed) {
-            Write-Output "::error::windows-smoke guard failed - see install output above"
+            Write-Output '::error::windows-smoke guard failed - see install output above'
             exit 1
           }
-          Write-Output "OK: cmd.exe parsed the .bat and aborted on missing Python (exit 1)"
-          # Explicit exit 0: cmd.exe legitimately returned 1; never let a
-          # stale $LASTEXITCODE fail the step after the assertions passed.
+          Write-Output 'OK: cmd.exe parsed the installer cleanly; Python section ran and fell through to Node.js'
           exit 0
 
       # Python 3.14: the newest supported release line (the installers accept
