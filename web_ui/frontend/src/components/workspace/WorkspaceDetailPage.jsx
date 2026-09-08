@@ -57,11 +57,39 @@ function TabPlaceholder({ tab }) {
 
 // ---- Permissions & Resources tab --------------------------------------------
 
-function firstEnabledGrain(entry) {
-  const grains = Array.isArray(entry && entry.permission_grain_set)
-    ? entry.permission_grain_set
-    : []
-  return grains.find((grain) => grain !== 'banned') || 'read'
+// Per-resource ceiling vocabulary. The backend serves the workspace ceiling as
+// the 10-key legacy permission map while summary.resource_catalog is the 6-entry
+// "new level" array whose generic permission_grain_set does NOT match what the
+// PUT /{ws_id}/permissions validator actually accepts:
+//   - generic resources accept banned|ask|read|write
+//   - host_bash accepts banned|ask|allow only
+//   - container is a real boolean (true == write-level enabled)
+//   - tty/jtag are not permission-gated (the validator rejects them outright)
+// So the editors are driven from this table, never from entry.permission_grain_set.
+const GENERIC_CEILING_LEVELS = ['banned', 'ask', 'read', 'write']
+const HOST_BASH_CEILING_LEVELS = ['banned', 'ask', 'allow']
+
+export const CONTAINER_CEILING = 'boolean'
+
+export const WORKSPACE_CEILING_OPTIONS = {
+  git: GENERIC_CEILING_LEVELS,
+  git_read: GENERIC_CEILING_LEVELS,
+  git_write: GENERIC_CEILING_LEVELS,
+  filesystem: GENERIC_CEILING_LEVELS,
+  network: GENERIC_CEILING_LEVELS,
+  system: GENERIC_CEILING_LEVELS,
+  execution: GENERIC_CEILING_LEVELS,
+  mcp: GENERIC_CEILING_LEVELS,
+  container: CONTAINER_CEILING,
+  host_bash: HOST_BASH_CEILING_LEVELS,
+}
+
+export function containerCeilingEnabled(value) {
+  return value === true || value === 'write'
+}
+
+function firstEnabledLevel(options) {
+  return (Array.isArray(options) && options.find((level) => level !== 'banned')) || 'read'
 }
 
 function PermissionsResourcesTab({
@@ -89,11 +117,13 @@ function PermissionsResourcesTab({
       <div className="wdp-section-title">Resource permissions</div>
       {catalog.map((entry) => {
         const name = entry.name
-        const grains = Array.isArray(entry.permission_grain_set)
-          ? entry.permission_grain_set
-          : []
+        const options = WORKSPACE_CEILING_OPTIONS[name]
+        const booleanCeiling = options === CONTAINER_CEILING
+        const noCeilingControl = options === undefined
         const current = localPermissions?.[name] ?? 'banned'
-        const disabled = current === 'banned'
+        const enabled = booleanCeiling
+          ? containerCeilingEnabled(current)
+          : current !== 'banned'
         return (
           <div className="wdp-resource-card" key={name}>
             <div className="wdp-resource-header">
@@ -101,45 +131,70 @@ function PermissionsResourcesTab({
               <span className="wdp-badge wdp-context-badge">
                 {entry.default_execution_context || 'unknown context'}
               </span>
-              <span
-                className={
-                  disabled ? 'wdp-badge wdp-badge-disabled' : 'wdp-badge wdp-badge-enabled'
-                }
-              >
-                {disabled ? 'Disabled' : 'Enabled'}
-              </span>
+              {noCeilingControl ? (
+                <span className="wdp-badge wdp-context-badge">Not permission-gated</span>
+              ) : (
+                <span
+                  className={
+                    enabled ? 'wdp-badge wdp-badge-enabled' : 'wdp-badge wdp-badge-disabled'
+                  }
+                >
+                  {enabled ? 'Enabled' : 'Disabled'}
+                </span>
+              )}
             </div>
             <div className="wdp-resource-desc">
               {entry.description || 'No description provided.'}
             </div>
             <div className="wdp-resource-controls">
-              <label className="wdp-perm-label">
-                Permission
-                <select
-                  className="wdp-perm-select"
-                  value={current}
-                  onChange={(event) => onPermissionChange(name, event.target.value)}
-                >
-                  {grains.map((grain) => (
-                    <option key={grain} value={grain}>
-                      {grain}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <button
-                type="button"
-                className={'wdp-toggle' + (disabled ? '' : ' wdp-toggle-on')}
-                onClick={() =>
-                  onPermissionChange(name, disabled ? firstEnabledGrain(entry) : 'banned')
-                }
-                role="switch"
-                aria-checked={!disabled}
-                aria-label={'Toggle ' + (entry.display_name || name)}
-              >
-                <span className="wdp-toggle-knob" />
-              </button>
-              <span className="wdp-toggle-state">{disabled ? 'Off' : 'On'}</span>
+              {booleanCeiling ? (
+                <React.Fragment>
+                  <label className="wdp-perm-label">Permission</label>
+                  <button
+                    type="button"
+                    className={'wdp-toggle' + (enabled ? ' wdp-toggle-on' : '')}
+                    onClick={() => onPermissionChange(name, !enabled)}
+                    role="switch"
+                    aria-checked={enabled}
+                    aria-label={'Toggle ' + (entry.display_name || name)}
+                  >
+                    <span className="wdp-toggle-knob" />
+                  </button>
+                  <span className="wdp-toggle-state">{enabled ? 'On' : 'Off'}</span>
+                </React.Fragment>
+              ) : noCeilingControl ? (
+                <span className="wdp-tools-none">No ceiling control.</span>
+              ) : (
+                <React.Fragment>
+                  <label className="wdp-perm-label">
+                    Permission
+                    <select
+                      className="wdp-perm-select"
+                      value={current}
+                      onChange={(event) => onPermissionChange(name, event.target.value)}
+                    >
+                      {options.map((level) => (
+                        <option key={level} value={level}>
+                          {level}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <button
+                    type="button"
+                    className={'wdp-toggle' + (enabled ? ' wdp-toggle-on' : '')}
+                    onClick={() =>
+                      onPermissionChange(name, enabled ? 'banned' : firstEnabledLevel(options))
+                    }
+                    role="switch"
+                    aria-checked={enabled}
+                    aria-label={'Toggle ' + (entry.display_name || name)}
+                  >
+                    <span className="wdp-toggle-knob" />
+                  </button>
+                  <span className="wdp-toggle-state">{enabled ? 'On' : 'Off'}</span>
+                </React.Fragment>
+              )}
             </div>
             <div className="wdp-tools-list">
               <span className="wdp-tools-label">Tools:</span>

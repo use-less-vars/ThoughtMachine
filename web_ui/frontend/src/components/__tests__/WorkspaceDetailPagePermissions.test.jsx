@@ -104,12 +104,16 @@ function makeSummary(overrides = {}) {
     root_path: '~/workspaces/ws-test-1',
     allow_host_resources: false,
     permissions: {
-      git: 'read',
-      filesystem: 'read',
-      container: 'banned',
+      git_read: 'read',
+      git_write: 'ask',
       host_bash: 'banned',
-      tty: 'read',
-      jtag: 'banned',
+      container: 'ask',
+      network: 'ask',
+      filesystem: 'read',
+      system: 'read',
+      git: 'read',
+      execution: 'banned',
+      mcp: 'banned',
     },
     resource_catalog: CATALOG,
     active_sessions: [],
@@ -163,19 +167,55 @@ afterEach(() => {
 })
 
 describe('WorkspaceDetailPage \u2014 Permissions & Resources', () => {
-  it('renders every resource card with its current permission level', async () => {
+  it('renders every resource card with the correct per-resource ceiling control', async () => {
     await renderPermissionsTab()
     expect(document.querySelectorAll('.wdp-resource-card').length).toBe(6)
+    // Generic resources: dropdown over banned|ask|read|write.
     expect(cardFor('Git').getByRole('combobox')).toHaveValue('read')
+    expect(
+      Array.from(cardFor('Git').getByRole('combobox').options).map((o) => o.value)
+    ).toEqual(['banned', 'ask', 'read', 'write'])
     expect(cardFor('Filesystem').getByRole('combobox')).toHaveValue('read')
-    expect(cardFor('Container').getByRole('combobox')).toHaveValue('banned')
+    // host_bash: dropdown over banned|ask|allow (never read/write).
     expect(cardFor('Host bash').getByRole('combobox')).toHaveValue('banned')
-    expect(cardFor('TTY').getByRole('combobox')).toHaveValue('read')
-    expect(cardFor('JTAG').getByRole('combobox')).toHaveValue('banned')
-    // Banned resources render as Disabled with an Off switch.
+    expect(
+      Array.from(cardFor('Host bash').getByRole('combobox').options).map((o) => o.value)
+    ).toEqual(['banned', 'ask', 'allow'])
+    // Container: a real boolean toggle, not a string dropdown.
+    expect(cardFor('Container').queryByRole('combobox')).toBeNull()
+    expect(cardFor('Container').getByRole('switch', { name: 'Toggle Container' })).toHaveAttribute(
+      'aria-checked',
+      'false'
+    )
+    // tty/jtag exist in the raw catalog but are not permission-gated resources.
+    expect(cardFor('TTY').queryByRole('combobox')).toBeNull()
+    expect(cardFor('TTY').getByText('Not permission-gated')).toBeInTheDocument()
+    expect(cardFor('JTAG').queryByRole('combobox')).toBeNull()
+    expect(cardFor('JTAG').getByText('Not permission-gated')).toBeInTheDocument()
+    // Banned/off resources render as Disabled with an Off switch.
     expect(cardFor('Container').getByText('Disabled')).toBeInTheDocument()
     expect(cardFor('Container').getByText('Off')).toBeInTheDocument()
     expect(cardFor('Git').getByText('Enabled')).toBeInTheDocument()
+  })
+
+  it('persists the container ceiling as a real boolean', async () => {
+    const { putCalls } = await renderPermissionsTab()
+    const containerToggle = cardFor('Container').getByRole('switch', {
+      name: 'Toggle Container',
+    })
+    expect(containerToggle).toHaveAttribute('aria-checked', 'false')
+    fireEvent.click(containerToggle)
+    expect(containerToggle).toHaveAttribute('aria-checked', 'true')
+    expect(screen.getByText('Unsaved changes')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Apply Permissions' }))
+    await screen.findAllByText('Permissions updated')
+    expect(putCalls.length).toBe(1)
+    // The container ceiling leaves the editor as a real boolean, never a
+    // 'banned'/'ask' string (the preset value this fixture starts from).
+    expect(putCalls[0].permissions).toEqual({
+      ...makeSummary().permissions,
+      container: true,
+    })
   })
 
   it('renders tools as chips and none for empty tool lists', async () => {

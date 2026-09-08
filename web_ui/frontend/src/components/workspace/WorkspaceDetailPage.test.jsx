@@ -68,12 +68,16 @@ function makeSummary(overrides = {}) {
     root_path: '/home/jojo/workspaces/research',
     allow_host_resources: false,
     permissions: {
-      git: 'read',
-      filesystem: 'read',
-      container: 'ask',
+      git_read: 'read',
+      git_write: 'ask',
       host_bash: 'banned',
-      tty: 'banned',
-      jtag: 'banned',
+      container: 'ask',
+      network: 'ask',
+      filesystem: 'read',
+      system: 'read',
+      git: 'read',
+      execution: 'banned',
+      mcp: 'banned',
     },
     capabilities: ['docker', 'network'],
     dockerfile: {
@@ -346,6 +350,25 @@ describe('WorkspaceDetailPage', () => {
     // Changing a dropdown marks pending state.
     const selects = screen.getAllByRole('combobox')
     expect(selects).toHaveLength(3)
+    // Each select offers exactly the vocabulary the backend validator accepts:
+    // generic banned|ask|read|write, and banned|ask|allow for host_bash.
+    expect(Array.from(selects[0].options).map((o) => o.value)).toEqual([
+      'banned',
+      'ask',
+      'read',
+      'write',
+    ])
+    expect(Array.from(selects[1].options).map((o) => o.value)).toEqual([
+      'banned',
+      'ask',
+      'read',
+      'write',
+    ])
+    expect(Array.from(selects[2].options).map((o) => o.value)).toEqual([
+      'banned',
+      'ask',
+      'allow',
+    ])
     fireEvent.change(selects[0], { target: { value: 'write' } })
     expect(screen.getByText('Unsaved changes')).toBeInTheDocument()
 
@@ -359,12 +382,16 @@ describe('WorkspaceDetailPage', () => {
     // permission edit omits it (the backend treats an absent key as unchanged).
     expect(putBodies[0]).toEqual({
       permissions: {
-        git: 'write',
-        filesystem: 'read',
-        container: 'ask',
+        git_read: 'read',
+        git_write: 'ask',
         host_bash: 'banned',
-        tty: 'banned',
-        jtag: 'banned',
+        container: 'ask',
+        network: 'ask',
+        filesystem: 'read',
+        system: 'read',
+        git: 'write',
+        execution: 'banned',
+        mcp: 'banned',
       },
     })
 
