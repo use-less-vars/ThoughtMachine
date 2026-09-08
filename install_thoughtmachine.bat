@@ -72,52 +72,47 @@ set PYTHON_CMD=
 set PYTHON_VER=
 set PYTHON_OK=0
 
-REM Try py launcher first, then python, then python3
-py -c "import sys;exit(0 if (3,11)<=sys.version_info[:2] else 1)" >nul 2>&1
-if not errorlevel 1 (
-    set PYTHON_CMD=py
-    set PYTHON_OK=1
-)
+REM Try py launcher first, then python, then python3. Every probe below is a
+REM single top-level line: cmd.exe mis-parses parentheses inside multi-line IF
+REM blocks, so this section deliberately uses NO parenthesized blocks at all.
+REM GOTO/labels replace the nested IF/ELSE structure that crashed cmd.exe here.
+py --version >nul 2>&1
+if not errorlevel 1 set PYTHON_CMD=py
+if not defined PYTHON_CMD python --version >nul 2>&1
+if not defined PYTHON_CMD if not errorlevel 1 set PYTHON_CMD=python
+if not defined PYTHON_CMD python3 --version >nul 2>&1
+if not defined PYTHON_CMD if not errorlevel 1 set PYTHON_CMD=python3
 
-if not defined PYTHON_CMD (
-    python -c "import sys;exit(0 if (3,11)<=sys.version_info[:2] else 1)" >nul 2>&1
-    if not errorlevel 1 (
-        set PYTHON_CMD=python
-        set PYTHON_OK=1
-    )
-)
+if not defined PYTHON_CMD goto :python_missing
 
-if not defined PYTHON_CMD (
-    python3 -c "import sys;exit(0 if (3,11)<=sys.version_info[:2] else 1)" >nul 2>&1
-    if not errorlevel 1 (
-        set PYTHON_CMD=python3
-        set PYTHON_OK=1
-    )
-)
+REM Capture the version banner for display, e.g. "Python 3.13.2"
+%PYTHON_CMD% --version > "%TEMP%\tm_pyver.txt" 2>&1
+set /p PYTHON_VER=<"%TEMP%\tm_pyver.txt"
+del "%TEMP%\tm_pyver.txt" 2>nul
 
-REM Get version string for display
-if defined PYTHON_CMD (
-    %PYTHON_CMD% --version > "%TEMP%\tm_pyver.txt" 2>&1
-    set /p PYTHON_VER=<"%TEMP%\tm_pyver.txt"
-    del "%TEMP%\tm_pyver.txt" 2>nul
-)
+REM Gate: need Python 3.11 or newer; 3.14 is the newest supported line
+%PYTHON_CMD% -c "import sys;exit(0 if (3,11)<=sys.version_info[:2] else 1)" >nul 2>&1
+if not errorlevel 1 goto :python_ok
 
-if !PYTHON_OK!==1 (
-    echo   [+] !PYTHON_CMD! -- version !PYTHON_VER!
-    REM Warn on very new (3.15+) interpreters: usually fine, but wheels may lag.
-    !PYTHON_CMD! -c "import sys;sys.exit(0 if sys.version_info[:2]>=(3,15) else 1)" >nul 2>&1
-    if not errorlevel 1 (
-        echo   [!] Python !PYTHON_VER! is very new (3.15+). If pip install fails,
-        echo       install Python 3.14 or 3.13 and re-run this installer.
-    )
-) else (
-    if defined PYTHON_VER (
-        echo   [x] Python !PYTHON_VER! found but not supported.
-        echo       Need Python 3.11 or newer (3.14 supported).
-    ) else (
-        echo   [x] Python not found.
-    )
-)
+echo   [x] Python %PYTHON_VER% found but not supported.
+echo       Need Python 3.11 or newer ^(3.14 supported^).
+goto :python_done
+
+:python_missing
+echo   [x] Python not found.
+echo       Install Python 3.11+ from https://www.python.org/downloads/ and re-run.
+goto :python_done
+
+:python_ok
+set PYTHON_OK=1
+echo   [+] %PYTHON_CMD% -- version %PYTHON_VER%
+
+REM Very new interpreters (3.15+) usually work, but wheels may lag behind.
+%PYTHON_CMD% -c "import sys;sys.exit(0 if sys.version_info[:2]>=(3,15) else 1)" >nul 2>&1
+if not errorlevel 1 echo   [!] Python %PYTHON_VER% is very new ^(3.15+^). If pip install fails,
+if not errorlevel 1 echo       install Python 3.14 or 3.13 and re-run this installer.
+
+:python_done
 
 echo(
 echo   --- Node.js ---
