@@ -298,6 +298,13 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
     setApplyError(null);
     setProviderVersion(0);
 
+    // Permission edits are persisted by the REST PUT below — immediate and
+    // independent of the WebSocket apply_config pipeline (which may be queued
+    // while the controller is busy).  When the ONLY pending change is the
+    // permissions tab, finish right after the PUT and skip apply_config so the
+    // save is never deferred behind the busy-queue ('Queued — applying…').
+    const permissionsOnlyApply = Boolean(sessionPerms) && permsDirty && !isDirty && providerVersion === 0;
+
     if (sessionId && sessionPerms) {
       try {
         // PUT only canonical session-permission keys — legacy frontend keys
@@ -322,20 +329,31 @@ function ConfigPanel({ mode = null, config, sendCommand, providers, availableToo
           throw new Error(message);
         }
         const data = await res.json();
-        const raw = data && typeof data.raw === 'object' && data.raw !== null ? data.raw : {};
-        // Adopt the server's canonical response; lastAppliedRaw refresh clears permsDirty.
-        setSessionPerms({
-          raw,
-          effective: data && typeof data.effective === 'object' && data.effective !== null ? data.effective : (sessionPerms.effective ?? null),
+        // Applied baseline = exactly what we PUT (canonical values the backend
+        // persists unchanged). Do NOT copy the echo over sessionPerms.raw: the
+        // user may have edited the tab again while the PUT was in flight, and
+        // those newer edits must survive (stay dirty until the next Apply)
+        // instead of being silently swallowed by echo adoption.
+        setSessionPerms((prev) => ({
+          ...prev,
+          effective: data && typeof data.effective === 'object' && data.effective !== null ? data.effective : (prev?.effective ?? null),
           resolved_at: data?.resolved_at ?? null,
-        });
-        setLastAppliedRaw(raw);
+        }));
+        setLastAppliedRaw(payload);
       } catch (err) {
         // PUT failed: surface the error, re-enable Apply, DO NOT touch apply_config.
         setIsApplying(false);
         setApplyError(`Failed to save permissions: ${err.message}`);
         return;
       }
+    }
+
+    if (permissionsOnlyApply) {
+      // The PUT already applied the permission edits and refreshed
+      // lastAppliedRaw (clearing permsDirty).  Nothing config-level changed, so
+      // there is nothing to queue behind the controller — re-enable Apply now.
+      setIsApplying(false);
+      return;
     }
 
     // Strip session_permissions defensively (stale store drafts may still hold

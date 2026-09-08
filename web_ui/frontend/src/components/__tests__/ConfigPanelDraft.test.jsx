@@ -206,28 +206,143 @@ describe('ConfigPanel draft persistence (disk-pure permissions flow)', () => {
     expect(screen.queryByText('Unsaved changes')).not.toBeInTheDocument()
   })
 
-  it('PUTs the raw profile to the session endpoint on Apply, then applies config without session_permissions', async () => {
+  it('applies a permission-only change immediately via the session PUT — no apply_config, never queued', async () => {
     const fetchMock = globalThis.fetch
-    const { sendCommand, rerender } = renderPanel()
+    const { sendCommand } = renderPanel()
     const select = await openPermissionsTabLoaded()
     fireEvent.change(select, { target: { value: 'ask' } })
+    expect(screen.getByText('Unsaved permission changes')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
 
-    await waitFor(() => {
-      expect(sendCommand).toHaveBeenCalledWith('apply_config', expect.anything())
-    })
+    // The permission path must never surface the queued state: no apply_config
+    // is sent, so no config_queued ACK can ever arrive — assert the absence of
+    // the 'Queued — applying when idle…' indicator explicitly (requirement b).
+    expect(screen.queryByText('Queued — applying when idle…')).not.toBeInTheDocument()
+
+    // The permission-only apply completes on the PUT success ALONE: Apply
+    // re-enables without any config_changed echo (and thus without ever being
+    // deferred as 'Queued — applying when idle…' behind a busy controller).
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Apply' })).toBeEnabled())
+
+    // Immediate-success feedback — Apply re-enabled on PUT success alone,
+    // nothing queued, no stuck 'Applying…' state lingers.
+    expect(screen.queryByText('Queued — applying when idle…')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Applying…' })).not.toBeInTheDocument()
+
     // The PUT carried the full edited raw map...
     const putCall = fetchMock.mock.calls.find(
       ([url, opts]) => String(url).includes('/api/session/s1/permissions') && opts && opts.method === 'PUT'
     )
     expect(putCall).toBeTruthy()
     expect(JSON.parse(putCall[1].body)).toEqual({ ...RAW_PROFILE, network: 'ask' })
-    // ...and apply_config is permission-free.
+
+    // ...and that is the WHOLE apply: no config-level change is pending, so
+    // apply_config is never sent — the save is immediate (REST) and can never
+    // enter the apply_config busy-queue.
+    expect(sendCommand).not.toHaveBeenCalled()
+    expect(sendCommand).not.toHaveBeenCalledWith('apply_config', expect.anything())
+
+    // The PUT echo became the applied baseline: dirty labels cleared, Network
+    // shows the persisted value, no draft was created (permissions never live
+    // in the draft).
+    expect(screen.queryByText('Unsaved permission changes')).not.toBeInTheDocument()
+    expect(screen.queryByText('Unsaved changes')).not.toBeInTheDocument()
+    expect(select.value).toBe('ask')
+    expect(useStore.getState().sessionDrafts['s1']).toBeUndefined()
+  })
+
+  it('applies rapid successive permission changes sequentially via the session PUT — no dropped edits', async () => {
+    const { sendCommand } = renderPanel()
+    const select = await openPermissionsTabLoaded()
+    // Deferred PUT stub: every session-permission PUT resolves only when this
+    // test resolves it, so request order/bodies are asserted exactly.
+    const pendingPuts = []
+    const deferredFetch = vi.fn(async (url, options) => {
+      const s = String(url)
+      if (s.includes('/api/session/s1/permissions') && options && options.method === 'PUT') {
+        return new Promise((resolve) => pendingPuts.push({ resolve, body: JSON.parse(options.body) }))
+      }
+      const key = Object.keys(DEFAULT_ROUTES).filter((k) => s.includes(k)).sort((a, b) => b.length - a.length)[0]
+      return DEFAULT_ROUTES[key] || DEFAULT_FALLBACK
+    })
+    vi.stubGlobal('fetch', deferredFetch)
+    // Edit 1 (banned → ask) + Apply → PUT #1 is in flight with the FIRST value.
+    fireEvent.change(select, { target: { value: 'ask' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    await waitFor(() => expect(pendingPuts).toHaveLength(1))
+    expect(pendingPuts[0].body).toEqual({ ...RAW_PROFILE, network: 'ask' })
+    // Mid-flight the panel shows the plain applying state — never the queued
+    // indicator (no apply_config was sent, so no config_queued ACK can come).
+    expect(screen.getByRole('button', { name: 'Applying…' })).toBeDisabled()
+    expect(screen.queryByText('Queued — applying when idle…')).not.toBeInTheDocument()
+    // Edit 2 lands while PUT #1 is still pending (permission selects stay
+    // editable mid-flight). 'outbound' is a valid network level distinct from
+    // the persisted 'ask' (and from the 'write' display-only fallback).
+    fireEvent.change(select, { target: { value: 'outbound' } })
+    expect(select.value).toBe('outbound')
+    // Resolve PUT #1 (server persisted 'ask') — the newer 'outbound' edit must
+    // NOT be swallowed by the echo: the tab stays on 'outbound' and dirty.
+    await act(async () => {
+      pendingPuts[0].resolve(jsonOk(PERMISSIONS_RESPONSE({ ...RAW_PROFILE, network: 'ask' })))
+    })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Apply' })).toBeEnabled())
+    expect(select.value).toBe('outbound')
+    expect(screen.getByText('Unsaved permission changes')).toBeInTheDocument()
+    expect(screen.queryByText('Queued — applying when idle…')).not.toBeInTheDocument()
+    // Clicking Apply again sends PUT #2 with the SECOND value (full map).
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    await waitFor(() => expect(pendingPuts).toHaveLength(2))
+    expect(pendingPuts[1].body).toEqual({ ...RAW_PROFILE, network: 'outbound' })
+    // Resolving PUT #2 leaves the panel clean and matching the last edit.
+    await act(async () => {
+      pendingPuts[1].resolve(jsonOk(PERMISSIONS_RESPONSE({ ...RAW_PROFILE, network: 'outbound' })))
+    })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Apply' })).toBeEnabled())
+    expect(select.value).toBe('outbound')
+    expect(screen.queryByText('Unsaved permission changes')).not.toBeInTheDocument()
+    // Sequential REST applies only — nothing ever routed to the busy-queue.
+    expect(sendCommand).not.toHaveBeenCalled()
+    expect(sendCommand).not.toHaveBeenCalledWith('apply_config', expect.anything())
+  })
+
+  it('PUTs permission edits immediately AND sends a permission-free apply_config when config edits are also pending', async () => {
+    const fetchMock = globalThis.fetch
+    const { sendCommand, container, rerender } = renderPanel()
+    // Permission edit — Permissions tab.
+    const select = await openPermissionsTabLoaded()
+    fireEvent.change(select, { target: { value: 'ask' } })
+    expect(screen.getByText('Unsaved permission changes')).toBeInTheDocument()
+
+    // Config edit — General tab (draft in the store; permissions NOT in it).
+    fireEvent.click(screen.getByRole('button', { name: 'General' }))
+    const temperature = container.querySelector('input[type="range"]')
+    expect(temperature.value).toBe('0.7')
+    fireEvent.change(temperature, { target: { value: '0.9' } })
+    expect(screen.getByText('Unsaved changes')).toBeInTheDocument()
+    expect(useStore.getState().sessionDrafts['s1'].temperature).toBe(0.9)
+    expect(useStore.getState().sessionDrafts['s1'].session_permissions).toBeUndefined()
+
+    // With config edits pending the apply still routes through apply_config
+    // (only a PERMISSION-ONLY apply skips it) — but the permission PUT fires
+    // first and lands immediately regardless of the controller's busy state.
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    await waitFor(() => {
+      expect(sendCommand).toHaveBeenCalledWith('apply_config', expect.anything())
+    })
+
+    const putCall = fetchMock.mock.calls.find(
+      ([url, opts]) => String(url).includes('/api/session/s1/permissions') && opts && opts.method === 'PUT'
+    )
+    expect(putCall).toBeTruthy()
+    expect(JSON.parse(putCall[1].body)).toEqual({ ...RAW_PROFILE, network: 'ask' })
+
+    // apply_config carries the config draft only — never session_permissions.
     expect(sendCommand).toHaveBeenCalledWith('apply_config', {
       config: expect.not.objectContaining({ session_permissions: expect.anything() }),
     })
     const applyCall = sendCommand.mock.calls.find(([cmd]) => cmd === 'apply_config')
     expect(applyCall[1].config.mode).toBe('custom')
+    expect(applyCall[1].config.temperature).toBe(0.9)
 
     // Backend echoes the applied config; SessionTab then re-renders ConfigPanel
     // with the new config prop — the pending draft is dropped on success.
@@ -241,13 +356,14 @@ describe('ConfigPanel draft persistence (disk-pure permissions flow)', () => {
     await waitFor(() => {
       expect(useStore.getState().sessionDrafts['s1']).toBeUndefined()
     })
-    expect(screen.queryByText('Unsaved permission changes')).not.toBeInTheDocument()
     expect(screen.queryByText('Unsaved changes')).not.toBeInTheDocument()
-    // The PUT echo became the applied baseline: Network shows the persisted
-    // value and Apply is re-enabled.
-    const selectAfter = screen.getByText('Network').closest('div').querySelector('select')
-    expect(selectAfter.value).toBe('ask')
     expect(screen.getByRole('button', { name: 'Apply' })).toBeEnabled()
+
+    // The permission PUT echo became the applied baseline for the tab.
+    fireEvent.click(screen.getByRole('button', { name: 'Permissions' }))
+    const selectAfter = screen.getByText('Network').closest('div').querySelector('select')
+    await waitFor(() => expect(selectAfter.value).toBe('ask'))
+    expect(screen.queryByText('Unsaved permission changes')).not.toBeInTheDocument()
   })
 
   it('surfaces a failed permissions PUT (422) and aborts apply_config — Apply re-enabled, no draft write, edit stays dirty', async () => {
