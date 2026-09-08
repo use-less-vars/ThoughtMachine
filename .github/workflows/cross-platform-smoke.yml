@@ -115,17 +115,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Regression guard for LF-only .bat files: cmd.exe REQUIRES CRLF line
-      # endings (an LF-only install_thoughtmachine.bat mis-parses multi-line
-      # blocks and crashed with '".' is not recognized as an internal or
-      # external command' / 'kann syntaktisch an dieser Stelle nicht
-      # verarbeitet werden' on the first parenthesized block). With every
-      # Python removed from PATH the installer must abort CLEANLY (exit 1 +
-      # '[x] Python not found.') and never reach venv creation.
+      # Windows-user bug guard - REAL cause (LF/CRLF theory overturned):
+      # cmd.exe deterministically mis-parses parenthesized content (REM
+      # comment text with parens, quoted python -c one-liners with parens)
+      # INSIDE multi-line IF blocks: '". was unexpected at this time.' /
+      # 'kann syntaktisch an dieser Stelle nicht verarbeitet werden' right
+      # after the '--- Python ---' banner. Line endings were NOT the bug:
+      # the .bat already reached Windows as CRLF (blob LF, but checkout and
+      # GitHub ZIP both deliver CRLF via .gitattributes 'text eol=crlf',
+      # 17518d5). The installer rewrite (a9ee26e) removed every
+      # parens-inside-block in the Python check. With all Python removed
+      # from PATH the installer must still abort CLEANLY (exit 1 + '[x]
+      # Python not found.') and never reach venv creation.
       - name: install_thoughtmachine.bat aborts cleanly without Python
         run: |
           $env:Path = ($env:Path -split ';' | Where-Object { $_ -notmatch 'Python' }) -join ';'
-          $out = & cmd.exe /c "install_thoughtmachine.bat <nul" 2>&1 | Out-String
+          # 2>&1 must stay INSIDE the cmd /c string: cmd then merges its own
+          # stderr into stdout before PowerShell sees it (avoids
+          # NativeCommandError noise corrupting the captured output).
+          $out = & cmd.exe /c "install_thoughtmachine.bat <nul 2>&1" | Out-String
           $rc = $LASTEXITCODE
           Write-Output "install_thoughtmachine.bat (no Python) exit code: $rc"
           Write-Output "----- output -----"
@@ -141,11 +149,17 @@ jobs:
             $failed = $true
           }
           if ($out -match 'unexpected at this time|syntaktisch|Creating virtual environment') {
-            Write-Output "::error::LF-only .bat regression: cmd mis-parsed the script or install proceeded without Python"
+            Write-Output "::error::cmd mis-parsed the .bat or install proceeded without Python"
             $failed = $true
           }
-          if ($failed) { exit 1 }
+          if ($failed) {
+            Write-Output "::error::windows-smoke guard failed - see install output above"
+            exit 1
+          }
           Write-Output "OK: cmd.exe parsed the .bat and aborted on missing Python (exit 1)"
+          # Explicit exit 0: cmd.exe legitimately returned 1; never let a
+          # stale $LASTEXITCODE fail the step after the assertions passed.
+          exit 0
 
       # Python 3.14: the newest supported release line (the installers accept
       # 3.11+ with no ceiling). This job proves the full Windows stack - venv
