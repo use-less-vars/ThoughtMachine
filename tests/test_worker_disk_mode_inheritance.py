@@ -215,7 +215,7 @@ class TestWorkerDiskPureGate:
             workspace_id=WORKSPACE,
         )
         assert result["result"] != "FS OK"
-        assert "no interactive user available" in result["result"], result["result"]
+        assert "ask requires interactive approval; not available in worker context" in result["result"], result["result"]
         assert bus.published == [], "worker ask must never publish a prompt event"
 
     def test_worker_disk_read_caps_write_tool(

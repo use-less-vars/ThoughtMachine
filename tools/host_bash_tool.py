@@ -246,6 +246,15 @@ class HostBashTool(ToolBase):
                 grain,
             )
         if grain == "ask":
+            if self.is_worker_context:
+                # Worker context: no interactive operator exists to answer a
+                # SecurityPromptEvent, so asking would strand the request or
+                # leak it to a main-session operator prompt.  Deny in-tool
+                # with the same standardized worker-ask message the outer
+                # gate uses for category-gated tools.
+                msg = "host_bash: ask requires interactive approval; not available in worker context"
+                self._audit_log("deny", msg, cmd)
+                return denied_json(msg, grain)
             decision = self._request_approval(cmd)
             if decision == "denied":
                 self._audit_log("deny", "host_bash: command rejected by user", cmd)

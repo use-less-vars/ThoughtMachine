@@ -38,6 +38,7 @@ def make_tool(
     create_session_cfg=True,
     audit_log_path=None,
     log_dir=None,
+    is_worker_context=False,
 ):
     """Build a HostBashTool wired to tmp_path vault fixtures + audit log.
 
@@ -73,6 +74,7 @@ def make_tool(
         session_id=session_id,
         workspace_path=None,
         audit_log_path=audit_log_path,
+        is_worker_context=is_worker_context,
     )
 
 
@@ -253,6 +255,45 @@ def test_host_bash_allow_executes_without_approval(tmp_path, monkeypatch):
     assert result["permission_level"] == "allow"
     mock_subprocess.run.assert_called_once()
     assert mock_subprocess.run.call_args.kwargs["shell"] is True
+
+
+def test_host_bash_worker_context_ask_denied_without_approval(tmp_path, monkeypatch):
+    """Worker context + ask grain: denied in-tool, no approval prompt, no subprocess."""
+    msg = "host_bash: ask requires interactive approval; not available in worker context"
+    with mock.patch.object(
+        HostBashTool,
+        "_request_approval",
+        side_effect=AssertionError("approval must not be requested in worker context"),
+    ):
+        with mock.patch("tools.host_bash_tool.subprocess") as mock_subprocess:
+            tool = make_tool(tmp_path, monkeypatch, grain="ask", is_worker_context=True)
+            result = json.loads(tool.execute())
+    assert result["success"] is False
+    assert result["outcome"] == "denied"
+    assert result["permission_level"] == "ask"
+    assert msg in result["error"]
+    mock_subprocess.run.assert_not_called()
+    records = read_audit(tmp_path)
+    assert len(records) == 1
+    assert records[0]["outcome"] == "deny"
+    assert records[0]["reason"] == msg
+
+
+def test_host_bash_worker_context_allow_still_executes(tmp_path, monkeypatch):
+    """Worker context does not restrict an 'allow' grain: execution proceeds."""
+    with mock.patch.object(
+        HostBashTool,
+        "_request_approval",
+        side_effect=AssertionError("approval must not be requested in allow mode"),
+    ):
+        with mock.patch("tools.host_bash_tool.subprocess") as mock_subprocess:
+            mock_subprocess.run.return_value = SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+            tool = make_tool(tmp_path, monkeypatch, grain="allow", is_worker_context=True)
+            result = json.loads(tool.execute())
+    assert result["success"] is True
+    assert result["outcome"] == "executed"
+    assert result["permission_level"] == "allow"
+    mock_subprocess.run.assert_called_once()
 
 
 def test_host_bash_ask_approval_via_resolve(tmp_path, monkeypatch):

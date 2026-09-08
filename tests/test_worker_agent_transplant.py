@@ -862,10 +862,10 @@ class TestGateDenialInstant:
                 f"Expected gate denial message in tool result, got: {result_content}"
             )
 
-            # Should mention 'no interactive user available' (the NullEventBus message)
-            # or a similar denial explanation
+            # Should mention 'ask requires interactive approval' (the
+            # NullEventBus message) or a similar denial explanation
             denial_phrases = [
-                "no interactive user",
+                "ask requires interactive approval",
                 "permission denied",
                 "filesystem:write",
             ]

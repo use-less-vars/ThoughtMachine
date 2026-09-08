@@ -859,7 +859,7 @@ def check_required_categories(
     if event_bus is None or is_worker_context or isinstance(event_bus, NullEventBus):
         return False, (
             f"Permission denied: {', '.join(ask_categories)} required by "
-            f"'{tool_name}' — no interactive user available for worker prompt approval."
+            f"'{tool_name}' — ask requires interactive approval; not available in worker context."
         )
 
     # ── Prompt the user for approval ────────────────────────────────────

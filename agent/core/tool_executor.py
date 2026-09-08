@@ -317,7 +317,7 @@ class ToolExecutor:
             except ValidationError as e:
                 # Provide LLM-friendly error with valid field names
                 try:
-                    infra_fields = {"workspace_path", "token_limit", "is_docker", "container_workspace_path", "tool", "agent_config", "session_permissions", "session_id"}
+                    infra_fields = {"workspace_path", "token_limit", "is_docker", "container_workspace_path", "tool", "agent_config", "session_permissions", "session_id", "is_worker_context"}
                     valid_fields = [f for f in valid_field_names if f not in infra_fields]
                     valid_fields_str = ', '.join(valid_fields)
                     return {'result': f'Invalid arguments: {e}\n\nValid fields: {valid_fields_str}', 'tool_type': 'normal'}
@@ -474,6 +474,13 @@ class ToolExecutor:
                 _worker_name = current_worker_name()
                 if _worker_name:
                     tool_args['worker_name'] = _worker_name
+
+            # Inject the worker-context flag unconditionally: tools that
+            # self-gate on the 'ask' grain (e.g. host_bash) must deny from a
+            # worker context instead of reaching an interactive approval
+            # prompt.  Worker executors pass is_worker_context=True; main-agent
+            # executors default to False and keep the interactive ask flow.
+            tool_args['is_worker_context'] = self._is_worker_context
 
             # Credential injection: resolve {{credential:...}} placeholders in tool args
             if tool_args:

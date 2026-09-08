@@ -129,7 +129,7 @@ class TestNullEventBusIntegration:
             f"NullEventBus prompt path took {elapsed:.3f}s "
             f"— should return instantly without blocking"
         )
-        assert "no interactive user available" in msg.lower(), (
+        assert "ask requires interactive approval; not available in worker context" in msg.lower(), (
             f"Message should explain why: {msg}"
         )
 
@@ -156,7 +156,7 @@ class TestNullEventBusIntegration:
             f"event_bus=None prompt path took {elapsed:.3f}s "
             f"— should return instantly without blocking"
         )
-        assert "no interactive user available" in msg.lower(), (
+        assert "ask requires interactive approval; not available in worker context" in msg.lower(), (
             f"Message should explain why: {msg}"
         )
 

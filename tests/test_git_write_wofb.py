@@ -13,7 +13,8 @@ Phase-3 contract under test:
   be resolved (fail closed).  Full ``write``/``full``/``ask`` grants are
   never branch-restricted by the tool.
 * A worker whose git level resolves to ``ask`` is auto-denied for
-  ``git:write`` (no interactive user available).
+  ``git:write`` (ask requires interactive approval; not available in
+  worker context).
 
 All git subprocess execution is mocked: no real git binary is required.
 """
@@ -176,4 +177,4 @@ def test_worker_ask_git_write_auto_denied():
         event_bus=None, is_worker_context=True,
     )
     assert denied is False
-    assert "no interactive user available" in deny_msg
+    assert "ask requires interactive approval; not available in worker context" in deny_msg
