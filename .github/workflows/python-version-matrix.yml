@@ -62,21 +62,14 @@ jobs:
       # docker/e2e tests need a real Docker daemon / Playwright browsers;
       # the plain unit + integration suite must pass on every supported line.
       #
-      # Deselected (pre-existing dev failures, NOT Python-3.14 regressions -
-      # reproduce identically on the 3.12 host baseline): the two vault-hook
-      # tests in tests/security/test_git_hardening.py pass container:False and
-      # rely on host-side git, but since the permission-simplification change
-      # host git is fail-closed without allow_host_resources: true in the
-      # <vault>/workspaces/<ws_id>/config.json the tests never create - so no
-      # bare runner can ever pass them. They belong to the agent-runtime
-      # container path / need test-side config seeding (dev-team triage).
-      # Keeping them deselected keeps this matrix job's 3.14 wheel-availability
-      # signal clean.
+      # The two vault-hook tests in tests/security/test_git_hardening.py were
+      # previously deselected because they failed the fail-closed host-git
+      # gate (no allow_host_resources in their workspace config). They now
+      # seed their own <vault>/workspaces/<ws_id>/config.json, so they run
+      # on every matrix line again.
       - name: Run unit tests
         run: >
           python -m pytest -m "not docker and not e2e" --timeout 600 -ra
-          --deselect tests/security/test_git_hardening.py::test_vault_pre_commit_hook_never_runs
-          --deselect tests/security/test_git_hardening.py::test_failing_vault_pre_commit_hook_does_not_abort
 
   installer-contract:
     name: Installer version-contract assertions

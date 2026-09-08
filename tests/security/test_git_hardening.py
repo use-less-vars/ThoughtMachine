@@ -22,6 +22,7 @@ NOTE: this suite intentionally never writes to the real $HOME. Any hostile
 .gitconfig is created inside tmp_path only (the tool overrides HOME itself,
 so even monkeypatched HOME values in this file are purely belt-and-braces).
 """
+import json
 import os
 import shutil
 import subprocess
@@ -294,13 +295,24 @@ def test_vault_pre_commit_hook_never_runs(tmp_path, monkeypatch):
     _run_git_clean(repo, "config", "user.email", "test@example.com")
 
     ws_id = "ws-vault-test"
-    hooks_dir = tmp_path / ".thoughtmachine" / "hooks" / ws_id
+    # Vault pinned via THOUGHTMACHINE_VAULT_ROOT (test-side harness only).
+    # Host-side git is fail-closed without allow_host_resources: true in
+    # <vault>/workspaces/<ws_id>/config.json, so seed it to keep the commit
+    # flowing through the hermetic host path this test exercises.
+    vault = tmp_path / ".thoughtmachine"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(vault))
+    ws_cfg_dir = vault / "workspaces" / ws_id
+    ws_cfg_dir.mkdir(parents=True)
+    (ws_cfg_dir / "config.json").write_text(
+        json.dumps({"allow_host_resources": True})
+    )
+    hooks_dir = vault / "hooks" / ws_id
     hooks_dir.mkdir(parents=True)
     hook = hooks_dir / "pre-commit"
     hook.write_text("#!/bin/sh\ntouch vault_marker.txt\n")
     # sh must READ the script file to interpret it, so hooks need read+exec.
     hook.chmod(0o755)
-    monkeypatch.setenv("HOME", str(tmp_path))
     vault_marker = repo / "vault_marker.txt"
 
     (repo / "hello.txt").write_text("hi\n")
@@ -329,13 +341,24 @@ def test_failing_vault_pre_commit_hook_does_not_abort(tmp_path, monkeypatch):
     _run_git_clean(repo, "config", "user.email", "test@example.com")
 
     ws_id = "ws-vault-fail"
-    hooks_dir = tmp_path / ".thoughtmachine" / "hooks" / ws_id
+    # Vault pinned via THOUGHTMACHINE_VAULT_ROOT (test-side harness only).
+    # Host-side git is fail-closed without allow_host_resources: true in
+    # <vault>/workspaces/<ws_id>/config.json, so seed it to keep the commit
+    # flowing through the hermetic host path this test exercises.
+    vault = tmp_path / ".thoughtmachine"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(vault))
+    ws_cfg_dir = vault / "workspaces" / ws_id
+    ws_cfg_dir.mkdir(parents=True)
+    (ws_cfg_dir / "config.json").write_text(
+        json.dumps({"allow_host_resources": True})
+    )
+    hooks_dir = vault / "hooks" / ws_id
     hooks_dir.mkdir(parents=True)
     hook = hooks_dir / "pre-commit"
     hook.write_text("#!/bin/sh\necho 'blocked by policy' >&2\nexit 1\n")
     # sh must READ the script file to interpret it, so hooks need read+exec.
     hook.chmod(0o755)
-    monkeypatch.setenv("HOME", str(tmp_path))
 
     (repo / "hello.txt").write_text("hi\n")
     _run_git_clean(repo, "add", "hello.txt")
