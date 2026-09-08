@@ -1,7 +1,8 @@
 # Windows batch files: cmd.exe REQUIRES CRLF line endings (LF-only .bat files
 # mis-parse multi-line if/for blocks -> "was unexpected at this time" crashes).
-# Marked -text so the CRLF bytes are stored AS-IS in the repo: every checkout,
-# ZIP export and file copy then delivers CRLF to cmd.exe, regardless of the
-# consumer's core.autocrlf setting.
-*.bat -text
-*.cmd -text
+# text eol=crlf normalizes checkins to LF in the repo and materializes CRLF on
+# every checkout, ZIP export and file copy, so future LF-only content edits can
+# never be delivered to cmd.exe without CRLF again (the a61f966 regression
+# class). The windows-smoke CI step is the behavioral guard for this.
+*.bat text eol=crlf
+*.cmd text eol=crlf
