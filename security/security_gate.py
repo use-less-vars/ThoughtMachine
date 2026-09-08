@@ -447,6 +447,177 @@ def split_git_permission(level: Any) -> tuple:
     return (False, False)
 
 
+class _CeilingAnnotatedDict(dict):
+    """Plain ``dict`` carrying workspace-ceiling provenance annotations.
+
+    Identical to a normal dict for equality, iteration, indexing, ``len``,
+    membership and JSON serialisation; it additionally carries a
+    ``_ceiling_annotations`` attribute mapping each effective-permission
+    category the workspace ceiling actually restricted to
+    ``{"pre": <pre-ceiling value>, "level": <ceiling level label>}``.
+    The attribute survives in-place mutation (the worker-footprint merge in
+    ``check_required_categories``) and injection into tool arguments, so a
+    denial can be attributed to the workspace ceiling without any signature
+    changes anywhere.
+    """
+
+    __slots__ = ("_ceiling_annotations",)
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._ceiling_annotations: Dict[str, Dict[str, Any]] = {}
+
+
+def _ceiling_level_label(value: Any) -> str:
+    """Render a raw workspace ceiling value as a stable message label."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value).lower()
+
+
+def _merge_with_capabilities(
+    session: SessionPermissions, workspace: WorkspaceCapabilities
+) -> Dict[str, Any]:
+    """Merge a session profile with workspace capabilities (no ceiling).
+
+    This is the capability-merge tail of :func:`get_effective_permissions`:
+    the filesystem_write / allow_network / allow_docker / git_available caps
+    applied on top of a session profile.  Kept as a helper so the same merge
+    can be run over the pre-ceiling and post-ceiling session profiles; the
+    diff between the two results isolates the categories the workspace
+    ceiling actually restricted.
+    """
+
+    # ── Filesystem ──────────────────────────────────────────────────────
+    # Workspace filesystem_write caps write access; if False, downgrade to read.
+    fs = session.filesystem
+    if not workspace.filesystem_write and fs == "write":
+        fs = "read"  # downgrade write → read
+    # (read / none / banned / ask pass through unchanged)
+
+    # ── Network ─────────────────────────────────────────────────────────
+    net: Any = _min_permission(session.network, workspace.allow_network)
+
+    # ── Container ───────────────────────────────────────────────────────
+    container: Any = session.container and workspace.allow_docker
+
+    # ── Git ─────────────────────────────────────────────────────────────
+    # Explicit session grains (git_read/git_write) take precedence over the
+    # single ``git`` level; each grain is still capped by the workspace
+    # capability.  When a grain is None it falls back to split_git_permission
+    # so legacy ``git``-only configs keep their exact historical behaviour.
+    git: Any = _min_permission(session.git, workspace.git_available)
+    if session.git_read is not None:
+        git_read: Any = _min_permission(session.git_read, workspace.git_available)
+    else:
+        git_read = split_git_permission(git)[0]
+    if session.git_write is not None:
+        git_write: Any = _min_permission(session.git_write, workspace.git_available)
+    else:
+        git_write = split_git_permission(git)[1]
+
+    # ── System ──────────────────────────────────────────────────────────
+    system: Any = session.system  # no workspace cap yet
+
+    return {
+        "filesystem": fs,
+        "network": net,
+        "container": container,
+        "git": git,
+        "git_read": git_read,
+        "git_write": git_write,
+        "system": system,
+        "mcp": session.mcp,
+        "execution": session.execution,
+        "host_bash": session.host_bash,
+    }
+
+
+def _annotate_ceiling_changes(
+    base_eff: Dict[str, Any],
+    capped_eff: Dict[str, Any],
+    workspace_permissions: Dict[str, Any],
+) -> Optional["_CeilingAnnotatedDict"]:
+    """Return an annotated copy of *capped_eff*, or ``None`` if no category
+    changed (or none is attributable to a ceiling resource).
+
+    Every category whose merged value differs between the pre-ceiling
+    (*base_eff*) and post-ceiling (*capped_eff*) capability merges was
+    restricted by the workspace ceiling — the merge is identical for both
+    profiles, so capability-driven caps (filesystem_write / allow_docker /
+    allow_network / git_available) affect both equally and never show up in
+    the diff.  Each annotation records the pre-ceiling value (``pre``) and
+    the responsible ceiling's level label.
+    """
+
+    changed = [key for key in base_eff if base_eff[key] != capped_eff.get(key)]
+    if not changed:
+        return None
+
+    # Raw ceiling level per session key it caps (later entries win, matching
+    # apply_workspace_ceiling's iteration order).
+    level_by_session_key: Dict[str, str] = {}
+    for resource, value in workspace_permissions.items():
+        session_key = _WORKSPACE_RESOURCE_MAP.get(resource)
+        if session_key is None:
+            continue  # unknown resource: apply_workspace_ceiling ignores it
+        level_by_session_key[session_key] = _ceiling_level_label(value)
+
+    annotated = _CeilingAnnotatedDict(capped_eff)
+    for key in changed:
+        label = level_by_session_key.get(key)
+        if label is None and key in ("git_read", "git_write"):
+            # A session-level ``git`` ceiling also caps the split write grain
+            # when no explicit grain exists — attribute it to the ceiling.
+            label = level_by_session_key.get("git")
+        if label is None:
+            continue  # no attributable ceiling: leave unannotated
+        annotated._ceiling_annotations[key] = {
+            "pre": base_eff[key],
+            "level": label,
+        }
+    if not annotated._ceiling_annotations:
+        return None
+    return annotated
+
+
+def _ceiling_denial_note(
+    category: str,
+    required_value: str,
+    effective: Dict[str, Any],
+    permission_footprint: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Return the ceiling level label when *this* denial is caused by the
+    workspace ceiling, else an empty string.
+
+    The denial is attributed to the workspace ceiling only when the
+    pre-ceiling session value (annotation ``pre``, computed without the
+    worker footprint) satisfies *required_value* AND the worker footprint
+    (when present) does not independently deny it — i.e. removing the
+    ceiling would flip the denial into an allow.  In every other case the
+    caller returns its current message byte-identical.
+    """
+    annotations = getattr(effective, "_ceiling_annotations", None)
+    if not annotations:
+        return ""
+    annotation = annotations.get(category)
+    if annotation is None:
+        return ""
+    if _value_satisfies(required_value, annotation["pre"]) is not True:
+        # The session grant alone was already insufficient — the denial is
+        # not caused by the workspace ceiling.
+        return ""
+    if permission_footprint:
+        footprint_value = permission_footprint.get(category)
+        if (
+            footprint_value is not None
+            and _value_satisfies(required_value, footprint_value) is not True
+        ):
+            # The worker footprint independently denies the request.
+            return ""
+    return str(annotation["level"])
+
+
 def get_effective_permissions(
     session: SessionPermissions,
     workspace: WorkspaceCapabilities,
@@ -567,6 +738,11 @@ def get_effective_permissions(
     # permission levels; apply it to the raw session profile first.  The
     # workspace-capability merge below can then only make the result more
     # restrictive, never raise the session back above the ceiling.
+    # ``base_session`` is kept so the ceiling's effect can be isolated: the
+    # same capability merge over the pre-ceiling profile reveals exactly
+    # which categories the workspace ceiling restricted (see
+    # _annotate_ceiling_changes).
+    base_session = session
     if workspace_permissions:
         raw = session.model_dump() if hasattr(session, "model_dump") else dict(session.__dict__)
         capped = apply_workspace_ceiling(workspace_permissions, raw)
@@ -575,49 +751,25 @@ def get_effective_permissions(
         except Exception:
             pass  # keep the original session if the capped profile is not schema-valid
 
-    # ── Filesystem ──────────────────────────────────────────────────────
-    # Workspace filesystem_write caps write access; if False, downgrade to read.
-    fs = session.filesystem
-    if not workspace.filesystem_write and fs == "write":
-        fs = "read"  # downgrade write → read
-    # (read / none / banned / ask pass through unchanged)
+    # ── Capability merge over the (possibly ceiling-capped) session ───────
+    effective = _merge_with_capabilities(session, workspace)
 
-    # ── Network ─────────────────────────────────────────────────────────
-    net: Any = _min_permission(session.network, workspace.allow_network)
-
-    # ── Container ───────────────────────────────────────────────────────
-    container: Any = session.container and workspace.allow_docker
-
-    # ── Git ─────────────────────────────────────────────────────────────
-    # Explicit session grains (git_read/git_write) take precedence over the
-    # single ``git`` level; each grain is still capped by the workspace
-    # capability.  When a grain is None it falls back to split_git_permission
-    # so legacy ``git``-only configs keep their exact historical behaviour.
-    git: Any = _min_permission(session.git, workspace.git_available)
-    if session.git_read is not None:
-        git_read: Any = _min_permission(session.git_read, workspace.git_available)
-    else:
-        git_read = split_git_permission(git)[0]
-    if session.git_write is not None:
-        git_write: Any = _min_permission(session.git_write, workspace.git_available)
-    else:
-        git_write = split_git_permission(git)[1]
-
-    # ── System ──────────────────────────────────────────────────────────
-    system: Any = session.system  # no workspace cap yet
-
-    return {
-        "filesystem": fs,
-        "network": net,
-        "container": container,
-        "git": git,
-        "git_read": git_read,
-        "git_write": git_write,
-        "system": system,
-        "mcp": session.mcp,
-        "execution": session.execution,
-        "host_bash": session.host_bash,
-    }
+    # When the workspace ceiling actually lowered the session profile, run
+    # the SAME capability merge over the pre-ceiling profile: the diff then
+    # isolates exactly which categories the ceiling restricted (capability
+    # caps — filesystem_write / allow_docker / allow_network / git_available
+    # — hit both merges equally and are never attributed to the ceiling).
+    # The annotated result is a plain-dict subclass whose content is
+    # identical; when nothing changed (or there is no ceiling) the plain
+    # dict is returned, so the common path is byte-for-byte unchanged.
+    if workspace_permissions and session is not base_session:
+        base_eff = _merge_with_capabilities(base_session, workspace)
+        annotated = _annotate_ceiling_changes(
+            base_eff, effective, workspace_permissions
+        )
+        if annotated is not None:
+            return annotated
+    return effective
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -879,10 +1031,20 @@ def check_required_categories(
         result = _value_satisfies(required_value, allowed)
 
         if result is False:
-            return False, (
+            message = (
                 f"Permission denied: Tool requires {category}:{required_value}, "
                 f"but session allows {category}:{allowed}"
             )
+            ceiling_level = _ceiling_denial_note(
+                category, required_value, effective, permission_footprint
+            )
+            if ceiling_level:
+                # The workspace permission ceiling is what blocks this call
+                # (the session grant alone would allow it) — name it so the
+                # denial explains why a permissive-looking session profile
+                # still refuses.
+                message = f"{message} (workspace ceiling: {ceiling_level})"
+            return False, message
 
         if result == "ASK":
             prompts_needed = True
