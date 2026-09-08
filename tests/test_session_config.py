@@ -58,3 +58,29 @@ class TestWorkerFieldsSessionOwned:
         assert AgentConfig.FIELD_CATEGORIES['worker_timeout_seconds'] == HOT_SWAPPABLE
         assert AgentConfig.FIELD_CATEGORIES['worker_max_retries'] == HOT_SWAPPABLE
         assert AgentConfig.FIELD_CATEGORIES['session_permissions'] == HOT_SWAPPABLE
+
+
+class TestLegacyAllowHostResourcesDropped:
+    """The legacy SessionConfig allow_host_resources key is dropped on load."""
+
+    def test_model_validate_accepts_and_drops_legacy_key(self):
+        cfg = SessionConfig.model_validate({"allow_host_resources": True})
+        assert "allow_host_resources" not in cfg.model_dump()
+
+    def test_dump_roundtrip_omits_legacy_key(self):
+        cfg = SessionConfig.model_validate(
+            {"allow_host_resources": False, "git_write": "write"}
+        )
+        dumped = cfg.model_dump()
+        assert "allow_host_resources" not in dumped
+        assert dumped["git_write"] == "write"
+
+    def test_attribute_absent(self):
+        cfg = SessionConfig.model_validate({"allow_host_resources": True})
+        assert not hasattr(cfg, "allow_host_resources")
+
+    def test_agent_config_from_legacy_session_omits_key(self):
+        cfg = SessionConfig.model_validate({"allow_host_resources": True})
+        ac = cfg.to_agent_config()
+        assert "allow_host_resources" not in ac.model_dump()
+

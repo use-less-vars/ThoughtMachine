@@ -754,3 +754,66 @@ class TestLegacyOperationsTrailer:
         assert "execution_mode: host_fallback" in result
         assert "failure_reason: none" in result
         assert "fallback_used: false" in result
+
+
+# ---------------------------------------------------------------------------
+# workspace-config allow_host_resources gate on host-side git fallback
+# ---------------------------------------------------------------------------
+class TestHostFallbackWorkspaceGate:
+    """Host-side git fallback is gated by the workspace vault config
+    allow_host_resources flag when a resolved workspace id exists."""
+
+    @staticmethod
+    def _write_ws_config(vault, ws_id, allow):
+        import json
+        cfg_dir = vault / "workspaces" / ws_id
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        (cfg_dir / "config.json").write_text(
+            json.dumps({"allow_host_resources": allow}), encoding="utf-8")
+
+    def test_allowed_when_workspace_config_allows(
+        self, tmp_path, fake_sandbox, monkeypatch
+    ):
+        vault = tmp_path / "vault"
+        self._write_ws_config(vault, "test-ws", True)
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(vault))
+
+        tool = _read_host_tool(tmp_path, operation="status")
+        object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
+        result = tool._git_status(tmp_path)
+
+        assert result.startswith("ok")
+        assert "execution_mode: host_fallback" in result
+        assert tool._last_execution_mode == "host_fallback"
+        assert _FakeSandbox.instances  # host-side git actually ran
+
+    def test_denied_when_workspace_config_disallows(
+        self, tmp_path, fake_sandbox, monkeypatch
+    ):
+        vault = tmp_path / "vault"
+        self._write_ws_config(vault, "test-ws", False)
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(vault))
+
+        tool = _read_host_tool(tmp_path, operation="status")
+        object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
+        with pytest.raises(
+            RuntimeError, match="allow_host_resources: true in the workspace config"
+        ):
+            tool._git_status(tmp_path)
+        assert tool._last_execution_mode == "unavailable"
+        assert not _FakeSandbox.instances
+
+    def test_denied_when_workspace_config_missing(
+        self, tmp_path, fake_sandbox, monkeypatch
+    ):
+        vault = tmp_path / "vault"
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(vault))
+
+        tool = _read_host_tool(tmp_path, operation="status")
+        object.__setattr__(tool, "_resolved_workspace_id", "test-ws")
+        with pytest.raises(
+            RuntimeError, match="allow_host_resources: true in the workspace config"
+        ):
+            tool._git_status(tmp_path)
+        assert tool._last_execution_mode == "unavailable"
+        assert not _FakeSandbox.instances

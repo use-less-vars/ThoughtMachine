@@ -8,7 +8,7 @@ Covers:
    fall back to 120/3; 0 preserved).
 3. Operator feature-flag propagation (SessionConfig -> AgentConfig,
    ToolExecutor agent_config injection, WorkerThread._build_agent_config,
-   git_info_tool exact-True gate, host_bash allow_host_resources gate).
+   git_info_tool exact-True gate, host_bash permission-grain gate).
 4. Old -> new config diff logging (agent hot-swap / restart branches and
    bridge.apply_config).
 5. ``_build_global_agent_config`` raises RuntimeError instead of silently
@@ -147,19 +147,18 @@ class TestOperatorFlagPropagation:
     def test_session_config_to_agent_config_flags(self):
         acfg = SessionConfig(
             git_allow_worktree_commits=True,
-            allow_host_resources=True,
             use_workspace_lifecycle_manager=True,
             use_container_registry=True,
         ).to_agent_config()
         assert acfg.session_permissions.git_write == 'write'
-        assert acfg.allow_host_resources is True
+        assert 'allow_host_resources' not in acfg.model_dump()
         assert acfg.use_workspace_lifecycle_manager is True
         assert acfg.use_container_registry is True
 
     def test_flags_default_to_false(self):
         acfg = SessionConfig().to_agent_config()
         assert acfg.session_permissions.git_write is None
-        assert acfg.allow_host_resources is False
+        assert 'allow_host_resources' not in acfg.model_dump()
 
 
 class TestToolExecutorFlagInjection:
@@ -187,7 +186,6 @@ class TestToolExecutorFlagInjection:
             max_turns=50,
             model='m1',
             git_allow_worktree_commits=True,
-            allow_host_resources=True,
             use_workspace_lifecycle_manager=True,
             use_container_registry=True,
         )
@@ -206,7 +204,7 @@ class TestToolExecutorFlagInjection:
         assert result['result'] == "OK"
         injected = captured['agent_config']
         assert 'git_allow_worktree_commits' not in injected
-        assert injected['allow_host_resources'] is True
+        assert 'allow_host_resources' not in injected
         assert injected['use_workspace_lifecycle_manager'] is True
         assert injected['use_container_registry'] is True
 
@@ -224,7 +222,6 @@ class TestWorkerFlagForwarding:
                 "model": "mock-model",
                 "api_key": "sk-test",
                 "git_allow_worktree_commits": True,
-                "allow_host_resources": True,
             },
             workspace_dir=tmp_path,
             tool_classes={},
@@ -232,7 +229,7 @@ class TestWorkerFlagForwarding:
         acfg = wt._build_agent_config()
         assert acfg is not None
         assert acfg.session_permissions.git_write == 'write'
-        assert acfg.allow_host_resources is True
+        assert 'allow_host_resources' not in acfg.model_dump()
 
 
 class TestGitWriteToolFlagGate:
@@ -310,42 +307,68 @@ class TestGitWriteToolFlagGate:
 
 
 class TestHostBashFlagGate:
+    """host_bash execution is gated solely by the effective host_bash grain."""
 
-    def test_disabled_when_flag_missing(self, tmp_path):
+    def test_denied_when_grain_missing(self, tmp_path):
         from unittest import mock
         from tools.host_bash_tool import HostBashTool
 
         with mock.patch("tools.host_bash_tool.subprocess") as mock_subprocess:
             tool = HostBashTool(
                 command="echo hi",
-                effective_permissions={"host_bash": "allow"},
+                effective_permissions={},  # no host_bash grain
                 session_permissions=None,
-                agent_config={"log_dir": str(tmp_path)},  # flag absent
+                agent_config={"log_dir": str(tmp_path)},
                 session_id="sess1",
                 workspace_path=None,
             )
             result = json.loads(tool.execute())
         assert result["success"] is False
-        assert "allow_host_resources is false" in result["error"]
+        assert result["outcome"] == "denied"
+        assert "not allowed (requires ask or allow)" in result["error"]
+        assert result["permission_level"] is None
         mock_subprocess.run.assert_not_called()
 
-    def test_disabled_when_flag_false(self, tmp_path):
+    def test_denied_when_grain_banned(self, tmp_path):
         from unittest import mock
         from tools.host_bash_tool import HostBashTool
 
         with mock.patch("tools.host_bash_tool.subprocess") as mock_subprocess:
             tool = HostBashTool(
                 command="echo hi",
-                effective_permissions={"host_bash": "allow"},
+                effective_permissions={"host_bash": "banned"},
                 session_permissions=None,
-                agent_config={"allow_host_resources": False, "log_dir": str(tmp_path)},
+                agent_config={"log_dir": str(tmp_path)},
                 session_id="sess1",
                 workspace_path=None,
             )
             result = json.loads(tool.execute())
         assert result["success"] is False
-        assert "allow_host_resources is false" in result["error"]
+        assert result["outcome"] == "denied"
+        assert "not allowed (requires ask or allow)" in result["error"]
+        assert result["permission_level"] == "banned"
         mock_subprocess.run.assert_not_called()
+
+    def test_executes_when_grain_allow(self, tmp_path):
+        from types import SimpleNamespace
+        from unittest import mock
+        from tools.host_bash_tool import HostBashTool
+
+        with mock.patch("tools.host_bash_tool.subprocess") as mock_subprocess:
+            mock_subprocess.run.return_value = SimpleNamespace(
+                returncode=0, stdout="", stderr="")
+            tool = HostBashTool(
+                command="echo hi",
+                effective_permissions={"host_bash": "allow"},
+                session_permissions=None,
+                agent_config={"log_dir": str(tmp_path)},
+                session_id="sess1",
+                workspace_path=None,
+            )
+            result = json.loads(tool.execute())
+        assert result["success"] is True
+        assert result["outcome"] == "executed"
+        mock_subprocess.run.assert_called_once()
 
 
 # ─────────────────────────────────────────────────────────────────────
