@@ -40,7 +40,7 @@ _ALL_TOOLS = [
     # Git
     "git_read",
     "git_write",
-    # Host execution (gated by the allow_host_resources feature flag)
+    # Host execution (gated by the host_bash permission grain)
     "host_bash",
     # Execution
     "DockerCodeRunner",

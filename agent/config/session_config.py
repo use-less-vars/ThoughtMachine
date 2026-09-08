@@ -82,6 +82,13 @@ class SessionConfig(BaseModel):
                 values['git_write'] = 'write'
         return values
 
+    @model_validator(mode='before')
+    def drop_legacy_allow_host_resources(cls, values):
+        """Drop the removed session-level ``allow_host_resources`` flag (host_bash now gates on the host_bash permission grain only)."""
+        if isinstance(values, dict):
+            values.pop('allow_host_resources', None)
+        return values
+
     # ── Fields ──────────────────────────────────────────────────────────
 
     enabled_tools: List[str] = Field(
@@ -183,10 +190,6 @@ class SessionConfig(BaseModel):
         default=None,
         ge=0,
         description='Per-worker retry limit for sessions spawned from this session (None = factory default 3).',
-    )
-    allow_host_resources: bool = Field(
-        default=False,
-        description='Allow supervised host-shell commands via the host_bash tool in this session (feature flag).',
     )
     max_workers_per_session: Optional[int] = Field(
         default=None,
@@ -315,7 +318,6 @@ class SessionConfig(BaseModel):
 
         kwargs['use_workspace_lifecycle_manager'] = bool(self.use_workspace_lifecycle_manager)
         kwargs['use_container_registry'] = bool(self.use_container_registry)
-        kwargs['allow_host_resources'] = bool(self.allow_host_resources)
         if self.max_workers_per_session is not None:
             kwargs['max_workers_per_session'] = self.max_workers_per_session
         if self.worker_timeout_seconds is not None:

@@ -67,7 +67,6 @@ class AgentConfig(BaseModel):
         'worker_max_retries': HOT_SWAPPABLE,
         'use_workspace_lifecycle_manager': HOT_SWAPPABLE,
         'use_container_registry': HOT_SWAPPABLE,
-        'allow_host_resources': HOT_SWAPPABLE,
         'mode': RESTART_REQUIRED,
     }
 
@@ -143,11 +142,6 @@ class AgentConfig(BaseModel):
         default=False,
         description='Enable ContainerRegistry delegation for container lifecycle in worker queries (feature flag).',
     )
-    allow_host_resources: bool = Field(
-        default=False,
-        description='Allow the agent to run supervised host-shell commands via the host_bash tool (feature flag).',
-    )
-
     @field_validator('system_prompt')
     def load_default_system_prompt(cls, v):
         """Load the system prompt with the following precedence:

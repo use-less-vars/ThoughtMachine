@@ -322,7 +322,6 @@ def backend_to_frontend_config(backend: Dict[str, Any]) -> Dict[str, Any]:
         else:
             mode_tool_names = None
 
-        allow_host_resources = bool(cfg.get("allow_host_resources", False))
         session_perms = cfg.get("session_permissions") or {}
         if hasattr(session_perms, "model_dump"):
             session_perms = session_perms.model_dump()
@@ -337,12 +336,13 @@ def backend_to_frontend_config(backend: Dict[str, Any]) -> Dict[str, Any]:
                 # Keep tool descriptions so the frontend can show them without
                 # a separate /api/tools round-trip (session_loaded tools fix).
                 "description": (cls.__doc__ or "").strip(),
-                # host_bash is gated on the allow_host_resources feature flag;
-                # expose why it is off so the UI can explain it.
+                # host_bash permission checks are in-tool (no outer-gate
+                # category); expose the grain-dependent reason so the UI can
+                # explain when the tool is off.
                 "disabled_reason": (
-                    "requires allow_host_resources: true"
+                    "requires host_bash permission ask or allow"
                     if cls.tool_name() == "host_bash"
-                    and not allow_host_resources
+                    and session_perms.get("host_bash") not in ("ask", "allow")
                     else None
                 ),
                 # host_bash has no outer-gate category (permission checks are

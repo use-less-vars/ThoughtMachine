@@ -2541,9 +2541,9 @@ async def api_get_tools():
     """Return the complete list of all available tools with UI metadata.
 
     Each entry carries the tool's canonical name plus UI hints:
-    ``disabled_reason`` (why a tool may be gated, e.g. host_bash without
-    the allow_host_resources feature flag) and ``permission_level`` (the
-    configured session-permission grain for gated tools).
+    ``disabled_reason`` (why a tool may be gated) and
+    ``permission_level`` (the configured session-permission grain for
+    gated tools).
     """
     try:
         from session.tool_presets import _ALL_TOOLS
@@ -2554,7 +2554,6 @@ async def api_get_tools():
         except ImportError:
             return {"tools": [], "error": "Could not load tool list"}
     defaults = load_global_defaults()
-    allow_host_resources = bool(defaults.get("allow_host_resources", False))
     session_perms = defaults.get("session_permissions") or {}
     if hasattr(session_perms, "model_dump"):
         session_perms = session_perms.model_dump()
@@ -2565,8 +2564,9 @@ async def api_get_tools():
             "name": name,
             "enabled": True,
             "disabled_reason": (
-                "requires allow_host_resources: true"
-                if name == "host_bash" and not allow_host_resources
+                "requires host_bash permission ask or allow"
+                if name == "host_bash"
+                and session_perms.get("host_bash") not in ("ask", "allow")
                 else None
             ),
             "permission_level": (
