@@ -1000,6 +1000,11 @@ def test_pause_idle_worker_is_non_destructive(tmp_path, monkeypatch):
     assert _wait_until(lambda: thread.status == "paused" and thread.is_alive()), (
         f"worker did not reach paused (status={thread.status})"
     )
+    # pause() flips status to 'paused' synchronously; wait for the worker
+    # thread to actually publish worker_paused (race-free signal).
+    assert _wait_until(lambda: any(e == "worker_paused" for e, _ in events)), (
+        f"no worker_paused event: {events}"
+    )
     paused = [d for e, d in events if e == "worker_paused"]
     assert paused, f"no worker_paused event: {events}"
     assert paused[-1]["status"] == "paused"
