@@ -15,6 +15,7 @@ Usage::
 The WorkerContext exposes these Session-equivalent attributes:
 
   - session_id (str)
+  - workspace_id (str | None)
   - user_history (list[dict])
   - total_input_tokens (int)
   - total_output_tokens (int)
@@ -62,6 +63,7 @@ class WorkerContext:
     def __init__(
         self,
         session_id: Optional[str] = None,
+        workspace_id: Optional[str] = None,
         user_history: Optional[List[Dict[str, Any]]] = None,
         total_input_tokens: int = 0,
         total_output_tokens: int = 0,
@@ -69,6 +71,7 @@ class WorkerContext:
         turn_count: int = 0,
     ) -> None:
         self.session_id: str = session_id or f"worker-{uuid.uuid4().hex[:12]}"
+        self.workspace_id: Optional[str] = workspace_id
         self.worker_name: str = worker_name or f"worker-{uuid.uuid4().hex[:12]}"
         self.user_history: List[Dict[str, Any]] = user_history or []
         self.total_input_tokens: int = total_input_tokens
@@ -203,6 +206,7 @@ class WorkerContext:
         """Serialize this WorkerContext to a dict for JSON persistence."""
         return {
             "session_id": self.session_id,
+            "workspace_id": self.workspace_id,
             "worker_name": self.worker_name,
             "turn_count": self.turn_count,
             "conversation": self.user_history,
@@ -215,6 +219,7 @@ class WorkerContext:
         """Deserialize a WorkerContext from a dict (as stored in context.json)."""
         return cls(
             session_id=data.get("session_id"),
+            workspace_id=data.get("workspace_id"),
             worker_name=data.get("worker_name"),
             user_history=data.get("conversation", []),
             total_input_tokens=data.get("total_input_tokens", 0),

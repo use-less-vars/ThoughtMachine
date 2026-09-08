@@ -669,3 +669,22 @@
   width: 100%;
 }
 
+/* ── '+ New Session' header button ───────────────────────────── */
+
+.wdp-new-session-btn {
+  background: rgba(137, 180, 250, 0.14);
+  color: #89b4fa;
+  border: 1px solid rgba(137, 180, 250, 0.45);
+  border-radius: 999px;
+  padding: 0.32rem 0.95rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.wdp-new-session-btn:hover {
+  background: #89b4fa;
+  color: #11111b;
+}
+

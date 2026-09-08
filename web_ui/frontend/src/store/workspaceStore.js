@@ -528,12 +528,16 @@ const useWorkspaceStore = create((set, get) => ({
   },
 
   // POST /api/session/create → returns the created session JSON.
-  createSession: async (id, { name, mode } = {}) => {
+  // workspacePathOverride: optional 3rd arg — lets callers (e.g. the
+  // WorkspaceDetailPage header) supply a concrete absolute workspace path
+  // when the store has no list entry / root for the workspace id.
+  createSession: async (id, { name, mode } = {}, workspacePathOverride) => {
     const workspace = get().workspaceList.find((w) => w.id === id) || get().currentWorkspace
     const payload = { mode: mode || 'agent' }
     if (name) payload.name = name
     payload.workspace_id = id
-    if (workspace && workspace.root) payload.workspace_path = workspace.root
+    const workspacePath = workspacePathOverride || (workspace && workspace.root)
+    if (workspacePath) payload.workspace_path = workspacePath
     const res = await fetch(`${API_BASE}/api/session/create`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

@@ -2,22 +2,19 @@
 """Supervised host-shell execution tool.
 
 ``host_bash`` runs a shell command on the host machine (outside the Docker
-sandbox) under explicit operator control.  It is disabled by default:
+sandbox) under explicit operator control.  It is disabled by default and
+gated solely on the effective ``host_bash`` permission grain:
 
-* the **workspace** must opt in via ``allow_host_resources: true`` in
-  ``<vault>/workspaces/<id>/config.json`` (feature flag, default false);
-* the **session** must opt in via ``allow_host_resources: true`` in
-  ``<vault>/sessions/<id>/config.json`` **or** via the operator-injected
-  ``AgentConfig.allow_host_resources`` flag (legacy path — operator-set,
-  never defaulted open); and
 * the effective permission grain for ``host_bash`` must be ``"ask"`` or
   ``"allow"`` (``effective_permissions['host_bash']`` /
-  ``session_permissions['host_bash']``).
+  ``session_permissions['host_bash']``).  When unset the grain defaults to
+  ``"banned"`` (fail closed).
 
-The workspace leg is vault-only and fails closed: with no workspace id (or no
-vault config) the tool denies.  The session leg additionally honours the
-injected agent config flag so existing operator-configured deployments keep
-working; it is never defaulted open.
+The legacy session-level ``allow_host_resources`` flag and the
+workspace-level gating of host_bash are removed: the workspace top-level
+``allow_host_resources`` key now only applies to other host-execution
+surfaces via ``tools.host_resource_policy``.  host_bash itself is never
+dependent on those flags and is never defaulted open.
 
 Every invocation is written to ``<log_root>/host_bash_audit.jsonl`` as a
 JSONL record with exactly six fields: ``timestamp``, ``workspace_id``,
@@ -28,8 +25,6 @@ audit record.
 Audit mapping (``outcome``, ``reason``):
 
 * empty command               -> (``"deny"``, ``"empty command"``)
-* workspace/session flag missing or false
-                              -> (``"deny"``, names the flag(s) that are off)
 * permission grain not ask/allow
                               -> (``"deny"``, ``"<grain> not allowed ..."``)
 * approval rejected           -> (``"deny"``, ``"host_bash: command rejected by user"``)
@@ -108,52 +103,6 @@ class HostBashTool(ToolBase):
             except Exception:
                 pass
         return ""
-
-    def _workspace_allow_host_resources(self) -> bool:
-        """Read the workspace feature flag from the vault, fail-closed.
-
-        ``<vault>/workspaces/<id>/config.json`` -> ``allow_host_resources``.
-        Missing config, invalid JSON, or a non-dict root all read as False.
-        """
-        ws_id = self._workspace_id()
-        if not ws_id:
-            return False
-        try:
-            from thoughtmachine.vault import vault_root
-
-            config_path = vault_root() / "workspaces" / ws_id / "config.json"
-            if not config_path.is_file():
-                return False
-            data = json.loads(config_path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                return False
-            return bool(data.get("allow_host_resources", False))
-        except Exception:
-            return False
-
-    def _session_allow_host_resources(self) -> bool:
-        """Session feature flag: vault config OR the injected agent config flag.
-
-        The session leg is open when ``<vault>/sessions/<id>/config.json``
-        sets ``allow_host_resources: true`` OR the operator-injected
-        ``agent_config['allow_host_resources']`` is true (legacy path).  The
-        workspace leg is vault-only and stays fail-closed.
-        """
-        agent_allow = bool((self.agent_config or {}).get("allow_host_resources", False))
-        session_id = self.session_id or ""
-        if not session_id:
-            return agent_allow
-        try:
-            from thoughtmachine.vault import vault_root
-
-            config_path = vault_root() / "sessions" / session_id / "config.json"
-            if config_path.is_file():
-                data = json.loads(config_path.read_text(encoding="utf-8"))
-                if isinstance(data, dict) and data.get("allow_host_resources"):
-                    return True
-        except Exception:
-            pass
-        return agent_allow
 
     def _redact_command(self, command: str) -> str:
         """Redact environment values (len >= 6) from the command for audit."""
@@ -282,22 +231,10 @@ class HostBashTool(ToolBase):
                 default=str,
             )
 
-        # Feature flags, read at call time from the vault (fail-closed) plus
-        # the operator-injected session flag.
-        ws_allow = self._workspace_allow_host_resources()
-        session_allow = self._session_allow_host_resources()
+        # host_bash is gated solely on the effective host_bash permission
+        # grain (default 'banned'); the workspace/session allow_host_resources
+        # feature flags no longer apply.
         grain = self._effective_grain()
-        if not ws_allow or not session_allow:
-            missing = []
-            ws_id = self._workspace_id()
-            session_id = self.session_id or ""
-            if not ws_allow:
-                missing.append(f"workspace (workspaces/{ws_id or '<unknown>'}/config.json)")
-            if not session_allow:
-                missing.append(f"session (sessions/{session_id or '<unknown>'}/config.json)")
-            reason = "host_bash denied: allow_host_resources is false or missing for: " + "; ".join(missing)
-            self._audit_log("deny", reason, cmd)
-            return denied_json(reason, grain)
         if grain not in ("ask", "allow"):
             self._audit_log(
                 "deny",
@@ -309,6 +246,15 @@ class HostBashTool(ToolBase):
                 grain,
             )
         if grain == "ask":
+            if self.is_worker_context:
+                # Worker context: no interactive operator exists to answer a
+                # SecurityPromptEvent, so asking would strand the request or
+                # leak it to a main-session operator prompt.  Deny in-tool
+                # with the same standardized worker-ask message the outer
+                # gate uses for category-gated tools.
+                msg = "host_bash: ask requires interactive approval; not available in worker context"
+                self._audit_log("deny", msg, cmd)
+                return denied_json(msg, grain)
             decision = self._request_approval(cmd)
             if decision == "denied":
                 self._audit_log("deny", "host_bash: command rejected by user", cmd)

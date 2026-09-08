@@ -115,10 +115,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      # Python 3.14: the newest supported release line (the installers accept
+      # 3.11+ with no ceiling). This job proves the full Windows stack - venv
+      # creation, pip cp314 wheel resolution, critical import and the smoke
+      # script - works on it.
+      - name: Set up Python (3.14)
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.14'
 
       - name: Create virtual environment
         run: python -m venv .venv

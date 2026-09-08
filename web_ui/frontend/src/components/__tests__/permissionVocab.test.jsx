@@ -79,9 +79,9 @@ const openPermissionsTab = () => {
   fireEvent.click(screen.getByRole('button', { name: 'Permissions' }));
 };
 
-// Permissions-tab select order (DOM order: Filesystem, Network, Git, System, Execution;
+// Permissions-tab select order (DOM order: Git, Filesystem, Network, MCP, Host Bash;
 // Container is a checkbox, not a select).
-const TAB_RESOURCE_ORDER = ['filesystem', 'network', 'git', 'system', 'execution'];
+const TAB_RESOURCE_ORDER = ['git', 'filesystem', 'network', 'mcp', 'host_bash'];
 
 beforeEach(() => {
   useStore.getState().reset();
@@ -97,15 +97,12 @@ afterEach(() => {
 describe('SESSION_RESOURCE_VOCAB (frontend mirror of backend)', () => {
   it('mirrors the backend permission vocabulary (thoughtmachine/security.py, security/security_gate.py) exactly', () => {
     expect(SESSION_RESOURCE_VOCAB).toEqual({
-      filesystem: ['banned', 'ask', 'read', 'write', 'full'],
-      system: ['banned', 'ask', 'read', 'write', 'full'],
-      git: ['banned', 'ask', 'read', 'write', 'full'],
-      network: ['banned', 'ask', 'write', 'outbound'],
-      git_read: ['banned', 'ask', 'read', 'write'],
-      git_write: ['banned', 'ask', 'read', 'write'],
-      mcp: ['banned', 'connect', 'full'],
-      execution: ['banned', 'ask', 'read', 'write', 'full'],
+      git: ['banned', 'ask', 'read', 'write', 'write_on_feature_branch'],
+      filesystem: ['banned', 'read', 'write'],
       container: [true, false],
+      network: ['banned', 'ask', 'write', 'outbound'],
+      mcp: ['banned', 'connect', 'full'],
+      host_bash: ['banned', 'ask', 'allow'],
     });
   });
 
@@ -124,8 +121,8 @@ describe('PERMISSION_RANK_ORDER (frontend mirror of backend)', () => {
       read: 2,
       outbound: 2.5,
       write: 3,
+      write_on_feature_branch: 3,
       full: 4,
-      write_feature_branches: 4,
     });
   });
 });
@@ -135,6 +132,7 @@ describe('PILL_COLORS / getPill', () => {
     expect(PILL_COLORS).toEqual({
       full: { bg: '#a6e3a1', fg: '#1e1e2e', label: 'Full' },
       write: { bg: '#a6e3a1', fg: '#1e1e2e', label: 'Write' },
+      write_on_feature_branch: { bg: '#a6e3a1', fg: '#1e1e2e', label: 'Feature Branch' },
       read: { bg: '#89b4fa', fg: '#1e1e2e', label: 'Read' },
       ask: { bg: '#f9e2af', fg: '#1e1e2e', label: 'Ask' },
       banned: { bg: '#f38ba8', fg: '#1e1e2e', label: 'Banned' },
@@ -146,6 +144,7 @@ describe('PILL_COLORS / getPill', () => {
   it('resolves known keys, boolean keys, and unknown-key fallback', () => {
     expect(getPill('write')).toEqual(PILL_COLORS.write);
     expect(getPill('full')).toEqual(PILL_COLORS.full);
+    expect(getPill('write_on_feature_branch')).toEqual(PILL_COLORS.write_on_feature_branch);
     expect(getPill(true)).toEqual(PILL_COLORS.true);
     expect(getPill(false)).toEqual(PILL_COLORS.false);
     expect(getPill('unknown')).toEqual({ bg: '#6c7086', fg: '#cdd6f4', label: 'unknown' });
@@ -155,7 +154,7 @@ describe('PILL_COLORS / getPill', () => {
 });
 
 describe('ConfigPanel permission option drift guard', () => {
-  it('renders exactly 5 permission selects (Filesystem, Network, Git, System, Execution)', () => {
+  it('renders exactly 5 permission selects (Git, Filesystem, Network, MCP, Host Bash)', () => {
     renderPanel();
     openPermissionsTab();
     const selects = Array.from(document.querySelectorAll('select'));
@@ -185,20 +184,21 @@ describe('ConfigPanel permission option drift guard', () => {
     const selects = Array.from(document.querySelectorAll('select'));
     const optionValues = (i) => Array.from(selects[i].options).map((o) => o.value);
 
-    // permissive-first (rank descending)
-    expect(optionValues(0)).toEqual(['full', 'write', 'read', 'ask', 'banned']); // filesystem
-    expect(optionValues(1)).toEqual(['write', 'outbound', 'ask', 'banned']); // network (includes outbound)
-    expect(optionValues(3)).toEqual(['full', 'write', 'read', 'ask', 'banned']); // system
-    expect(optionValues(4)).toEqual(['full', 'write', 'read', 'ask', 'banned']); // execution
-    // git keeps its legacy UI order (values still filtered through the canonical vocab)
-    expect(optionValues(2)).toEqual(['full', 'write', 'read', 'banned', 'ask']); // git
+    // permissive-first
+    expect(optionValues(0)).toEqual(['write', 'write_on_feature_branch', 'read', 'ask', 'banned']); // git
+    expect(optionValues(1)).toEqual(['write', 'read', 'banned']); // filesystem
+    expect(optionValues(2)).toEqual(['write', 'outbound', 'ask', 'banned']); // network (includes outbound)
+    expect(optionValues(3)).toEqual(['full', 'connect', 'banned']); // mcp
+    expect(optionValues(4)).toEqual(['allow', 'ask', 'banned']); // host_bash
   });
 
   it('capitalises rendered option labels', () => {
     renderPanel();
     openPermissionsTab();
     const selects = Array.from(document.querySelectorAll('select'));
-    const labels = Array.from(selects[1].options).map((o) => o.textContent.trim());
+    const labels = Array.from(selects[2].options).map((o) => o.textContent.trim());
     expect(labels).toEqual(['Write', 'Outbound', 'Ask', 'Banned']);
+    const gitLabels = Array.from(selects[0].options).map((o) => o.textContent.trim());
+    expect(gitLabels).toEqual(['Write', 'Write on feature branches', 'Read', 'Ask', 'Banned']);
   });
 });

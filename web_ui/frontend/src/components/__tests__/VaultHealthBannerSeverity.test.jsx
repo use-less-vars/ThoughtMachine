@@ -6,7 +6,7 @@
  */
 import React from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent } from '@testing-library/react'
 import '@testing-library/jest-dom/vitest'
 import VaultHealthBanner from '../VaultHealthBanner'
 
@@ -55,6 +55,9 @@ describe('VaultHealthBanner \u2014 severity mapping and fallback', () => {
     })
     render(<VaultHealthBanner />)
     const alert = await screen.findByRole('alert')
+    // The list starts collapsed; expand it before asserting the mapped badges.
+    expect(alert.querySelector('.vault-health-severity')).not.toBeInTheDocument()
+    fireEvent.click(alert.querySelector('button.vault-health-toggle'))
     expect(alert.querySelector('.vault-health-severity.critical')).toBeInTheDocument()
     expect(alert.querySelector('.vault-health-severity.error')).not.toBeInTheDocument()
   })
@@ -68,6 +71,7 @@ describe('VaultHealthBanner \u2014 severity mapping and fallback', () => {
     })
     render(<VaultHealthBanner />)
     const alert = await screen.findByRole('alert')
+    fireEvent.click(alert.querySelector('button.vault-health-toggle'))
     expect(alert.querySelector('.vault-health-severity.medium')).toBeInTheDocument()
     expect(alert.querySelector('.vault-health-severity.warning')).not.toBeInTheDocument()
   })

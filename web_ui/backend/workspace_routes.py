@@ -32,6 +32,12 @@ from thoughtmachine.workspace_capabilities import (
     load_workspace_capabilities,
 )
 
+from thoughtmachine.permission_store import (
+    PermissionStoreError,
+    read_session_permissions,
+)
+from thoughtmachine.vault import vault_root
+
 from tools.workspace.worker_registry import WorkerRegistry as _WorkerRegistry
 _worker_registry = _WorkerRegistry.get_instance()._worker_registry
 _registry_lock = _WorkerRegistry.get_instance()._registry_lock
@@ -779,9 +785,10 @@ async def get_effective_permissions(
     """Return the effective (merged) permissions for this workspace.
 
     Merges the session-level permissions with workspace-level capabilities.
-    If *session_id* is provided, the session is loaded and its embedded
-    ``session_permissions`` are used; otherwise a read-only, no-network
-    default is assumed.
+    If *session_id* is provided, session permissions are resolved sidecar
+    first (``permission_store.read_session_permissions``), falling back to
+    the saved session's embedded ``session_permissions`` metadata; otherwise
+    a read-only, no-network default is assumed.
     """
     ensure_workspace_dirs(ws_id)
 
@@ -795,7 +802,14 @@ async def get_effective_permissions(
 
     session_perms = None
     if session_id:
-        raw_perms = _load_session_permissions(session_id)
+        raw_perms = None
+        try:
+            raw_perms = read_session_permissions(vault_root(), ws_id, session_id)
+        except PermissionStoreError:
+            # No sidecar / legacy record (or unreadable source) for this
+            # session: fall back to the metadata-based loader.  The read-only
+            # default below still applies if that finds nothing.
+            raw_perms = _load_session_permissions(session_id)
         if raw_perms is not None and isinstance(raw_perms, dict):
             try:
                 session_perms = SessionPermissions(**raw_perms)
@@ -1388,11 +1402,20 @@ async def get_workspace_permissions(ws_id: str) -> Dict[str, Any]:
     purpose = cfg.get("purpose", "general")
     allow_host_resources = bool(cfg.get("allow_host_resources", False))
     permissions = _resolve_workspace_permissions(cfg, purpose)
+    raw_cfg_permissions = cfg.get("permissions")
+    raw = (
+        dict(raw_cfg_permissions)
+        if isinstance(raw_cfg_permissions, dict) and raw_cfg_permissions
+        else {}
+    )
     return {
         "workspace_id": ws_id,
         "purpose": purpose,
         "permissions": permissions,
         "allow_host_resources": allow_host_resources,
+        "raw": raw,
+        "effective": permissions,
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -1442,6 +1465,9 @@ async def put_workspace_permissions(
         "permissions": normalized,
         "allow_host_resources": allow_host_resources,
         "risk": risk,
+        "raw": normalized,
+        "effective": normalized,
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
     }
 
 

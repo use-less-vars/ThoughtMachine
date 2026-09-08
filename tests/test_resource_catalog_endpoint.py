@@ -11,7 +11,7 @@ import sys
 import pytest
 from starlette.testclient import TestClient
 
-_EXPECTED_NAMES = {"git", "filesystem", "docker", "host_bash", "tty", "jtag"}
+_EXPECTED_NAMES = {"git", "filesystem", "container", "host_bash", "tty", "jtag"}
 _EXPECTED_KEYS = {
     "name",
     "display_name",

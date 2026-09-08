@@ -68,6 +68,11 @@ class ToolBase(BaseModel):
     # declare this field; inherited by all tools that extend ToolBase.
     session_id: Optional[str] = Field(default=None, description="Session ID injected by ToolExecutor")
 
+    # Worker-context flag injected by ToolExecutor before execute(). True when
+    # the tool runs inside a worker sub-agent with no interactive user; tools
+    # that self-gate on the 'ask' grain must deny instead of prompting.
+    is_worker_context: bool = Field(default=False, description="Whether tool runs in worker context (no interactive user); injected by ToolExecutor.")
+
     # Security capabilities required by this tool
     requires_capabilities: ClassVar[List[str]] = []
 

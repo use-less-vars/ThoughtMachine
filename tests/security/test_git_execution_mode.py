@@ -216,6 +216,22 @@ class TestSelfHealingModeRouting:
         monkeypatch.setattr("tools.git_info_tool.SandboxedExecution", _FakeSandbox)
         return _FakeSandbox
 
+    def _allow_host_resources(self, tmp_path, monkeypatch):
+        """Let the workspace-config gate allow host fallback for 'test-ws'.
+
+        Host-side git execution is gated by
+        ``workspace_allows_host_resources`` (vault config) once a resolved
+        workspace id exists, so the degraded-path tests below must grant it.
+        """
+        import json
+
+        vault = tmp_path / "vault"
+        cfg_dir = vault / "workspaces" / "test-ws"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        (cfg_dir / "config.json").write_text(
+            json.dumps({"allow_host_resources": True}), encoding="utf-8"
+        )
+        monkeypatch.setenv("THOUGHTMACHINE_VAULT_ROOT", str(vault))
     def test_containerized_uses_container_exec_path(self, tmp_path):
         manager = _FakeEnsureManager(
             {
@@ -241,6 +257,7 @@ class TestSelfHealingModeRouting:
         assert "--no-verify" not in command
 
     def test_host_fallback_commit_uses_hardened_host_path(self, tmp_path, monkeypatch):
+        self._allow_host_resources(tmp_path, monkeypatch)
         _FakeSandbox = self._host_sandbox(monkeypatch)
         manager = _FakeEnsureManager(
             {
@@ -285,6 +302,7 @@ class TestSelfHealingModeRouting:
         assert not [c for c in manager.calls if c[0] == "exec"]
 
     def test_host_fallback_status_runs_without_no_verify(self, tmp_path, monkeypatch):
+        self._allow_host_resources(tmp_path, monkeypatch)
         _FakeSandbox = self._host_sandbox(monkeypatch)
         manager = _FakeEnsureManager(
             {
@@ -349,6 +367,7 @@ class TestSelfHealingModeRouting:
 
     def test_host_fallback_failure_reason_plumbing(self, tmp_path, monkeypatch):
         """failure_reason/fallback_used from ensure_resource reach the trailer."""
+        self._allow_host_resources(tmp_path, monkeypatch)
         _FakeSandbox = self._host_sandbox(monkeypatch)
         manager = _FakeEnsureManager(
             {

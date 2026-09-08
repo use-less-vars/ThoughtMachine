@@ -137,7 +137,6 @@ class TestFrontendToolMapping:
             {
                 "mode": "custom",
                 "enabled_tools": ["Respond", "git_read", "host_bash"],
-                "allow_host_resources": False,
                 "session_permissions": {},
             }
         )
@@ -150,7 +149,7 @@ class TestFrontendToolMapping:
         assert tools["host_bash"]["enabled"] is True
         assert (
             tools["host_bash"]["disabled_reason"]
-            == "requires allow_host_resources: true"
+            == "requires host_bash permission ask or allow"
         )
         assert tools["host_bash"]["permission_level"] is None
 
@@ -161,26 +160,50 @@ class TestFrontendToolMapping:
         tools = _tools_by_name(cfg)
         assert tools["git_read"]["enabled"] is True
 
-    def test_host_bash_enabled_when_allow_host_resources(self):
+    def test_host_bash_disabled_reason_when_no_grain(self):
+        """No host_bash grain in session_permissions -> tool listed with a reason."""
         cfg = backend_to_frontend_config(
             {
                 "mode": "custom",
                 "enabled_tools": ["host_bash"],
-                "allow_host_resources": True,
                 "session_permissions": {},
             }
         )
         tools = _tools_by_name(cfg)
-        assert tools["host_bash"]["disabled_reason"] is None
+        assert tools["host_bash"]["enabled"] is True
+        assert (
+            tools["host_bash"]["disabled_reason"]
+            == "requires host_bash permission ask or allow"
+        )
+        assert tools["host_bash"]["permission_level"] is None
 
-    def test_host_bash_permission_level_surfaced(self):
+    def test_host_bash_enabled_when_grain_allow(self):
+        """host_bash grain 'allow' -> no disabled reason and level surfaced."""
         cfg = backend_to_frontend_config(
             {
                 "mode": "custom",
                 "enabled_tools": ["host_bash"],
-                "allow_host_resources": True,
+                "session_permissions": {"host_bash": "allow"},
+            }
+        )
+        tools = _tools_by_name(cfg)
+        assert tools["host_bash"]["disabled_reason"] is None
+        assert tools["host_bash"]["permission_level"] == "allow"
+
+    def test_host_bash_grain_full_disabled_and_surfaced(self):
+        """'full' is not a valid host_bash grain (ask/allow only): the tool is
+        listed with the disabled reason while the configured grain is still
+        surfaced as the permission level."""
+        cfg = backend_to_frontend_config(
+            {
+                "mode": "custom",
+                "enabled_tools": ["host_bash"],
                 "session_permissions": {"host_bash": "full"},
             }
         )
         tools = _tools_by_name(cfg)
+        assert (
+            tools["host_bash"]["disabled_reason"]
+            == "requires host_bash permission ask or allow"
+        )
         assert tools["host_bash"]["permission_level"] == "full"

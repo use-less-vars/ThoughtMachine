@@ -112,7 +112,79 @@ except ImportError:
     GIT_MODE_RESOLVER_AVAILABLE = False
 
 
+# Resource catalog (canonical session-resource keys used for display folding)
+try:
+    from security.resource_catalog import RESOURCE_CATALOG, canonical_resource_keys
+    RESOURCE_CATALOG_AVAILABLE = True
+except ImportError:
+    RESOURCE_CATALOG = {}
+    canonical_resource_keys = ()
+    RESOURCE_CATALOG_AVAILABLE = False
+
+
 logger = logging.getLogger(__name__)
+
+
+# Canonical git permission levels (display fold order, most permissive last) —
+# DISPLAY-ONLY; never feeds gating.
+_CANONICAL_GIT_LEVELS = ('banned', 'ask', 'read', 'write', 'write_on_feature_branch')
+
+
+def _canonical_git_level(effective):
+    """Fold the gate's git grains (git / git_read / git_write) into one canonical level.
+
+    DISPLAY-ONLY: this fold is for human-readable output (CheckSystem
+    'effective_permissions'). Gating always consumes the individual grains from
+    the security gate — nothing here feeds authorization.
+    """
+    if not isinstance(effective, dict):
+        return None
+    # git_write is the strongest signal of what git operations are allowed.
+    gw = effective.get('git_write')
+    if gw not in (None, False):
+        gw = str(gw).lower()
+        if gw == 'full':
+            gw = 'write'
+        if gw in ('write', 'write_on_feature_branch'):
+            return gw
+    # The stored session git level (if present) is the next best signal.
+    git = effective.get('git')
+    if git not in (None, False):
+        git = str(git).lower()
+        if git == 'full':
+            git = 'write'
+        if git == 'write_feature_branches':
+            git = 'write_on_feature_branch'
+        if git in _CANONICAL_GIT_LEVELS:
+            return git
+    # git_read only ever implies read-level access (never write).
+    gr = effective.get('git_read')
+    if gr not in (None, False):
+        gr = str(gr).lower()
+        if gr == 'banned':
+            return 'banned'
+        if gr in ('ask', 'read', 'write', 'full'):
+            return 'read'
+    return None
+
+
+def _canonical_permission_display(effective):
+    """Return the canonical session-resource view of an effective-permissions dict.
+
+    DISPLAY-ONLY (see _canonical_git_level): legacy/gate-only keys such as
+    system, execution, git_read and git_write are hidden or folded, so what the
+    operator sees matches the session-resource vocabulary the ConfigPanel edits.
+    """
+    if not isinstance(effective, dict):
+        return {}
+    reported = {k: v for k, v in effective.items() if k in canonical_resource_keys}
+    if 'git' in effective or 'git_read' in effective or 'git_write' in effective:
+        level = _canonical_git_level(effective)
+        if level is not None:
+            reported['git'] = level
+        elif 'git' in reported:
+            del reported['git']
+    return reported
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +347,19 @@ class CheckSystem(ToolBase):
     # -- query implementations -------------------------------------------
 
     def _query_permissions(self, ws_id: Optional[str]) -> dict:
-        """Return effective permissions (session × workspace)."""
+        """Return effective permissions (session × workspace).
+
+        Source-of-truth precedence:
+        1. ``self.effective_permissions`` (when a non-empty dict) — injected by
+           ToolExecutor, computed FRESH THIS CALL from the disk grants + ceiling
+           via the session_id + workspace_id 4-arg gate. Authoritative over the
+           session-start mirror in ``self.session_permissions``, which is never
+           refreshed when the operator changes permissions on disk.
+        2. Legacy 2-arg merge of the in-memory session mirror against the
+           workspace capabilities file — kept only for id-less executors /
+           direct construction, where the disk 4-arg mode cannot engage.
+        3. Raw session mirror when the gate module is unavailable.
+        """
         # Load workspace capabilities from file
         workspace_capabilities = {}
         if CAPABILITIES_AVAILABLE and _workspace_dir and ws_id:
@@ -288,8 +372,15 @@ class CheckSystem(ToolBase):
 
         effective = {}
         permission_fetch_error = None
-        if GATE_AVAILABLE and get_effective_permissions and self.session_permissions:
-            # Build a simple SessionPermissions object or use raw dict
+        permission_origin = "none"
+        injected = getattr(self, "effective_permissions", None)
+        if isinstance(injected, dict) and injected:
+            # Executor's per-call disk-authoritative merge (see docstring).
+            effective = dict(injected)
+            permission_origin = "executor-disk"
+        elif GATE_AVAILABLE and get_effective_permissions and self.session_permissions:
+            # Id-less / direct-construction fallback: 2-arg merge of the
+            # in-memory session mirror with the workspace capabilities file.
             try:
                 from thoughtmachine.security import SessionPermissions
                 session_obj = SessionPermissions(**self.session_permissions)
@@ -299,6 +390,7 @@ class CheckSystem(ToolBase):
                     if k in [f.name for f in __import__('dataclasses').fields(WorkspaceCapabilities)]
                 })
                 effective = get_effective_permissions(session_obj, caps_obj)
+                permission_origin = "mirror-merge"
             except Exception as exc:
                 # Fail-closed: surface the error instead of silently returning
                 # the raw session permissions (which could overstate effective
@@ -308,12 +400,17 @@ class CheckSystem(ToolBase):
                 permission_fetch_error = str(exc)
         elif self.session_permissions:
             effective = dict(self.session_permissions)
+            permission_origin = "session-mirror"
 
         return {
-            "effective_permissions": effective,
+            # DISPLAY-ONLY fold: gate grain keys (git_read/git_write/system/
+            # execution) are hidden/folded so the report matches the canonical
+            # session-resource vocabulary the ConfigPanel edits.
+            "effective_permissions": _canonical_permission_display(effective),
             "workspace_capabilities": workspace_capabilities,
             "workspace_id": ws_id,
             "source": "gate" if GATE_AVAILABLE else "session_fallback",
+            "permission_origin": permission_origin,
             "permission_fetch_error": permission_fetch_error,
         }
 
@@ -529,6 +626,7 @@ class CheckSystem(ToolBase):
             manager = _ContainerManager(
                 workspace_path=ws_path,
                 session_permissions=self.session_permissions or {},
+                session_id=getattr(self, "session_id", None),
             )
             # Daemon reachability + image presence in one API call. No pull:
             # a missing image is reported and the probe is skipped.

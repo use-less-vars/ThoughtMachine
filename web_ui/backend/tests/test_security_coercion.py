@@ -31,9 +31,12 @@ class TestCoerceSessionPermissions:
 
     def test_valid_permissions_pass_through(self):
         """All valid values should pass through unchanged."""
-        # NOTE: "mcp" is part of PERMISSION_SCHEMA (banned/connect/full) and
-        # missing keys are filled with SAFE_DEFAULTS, so it must be present
-        # in the pass-through fixture.
+        # NOTE: "mcp" and the split git sub-grains ("git_read"/"git_write")
+        # are part of PERMISSION_SCHEMA; keys absent from raw are filled
+        # with SAFE_DEFAULTS (the security gate derives git_read/git_write
+        # from "git"), so the pass-through contract applies to raw's keys,
+        # and the normalized result additionally carries the sub-grain
+        # defaults.
         raw = {
             "network": "write",
             "filesystem": "read",
@@ -44,7 +47,11 @@ class TestCoerceSessionPermissions:
             "mcp": "connect",
         }
         result = coerce_session_permissions(raw)
-        assert result == raw, f"Expected pass-through, got {result}"
+        for key, value in raw.items():
+            assert result[key] == value, f"Expected {key}={value!r}, got {result[key]!r}"
+        # Sub-grains absent from raw are default-filled (not dropped):
+        assert result["git_read"] == SAFE_DEFAULTS["git_read"]
+        assert result["git_write"] == SAFE_DEFAULTS["git_write"]
 
     def test_invalid_value_replaced_with_default(self):
         """An invalid value for a known key should be replaced by the safe default."""

@@ -14,7 +14,9 @@ This suite verifies the routing fix in GitInfoTool and Agent:
 - ``execute()`` network gate: 'ask' network -> deferred; banned/missing stay
   fail-closed (atomic error returned).
 - ``Agent._apply_pending_config``: when a restart is deferred for a missing API
-  key, the session_permissions portion is still applied synchronously.
+  key, the whole pending config (including any session_permissions change) stays
+  pending; permissions are not mirrored onto the live config until the pending
+  config is applied via hot swap or restart.
 """
 from types import SimpleNamespace
 
@@ -232,9 +234,17 @@ class TestVaultHooksRemoved:
 
 
 class TestApplyPendingConfigPermissions:
-    """_apply_pending_config: permissions apply even when restart is deferred."""
+    """_apply_pending_config: deferred-restart updates stay pending in full.
 
-    def test_session_permissions_applied_when_restart_deferred(self, monkeypatch):
+    Permissions are part of the pending config, not a hot-swappable side
+    channel: when a restart is impossible, session_permissions are NOT
+    mirrored onto the live configs. The ask/deny decision therefore keeps
+    flowing through the outer gate (which owns the interactive ask flow),
+    and the user's grant remains effective until the restart lands.
+    """
+
+    def test_permissions_deferred_when_restart_deferred(self, monkeypatch):
+        """No API key: nothing applies, including session_permissions."""
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_COMPATIBLE_API_KEY", raising=False)
         monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
@@ -260,10 +270,11 @@ class TestApplyPendingConfigPermissions:
         assert result is False
         assert agent._pending_config is not None
         assert agent.config.model == "deepseek-reasoner"  # not swapped
-        # ...but session_permissions are hot-swappable and must land now.
-        assert agent.config.session_permissions.git == "ask"
-        assert agent.state.config.session_permissions.git == "ask"
-        assert agent.tool_executor.config.session_permissions.git == "ask"
+        # ...and session_permissions are NOT mirrored onto the live configs:
+        # they travel with the pending config and land only on the restart.
+        assert agent.config.session_permissions.git == "read"
+        assert agent.state.config.session_permissions.git == "read"
+        assert agent.tool_executor.config.session_permissions.git == "read"
 
     def test_no_sync_when_permissions_unchanged(self, monkeypatch):
         """Identical permissions: no-op branch keeps everything untouched."""

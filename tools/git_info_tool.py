@@ -98,6 +98,31 @@ class GitReadTool(ToolBase):
     _last_failure_reason: Optional[str] = None
     _last_fallback_used: bool = False
 
+    def _host_execution_denied_reason(self) -> Optional[str]:
+        """Return a deny reason when the workspace ceiling blocks host git.
+
+        Host-side git execution remains gated on the workspace top-level
+        ``allow_host_resources`` key (see ``tools.host_resource_policy``).
+        With no resolvable workspace id there is no workspace ceiling, so
+        the legacy host path stays allowed.  Any policy-lookup failure is
+        treated as "no ceiling" (fail open to the legacy path) so this gate
+        never makes git unusable when the policy helper is unavailable.
+        """
+        ws_id = self._resolved_workspace_id or getattr(self, "workspace_id", None)
+        if not ws_id:
+            return None
+        try:
+            from tools.host_resource_policy import workspace_allows_host_resources
+        except Exception:
+            return None
+        if workspace_allows_host_resources(ws_id):
+            return None
+        return (
+            "GitReadTool: host-side git execution requires "
+            "allow_host_resources: true in the workspace config "
+            f"(workspaces/{ws_id}/config.json)"
+        )
+
     @classmethod
     def get_required_categories(cls, params: dict | None = None) -> list[str]:
         """Return dynamic permission categories based on the git operation.
@@ -474,6 +499,11 @@ class GitReadTool(ToolBase):
                     "for this operation but container mode is not active "
                     "(host backend would bypass the commit QA gate)"
                 )
+            denied = self._host_execution_denied_reason()
+            if denied:
+                self._last_execution_mode = "unavailable"
+                self._last_failure_reason = denied
+                raise RuntimeError(denied)
             self._last_execution_mode = "host_fallback"
             self._last_failure_reason = None
             self._last_fallback_used = False
@@ -522,6 +552,11 @@ class GitReadTool(ToolBase):
                 "GitReadTool: containerized git execution is mandatory for "
                 f"this operation but execution degraded to host: {detail}"
             )
+        denied = self._host_execution_denied_reason()
+        if denied:
+            self._last_execution_mode = "unavailable"
+            self._last_failure_reason = denied
+            raise RuntimeError(denied)
         logger.warning(
             "GitReadTool degraded containerized git execution to hardened "
             "host git: %s (operation=%s)",
@@ -801,6 +836,7 @@ class GitReadTool(ToolBase):
                 workspace_path=self._resolved_workspace_path,
                 network_mode=network_mode,
                 session_permissions=self.session_permissions,
+                session_id=getattr(self, "session_id", None),
             )
 
         try:

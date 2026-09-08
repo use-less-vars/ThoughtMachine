@@ -39,9 +39,9 @@
     ]
   },
   {
-    "name": "docker",
-    "display_name": "Docker",
-    "description": "Docker container lifecycle and sandboxed code execution.",
+    "name": "container",
+    "display_name": "Container",
+    "description": "Container lifecycle and sandboxed code execution (Docker runtime).",
     "permission_grain_set": [
       "banned",
       "read",

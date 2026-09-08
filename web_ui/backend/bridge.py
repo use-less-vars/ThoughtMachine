@@ -1483,6 +1483,7 @@ class WebAgentBridge:
 
         # Log an old -> new field diff for observability (None == '' treated
         # as equivalent for string fields, mirroring Agent._configs_are_identical).
+        changed_keys = set()
         if old_session_config is not None and new_config is not None:
             old_dump = old_session_config.model_dump(exclude={'api_key', 'stop_check'})
             new_dump = new_config.model_dump(exclude={'api_key', 'stop_check'})
@@ -1496,32 +1497,48 @@ class WebAgentBridge:
                     new_val = None
                 if old_val != new_val:
                     changes.append(f'{key}: {repr(old_val)[:80]} -> {repr(new_val)[:80]}')
+                    changed_keys.add(key)
             if changes:
                 log('INFO', 'server.bridge',
                     f'apply_config: {len(changes)} change(s): ' + '; '.join(changes))
             else:
                 log('DEBUG', 'server.bridge', 'apply_config: no field changes detected')
 
-        # Step 3: Convert to AgentConfig and apply to controller
+        # A change that ONLY touches session_permissions is persisted (see
+        # _refresh_persistence_dump above and save_session below) and picked up
+        # by the tool-executor gate from disk on the next tool call.
+        permission_only_change = (
+            old_session_config is not None
+            and new_config is not None
+            and bool(changed_keys)
+            and changed_keys == {'session_permissions'}
+        )
+
+        # Step 3: Convert to AgentConfig (always needed below for audit + merge).
         agent_config = self._session_config.to_agent_config()
 
-        if self._controller is not None:
-            controller_alive = (
-                hasattr(self._controller, "thread")
-                and self._controller.thread is not None
-                and self._controller.thread.is_alive()
-            )
-            if not controller_alive:
-                log("WARNING", "server.bridge",
-                    "apply_config: controller thread is dead — restarting controller")
-                self._restart_controller(self._session_config)
-            self._controller.request_config_update(agent_config)
+        # Permission-only changes are persist-only: pushing them into the live
+        # controller is pointless and re-syncing the container would needlessly
+        # kill/rebuild it. Both are skipped for permission-only changes; non-
+        # permission (or mixed) changes keep both behaviors.
+        if not permission_only_change:
+            if self._controller is not None:
+                controller_alive = (
+                    hasattr(self._controller, "thread")
+                    and self._controller.thread is not None
+                    and self._controller.thread.is_alive()
+                )
+                if not controller_alive:
+                    log("WARNING", "server.bridge",
+                        "apply_config: controller thread is dead — restarting controller")
+                    self._restart_controller(self._session_config)
+                self._controller.request_config_update(agent_config)
 
-        # Step 4: Re-sync container
-        self._maybe_re_sync_container(
-            self._workspace_path or "",
-            getattr(agent_config, "session_permissions", None),
-        )
+            # Step 4: Re-sync container
+            self._maybe_re_sync_container(
+                self._workspace_path or "",
+                getattr(agent_config, "session_permissions", None),
+            )
 
         # Step 5: Persist to disk
         self.save_session()

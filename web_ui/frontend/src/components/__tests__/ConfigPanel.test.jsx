@@ -7,9 +7,10 @@
  *   - header / save-as-default button
  *   - all 8 tab buttons
  *   - /api/tools fetch on mount (global fetch is mocked)
- *   - Permissions tab: 5 selects in order, PERMISSION_DEFAULTS values when
- *     session_permissions is missing, container checkbox, legacy boolean
- *     network normalization (true → 'write', false → 'banned')
+ *   - Permissions tab: 5 selects in order (Git, Filesystem, Network, MCP, Host
+ *     Bash), canonical safe defaults when session_permissions is missing,
+ *     container checkbox, legacy boolean network normalization (true → 'write',
+ *     false → 'banned')
  *   - set_default_config flow + pending/saved button states
  *   - apply_config flow + disabled state when ws is disconnected
  *   - mode badge with (locked) hint
@@ -131,17 +132,17 @@ describe('backend tool fetch', () => {
 // Permissions tab
 // ==========================================================================
 describe('Permissions tab', () => {
-  it('shows PERMISSION_DEFAULTS values when session_permissions is missing', () => {
+  it('shows canonical safe-default values when session_permissions is missing', () => {
     const { container } = renderPanel({ config: { ...baseConfig, session_permissions: undefined } });
     fireEvent.click(screen.getByRole('button', { name: 'Permissions' }));
     const selects = container.querySelectorAll('select');
     expect(selects).toHaveLength(5);
-    // Order must be: Filesystem, Network, Git, System, Execution
-    expect(selects[0].value).toBe(PERMISSION_DEFAULTS.filesystem); // 'read'
-    expect(selects[1].value).toBe(PERMISSION_DEFAULTS.network);   // 'banned'
-    expect(selects[2].value).toBe(PERMISSION_DEFAULTS.git);       // 'read'
-    expect(selects[3].value).toBe(PERMISSION_DEFAULTS.system);    // 'read'
-    expect(selects[4].value).toBe(PERMISSION_DEFAULTS.execution); // 'banned'
+    // Order must be: Git, Filesystem, Network, MCP, Host Bash
+    expect(selects[0].value).toBe(PERMISSION_DEFAULTS.git);       // 'read'
+    expect(selects[1].value).toBe(PERMISSION_DEFAULTS.filesystem); // 'read'
+    expect(selects[2].value).toBe(PERMISSION_DEFAULTS.network);   // 'banned'
+    expect(selects[3].value).toBe('banned');                      // mcp — not in legacy PERMISSION_DEFAULTS
+    expect(selects[4].value).toBe('banned');                      // host_bash — not in legacy PERMISSION_DEFAULTS
     const checkbox = container.querySelector('input[type="checkbox"]');
     expect(checkbox).not.toBeChecked();
   });
@@ -150,21 +151,21 @@ describe('Permissions tab', () => {
     const { container } = renderPanel();
     fireEvent.click(screen.getByRole('button', { name: 'Permissions' }));
     const selects = container.querySelectorAll('select');
-    expect(selects[0].value).toBe('write');
+    expect(selects[1].value).toBe('write'); // filesystem select (index 0 is now Git)
   });
 
   it('normalizes legacy boolean network permission true → write', () => {
     const { container } = renderPanel({ config: { ...baseConfig, session_permissions: { network: true } } });
     fireEvent.click(screen.getByRole('button', { name: 'Permissions' }));
     const selects = container.querySelectorAll('select');
-    expect(selects[1].value).toBe('write');
+    expect(selects[2].value).toBe('write');
   });
 
   it('normalizes legacy boolean network permission false → banned', () => {
     const { container } = renderPanel({ config: { ...baseConfig, session_permissions: { network: false } } });
     fireEvent.click(screen.getByRole('button', { name: 'Permissions' }));
     const selects = container.querySelectorAll('select');
-    expect(selects[1].value).toBe('banned');
+    expect(selects[2].value).toBe('banned');
   });
 });
 

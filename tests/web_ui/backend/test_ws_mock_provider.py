@@ -13,7 +13,8 @@ The MockProvider:
 Tests:
 1. new_session emits lifecycle events
 2. continue_session without a usable provider emits an error (mock never used)
-3. apply_config replaces session_permissions wholesale
+3. apply_config overlays a partial session_permissions payload over the
+   currently granted set (merge semantics — prior grants survive)
 4. saving and loading session preserves config
 5. model_override is ignored by apply_config
 6. api_key is stripped from the config dump
@@ -304,29 +305,36 @@ class TestWebSocketWithMockProvider:
             f"{len(MockProvider._instances)} — the mock must not be used"
         )
 
-    def test_apply_config_permissions_replace(self, mock_server):
+    def test_apply_config_permissions_merge_preserves_prior_grants(self, mock_server):
         """
-        apply_config with partial session_permissions REPLACES the whole
-        permissions dict (assignment semantics, not deep-merge).
+        apply_config with partial session_permissions MERGES the payload over
+        the currently granted set (overlay semantics, not wholesale replace):
+        keys absent from the payload survive unchanged, explicit payload
+        values win.
         """
         app, _tmp_home = mock_server
+        first_perms = {
+            "filesystem": "read",
+            "network": "banned",
+            "git": "read",
+            "container": False,
+            "mcp": "banned",
+            "host_bash": "banned",
+        }
         with TestClient(app) as client:
             with client.websocket_connect("/ws") as ws:
                 # Create session
                 new_session(ws)
 
-                # First, apply a config with full session_permissions
+                # First, apply a config with a full session_permissions set
+                # (canonical permission keys only).
                 ws.send_json({
                     "command": "apply_config",
                     "config": {
                         "provider_type": "mock",
                         "api_key": "mock-key",
                         "model": "mock-model",
-                        "session_permissions": {
-                            "filesystem": "read",
-                            "network": False,
-                            "browser": "deny",
-                        },
+                        "session_permissions": dict(first_perms),
                     },
                 })
                 poll_for_type(ws, "config_changed", timeout=5.0)
@@ -343,12 +351,22 @@ class TestWebSocketWithMockProvider:
                 config_msgs = poll_for_type(ws, "config_changed", timeout=5.0)
                 last_config = config_msgs[-1]["config"]
 
-        # session_permissions is replaced wholesale (not deep-merged)
+        # session_permissions is merged (overlay), not replaced wholesale:
+        # the partial payload flips 'filesystem' but every previously granted
+        # key keeps its value.
         perms = last_config.get("session_permissions", {})
-        assert perms == {"filesystem": "write"}, (
-            f"Expected session_permissions to be replaced by "
-            f"{{'filesystem': 'write'}}, got {perms}"
+        assert perms.get("filesystem") == "write", (
+            f"Explicit payload value should win; got "
+            f"filesystem={perms.get('filesystem')!r} in {perms}"
         )
+        for key, expected in first_perms.items():
+            if key == "filesystem":
+                continue
+            assert perms.get(key) == expected, (
+                f"apply_config must preserve previously granted "
+                f"'{key}'={expected!r} (merge, not replace); got "
+                f"{perms.get(key)!r} in {perms}"
+            )
 
     def test_model_override_ignored(self, mock_server):
         """

@@ -16,6 +16,7 @@ import GlobalResources from './GlobalResources'
 import GlobalCredentials from './GlobalCredentials'
 import PromptLibrary from './PromptLibrary'
 import ManageProvidersModal from './ManageProvidersModal'
+import NewSessionModal from './workspace/modals/NewSessionModal'
 import { fetchGlobalSummary } from '../globalApi'
 import './WorkspaceSelector.css'
 
@@ -49,6 +50,12 @@ export default function WorkspaceSelector() {
   const [acknowledgedRisk, setAcknowledgedRisk] = useState(false)
 
   const [showProviders, setShowProviders] = useState(false)
+
+  // '+ New Session' flow: sessionTarget opens NewSessionModal directly (one
+  // workspace); chooserOpen/chooserWsId pick the target when several exist.
+  const [sessionTarget, setSessionTarget] = useState(null)
+  const [chooserOpen, setChooserOpen] = useState(false)
+  const [chooserWsId, setChooserWsId] = useState('')
 
   const loadSummary = useCallback(async () => {
     setLoading(true)
@@ -125,6 +132,24 @@ export default function WorkspaceSelector() {
 
   const sensitiveSelected = !!selectedFolderPath && isPathSensitive(selectedFolderPath)
 
+  const openNewSession = () => {
+    if (workspaces.length === 1) {
+      const ws = workspaces[0]
+      setSessionTarget({ id: ws.id, name: ws.label || ws.id, path: ws.root || '' })
+      return
+    }
+    if (workspaces.length === 0) return
+    setChooserWsId(workspaces[0].id)
+    setChooserOpen(true)
+  }
+
+  const confirmChooser = () => {
+    const ws = workspaces.find((w) => w.id === chooserWsId)
+    if (!ws) return
+    setChooserOpen(false)
+    setSessionTarget({ id: ws.id, name: ws.label || ws.id, path: ws.root || '' })
+  }
+
   return (
     <div className="ws-selector">
       <VaultHealthBanner />
@@ -187,7 +212,14 @@ export default function WorkspaceSelector() {
         </section>
 
         <section className="gms-section" aria-label="Active Sessions">
-          <h3 className="gms-section-title">Active Sessions</h3>
+          <div className="gms-section-head">
+            <h3 className="gms-section-title">Active Sessions</h3>
+            {workspaces.length > 0 && (
+              <button className="ws-modal-btn gms-session-new-btn" onClick={openNewSession}>
+                + New Session
+              </button>
+            )}
+          </div>
           <GlobalSessions sessions={sessions} workspaces={workspaces} />
         </section>
 
@@ -217,6 +249,47 @@ export default function WorkspaceSelector() {
             ⚙ Manage Providers
           </button>
         </section>
+
+        {chooserOpen && (
+          <div className="ws-modal-overlay" onClick={() => setChooserOpen(false)}>
+            <div
+              className="ws-modal-dialog"
+              role="dialog"
+              aria-label="New session — choose workspace"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h3 className="ws-modal-title">New Session</h3>
+              <p className="ws-modal-hint">Choose the workspace for the new session.</p>
+              <label className="ws-modal-label" htmlFor="gms-session-ws-select">
+                Workspace
+              </label>
+              <select
+                id="gms-session-ws-select"
+                className="gms-session-chooser"
+                value={chooserWsId}
+                onChange={(e) => setChooserWsId(e.target.value)}
+              >
+                {workspaces.map((ws) => (
+                  <option key={ws.id} value={ws.id}>
+                    {ws.label || ws.id}
+                  </option>
+                ))}
+              </select>
+              <div className="ws-modal-actions">
+                <button className="ws-modal-btn" onClick={() => setChooserOpen(false)}>
+                  Cancel
+                </button>
+                <button className="ws-modal-btn ws-modal-btn-primary" onClick={confirmChooser}>
+                  Create Session
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {sessionTarget && (
+          <NewSessionModal workspace={sessionTarget} onClose={() => setSessionTarget(null)} />
+        )}
 
         {showProviders && (
           <ManageProvidersModal

@@ -101,7 +101,16 @@ def _backend_env(vault: str, port: int) -> dict:
 
 
 def _start_backend(vault: str, port: int) -> subprocess.Popen:
-    return subprocess.Popen(
+    """Boot the backend with stdout/stderr redirected to a log file.
+
+    Child output is written straight to a file descriptor (``stdout=PIPE``
+    would leave the pipe undrained and wedge the backend once ~64KB of log
+    output accumulates).  The log handle is attached to the Popen object and
+    closed by ``_stop_proc`` so restarts can re-append to the same file.
+    """
+    log_path = Path(vault) / f"backend-{port}.log"
+    log_handle = open(log_path, "ab", buffering=0)
+    proc = subprocess.Popen(
         [
             sys.executable,
             "-m",
@@ -113,21 +122,30 @@ def _start_backend(vault: str, port: int) -> subprocess.Popen:
         ],
         cwd=REPO_ROOT,
         env=_backend_env(vault, port),
-        stdout=subprocess.PIPE,
+        stdout=log_handle,
         stderr=subprocess.STDOUT,
-        text=True,
     )
+    proc._log_handle = log_handle
+    proc._log_path = log_path
+    return proc
 
 
 def _stop_proc(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
-    proc.terminate()
-    try:
-        proc.wait(timeout=15)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=15)
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=15)
+    # Close the attached log handle even when the child already exited (e.g.
+    # a crash mid-test) so a restart can safely re-open the same log file.
+    handle = getattr(proc, "_log_handle", None)
+    if handle is not None:
+        try:
+            handle.close()
+        except OSError:
+            pass
 
 
 def _resolve_node() -> str:
@@ -155,17 +173,29 @@ def _resolve_node() -> str:
 
 @pytest.fixture(scope="session")
 def e2e_backend():
-    """Boot the real FastAPI backend as a subprocess against a temp vault."""
+    """Boot the real FastAPI backend as a subprocess against a temp vault.
+
+    Process state is held in a mutable local ``state`` dict that is yielded
+    to tests.  ``restart_backend`` may replace ``state["proc"]`` with a
+    fresh process; teardown always stops the process currently recorded in
+    the dict, so a restarted backend is cleaned up at session end instead
+    of being leaked.
+    """
     vault = tempfile.mkdtemp(prefix="e2e_vault_")
     (Path(vault) / ".thoughtmachine").mkdir(parents=True, exist_ok=True)
     port = _free_port(8000)
-    proc = _start_backend(vault, port)
-    base_url = f"http://127.0.0.1:{port}"
+    state = {
+        "base_url": f"http://127.0.0.1:{port}",
+        "port": port,
+        "vault": vault,
+        "proc": _start_backend(vault, port),
+        "log_path": str(Path(vault) / f"backend-{port}.log"),
+    }
     try:
-        _wait_http_ok(f"{base_url}/health")
-        yield {"base_url": base_url, "port": port, "vault": vault, "proc": proc}
+        _wait_http_ok(f"{state['base_url']}/health")
+        yield state
     finally:
-        _stop_proc(proc)
+        _stop_proc(state["proc"])
 
 
 @pytest.fixture(scope="session")
@@ -178,18 +208,28 @@ def e2e_frontend(e2e_backend):
             f"{FRONTEND_DIR} first"
         )
     port = _free_port(5173)
+    # Same stdout=PIPE-wedge guard as the backend: redirect to a log file so
+    # an undrained pipe can never stall the dev server.
+    log_path = Path(e2e_backend["vault"]) / f"vite-{port}.log"
+    log_handle = open(log_path, "ab", buffering=0)
     proc = subprocess.Popen(
         [node, str(VITE_BIN), "--host", "127.0.0.1", "--port", str(port)],
         cwd=FRONTEND_DIR,
         env={**os.environ, "VITE_BACKEND_PORT": str(e2e_backend["port"])},
-        stdout=subprocess.PIPE,
+        stdout=log_handle,
         stderr=subprocess.STDOUT,
-        text=True,
     )
+    proc._log_handle = log_handle
+    proc._log_path = log_path
     base_url = f"http://127.0.0.1:{port}"
     try:
         _wait_http_ok(f"{base_url}/")
-        yield {"base_url": base_url, "port": port, "proc": proc}
+        yield {
+            "base_url": base_url,
+            "port": port,
+            "proc": proc,
+            "log_path": str(log_path),
+        }
     finally:
         _stop_proc(proc)
 
@@ -217,6 +257,12 @@ def restart_backend(e2e_backend):
 
     The Vite dev server proxies to the backend by port, so restarting on the
     same port keeps the frontend working without a frontend restart.
+
+    The replacement process is written back into ``e2e_backend``'s mutable
+    state, and the session-scoped ``e2e_backend`` fixture owns final
+    cleanup: this fixture deliberately has NO teardown of its own, so a
+    restart never kills the shared session-scoped backend out from under
+    later tests.
     """
 
     def _restart():
@@ -227,7 +273,6 @@ def restart_backend(e2e_backend):
         return new_proc
 
     yield _restart
-    _stop_proc(e2e_backend["proc"])
 
 
 @pytest.fixture(scope="session")

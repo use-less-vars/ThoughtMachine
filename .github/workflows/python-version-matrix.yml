@@ -1,0 +1,141 @@
+#===============================================================================
+# python-version-matrix.yml - Python-version compatibility matrix CI.
+#
+# WHY: the install pipeline accepts Python 3.11+ with NO upper ceiling
+# (3.14 is the current supported release line - see
+# install_thoughtmachine.bat and install_thoughtmachine.sh). This workflow
+# makes that promise testable:
+#
+#   * unit-tests - the full pytest suite (minus docker/e2e marked tests)
+#     runs on every supported CPython line: 3.11, 3.12, 3.13 and 3.14.
+#     3.14 is where pip cp314 wheel availability actually gets exercised,
+#     so a failure here is the early-warning signal this change is about.
+#
+#   * installer-contract - static assertions that the installer scripts
+#     really are floor-only: they probe python3.14 FIRST, the winget
+#     auto-install pins Python.Python.3.14, and the 3.15+ warning threshold
+#     is in place. Regression greps prove the old 3.11-3.13 ceiling text is
+#     gone from both installers.
+#
+#   * windows-python-314 - runs the EXACT version-probe snippet used by
+#     install_thoughtmachine.bat on a real Windows runner with Python 3.14:
+#     the new floor-only probe must accept 3.14 (exit 0) and the legacy
+#     capped probe must reject it (non-zero) - proof that 3.14 would have
+#     been blocked before this change.
+#===============================================================================
+name: Python Version Matrix
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: python-version-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Unit tests - Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12', '3.13', '3.14']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -e .
+
+      # docker/e2e tests need a real Docker daemon / Playwright browsers;
+      # the plain unit + integration suite must pass on every supported line.
+      - name: Run unit tests
+        run: python -m pytest -m "not docker and not e2e" --timeout 600 -ra
+
+  installer-contract:
+    name: Installer version-contract assertions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Shell syntax check
+        run: bash -n install.sh install_thoughtmachine.sh start_thoughtmachine.sh
+
+      - name: install_thoughtmachine.sh probes python3.14 first
+        run: |
+          grep -qF -- "for cmd in python3.14 python3.13 python3.12 python3.11 python3 python; do" install_thoughtmachine.sh \
+            || { echo "::error::install_thoughtmachine.sh must probe python3.14 first"; exit 1; }
+
+      - name: install_thoughtmachine.sh winget auto-install pins Python 3.14
+        run: |
+          grep -qF -- "Python.Python.3.14" install_thoughtmachine.sh \
+            || { echo "::error::winget install must pin Python.Python.3.14"; exit 1; }
+          if grep -qF -- "Python.Python.3.12" install_thoughtmachine.sh; then
+            echo "::error::stale Python.Python.3.12 winget pin still present"
+            exit 1
+          fi
+
+      - name: install_thoughtmachine.sh warns only on 3.15+ (floor-only)
+        run: |
+          grep -qF -- "-ge 15" install_thoughtmachine.sh \
+            || { echo "::error::3.15+ warning threshold missing"; exit 1; }
+          if grep -qF -- 'minor" -ge 14' install_thoughtmachine.sh; then
+            echo "::error::old 3.14+ warning threshold still present (should be 3.15+)"
+            exit 1
+          fi
+
+      - name: install_thoughtmachine.bat gate is floor-only (3.11+)
+        run: |
+          grep -qF -- "sys.version_info[:2] else 1" install_thoughtmachine.bat \
+            || { echo "::error::install_thoughtmachine.bat probe must accept any Python >= 3.11"; exit 1; }
+          grep -qF -- "(3,15)" install_thoughtmachine.bat \
+            || { echo "::error::3.15+ warning probe missing in install_thoughtmachine.bat"; exit 1; }
+          if grep -qF -- "sys.version_info[:2]<=(3,13)" install_thoughtmachine.bat; then
+            echo "::error::old 3.11-3.13 ceiling still present in install_thoughtmachine.bat"
+            exit 1
+          fi
+          if grep -qF -- "3.11-3.13" install_thoughtmachine.bat; then
+            echo "::error::old 3.11-3.13 message still present in install_thoughtmachine.bat"
+            exit 1
+          fi
+
+  windows-python-314:
+    name: Windows Python 3.14 gate proof
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: New floor-only probe accepts Python 3.14
+        run: |
+          python -c "import sys;sys.exit(0 if (3,11)<=sys.version_info[:2] else 1)"
+          echo "OK: floor-only gate accepted $(python --version 2>&1)"
+
+      - name: Legacy capped probe would have rejected 3.14
+        run: |
+          if python -c "import sys;sys.exit(0 if (3,11)<=sys.version_info[:2]<=(3,13) else 1)"; then
+            echo "::error::legacy 3.11-3.13 ceiling unexpectedly accepted Python 3.14"
+            exit 1
+          fi
+          echo "OK: legacy 3.11-3.13 ceiling correctly rejects $(python --version 2>&1)"

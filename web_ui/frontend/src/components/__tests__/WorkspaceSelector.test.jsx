@@ -230,4 +230,69 @@ describe('WorkspaceSelector', () => {
     await waitFor(() => expect(window.location.hash).toBe('#/workspace/ws-custom'))
     expect(localStorage.getItem('thoughtmachine_last_workspace')).toBe('/home/test/project-a')
   })
+
+  it('creates a session through the chooser when several workspaces exist', async () => {
+    const createBodies = []
+    stubFetchByUrl([
+      ...ROUTES,
+      { match: '/api/session/list?workspace_id=ws-b', value: jsonOk([]) },
+      {
+        match: '/api/session/create',
+        value: (url, init) => {
+          createBodies.push(JSON.parse(init.body))
+          return jsonOk({ session_id: 's-x', mode: 'engineer' })
+        },
+      },
+    ])
+    render(<WorkspaceSelector />)
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    fireEvent.click(screen.getByRole('button', { name: '+ New Session' }))
+    const chooser = screen.getByRole('dialog', { name: /choose workspace/ })
+    expect(chooser).toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText('Workspace'), { target: { value: 'ws-b' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create Session' }))
+
+    // The chooser closes and the real session modal opens targeted at ws-b.
+    const modal = await screen.findByRole('dialog', { name: /^New session$/ })
+    expect(screen.queryByRole('dialog', { name: /choose workspace/ })).toBeNull()
+    expect(modal).toHaveTextContent('Beta Workspace')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Create Session' }))
+    await waitFor(() => expect(createBodies.length).toBe(1))
+    // ws objects in the summary carry no root; no name typed -> plain body.
+    expect(createBodies[0]).toEqual({ mode: 'engineer', workspace_id: 'ws-b' })
+    expect(await screen.findByText('Session created.')).toBeInTheDocument()
+  })
+
+  it('opens the session modal directly when exactly one workspace exists', async () => {
+    stubFetchByUrl(
+      ROUTES.map((r) =>
+        r.match === '/api/global/summary'
+          ? { match: r.match, value: jsonOk({ ...SUMMARY, workspaces: [SUMMARY.workspaces[0]] }) }
+          : r
+      ).concat([{ match: '/api/session/list?workspace_id=ws-a', value: jsonOk([]) }])
+    )
+    render(<WorkspaceSelector />)
+    await screen.findByRole('heading', { name: 'Alpha Workspace' })
+
+    fireEvent.click(screen.getByRole('button', { name: '+ New Session' }))
+    const modal = await screen.findByRole('dialog', { name: /^New session$/ })
+    expect(screen.queryByRole('dialog', { name: /choose workspace/ })).toBeNull()
+    expect(modal).toHaveTextContent('Alpha Workspace')
+  })
+
+  it('hides the New Session button when there are no workspaces', async () => {
+    stubFetchByUrl(
+      ROUTES.map((r) =>
+        r.match === '/api/global/summary'
+          ? { match: r.match, value: jsonOk({ ...SUMMARY, workspaces: [], active_sessions: [] }) }
+          : r
+      )
+    )
+    render(<WorkspaceSelector />)
+    await screen.findByText('No workspaces yet. Create one to get started.')
+    expect(screen.queryByRole('button', { name: '+ New Session' })).toBeNull()
+  })
 })

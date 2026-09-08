@@ -56,9 +56,9 @@ const CATALOG = [
     tools: ['read_file', 'file_editor', 'apply_edits', 'file_search', 'glob'],
   },
   {
-    name: 'docker',
-    display_name: 'Docker',
-    description: 'Docker container execution',
+    name: 'container',
+    display_name: 'Container',
+    description: 'Container sandboxed code execution (Docker runtime)',
     permission_grain_set: ['banned', 'read', 'ask', 'write'],
     default_execution_context: 'containerized',
     container_image: null,
@@ -106,7 +106,7 @@ function makeSummary(overrides = {}) {
     permissions: {
       git: 'read',
       filesystem: 'read',
-      docker: 'banned',
+      container: 'banned',
       host_bash: 'banned',
       tty: 'read',
       jtag: 'banned',
@@ -168,13 +168,13 @@ describe('WorkspaceDetailPage \u2014 Permissions & Resources', () => {
     expect(document.querySelectorAll('.wdp-resource-card').length).toBe(6)
     expect(cardFor('Git').getByRole('combobox')).toHaveValue('read')
     expect(cardFor('Filesystem').getByRole('combobox')).toHaveValue('read')
-    expect(cardFor('Docker').getByRole('combobox')).toHaveValue('banned')
+    expect(cardFor('Container').getByRole('combobox')).toHaveValue('banned')
     expect(cardFor('Host bash').getByRole('combobox')).toHaveValue('banned')
     expect(cardFor('TTY').getByRole('combobox')).toHaveValue('read')
     expect(cardFor('JTAG').getByRole('combobox')).toHaveValue('banned')
     // Banned resources render as Disabled with an Off switch.
-    expect(cardFor('Docker').getByText('Disabled')).toBeInTheDocument()
-    expect(cardFor('Docker').getByText('Off')).toBeInTheDocument()
+    expect(cardFor('Container').getByText('Disabled')).toBeInTheDocument()
+    expect(cardFor('Container').getByText('Off')).toBeInTheDocument()
     expect(cardFor('Git').getByText('Enabled')).toBeInTheDocument()
   })
 
@@ -247,5 +247,28 @@ describe('WorkspaceDetailPage \u2014 Permissions & Resources', () => {
     // Draft preserved on failure \u2014 the editor must not be reset.
     expect(cardFor('Git').getByRole('combobox')).toHaveValue('write')
     expect(screen.getByRole('button', { name: 'Apply Permissions' })).toBeEnabled()
+  })
+
+  it('omits workspace_path when the workspace root is a tilde path', async () => {
+    const createBodies = []
+    stubBackend(makeSummary(), {
+      '/api/session/list?workspace_id=ws-test-1': jsonOk([]),
+      '/api/session/create': (url, init) => {
+        createBodies.push(JSON.parse(init.body))
+        return jsonOk({ session_id: 's-tilde-1', mode: 'engineer' })
+      },
+    })
+    render(<WorkspaceDetailPage workspaceId="ws-test-1" />)
+    await screen.findByText('Code Development')
+
+    fireEvent.click(screen.getByRole('button', { name: '+ New Session' }))
+    await screen.findByRole('dialog', { name: /^New session$/ })
+    fireEvent.click(screen.getByRole('button', { name: 'Create Session' }))
+
+    await waitFor(() => expect(createBodies.length).toBe(1))
+    // '~/workspaces/ws-test-1' is not an absolute path, so workspace_path must
+    // be omitted and the backend resolves the root on its own.
+    expect(createBodies[0]).toEqual({ mode: 'engineer', workspace_id: 'ws-test-1' })
+    expect(createBodies[0]).not.toHaveProperty('workspace_path')
   })
 })

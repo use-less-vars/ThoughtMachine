@@ -32,6 +32,7 @@ from thoughtmachine.security import SessionPermissions, PERMISSION_SCHEMA, _pend
 from agent.config.defaults import PROMPT_TIMEOUT, RESOURCE_REGISTRY
 from agent.events import SecurityPromptEvent, EventType, NullEventBus
 from security.gate_helpers import _value_satisfies
+from security.resource_catalog import RESOURCE_CATALOG, coerce_resource_permissions
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,33 @@ _FAIL_CLOSED_CAPABILITIES = WorkspaceCapabilities(
     allow_network=False,
     git_available=False,
 )
+
+# ── Fail-closed disk-mode constants ──────────────────────────────────────────────────────────────────────
+# Used when ``get_effective_permissions()`` runs in disk mode (both
+# ``session_id`` and ``workspace_id`` supplied, no in-memory
+# ``workspace_permissions``) and the vault permission store cannot be read
+# (missing/corrupt sidecar or config, I/O error, unexpected exception).  The
+# deny-all session plus deny-all ceiling flow through the SAME merge below
+# and yield the all-banned 10-key result shape — a disk-mode caller never
+# receives default grants because the store was unreadable.
+_DISK_FAIL_CLOSED_SESSION = SessionPermissions(
+    container=False,
+    network="banned",
+    filesystem="banned",
+    system="banned",
+    git="banned",
+    execution="banned",
+    mcp="banned",
+)
+_DISK_FAIL_CLOSED_CEILING: Dict[str, Any] = {
+    "filesystem": "banned",
+    "container": False,
+    "host_bash": "banned",
+    "git": "banned",
+    "git_read": "banned",
+    "git_write": "banned",
+    "network": "banned",
+}
 
 
 def get_workspace_capabilities(workspace_id: str) -> WorkspaceCapabilities:
@@ -110,6 +138,11 @@ def _min_permission(
     _LEVEL_MAP: dict[str, float] = {
         "banned": 0.0, "ask": 1.0, "none": 1.0,
         "read": 2.0, "outbound": 2.5, "write": 3.0, "full": 4.0,
+        # Session git level (branch-restricted writes) ranks at write level,
+        # so a worker footprint restricting git to read caps it to read
+        # instead of keeping branch-write silently (the 2.0 unknown default
+        # below would let it slip through the comparison otherwise).
+        "write_on_feature_branch": 3.0,
     }
 
     def _level(v: Any) -> float:
@@ -138,6 +171,11 @@ _WORKSPACE_CEILING_LEVELS: Dict[str, float] = {
     "read": 1.0,
     "ask": 2.0,
     "write": 3.0,
+    # Session git level (branch-restricted writes) ranks at write level so
+    # a stricter ceiling (read/ask/banned) caps it like plain write while a
+    # write ceiling leaves it standing.  As a ceiling value it means
+    # write-rank (3.0) -- never unlimited.
+    "write_on_feature_branch": 3.0,
     "full": 3.0,  # session-side alias for write-level
     "none": 1.0,  # alias used by some purpose presets
     "outbound": 2.5,  # session-side network level
@@ -145,9 +183,12 @@ _WORKSPACE_CEILING_LEVELS: Dict[str, float] = {
 }
 
 # Workspace permission-map resource names -> session-permissions keys they cap.
-# Accepts both the NEW workspace map names (filesystem, docker, host_bash, git,
-# network, git_read, git_write) and the OLD purpose-preset names (container,
-# git_read, git_write, host_bash, network, filesystem).
+# The canonical workspace resource for sandboxed execution is ``container``
+# (boolean ceiling); the legacy alias ``docker`` maps onto it here, so a
+# docker ceiling of write-rank allows the container session grant while
+# anything stricter (banned/read/ask) denies it.  Also accepts the OLD
+# purpose-preset names (container, git_read, git_write, host_bash, network,
+# filesystem).
 _WORKSPACE_RESOURCE_MAP: Dict[str, str] = {
     "filesystem": "filesystem",
     "docker": "container",
@@ -157,6 +198,21 @@ _WORKSPACE_RESOURCE_MAP: Dict[str, str] = {
     "network": "network",
     "git_read": "git_read",
     "git_write": "git_write",
+}
+
+#: Recognised workspace-ceiling resource names: the canonical catalog
+#: resources (session-grant keys git/filesystem/container/network/mcp/
+#: host_bash -- see security/resource_catalog.py) plus the legacy alias
+#: ``docker`` (kept recognised -- normalised onto ``container`` by
+#: _WORKSPACE_RESOURCE_MAP so legacy disk ceilings never fail open) and the
+#: legacy git grains (git_read, git_write).
+#: A ceiling key outside this set is an unknown resource: it is logged and
+#: ignored (fail-open), so forward-compatible workspace maps never break
+#: session resolution.
+_WORKSPACE_CEILING_KEYS = frozenset(RESOURCE_CATALOG) | {
+    "docker",
+    "git_read",
+    "git_write",
 }
 
 
@@ -181,9 +237,22 @@ def apply_workspace_ceiling(
           session value stands.
         * An unknown ceiling level is treated as no ceiling (fail-open), so
           forward-compatible workspace maps never break session resolution.
+        * An unknown ceiling resource (outside ``RESOURCE_CATALOG`` and the
+          legacy workspace grains ``docker``/``git_read``/``git_write``) is
+          logged and ignored (fail-open) -- the session value stands.
+        * ``docker`` is a legacy alias for ``container``: it is normalised
+          onto ``container`` by ``_WORKSPACE_RESOURCE_MAP`` before ranking,
+          so a docker ceiling of ``write`` (or ``full``/``True``) allows the
+          container session grant, while ``banned``/``read``/``ask`` (or
+          ``False``) deny it.
         * Boolean session values (``container``) survive only when the
           ceiling is write-level or unlimited; any stricter ceiling forces
           ``False``.  The ``container`` key is always emitted as a boolean.
+        * ``host_bash`` is capped on its own scale -- ``banned < ask <
+          allow`` -- so a workspace ceiling of ``banned``/``ask``/``allow``
+          (or a boolean, ``True`` ~ ``allow``, ``False`` ~ ``banned``) caps
+          the session value accordingly.  The ``host_bash`` key is always
+          emitted as one of ``banned``/``ask``/``allow``.
         * Unknown session keys are passed through untouched.
     """
     if not workspace_permissions:
@@ -191,10 +260,63 @@ def apply_workspace_ceiling(
 
     result = dict(session_permissions)
     for resource, ceiling in workspace_permissions.items():
+        if resource not in _WORKSPACE_CEILING_KEYS:
+            logger.warning(
+                "ignoring workspace ceiling for unknown resource %r "
+                "(not a catalog resource or legacy workspace grain); "
+                "fail-open: no ceiling applied",
+                resource,
+            )
+            continue
         key = _WORKSPACE_RESOURCE_MAP.get(resource)
         if key is None or key not in result:
             continue  # unknown resource / not a session key: no ceiling
         session_val = result[key]
+
+        # host_bash ranks on its own scale -- banned < ask < allow -- which
+        # is NOT part of _WORKSPACE_CEILING_LEVELS ('allow' is not a generic
+        # ceiling level there, and 'ask' means something else).  It must be
+        # intercepted before the generic rank normalisation below, or a
+        # host_bash 'allow' ceiling would hit the unknown-level fail-open
+        # path and never cap the session value.  Legacy ceiling values like
+        # 'read'/'write' are not part of the host_bash vocabulary and are
+        # treated as unknown (warn + fail-open).
+        if key == "host_bash":
+            _HOST_BASH_RANKS = {"banned": 0.0, "ask": 1.0, "allow": 2.0}
+            if isinstance(ceiling, bool):
+                # Boolean host_bash ceiling: True ~ allow-level (2.0),
+                # False ~ banned (0.0, caps any session grant to banned).
+                ceiling_rank = 2.0 if ceiling else 0.0
+            elif isinstance(ceiling, str):
+                ceiling_rank = _HOST_BASH_RANKS.get(ceiling.lower())
+            else:
+                ceiling_rank = None
+            if ceiling_rank is None:
+                logger.warning(
+                    "ignoring workspace ceiling level %r for host_bash "
+                    "(not a host_bash level: banned/ask/allow); "
+                    "fail-open: no ceiling applied",
+                    ceiling,
+                )
+                continue
+            if isinstance(session_val, bool):
+                # Boolean session host_bash: True ~ allow (2.0).
+                session_rank = 2.0 if session_val else 0.0
+            else:
+                session_rank = _HOST_BASH_RANKS.get(
+                    str(session_val).lower()
+                )
+            if session_rank is None:
+                continue  # unknown session value: leave untouched
+            if ceiling_rank < session_rank:
+                # Only ever emit host_bash vocabulary values; a boolean
+                # ceiling caps to 'banned' (never a bare bool/"true").
+                result[key] = (
+                    "banned"
+                    if isinstance(ceiling, bool)
+                    else str(ceiling).lower()
+                )
+            continue
 
         # Normalise the ceiling to a rank; unknown ceilings are fail-open.
         if isinstance(ceiling, bool):
@@ -204,6 +326,12 @@ def apply_workspace_ceiling(
         else:
             ceiling_rank = None
         if ceiling_rank is None:
+            logger.warning(
+                "ignoring workspace ceiling level %r for resource %r "
+                "(not a known ceiling level); fail-open: no ceiling applied",
+                ceiling,
+                resource,
+            )
             continue
         if ceiling_rank >= 4.0:
             continue  # write_feature_branches -> unlimited
@@ -253,6 +381,13 @@ def split_git_permission(level: Any) -> tuple:
     ``full``             ``full``             ``full``
     ===================  ===================  ====================
 
+    ``write_on_feature_branch`` (session git level, branch-restricted
+    writes) splits into git_read ``read`` + git_write
+    ``write_on_feature_branch``: reads are allowed on any branch, while the
+    write grain carries the verbatim branch-aware level so the Phase-3 git
+    write tool gate can admit feature-branch commits and deny plain
+    ``git:write`` requests.
+
     ``ask`` maps to ``ask`` on both sub-levels so the interactive prompt
     flow for ``git:write`` is preserved (an ``ask`` write is prompted
     exactly as before).
@@ -266,6 +401,12 @@ def split_git_permission(level: Any) -> tuple:
         return ("read", "banned")
     if s in ("write", "full"):
         return (s, s)
+    if s == "write_on_feature_branch":
+        # Feature-branch write grant: reads are allowed everywhere; the
+        # write grain keeps the verbatim level so the branch-aware git
+        # write tool (Phase 3) can allow feature-branch commits while the
+        # gate denies plain git:write requests (fail closed until then).
+        return ("read", "write_on_feature_branch")
     # Unknown level: fail closed on both sub-levels.
     return (False, False)
 
@@ -274,15 +415,22 @@ def get_effective_permissions(
     session: SessionPermissions,
     workspace: WorkspaceCapabilities,
     workspace_permissions: Optional[Dict[str, Any]] = None,
+    *,
+    session_id: Optional[str] = None,
+    workspace_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Merge the session's permission profile with the workspace's capabilities.
 
-    Returns a flat dict with keys matching the seven permission categories,
-    plus the split git sub-categories::
+    Returns a flat dict with keys matching the eight permission categories
+    (including ``host_bash``), plus the split git sub-categories::
 
-        {"filesystem": ..., "network": ..., "container": ..., "git": ..., "system": ..., "mcp": ..., "execution": ...}
+        {"filesystem": ..., "network": ..., "container": ..., "git": ..., "system": ..., "mcp": ..., "execution": ..., "host_bash": ...}
         {"git_read": ..., "git_write": ...}
+
+    ``host_bash`` is capped by the workspace ceiling inside
+    :func:`apply_workspace_ceiling` (its own ``banned < ask < allow``
+    scale) and is otherwise the session value directly.
 
     Each value is either a boolean (``True`` / ``False``) for hard allow/deny,
     a string level (``"write"``, ``"read"``, ``"none"``, ``"banned"``, ``"ask"``, ``"outbound"``),
@@ -295,13 +443,89 @@ def get_effective_permissions(
     Args:
         workspace_permissions:
             Optional workspace-level permission ceilings — a dict mapping
-            workspace resource names (``filesystem``, ``docker``, ``host_bash``,
-            ``git``, ``network``, ``git_read``, ``git_write``) to their maximum
-            allowed level (e.g. ``{"filesystem": "read", "docker": "banned"}``).
-            Applied to the session profile BEFORE the workspace-capability merge
-            via :func:`apply_workspace_ceiling`, so a session can never exceed
-            the workspace's declared ceiling for this workspace.
+            workspace resource names (``filesystem``, ``container``,
+            ``host_bash``, ``git``, ``network``, ``git_read``,
+            ``git_write``) to their maximum allowed level (e.g.
+            ``{"filesystem": "read", "container": False}``).  ``container``
+            is the canonical boolean ceiling; the legacy alias ``docker`` is
+            also accepted and normalised onto ``container`` (write-level
+            allows the container session grant, anything stricter denies it).
+            Applied to the session profile BEFORE the workspace-capability
+            merge via :func:`apply_workspace_ceiling`, so a session can never
+            exceed the workspace's declared ceiling for this workspace.
+        session_id / workspace_id:
+            Keyword-only arguments enabling **disk mode**.  When BOTH are
+            supplied AND *workspace_permissions* is None, the session grant
+            profile and the workspace permission ceiling are loaded from the
+            vault permission store (``thoughtmachine.permission_store``)
+            under ``<vault>/workspaces/<workspace_id>/sessions/<session_id>``
+            and ``<vault>/workspaces/<workspace_id>/config.json``
+            respectively, instead of being taken from the *session* and
+            *workspace_permissions* arguments.  The stored grants replace the
+            *session* argument; the stored ceiling replaces
+            *workspace_permissions*; the *workspace* capabilities argument
+            is still merged below.
+
+    Precedence rule:
+        An explicit in-memory ``workspace_permissions`` dict always wins.
+        Disk mode engages ONLY when both ``session_id`` and ``workspace_id``
+        are supplied AND ``workspace_permissions`` is None; supplying just
+        one of the ids keeps the legacy behaviour unchanged.
+
+    Fail-closed contract:
+        Disk mode never fabricates permissive defaults.  If the store is
+        missing, corrupt, or raises for any reason, the session resolves to
+        a deny-all profile (every category ``banned`` / ``False``) and the
+        ceiling to a deny-all ceiling, so the merged result is the
+        all-denied shape rather than an accidental grant.
+
+    Absent-grant rule:
+        ``SessionPermissions`` carries safe pydantic defaults (filesystem
+        ``read``, git ``read``, system ``read``; network / mcp / execution
+        ``banned``; container ``False``).  A grant set that is missing a
+        key resolves to that key's default -- never an accidental denial of
+        a default.  Ceilings and workspace capabilities only ever lower
+        those values further; a ceiling-only passthrough that would lift a
+        default-banned key (e.g. ``network``) into a grant would be a
+        regression, which is why the full default-filled profile is kept.
     """
+    # ── Disk-mode dispatch ──────────────────────────────────────────────────────────────────────────────────────────────────
+    # Both ids supplied and no explicit in-memory ceiling: the grant profile
+    # and the ceiling come from the vault permission store.  Imports are
+    # lazy so the legacy in-memory path never depends on permission_store /
+    # vault.  Any store error fails CLOSED (deny-all session + deny-all
+    # ceiling); the merged result below can then only be restrictive.
+    if workspace_permissions is None and session_id is not None and workspace_id is not None:
+        import thoughtmachine.vault as _vault_module
+        from thoughtmachine.permission_store import (
+            read_session_permissions,
+            workspace_ceiling,
+        )
+
+        try:
+            _vault_root = _vault_module.vault_root()
+            disk_grants = read_session_permissions(_vault_root, workspace_id, session_id)
+            disk_ceiling = workspace_ceiling(_vault_root, workspace_id)
+        except Exception:
+            session = _DISK_FAIL_CLOSED_SESSION
+            workspace_permissions = _DISK_FAIL_CLOSED_CEILING
+        else:
+            try:
+                # Belt-and-braces: read_session_permissions already returns
+                # catalog-clean grants (the store coerces on every read and
+                # write), but re-coercing at the gate boundary keeps a
+                # non-catalog key from ever reaching SessionPermissions.
+                # coerce_resource_permissions never raises; the except below
+                # still guards the constructor.
+                session = SessionPermissions(
+                    **coerce_resource_permissions(disk_grants)
+                )
+            except Exception:
+                # Unreadable grant record -> deny-all session; the disk
+                # ceiling still applies on top of it.
+                session = _DISK_FAIL_CLOSED_SESSION
+            workspace_permissions = disk_ceiling
+
     # ── Workspace permission ceiling ────────────────────────────────────
     # The workspace's permission map is a hard ceiling on the session's
     # permission levels; apply it to the raw session profile first.  The
@@ -356,6 +580,7 @@ def get_effective_permissions(
         "system": system,
         "mcp": session.mcp,
         "execution": session.execution,
+        "host_bash": session.host_bash,
     }
 
 
@@ -634,7 +859,7 @@ def check_required_categories(
     if event_bus is None or is_worker_context or isinstance(event_bus, NullEventBus):
         return False, (
             f"Permission denied: {', '.join(ask_categories)} required by "
-            f"'{tool_name}' — no interactive user available for worker prompt approval."
+            f"'{tool_name}' — ask requires interactive approval; not available in worker context."
         )
 
     # ── Prompt the user for approval ────────────────────────────────────

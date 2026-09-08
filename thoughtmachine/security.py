@@ -113,9 +113,10 @@ class SessionPermissions(BaseModel):
     - **network**:    ``'banned' | 'ask' | 'write' | 'outbound'`` (legacy booleans are accepted)
     - **filesystem**: ``'banned' | 'read' | 'write' | 'full' | 'ask'``
     - **system**:   ``'banned' | 'read' | 'write' | 'full' | 'ask'``
-    - **git**:        ``'banned' | 'read' | 'write' | 'full' | 'ask'``
+    - **git**:        ``'banned' | 'read' | 'write' | 'full' | 'ask' | 'write_on_feature_branch'``
     - **execution**:  ``'banned' | 'read' | 'write' | 'full' | 'ask'``
     - **mcp**:        ``'banned' | 'connect' | 'full'``
+    - **host_bash**:  ``'banned' | 'ask' | 'allow'`` (supervised host shell access level; the security gate caps the session value by the workspace ceiling)
     """
 
     container: bool = Field(
@@ -134,7 +135,9 @@ class SessionPermissions(BaseModel):
         default='read',
         description='System operations access level.',
     )
-    git: Literal['banned', 'read', 'write', 'full', 'ask'] = Field(
+    git: Literal[
+        'banned', 'read', 'write', 'full', 'ask', 'write_on_feature_branch',
+    ] = Field(
         default='read',
         description='Git operations access level for the session.',
     )
@@ -159,6 +162,10 @@ class SessionPermissions(BaseModel):
     mcp: Literal['banned', 'connect', 'full'] = Field(
         default='banned',
         description='MCP server connection access level.',
+    )
+    host_bash: Literal['banned', 'ask', 'allow'] = Field(
+        default='banned',
+        description='Supervised host shell access level.',
     )
 
     @field_validator('network', mode='before')
@@ -188,18 +195,25 @@ class SessionPermissions(BaseModel):
 VALID_PERMISSION_LEVELS = ("banned", "ask", "read", "write")
 # "full" is intentionally excluded — it is not a valid mode for
 # the Docker security gate and should not be settable from the UI.
+# ``write_on_feature_branch`` is a git-only level ("commit only on feature
+# branches"; the security gate splits it into git_read=read +
+# git_write=write_on_feature_branch). It must NOT leak into the other
+# VALID_PERMISSION_LEVELS consumers (filesystem/system/git_read/git_write),
+# so ``git`` gets its own dedicated tuple below.
+GIT_PERMISSION_LEVELS = VALID_PERMISSION_LEVELS + ("write_on_feature_branch",)
 PERMISSION_SCHEMA: Dict[str, tuple] = {
     "network":   ("banned", "ask", "write", "outbound"),
     "filesystem": VALID_PERMISSION_LEVELS,   # banned, ask, read, write (no "full")
     "container":  (True, False),
     "execution":  ("banned", "ask", "read", "write"),
-    "git":        VALID_PERMISSION_LEVELS,
+    "git":        GIT_PERMISSION_LEVELS,   # + write_on_feature_branch (git-only)
     # Split git sub-categories (derived from ``git`` by the security gate;
     # declared here so worker permission footprints and config validation
     # accept them).
     "git_read":   VALID_PERMISSION_LEVELS,
     "git_write":  VALID_PERMISSION_LEVELS,
     "mcp":        ("banned", "connect", "full"),
+    "host_bash":  ("banned", "ask", "allow"),
     "system":     VALID_PERMISSION_LEVELS,
 }
 SAFE_DEFAULTS: Dict[str, Any] = {
@@ -209,6 +223,7 @@ SAFE_DEFAULTS: Dict[str, Any] = {
     "git": "read",
     "git_read": "read",
     "git_write": "banned",
+    "host_bash": "banned",
     "mcp": "banned",
     "network": "banned",
     "system": "read",

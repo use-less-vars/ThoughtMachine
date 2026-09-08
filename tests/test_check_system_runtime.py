@@ -61,9 +61,43 @@ def test_effective_permissions_uses_runtime():
         result = _parse_result(tool.execute())
     assert result["effective_permissions"] == {"filesystem": "read", "network": "deny"}
     assert result["source"] == "gate"
+    # No injected disk-effective dict here (direct construction): the legacy
+    # 2-arg mirror merge is the documented fallback.
+    assert result["permission_origin"] == "mirror-merge"
     call_args = mock_perms.call_args
     session_obj = call_args[0][0]
     assert getattr(session_obj, "filesystem", None) == "read"
+
+
+def test_effective_permissions_prefers_injected_disk_merge():
+    """A non-empty injected effective_permissions (ToolExecutor's per-call DISK
+    merge) wins over the stale session-start mirror in session_permissions.
+
+    Regression: after the operator downgraded filesystem write -> read on disk,
+    CheckSystem kept reporting filesystem:write because _query_permissions rebuilt
+    SessionPermissions from the never-refreshed in-memory mirror. The injected
+    dict is computed fresh each call from disk grants + ceiling, so it must be
+    reported verbatim and the mirror merge must NOT run.
+    """
+    stale_mirror = {"filesystem": "write", "network": "banned"}
+    disk_effective = {"filesystem": "read", "network": "banned"}
+    with patch.object(
+        CheckSystem, "_load_allowlist_from_vault", return_value=["effective_permissions"]
+    ), patch(
+        "tools.workspace.check_system.get_effective_permissions",
+        side_effect=AssertionError(
+            "mirror merge must not run when the disk-effective dict is injected"
+        ),
+    ):
+        tool = CheckSystem(
+            query="effective_permissions",
+            session_permissions=stale_mirror,
+            effective_permissions=disk_effective,
+        )
+        result = _parse_result(tool.execute())
+    assert result["effective_permissions"] == disk_effective
+    assert result["permission_origin"] == "executor-disk"
+    assert result["permission_fetch_error"] is None
 
 
 def test_runtime_state_returns_no_secrets(tmp_path):
@@ -97,3 +131,49 @@ def test_runtime_state_returns_no_secrets(tmp_path):
     assert result["worker_limits"]["worker_max_retries"] == 3
     assert "sk-secret" not in text
     assert '"api_key"' not in text
+
+
+def test_effective_permissions_reports_canonical_git_only():
+    """executor-disk dict folds the git grains into a single canonical git level."""
+    with patch.object(
+        CheckSystem, "_load_allowlist_from_vault", return_value=["effective_permissions"]
+    ):
+        tool = CheckSystem(
+            query="effective_permissions",
+            effective_permissions={
+                "filesystem": "read",
+                "network": "banned",
+                "git": "write",
+                "git_read": "write",
+                "git_write": "write",
+            },
+        )
+        result = _parse_result(tool.execute())
+    assert result["effective_permissions"] == {
+        "filesystem": "read",
+        "network": "banned",
+        "git": "write",
+    }
+    assert result["permission_origin"] == "executor-disk"
+
+
+def test_effective_permissions_folds_session_mirror_git_grains_without_gate():
+    """session-mirror fallback still reports a canonical git level (display-only)."""
+    with patch.object(
+        CheckSystem, "_load_allowlist_from_vault", return_value=["effective_permissions"]
+    ), patch("tools.workspace.check_system.GATE_AVAILABLE", False):
+        tool = CheckSystem(
+            query="effective_permissions",
+            session_permissions={
+                "filesystem": "read",
+                "git_read": "write",
+                "git_write": "write_on_feature_branch",
+            },
+        )
+        result = _parse_result(tool.execute())
+    assert result["effective_permissions"] == {
+        "filesystem": "read",
+        "git": "write_on_feature_branch",
+    }
+    assert result["permission_origin"] == "session-mirror"
+

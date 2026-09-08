@@ -10,6 +10,7 @@ import React, { useEffect, useState } from 'react'
 import useWorkspaceSummary from './useWorkspaceSummary'
 import { fetchTools, updateWorkspacePermissions } from './workspaceApi'
 import VaultHealthBanner from '../VaultHealthBanner'
+import NewSessionModal from './modals/NewSessionModal'
 import './WorkspaceDetailPage.css'
 
 const TABS = [
@@ -409,6 +410,7 @@ export default function WorkspaceDetailPage({ workspaceId }) {
   const [applyError, setApplyError] = useState(null)
   const [applySuccess, setApplySuccess] = useState(null)
   const [activeTab, setActiveTab] = useState('Overview')
+  const [showNewSession, setShowNewSession] = useState(false)
 
   // Keep the toggle and the permissions editor in sync with the persisted
   // values each time the summary (re)loads — including after a successful
@@ -519,6 +521,13 @@ export default function WorkspaceDetailPage({ workspaceId }) {
           <div className="wdp-ws-id">{summary.workspace_id}</div>
         </div>
         <div className="wdp-header-controls">
+          <button
+            type="button"
+            className="wdp-new-session-btn"
+            onClick={() => setShowNewSession(true)}
+          >
+            + New Session
+          </button>
           <div className="wdp-counts">
             <span className="wdp-count" title="Active sessions">
               {activeSessions} sessions
@@ -657,6 +666,18 @@ export default function WorkspaceDetailPage({ workspaceId }) {
             </div>
           </div>
         </div>
+      )}
+
+      {showNewSession && (
+        <NewSessionModal
+          workspace={{
+            id: summary.workspace_id,
+            name: summary.label || summary.workspace_id,
+            path: summary.root_path || '',
+            root: summary.root_path || '',
+          }}
+          onClose={() => setShowNewSession(false)}
+        />
       )}
     </div>
   )

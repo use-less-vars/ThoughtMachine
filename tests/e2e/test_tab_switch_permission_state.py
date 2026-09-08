@@ -1,24 +1,37 @@
 """
-E2E regression test: switching between session tabs must not lose a
-permission edit made in the Permissions tab.
+E2E regression test: tab switching and the disk-pure permission-draft UX.
 
-Scenario (bug: tab switch loses permission state):
-  1. Open session A, set Network permission from default ``banned`` to
-     ``ask`` (within the research-workspace ceiling) — WITHOUT pressing
-     Apply, so the edit exists only as an unsaved draft (the "Unsaved
-     changes" indicator is showing).
+Disk-pure UX contract under test
+--------------------------------
+* ConfigPanel permission edits are TAB-LOCAL drafts.  App.jsx mounts ONLY
+  the active SessionTab (``key={activeTab.sessionId}``), so switching tabs
+  unmounts the previous tab's ConfigPanel and destroys its local draft
+  state.
+* An edit that is never Apply'd is therefore DROPPED on a tab round-trip:
+  after A -> B -> A the Permissions tab re-initializes from the last
+  backend config, so the select reverts to its ORIGINAL value and no
+  unsaved-change banner is shown.
+* An edit that IS Apply'd is persisted to the session file (session
+  WebSocket ``apply_config`` -> ``merge_session_permissions``) and survives
+  the round-trip: after A -> B -> A the select still shows the applied
+  value.
+
+Scenario
+--------
+Phase 1 - unsaved draft is dropped:
+  1. Open session A, set Network permission from its original value to
+     ``ask`` (within the research-workspace ceiling) - WITHOUT pressing
+     Apply.  The specific banner "Unsaved permission changes" shows
+     (count 1); the generic "Unsaved changes" banner does not (count 0).
   2. Switch to session tab B, then switch back to tab A.
-  3. Open the Permissions tab again: the Network select must still show
-     ``ask`` and "Unsaved changes" must still be present.
+  3. Re-open the Permissions tab: the Network select shows the ORIGINAL
+     value again and both banners are absent (count 0 each).
 
-Reproduced failure (current code): after the A -> B -> A round-trip the
-select reverts to ``banned`` and "Unsaved changes" disappears. Root cause:
-App.jsx mounts ONLY the active SessionTab (``key={activeTab.sessionId}``),
-so switching tabs unmounts tab A's ConfigPanel and destroys its local
-``draft`` state; on remount ConfigPanel's ``useEffect([config])`` re-
-initializes the draft from the last backend config (``session_permissions``
-is empty, so the UI falls back to the default ``banned``). The unsaved
-edit never reaches the store or the backend, so nothing can restore it.
+Phase 2 - Apply'd change survives:
+  4. Select ``ask`` again and press Apply; the applied-config echo clears
+     the draft (both banners count 0) and the select re-seeds to ``ask``.
+  5. Switch A -> B -> A and re-open Permissions: the select still shows
+     ``ask`` and both banners stay at count 0.
 
 NOTE on the workspace ceiling: the conftest ``workspace`` fixture creates a
 ``purpose=research`` workspace whose permission ceiling (purpose preset)
@@ -68,14 +81,14 @@ def _network_select(page):
     return page.locator("label", has_text="Network").locator("..").locator("select").first
 
 
-def test_tab_switch_preserves_session_permissions(page, e2e_frontend, e2e_backend, workspace):
+def test_tab_switch_permission_state(page, e2e_frontend, e2e_backend, workspace):
     import httpx
 
     base_url = e2e_frontend["base_url"]
     ws_id = workspace["ws_id"]
     backend_url = e2e_backend["base_url"]
 
-    # ── Create two sessions via the backend REST API ──────────────────────
+    # ── Create two sessions via the backend REST API ─────────────────────
     with httpx.Client(timeout=30) as client:
         resp_a = client.post(
             f"{backend_url}/api/session/create",
@@ -91,7 +104,7 @@ def test_tab_switch_preserves_session_permissions(page, e2e_frontend, e2e_backen
         resp_b.raise_for_status()
         sid_b = resp_b.json()["session_id"]
 
-    # ── WebSocket frame capture (config_changed / session_loaded) ─────────
+    # ── WebSocket frame capture (config_changed / session_loaded) ────────
     ws_frames = []
 
     def _on_ws(ws):
@@ -106,7 +119,7 @@ def test_tab_switch_preserves_session_permissions(page, e2e_frontend, e2e_backen
 
     page.on("websocket", _on_ws)
 
-    # ── REST snapshots for evidence classification ────────────────────────
+    # ── REST snapshots for evidence classification ───────────────────────
     def _rest_snapshot(tag):
         lines = [f"--- REST snapshot [{tag}] ---"]
         for label, path, params in (
@@ -130,7 +143,7 @@ def test_tab_switch_preserves_session_permissions(page, e2e_frontend, e2e_backen
         except Exception as exc:
             print(f"UI select value [{tag}]: ERR {exc}", flush=True)
 
-    # ── Open session A and apply a Network permission change ──────────────
+    # ── Open session A, Permissions tab ──────────────────────────────────
     page.goto(f"{base_url}/#/workspace/{ws_id}/session/{sid_a}")
     _wait_config_panel_ready(page)
 
@@ -138,46 +151,79 @@ def test_tab_switch_preserves_session_permissions(page, e2e_frontend, e2e_backen
 
     network_select = _network_select(page)
     expect(network_select).to_be_visible(timeout=10000)
-    current = network_select.input_value()
-    print(f"network value before change: {current}", flush=True)
-    if current == APPLIED_NETWORK:
+    original = network_select.input_value()
+    print(f"network value before change: {original}", flush=True)
+    if original == APPLIED_NETWORK:
         pytest.fail(f"network already at {APPLIED_NETWORK}; cannot exercise a change")
 
+    # ══ Phase 1: an UNSAVED draft is tab-local and is dropped on unmount ══
     network_select.select_option(APPLIED_NETWORK)
     expect(network_select).to_have_value(APPLIED_NETWORK)  # dirty draft
 
-    # UNSAVED-DRAFT variant: do NOT press Apply. The dirty edit (plus the
-    # "Unsaved changes" indicator) is the permission state that must survive
-    # the tab round-trip.
-    expect(network_select).to_have_value(APPLIED_NETWORK)
-    expect(page.get_by_text("Unsaved changes")).to_have_count(1, timeout=5000)
+    # Do NOT press Apply.  The permission edit shows the specific banner;
+    # the generic "Unsaved changes" banner must NOT appear for it.
+    expect(page.get_by_text("Unsaved permission changes")).to_have_count(1, timeout=5000)
+    expect(page.get_by_text("Unsaved changes")).to_have_count(0, timeout=5000)
 
-    _ui_value("after-edit-no-apply", network_select)
-    _rest_snapshot("after-edit-no-apply")
+    _ui_value("phase1-edit-no-apply", network_select)
+    _rest_snapshot("phase1-edit-no-apply")
 
-    # ── Tab round-trip: A → B → A ─────────────────────────────────────────
+    # ── Tab round-trip: A → B → A ────────────────────────────────────────
     _switch_tab(page, SESSION_B_NAME)
     _wait_config_panel_ready(page)
 
     _switch_tab(page, SESSION_A_NAME)
     _wait_config_panel_ready(page)
 
-    # ── Re-open the Permissions tab: the applied value must survive ───────
+    # ── Re-open Permissions: the un-Apply'd draft must be gone ───────────
     page.get_by_role("button", name="Permissions", exact=True).click()
 
     network_select = _network_select(page)
     expect(network_select).to_be_visible(timeout=10000)
-    _ui_value("after-tab-roundtrip", network_select)
-    _rest_snapshot("after-tab-roundtrip")
+    _ui_value("phase1-after-roundtrip", network_select)
+    _rest_snapshot("phase1-after-roundtrip")
 
-    # ── Dump captured WS frames (config_changed / session_loaded) ─────────
+    # Remount re-initializes from the backend config: ORIGINAL value, no
+    # draft, no banner (generic or specific).
+    expect(network_select).to_have_value(original, timeout=15000)
+    expect(page.get_by_text("Unsaved permission changes")).to_have_count(0, timeout=5000)
+    expect(page.get_by_text("Unsaved changes")).to_have_count(0, timeout=5000)
+
+    # ══ Phase 2: an Apply'd change IS persisted and survives the round-trip ══
+    network_select.select_option(APPLIED_NETWORK)
+    expect(network_select).to_have_value(APPLIED_NETWORK)  # dirty draft
+
+    page.get_by_role("button", name="Apply", exact=True).click()
+
+    # Applied-config echo clears the draft; select re-seeds to ask.
+    expect(page.get_by_text("Unsaved permission changes")).to_have_count(0, timeout=15000)
+    expect(page.get_by_text("Unsaved changes")).to_have_count(0, timeout=5000)
+    expect(network_select).to_have_value(APPLIED_NETWORK, timeout=15000)
+
+    _ui_value("phase2-after-apply", network_select)
+    _rest_snapshot("phase2-after-apply")
+
+    # ── Tab round-trip: A → B → A ────────────────────────────────────────
+    _switch_tab(page, SESSION_B_NAME)
+    _wait_config_panel_ready(page)
+
+    _switch_tab(page, SESSION_A_NAME)
+    _wait_config_panel_ready(page)
+
+    # ── Re-open Permissions: the Apply'd value must survive ──────────────
+    page.get_by_role("button", name="Permissions", exact=True).click()
+
+    network_select = _network_select(page)
+    expect(network_select).to_be_visible(timeout=10000)
+    _ui_value("phase2-after-roundtrip", network_select)
+    _rest_snapshot("phase2-after-roundtrip")
+
+    expect(network_select).to_have_value(APPLIED_NETWORK, timeout=15000)
+    expect(page.get_by_text("Unsaved permission changes")).to_have_count(0, timeout=5000)
+    expect(page.get_by_text("Unsaved changes")).to_have_count(0, timeout=5000)
+
+    # ── Dump captured WS frames (config_changed / session_loaded) ────────
     print(f"--- WS frames captured: {len(ws_frames)} ---", flush=True)
     for url, txt in ws_frames:
         if sid_a in txt or "load_session" in txt:
             print(f"[WS {url}] {txt[:1200]}", flush=True)
-
-    # If the ConfigPanel remounts on tab reactivation (or the draft is
-    # re-initialized from a stale config prop), the unsaved edit is lost here.
-    expect(page.get_by_text("Unsaved changes")).to_have_count(1, timeout=5000)
-
-    expect(network_select).to_have_value(APPLIED_NETWORK, timeout=15000)

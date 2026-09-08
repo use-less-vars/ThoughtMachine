@@ -5,7 +5,7 @@ REM  Windows installer for ThoughtMachine.
 REM  Checks prerequisites, then creates venv, installs deps, builds frontend.
 REM
 REM  Prerequisites (install manually if missing):
-REM    - Python 3.11-3.13 from https://www.python.org/downloads/
+REM    - Python 3.11+ (3.14 supported) from https://www.python.org/downloads/
 REM    - Node.js 18+ (LTS) from https://nodejs.org/
 REM    - Docker Desktop from https://www.docker.com/products/docker-desktop/
 REM      Docker Desktop is required for full functionality. Some features will be disabled.
@@ -73,14 +73,14 @@ set PYTHON_VER=
 set PYTHON_OK=0
 
 REM Try py launcher first, then python, then python3
-py -c "import sys;exit(0 if (3,11)<=sys.version_info[:2]<=(3,13) else 1)" >nul 2>&1
+py -c "import sys;exit(0 if (3,11)<=sys.version_info[:2] else 1)" >nul 2>&1
 if not errorlevel 1 (
     set PYTHON_CMD=py
     set PYTHON_OK=1
 )
 
 if not defined PYTHON_CMD (
-    python -c "import sys;exit(0 if (3,11)<=sys.version_info[:2]<=(3,13) else 1)" >nul 2>&1
+    python -c "import sys;exit(0 if (3,11)<=sys.version_info[:2] else 1)" >nul 2>&1
     if not errorlevel 1 (
         set PYTHON_CMD=python
         set PYTHON_OK=1
@@ -88,7 +88,7 @@ if not defined PYTHON_CMD (
 )
 
 if not defined PYTHON_CMD (
-    python3 -c "import sys;exit(0 if (3,11)<=sys.version_info[:2]<=(3,13) else 1)" >nul 2>&1
+    python3 -c "import sys;exit(0 if (3,11)<=sys.version_info[:2] else 1)" >nul 2>&1
     if not errorlevel 1 (
         set PYTHON_CMD=python3
         set PYTHON_OK=1
@@ -104,10 +104,16 @@ if defined PYTHON_CMD (
 
 if !PYTHON_OK!==1 (
     echo   [+] !PYTHON_CMD! -- version !PYTHON_VER!
+    REM Warn on very new (3.15+) interpreters: usually fine, but wheels may lag.
+    !PYTHON_CMD! -c "import sys;sys.exit(0 if sys.version_info[:2]>=(3,15) else 1)" >nul 2>&1
+    if not errorlevel 1 (
+        echo   [!] Python !PYTHON_VER! is very new (3.15+). If pip install fails,
+        echo       install Python 3.14 or 3.13 and re-run this installer.
+    )
 ) else (
     if defined PYTHON_VER (
         echo   [x] Python !PYTHON_VER! found but not supported.
-        echo       Need Python 3.11, 3.12, or 3.13.
+        echo       Need Python 3.11 or newer (3.14 supported).
     ) else (
         echo   [x] Python not found.
     )
@@ -182,7 +188,7 @@ echo   --- Summary ---
 set ALL_OK=1
 if !PYTHON_OK!==0 (
     set ALL_OK=0
-    echo   [FAIL] Python 3.11-3.13 required - install or upgrade
+    echo   [FAIL] Python 3.11+ required - install or upgrade
 )
 if !NODE_OK!==0 (
     set ALL_OK=0

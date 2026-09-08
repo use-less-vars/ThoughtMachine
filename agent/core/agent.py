@@ -266,18 +266,6 @@ class Agent:
                     f'No API key available for provider "{new_config.provider_type}". '
                     f'Set {new_config.provider_type.upper()}_API_KEY environment variable '
                     f'or provide an api_key in the configuration.')
-                # Permissions are HOT_SWAPPABLE and must not wait for a restart
-                # that cannot succeed (no API key): apply the session_permissions
-                # portion synchronously, mirroring _hot_swap's propagation to
-                # state.config and tool_executor.config. Other fields stay pending
-                # for retry on the next turn.
-                if new_config.session_permissions != self.config.session_permissions:
-                    self.config.session_permissions = new_config.session_permissions
-                    self.state.config.session_permissions = new_config.session_permissions
-                    self.tool_executor.config.session_permissions = new_config.session_permissions
-                    log('DEBUG', 'core.agent',
-                        'Applied session_permissions synchronously from preserved '
-                        'pending config (restart deferred: no API key)')
                 return False
             diff = _config_diff(old_config, new_config)
             log('INFO', 'core.config',
@@ -1315,7 +1303,7 @@ class Agent:
                 self._add_conversation_data_to_event(turn_event)
                 yield turn_event
                 if tool_calls:
-                    executed_tools, final_detected, respond_result, summary_text, summary_keep_recent_turns = self.tool_executor.execute_tool_calls(tool_calls, add_to_conversation_func=self._add_to_conversation, agent_id=0, session_id=self.session_id, turn_transaction=turn_transaction)
+                    executed_tools, final_detected, respond_result, summary_text, summary_keep_recent_turns = self.tool_executor.execute_tool_calls(tool_calls, add_to_conversation_func=self._add_to_conversation, agent_id=0, session_id=self.session_id, workspace_id=getattr(getattr(self, '_session', None), 'workspace_id', None) or "", turn_transaction=turn_transaction)
                     processed_tools = []
                     for tool_info in executed_tools:
                         result = tool_info.get('result', '')

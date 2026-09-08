@@ -764,6 +764,40 @@ def _restrictive_merge(
             result[key] = s_val if s_rank <= w_rank else w_val
     return result
 
+
+_WOFB_GRAIN = "write_on_feature_branch"
+
+
+def _canonicalize_session_permissions(
+    permissions: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Fold derived ``write_on_feature_branch`` split grains onto the canonical
+    ``git`` channel (worker AgentConfig boundary).
+
+    The permission gate mirrors canonical ``git='write_on_feature_branch'``
+    into the derived ``git_read`` / ``git_write`` split grains of the
+    effective-permissions dict (a plain-dict convenience for the tools layer
+    — see bca9663).  The config-bound ``SessionPermissions`` schema accepts
+    ``write_on_feature_branch`` ONLY on ``git``: the ``git_read`` /
+    ``git_write`` fields deliberately stay 4-value literals so the wofb value
+    must never reach them.  When a split grain carries the wofb echo we drop
+    it (absent means the gate re-derives it from ``git``); when the dict is
+    internally inconsistent (wofb grain without a canonical ``git`` wofb) we
+    fall back fail-closed to the category's safe default.
+    """
+    if not isinstance(permissions, dict):
+        return permissions
+    canonical_wofb = permissions.get("git") == _WOFB_GRAIN
+    result = dict(permissions)
+    for grain in ("git_read", "git_write"):
+        if result.get(grain) == _WOFB_GRAIN:
+            if canonical_wofb:
+                result.pop(grain, None)
+            else:
+                result[grain] = _load_safe_defaults().get(grain) or "banned"
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Worker-scoped container cleanup helpers
 # ---------------------------------------------------------------------------
@@ -804,6 +838,7 @@ class WorkerThread(threading.Thread):
         project_root: Optional[str] = None,
         timeout_seconds: Optional[int] = None,
         session_id: Optional[str] = None,
+        workspace_id: Optional[str] = None,
         instance_id: int = 1,
         container_manager: Optional[Any] = None,
         *,
@@ -818,6 +853,7 @@ class WorkerThread(threading.Thread):
         self.definition = definition
         self._agent_config_dict = agent_config
         self.session_id = session_id
+        self.workspace_id: Optional[str] = workspace_id
         # Container manager used to stop/remove containers owned by this
         # worker at teardown (see _cleanup_worker_containers).
         self._container_manager: Optional[Any] = container_manager
@@ -1622,7 +1658,11 @@ class WorkerThread(threading.Thread):
 
         # ── Inject session permissions (restrictive merge — session is ceiling) ──
         merged = _restrictive_merge(self._session_permissions, self._permission_footprint)
-        worker_cfg["session_permissions"] = merged
+        # Fold derived ``write_on_feature_branch`` split grains back onto the
+        # canonical ``git`` channel: SessionPermissions validates git_read /
+        # git_write against 4-value literals only (bca9663 invariant), so the
+        # AgentConfig-bound dict must never carry the wofb echo on a grain.
+        worker_cfg["session_permissions"] = _canonicalize_session_permissions(merged)
 
         # ── Safety net: inject workspace_path if missing ────────────────
         # Worker._build_agent_config (the Tool-class method) now injects
@@ -2065,6 +2105,16 @@ class WorkerThread(threading.Thread):
             # ── Load persisted context or create fresh ────────────────
             self._worker_ctx = self._load_context()
 
+            # The live thread ids (real parent session/workspace resolved at
+            # spawn) are authoritative over any ids persisted in context.json
+            # (an older run may have stored a phantom worker-<uuid> session id
+            # or no workspace id at all).
+            if self._worker_ctx is not None:
+                if self.session_id:
+                    self._worker_ctx.session_id = self.session_id
+                if self.workspace_id:
+                    self._worker_ctx.workspace_id = self.workspace_id
+
             # Override persisted status/error with live thread state
             self.status = "ready"
             self.error = None
@@ -2119,6 +2169,8 @@ class WorkerThread(threading.Thread):
                 # Reset cached token count for a fresh run
                 self._cached_context_tokens = None
                 self._worker_ctx = WorkerContext(
+                    session_id=self.session_id,
+                    workspace_id=self.workspace_id,
                     worker_name=self.worker_name,
                     user_history=user_history,
                 )
@@ -3954,7 +4006,7 @@ class Worker(ToolBase):
         # explicitly exposes.  A footprint that requests a category absent
         # from the session profile is rejected outright: the worker can never
         # grant itself access to a category the session does not expose.
-        session_perms = self.session_permissions or {}
+        session_perms = self.effective_permissions or self.session_permissions or {}
         denied_categories = sorted(set(worker_perms) - set(session_perms))
         if denied_categories:
             return {
@@ -4043,7 +4095,7 @@ class Worker(ToolBase):
                     workspace_path=ws_dir,
                     session_id=self.session_id,
                     workspace_id=workspace_id or ws_id or "default",
-                    session_permissions=self.session_permissions,
+                    session_permissions=self.effective_permissions or self.session_permissions,
                 )
             except Exception:
                 container_manager = None
@@ -4055,10 +4107,11 @@ class Worker(ToolBase):
             agent_config=agent_config,
             workspace_dir=ws_dir,
             tool_classes=tool_classes if tool_classes else None,
-            session_permissions=self.session_permissions,
+            session_permissions=self.effective_permissions or self.session_permissions,
             project_root=project_root,
             timeout_seconds=effective_timeout,
             session_id=self.session_id,
+            workspace_id=ws_id,
             instance_id=spawn_iid,
             container_manager=container_manager,
         )

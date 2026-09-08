@@ -234,7 +234,11 @@ def test_container_manager_start_delegates_fresh_create_to_registry(monkeypatch)
         "thoughtmachine.workspace_id": "w1",
         "thoughtmachine.container_type": "free_use",
     }
-    assert kwargs["environment"] == {"PYTHONUSERBASE": "/home/agent/.local"}
+    assert kwargs["environment"] == {
+        "PYTHONUSERBASE": "/home/agent/.local",
+        "THOUGHTMACHINE_SESSION_ID": "s1",
+        "THOUGHTMACHINE_WORKSPACE_ID": "w1",
+    }
     assert kwargs["mounts"] == [
         {"source": "/tmp/ws-test", "target": "/workspace", "mode": "ro"}
     ]
