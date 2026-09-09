@@ -1,6 +1,6 @@
-"""vault_repair.py -- read-only vault integrity scanner (phase 1 of vault repair).
+"""vault_repair.py -- ThoughtMachine vault integrity scanner and repairer.
 
-Phase-1 scope: DIAGNOSIS ONLY.  This module inspects a ThoughtMachine vault
+Phase-1 scope: DIAGNOSIS.  This module inspects a ThoughtMachine vault
 (``~/.thoughtmachine`` or ``$THOUGHTMACHINE_VAULT_ROOT``) and produces a
 structured, never-raising report of every integrity finding:
 
@@ -11,19 +11,41 @@ structured, never-raising report of every integrity finding:
 * seeded-file drift vs the ``resources/`` seed files,
 * files present in the vault root but undeclared by the manifest.
 
-``--apply`` repair, quarantine, seed restoration and GC hooks are LATER
-phases (see ``working_docs/vault_repair_design.md``); this module never
-writes, and ``--dry-run`` is accepted as a forward-compatibility no-op.
+Phase-2 scope (this module is ADDITIVE on top of phase 1): ``--apply``
+repair.  The default remains read-only; ``run_repair(apply=True)`` / the
+``--apply`` CLI flag mutate the vault under strict guardrails (see
+``working_docs/vault_repair_design.md``):
 
-The module is stdlib-only apart from the repo-local drift checker import so
-it can be invoked on the host as ``python3 -m thoughtmachine.vault_repair``.
+* every rewrite of an existing file is preceded by a timestamped sibling
+  ``<name>.bak-<YYYYmmddHHMMSS>`` backup (never deleted),
+* nothing is ever deleted: unknown files/keys are quarantined (moved under
+  ``<vault_root>/.quarantine``) or recorded, never destroyed,
+* permission tightening only: legacy ``git_read``/``git_write`` fields are
+  folded into the canonical ``git`` grain at *at least* their legacy
+  permissiveness before removal; ``docker`` is converted to ``container``
+  only in ceiling dicts,
+* ``git_allow_worktree_commits`` is an engine-read flag (the agent/config
+  validators fold ``True`` to ``git: write`` at load) and is NEVER
+  auto-removed -- it is downgraded to a manual-review finding,
+* seeded files (incl. the checksystem allowlist) are restored only under
+  ``--restore-seeds --yes``; allowlist tampering is quarantined, never
+  auto-fixed,
+* ``--dry-run`` is accepted as a no-op for forward compatibility.
+
+The module never raises and is stdlib-only apart from the repo-local drift
+checker import, so it can be invoked on the host as
+``python3 -m thoughtmachine.vault_repair``.
 """
 
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
+import re
+import shutil
+import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,8 +58,8 @@ from agent.config.vault_drift import (
     _resources_dir,
 )
 
-__version__ = "0.1.0"
-TOOL_VERSION = "thoughtmachine.vault_repair 0.1.0"
+__version__ = "0.2.0"
+TOOL_VERSION = "thoughtmachine.vault_repair 0.2.0"
 DEFAULT_VAULT_ROOT = "~/.thoughtmachine"
 
 # ---------------------------------------------------------------------------
@@ -53,9 +75,68 @@ LEGACY_KEYS = ("git_read", "git_write", "execution", "git_allow_worktree_commits
 LEGACY_SET = frozenset(LEGACY_KEYS)
 _PERM_INTEREST = LEGACY_SET | SESSION_VOCAB_SET | {"system", "docker"}
 
+# Engine-read legacy flag: agent/config/models.py (migrate_git_allow_worktree_commits)
+# and agent/config/session_config.py (migrate_legacy_git_fields) fold True to
+# git 'write' at load time.  NEVER auto-removed by this tool (removal could
+# silently reduce grants); reported as manual_review everywhere it is seen.
+_GAW_KEY = "git_allow_worktree_commits"
+
+# Canonical git grain ranks (mirrors security/resource_catalog.py
+# GRANT_LEVEL_RANKS: banned < ask < read < write == write_on_feature_branch).
+_GIT_MERGE_RANK = {
+    "banned": 0,
+    "ask": 1,
+    "read": 2,
+    "write": 3,
+    "write_on_feature_branch": 3,
+    "full": 4,
+}
+
+# Backups created by this tool: '<name>.bak-<YYYYmmddHHMMSS>[-N]'.  They do
+# NOT end in '.bak' (so agent.config.vault_drift's unknown-root-file scan
+# would flag them); filtered everywhere the tool scans.
+_BACKUP_SUFFIX_RE = re.compile(r"\.bak-\d{14}(?:-\d+)?$")
+
+# Default quarantine location, relative to the vault root.
+#
+# NOTE: deliberately NOT 'logs/quarantine'.  The schema manifest declares a
+# 'logs/*' PATTERN entry with root_type 'string', and VaultDriftChecker feeds
+# every glob match -- directories included -- to the text-file check, which
+# raises DriftAbortError on a directory.  A quarantine dir under logs/ would
+# therefore abort every post-apply re-scan.  A hidden, root-level directory is
+# invisible to the drift checker (patterns never match it; the unknown-file
+# scan only inspects root FILES and skips dot-names) and to the permission
+# deep-scan (which prunes it explicitly).
+_DEFAULT_QUARANTINE_REL = ".quarantine"
+
+# Key-name hints used to redact secret material from repair artifacts.
+_SECRET_HINTS = ("api_key", "apikey", "secret", "token", "password", "credential")
+
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _utcnow_compact() -> str:
+    """Compact UTC timestamp used in backup/quarantine names."""
+    return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+
+
+def _is_secret_key(key: str) -> bool:
+    low = key.lower()
+    return any(h in low for h in _SECRET_HINTS)
+
+
+def _redact_value(value: Any, key: str = "") -> Any:
+    """Recursively redact values whose key names look secret."""
+    if isinstance(value, dict):
+        return {k: ("<redacted>" if _is_secret_key(k) else _redact_value(v, k))
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_value(v, key) for v in value]
+    if isinstance(value, str) and _is_secret_key(key):
+        return "<redacted>"
+    return value
 
 
 def classify(relpath: str) -> Tuple[str, str]:
@@ -233,7 +314,7 @@ def _collect_drift_issues(drift_report: dict, manifest: dict, sink: _IssueSink,
         finfo = drift_report["files"][rel]
         status = finfo.get("status")
         drifts = finfo.get("drifts") or []
-        file_spec = manifest_files.get(rel) or {}
+        file_spec = _manifest_spec_for(rel, manifest_files) or {}
         if status == "backfill_pending":
             # A missing vault file restorable from the manifest safe_default.
             default_value = file_spec.get("safe_default")
@@ -251,6 +332,23 @@ def _collect_drift_issues(drift_report: dict, manifest: dict, sink: _IssueSink,
             field = d.get("field") or "*"
             message = d.get("hint") or d.get("issue") or status
             action = d.get("action") or ""
+            if issue == "undeclared field" and field == _GAW_KEY:
+                # git_allow_worktree_commits is an engine-read flag (folded to
+                # git 'write' at load by agent/config validators); never offer
+                # machine removal -- removal could silently reduce grants.
+                sink.add(
+                    file=rel, path_in_file=field, category="unknown_top_key",
+                    classification="manual_review", severity="warning",
+                    message=(
+                        'Legacy engine-read flag "%s" in %s -- agent/config '
+                        'validators (models.py migrate_git_allow_worktree_commits, '
+                        'session_config.py migrate_legacy_git_fields) fold True to '
+                        'git "write" at load; left for human review'
+                        % (_GAW_KEY, rel)
+                    ),
+                    fix="review (engine-read legacy flag)",
+                )
+                continue
             mapped = _drift_issue_map(issue, field, message, action, file_spec)
             sink.add(file=rel,
                      path_in_file=field if field != "*" else "",
@@ -264,6 +362,10 @@ def _collect_drift_issues(drift_report: dict, manifest: dict, sink: _IssueSink,
         if not isinstance(w, str) or not w.startswith("Unknown file: "):
             continue
         name = w[len("Unknown file: "):]
+        if _BACKUP_SUFFIX_RE.search(name):
+            # Backup siblings created by this tool ('<name>.bak-<ts>') would
+            # otherwise resurface as unknown files on every post-apply scan.
+            continue
         if name not in extra_files:
             extra_files.append(name)
         sink.add(file=name, path_in_file="", category="extra_file",
@@ -271,14 +373,79 @@ def _collect_drift_issues(drift_report: dict, manifest: dict, sink: _IssueSink,
                  message=w, fix="Review and remove if not needed")
 
 
-def _collect_permission_issues(root: Path, sink: _IssueSink) -> None:
-    """Walk all ``*.json`` vault files and report permission-dict drift."""
+def _pattern_segments_match(pattern: str, relpath: str) -> bool:
+    """Match *relpath* against a manifest glob *pattern* segment-wise.
+
+    Both sides are split on '/'; every segment must match via
+    fnmatch.fnmatchcase, so a '*' never crosses a directory boundary (the
+    same semantics VaultDriftChecker relies on when globbing pattern entries).
+    """
+    pat_segs = pattern.split("/")
+    rel_segs = relpath.split("/")
+    if len(pat_segs) != len(rel_segs):
+        return False
+    return all(fnmatch.fnmatchcase(rp, pp)
+               for rp, pp in zip(rel_segs, pat_segs))
+
+
+def _manifest_spec_for(rel: str, manifest_files: Dict[str, Any]) -> Optional[dict]:
+    """Return the manifest spec governing *rel*, or None.
+
+    An exact key match wins; otherwise the first pattern entry (sorted by
+    key) whose glob matches the whole relative path segment-wise.  Pattern
+    entries carry ``"pattern": true`` and use their manifest KEY as the glob.
+    """
+    if not manifest_files:
+        return None
+    if rel in manifest_files:
+        spec = manifest_files[rel]
+        return spec if isinstance(spec, dict) else None
+    for key in sorted(manifest_files):
+        spec = manifest_files[key]
+        if not isinstance(spec, dict):
+            continue
+        if not spec.get("pattern"):
+            continue
+        if _pattern_segments_match(key, rel):
+            return spec
+    return None
+
+
+def _declared_root_fields(spec: Optional[dict]) -> Optional[dict]:
+    """Return the declared top-level ``fields`` of a root_type-dict spec."""
+    if not isinstance(spec, dict):
+        return None
+    if spec.get("root_type") != "dict":
+        return None
+    fields = spec.get("fields")
+    if not isinstance(fields, dict) or not fields:
+        return None
+    return fields
+
+
+def _collect_permission_issues(root: Path, sink: _IssueSink,
+                               manifest_files: Optional[Dict[str, Any]] = None) -> None:
+    """Walk all ``*.json`` vault files and report permission-dict drift.
+
+    *manifest_files* (``manifest['files']``) bounds the deep scan of
+    declared-root dicts (see ``_deep_permission_scan``).
+    """
     if not root.is_dir():
         return
+    manifest_files = manifest_files or {}
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames.sort()
+        # The drift checker never descends into hidden dirs (its globs and
+        # the unknown-file scan ignore dot-names); mirror that here so this
+        # tool's own '.quarantine' audit dir is never re-scanned.
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
         for name in sorted(filenames):
             if not name.endswith(".json"):
+                continue
+            if _BACKUP_SUFFIX_RE.search(name):
+                # '<name>.bak-<ts>' siblings created by this tool's backups
+                # must never be re-scanned (they would otherwise resurface as
+                # unknown files / invalid JSON on every post-apply scan).
                 continue
             full = Path(dirpath) / name
             rel = str(full.relative_to(root))
@@ -301,7 +468,14 @@ def _collect_permission_issues(root: Path, sink: _IssueSink) -> None:
                 for k in sorted(perm_dict):
                     path = "%s.%s" % (label, k)
                     if ceiling:
-                        if k in LEGACY_SET:
+                        if k == _GAW_KEY:
+                            sink.add(file=rel, path_in_file=path,
+                                     category="legacy_permission_key",
+                                     classification="manual_review",
+                                     severity="warning",
+                                     message='Legacy engine-read flag "%s" in ceiling permission dict — agent/config validators fold True to git "write" at load; left for human review' % k,
+                                     fix="review (engine-read legacy flag)")
+                        elif k in LEGACY_SET:
                             sink.add(file=rel, path_in_file=path,
                                      category="legacy_permission_key",
                                      classification="machine_apply",
@@ -330,7 +504,14 @@ def _collect_permission_issues(root: Path, sink: _IssueSink) -> None:
                                      message='Unknown permission key "%s" in ceiling permission dict — KEPT for human review' % k,
                                      fix="review (kept)")
                     else:
-                        if k in LEGACY_SET:
+                        if k == _GAW_KEY:
+                            sink.add(file=rel, path_in_file=path,
+                                     category="legacy_permission_key",
+                                     classification="manual_review",
+                                     severity="warning",
+                                     message='Legacy engine-read flag "%s" in session/agent permission dict — agent/config validators fold True to git "write" at load; left for human review' % k,
+                                     fix="review (engine-read legacy flag)")
+                        elif k in LEGACY_SET:
                             sink.add(file=rel, path_in_file=path,
                                      category="legacy_permission_key",
                                      classification="machine_apply",
@@ -344,12 +525,23 @@ def _collect_permission_issues(root: Path, sink: _IssueSink) -> None:
                                      severity="warning",
                                      message='Unknown permission key "%s" in session/agent permission dict — cleanup would drop it' % k,
                                      fix="drop on cleanup")
-            _deep_permission_scan(rel, doc, sink, scoped_ids)
+            spec = _manifest_spec_for(rel, manifest_files)
+            _deep_permission_scan(rel, doc, sink, scoped_ids,
+                                  declared_fields=_declared_root_fields(spec))
 
 
 def _deep_permission_scan(rel: str, doc: Any, sink: _IssueSink,
-                          skip_ids: set) -> None:
-    """Report permission-shaped nested dicts that are not scoped locations."""
+                          skip_ids: set,
+                          declared_fields: Optional[Dict[str, Any]] = None) -> None:
+    """Report permission-shaped nested dicts that are not scoped locations.
+
+    When *declared_fields* is given (the top-level ``fields`` of a
+    root_type-dict manifest spec), the scan bounds the document root to the
+    declared keys: undeclared top-level keys of a declared-root file are
+    owned by the drift checker (machine removal of the whole subtree), so
+    reporting stale nested issues inside them would double-report and leave
+    issues pointing at already-removed nodes.
+    """
     visited = set()
 
     def walk(value: Any, path: str) -> None:
@@ -358,9 +550,19 @@ def _deep_permission_scan(rel: str, doc: Any, sink: _IssueSink,
                 return
             visited.add(id(value))
             keys = set(value)
-            if keys & _PERM_INTEREST:
-                for k in sorted(keys):
-                    if k in LEGACY_SET:
+            declared_root = bool(declared_fields) and path == "root"
+            children = (sorted(keys & set(declared_fields)) if declared_root
+                        else sorted(keys))
+            if not declared_root and keys & _PERM_INTEREST:
+                for k in children:
+                    if k == _GAW_KEY:
+                        sink.add(file=rel, path_in_file="%s.%s" % (path, k),
+                                 category="legacy_permission_key",
+                                 classification="manual_review",
+                                 severity="warning",
+                                 message='Legacy engine-read flag "%s" in permission-shaped object at %s::%s — agent/config validators fold True to git "write" at load; left for human review' % (k, rel, path),
+                                 fix="review (engine-read legacy flag)")
+                    elif k in LEGACY_SET:
                         sink.add(file=rel, path_in_file="%s.%s" % (path, k),
                                  category="legacy_permission_key",
                                  classification="machine_apply",
@@ -381,8 +583,8 @@ def _deep_permission_scan(rel: str, doc: Any, sink: _IssueSink,
                                  severity="warning",
                                  message='Unknown permission key "%s" in permission-shaped object at %s::%s — review' % (k, rel, path),
                                  fix="review")
-            for k, v in value.items():
-                walk(v, "%s.%s" % (path, k))
+            for k in children:
+                walk(value[k], "%s.%s" % (path, k))
         elif isinstance(value, list):
             for idx, item in enumerate(value):
                 walk(item, "%s[%d]" % (path, idx))
@@ -421,6 +623,496 @@ def _collect_seeded_files(root: Path) -> List[dict]:
     return entries
 
 
+# ---------------------------------------------------------------------------
+# Phase-2 repair engine.
+#
+# Guardrails (see working_docs/vault_repair_design.md): every rewrite of an
+# existing file is preceded by a timestamped sibling '<name>.bak-<ts>' backup
+# (never deleted, never re-scanned); removed nodes are quarantined as JSON
+# artifacts under '<vault_root>/.quarantine' (never destroyed); permission
+# changes only tighten -- legacy git_read/git_write/execution keys are folded
+# into the canonical 'git' grain at >= their legacy permissiveness and 'docker'
+# is converted to 'container' in ceiling dicts; git_allow_worktree_commits is
+# an engine-read flag and is NEVER auto-removed; seeded files are restored
+# only under --restore-seeds --yes, and allowlist tampering is quarantined,
+# never auto-fixed.
+# ---------------------------------------------------------------------------
+
+# Broader = smaller number (mirrors security/resource_catalog.py
+# GRANT_LEVEL_RANKS: write is broader than write_on_feature_branch ...).
+_GIT_BREADTH = {
+    "write": 0,
+    "write_on_feature_branch": 1,
+    "read": 2,
+    "ask": 3,
+    "banned": 4,
+}
+
+# Segment matcher: '<key>[<idx>][<idx>]...' (dict key, then list indices).
+_SEG_RE = re.compile(r"([^\[]+)((\[\d+\])*)")
+
+
+def _resolve_quarantine_dir(root: Path, quarantine_dir: Optional[Any] = None) -> Path:
+    """Resolve (and create) the quarantine dir for removed-node artifacts."""
+    q = Path(quarantine_dir).expanduser() if quarantine_dir \
+        else (root / _DEFAULT_QUARANTINE_REL)
+    if not q.is_absolute():
+        q = root / q
+    q.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(q, 0o700)
+    except OSError:
+        pass
+    return q
+
+
+def _unique_path(path: Path) -> Path:
+    """Return *path*, or the first '<name>-N' sibling that does not exist."""
+    if not path.exists():
+        return path
+    for i in range(1, 10000):
+        candidate = path.with_name("%s-%d" % (path.name, i))
+        if not candidate.exists():
+            return candidate
+    return path.with_name("%s-9999" % path.name)
+
+
+def _canon_path(path_in_file: str) -> str:
+    """Normalize a locate-style path label into a dot path from the doc root.
+
+    'root' -> '', '$.permissions' -> 'permissions',
+    '$.metadata.session_config.session_permissions' ->
+    'metadata.session_config.session_permissions', 'root.a.b' -> 'a.b'.
+    """
+    p = path_in_file or ""
+    if p.startswith("$."):
+        p = p[2:]
+    if p == "root":
+        return ""
+    if p.startswith("root."):
+        p = p[len("root."):]
+    return p
+
+
+def _parent_path_of(canon: str) -> Tuple[str, str]:
+    """Split *canon* into its parent dot path and final segment."""
+    if "." in canon:
+        head, _, last = canon.rpartition(".")
+        return head, last
+    return "", canon
+
+
+def _backup_file(path: Path, made: Dict[str, str]) -> Optional[Path]:
+    """Copy *path* to a timestamped sibling backup; record it in *made*."""
+    if not path.is_file():
+        return None
+    ts = _utcnow_compact()
+    target = _unique_path(path.with_name("%s.bak-%s" % (path.name, ts)))
+    try:
+        shutil.copy2(path, target)
+    except OSError:
+        return None
+    made[str(path)] = str(target)
+    return target
+
+
+def _atomic_write_bytes(path: Path, data: bytes, new_mode: int = 0o600) -> None:
+    """Atomically write *data* to *path* (tmp file + os.replace)."""
+    prev_mode = None
+    if path.exists():
+        try:
+            prev_mode = stat.S_IMODE(path.stat().st_mode)
+        except OSError:
+            pass
+    tmp = path.with_name(".%s.tmp-%s" % (path.name, _utcnow_compact()))
+    try:
+        tmp.write_bytes(data)
+        try:
+            os.chmod(tmp, prev_mode if prev_mode is not None else new_mode)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_json_file(path: Path, obj: Any, new_mode: int = 0o600) -> None:
+    """Atomically write *obj* as pretty JSON with a trailing newline."""
+    _atomic_write_bytes(path, (json.dumps(obj, indent=2) + "\n").encode("utf-8"),
+                        new_mode)
+
+
+def _resolve_parent(doc: Any, dotted: str) -> Tuple[Any, str]:
+    """Navigate *dotted* from *doc* to its parent dict and final key.
+
+    Segments are split on '.'; an optional '[<idx>]' suffix on a segment
+    addresses list elements (applied while descending intermediate segments).
+    The final segment's indices are IGNORED: removal only ever targets dict
+    keys, never list elements.  Raises KeyError/TypeError/IndexError/
+    ValueError when the path does not exist or *doc* is not a dict at the
+    top level; empty *dotted* raises ValueError.
+    """
+    if not dotted:
+        raise ValueError("empty path")
+    parts = dotted.split(".")
+    parent = doc
+    for i, part in enumerate(parts):
+        m = _SEG_RE.match(part)
+        if not m:
+            raise KeyError("malformed segment %r" % part)
+        key = m.group(1)
+        if i == len(parts) - 1:
+            return parent, key
+        node = parent[key]
+        for idx in (int(idx) for idx in re.findall(r"\[(\d+)\]", part)):
+            node = node[idx]
+        parent = node
+    raise KeyError("unreachable path %r" % dotted)  # pragma: no cover
+
+
+def _git_rank(value: Any) -> Optional[int]:
+    """Canonical rank of a git grain string; None for non-strings/unknown."""
+    if not isinstance(value, str):
+        return None
+    return _GIT_MERGE_RANK.get(value.strip().lower())
+
+
+def _legacy_git_contributions(perm_dict: dict) -> List[Tuple[str, str, int]]:
+    """Return (source_key, canonical_value, rank) for legacy git fields."""
+    out: List[Tuple[str, str, int]] = []
+    if perm_dict.get(_GAW_KEY) is True:
+        out.append((_GAW_KEY, "write", 3))
+    for key in ("git_write", "git_read"):
+        if key not in perm_dict:
+            continue
+        val = perm_dict[key]
+        if isinstance(val, bool):
+            canon = "write" if val else "banned"
+            out.append((key, canon, _GIT_MERGE_RANK[canon]))
+            continue
+        if not isinstance(val, str):
+            continue
+        norm = val.strip().lower()
+        if norm in ("write", "full"):
+            out.append((key, "write", 3))
+        elif norm == "write_on_feature_branch":
+            out.append((key, "write_on_feature_branch", 3))
+        elif norm in ("read", "ask", "banned"):
+            out.append((key, norm, _GIT_MERGE_RANK[norm]))
+        # Unrecognised values have no safe fold target; skipped.
+    return out
+
+
+def _merged_git_value(perm_dict: dict) -> Optional[str]:
+    """Fold legacy git fields into the canonical 'git' value.
+
+    Picks the most permissive candidate (rank desc), ties broken by breadth
+    asc and existing 'git' winning (prio 0 < 1).  Never downgrades an
+    existing canonical value.
+    """
+    candidates: List[Tuple[int, int, int, str]] = []
+    existing = perm_dict.get("git")
+    if isinstance(existing, str):
+        rank = _git_rank(existing)
+        if rank is not None:
+            candidates.append((rank, _GIT_BREADTH.get(existing, 9), 0, existing))
+    for src, val, rank in _legacy_git_contributions(perm_dict):
+        candidates.append((rank, _GIT_BREADTH.get(val, 9), 1, val))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: (-c[0], c[1], c[2]))
+    return candidates[0][3]
+
+
+def _quarantine_artifact_path(quarantine_dir: Path, rel: str, dotted: str,
+                              category: str, removed: Any,
+                              hint_key: str) -> Path:
+    """Write one JSON artifact for a removed node; return its path.
+
+    OSError propagates to the caller (treated as an abort of the rewrite).
+    """
+    payload = {
+        "quarantined_from": rel,
+        "path_in_file": dotted,
+        "category": category,
+        "removed_at": _utcnow_iso(),
+        "value": _redact_value(removed, hint_key),
+    }
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", "%s__%s" % (rel, dotted or "root"))
+    name = _unique_path(quarantine_dir /
+                        ("%s__%s.json" % (safe, _utcnow_compact())))
+    _atomic_write_json_file(name, payload, new_mode=0o600)
+    return name
+
+
+def _read_json_doc(root: Path, rel: str) -> Tuple[Path, Any]:
+    """Read and parse *rel* under *root*. OSError/JSONDecodeError propagate."""
+    p = root / rel
+    doc = json.loads(p.read_text(encoding="utf-8"))
+    return p, doc
+
+
+def _remove_node(doc: Any, canon: str) -> None:
+    """Delete the dict key addressed by *canon* from *doc*."""
+    parent, last = _resolve_parent(doc, canon)
+    del parent[last]
+
+
+def _get_node(doc: Any, canon: str) -> Any:
+    """Return the value addressed by *canon* (descends list indices too)."""
+    if not canon:
+        raise KeyError("empty path")
+    node = doc
+    for part in canon.split("."):
+        m = _SEG_RE.match(part)
+        if not m:
+            raise KeyError("malformed segment %r" % part)
+        node = node[m.group(1)]
+        for idx in (int(idx) for idx in re.findall(r"\[(\d+)\]", part)):
+            node = node[idx]
+    return node
+
+
+def _fix_issue(root: Path, quarantine_dir: Path, issue: dict,
+               made: Dict[str, str]) -> dict:
+    """Perform exactly ONE machine fix for *issue*.  Raises on failure.
+
+    The file is re-read per issue (fixes run against the pre-apply report and
+    later fixes in the same run may have rewritten the same file).
+    """
+    rel = issue.get("file") or ""
+    category = issue.get("category") or ""
+    path_in_file = issue.get("path_in_file") or ""
+    full = root / rel
+
+    if category == "missing_file":
+        if full.exists():
+            raise ValueError("target file already exists: %s" % rel)
+        default = issue.get("default_value")
+        if default is None:
+            raise ValueError("no schema safe_default for %s" % rel)
+        full.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(default, str):
+            _atomic_write_bytes(full, default.encode("utf-8"))
+        else:
+            _atomic_write_json_file(full, default)
+        return {"status": "applied", "action": "created from schema safe_default"}
+
+    _, doc = _read_json_doc(root, rel)
+    if not isinstance(doc, dict):
+        raise ValueError("document root is not a dict: %s" % rel)
+    canon = _canon_path(path_in_file)
+
+    def rewrite_with_backup() -> None:
+        if full.is_file():
+            bak = _backup_file(full, made)
+            if bak is None:
+                raise ValueError("backup failed; rewrite aborted")
+        _atomic_write_json_file(full, doc)
+
+    if category == "missing_field":
+        default = issue.get("default_value")
+        if default is None:
+            raise ValueError("no schema default for %s::%s" % (rel, canon))
+        parent, last = _resolve_parent(doc, canon)
+        if last in parent:
+            raise ValueError("field %r already present in %s" % (last, rel))
+        parent[last] = default
+        rewrite_with_backup()
+        return {"status": "applied", "action": "backfilled %s from schema default" % last}
+
+    if category in ("unknown_top_key", "unknown_nested_key"):
+        removed = _get_node(doc, canon)
+        hint_key = _parent_path_of(canon)[1] or canon or "value"
+        _quarantine_artifact_path(quarantine_dir, rel, canon, category,
+                                  removed, hint_key)
+        if full.is_file():
+            bak = _backup_file(full, made)
+            if bak is None:
+                raise ValueError("backup failed; rewrite aborted")
+        _remove_node(doc, canon)
+        _atomic_write_json_file(full, doc)
+        return {"status": "applied",
+                "action": "removed %s; original quarantined under %s"
+                          % (canon or "<root>", _DEFAULT_QUARANTINE_REL)}
+
+    if category == "legacy_permission_key":
+        parent, last = _resolve_parent(doc, canon)
+        if last == _GAW_KEY:
+            raise ValueError("manual review only (engine-read flag; never auto-removed)")
+        if last == "docker":
+            if "container" in parent:
+                raise ValueError("'container' already present; refusing to overwrite")
+            docker_val = parent["docker"]
+            parent["container"] = (docker_val if isinstance(docker_val, bool)
+                                   else (docker_val == "write"))
+            del parent["docker"]
+            rewrite_with_backup()
+            return {"status": "applied", "action": "converted docker to container"}
+        if last in ("git_write", "git_read", "execution"):
+            merged = _merged_git_value(parent)
+            if merged is None:
+                raise ValueError("no canonical git value to fold legacy key %s into" % last)
+            parent["git"] = merged
+            del parent[last]
+            rewrite_with_backup()
+            return {"status": "applied", "action": "folded %s into git=%s" % (last, merged)}
+        raise ValueError("unsupported legacy key %s" % last)
+
+    raise ValueError("unsupported category %s" % category)
+
+
+def _apply_fixes(root: Path, quarantine_dir: Path, report: dict,
+                 made: Dict[str, str]) -> List[dict]:
+    """Apply every machine_apply issue in *report*.  Never raises."""
+    performed: List[dict] = []
+    for issue in report.get("issues", []):
+        if issue.get("classification") != "machine_apply":
+            continue
+        entry: Dict[str, Any] = {
+            "id": issue.get("id"),
+            "file": issue.get("file"),
+            "path_in_file": issue.get("path_in_file") or "",
+            "category": issue.get("category"),
+        }
+        try:
+            res = _fix_issue(root, quarantine_dir, issue, made)
+            entry["status"] = "applied"
+            entry["action"] = res["action"]
+        except Exception as exc:
+            entry["status"] = "error"
+            entry["error"] = str(exc)
+        performed.append(entry)
+    return performed
+
+
+def _restore_seeded_seeds(root: Path, quarantine_dir: Path, report: dict,
+                          made: Dict[str, str]) -> List[dict]:
+    """Restore missing/drifted seeded files under --restore-seeds --yes.
+
+    Allowlist drift is only quarantined (never auto-fixed); other drifted
+    seeded files are restored from the seed after a sibling backup.  Missing
+    seeded files are re-created from the seed directly.
+    """
+    performed: List[dict] = []
+    resources = _resources_dir()
+    for entry in sorted(report.get("seeded_files", []),
+                        key=lambda e: str(e.get("file"))):
+        rel = entry["file"]
+        status = entry.get("status")
+        if status not in ("missing", "drift"):
+            continue
+        seed_name = _SEED_MAP.get(rel)
+        if not seed_name:
+            continue
+        seed = resources / seed_name
+        vpath = root / rel
+        if not seed.is_file():
+            performed.append({"file": rel, "category": "seeded_drift",
+                              "status": "error",
+                              "error": "no seed resource %s" % seed_name})
+            continue
+        if status == "missing":
+            vpath.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(seed, vpath)
+            performed.append({"file": rel, "category": "seeded_drift",
+                              "status": "applied", "action": "restored from seed"})
+            continue
+        # Drift.
+        if "checksystem_allowlist" in rel:
+            try:
+                payload = json.loads(vpath.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                payload = vpath.read_text(encoding="utf-8")
+            try:
+                _quarantine_artifact_path(quarantine_dir, rel, "", "seeded_drift",
+                                          payload, rel)
+            except OSError:
+                performed.append({"file": rel, "category": "seeded_drift",
+                                  "status": "error",
+                                  "error": "quarantine write failed"})
+                continue
+            performed.append({"file": rel, "category": "seeded_drift",
+                              "status": "applied",
+                              "action": "quarantined allowlist drift; not auto-fixed"})
+            continue
+        bak = _backup_file(vpath, made)
+        if bak is None:
+            performed.append({"file": rel, "category": "seeded_drift",
+                              "status": "error",
+                              "error": "backup failed; restore aborted"})
+            continue
+        shutil.copy2(seed, vpath)
+        performed.append({"file": rel, "category": "seeded_drift",
+                          "status": "applied", "action": "restored from seed"})
+    return performed
+
+
+def run_repair(vault_root: Any, apply: bool = False,
+               quarantine_dir: Optional[Any] = None,
+               restore_seeds: bool = False, yes: bool = False) -> dict:
+    """Inspect the vault and optionally apply machine fixes / seed restores.
+
+    Never raises.  ``apply=False`` without ``restore_seeds --yes`` is a pure
+    inspection (identical to ``run_inspection``).  With ``apply=True`` every
+    machine_apply finding is fixed under the repair guardrails; seed
+    restoration only happens when *restore_seeds* AND *yes* are True.
+    """
+    root = Path(vault_root)
+    made: Dict[str, str] = {}
+    try:
+        want_repair = bool(apply) or (restore_seeds and yes)
+        if not want_repair:
+            return run_inspection(root)
+        pre = run_inspection(root)
+        quarantine = _resolve_quarantine_dir(root, quarantine_dir)
+        performed = _apply_fixes(root, quarantine, pre, made) if apply else []
+        seed_perf: List[dict] = []
+        if restore_seeds and yes:
+            seed_perf = _restore_seeded_seeds(root, quarantine, pre, made)
+        post = run_inspection(root)
+        post["run"]["dry_run"] = False
+        backups = []
+        for orig, bak in sorted(made.items()):
+            backups.append({
+                "backup": os.path.relpath(bak, str(root)),
+                "backup_of": os.path.relpath(orig, str(root)),
+            })
+        post["repair"] = {
+            "requested_apply": bool(apply),
+            "restore_seeds": bool(restore_seeds and yes),
+            "performed": performed + seed_perf,
+            "backups": backups,
+        }
+        return post
+    except Exception as exc:
+        try:
+            base = run_inspection(root)
+        except Exception:
+            base = {
+                "run": {"vault_root": str(root), "dry_run": False,
+                        "tool_version": TOOL_VERSION, "now": _utcnow_iso()},
+                "summary": {"total_issues": 0, "by_category": {},
+                            "by_classification": {"machine_apply": 0,
+                                                   "manual_review": 0}},
+                "issues": [],
+                "extra_files": [],
+                "seeded_files": [],
+            }
+        base["repair"] = {
+            "requested_apply": bool(apply),
+            "restore_seeds": bool(restore_seeds and yes),
+            "error": str(exc),
+            "performed": [],
+            "backups": [],
+        }
+        return base
+
+
 def run_inspection(vault_root: Any, manifest_path: Optional[Any] = None) -> dict:
     """Run the read-only vault integrity inspection. Never raises.
 
@@ -456,7 +1148,7 @@ def run_inspection(vault_root: Any, manifest_path: Optional[Any] = None) -> dict
 
     extra_files: List[str] = []
     _collect_drift_issues(drift_report or {}, manifest, sink, extra_files)
-    _collect_permission_issues(root, sink)
+    _collect_permission_issues(root, sink, manifest.get("files") or {})
 
     issues = sink.issues
     issues.sort(key=lambda i: (i.get("file") or "", i.get("path_in_file") or "",
@@ -495,14 +1187,23 @@ def run_inspection(vault_root: Any, manifest_path: Optional[Any] = None) -> dict
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """CLI entry point. Exit codes: 0 healthy, 1 findings, 2 usage, 3 root error."""
+    """CLI entry point.
+
+    Exit codes:
+      0  vault is healthy (no findings)
+      1  findings present (read-only)
+      2  --apply performed at least one fix
+      3  vault root missing, or repair errors occurred
+    """
     parser = argparse.ArgumentParser(
         prog="thoughtmachine.vault_repair",
         description=(
-            "Phase-1 read-only vault integrity scanner. Reports schema drift, "
-            "permission-dict drift, seeded-file drift and unknown root files. "
-            "Repair (--apply), quarantine and seed restoration are later "
-            "phases; this tool never writes."
+            "ThoughtMachine vault integrity scanner and repairer. Default "
+            "mode is read-only diagnosis (schema drift, permission-dict "
+            "drift, seeded-file drift, unknown root files). --apply mutates: "
+            "machine fixes are performed under guardrails (timestamped "
+            "sibling backups, .quarantine artifacts, permission tightening "
+            "only). Seed restoration requires --restore-seeds --yes."
         ),
     )
     parser.add_argument("--vault-root", metavar="PATH", default=None,
@@ -510,11 +1211,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--report-json", metavar="PATH", default=None,
                         help="Write the full JSON report to this path")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Accepted for forward compatibility; phase 1 is always read-only")
+                        help="Force read-only mode; --apply is ignored")
+    parser.add_argument("--apply", action="store_true",
+                        help="Mutate the vault: apply machine fixes (backups + quarantine artifacts) and re-scan")
+    parser.add_argument("--quarantine-dir", metavar="PATH", default=None,
+                        help="Directory for removed-node artifacts (default: <vault_root>/.quarantine)")
+    parser.add_argument("--restore-seeds", action="store_true",
+                        help="Restore missing/drifted seeded files (requires --yes)")
+    parser.add_argument("--yes", action="store_true",
+                        help="Acknowledge the --restore-seeds mutation")
     args = parser.parse_args(argv)
 
     root = resolve_vault_root(args.vault_root)
-    report = run_inspection(root)
+    dry_run = bool(args.dry_run)
+    apply_mut = args.apply and not dry_run
+    if apply_mut or args.restore_seeds:
+        report = run_repair(root, apply=apply_mut,
+                            quarantine_dir=args.quarantine_dir,
+                            restore_seeds=args.restore_seeds, yes=args.yes)
+    else:
+        report = run_inspection(root)
     if args.report_json:
         out = Path(args.report_json)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -528,10 +1244,32 @@ def main(argv: Optional[List[str]] = None) -> int:
              summary["by_classification"].get("manual_review", 0)))
     if args.report_json:
         print("  report written to %s" % args.report_json)
+    if args.restore_seeds and not args.yes:
+        print("  note: seed restoration requires --yes; seeds left untouched")
+    repair = report.get("repair")
+    if repair:
+        performed = repair.get("performed") or []
+        errs = [p for p in performed if p.get("status") == "error"]
+        backups = repair.get("backups") or []
+        print("  repair: %d performed (%d errors), %d backups"
+              % (len(performed), len(errs), len(backups)))
+        if repair.get("error"):
+            print("  repair error: %s" % repair["error"])
     if summary["total_issues"]:
-        print("  findings present (read-only mode; no changes were made)")
+        if apply_mut:
+            print("  findings remain after repair (manual_review or errors)")
+        else:
+            print("  findings present (read-only mode; no changes were made)")
     else:
         print("  vault is healthy (no findings)")
+    if repair and (repair.get("error") or any(
+            p.get("status") == "error" for p in (repair.get("performed") or []))):
+        return 3
+    if apply_mut:
+        performed = repair.get("performed") or []
+        if any(p.get("status") == "applied" for p in performed):
+            return 2
+        return 0 if summary["total_issues"] == 0 else 1
     return 0 if summary["total_issues"] == 0 else 1
 
 
